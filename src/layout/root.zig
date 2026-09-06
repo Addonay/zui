@@ -39,14 +39,26 @@ pub const round = @import("round.zig");
 pub const Style = style.Style;
 pub const Display = style.Display;
 pub const Position = style.Position;
+pub const BoxSizing = style.BoxSizing;
+pub const Direction = style.Direction;
 pub const Dimension = style.Dimension;
 pub const LengthPercentage = style.LengthPercentage;
+pub const Edges = style.Edges;
+pub const FlexDirection = style.FlexDirection;
+pub const FlexWrap = style.FlexWrap;
+pub const AlignItems = style.AlignItems;
+pub const AlignContent = style.AlignContent;
+pub const AlignSelf = style.AlignSelf;
+pub const JustifyContent = style.JustifyContent;
+pub const GridTrack = style.GridTrack;
+pub const GridAutoFlow = style.GridAutoFlow;
 pub const AvailableSpace = geometry.AvailableSpace;
 pub const SizingMode = geometry.SizingMode;
 pub const Layout = geometry.Layout;
 pub const LayoutTree = tree.LayoutTree;
 pub const NodeId = tree.NodeId;
 pub const MeasureFunc = measure.MeasureFunc;
+pub const ComputeTree = compute.ComputeTree;
 
 test {
     _ = @import("style.zig");
@@ -59,4 +71,5 @@ test {
     _ = @import("block.zig");
     _ = @import("compute.zig");
     _ = @import("round.zig");
+    _ = @import("bench/conformance.zig");
 }

@@ -531,7 +531,10 @@ pub const WaylandBackend = struct {
 test "wayland availability and initialization" {
     if (!WaylandBackend.isAvailable()) return;
 
-    var b = try WaylandBackend.init(std.testing.allocator, "ZUI Wayland Test", 320, 240);
+    var b = WaylandBackend.init(std.testing.allocator, "ZUI Wayland Test", 320, 240) catch |err| switch (err) {
+        error.CannotConnectWayland => return,
+        else => return err,
+    };
     defer b.deinit();
 
     const handle = b.backendHandle();

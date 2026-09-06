@@ -110,8 +110,12 @@ pub fn collectLinesWithGap(
 
     if (min_content) {
         for (line_of, 0..) |*line, i| line.* = @intCast(i);
-        if (line_starts) |starts| for (starts[0..mains.len], 0..) |*value, i| value.* = @intCast(i);
-        if (line_ends) |ends| for (ends[0..mains.len], 0..) |*value, i| value.* = @intCast(i + 1);
+        if (line_starts) |starts| {
+            for (starts[0..mains.len], 0..) |*value, i| value.* = @intCast(i);
+        }
+        if (line_ends) |ends| {
+            for (ends[0..mains.len], 0..) |*value, i| value.* = @intCast(i + 1);
+        }
         return @intCast(mains.len);
     }
 
@@ -238,7 +242,7 @@ pub fn arrange(
         resolveLine(tree, scratch, scratch.line_start[line], scratch.line_end[line], is_row, final_main, gap_main, line);
     }
 
-    distributeLines(container, final_cross, gap_cross, scratch.line_cross[0..line_count], scratch.line_offset[0..line_count], wrap);
+    distributeLines(container, final_cross, gap_cross, scratch.line_cross[0..line_count], scratch.line_offset[0..line_count], container.flex_wrap == .wrap_reverse);
 
     line = 0;
     while (line < line_count) : (line += 1) {
@@ -354,7 +358,9 @@ fn distributeLines(style: style_mod.Style, final_cross: f32, gap: f32, crosses: 
         .start, .flex_start => {},
         .end, .flex_end => start = free,
         .center => start = free / 2,
-        .space_between => if (crosses.len > 1) step += free / @as(f32, @floatFromInt(crosses.len - 1)) else start = free / 2,
+        .space_between => {
+            if (crosses.len > 1) step += free / @as(f32, @floatFromInt(crosses.len - 1)) else start = free / 2;
+        },
         .space_around => {
             const each = free / @as(f32, @floatFromInt(crosses.len));
             start = each / 2;
@@ -376,7 +382,9 @@ fn distributeLines(style: style_mod.Style, final_cross: f32, gap: f32, crosses: 
         offset.* = cursor;
         cursor += cross + step;
     }
-    if (wrap) for (crosses, offsets) |cross, *offset| offset.* = final_cross - offset.* - cross;
+    if (wrap) {
+        for (crosses, offsets) |cross, *offset| offset.* = final_cross - offset.* - cross;
+    }
 }
 
 fn positionLine(
@@ -393,6 +401,13 @@ fn positionLine(
 ) void {
     const count = ids.len;
     if (count == 0) return;
+
+    // Publish the resolved main sizes before calculating positions. The
+    // dispatcher uses these values as the child's final assigned size during
+    // the subsequent nested reflow.
+    for (ids, targets) |id, target| {
+        if (is_row) tree.nodes[id].layout.w = target else tree.nodes[id].layout.h = target;
+    }
 
     var used: f32 = gap_main * @as(f32, @floatFromInt(if (count > 1) count - 1 else 0));
     var auto_count: usize = 0;
@@ -417,7 +432,9 @@ fn positionLine(
         .start, .flex_start => {},
         .end, .flex_end => cursor = @max(0, free),
         .center => cursor = @max(0, free / 2),
-        .space_between => if (count > 1 and free > 0) justify_gap += free / @as(f32, @floatFromInt(count - 1)) else cursor = @max(0, free / 2),
+        .space_between => {
+            if (count > 1 and free > 0) justify_gap += free / @as(f32, @floatFromInt(count - 1)) else cursor = @max(0, free / 2);
+        },
         .space_around => if (free > 0) {
             const each = free / @as(f32, @floatFromInt(count));
             cursor = each / 2;
@@ -451,22 +468,20 @@ fn positionLine(
     for (ids, 0..) |id, i| {
         const cs = tree.nodes[id].style;
         const m = cs.margin;
-        const align = container.effectiveAlign(cs.align_self);
+        const cross_alignment = container.effectiveAlign(cs.align_self);
         const lead_margin = if (is_row) m.top else m.left;
         const trail_margin = if (is_row) m.bottom else m.right;
         const lead_auto = if (is_row) cs.margin_top_auto else cs.margin_left_auto;
         const trail_auto = if (is_row) cs.margin_bottom_auto else cs.margin_right_auto;
         var cross_size = if (is_row) tree.nodes[id].layout.h else tree.nodes[id].layout.w;
         const cross_auto = cs.isAutoOnAxis(!is_row);
-        if (align == .stretch and cross_auto and !lead_auto and !trail_auto) {
+        if (cross_alignment == .stretch and cross_auto and !lead_auto and !trail_auto) {
             cross_size = clamp(line_cross - lead_margin - trail_margin, crossMin(cs, is_row, line_cross), crossMax(cs, is_row, line_cross));
             if (is_row) tree.nodes[id].layout.h = cross_size else tree.nodes[id].layout.w = cross_size;
         }
         const free_cross = line_cross - cross_size - lead_margin - trail_margin;
         var cross_pos = line_offset + lead_margin;
-        if (lead_auto and trail_auto and free_cross > 0) cross_pos += free_cross / 2
-        else if (lead_auto and free_cross > 0) cross_pos += free_cross
-        else if (!lead_auto and !trail_auto) switch (align) {
+        if (lead_auto and trail_auto and free_cross > 0) cross_pos += free_cross / 2 else if (lead_auto and free_cross > 0) cross_pos += free_cross else if (!lead_auto and !trail_auto) switch (cross_alignment) {
             .end, .flex_end => cross_pos += @max(0, free_cross),
             .center => cross_pos += @max(0, free_cross / 2),
             else => {},
@@ -536,7 +551,7 @@ test "grow and shrink use flex factors" {
 }
 
 test "line collection includes gaps and admits oversized first item" {
-    const mains = [_]f32{ 80, 30, 30 };
+    const mains = [_]f32{ 80, 80, 30 };
     var lines = [_]u16{ 99, 99, 99 };
     var starts = [_]u16{ 99, 99, 99 };
     var ends = [_]u16{ 99, 99, 99 };

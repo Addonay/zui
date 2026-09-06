@@ -546,7 +546,10 @@ fn mapX11Keycode(kc: c_uint) event.Key {
 test "x11 availability and creation" {
     if (!X11Backend.isAvailable()) return;
 
-    var b = try X11Backend.init(std.testing.allocator, "ZUI X11 Test", 200, 150);
+    var b = X11Backend.init(std.testing.allocator, "ZUI X11 Test", 200, 150) catch |err| switch (err) {
+        error.CannotOpenDisplay => return,
+        else => return err,
+    };
     defer b.deinit();
 
     const handle = b.backendHandle();

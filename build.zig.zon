@@ -6,6 +6,7 @@
     .paths = .{
         "src",
         "examples",
+        "BENCHMARKS.md",
         "build.zig",
         "build.zig.zon",
     },

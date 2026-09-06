@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const layout_mod = b.addModule("layout", .{
-        .root_source_file = b.path("src/layout/root.zig"),
+        .root_source_file = b.path("src/layout_module.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -26,8 +26,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    // Compile the layout module as its own root as well. This catches
+    // accidental dependencies on the wider ZUI surface and documents the
+    // supported `@import("layout")` package boundary.
+    const layout_tests = b.addTest(.{
+        .root_module = layout_mod,
+    });
+    const run_layout_tests = b.addRunArtifact(layout_tests);
+
     const test_step = b.step("test", "Run zui unit tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_layout_tests.step);
 
     // Layout benchmarks (reproducible, ReleaseFast). Writes table to stdout;
     // copy into BENCHMARKS.md after verifying on your machine.
@@ -46,6 +55,19 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench);
     const bench_step = b.step("bench-layout", "Run layout benchmarks (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
+
+    // Optional cross-check against the vendored Taffy 0.14 reference. It is
+    // intentionally a separate step because Cargo may need network access to
+    // fetch Criterion's transitive dependencies.
+    const taffy_compare = b.addSystemCommand(&.{
+        "cargo",
+        "run",
+        "--release",
+        "--manifest-path",
+        "src/layout/bench/Cargo.toml",
+    });
+    const taffy_step = b.step("bench-taffy", "Run the Taffy release comparison benchmark");
+    taffy_step.dependOn(&taffy_compare.step);
 
     const todo = b.addExecutable(.{
         .name = "todo",
