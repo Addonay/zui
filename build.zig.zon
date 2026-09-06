@@ -1,0 +1,12 @@
+.{
+    .name = .zui,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0-dev.1970+67f39b551",
+    .fingerprint = 0xc00160dbcf146dfd,
+    .paths = .{
+        "src",
+        "examples",
+        "build.zig",
+        "build.zig.zon",
+    },
+}
