@@ -2,10 +2,16 @@
 //!
 //! Design mirrors the glyph atlas contract: frames reference pool offsets,
 //! pool bytes must survive until present (render+present run adjacently per
-//! window in `App.step`). Eviction only drops entries unused by the current
-//! frame, so already-emitted `Scene` refs stay valid; when nothing is
-//! evictable the lookup fails and the painter drops the image — same
-//! drop-instead-of-grow policy as quad overflow.
+//! window in `App.step`). Pool reset drops only entries unused by the
+//! current frame, so already-emitted `Scene` refs stay valid; when a
+//! current-frame entry blocks reset the lookup fails and the painter drops
+//! the image — same drop-instead-of-grow policy as quad overflow.
+//!
+//! Slots and bytes reclaim independently: filling the 64 entry table evicts
+//! the stalest non-pinned slot (bytes orphan until the next pool reset).
+//! Every placement mints a Handle generation, so retained handles (the
+//! `.handle` element path, which bypasses hash lookup) validate explicitly
+//! and report stale instead of aliasing recycled bytes.
 
 const std = @import("std");
 const limits = @import("../core/limits.zig");
@@ -15,10 +21,15 @@ const raster = @import("raster.zig");
 const svg = @import("svg.zig");
 
 /// Pool reference emitted into `Scene` image entries.
+/// `generation` makes staleness detectable: every placement mints a fresh
+/// generation, so a handle whose slot was reused or reset reports stale
+/// instead of silently addressing another image's bytes. Zero is reserved
+/// for `invalid` and never minted.
 pub const Handle = struct {
     offset: u32,
     w: u32,
     h: u32,
+    generation: u32 = 0,
 
     pub const invalid: Handle = .{ .offset = 0, .w = 0, .h = 0 };
 };
@@ -31,12 +42,19 @@ const Entry = struct {
     /// Last frame that looked this entry up; eviction skips current-frame.
     pin: u64 = 0,
     live: bool = false,
+    /// Minted per placement from `next_generation`; matches the Handle.
+    generation: u32 = 0,
 };
 
 pub const Cache = struct {
     pool: []u8 = &.{},
     used: usize = 0,
     entries: [limits.MAX_CACHED_IMAGES]Entry = undefined,
+    /// Monotonic placement generation; 0 is never minted (see Handle).
+    next_generation: u32 = 1,
+    /// Slot-eviction + stale-handle drops since init (observable budgets).
+    slot_evictions: u64 = 0,
+    stale_drops: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) !*Cache {
         const self = try allocator.create(Cache);
@@ -107,10 +125,30 @@ pub const Cache = struct {
         for (&self.entries) |*e| {
             if (e.live and e.hash == hash) {
                 e.pin = frame;
-                return .{ .offset = e.offset, .w = e.w, .h = e.h };
+                return .{ .offset = e.offset, .w = e.w, .h = e.h, .generation = e.generation };
             }
         }
         return null;
+    }
+
+    /// Re-resolve a retained handle (the `.handle` element path, which
+    /// bypasses hash lookup). Returns false when the slot was reused or the
+    /// pool reset since the handle was minted — the painter drops the image
+    /// instead of drawing another image's bytes. On success the entry is
+    /// re-pinned to `frame`, protecting its bytes like a fresh lookup.
+    pub fn validate(self: *Cache, h: Handle, frame: u64) bool {
+        if (h.generation == 0) {
+            self.stale_drops += 1;
+            return false;
+        }
+        for (&self.entries) |*e| {
+            if (e.live and e.generation == h.generation and e.offset == h.offset and e.w == h.w and e.h == h.h) {
+                e.pin = frame;
+                return true;
+            }
+        }
+        self.stale_drops += 1;
+        return false;
     }
 
     const PlaceError = error{ ImageCacheFull, ImageTooLarge };
@@ -129,7 +167,28 @@ pub const Cache = struct {
         }
         const slot = for (&self.entries) |*e| {
             if (!e.live) break e;
-        } else return PlaceError.ImageCacheFull;
+        } else blk: {
+            // Ordinary slot eviction: reuse the stalest entry not pinned by
+            // the current frame (its pool bytes stay orphaned until the next
+            // pool reset — slots and bytes reclaim independently). The old
+            // handle's generation dies with the slot, so retained handles
+            // report stale instead of aliasing the new bytes.
+            var victim: ?*Entry = null;
+            for (&self.entries) |*e| {
+                if (e.pin == frame) continue;
+                if (victim == null or e.pin < victim.?.pin) victim = e;
+            }
+            const v = victim orelse return PlaceError.ImageCacheFull;
+            self.slot_evictions += 1;
+            break :blk v;
+        };
+        // Mint before writing: even a zero-size placement retires the old
+        // generation (a reused slot never aliases a retained handle).
+        // Wraps after 4B placements, skipping 0; no handle can outlive
+        // the pool churn between reuses.
+        const generation = self.next_generation;
+        self.next_generation +%= 1;
+        if (self.next_generation == 0) self.next_generation = 1;
         @memcpy(self.pool[self.used..][0..src.len], src);
         slot.* = .{
             .hash = hash,
@@ -138,9 +197,10 @@ pub const Cache = struct {
             .h = h,
             .pin = frame,
             .live = true,
+            .generation = generation,
         };
         self.used += src.len;
-        return .{ .offset = slot.offset, .w = w, .h = h };
+        return .{ .offset = slot.offset, .w = w, .h = h, .generation = generation };
     }
 };
 
@@ -185,4 +245,46 @@ test "cache reset reclaims stale entries but keeps pinned" {
     try std.testing.expectError(error.ImageCacheFull, cache.place(3, big2, 1024, @intCast(limits.MAX_IMAGE_POOL_BYTES / 4096), 3));
     // Pinned entry still intact.
     try std.testing.expectEqualSlices(u8, &small, cache.pixels(h));
+}
+
+test "cache evicts stalest slot when the table fills" {
+    const t = std.testing.allocator;
+    var cache = try Cache.init(t);
+    defer cache.deinit(t);
+    var px: [4]u8 = @splat(7);
+    var first: Handle = .invalid;
+    var i: u64 = 0;
+    while (i < limits.MAX_CACHED_IMAGES) : (i += 1) {
+        const h = try cache.place(1000 + i, &px, 1, 1, 1);
+        if (i == 0) first = h;
+        try std.testing.expect(h.generation != 0);
+    }
+    // Table full, pool nearly empty: the 65th placement evicts the stalest
+    // non-pinned slot instead of failing.
+    const fresh = try cache.place(99999, &px, 1, 1, 2);
+    try std.testing.expectEqual(@as(u64, 1), cache.slot_evictions);
+    try std.testing.expect(cache.validate(fresh, 2));
+    // The evicted handle reports stale — it must never alias the new bytes.
+    try std.testing.expect(!cache.validate(first, 2));
+    try std.testing.expectEqual(@as(u64, 1), cache.stale_drops);
+    // ...while a surviving entry still validates.
+    const survivor = try cache.place(88888, &px, 1, 1, 2);
+    _ = survivor;
+    try std.testing.expect(cache.validate(fresh, 2));
+}
+
+test "cache handle goes stale across pool reset" {
+    const t = std.testing.allocator;
+    var cache = try Cache.init(t);
+    defer cache.deinit(t);
+    var small: [16]u8 = @splat(3);
+    const h = try cache.place(42, &small, 2, 2, 1);
+    try std.testing.expect(cache.validate(h, 1));
+    // Next frame the pool resets around it (stale pin, no current pins).
+    const big = try t.alloc(u8, limits.MAX_IMAGE_POOL_BYTES);
+    defer t.free(big);
+    _ = try cache.place(43, big, 1024, @intCast(limits.MAX_IMAGE_POOL_BYTES / 4096), 2);
+    try std.testing.expect(!cache.validate(h, 2));
+    // Invalid handles never validate.
+    try std.testing.expect(!cache.validate(.invalid, 2));
 }

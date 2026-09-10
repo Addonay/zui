@@ -155,14 +155,18 @@ pub const Node = struct {
 };
 
 /// Transient per-frame element tree (~2.5MB inline). Lives in the heap
-/// `Window` (`ui_frame`); tests may stack ONE Frame plus ONE `Scene` but
-/// must heap-allocate the font `Collection` alongside them. See the
-/// "hot frame structs stay within stack budget" test in painter.zig.
+/// `Window` (`ui_frame`); hold at most one of Frame/Scene/Collection per
+/// stack in tests too (heap-allocate the rest). See the "hot frame structs
+/// stay within stack budget" test in painter.zig.
 pub const Frame = struct {
     nodes: [max_nodes]Node = undefined,
     node_count: usize = 0,
     regions: [max_regions]HitRegion = undefined,
     region_count: usize = 0,
+    /// Cumulative addRegion drops (table full). Hit regions gate clicks:
+    /// a silent drop makes a live control unclickable, so the count keeps
+    /// the failure observable (plan M10). Never reset by reset().
+    dropped_regions: u64 = 0,
     text_storage: [text_storage_len]u8 = undefined,
     text_len: usize = 0,
     window: ?*anyopaque = null,
@@ -204,10 +208,16 @@ pub const Frame = struct {
         return out;
     }
 
-    pub fn addRegion(self: *Frame, region: HitRegion) void {
-        if (self.region_count >= self.regions.len) return;
+    /// Returns false (and counts the drop) when the table is full instead
+    /// of silently losing a clickable control.
+    pub fn addRegion(self: *Frame, region: HitRegion) bool {
+        if (self.region_count >= self.regions.len) {
+            self.dropped_regions += 1;
+            return false;
+        }
         self.regions[self.region_count] = region;
         self.region_count += 1;
+        return true;
     }
 };
 

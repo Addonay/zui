@@ -6,7 +6,11 @@ const images = @import("../images/root.zig");
 const element = @import("element.zig");
 
 pub fn paint(frame: *element.Frame, root: element.Element, scene: *gpu.Scene) void {
-    paintNode(frame, root.index, scene, core.Color.white, .{
+    // Frame boundary for the glyph atlas: applies any eviction deferred
+    // past the previous frame's emitted glyphs (safe — that frame already
+    // presented before this paint runs).
+    if (frame.fonts) |fc| fc.glyphs.beginFrame();
+    paintNode(frame, root.index, scene, core.Color.white, 1, .{
         .x = -1e9,
         .y = -1e9,
         .w = 2e9,
@@ -37,41 +41,22 @@ fn contentBox(node: *const element.Node) core.Rect {
     };
 }
 
-fn mix(a: core.Color, b: core.Color, t: f32) core.Color {
-    return .{
-        .r = a.r + (b.r - a.r) * t,
-        .g = a.g + (b.g - a.g) * t,
-        .b = a.b + (b.b - a.b) * t,
-        .a = a.a + (b.a - a.a) * t,
-    };
-}
-
-fn clippedEquals(bounds: core.Rect, clipped: core.Rect) bool {
-    return @abs(bounds.x - clipped.x) < 0.001 and @abs(bounds.y - clipped.y) < 0.001 and
-        @abs(bounds.w - clipped.w) < 0.001 and @abs(bounds.h - clipped.h) < 0.001;
-}
-
 fn gradientQuad(scene: *gpu.Scene, bounds: core.Rect, from: core.Color, to: core.Color, radius: f32, clip: core.Rect) void {
     if (bounds.w <= 0 or bounds.h <= 0) return;
     if (from.a <= 0 and to.a <= 0) return;
     const visible = intersect(bounds, clip);
     if (visible.w <= 0 or visible.h <= 0) return;
-    // A rect clip can't preserve rounded corners once it cuts, so only keep
-    // the radius when nothing was cut (the common case: parents fit).
-    const kept_radius = if (clippedEquals(bounds, visible)) radius else 0;
-    // Keep the gradient mapped to the original span so a clipped slice shows
-    // the same colors as the unclipped button would at those pixels.
-    const t0 = (visible.x - bounds.x) / bounds.w;
-    const t1 = (visible.x + visible.w - bounds.x) / bounds.w;
-    _ = scene.push(.{ .x = visible.x, .y = visible.y, .w = visible.w, .h = visible.h, .color = mix(from, to, t0), .gradient_to = mix(from, to, t1), .radius = kept_radius });
+    // Geometry goes out UNCUT with the clip attached: the rasterizer cuts
+    // per pixel, so a partial clip keeps the corner radius and the full
+    // gradient span (a clipped slice shows the same colors as the unclipped
+    // button at those pixels).
+    _ = scene.push(.{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = bounds.h, .color = from, .gradient_to = to, .radius = radius, .clip = clip });
 }
 
 fn quad(scene: *gpu.Scene, bounds: core.Rect, color: core.Color, radius: f32, clip: core.Rect) void {
     if (bounds.w <= 0 or bounds.h <= 0 or color.a <= 0) return;
-    const visible = intersect(bounds, clip);
-    if (visible.w <= 0 or visible.h <= 0) return;
-    const kept_radius = if (clippedEquals(bounds, visible)) radius else 0;
-    _ = scene.push(.{ .x = visible.x, .y = visible.y, .w = visible.w, .h = visible.h, .color = color, .radius = kept_radius });
+    if (intersect(bounds, clip).w <= 0 or intersect(bounds, clip).h <= 0) return;
+    _ = scene.push(.{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = bounds.h, .color = color, .radius = radius, .clip = clip });
 }
 
 /// Border ring: one quad that honors `radius` exactly. The old 4-strip
@@ -79,24 +64,28 @@ fn quad(scene: *gpu.Scene, bounds: core.Rect, color: core.Color, radius: f32, cl
 /// left background-colored notches (seen on the circular checkbox).
 fn ring(scene: *gpu.Scene, bounds: core.Rect, color: core.Color, width: f32, radius: f32, clip: core.Rect) void {
     if (bounds.w <= 0 or bounds.h <= 0 or color.a <= 0 or width <= 0) return;
-    const visible = intersect(bounds, clip);
-    if (visible.w <= 0 or visible.h <= 0) return;
-    const kept_radius = if (clippedEquals(bounds, visible)) radius else 0;
-    _ = scene.push(.{ .x = visible.x, .y = visible.y, .w = visible.w, .h = visible.h, .color = color, .radius = kept_radius, .border_width = width });
+    if (intersect(bounds, clip).w <= 0 or intersect(bounds, clip).h <= 0) return;
+    _ = scene.push(.{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = bounds.h, .color = color, .radius = radius, .border_width = width, .clip = clip });
 }
 
-fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_color: core.Color, clip: core.Rect) void {
+fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_color: core.Color, inherited_opacity: f32, clip: core.Rect) void {
     const node = &frame.nodes[index];
-    const hovered = node.bounds.contains(frame.pointer);
+    // Hover follows the effective clip like hit-testing does: a clipped-away
+    // control neither highlights nor clicks.
+    const hovered = intersect(node.bounds, clip).contains(frame.pointer);
     const style = node.style;
+    // Group opacity accumulates down the tree: a 0.5 child inside a 0.5
+    // parent draws at 0.25. (True isolated group compositing would need an
+    // offscreen buffer; multiplied alpha is the documented approximation.)
+    const opacity = inherited_opacity * style.opacity;
 
     if (style.shadow) {
         // Two-layer shadow: wide faint halo + tight contact layer. Reads as
         // soft elevation instead of a hard offset slab.
         const outer = core.Rect{ .x = node.bounds.x - 6, .y = node.bounds.y + 4, .w = node.bounds.w + 12, .h = node.bounds.h + 12 };
-        quad(scene, outer, alpha(core.Color.rgba(0, 0, 0, 0.14), style.opacity), style.radius + 6, clip);
+        quad(scene, outer, alpha(core.Color.rgba(0, 0, 0, 0.14), opacity), style.radius + 6, clip);
         const inner = core.Rect{ .x = node.bounds.x - 2, .y = node.bounds.y + 2, .w = node.bounds.w + 4, .h = node.bounds.h + 4 };
-        quad(scene, inner, alpha(core.Color.rgba(0, 0, 0, 0.16), style.opacity), style.radius + 2, clip);
+        quad(scene, inner, alpha(core.Color.rgba(0, 0, 0, 0.16), opacity), style.radius + 2, clip);
     }
     if (style.blur > 0 and style.background != null) {
         // Fake blur as a soft falloff: concentric expanding layers, largest
@@ -109,7 +98,7 @@ fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_col
             const expand = spread * (1 - t);
             // Faintest on the outside, stronger toward the center so the
             // layers accumulate softly with no visible rim.
-            const layer_alpha = style.opacity * (0.013 + 0.013 * t);
+            const layer_alpha = opacity * (0.013 + 0.013 * t);
             const glow = core.Rect{
                 .x = node.bounds.x - expand,
                 .y = node.bounds.y - expand,
@@ -123,23 +112,28 @@ fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_col
     const background = if (hovered) style.hover_background orelse style.background else style.background;
     if (background) |from| {
         if (style.gradient_to) |to| {
-            gradientQuad(scene, node.bounds, alpha(from, style.opacity), alpha(to, style.opacity), style.radius, clip);
+            gradientQuad(scene, node.bounds, alpha(from, opacity), alpha(to, opacity), style.radius, clip);
         } else {
-            quad(scene, node.bounds, alpha(from, style.opacity), style.radius, clip);
+            quad(scene, node.bounds, alpha(from, opacity), style.radius, clip);
         }
     }
 
     if (style.border_width > 0) {
         const border = if (hovered) style.hover_border orelse style.border_color else style.border_color;
-        if (border) |border_color| paintBorder(scene, node.bounds, alpha(border_color, style.opacity), style.border_width, style.dashed_border, style.border_bottom_only, style.radius, clip);
+        if (border) |border_color| paintBorder(scene, node.bounds, alpha(border_color, opacity), style.border_width, style.dashed_border, style.border_bottom_only, style.radius, clip);
     }
 
-    const text_color = node.text_style.color orelse style.text_color orelse inherited_color;
+    const text_color = alpha(node.text_style.color orelse style.text_color orelse inherited_color, opacity);
     if (node.kind == .text) paintText(frame, scene, node, text_color, clip);
-    if (node.kind == .image) paintImage(frame, scene, node, clip);
+    if (node.kind == .image) paintImage(frame, scene, node, opacity, clip);
 
     if (node.listener != null or node.mouse_down_listener != null or node.double_click_listener != null or node.focus != null) {
-        frame.addRegion(.{ .bounds = node.bounds, .listener = node.listener, .mouse_down_listener = node.mouse_down_listener, .double_click_listener = node.double_click_listener, .focus = node.focus });
+        // Hit regions obey the same effective clip as paint: a clipped-away
+        // control cannot be clicked. Empty clips register nothing.
+        const hit = intersect(node.bounds, clip);
+        if (hit.w > 0 and hit.h > 0) {
+            _ = frame.addRegion(.{ .bounds = hit, .listener = node.listener, .mouse_down_listener = node.mouse_down_listener, .double_click_listener = node.double_click_listener, .focus = node.focus });
+        }
     }
 
     var child = node.first_child;
@@ -149,7 +143,7 @@ fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_col
     // looser incoming clip so they can bleed outward.
     const child_clip = intersect(clip, contentBox(node));
     while (child) |child_index| : (child = frame.nodes[child_index].next_sibling) {
-        paintNode(frame, child_index, scene, style.text_color orelse inherited_color, child_clip);
+        paintNode(frame, child_index, scene, style.text_color orelse inherited_color, opacity, child_clip);
     }
 }
 
@@ -178,20 +172,28 @@ fn paintBorder(scene: *gpu.Scene, bounds: core.Rect, color: core.Color, width: f
 }
 
 /// Resolve an image node to a cache handle and emit a blit. Drops the
-/// image (logs at the cache) when sources fail, the cache is full, or no
-/// cache/allocator is attached — same policy as quad overflow.
-fn paintImage(frame: *element.Frame, scene: *gpu.Scene, node: *const element.Node, clip: core.Rect) void {
+/// image (logs at the cache) when sources fail, the cache is full, the
+/// retained handle went stale, or no cache/allocator is attached — same
+/// policy as quad overflow.
+fn paintImage(frame: *element.Frame, scene: *gpu.Scene, node: *const element.Node, opacity: f32, clip: core.Rect) void {
     const desc = node.image;
     const bw = node.bounds.w;
     const bh = node.bounds.h;
     if (bw <= 0 or bh <= 0) return;
     const cache = frame.images orelse return;
-    const alloc = frame.allocator orelse return;
 
+    // Retained handles resolve without decoding or I/O, so they need no
+    // allocator; bytes/path sources do.
     const handle: images.Handle = switch (desc.source) {
-        .handle => |h| h,
-        .bytes => |bytes| resolveBytes(cache, alloc, bytes, desc, bw, bh, frame.frame_id) orelse return,
-        .path => |path| readPathBytes(cache, alloc, path, desc, bw, bh, frame.frame_id) orelse return,
+        .handle => |h| if (cache.validate(h, frame.frame_id)) h else return,
+        .bytes, .path => blk: {
+            const alloc = frame.allocator orelse return;
+            break :blk switch (desc.source) {
+                .bytes => |bytes| resolveBytes(cache, alloc, bytes, desc, bw, bh, frame.frame_id) orelse return,
+                .path => |path| readPathBytes(cache, alloc, path, desc, bw, bh, frame.frame_id) orelse return,
+                .handle => unreachable,
+            };
+        },
     };
 
     if (handle.w == 0 or handle.h == 0) return;
@@ -226,7 +228,7 @@ fn paintImage(frame: *element.Frame, scene: *gpu.Scene, node: *const element.Nod
     }
 
     var tint = desc.tint orelse core.Color.white;
-    tint.a *= node.style.opacity;
+    tint.a *= opacity;
     _ = scene.pushImage(.{
         .x = dx,
         .y = dy,
@@ -529,14 +531,21 @@ test "lowercase glyphs differ from uppercase" {
 
 test "gradient background emits a single quad" {
     const t = @import("std").testing;
-    var frame = element.Frame{};
+    // Heap-allocated: Frame+Scene on the stack (~8.6MB) forces deep stack
+    // growth that collides with heap mmaps depending on order/ASLR (flaky
+    // segfault); see the budget test below.
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
     frame.reset(@ptrFromInt(1), .{});
-    element.beginFrame(&frame);
+    element.beginFrame(frame);
     defer element.endFrame();
     const root = element.div().w(100).h(20).bg_gradient(core.Color.hex(0x7c5cff), core.Color.hex(0x46d5e8));
-    @import("layout.zig").layout(&frame, root, .{ .w = 100, .h = 20 });
-    var scene = gpu.Scene{};
-    paint(&frame, root, &scene);
+    @import("layout.zig").layout(frame, root, .{ .w = 100, .h = 20 });
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
     try t.expectEqual(@as(usize, 1), scene.slice().len);
     try t.expect(scene.slice()[0].gradient_to != null);
     try t.expectEqual(@as(f32, 100), scene.slice()[0].w);
@@ -544,32 +553,54 @@ test "gradient background emits a single quad" {
 
 test "overflowing text clips to parent content box" {
     const t = @import("std").testing;
-    var frame = element.Frame{};
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
     frame.reset(@ptrFromInt(1), .{});
-    element.beginFrame(&frame);
+    element.beginFrame(frame);
     defer element.endFrame();
     const root = element.div().w(60).h(30).bg(core.Color.hex(0x1e1f2a))
         .child(element.text("aaaaaaaaaaaaaaaaaaaa", .{ .size = 14 }));
-    @import("layout.zig").layout(&frame, root, .{ .w = 200, .h = 100 });
-    var scene = gpu.Scene{};
-    paint(&frame, root, &scene);
+    @import("layout.zig").layout(frame, root, .{ .w = 200, .h = 100 });
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
     try t.expect(scene.slice().len > 1); // bg + (clipped) glyph pixels
-    for (scene.slice()) |q| {
-        try t.expect(q.x >= -0.01);
-        try t.expect(q.x + q.w <= 60.01);
+    // Scene geometry is logical (uncut); the clip binds at rasterization.
+    // Render and assert no painted pixel escapes the 60px field.
+    var buf: [200 * 100 * 4]u8 = undefined;
+    const target = gpu.software.Target.init(&buf, 200, 100, .rgba32);
+    target.clear(core.Color.hex(0x000000));
+    target.renderScene(scene, &.{}, &.{});
+    var y: usize = 0;
+    while (y < 100) : (y += 1) {
+        var x: usize = 60;
+        while (x < 200) : (x += 1) {
+            const off = (y * 200 + x) * 4;
+            try t.expectEqual(@as(u8, 0), buf[off]);
+            try t.expectEqual(@as(u8, 0), buf[off + 1]);
+            try t.expectEqual(@as(u8, 0), buf[off + 2]);
+        }
     }
+    // ...while the field itself did paint.
+    try t.expect(buf[(15 * 200 + 30) * 4 + 2] > 0 or buf[(15 * 200 + 30) * 4] > 0);
 }
 
 test "blurred background emits soft falloff layers" {
     const t = @import("std").testing;
-    var frame = element.Frame{};
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
     frame.reset(@ptrFromInt(1), .{});
-    element.beginFrame(&frame);
+    element.beginFrame(frame);
     defer element.endFrame();
     const root = element.div().w(50).h(50).bg(core.Color.hex(0x7c5cff)).blur(60);
-    @import("layout.zig").layout(&frame, root, .{ .w = 50, .h = 50 });
-    var scene = gpu.Scene{};
-    paint(&frame, root, &scene);
+    @import("layout.zig").layout(frame, root, .{ .w = 50, .h = 50 });
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
     // 8 glow layers + 1 background (was a single hard disc before).
     try t.expectEqual(@as(usize, 9), scene.slice().len);
     // Outermost layer is the largest and faintest.
@@ -578,18 +609,20 @@ test "blurred background emits soft falloff layers" {
 }
 
 test "hot frame structs stay within stack budget" {
-    // Regression for a flaky segfault: in Debug the font tests stacked
-    // Frame (~2.5MB) + Scene (~4.8MB) in an ~8MB test frame, then called
-    // Collection.init(), whose own frame is ~8.7MB — 16.7MB total on a
-    // 16MB thread stack. Frame+Scene stay stackable with room for call
-    // frames, but nothing else big may join them: Collection.init() must
-    // be called with Frame/Scene on the heap (as the font tests below do).
+    // Regression for flaky segfaults: in Debug, Frame (~2.5MB) + Scene
+    // (~5.9MB, quads carry their clip) stack to ~8.6MB frames, and
+    // Collection.init() needs ~8.7MB of its own. Deep stack growth into
+    // heap-mmap territory segfaults depending on order/ASLR — never on a
+    // fixed threshold, so the rule is structural, not numeric: heap-allocate
+    // whenever a function holds more than one of Frame/Scene/Collection (or
+    // calls Collection.init beneath them). Production keeps all three on
+    // the heap (Window, App); tests use the allocator (see the font tests).
     // Structural fix (pools behind init/deinit) is plan M10; until then
-    // this pins the budget so growth fails loudly instead of segfaulting.
+    // these pins fail loudly on growth instead of segfaulting rarely.
     const t = @import("std").testing;
     try t.expect(@sizeOf(element.Frame) < 4 * 1024 * 1024);
-    try t.expect(@sizeOf(gpu.Scene) < 6 * 1024 * 1024);
-    try t.expect(@sizeOf(element.Frame) + @sizeOf(gpu.Scene) < 8 * 1024 * 1024);
+    try t.expect(@sizeOf(gpu.Scene) < 7 * 1024 * 1024);
+    try t.expect(@sizeOf(element.Frame) + @sizeOf(gpu.Scene) < 9 * 1024 * 1024);
 }
 
 test "shaped text emits atlas glyphs, not bitmap quads" {
@@ -598,12 +631,12 @@ test "shaped text emits atlas glyphs, not bitmap quads" {
     // Heap-allocated: Collection.init() needs ~8.7MB of Debug frame (see
     // the budget test above), so Frame/Scene must not sit on the stack
     // beneath the call. Production code keeps them in the heap Window.
-    var stack = try t.allocator.create(fonts.Collection);
+    const stack = try t.allocator.create(fonts.Collection);
     defer t.allocator.destroy(stack);
     stack.* = try fonts.Collection.init();
     defer stack.deinit();
 
-    var frame = try t.allocator.create(element.Frame);
+    const frame = try t.allocator.create(element.Frame);
     defer t.allocator.destroy(frame);
     frame.* = .{};
     frame.reset(@ptrFromInt(1), .{});
@@ -612,7 +645,7 @@ test "shaped text emits atlas glyphs, not bitmap quads" {
     defer element.endFrame();
     const root = element.text("Hi", .{ .size = 16 });
     @import("layout.zig").layout(frame, root, .{ .w = 500, .h = 100 });
-    var scene = try t.allocator.create(gpu.Scene);
+    const scene = try t.allocator.create(gpu.Scene);
     defer t.allocator.destroy(scene);
     scene.* = .{};
     paint(frame, root, scene);
@@ -633,13 +666,13 @@ test "tofu codepoint substitutes the symbol face" {
     const t = @import("std").testing;
     if (!fonts.tables.FontconfigApi.isAvailable() or !fonts.tables.FreeTypeApi.isAvailable() or !fonts.tables.HarfBuzzApi.isAvailable()) return;
     // Heap-allocated: see "shaped text emits atlas glyphs" above.
-    var stack = try t.allocator.create(fonts.Collection);
+    const stack = try t.allocator.create(fonts.Collection);
     defer t.allocator.destroy(stack);
     stack.* = try fonts.Collection.init();
     defer stack.deinit();
     if (stack.symbols == null) return;
 
-    var frame = try t.allocator.create(element.Frame);
+    const frame = try t.allocator.create(element.Frame);
     defer t.allocator.destroy(frame);
     frame.* = .{};
     frame.reset(@ptrFromInt(1), .{});
@@ -648,7 +681,7 @@ test "tofu codepoint substitutes the symbol face" {
     defer element.endFrame();
     const root = element.text("✓", .{ .size = 16 });
     @import("layout.zig").layout(frame, root, .{ .w = 500, .h = 100 });
-    var scene = try t.allocator.create(gpu.Scene);
+    const scene = try t.allocator.create(gpu.Scene);
     defer t.allocator.destroy(scene);
     scene.* = .{};
     paint(frame, root, scene);
@@ -671,22 +704,26 @@ test "rounded border ring leaves no notches" {
     // showed background-colored corner notches because borders drew as
     // square strips past the rounded background.
     const t = @import("std").testing;
-    var frame = element.Frame{};
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
     frame.reset(@ptrFromInt(1), .{});
-    element.beginFrame(&frame);
+    element.beginFrame(frame);
     defer element.endFrame();
     const green = core.Color.hex(0x3DDC84);
     const root = element.div().size(24).rounded_full().bg(green).border_2().border_color(green);
-    @import("layout.zig").layout(&frame, root, .{ .w = 100, .h = 100 });
-    var scene = gpu.Scene{};
-    paint(&frame, root, &scene);
+    @import("layout.zig").layout(frame, root, .{ .w = 100, .h = 100 });
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
     // One fill + one ring (was 1 fill + 4 strips).
     try t.expectEqual(@as(usize, 2), scene.slice().len);
 
     var buf: [24 * 24 * 4]u8 = undefined;
     const target = gpu.software.Target.init(&buf, 24, 24, .rgba32);
     target.clear(core.Color.hex(0x000000));
-    target.renderScene(&scene, &.{}, &.{});
+    target.renderScene(scene, &.{}, &.{});
     const at = struct {
         fn pixel(pixels: []u8, x: usize, y: usize) u8 {
             return pixels[(y * 24 + x) * 4 + 1]; // green channel
@@ -725,15 +762,19 @@ test "img element measures intrinsic size and paints one blit" {
     const t = @import("std").testing;
     var cache = try images.Cache.init(t.allocator);
     defer cache.deinit(t.allocator);
-    var frame = element.Frame{};
-    testImageFrame(&frame, cache);
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    testImageFrame(frame, cache);
     defer element.endFrame();
     const root = element.img(test_png);
-    @import("layout.zig").layout(&frame, root, .{ .w = 100, .h = 100 });
+    @import("layout.zig").layout(frame, root, .{ .w = 100, .h = 100 });
     try t.expectEqual(@as(f32, 4), frame.nodes[root.index].measured.w);
     try t.expectEqual(@as(f32, 2), frame.nodes[root.index].measured.h);
-    var scene = gpu.Scene{};
-    paint(&frame, root, &scene);
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
     try t.expectEqual(@as(usize, 1), scene.imageSlice().len);
     const b = scene.imageSlice()[0];
     try t.expectEqual(@as(u32, 4), b.src_w);
@@ -749,7 +790,7 @@ test "img element measures intrinsic size and paints one blit" {
     var buf: [100 * 100 * 4]u8 = undefined;
     const target = gpu.software.Target.init(&buf, 100, 100, .rgba32);
     target.clear(core.Color.hex(0x000000));
-    target.renderScene(&scene, &.{}, cache.pool[0..cache.used]);
+    target.renderScene(scene, &.{}, cache.pool[0..cache.used]);
     try t.expectEqual(@as(u8, 255), buf[(25 * 100 + 0) * 4]);
     try t.expectEqual(@as(u8, 255), buf[(74 * 100 + 0) * 4 + 2]);
 }
@@ -760,23 +801,29 @@ test "img aspect derives the missing axis and cover crops" {
     defer cache.deinit(t.allocator);
     // 4x2 source at h=10 derives w=20.
     {
-        var frame = element.Frame{};
-        testImageFrame(&frame, cache);
+        const frame = try t.allocator.create(element.Frame);
+        defer t.allocator.destroy(frame);
+        frame.* = .{};
+        testImageFrame(frame, cache);
         defer element.endFrame();
         const root = element.img(test_png).h(10);
-        @import("layout.zig").layout(&frame, root, .{ .w = 100, .h = 100 });
+        @import("layout.zig").layout(frame, root, .{ .w = 100, .h = 100 });
         try t.expectEqual(@as(f32, 20), frame.nodes[root.index].measured.w);
         try t.expectEqual(@as(f32, 10), frame.nodes[root.index].measured.h);
     }
 
     // Cover in a square box: full dest, centered horizontal crop.
-    var frame2 = element.Frame{};
-    testImageFrame(&frame2, cache);
+    const frame2 = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame2);
+    frame2.* = .{};
+    testImageFrame(frame2, cache);
     defer element.endFrame();
     const cover = element.img(test_png).w(10).h(10).object_fit(.cover);
-    @import("layout.zig").layout(&frame2, cover, .{ .w = 100, .h = 100 });
-    var scene = gpu.Scene{};
-    paint(&frame2, cover, &scene);
+    @import("layout.zig").layout(frame2, cover, .{ .w = 100, .h = 100 });
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame2, cover, scene);
     try t.expectEqual(@as(usize, 1), scene.imageSlice().len);
     const b = scene.imageSlice()[0];
     try t.expectEqual(@as(f32, 10), b.w);
@@ -793,13 +840,17 @@ test "svg icon paints tinted blit, drops without cache" {
     var cache = try images.Cache.init(t.allocator);
     defer cache.deinit(t.allocator);
     {
-        var frame = element.Frame{};
-        testImageFrame(&frame, cache);
+        const frame = try t.allocator.create(element.Frame);
+        defer t.allocator.destroy(frame);
+        frame.* = .{};
+        testImageFrame(frame, cache);
         defer element.endFrame();
         const root = element.svg(test_icon).w(24).h(24).tint(core.Color.hex(0xFFFFFF));
-        @import("layout.zig").layout(&frame, root, .{ .w = 100, .h = 100 });
-        var scene = gpu.Scene{};
-        paint(&frame, root, &scene);
+        @import("layout.zig").layout(frame, root, .{ .w = 100, .h = 100 });
+        const scene = try t.allocator.create(gpu.Scene);
+        defer t.allocator.destroy(scene);
+        scene.* = .{};
+        paint(frame, root, scene);
         try t.expectEqual(@as(usize, 1), scene.imageSlice().len);
         const b = scene.imageSlice()[0];
         try t.expectEqual(@as(u32, 24), b.src_w);
@@ -816,13 +867,131 @@ test "svg icon paints tinted blit, drops without cache" {
     }
 
     // No cache attached: drops silently, never crashes.
-    var bare = element.Frame{};
+    var bare = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(bare);
+    bare.* = .{};
     bare.reset(@ptrFromInt(1), .{});
-    element.beginFrame(&bare);
+    element.beginFrame(bare);
     defer element.endFrame();
     const root2 = element.svg(test_icon).w(24).h(24);
-    @import("layout.zig").layout(&bare, root2, .{ .w = 100, .h = 100 });
-    var scene2 = gpu.Scene{};
-    paint(&bare, root2, &scene2);
+    @import("layout.zig").layout(bare, root2, .{ .w = 100, .h = 100 });
+    const scene2 = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene2);
+    scene2.* = .{};
+    paint(bare, root2, scene2);
     try t.expectEqual(@as(usize, 0), scene2.imageSlice().len);
+}
+
+test "nested opacity multiplies down the tree" {
+    // 0.5 parent x 0.5 child = 0.25 effective. Over black, white lands at
+    // ~64. (The old painter applied only the node's own opacity, so the
+    // child drew at 0.5; text ignored opacity entirely.)
+    const t = @import("std").testing;
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const root = element.div().w(10).h(10).opacity(0.5)
+        .child(element.div().w(10).h(10).bg(core.Color.hex(0xFFFFFF)).opacity(0.5));
+    @import("layout.zig").layout(frame, root, .{ .w = 10, .h = 10 });
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
+    var buf: [10 * 10 * 4]u8 = undefined;
+    const target = gpu.software.Target.init(&buf, 10, 10, .rgba32);
+    target.clear(core.Color.hex(0x000000));
+    target.renderScene(scene, &.{}, &.{});
+    const v = buf[(5 * 10 + 5) * 4];
+    try t.expect(v > 55 and v < 75);
+}
+
+test "imgHandle validates generations, drops stale" {
+    const t = @import("std").testing;
+    var cache = try images.Cache.init(t.allocator);
+    defer cache.deinit(t.allocator);
+    // Valid handle resolved through the real decode path paints one blit.
+    const h = try cache.imageFromBytes(t.allocator, test_png, 1);
+    {
+        const frame = try t.allocator.create(element.Frame);
+        defer t.allocator.destroy(frame);
+        frame.* = .{};
+        frame.images = cache;
+        frame.frame_id = 1;
+        element.beginFrame(frame);
+        defer element.endFrame();
+        const root = element.imgHandle(h).w(2).h(2);
+        @import("layout.zig").layout(frame, root, .{ .w = 100, .h = 100 });
+        const scene = try t.allocator.create(gpu.Scene);
+        defer t.allocator.destroy(scene);
+        scene.* = .{};
+        paint(frame, root, scene);
+        try t.expectEqual(@as(usize, 1), scene.imageSlice().len);
+    }
+    // Next frame the pool resets around the retained handle (stale pin, no
+    // current-frame pins): the same element now paints nothing instead of
+    // another image's recycled bytes. The reset is forced by rasterizing
+    // the icon at 1024x2048 (exactly the pool size) on frame 2.
+    _ = try cache.svgFromBytes(t.allocator, test_icon, 1024, 2048, null, 2);
+    {
+        const frame = try t.allocator.create(element.Frame);
+        defer t.allocator.destroy(frame);
+        frame.* = .{};
+        frame.images = cache;
+        frame.frame_id = 2;
+        element.beginFrame(frame);
+        defer element.endFrame();
+        const root = element.imgHandle(h).w(2).h(2);
+        @import("layout.zig").layout(frame, root, .{ .w = 100, .h = 100 });
+        const scene = try t.allocator.create(gpu.Scene);
+        defer t.allocator.destroy(scene);
+        scene.* = .{};
+        paint(frame, root, scene);
+        try t.expectEqual(@as(usize, 0), scene.imageSlice().len);
+    }
+}
+
+test "hit regions obey the painter clip" {
+    // A 20x20 button overflowing a 20x20 field at (15,15): paint clips the
+    // region to the visible 5x5, so clicks outside cannot hit it.
+    const t = @import("std").testing;
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const L = struct {
+        fn noop(_: *anyopaque, _: *const element.ListenerPayload, _: *anyopaque) void {}
+    }.noop;
+    const root = element.div().w(20).h(20)
+        .child(element.div().w(20).h(20).absolute().left(15).top(15).on_click(.{ .target = frame, .call_fn = L }));
+    @import("layout.zig").layout(frame, root, .{ .w = 100, .h = 100 });
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
+    try t.expectEqual(@as(usize, 1), frame.region_count);
+    const r = frame.regions[0].bounds;
+    try t.expectEqual(@as(f32, 15), r.x);
+    try t.expectEqual(@as(f32, 15), r.y);
+    try t.expectEqual(@as(f32, 5), r.w);
+    try t.expectEqual(@as(f32, 5), r.h);
+    try t.expect(!r.contains(.{ .x = 25, .y = 16 }));
+    try t.expect(r.contains(.{ .x = 16, .y = 16 }));
+}
+
+test "region overflow counts instead of silently dropping clicks" {
+    const t = @import("std").testing;
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    var i: usize = 0;
+    while (i < element.max_regions + 10) : (i += 1) {
+        _ = frame.addRegion(.{ .bounds = .{ .x = 0, .y = 0, .w = 1, .h = 1 } });
+    }
+    try t.expectEqual(@as(usize, element.max_regions), frame.region_count);
+    try t.expectEqual(@as(u64, 10), frame.dropped_regions);
 }

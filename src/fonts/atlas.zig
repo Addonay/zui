@@ -1,11 +1,14 @@
 //! Glyph atlas: fixed-capacity cache from rasterized glyphs (frame path).
 //!
 //! Keys are `(face_id, glyph_id, pixel_size)`. Coverage bytes live in one
-//! bump-allocated pool; when either the entry table or the pool fills, the
-//! whole atlas is evicted at once (documented, O(1), fragmentation-free).
-//! Full-clear is the right v0 policy: UI text re-rasterizes the working set
-//! within a frame or two, and LRU bookkeeping would cost more than it saves
-//! at 1024 entries. Counters expose hits/misses/evictions for tuning.
+//! bump-allocated pool. Exhaustion clears immediately only when the atlas
+//! holds no entries; otherwise the eviction defers to the next beginFrame
+//! (one paint per window, after the previous frame presented) and the
+//! overflowing put reports AtlasFull — already-emitted glyphs keep valid
+//! pool bytes, so a frame can never corrupt its own text. Full-clear is the
+//! right v0 policy: UI text re-rasterizes the working set within a frame or
+//! two, and LRU bookkeeping would cost more than it saves at 1024 entries.
+//! Counters expose hits/misses/evictions/drops for tuning.
 //!
 //! Copying honors FreeType pitch sign (bottom-up bitmaps) and 1-bit sources
 //! via `face.expandMonoRow`. All methods are heap-free.
@@ -45,10 +48,18 @@ pub const Atlas = struct {
     hits: u64 = 0,
     misses: u64 = 0,
     evictions: u64 = 0,
+    /// Overflow deferred past emitted glyphs; cleared at beginFrame, which
+    /// runs once per window paint — after the previous window presented, so
+    /// no live frame references the old bytes. Counts as an eviction then.
+    pending_eviction: bool = false,
+    /// Glyphs skipped by AtlasFull this frame (pen still advanced, so text
+    /// keeps its shape and heals next frame). Observable, not silent.
+    overflow_drops: u64 = 0,
 
     pub fn clear(self: *Atlas) void {
         self.entry_count = 0;
         self.pixels_used = 0;
+        self.pending_eviction = false;
     }
 
     pub fn get(self: *Atlas, key: AtlasKey) ?*const AtlasEntry {
@@ -67,17 +78,29 @@ pub const Atlas = struct {
         return self.pixels[entry.offset..][0..bytes];
     }
 
-    /// Insert a rasterized glyph, evicting everything if it does not fit.
-    /// Returns the cached entry. A single glyph larger than the whole pool
+    /// Insert a rasterized glyph. A single glyph larger than the whole pool
     /// is rejected with `error.GlyphTooLarge` instead of thrashing.
+    /// Exhaustion clears immediately ONLY when the atlas holds no entries
+    /// (nothing can reference the pool); otherwise it defers the eviction
+    /// to the next beginFrame and returns `error.AtlasFull` WITHOUT
+    /// clearing — already-emitted glyphs keep valid pool bytes, the caller
+    /// skips this glyph (pen advances, shape preserved), and the frame heals
+    /// next frame. A permanently oversized working set degrades to holes +
+    /// a growing overflow_drops counter instead of corruption.
     /// `embolden` applies a 1px synthetic-bold dilation for semibold/bold
     /// weights (ink only; advances stay shaped so measure still matches).
     pub fn put(self: *Atlas, key: AtlasKey, raster: *const face_mod.Raster, embolden: bool) !*const AtlasEntry {
         const bytes = @as(usize, raster.width) * raster.height;
         if (bytes > limits.MAX_ATLAS_PIXELS) return error.GlyphTooLarge;
         if (self.entry_count >= limits.MAX_ATLAS_GLYPHS or self.pixels_used + bytes > limits.MAX_ATLAS_PIXELS) {
-            self.clear();
-            self.evictions += 1;
+            if (self.entry_count == 0) {
+                self.clear();
+                self.evictions += 1;
+            } else {
+                self.pending_eviction = true;
+                self.overflow_drops += 1;
+                return error.AtlasFull;
+            }
         }
         const offset = self.pixels_used;
         if (bytes > 0) {
@@ -104,6 +127,18 @@ pub const Atlas = struct {
         };
         self.entry_count += 1;
         return slot;
+    }
+
+    /// Frame boundary. Call once per window paint before any put: applies a
+    /// deferred eviction (safe — the previous frame already presented).
+    /// Idempotent and cheap.
+    pub fn beginFrame(self: *Atlas) void {
+        if (self.pending_eviction) {
+            self.entry_count = 0;
+            self.pixels_used = 0;
+            self.pending_eviction = false;
+            self.evictions += 1;
+        }
     }
 };
 
@@ -172,7 +207,7 @@ test "atlas put/get/coverage round-trip" {
     try t.expectEqual(@as(u64, 0), atlas.evictions);
 }
 
-test "atlas evicts everything when full" {
+test "atlas defers eviction past emitted entries" {
     const t = std.testing;
     var atlas = Atlas{};
     // Fill the entry table with empty glyphs (no pixel cost).
@@ -191,11 +226,67 @@ test "atlas evicts everything when full" {
         _ = try atlas.put(.{ .face_id = 1, .glyph_id = i, .size_px = 16 }, &blank, false);
     }
     try t.expectEqual(@as(usize, limits.MAX_ATLAS_GLYPHS), atlas.entry_count);
-    // One more entry triggers a full clear.
-    _ = try atlas.put(.{ .face_id = 1, .glyph_id = 99999, .size_px = 16 }, &blank, false);
+    // Table full with live entries: report AtlasFull, change nothing.
+    try t.expectError(error.AtlasFull, atlas.put(.{ .face_id = 1, .glyph_id = 99999, .size_px = 16 }, &blank, false));
+    try t.expectEqual(@as(usize, limits.MAX_ATLAS_GLYPHS), atlas.entry_count);
+    try t.expect(atlas.get(.{ .face_id = 1, .glyph_id = 0, .size_px = 16 }) != null);
+    try t.expectEqual(@as(u64, 0), atlas.evictions);
+    try t.expectEqual(@as(u64, 1), atlas.overflow_drops);
+    try t.expect(atlas.pending_eviction);
+    // Next frame boundary applies the eviction; the table accepts again.
+    atlas.beginFrame();
     try t.expectEqual(@as(u64, 1), atlas.evictions);
+    try t.expect(!atlas.pending_eviction);
+    _ = try atlas.put(.{ .face_id = 1, .glyph_id = 99999, .size_px = 16 }, &blank, false);
     try t.expectEqual(@as(usize, 1), atlas.entry_count);
-    try t.expect(atlas.get(.{ .face_id = 1, .glyph_id = 0, .size_px = 16 }) == null);
+    // beginFrame without pending eviction is a no-op.
+    atlas.beginFrame();
+    try t.expectEqual(@as(u64, 1), atlas.evictions);
+}
+
+test "atlas overflow keeps earlier pool bytes valid" {
+    // M2 gate: a frame exceeding capacity must not corrupt glyphs it
+    // already emitted. Two ~600KB puts overflow the 1MB pool; the second
+    // reports AtlasFull and the first entry's bytes stay intact.
+    const t = std.testing;
+    var atlas = Atlas{};
+    const big_bytes = 600 * 1024;
+    const px_a = try t.allocator.alloc(u8, big_bytes);
+    defer t.allocator.free(px_a);
+    @memset(px_a, 0xA5);
+    const raster_a = face_mod.Raster{
+        .width = 600,
+        .height = 1024,
+        .pitch = 600,
+        .bearing_x = 0,
+        .bearing_y = 0,
+        .advance_px = 600,
+        .kind = .gray,
+        .pixels = px_a.ptr,
+    };
+    const entry_a = try atlas.put(.{ .face_id = 1, .glyph_id = 1, .size_px = 16 }, &raster_a, false);
+    const offset_a = entry_a.offset;
+    const px_b = try t.allocator.alloc(u8, big_bytes);
+    defer t.allocator.free(px_b);
+    @memset(px_b, 0x5A);
+    const raster_b = face_mod.Raster{
+        .width = 600,
+        .height = 1024,
+        .pitch = 600,
+        .bearing_x = 0,
+        .bearing_y = 0,
+        .advance_px = 600,
+        .kind = .gray,
+        .pixels = px_b.ptr,
+    };
+    try t.expectError(error.AtlasFull, atlas.put(.{ .face_id = 1, .glyph_id = 2, .size_px = 16 }, &raster_b, false));
+    // Earlier entry still resolves with untouched bytes.
+    const hit = atlas.get(.{ .face_id = 1, .glyph_id = 1, .size_px = 16 }).?;
+    try t.expectEqual(offset_a, hit.offset);
+    for (atlas.coverage(hit)) |v| try t.expectEqual(@as(u8, 0xA5), v);
+    // Next frame heals: clear applies, the big glyph fits again.
+    atlas.beginFrame();
+    _ = try atlas.put(.{ .face_id = 1, .glyph_id = 2, .size_px = 16 }, &raster_b, false);
 }
 
 test "copyBitmap honors negative pitch" {

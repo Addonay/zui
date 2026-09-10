@@ -54,10 +54,17 @@ pub const Target = struct {
     pub fn drawQuad(self: Target, q: Quad) void {
         if (q.w <= 0 or q.h <= 0 or q.color.a <= 0) return;
 
-        const x0: i32 = @intFromFloat(@max(0.0, q.x));
-        const y0: i32 = @intFromFloat(@max(0.0, q.y));
-        const x1: i32 = @intFromFloat(@min(@as(f32, @floatFromInt(self.width)), q.x + q.w));
-        const y1: i32 = @intFromFloat(@min(@as(f32, @floatFromInt(self.height)), q.y + q.h));
+        // Optional painter clip, tested per pixel so a partial clip keeps
+        // the corner radius (geometry arrives uncut; see Quad.clip).
+        const cx0: f32, const cy0: f32, const cx1: f32, const cy1: f32 = if (q.clip) |c|
+            .{ c.x, c.y, c.x + c.w, c.y + c.h }
+        else
+            .{ -1e9, -1e9, 1e9, 1e9 };
+
+        const x0: i32 = @intFromFloat(@max(0.0, @max(q.x, cx0)));
+        const y0: i32 = @intFromFloat(@max(0.0, @max(q.y, cy0)));
+        const x1: i32 = @intFromFloat(@min(@as(f32, @floatFromInt(self.width)), @min(q.x + q.w, cx1)));
+        const y1: i32 = @intFromFloat(@min(@as(f32, @floatFromInt(self.height)), @min(q.y + q.h, cy1)));
 
         if (x0 >= x1 or y0 >= y1) return;
 
@@ -248,14 +255,15 @@ pub const Target = struct {
     }
 
     pub fn renderScene(self: Target, scene: *const Scene, glyph_pixels: []const u8, image_pixels: []const u8) void {
-        for (scene.slice()) |q| {
-            self.drawQuad(q);
-        }
-        for (scene.glyphSlice()) |g| {
-            self.drawGlyph(g, glyph_pixels);
-        }
-        for (scene.imageSlice()) |b| {
-            self.drawImage(b, image_pixels);
+        // Paint order: a later command of ANY kind covers earlier ones.
+        // (The old code drew all quads, then glyphs, then images, so a
+        // later panel could never cover earlier text.)
+        for (scene.commandSlice()) |cmd| {
+            switch (cmd.kind) {
+                .quad => self.drawQuad(scene.slice()[cmd.index]),
+                .glyph => self.drawGlyph(scene.glyphSlice()[cmd.index], glyph_pixels),
+                .blit => self.drawImage(scene.imageSlice()[cmd.index], image_pixels),
+            }
         }
     }
 
@@ -713,4 +721,93 @@ test "software image blit samples, crops, tints, and grays" {
         .src_h = 2,
         .clip = full_clip,
     }, &src);
+}
+
+test "software renderScene honors paint order across kinds" {
+    // Glyph (white 1px) then image (blue 1px) then quad (red cover):
+    // each later command must cover the earlier ones regardless of kind.
+    // The old renderer drew all quads, then glyphs, then images, so the
+    // white glyph always won over the red panel.
+    const coverage = [_]u8{255};
+    const pool = [_]u8{ 0, 0, 255, 255 };
+    const clip = core.Rect{ .x = 0, .y = 0, .w = 4, .h = 4 };
+
+    var scene = Scene{};
+    try std.testing.expect(scene.pushGlyph(.{
+        .x = 1,
+        .y = 1,
+        .w = 1,
+        .h = 1,
+        .color = Color.hex(0xFFFFFF),
+        .atlas_offset = 0,
+        .clip = clip,
+    }));
+    try std.testing.expect(scene.pushImage(.{
+        .x = 1,
+        .y = 1,
+        .w = 1,
+        .h = 1,
+        .pool_offset = 0,
+        .src_w = 1,
+        .src_h = 1,
+        .clip = clip,
+    }));
+    try std.testing.expect(scene.push(.{ .x = 0, .y = 0, .w = 4, .h = 4, .color = Color.hex(0xFF0000) }));
+
+    var buf: [4 * 4 * 4]u8 = undefined;
+    const target = Target.init(&buf, 4, 4, .rgba32);
+    target.clear(Color.hex(0x000000));
+    target.renderScene(&scene, &coverage, &pool);
+    // (1,1) is red: the last command (quad) covered glyph and image.
+    try std.testing.expectEqual(@as(u8, 255), buf[(1 * 4 + 1) * 4]);
+    try std.testing.expectEqual(@as(u8, 0), buf[(1 * 4 + 1) * 4 + 2]);
+
+    // Without the covering quad the image (later than the glyph) wins.
+    var scene2 = Scene{};
+    try std.testing.expect(scene2.pushGlyph(.{
+        .x = 1,
+        .y = 1,
+        .w = 1,
+        .h = 1,
+        .color = Color.hex(0xFFFFFF),
+        .atlas_offset = 0,
+        .clip = clip,
+    }));
+    try std.testing.expect(scene2.pushImage(.{
+        .x = 1,
+        .y = 1,
+        .w = 1,
+        .h = 1,
+        .pool_offset = 0,
+        .src_w = 1,
+        .src_h = 1,
+        .clip = clip,
+    }));
+    target.clear(Color.hex(0x000000));
+    target.renderScene(&scene2, &coverage, &pool);
+    try std.testing.expectEqual(@as(u8, 255), buf[(1 * 4 + 1) * 4 + 2]); // blue
+}
+
+test "software partial clip keeps quad corner radius" {
+    // 10x10 radius-4 quad clipped to its left 6px: the old pre-cut push
+    // zeroed the radius, squaring the corner. Geometry now arrives uncut
+    // with a clip, so the corner curve survives the partial clip.
+    var buf: [10 * 10 * 4]u8 = undefined;
+    const target = Target.init(&buf, 10, 10, .rgba32);
+    target.clear(Color.hex(0x000000));
+    target.drawQuad(.{
+        .x = 0,
+        .y = 0,
+        .w = 10,
+        .h = 10,
+        .radius = 4,
+        .color = Color.hex(0xFFFFFF),
+        .clip = .{ .x = 0, .y = 0, .w = 6, .h = 10 },
+    });
+    // Corner (0,0) stays empty (curve kept), top edge mid-clip paints,
+    // and pixels past the clip stay empty.
+    try std.testing.expectEqual(@as(u8, 0), buf[0]);
+    try std.testing.expectEqual(@as(u8, 255), buf[(0 * 10 + 5) * 4]);
+    try std.testing.expectEqual(@as(u8, 0), buf[(5 * 10 + 7) * 4]);
+    try std.testing.expectEqual(@as(u8, 255), buf[(5 * 10 + 2) * 4]);
 }

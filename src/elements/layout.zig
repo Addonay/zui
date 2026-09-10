@@ -241,7 +241,7 @@ test "shaped measure matches collection measure" {
     // Heap-allocated: Collection.init() needs ~8.7MB of Debug frame (see
     // the "hot frame structs stay within stack budget" test in
     // painter.zig); keep the test frame small.
-    var stack = try t.allocator.create(fonts.Collection);
+    const stack = try t.allocator.create(fonts.Collection);
     defer t.allocator.destroy(stack);
     stack.* = try fonts.Collection.init();
     defer stack.deinit();

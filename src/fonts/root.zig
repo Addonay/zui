@@ -220,7 +220,7 @@ test "end to end: shape, rasterize, cache, measure" {
     // Heap-allocated: Collection.init() needs ~8.7MB of Debug frame (see
     // the "hot frame structs stay within stack budget" test in
     // elements/painter.zig); keep test frames small.
-    var stack = try t.allocator.create(Collection);
+    const stack = try t.allocator.create(Collection);
     defer t.allocator.destroy(stack);
     stack.* = try Collection.init();
     defer stack.deinit();
@@ -271,7 +271,7 @@ test "measureText matches shaped advances plus tracking" {
     if (!tables.FontconfigApi.isAvailable() or !tables.FreeTypeApi.isAvailable() or !tables.HarfBuzzApi.isAvailable()) return;
 
     // Heap-allocated: see "end to end" above.
-    var stack = try t.allocator.create(Collection);
+    const stack = try t.allocator.create(Collection);
     defer t.allocator.destroy(stack);
     stack.* = try Collection.init();
     defer stack.deinit();
@@ -302,7 +302,7 @@ test "symbol fallback covers the ui symbol set" {
     if (!tables.FontconfigApi.isAvailable() or !tables.FreeTypeApi.isAvailable() or !tables.HarfBuzzApi.isAvailable()) return;
 
     // Heap-allocated: see "end to end" above.
-    var stack = try t.allocator.create(Collection);
+    const stack = try t.allocator.create(Collection);
     defer t.allocator.destroy(stack);
     stack.* = try Collection.init();
     defer stack.deinit();

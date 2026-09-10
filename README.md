@@ -58,7 +58,7 @@ Roadmap: `plan.md` (milestones M0–M7). Port ledger: `src/layout/port.md`.
   **not** preserved (plan M2). No per-window DPI scaling yet.
 - `gpu/device` + Vulkan/Metal/D3D12 are skeletons returning
   `error.Unsupported`; presentation goes through `gpu/software`.
-- Hot structs (`Scene` ~4.8MB, element `Frame` ~2.5MB, font `Collection`
+- Hot structs (`Scene` ~5.9MB, element `Frame` ~2.5MB, font `Collection`
   ~1.1MB, all inline storage) must be heap-allocated or embedded in a heap
   owner — never stacked together in one function. Debug frames for
   `Collection.init()` alone reach ~8.7MB.
