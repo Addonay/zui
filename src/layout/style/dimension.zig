@@ -289,8 +289,10 @@ pub fn dimension_value(value: Dimension) compact.CompactLength {
 
 pub fn clamp_resolved_size(value: f32, minimum: LengthPercentageAuto, maximum: LengthPercentageAuto, basis: f32) f32 {
     const min_value = minimum.resolve(basis) orelse 0;
-    const max_value = maximum.resolve(basis);
-    return @min(max_value orelse value, @max(min_value, value));
+    // An auto max is unbounded (infinity), never the value itself: using
+    // the value here would swallow the min clamp whenever max is unset.
+    const max_value = maximum.resolve(basis) orelse std.math.inf(f32);
+    return @min(max_value, @max(min_value, value));
 }
 
 pub fn dimension_auto() Dimension {

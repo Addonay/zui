@@ -231,16 +231,22 @@ pub fn compute_grid_layout(tree_ref: *tree.TaffyTree, node_id: tree.NodeId, inpu
 
     const available_width = inputs.known_dimensions.width orelse styled_width_adjusted orelse inputs.available_space.width.into_option();
     const available_height = inputs.known_dimensions.height orelse styled_height_adjusted orelse inputs.available_space.height.into_option();
-    const column_width = try size_tracks(tree_ref.allocator, &columns, available_width, gap_value(node_style.gap.width, parent_width), children, placements.items, true, tree_ref);
-    const row_height = try size_tracks(tree_ref.allocator, &rows, available_height, gap_value(node_style.gap.height, parent_width), children, placements.items, false, tree_ref);
+    // Track sizing (and the alignment free-space math below) runs against
+    // the CONTENT box, like Taffy's inner_available_space: fr tracks and
+    // stretch distribution must not see padding/border. The outer size and
+    // item placement add the inset back explicitly.
+    const inner_width = if (available_width) |w| @max(0, w - inset.horizontal_axis_sum()) else null;
+    const inner_height = if (available_height) |h| @max(0, h - inset.vertical_axis_sum()) else null;
+    const column_width = try size_tracks(tree_ref.allocator, &columns, inner_width, gap_value(node_style.gap.width, parent_width), children, placements.items, true, tree_ref);
+    const row_height = try size_tracks(tree_ref.allocator, &rows, inner_height, gap_value(node_style.gap.height, parent_width), children, placements.items, false, tree_ref);
 
     const content_size = geometry.Size(f32){ .width = column_width, .height = row_height };
     const outer = geometry.Size(f32){
         .width = style.dimension.clamp_resolved_size(inputs.known_dimensions.width orelse available_width orelse content_size.width + inset.horizontal_axis_sum(), node_style.min_size.width, node_style.max_size.width, parent_width),
         .height = style.dimension.clamp_resolved_size(inputs.known_dimensions.height orelse available_height orelse content_size.height + inset.vertical_axis_sum(), node_style.min_size.height, node_style.max_size.height, inputs.parent_size.height orelse content_size.height),
     };
-    const column_alignment = alignment.align_track_sizes(available_width, columns.items, gap_value(node_style.gap.width, parent_width), node_style.justify_content orelse style.alignment.AlignContent.stretch);
-    const row_alignment = alignment.align_track_sizes(available_height, rows.items, gap_value(node_style.gap.height, parent_width), node_style.align_content orelse style.alignment.AlignContent.stretch);
+    const column_alignment = alignment.align_track_sizes(inner_width, columns.items, gap_value(node_style.gap.width, parent_width), node_style.justify_content orelse style.alignment.AlignContent.stretch);
+    const row_alignment = alignment.align_track_sizes(inner_height, rows.items, gap_value(node_style.gap.height, parent_width), node_style.align_content orelse style.alignment.AlignContent.stretch);
     try place_children(tree_ref, children, placements.items, columns.items, rows.items, column_alignment.gap, row_alignment.gap, column_alignment.start, row_alignment.start, inset, node_style);
     node_data.unrounded_layout.size = outer;
     node_data.unrounded_layout.padding = padding;
@@ -478,8 +484,13 @@ fn place_children(tree_ref: *tree.TaffyTree, children: []const tree.NodeId, plac
         const vertical_margin = geometry.Line(?f32){ .start = child.style.margin.top.resolve(width), .end = child.style.margin.bottom.resolve(width) };
         const horizontal_alignment = child.style.justify_self orelse container.justify_items orelse style.alignment.AlignItems.stretch;
         const vertical_alignment = child.style.align_self orelse container.align_items orelse style.alignment.AlignItems.stretch;
-        const child_width = child.style.size.width.resolve(width) orelse if (horizontal_alignment.keyword == .stretch and horizontal_margin.start != null and horizontal_margin.end != null) @max(0, width - horizontal_margin.start.? - horizontal_margin.end.?) else child.unrounded_layout.size.width;
-        const child_height = child.style.size.height.resolve(height) orelse if (vertical_alignment.keyword == .stretch and vertical_margin.start != null and vertical_margin.end != null) @max(0, height - vertical_margin.start.? - vertical_margin.end.?) else child.unrounded_layout.size.height;
+        const raw_width = child.style.size.width.resolve(width) orelse if (horizontal_alignment.keyword == .stretch and horizontal_margin.start != null and horizontal_margin.end != null) @max(0, width - horizontal_margin.start.? - horizontal_margin.end.?) else child.unrounded_layout.size.width;
+        const raw_height = child.style.size.height.resolve(height) orelse if (vertical_alignment.keyword == .stretch and vertical_margin.start != null and vertical_margin.end != null) @max(0, height - vertical_margin.start.? - vertical_margin.end.?) else child.unrounded_layout.size.height;
+        // Grid items clamp to min/max like every other box (Taffy resolves
+        // min/max against the grid area): a min-width 60 child in a fixed
+        // 40 track lays out at 60, not 40.
+        const child_width = style.dimension.clamp_resolved_size(raw_width, child.style.min_size.width, child.style.max_size.width, width);
+        const child_height = style.dimension.clamp_resolved_size(raw_height, child.style.min_size.height, child.style.max_size.height, height);
         // Track sizing establishes the containing block for the item. Run the
         // child dispatcher with those resolved outer dimensions so percentage
         // descendants and nested flex/grid containers see the grid area rather
@@ -503,13 +514,26 @@ fn place_children(tree_ref: *tree.TaffyTree, children: []const tree.NodeId, plac
 }
 
 fn preceding_track_extent(tracks: []const Track, end: usize, gap: f32) f32 {
+    // Sizes of the active tracks before `end`, plus one gap per preceding
+    // active track: track `end` sits AFTER the gap that follows track
+    // `end - 1`. (The old loop only added gaps between tracks inside the
+    // prefix, dropping the gap before track `end` itself — a 40px track
+    // with a 10px gap put the next column at x=40 instead of x=50.)
+    // Collapsed (auto-fit empty) tracks vanish entirely, size and gap.
     var result: f32 = 0;
     var active: usize = 0;
-    for (tracks[0..@min(end, tracks.len)]) |track| {
+    const bounded = @min(end, tracks.len);
+    for (tracks[0..bounded]) |track| {
         if (track.is_collapsed) continue;
-        if (active > 0) result += gap;
         result += track.size;
         active += 1;
+    }
+    if (active > 0 and end < tracks.len) {
+        result += gap * @as(f32, @floatFromInt(active));
+    } else if (active > 1) {
+        // Past-the-end fallback (should not happen: placements are bounded
+        // by the track count): count only gaps strictly inside the prefix.
+        result += gap * @as(f32, @floatFromInt(active - 1));
     }
     return result;
 }
@@ -685,4 +709,71 @@ test "grid auto-fit collapses tracks with no placed item" {
     try testing.expect(!tracks[0].is_collapsed);
     try testing.expect(tracks[1].is_collapsed);
     try testing.expectEqual(@as(?f32, 0), tracks[1].max);
+}
+
+test "grid gap offsets the second column" {
+    // Oracle (vendored Taffy 0.14): tracks 40px + 20px with a 10px gap put
+    // the second column at x=50, not x=40.
+    const testing = std.testing;
+    var tree_ref = tree.TaffyTree.init(testing.allocator);
+    defer tree_ref.deinit();
+    const first = try tree_ref.new_leaf(.{ .size = .{ .width = .length(40), .height = .length(10) } });
+    const second = try tree_ref.new_leaf(.{ .size = .{ .width = .length(20), .height = .length(10) } });
+    const columns = [_]grid_style.GridTemplateComponent{
+        .{ .single = grid_style.TrackSizingFunction.from_length(40) },
+        .{ .single = grid_style.TrackSizingFunction.from_length(20) },
+    };
+    const root = try tree_ref.new_with_children(.{
+        .display = .grid,
+        .grid_template_columns = &columns,
+        .gap = .{ .width = style.dimension.LengthPercentage.length(10), .height = style.dimension.LengthPercentage.length(0) },
+    }, &[_]tree.NodeId{ first, second });
+    try tree_ref.compute_layout(root, .{ .width = .{ .definite = 100 }, .height = .{ .definite = 20 } });
+    try testing.expectEqual(@as(f32, 0), (try tree_ref.layout_of(first)).location.x);
+    try testing.expectEqual(@as(f32, 50), (try tree_ref.layout_of(second)).location.x);
+}
+
+test "grid fr track subtracts container padding" {
+    // Oracle: 100px border-box grid with 10px horizontal padding and one
+    // 1fr track gives the child 80px, not 100px.
+    const testing = std.testing;
+    var tree_ref = tree.TaffyTree.init(testing.allocator);
+    defer tree_ref.deinit();
+    const child = try tree_ref.new_leaf(.{});
+    const columns = [_]grid_style.GridTemplateComponent{
+        .{ .single = grid_style.TrackSizingFunction.from_fr(1) },
+    };
+    const root = try tree_ref.new_with_children(.{
+        .display = .grid,
+        .size = .{ .width = .length(100), .height = .length(20) },
+        .padding = .{
+            .left = style.dimension.LengthPercentage.length(10),
+            .right = style.dimension.LengthPercentage.length(10),
+            .top = style.dimension.LengthPercentage.length(0),
+            .bottom = style.dimension.LengthPercentage.length(0),
+        },
+        .grid_template_columns = &columns,
+    }, &[_]tree.NodeId{child});
+    try tree_ref.compute_layout(root, .{ .width = .{ .definite = 100 }, .height = .{ .definite = 20 } });
+    try testing.expectEqual(@as(f32, 80), (try tree_ref.layout_of(child)).size.width);
+}
+
+test "grid child min-width clamps a smaller fixed track" {
+    // Oracle: a child with min-width 60px in a fixed 40px track lays out
+    // at 60px, not 40px.
+    const testing = std.testing;
+    var tree_ref = tree.TaffyTree.init(testing.allocator);
+    defer tree_ref.deinit();
+    const child = try tree_ref.new_leaf(.{
+        .min_size = .{ .width = style.dimension.LengthPercentageAuto.length(60), .height = style.dimension.LengthPercentageAuto.auto() },
+    });
+    const columns = [_]grid_style.GridTemplateComponent{
+        .{ .single = grid_style.TrackSizingFunction.from_length(40) },
+    };
+    const root = try tree_ref.new_with_children(.{
+        .display = .grid,
+        .grid_template_columns = &columns,
+    }, &[_]tree.NodeId{child});
+    try tree_ref.compute_layout(root, .{ .width = .{ .definite = 100 }, .height = .{ .definite = 20 } });
+    try testing.expectEqual(@as(f32, 60), (try tree_ref.layout_of(child)).size.width);
 }

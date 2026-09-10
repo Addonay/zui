@@ -126,25 +126,25 @@ pub const TaffyTree = struct {
 
     pub fn set_children(self: *TaffyTree, parent_id: NodeId, child_list: []const NodeId) !void {
         const parent_node = self.get_node_mut(parent_id) orelse return error.InvalidParentNode;
+        // Validate everything before mutating: a rejected child ID must
+        // leave the tree untouched, not half-detached (reparenting moves
+        // edges out of other parents below).
+        for (child_list) |child_id| {
+            const child = self.get_node_mut(child_id) orelse return error.InvalidChildNode;
+            if (child.parent) |old_parent| {
+                if (old_parent != parent_id and self.get_node(old_parent) == null) return error.InvalidParentNode;
+            }
+        }
         for (parent_node.children.items) |old_child| {
             if (self.get_node_mut(old_child)) |old| old.parent = null;
         }
         parent_node.children.clearRetainingCapacity();
         for (child_list) |child_id| {
             const child = self.get_node_mut(child_id) orelse return error.InvalidChildNode;
-            // Taffy's high-level tree removes a child from its previous
-            // parent before attaching it here. Keep this behavior explicit;
-            // silently leaving the old edge creates two layout parents.
-            if (child.parent) |old_parent| if (old_parent != parent_id) {
-                const old_parent_node = self.get_node_mut(old_parent) orelse return error.InvalidParentNode;
-                var index: usize = 0;
-                while (index < old_parent_node.children.items.len) : (index += 1) {
-                    if (old_parent_node.children.items[index] == child_id) {
-                        _ = old_parent_node.children.orderedRemove(index);
-                        break;
-                    }
-                }
-            };
+            // Detach from a previous parent first (marks it dirty); silently
+            // leaving the old edge creates two layout parents and a stale
+            // cached layout on the old one.
+            try self.detach_from_parent(child_id, child.parent, parent_id);
             child.parent = parent_id;
             try parent_node.children.append(self.allocator, child_id);
         }
@@ -485,4 +485,42 @@ test "taffy tree reparents children across mutation APIs" {
     try testing.expectEqual(second_parent, (try tree.parent(child)).?);
     _ = try tree.remove_child(second_parent, child);
     try testing.expect((try tree.parent(child)) == null);
+}
+
+test "taffy set_children reparent refreshes both parents" {
+    // A[X 10x10], B[] under a block root. Moving X to B via set_children
+    // must invalidate A's cached layout too — otherwise A keeps its stale
+    // 10px height after recompute.
+    const testing = std.testing;
+    var tree = TaffyTree.init(testing.allocator);
+    defer tree.deinit();
+    const x = try tree.new_leaf(.{ .size = .{ .width = .length(10), .height = .length(10) } });
+    const a = try tree.new_with_children(.{ .display = .block }, &[_]NodeId{x});
+    const b = try tree.new_with_children(.{ .display = .block }, &[_]NodeId{});
+    const root = try tree.new_with_children(.{ .display = .block }, &[_]NodeId{ a, b });
+    try tree.compute_layout(root, .{ .width = .{ .definite = 100 }, .height = .{ .definite = 100 } });
+    try testing.expectEqual(@as(f32, 10), (try tree.layout_of(a)).size.height);
+
+    try tree.set_children(b, &[_]NodeId{x});
+    try testing.expect(try tree.is_dirty(a));
+    try tree.compute_layout(root, .{ .width = .{ .definite = 100 }, .height = .{ .definite = 100 } });
+    try testing.expectEqual(@as(f32, 0), (try tree.layout_of(a)).size.height);
+    try testing.expectEqual(@as(f32, 10), (try tree.layout_of(b)).size.height);
+    try testing.expectEqual(b, (try tree.parent(x)).?);
+}
+
+test "taffy set_children validates before mutating" {
+    // A rejected child ID must leave the tree untouched — no partial
+    // detach/attach. A[X]; set_children(B, [X, BAD]) errors and A still
+    // owns X, B stays empty.
+    const testing = std.testing;
+    var tree = TaffyTree.init(testing.allocator);
+    defer tree.deinit();
+    const x = try tree.new_leaf(.{});
+    const a = try tree.new_with_children(.{}, &[_]NodeId{x});
+    const b = try tree.new_with_children(.{}, &[_]NodeId{});
+    try testing.expectError(error.InvalidChildNode, tree.set_children(b, &[_]NodeId{ x, 9999 }));
+    try testing.expectEqual(@as(usize, 1), try tree.child_count(a));
+    try testing.expectEqual(@as(usize, 0), try tree.child_count(b));
+    try testing.expectEqual(a, (try tree.parent(x)).?);
 }
