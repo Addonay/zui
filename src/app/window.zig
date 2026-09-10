@@ -118,6 +118,7 @@ pub const Window = struct {
     }
 
     pub fn requestRender(self: *Window) void {
+        if (self.closed) return;
         self.dirty = true;
         self.wakeup_fn(self.app);
     }
@@ -127,17 +128,21 @@ pub const Window = struct {
     }
 
     pub fn render(self: *Window) void {
+        // Clear before user code so a requestRender() during rendering
+        // schedules another frame instead of being swallowed.
+        self.dirty = false;
         self.scene.clear();
         if (self.renderer) |r| {
             r.call(self, &self.scene);
         }
-        self.dirty = false;
     }
 
+    /// Mark closed; destruction is deferred to `App.reapClosed` at a safe
+    /// point after dispatch/render. Calling close from inside a listener
+    /// or action is safe: the caller keeps using `self` until the sweep.
     pub fn close(self: *Window) void {
         if (self.closed) return;
         self.closed = true;
-        self.remove_fn(self.app, self);
     }
 
     pub fn isClosed(self: *const Window) bool {
@@ -282,9 +287,13 @@ pub const Window = struct {
                 }
             }
         }
+        // Focused control disappeared: clear so dead handles stop
+        // receiving text/key events instead of dispatching into freed state.
+        self.focused = .{};
     }
 
     pub fn handleEvent(self: *Window, event: platform.Event) void {
+        if (self.closed) return;
         switch (event) {
             .mouse => |mouse| {
                 self.pointer_position = mouse.pos;
@@ -293,8 +302,11 @@ pub const Window = struct {
                     // backend (both Wayland and X11 timestamp input). Events
                     // carry it in `time_ms`; zero means unknown and never
                     // doubles, which keeps headless tests deterministic.
-                    const timed = mouse.time_ms > 0 and self.last_click_ms > 0;
-                    const double_click = timed and mouse.time_ms - self.last_click_ms < 400 and
+                    // Seed history on the first timed press so the second
+                    // press can double even when starting from zero.
+                    const had_prior = self.last_click_ms > 0;
+                    const timed = mouse.time_ms > 0;
+                    const double_click = timed and had_prior and mouse.time_ms - self.last_click_ms < 400 and
                         @abs(mouse.pos.x - self.last_click_pos.x) < 6 and
                         @abs(mouse.pos.y - self.last_click_pos.y) < 6;
                     if (timed) {
@@ -423,4 +435,64 @@ test "window os hooks push title cursor and clipboard" {
     try std.testing.expect(win.writeClipboard("hello"));
     var out: [16]u8 = undefined;
     try std.testing.expectEqualStrings("hello", out[0..win.readClipboard(&out)]);
+}
+
+test "stale focus clears when its region disappears" {
+    const TestApp = @import("app.zig").App;
+    var app = try TestApp.initHeadless(std.testing.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, struct {
+        fn draw(w: *Window, sc: *gpu.Scene) void {
+            _ = w;
+            _ = sc;
+        }
+    }.draw);
+
+    win.focused = .{ .id = 42 };
+    win.ui_frame.region_count = 0;
+    win.updateHitRegions();
+    try std.testing.expectEqual(@as(u32, 0), win.focused.id);
+}
+
+test "double-click history seeds from zero" {
+    const TestApp = @import("app.zig").App;
+    var app = try TestApp.initHeadless(std.testing.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, struct {
+        fn draw(w: *Window, sc: *gpu.Scene) void {
+            _ = w;
+            _ = sc;
+        }
+    }.draw);
+
+    var doubles: u32 = 0;
+    const S = struct {
+        var count: *u32 = undefined;
+        fn onDouble(_: *anyopaque, _: *const elements.element.ListenerPayload, _: *anyopaque) void {
+            count.* += 1;
+        }
+    };
+    S.count = &doubles;
+    win.ui_frame.region_count = 1;
+    win.ui_frame.regions[0] = .{
+        .bounds = geometry.Rect{ .x = 0, .y = 0, .w = 100, .h = 100 },
+        .double_click_listener = .{ .target = win, .call_fn = S.onDouble },
+    };
+
+    const press = struct {
+        fn at(w: *Window, t: i64) void {
+            w.handleEvent(.{ .mouse = .{
+                .pos = .{ .x = 10, .y = 10 },
+                .button = .left,
+                .pressed = true,
+                .time_ms = t,
+            } });
+        }
+    }.at;
+    press(win, 100);
+    // First timed press seeds history even from a zero start.
+    try std.testing.expectEqual(@as(i64, 100), win.last_click_ms);
+    try std.testing.expectEqual(@as(u32, 0), doubles);
+    press(win, 300);
+    try std.testing.expectEqual(@as(u32, 1), doubles);
 }

@@ -7,7 +7,6 @@
         "src",
         "examples",
         "third_party",
-        "BENCHMARKS.md",
         "build.zig",
         "build.zig.zon",
     },

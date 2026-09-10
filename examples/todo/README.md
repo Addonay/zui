@@ -1,10 +1,9 @@
-# Todo — ZUI ideal target
+# Todo — ZUI example app
 
-`main.zig` next to this file is the design target: a fashionable dark todo
-app written as if `zui` already existed. It is intentionally not compiling
-yet — `src/` has no implementation.
-
-It mirrors GPUI's shape, translated to Zig:
+`main.zig` next to this file is a working retained todo app: it builds,
+runs natively (`zig build run-todo`), renders headless snapshots, and
+self-tests through synthetic input. It mirrors GPUI's shape, translated
+to Zig:
 
 - `App` / `Window` / `Context(T)` / `Entity(T)` — one foreground thread owns state.
 - Views are structs with `render(self, window, cx) Element`.
@@ -12,14 +11,16 @@ It mirrors GPUI's shape, translated to Zig:
 - Interaction is `cx.listener()` / `cx.listenerWith()` + `on_click` / `on_action`, then `cx.notify()`.
 - Retained widgets (the composer input) are child entities: `Entity(zui.TextField)`.
 
-## Naive build-out order
+## Build-out status
 
-1. `App` + event loop + one window (native backend directly, single backend).
-2. `Entity` arena + `Context.notify()` dirty bit + re-render every dirty frame (no diffing).
-3. Elements `div / text / spacer / when / children` + naive flexbox measure/layout (no cache).
-4. Software-first painter: one quad batch + one text run (use `stb_truetype` first, HarfBuzz later).
-5. Input: mouse hit-test, focus chain, keymap → actions, `TextField` as first retained widget.
-6. Then: scroll, window resize, clipboard, IME, GPU backend (Metal/Vulkan/WebGPU).
+Shipped (see root `README.md` + `plan.md` for limits and roadmap):
+
+1. `App` + event loop + one native window (`ZUI_BACKEND` override, headless `null`).
+2. `Entity` store + `Context.notify()` dirty bit + re-render every dirty frame (no diffing).
+3. Elements `div / text / spacer / when / children` + flexbox measure/layout.
+4. Software-first painter: quads, glyph runs, image blits (`gpu/software`).
+5. Input: mouse hit-test, focus handles, keymap → actions, `TextField` widget.
+6. Next: correct scene ordering/clipping, layout-port adapter, GPU vertical slice.
 
 ## What to look at in `main.zig`
 

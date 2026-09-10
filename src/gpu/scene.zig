@@ -28,6 +28,11 @@ pub const Quad = struct {
     border_width: f32 = 0,
 };
 
+/// Ordered draw payload for one frame (quads + glyph runs + image blits).
+/// Multi-MB inline storage (~4.8MB): heap-allocate or embed in a heap
+/// owner (e.g. `Window`). Never stack two of these, or one plus a `Frame`
+/// plus a font `Collection`, in a single function — that overflows a 16MB
+/// thread stack. See the "hot frame structs stay within stack budget" test.
 pub const Scene = struct {
     quads: [limits.MAX_QUADS_PER_FRAME]Quad = undefined,
     len: usize = 0,

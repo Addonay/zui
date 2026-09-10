@@ -264,7 +264,10 @@ pub fn mountView(store: *EntityStore, window: *Window, build_fn: anytype) void {
                 elements.layout.layout(&win.ui_frame, root_element, .{ .x = 0, .y = 0, .w = win.bounds.size.w, .h = win.bounds.size.h });
                 elements.painter.paint(&win.ui_frame, root_element, scene);
                 win.updateHitRegions();
-                header.store.dirty = false;
+                // NB: do NOT clear store.dirty here. App.step owns the
+                // store->window fan-out and clears before rendering, so a
+                // notify() during render survives for the next frame and
+                // other windows are not starved by the first window's clear.
             }
         }.render,
     });

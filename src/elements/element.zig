@@ -154,6 +154,10 @@ pub const Node = struct {
     focus: ?FocusHandle = null,
 };
 
+/// Transient per-frame element tree (~2.5MB inline). Lives in the heap
+/// `Window` (`ui_frame`); tests may stack ONE Frame plus ONE `Scene` but
+/// must heap-allocate the font `Collection` alongside them. See the
+/// "hot frame structs stay within stack budget" test in painter.zig.
 pub const Frame = struct {
     nodes: [max_nodes]Node = undefined,
     node_count: usize = 0,

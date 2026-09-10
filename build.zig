@@ -60,6 +60,30 @@ pub fn build(b: *std.Build) void {
     const run_todo_step = b.step("run-todo", "Run the todo example");
     run_todo_step.dependOn(&run_todo.step);
 
+    // Embedded unit tests in the todo example (pure-model tests). Without
+    // this, `zig build test` silently skips them.
+    const todo_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/todo/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zui", .module = mod }},
+        }),
+    });
+    const run_todo_tests = b.addRunArtifact(todo_tests);
+    test_step.dependOn(&run_todo_tests.step);
+
+    // Headless integration: drive the real event queue -> App -> Window ->
+    // hit-test -> listener path with synthetic input (plan M0). Needs the
+    // demo seed for its 3-todo fixture.
+    const selftest_todo = b.addRunArtifact(todo);
+    selftest_todo.setEnvironmentVariable("ZUI_BACKEND", "null");
+    selftest_todo.setEnvironmentVariable("ZUI_TODO_DEMO", "1");
+    selftest_todo.setEnvironmentVariable("ZUI_SELFTEST", "1");
+    const selftest_step = b.step("selftest-todo", "Run the todo headless integration selftest");
+    selftest_step.dependOn(&selftest_todo.step);
+    test_step.dependOn(&selftest_todo.step);
+
     const images_demo = b.addExecutable(.{
         .name = "images-demo",
         .root_module = b.createModule(.{

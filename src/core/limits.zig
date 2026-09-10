@@ -5,39 +5,41 @@
 //! Permission notice: free use/copy/modify/merge/publish/distribute/
 //! sublicense/sell with this notice included. Provided AS-IS, no warranty.
 //!
-//! All buffers and pools have fixed upper bounds to eliminate allocation
-//! during rendering. If you hit a limit, increase it here and rebuild.
+//! Hot frame storage (scene, layout nodes, atlas) uses fixed upper bounds
+//! so warm rendering avoids growing allocations. Cold paths (window
+//! creation, font discovery, image decode, Taffy tree storage) may still
+//! allocate; see plan M10 for the per-subsystem budget policy. Some
+//! entries below are inherited Gooey caps for systems not present in this
+//! tree (path/mesh pools, web renderer); they are kept for the caps they
+//! still bound and will be pruned as budgets get per-owner homes.
 //!
-//! ## Design Philosophy (per CLAUDE.md)
+//! ## Design Philosophy
 //!
-//! - Zero dynamic allocation after initialization
-//! - Pre-allocate pools for glyphs, render commands, widgets at startup
-//! - Use fixed-capacity arrays instead of growing ArrayLists during rendering
-//! - Put a limit on EVERYTHING to prevent infinite loops and tail latency spikes
+//! - Bound reusable hot storage; expose overflow instead of growing it
+//! - Prefer fixed-capacity arrays over growing ArrayLists during rendering
+//! - Put a limit on hot buffers to prevent infinite loops and tail latency spikes
 //!
-//! ## Limit Hierarchy
+//! ## Limit Hierarchy (what exists in this tree)
 //!
 //! ```
 //! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │ Per-Path Geometry Limits (triangulator.zig, path_mesh.zig)              │
-//! │ - MAX_PATH_VERTICES: Maximum vertices in a single path                  │
-//! │ - MAX_PATH_INDICES: Maximum indices after triangulation                 │
-//! │ Purpose: Bound memory per PathMesh, prevent stack overflow              │
-//! └─────────────────────────────────────────────────────────────────────────┘
-//!                                    │
-//!                                    ▼
-//! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │ Mesh Pool Limits (mesh_pool.zig)                                        │
-//! │ - MAX_PERSISTENT_MESHES: Cached meshes (icons, static shapes)           │
-//! │ - MAX_FRAME_MESHES: Per-frame scratch meshes (animations)               │
-//! │ Purpose: Bound total mesh storage, enable cache eviction                │
-//! └─────────────────────────────────────────────────────────────────────────┘
-//!                                    │
-//!                                    ▼
-//! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │ Per-Frame Instance Limits (scene.zig)                                   │
-//! │ - MAX_PATHS_PER_FRAME: Total path draw calls per frame                  │
+//! │ Per-frame scene limits (gpu/scene.zig)                                  │
+//! │ - MAX_QUADS_PER_FRAME / MAX_SCENE_GLYPHS / MAX_IMAGE_BLITS_PER_FRAME    │
 //! │ Purpose: Bound GPU upload size, fail fast on runaway rendering          │
+//! └─────────────────────────────────────────────────────────────────────────┘
+//!                                    │
+//!                                    ▼
+//! ┌─────────────────────────────────────────────────────────────────────────┐
+//! │ Text/Atlas limits (fonts/)                                              │
+//! │ - MAX_GLYPHS_PER_RUN / MAX_ATLAS_GLYPHS / MAX_ATLAS_PIXELS              │
+//! │ Purpose: Bound shaping runs and the glyph pixel pool                    │
+//! └─────────────────────────────────────────────────────────────────────────┘
+//!                                    │
+//!                                    ▼
+//! ┌─────────────────────────────────────────────────────────────────────────┐
+//! │ Image/Grid/GPU-pool limits (images/, layout/, gpu/device.zig)           │
+//! │ - MAX_IMAGE_POOL_BYTES / MAX_CACHED_IMAGES / MAX_GPU_*                  │
+//! │ Purpose: Bound decoded pixels and fixed driver handle pools             │
 //! └─────────────────────────────────────────────────────────────────────────┘
 //! ```
 

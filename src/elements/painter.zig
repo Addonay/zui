@@ -577,21 +577,45 @@ test "blurred background emits soft falloff layers" {
     try t.expect(scene.slice()[0].color.a < scene.slice()[5].color.a);
 }
 
+test "hot frame structs stay within stack budget" {
+    // Regression for a flaky segfault: in Debug the font tests stacked
+    // Frame (~2.5MB) + Scene (~4.8MB) in an ~8MB test frame, then called
+    // Collection.init(), whose own frame is ~8.7MB — 16.7MB total on a
+    // 16MB thread stack. Frame+Scene stay stackable with room for call
+    // frames, but nothing else big may join them: Collection.init() must
+    // be called with Frame/Scene on the heap (as the font tests below do).
+    // Structural fix (pools behind init/deinit) is plan M10; until then
+    // this pins the budget so growth fails loudly instead of segfaulting.
+    const t = @import("std").testing;
+    try t.expect(@sizeOf(element.Frame) < 4 * 1024 * 1024);
+    try t.expect(@sizeOf(gpu.Scene) < 6 * 1024 * 1024);
+    try t.expect(@sizeOf(element.Frame) + @sizeOf(gpu.Scene) < 8 * 1024 * 1024);
+}
+
 test "shaped text emits atlas glyphs, not bitmap quads" {
     const t = @import("std").testing;
     if (!fonts.tables.FontconfigApi.isAvailable() or !fonts.tables.FreeTypeApi.isAvailable() or !fonts.tables.HarfBuzzApi.isAvailable()) return;
-    var stack = try fonts.Collection.init();
+    // Heap-allocated: Collection.init() needs ~8.7MB of Debug frame (see
+    // the budget test above), so Frame/Scene must not sit on the stack
+    // beneath the call. Production code keeps them in the heap Window.
+    var stack = try t.allocator.create(fonts.Collection);
+    defer t.allocator.destroy(stack);
+    stack.* = try fonts.Collection.init();
     defer stack.deinit();
 
-    var frame = element.Frame{};
+    var frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
     frame.reset(@ptrFromInt(1), .{});
-    frame.fonts = &stack;
-    element.beginFrame(&frame);
+    frame.fonts = stack;
+    element.beginFrame(frame);
     defer element.endFrame();
     const root = element.text("Hi", .{ .size = 16 });
-    @import("layout.zig").layout(&frame, root, .{ .w = 500, .h = 100 });
-    var scene = gpu.Scene{};
-    paint(&frame, root, &scene);
+    @import("layout.zig").layout(frame, root, .{ .w = 500, .h = 100 });
+    var scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
 
     // Both glyphs have ink; a bare text node emits no quads at all.
     const glyphs = scene.glyphSlice();
@@ -608,19 +632,26 @@ test "shaped text emits atlas glyphs, not bitmap quads" {
 test "tofu codepoint substitutes the symbol face" {
     const t = @import("std").testing;
     if (!fonts.tables.FontconfigApi.isAvailable() or !fonts.tables.FreeTypeApi.isAvailable() or !fonts.tables.HarfBuzzApi.isAvailable()) return;
-    var stack = try fonts.Collection.init();
+    // Heap-allocated: see "shaped text emits atlas glyphs" above.
+    var stack = try t.allocator.create(fonts.Collection);
+    defer t.allocator.destroy(stack);
+    stack.* = try fonts.Collection.init();
     defer stack.deinit();
     if (stack.symbols == null) return;
 
-    var frame = element.Frame{};
+    var frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
     frame.reset(@ptrFromInt(1), .{});
-    frame.fonts = &stack;
-    element.beginFrame(&frame);
+    frame.fonts = stack;
+    element.beginFrame(frame);
     defer element.endFrame();
     const root = element.text("✓", .{ .size = 16 });
-    @import("layout.zig").layout(&frame, root, .{ .w = 500, .h = 100 });
-    var scene = gpu.Scene{};
-    paint(&frame, root, &scene);
+    @import("layout.zig").layout(frame, root, .{ .w = 500, .h = 100 });
+    var scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
 
     // The sans face has no U+2713, so the glyph must come from the symbol
     // face (id 3) with real ink — not dropped, not `.notdef`.

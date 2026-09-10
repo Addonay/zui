@@ -238,12 +238,17 @@ test "shaped measure matches collection measure" {
     const t = std.testing;
     const fonts = @import("../fonts/root.zig");
     if (!fonts.tables.FontconfigApi.isAvailable() or !fonts.tables.FreeTypeApi.isAvailable() or !fonts.tables.HarfBuzzApi.isAvailable()) return;
-    var stack = try fonts.Collection.init();
+    // Heap-allocated: Collection.init() needs ~8.7MB of Debug frame (see
+    // the "hot frame structs stay within stack budget" test in
+    // painter.zig); keep the test frame small.
+    var stack = try t.allocator.create(fonts.Collection);
+    defer t.allocator.destroy(stack);
+    stack.* = try fonts.Collection.init();
     defer stack.deinit();
 
     var frame = element.Frame{};
     frame.reset(@ptrFromInt(1), .{});
-    frame.fonts = &stack;
+    frame.fonts = stack;
     element.beginFrame(&frame);
     defer element.endFrame();
     const root = element.text("Hello", .{ .size = 14 });

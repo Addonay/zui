@@ -1,0 +1,64 @@
+# ZUI
+
+Hand-rolled retained UI framework in Zig. One foreground thread owns state
+(`App`/`Entity`/`Context`), views render transient elements (`div()`/`text()`),
+a layout pass sizes them, a painter records a `Scene`, and a native backend
+presents it with the CPU rasterizer. GPU drivers are future work.
+
+## Toolchain
+
+- Tested with `zig version 0.17.0-dev.2085+5e36170b5` on Linux.
+- `build.zig.zon` declares `minimum_zig_version 0.17.0-dev.1970+67f39b551`
+  (a floor, not the tested revision). Bump it deliberately and note the
+  tested revision here when upgrading.
+- System libraries (FreeType, HarfBuzz, Fontconfig, Wayland/X11, Vulkan
+  loader) are reached through hand-written `extern` tables via runtime
+  `dlopen` — never hard-linked. Vendored C is limited to image codecs
+  (`third_party/`: stb_image, nanosvg).
+
+## Commands
+
+```sh
+zig build test          # unit tests (zui + layout) + todo tests + headless selftest
+zig build run-todo      # run the todo example (needs a display or ZUI_BACKEND=null)
+zig build selftest-todo # headless integration: synthetic input through the full stack
+zig build run-images    # render the images demo to a PPM snapshot
+
+ZUI_BACKEND=null ZUI_TODO_DEMO=1 zig build run-todo       # seeded, headless
+ZUI_SNAPSHOT=/tmp/todo.ppm zig build run-todo             # one-frame PPM dump
+```
+
+## Architecture
+
+```text
+App / scheduler            owns entities, platform connection, fonts, image cache
+  Window                   one logical window (native window ownership: see Limits)
+    elements.Frame         transient nodes rebuilt each dirty render
+      elements.layout      flexbox measure/place (standalone layout/ port NOT yet wired)
+      elements.painter     nodes -> gpu.Scene (quads + glyphs + image blits)
+      gpu.software         CPU rasterizer; platform backends present the pixels
+fonts/                     discovery, shaping, glyph atlas (dlopen Fontconfig/FreeType/HarfBuzz)
+images/                    stb/nanosvg decoders + decoded-pixel cache
+layout/                    source-shaped Taffy port, standalone; adapter is plan M3
+gpu/device.zig             experimental SDL-shaped vtable; no working driver yet
+```
+
+Roadmap: `plan.md` (milestones M0–M7). Port ledger: `src/layout/port.md`.
+
+## Supported / limitations
+
+- Backends: Linux Wayland + X11 (runtime-verified); macOS Cocoa and Windows
+  Win32 exist as source but are **not** runtime-validated here. Headless
+  `null` backend for tests. `ZUI_BACKEND=wayland|x11|null` pins the choice.
+- One native window per process for now (`error.MultipleNativeWindowsNotSupported`
+  otherwise); headless supports up to `MAX_WINDOWS` logical windows.
+- Text: shaping/measurement and paint can disagree on tracking/fallback;
+  TextField is append-only with no selection/IME yet (plan M3/M4).
+- Scene draws quads, then glyphs, then images — cross-type paint order is
+  **not** preserved (plan M2). No per-window DPI scaling yet.
+- `gpu/device` + Vulkan/Metal/D3D12 are skeletons returning
+  `error.Unsupported`; presentation goes through `gpu/software`.
+- Hot structs (`Scene` ~4.8MB, element `Frame` ~2.5MB, font `Collection`
+  ~1.1MB, all inline storage) must be heap-allocated or embedded in a heap
+  owner — never stacked together in one function. Debug frames for
+  `Collection.init()` alone reach ~8.7MB.

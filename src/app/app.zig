@@ -39,26 +39,40 @@ pub const App = struct {
 
     pub fn init(allocator: std.mem.Allocator) !App {
         var instance = try platform.createAuto(allocator, "ZUI Application", 800, 600);
+        errdefer instance.deinit(allocator);
+        const font_stack = try initFonts(allocator);
+        errdefer if (font_stack) |fc| {
+            fc.deinit();
+            allocator.destroy(fc);
+        };
+        const cache = try images.Cache.init(allocator);
         return .{
             .allocator = allocator,
             .backend = instance.handle(),
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = instance,
-            .fonts = try initFonts(allocator),
-            .image_cache = try images.Cache.init(allocator),
+            .fonts = font_stack,
+            .image_cache = cache,
         };
     }
 
     pub fn initHeadless(allocator: std.mem.Allocator) !App {
         const nb = try allocator.create(platform.null_backend.NullBackend);
+        errdefer allocator.destroy(nb);
         nb.* = .{};
+        const font_stack = try initFonts(allocator);
+        errdefer if (font_stack) |fc| {
+            fc.deinit();
+            allocator.destroy(fc);
+        };
+        const cache = try images.Cache.init(allocator);
         return .{
             .allocator = allocator,
             .backend = nb.backendHandle(),
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = .{ .null_backend = nb },
-            .fonts = try initFonts(allocator),
-            .image_cache = try images.Cache.init(allocator),
+            .fonts = font_stack,
+            .image_cache = cache,
         };
     }
 
@@ -183,6 +197,11 @@ pub const App = struct {
     }
 
     pub fn openWindow(self: *App, options: WindowOptions, build_or_render: anytype) !*Window {
+        // One native window per connection until per-window surfaces land
+        // (plan M5). Null/headless keeps N logical windows for tests.
+        if (self.backend.kind() != .null and self.liveWindowCount() > 0) {
+            return error.MultipleNativeWindowsNotSupported;
+        }
         var slot: ?usize = null;
         for (&self.windows, 0..) |maybe_win, i| {
             if (maybe_win == null) {
@@ -263,6 +282,9 @@ pub const App = struct {
     }
 
     pub fn removeWindow(self: *App, win: *Window) void {
+        // Legacy immediate destroy; prefer close()+reapClosed(). Kept for
+        // explicit teardown outside dispatch. Never call from inside an
+        // event listener: use win.close() so dispatch can keep using self.
         for (&self.windows) |*maybe_win| {
             if (maybe_win.* == win) {
                 maybe_win.* = null;
@@ -275,9 +297,37 @@ pub const App = struct {
         }
     }
 
+    /// Live (non-null, non-closed) window count.
+    pub fn liveWindowCount(self: *const App) usize {
+        var n: usize = 0;
+        for (&self.windows) |maybe_win| {
+            if (maybe_win) |win| {
+                if (!win.closed) n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// Destroy windows marked closed. Called at safe points in step()
+    /// (after dispatch, after present); also callable directly in tests.
+    pub fn reapClosed(self: *App) void {
+        for (&self.windows) |*maybe_win| {
+            if (maybe_win.*) |win| {
+                if (win.closed) {
+                    maybe_win.* = null;
+                    if (self.active_window_count > 0) {
+                        self.active_window_count -= 1;
+                    }
+                    self.allocator.destroy(win);
+                }
+            }
+        }
+    }
+
     pub fn closeFirstWindow(self: *App) void {
         for (&self.windows) |*maybe_win| {
             if (maybe_win.*) |win| {
+                if (win.closed) continue;
                 win.close();
                 break;
             }
@@ -294,6 +344,7 @@ pub const App = struct {
                     const info = self.backend.windowInfo();
                     for (&self.windows) |*maybe_win| {
                         if (maybe_win.*) |win| {
+                            if (win.closed) continue;
                             win.bounds.size = info.size;
                             win.requestRender();
                         }
@@ -303,7 +354,10 @@ pub const App = struct {
             },
             .mouse, .key, .text, .scroll => {
                 for (&self.windows) |*maybe_win| {
-                    if (maybe_win.*) |win| win.handleEvent(ev);
+                    if (maybe_win.*) |win| {
+                        if (win.closed) continue;
+                        win.handleEvent(ev);
+                    }
                 }
             },
         }
@@ -327,6 +381,21 @@ pub const App = struct {
         while (self.event_queue.pop()) |ev| {
             self.handleEvent(ev);
         }
+        // Destroy windows closed during dispatch before further work.
+        self.reapClosed();
+
+        // 2b. Entity mutation outside a window context (Entity.update with
+        // no window) only sets EntityStore.dirty. Fan out conservatively to
+        // all live windows so the mutation visibly redraws. Clear before
+        // rendering so invalidations during render schedule the next frame.
+        if (self.entities.dirty) {
+            self.entities.dirty = false;
+            for (&self.windows) |*maybe_win| {
+                if (maybe_win.*) |win| {
+                    if (!win.closed) win.requestRender();
+                }
+            }
+        }
 
         if (self.should_quit or self.active_window_count == 0) {
             return false;
@@ -339,9 +408,11 @@ pub const App = struct {
         var presented: usize = 0;
         for (&self.windows) |*maybe_win| {
             if (maybe_win.*) |win| {
+                if (win.closed) continue;
                 // Pending key sequences expire on a tick budget; expiry
                 // fires a remembered single-key action, if any.
                 if (win.keymap.tick()) |action_name| win.fireAction(action_name);
+                if (win.closed) continue;
                 if (win.dirty and !win.closed) {
                     win.frame_id = self.step_count;
                     win.render();
@@ -350,6 +421,9 @@ pub const App = struct {
                 }
             }
         }
+        // Destroy windows closed during render/callbacks; dispatch above
+        // already finished using them.
+        self.reapClosed();
 
         self.step_count += 1;
         zlog.log("app", "step {d}: {d} queued events, {d} presented", .{ self.step_count, qlen, presented });
@@ -397,8 +471,12 @@ test "app lifecycle and window capacity" {
         fn noop(_: *Window, _: *gpu.Scene) void {}
     }.noop));
 
-    // Close one window and ensure a new one can be opened
+    // Close one window and ensure a new one can be opened. Close is
+    // deferred: the slot frees on the reap sweep, not inside the call.
     wins[0].close();
+    try std.testing.expect(wins[0].isClosed());
+    try std.testing.expectEqual(@as(usize, limits.MAX_WINDOWS), app.active_window_count);
+    app.reapClosed();
     try std.testing.expectEqual(@as(usize, limits.MAX_WINDOWS - 1), app.active_window_count);
 
     const replacement = try app.openWindow(.{ .title = "Replacement" }, struct {
@@ -593,4 +671,90 @@ test "app owns the font stack when system fonts exist" {
     defer app.deinit();
     try std.testing.expect(app.fonts != null);
     try std.testing.expectEqual(@as(usize, 0), app.glyphPixels().len);
+}
+
+test "close defers destruction until reap" {
+    var app = try App.initHeadless(std.testing.allocator);
+    defer app.deinit();
+
+    const win = try app.openWindow(.{ .title = "Deferred" }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+    win.close();
+    // Still allocated: events are ignored but the pointer stays valid.
+    try std.testing.expect(win.isClosed());
+    try std.testing.expectEqual(@as(usize, 1), app.active_window_count);
+    win.handleEvent(.{ .mouse = .{
+        .pos = .{ .x = 0, .y = 0 },
+        .button = .left,
+        .pressed = true,
+    } });
+    app.reapClosed();
+    try std.testing.expectEqual(@as(usize, 0), app.active_window_count);
+}
+
+test "entity update outside events schedules a render" {
+    var app = try App.initHeadless(std.testing.allocator);
+    defer app.deinit();
+
+    var renders: u32 = 0;
+    const S = struct {
+        fn draw(ctx: ?*anyopaque, _: *Window, sc: *gpu.Scene) void {
+            const count: *u32 = @ptrCast(@alignCast(ctx.?));
+            count.* += 1;
+            _ = sc.push(.{ .x = 0, .y = 0, .w = 10, .h = 10, .color = color.Color.white });
+        }
+    };
+    _ = try app.openWindow(.{}, Renderer{ .ptr = &renders, .render_fn = S.draw });
+
+    try std.testing.expect(app.step());
+    try std.testing.expectEqual(@as(u32, 1), renders);
+    // Idle step renders nothing.
+    try std.testing.expect(app.step());
+    try std.testing.expectEqual(@as(u32, 1), renders);
+
+    const Counter = struct {
+        pub const Options = struct {};
+        n: u32 = 0,
+        pub fn init(_: *runtime.Context(@This()), _: Options) @This() {
+            return .{};
+        }
+    };
+    const e = app.entities.create(Counter, .{}, null);
+    e.update(struct {
+        fn bump(v: *Counter) void {
+            v.n += 1;
+        }
+    }.bump);
+    try std.testing.expectEqual(@as(u32, 1), e.read().n);
+    // No window was touched, but the store dirty bit must fan out.
+    try std.testing.expect(app.step());
+    try std.testing.expectEqual(@as(u32, 2), renders);
+}
+
+test "requestRender during render schedules another frame" {
+    var app = try App.initHeadless(std.testing.allocator);
+    defer app.deinit();
+
+    const S = struct {
+        var calls: u32 = 0;
+        fn draw(_: ?*anyopaque, w: *Window, sc: *gpu.Scene) void {
+            _ = sc.push(.{ .x = 0, .y = 0, .w = 10, .h = 10, .color = color.Color.white });
+            calls += 1;
+            if (calls == 1) w.requestRender();
+        }
+    };
+    S.calls = 0;
+    const win = try app.openWindow(.{}, struct {
+        fn draw(w: *Window, sc: *gpu.Scene) void {
+            S.draw(null, w, sc);
+        }
+    }.draw);
+
+    try std.testing.expect(app.step());
+    try std.testing.expectEqual(@as(u32, 1), S.calls);
+    // The in-render invalidation survived instead of being swallowed.
+    try std.testing.expect(win.dirty);
+    try std.testing.expect(app.step());
+    try std.testing.expectEqual(@as(u32, 2), S.calls);
 }

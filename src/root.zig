@@ -1,19 +1,21 @@
-//! ZUI — hand-rolled GPU UI framework in Zig.
+//! ZUI — hand-rolled retained UI framework in Zig.
 //!
-//! Low-level first: core primitives, platform backends, GPU scene, text.
-//! The retained `App`/`Entity` API from `examples/todo` builds on top once
-//! the frame loop, layout, and painters land.
+//! One foreground thread owns state (`App`/`Entity`/`Context`); views render
+//! transient elements each dirty frame, laid out by `elements/layout`,
+//! painted into a `gpu.Scene`, and presented by the native `platform`
+//! backend via the `gpu/software` rasterizer.
 //!
-//! Architectural debts, not copies:
+//! Attribution, not copies:
 //! - Windowing: one backend vtable + bootstrap probe order, `dlopen`ed
-//!   WM/GL/VK tables, `PumpEvents` + `WaitEventTimeout` pair, normalized
-//!   events before queueing, minimal headless reference backend,
-//!   per-platform state union, dynamic loading with fallback.
-//! - DVUI: tiny `Backend` contract (begin/end, triangles, textures),
-//!   `@src()`-derived IDs, headless testing backend.
+//!   WM tables, normalized events before queueing, minimal headless
+//!   reference backend, dynamic loading with fallback.
+//! - DVUI: tiny `Backend` contract, `@src()`-derived IDs, headless testing
+//!   backend (patterns only).
 //! - Gooey: Zig module layout, static caps, hand-written C `extern`
-//!   bindings, `@embedFile` shaders. `core/limits` and `text/bindings`
-//!   are direct MIT-licensed ports, attributed in-file.
+//!   bindings. `core/limits` and `text/bindings` are direct MIT-licensed
+//!   ports, attributed in-file.
+//! - SDL3 (`gpu/device` shape) and Taffy (`layout/` port) are API/algorithm
+//!   references; see `plan.md` for what is actually wired up.
 
 pub const core = @import("core/root.zig");
 pub const layout = @import("layout/root.zig");

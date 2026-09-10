@@ -33,6 +33,11 @@ pub const Atlas = atlas.Atlas;
 
 /// One owned copy of the whole stack. Init-time only; frames borrow it.
 ///
+/// ~1.1MB with the atlas pixel pool inline: heap-allocate (App embeds it
+/// behind a pointer; tests use the allocator). Never stack a Collection
+/// with a Frame and a Scene in one function — see the "hot frame structs
+/// stay within stack budget" test in elements/painter.zig.
+///
 /// Holds both UI families (ids 1/2): `faceFor`/`shaperFor` pick mono when
 /// the text style names one (e.g. `"JetBrains Mono, ..."`), sans otherwise.
 /// `symbols` (id 3, optional) covers dingbats the UI faces lack (✓✦○);
@@ -212,7 +217,12 @@ test "end to end: shape, rasterize, cache, measure" {
     const t = std.testing;
     if (!tables.FontconfigApi.isAvailable() or !tables.FreeTypeApi.isAvailable() or !tables.HarfBuzzApi.isAvailable()) return;
 
-    var stack = try Collection.init();
+    // Heap-allocated: Collection.init() needs ~8.7MB of Debug frame (see
+    // the "hot frame structs stay within stack budget" test in
+    // elements/painter.zig); keep test frames small.
+    var stack = try t.allocator.create(Collection);
+    defer t.allocator.destroy(stack);
+    stack.* = try Collection.init();
     defer stack.deinit();
     try stack.sans_shaper.setPixelSize(16);
 
@@ -260,7 +270,10 @@ test "measureText matches shaped advances plus tracking" {
     const t = std.testing;
     if (!tables.FontconfigApi.isAvailable() or !tables.FreeTypeApi.isAvailable() or !tables.HarfBuzzApi.isAvailable()) return;
 
-    var stack = try Collection.init();
+    // Heap-allocated: see "end to end" above.
+    var stack = try t.allocator.create(Collection);
+    defer t.allocator.destroy(stack);
+    stack.* = try Collection.init();
     defer stack.deinit();
 
     const text = "Tasks 123";
@@ -288,10 +301,13 @@ test "symbol fallback covers the ui symbol set" {
     const t = std.testing;
     if (!tables.FontconfigApi.isAvailable() or !tables.FreeTypeApi.isAvailable() or !tables.HarfBuzzApi.isAvailable()) return;
 
-    var stack = try Collection.init();
+    // Heap-allocated: see "end to end" above.
+    var stack = try t.allocator.create(Collection);
+    defer t.allocator.destroy(stack);
+    stack.* = try Collection.init();
     defer stack.deinit();
     if (stack.symbols == null) return; // nothing installed: UI shows tofu
-    std.debug.print("symbols face picked for {d}/{d} UI symbols\n", .{ scoreOf(&stack), Collection.symbol_set.len });
+    std.debug.print("symbols face picked for {d}/{d} UI symbols\n", .{ scoreOf(stack), Collection.symbol_set.len });
 
     // The sans face genuinely lacks these (why the fallback exists)...
     try t.expectEqual(@as(u32, 0), stack.sans.glyphIndex(0x2726));
