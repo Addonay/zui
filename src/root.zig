@@ -5,11 +5,10 @@
 //! the frame loop, layout, and painters land.
 //!
 //! Architectural debts, not copies:
-//! - SDL3: backend vtable + bootstrap probe order, `dlopen`ed WM/GL/VK
-//!   tables, `PumpEvents` + `WaitEventTimeout` pair, `SDL_Send*`
-//!   normalization before queueing.
-//! - GLFW: null backend as the minimal reference template, per-platform
-//!   state union, dynamic loading with fallback (Wayland then X11).
+//! - Windowing: one backend vtable + bootstrap probe order, `dlopen`ed
+//!   WM/GL/VK tables, `PumpEvents` + `WaitEventTimeout` pair, normalized
+//!   events before queueing, minimal headless reference backend,
+//!   per-platform state union, dynamic loading with fallback.
 //! - DVUI: tiny `Backend` contract (begin/end, triangles, textures),
 //!   `@src()`-derived IDs, headless testing backend.
 //! - Gooey: Zig module layout, static caps, hand-written C `extern`
@@ -21,6 +20,8 @@ pub const layout = @import("layout/root.zig");
 pub const platform = @import("platform/root.zig");
 pub const gpu = @import("gpu/root.zig");
 pub const text_system = @import("text/root.zig");
+pub const fonts = @import("fonts/root.zig");
+pub const images = @import("images/root.zig");
 pub const app = @import("app/root.zig");
 pub const elements = @import("elements/root.zig");
 pub const widgets = @import("widgets/root.zig");
@@ -59,6 +60,12 @@ pub const text = elements.text;
 pub const textFmt = elements.textFmt;
 pub const spacer = elements.spacer;
 pub const when = elements.when;
+pub const img = elements.img;
+pub const imgPath = elements.imgPath;
+pub const imgHandle = elements.imgHandle;
+pub const svg = elements.svg;
+pub const svgPath = elements.svgPath;
+pub const ImageFit = elements.ImageFit;
 pub const progressBar = elements.progressBar;
 pub const progressTrack = elements.progressTrack;
 pub const formatToday = elements.formatToday;
@@ -93,6 +100,8 @@ test {
     _ = @import("platform/root.zig");
     _ = @import("gpu/root.zig");
     _ = @import("text/root.zig");
+    _ = @import("fonts/root.zig");
+    _ = @import("images/root.zig");
     _ = @import("app/root.zig");
     _ = @import("elements/root.zig");
     _ = @import("widgets/root.zig");

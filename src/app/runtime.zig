@@ -254,6 +254,10 @@ pub fn mountView(store: *EntityStore, window: *Window, build_fn: anytype) void {
                 const entity = Entity(T){ .header = header, .value = value };
                 var render_cx = Context(T){ .store = header.store, .current = entity, .window = win };
                 win.ui_frame.reset(win, win.pointer_position);
+                win.ui_frame.fonts = win.fonts;
+                win.ui_frame.images = win.images;
+                win.ui_frame.frame_id = win.frame_id;
+                win.ui_frame.allocator = win.allocator;
                 elements.element.beginFrame(&win.ui_frame);
                 defer elements.element.endFrame();
                 const root_element = value.render(win, &render_cx);

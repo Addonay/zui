@@ -14,7 +14,7 @@ It mirrors GPUI's shape, translated to Zig:
 
 ## Naive build-out order
 
-1. `App` + event loop + one window (start with GLFW or Wayland directly, single backend).
+1. `App` + event loop + one window (native backend directly, single backend).
 2. `Entity` arena + `Context.notify()` dirty bit + re-render every dirty frame (no diffing).
 3. Elements `div / text / spacer / when / children` + naive flexbox measure/layout (no cache).
 4. Software-first painter: one quad batch + one text run (use `stb_truetype` first, HarfBuzz later).

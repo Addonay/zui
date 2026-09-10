@@ -489,7 +489,10 @@ fn filterPill(cx: *Context(TodoApp), f: Filter, active_filter: Filter, n: usize)
         .px(8)
         .h(20)
         .rounded_full()
-        .bg(if (active) zui.hex(0x00000022) else zui.hex(0xffffff14))
+        // NOTE: `hex` branches on magnitude (<=0xFFFFFF is opaque RRGGBB),
+        // so translucent black must be spelled `rgba`, not `hex(0x00000022)`
+        // (which parses as opaque navy #000022).
+        .bg(if (active) zui.rgba(0, 0, 0, 0.13) else zui.hex(0xffffff14))
         .items_center()
         .justify_center()
         .child(zui.textFmt("{d}", .{n}, .{ .font = theme.font.mono, .size = 12, .line_height = 16, .weight = .semibold })));
@@ -532,6 +535,34 @@ fn emptyState(title: []const u8, body: []const u8) Element {
 // App wiring — mirrors gpui's `application().run(|cx| cx.open_window(...))`.
 // ---------------------------------------------------------------------------
 
+fn buildRoot(window: *Window, vcx: *Context(TodoApp)) Entity(TodoApp) {
+    // Focus the composer on launch, like gpui's `window.focus(...)`.
+    const view = vcx.new(TodoApp, .{});
+    window.focus(view.read().input.focusHandle(vcx), vcx);
+    vcx.bindKeys(TodoApp, &.{
+        .{ .key = "enter", .action = "add" },
+        .{ .key = "space", .action = "toggle-selected" },
+        .{ .key = "backspace", .action = "delete-selected" },
+    });
+    window.on_action("add", view, TodoApp.addFromDraft);
+    window.on_action("toggle-selected", view, TodoApp.toggleSelected);
+    window.on_action("delete-selected", view, TodoApp.removeSelected);
+    seedDemo(view);
+    return view;
+}
+
+/// Screenshot seed: ZUI_TODO_DEMO=1 starts with rows so empty state and
+/// populated list can both be verified visually.
+fn seedDemo(view: Entity(TodoApp)) void {
+    if (std.c.getenv("ZUI_TODO_DEMO") == null) return;
+    view.updateWith("Buy milk", TodoApp.add) catch {};
+    view.updateWith("Write zig", TodoApp.add) catch {};
+    view.updateWith("Ship the todo app", TodoApp.add) catch {};
+    if (view.read().todos.items.len > 0) {
+        view.updateWith(view.read().todos.items[0].id, TodoApp.toggle);
+    }
+}
+
 fn onOpen(cx: *App) void {
     const bounds = zui.Bounds.centered(null, zui.size(680, 760), cx);
     _ = cx.openWindow(.{
@@ -542,30 +573,224 @@ fn onOpen(cx: *App) void {
         // (icon, title, min/max/close) so the app looks identical on
         // Wayland, X11, Win32, and Cocoa.
         .chrome = .custom,
-    }, struct {
-        fn build(window: *Window, vcx: *Context(TodoApp)) Entity(TodoApp) {
-            // Focus the composer on launch, like gpui's `window.focus(...)`.
-            const view = vcx.new(TodoApp, .{});
-            window.focus(view.read().input.focusHandle(vcx), vcx);
-            vcx.bindKeys(TodoApp, &.{
-                .{ .key = "enter", .action = "add" },
-                .{ .key = "space", .action = "toggle-selected" },
-                .{ .key = "backspace", .action = "delete-selected" },
-            });
-            window.on_action("add", view, TodoApp.addFromDraft);
-            window.on_action("toggle-selected", view, TodoApp.toggleSelected);
-            window.on_action("delete-selected", view, TodoApp.removeSelected);
-            return view;
-        }
-    }.build) catch |err| std.log.err("open window: {s}", .{@errorName(err)});
+    }, buildRoot) catch |err| std.log.err("open window: {s}", .{@errorName(err)});
     cx.activate(true);
 }
 
+/// Headless snapshot: ZUI_SNAPSHOT=/path.ppm renders one frame through the
+/// exact layout+painter path and dumps it as PPM. No window needed, so visual
+/// regressions can be checked in CI or over ssh.
+fn snapshotHeadless(gpa: std.mem.Allocator, path: []const u8) !void {
+    const width: u32 = 680;
+    const height: u32 = 760;
+    var app = try App.initHeadless(gpa);
+    defer app.deinit();
+    const win = try app.openWindow(.{
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 680, .h = 760 } },
+        .title = "Tasks — zui",
+        .min_size = zui.size(440, 520),
+        .chrome = .custom,
+    }, buildRoot);
+    _ = app.step();
+
+    if (std.c.getenv("ZUI_DEBUG_BOUNDS")) |raw| {
+        const out_path = std.mem.span(raw);
+        var path_buf: [4096]u8 = undefined;
+        if (out_path.len < path_buf.len) {
+            @memcpy(path_buf[0..out_path.len], out_path);
+            path_buf[out_path.len] = 0;
+            const name: [*:0]const u8 = path_buf[0..out_path.len :0];
+            if (std.c.fopen(name, "w")) |f| {
+                defer _ = std.c.fclose(f);
+                var idx: usize = 0;
+                while (idx < win.ui_frame.node_count) : (idx += 1) {
+                    const n = &win.ui_frame.nodes[idx];
+                    const kind: u8 = switch (n.kind) {
+                        .container => 'C',
+                        .text => 'T',
+                        .spacer => 'S',
+                        .image => 'I',
+                    };
+                    var line: [512]u8 = undefined;
+                    const text_len = @min(n.text_value.len, 80);
+                    const text = try std.fmt.bufPrint(&line, "node {d} kind {c} bounds {d:.1} {d:.1} {d:.1} {d:.1} text '{s}'\n", .{ idx, kind, n.bounds.x, n.bounds.y, n.bounds.w, n.bounds.h, n.text_value[0..text_len] });
+                    if (std.c.fwrite(text.ptr, 1, text.len, f) != text.len) break;
+                }
+                for (win.scene.slice(), 0..) |q, qi| {
+                    var line: [512]u8 = undefined;
+                    const text = try std.fmt.bufPrint(&line, "quad {d} rect {d:.1} {d:.1} {d:.1} {d:.1} r={d:.1} rgba {d:.2} {d:.2} {d:.2} {d:.2}\n", .{ qi, q.x, q.y, q.w, q.h, q.radius, q.color.r, q.color.g, q.color.b, q.color.a });
+                    if (std.c.fwrite(text.ptr, 1, text.len, f) != text.len) break;
+                }
+                for (win.scene.glyphSlice(), 0..) |g, gi| {
+                    var line: [512]u8 = undefined;
+                    const text = try std.fmt.bufPrint(&line, "glyph {d} pos {d:.1} {d:.1} size {d}x{d} off {d}\n", .{ gi, g.x, g.y, g.w, g.h, g.atlas_offset });
+                    if (std.c.fwrite(text.ptr, 1, text.len, f) != text.len) break;
+                }
+                for (win.scene.imageSlice(), 0..) |b, bi| {
+                    var line: [512]u8 = undefined;
+                    const text = try std.fmt.bufPrint(&line, "blit {d} rect {d:.1} {d:.1} {d:.1} {d:.1} src {d}x{d} off {d}\n", .{ bi, b.x, b.y, b.w, b.h, b.src_w, b.src_h, b.pool_offset });
+                    if (std.c.fwrite(text.ptr, 1, text.len, f) != text.len) break;
+                }
+            }
+        }
+    }
+
+    const pixels = try gpa.alloc(u8, @as(usize, width) * height * 4);
+    defer gpa.free(pixels);
+    const target = zui.gpu.software.Target.init(pixels, width, height, .rgba32);
+    target.clear(theme.bg);
+    target.renderScene(&win.scene, app.glyphPixels(), app.imagePixels());
+
+    const file = file: {
+        var path_buf: [4096]u8 = undefined;
+        if (path.len >= path_buf.len) return error.NameTooLong;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        const name: [*:0]const u8 = path_buf[0..path.len :0];
+        break :file std.c.fopen(name, "wb") orelse return error.CannotOpenSnapshot;
+    };
+    defer _ = std.c.fclose(file);
+    var header: [64]u8 = undefined;
+    const header_text = try std.fmt.bufPrint(&header, "P6\n{d} {d}\n255\n", .{ width, height });
+    if (std.c.fwrite(header_text.ptr, 1, header_text.len, file) != header_text.len) return error.SnapshotWriteFailed;
+    var i: usize = 0;
+    while (i < pixels.len) : (i += 4) {
+        if (std.c.fwrite(pixels.ptr + i, 1, 3, file) != 3) return error.SnapshotWriteFailed;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
+    if (std.c.getenv("ZUI_SNAPSHOT")) |raw| {
+        try snapshotHeadless(init.gpa, std.mem.span(raw));
+        return;
+    }
+    if (std.c.getenv("ZUI_SELFTEST") != null) {
+        try selftestHeadless(init.gpa);
+        return;
+    }
     var app = try App.init(init.gpa);
     defer app.deinit();
 
     app.run(onOpen);
+}
+
+/// Headless functional test: drives synthetic mouse/key events through the
+/// full backend queue → App → Window → hit-test → listener → entity path
+/// and verifies state changes. Run with:
+///   ZUI_TODO_DEMO=1 ZUI_SELFTEST=1 zig build run-todo
+/// Exits nonzero on the first failure so CI can gate on it.
+var selftest_view: ?Entity(TodoApp) = null;
+
+fn selftestBuildRoot(window: *Window, vcx: *Context(TodoApp)) Entity(TodoApp) {
+    const view = buildRoot(window, vcx);
+    selftest_view = view;
+    return view;
+}
+
+fn selftestHeadless(gpa: std.mem.Allocator) !void {
+    const out = std.debug.print;
+    var app = try App.initHeadless(gpa);
+    defer app.deinit();
+    const win = try app.openWindow(.{
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 680, .h = 760 } },
+        .title = "Tasks — zui",
+        .min_size = zui.size(440, 520),
+        .chrome = .custom,
+    }, selftestBuildRoot);
+    _ = app.step(); // initial render populates hit regions
+    const null_backend = app.getNullBackend() orelse return error.SelftestNeedsNullBackend;
+    const view = selftest_view orelse return error.SelftestNoView;
+
+    var failures: u32 = 0;
+    const check = struct {
+        fn ok(cond: bool, count: *u32, comptime fmt: []const u8, args: anytype) void {
+            if (cond) {
+                out("selftest PASS: " ++ fmt ++ "\n", args);
+            } else {
+                out("selftest FAIL: " ++ fmt ++ "\n", args);
+                count.* += 1;
+            }
+        }
+    }.ok;
+
+    // -- 0. demo seed gave 3 todos, first done --
+    check(view.read().todos.items.len == 3, &failures, "seed has 3 todos (got {d})", .{view.read().todos.items.len});
+    check(view.read().todos.items[0].done, &failures, "first todo starts done", .{});
+
+    // -- 1. type "Test task" into the composer (focus starts on input).
+    // Real backends emit one `.text` per physical press; `.key` alone
+    // must never insert (that path is for bindings and editing keys).
+    for ("Test task") |byte| {
+        var text_ev = zui.platform.event.TextEvent{};
+        text_ev.text[0] = byte;
+        text_ev.len = 1;
+        if (!null_backend.pushEvent(.{ .text = text_ev })) return error.SelftestQueueFull;
+        _ = app.step();
+    }
+    check(std.mem.eql(u8, view.read().input.read().buffer[0..view.read().input.read().len], "Test task"), &failures, "typing fills composer", .{});
+
+    // -- 1b. space keypress is consumed by the field: no toggle fires,
+    // and (unlike the old .key-insertion path) no space is inserted --
+    const selected_before = view.read().selected;
+    const len_before = view.read().input.read().len;
+    if (!null_backend.pushEvent(.{ .key = .{ .key = .space, .pressed = true } })) return error.SelftestQueueFull;
+    _ = app.step();
+    check(view.read().selected == selected_before, &failures, "space in field does not toggle", .{});
+    check(view.read().input.read().len == len_before, &failures, "space key alone inserts nothing", .{});
+
+    // -- 2. press Enter → "add" action appends the todo, clears input --
+    if (!null_backend.pushEvent(.{ .key = .{ .key = .enter, .pressed = true } })) return error.SelftestQueueFull;
+    _ = app.step();
+    check(view.read().todos.items.len == 4, &failures, "enter adds todo (got {d})", .{view.read().todos.items.len});
+    check(view.read().input.read().len == 0, &failures, "input cleared after add", .{});
+
+    // -- 3. click the first checkbox → toggles it off --
+    const box = findCheckbox(win, "Buy milk") orelse {
+        check(false, &failures, "checkbox region found", .{});
+        return error.SelftestFailures;
+    };
+    if (!null_backend.pushEvent(.{ .mouse = .{
+        .pos = .{ .x = box.x + box.w / 2, .y = box.y + box.h / 2 },
+        .button = .left,
+        .pressed = true,
+    } })) return error.SelftestQueueFull;
+    _ = app.step();
+    check(!view.read().todos.items[0].done, &failures, "click toggles first todo off", .{});
+
+    // -- 4. UI re-rendered with regions intact --
+    check(win.ui_frame.region_count > 0, &failures, "regions present after input (got {d})", .{win.ui_frame.region_count});
+
+    if (failures > 0) return error.SelftestFailures;
+    out("selftest: all checks passed\n", .{});
+}
+
+/// Locate the ~24x24 clickable checkbox region on the row showing `title`.
+fn findCheckbox(win: *Window, title: []const u8) ?zui.Rect {
+    var text_x: f32 = 0;
+    var text_y: f32 = 0;
+    var found_text = false;
+    var idx: usize = 0;
+    while (idx < win.ui_frame.node_count) : (idx += 1) {
+        const n = &win.ui_frame.nodes[idx];
+        if (n.kind == .text and std.mem.eql(u8, n.text_value, title)) {
+            text_x = n.bounds.x;
+            text_y = n.bounds.y + n.bounds.h / 2;
+            found_text = true;
+            break;
+        }
+    }
+    if (!found_text) return null;
+    for (win.ui_frame.regions[0..win.ui_frame.region_count]) |region| {
+        if (region.listener == null) continue;
+        const w = region.bounds.w;
+        const h = region.bounds.h;
+        if (w < 20 or w > 28 or h < 20 or h > 28) continue;
+        const cy = region.bounds.y + h / 2;
+        if (@abs(cy - text_y) < 24 and region.bounds.x < text_x) {
+            return region.bounds;
+        }
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------

@@ -6,8 +6,11 @@ const limits = @import("../core/limits.zig");
 const color = @import("../core/color.zig");
 const platform = @import("../platform/root.zig");
 const gpu = @import("../gpu/root.zig");
+const fonts = @import("../fonts/root.zig");
 const window_mod = @import("window.zig");
 const runtime = @import("runtime.zig");
+const zlog = @import("../core/log.zig");
+const images = @import("../images/root.zig");
 
 pub const Window = window_mod.Window;
 pub const WindowOptions = window_mod.WindowOptions;
@@ -18,12 +21,21 @@ pub const App = struct {
     backend: platform.Backend,
     entities: runtime.EntityStore,
     owned_backend: ?platform.BackendInstance = null,
+    /// Owned font stack (null without system fonts → bitmap fallback).
+    /// Borrowed by windows/frames per render; never grows after init.
+    fonts: ?*fonts.Collection = null,
+    /// Owned decoded-image pool (always present; empty until first image).
+    /// Borrowed by windows/frames per render like the font stack.
+    image_cache: ?*images.Cache = null,
     windows: [limits.MAX_WINDOWS]?*Window = @splat(null),
     active_window_count: usize = 0,
     next_window_id: u32 = 1,
     event_queue: platform.EventQueue = .{},
     should_quit: bool = false,
     is_active: bool = false,
+    /// Monotonic frame counter for `ZUI_LOG` diagnostics (a stalled
+    /// counter in the log pinpoints event-loop starvation hangs).
+    step_count: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) !App {
         var instance = try platform.createAuto(allocator, "ZUI Application", 800, 600);
@@ -32,6 +44,8 @@ pub const App = struct {
             .backend = instance.handle(),
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = instance,
+            .fonts = try initFonts(allocator),
+            .image_cache = try images.Cache.init(allocator),
         };
     }
 
@@ -43,6 +57,8 @@ pub const App = struct {
             .backend = nb.backendHandle(),
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = .{ .null_backend = nb },
+            .fonts = try initFonts(allocator),
+            .image_cache = try images.Cache.init(allocator),
         };
     }
 
@@ -52,7 +68,32 @@ pub const App = struct {
             .backend = be,
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = null,
+            .fonts = initFonts(allocator) catch null,
+            .image_cache = images.Cache.init(allocator) catch null,
         };
+    }
+
+    fn initFonts(allocator: std.mem.Allocator) !?*fonts.Collection {
+        // Font failure degrades to the bitmap fallback; only allocator OOM
+        // propagates. Stack-first ordering keeps this leak-free.
+        const stack = fonts.Collection.init() catch return null;
+        const owned = try allocator.create(fonts.Collection);
+        owned.* = stack;
+        return owned;
+    }
+
+    /// Atlas pixel pool backing the current frame's glyph entries (empty
+    /// without fonts). Valid only until the next render mutates the atlas.
+    pub fn glyphPixels(self: *App) []const u8 {
+        if (self.fonts) |fc| return fc.glyphs.pixels[0..fc.glyphs.pixels_used];
+        return &.{};
+    }
+
+    /// Image-cache pool backing the current frame's image entries (empty
+    /// without a cache). Same lifetime rule as the glyph pool.
+    pub fn imagePixels(self: *App) []const u8 {
+        if (self.image_cache) |ic| return ic.pool[0..ic.used];
+        return &.{};
     }
 
     pub fn deinit(self: *App) void {
@@ -64,6 +105,15 @@ pub const App = struct {
         }
         self.active_window_count = 0;
         self.entities.deinit();
+        if (self.fonts) |fc| {
+            fc.deinit();
+            self.allocator.destroy(fc);
+            self.fonts = null;
+        }
+        if (self.image_cache) |ic| {
+            ic.deinit(self.allocator);
+            self.image_cache = null;
+        }
         if (self.owned_backend) |*be| {
             be.deinit(self.allocator);
             self.owned_backend = null;
@@ -82,6 +132,41 @@ pub const App = struct {
 
     pub fn wakeup(self: *App) void {
         self.backend.wakeup();
+    }
+
+    fn osSetTitle(raw: *anyopaque, title: []const u8) void {
+        const app: *App = @ptrCast(@alignCast(raw));
+        app.backend.setTitle(title);
+    }
+
+    fn osSetCursor(raw: *anyopaque, shape: platform.CursorShape) void {
+        const app: *App = @ptrCast(@alignCast(raw));
+        app.backend.setCursor(shape);
+    }
+
+    fn osGetClipboard(raw: *anyopaque, out: []u8) usize {
+        const app: *App = @ptrCast(@alignCast(raw));
+        return app.backend.clipboardText(out);
+    }
+
+    fn osSetClipboard(raw: *anyopaque, text: []const u8) bool {
+        const app: *App = @ptrCast(@alignCast(raw));
+        return app.backend.setClipboardText(text);
+    }
+
+    fn osDragWindow(raw: *anyopaque) void {
+        const app: *App = @ptrCast(@alignCast(raw));
+        app.backend.dragWindow();
+    }
+
+    fn osMinimizeWindow(raw: *anyopaque) void {
+        const app: *App = @ptrCast(@alignCast(raw));
+        app.backend.minimizeWindow();
+    }
+
+    fn osToggleMaximizeWindow(raw: *anyopaque) void {
+        const app: *App = @ptrCast(@alignCast(raw));
+        app.backend.toggleMaximizeWindow();
     }
 
     pub fn activate(self: *App, ignoring_other_apps: bool) void {
@@ -118,6 +203,7 @@ pub const App = struct {
         win.* = .{
             .id = self.next_window_id,
             .app = self,
+            .allocator = self.allocator,
             .wakeup_fn = struct {
                 fn call(raw: *anyopaque) void {
                     const app: *App = @ptrCast(@alignCast(raw));
@@ -130,6 +216,16 @@ pub const App = struct {
                     app.removeWindow(window);
                 }
             }.call,
+            .os = .{
+                .ctx = self,
+                .setTitle = osSetTitle,
+                .setCursor = osSetCursor,
+                .getClipboard = osGetClipboard,
+                .setClipboard = osSetClipboard,
+                .dragWindow = osDragWindow,
+                .minimizeWindow = osMinimizeWindow,
+                .toggleMaximizeWindow = osToggleMaximizeWindow,
+            },
             .bounds = bounds,
             .min_size = options.min_size,
             .max_size = options.max_size,
@@ -138,10 +234,21 @@ pub const App = struct {
             .closed = false,
             .scene = .{},
             .renderer = null,
+            .fonts = self.fonts,
+            .images = self.image_cache,
         };
         self.next_window_id += 1;
 
         win.setTitle(options.title);
+        // Explicit bounds resize the native window to match (X11/Cocoa/
+        // Win32 honor it; Wayland sizes via compositor configure instead).
+        if (options.bounds) |explicit| {
+            if (explicit.size.w > 0 and explicit.size.h > 0) {
+                self.backend.setSize(@intFromFloat(explicit.size.w), @intFromFloat(explicit.size.h));
+            }
+        }
+        // Framed uses the OS titlebar; custom draws its own chrome.
+        self.backend.setDecorated(options.chrome == .system);
 
         self.windows[idx] = win;
         self.active_window_count += 1;
@@ -194,7 +301,7 @@ pub const App = struct {
                 },
                 .focused, .unfocused => {},
             },
-            .mouse, .key, .text => {
+            .mouse, .key, .text, .scroll => {
                 for (&self.windows) |*maybe_win| {
                     if (maybe_win.*) |win| win.handleEvent(ev);
                 }
@@ -214,6 +321,7 @@ pub const App = struct {
     pub fn step(self: *App) bool {
         // 1. Poll events from backend into app's event queue
         self.backend.poll(&self.event_queue);
+        const qlen = self.event_queue.len;
 
         // 2. Process events
         while (self.event_queue.pop()) |ev| {
@@ -224,23 +332,36 @@ pub const App = struct {
             return false;
         }
 
-        // 3. Render dirty windows & present
+        // 3. Render dirty windows & present. Each window renders and
+        // presents adjacently: glyph entries borrow atlas pool bytes that a
+        // later window's render could evict, so present must follow render
+        // before any other window paints.
+        var presented: usize = 0;
         for (&self.windows) |*maybe_win| {
             if (maybe_win.*) |win| {
+                // Pending key sequences expire on a tick budget; expiry
+                // fires a remembered single-key action, if any.
+                if (win.keymap.tick()) |action_name| win.fireAction(action_name);
                 if (win.dirty and !win.closed) {
+                    win.frame_id = self.step_count;
                     win.render();
-                    self.backend.present(&win.scene);
+                    self.backend.present(&win.scene, self.glyphPixels(), self.imagePixels());
+                    presented += 1;
                 }
             }
         }
 
+        self.step_count += 1;
+        zlog.log("app", "step {d}: {d} queued events, {d} presented", .{ self.step_count, qlen, presented });
         return !self.should_quit and self.active_window_count > 0;
     }
 
     pub fn run(self: *App, onOpen: ?*const fn (*App) void) void {
+        zlog.log("app", "run: backend={s}", .{@tagName(self.backend.kind())});
         if (onOpen) |cb| {
             cb(self);
         }
+        zlog.log("app", "run: {d} window(s) open, entering loop", .{self.active_window_count});
         while (self.step()) {
             if (self.should_quit or self.active_window_count == 0) break;
             if (self.backend.kind() == .null) {
@@ -463,4 +584,13 @@ test "app auto probe initializes available backend" {
 
     const k = app.backend.kind();
     try std.testing.expect(k == .wayland or k == .x11 or k == .null);
+}
+
+test "app owns the font stack when system fonts exist" {
+    const font_tables = @import("../fonts/root.zig").tables;
+    if (!font_tables.FontconfigApi.isAvailable() or !font_tables.FreeTypeApi.isAvailable() or !font_tables.HarfBuzzApi.isAvailable()) return;
+    var app = try App.initHeadless(std.testing.allocator);
+    defer app.deinit();
+    try std.testing.expect(app.fonts != null);
+    try std.testing.expectEqual(@as(usize, 0), app.glyphPixels().len);
 }

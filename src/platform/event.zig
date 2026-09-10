@@ -108,6 +108,15 @@ pub const KeyEvent = struct {
     repeat: bool = false,
 };
 
+pub const ScrollEvent = struct {
+    pos: geometry.Point,
+    /// Lines scrolled; positive dy scrolls up, positive dx scrolls right.
+    /// Fractional values carry pixel-precise trackpad deltas.
+    dx: f32 = 0,
+    dy: f32 = 0,
+    modifiers: Modifiers = .{},
+};
+
 pub const TextEvent = struct {
     text: [32]u8 = std.mem.zeroes([32]u8),
     len: u8 = 0,
@@ -129,6 +138,7 @@ pub const Event = union(enum) {
     mouse: MouseEvent,
     key: KeyEvent,
     text: TextEvent,
+    scroll: ScrollEvent,
     window: WindowEvent,
 };
 

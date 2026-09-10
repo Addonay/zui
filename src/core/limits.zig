@@ -53,6 +53,10 @@ pub const MAX_QUADS_PER_FRAME: u32 = 65536;
 /// Maximum glyphs per frame (text characters)
 pub const MAX_GLYPHS_PER_FRAME: u32 = 65536;
 
+/// Maximum shaped glyphs collected into one `Scene`. Separate from the
+/// shaping-run cap: a frame holds many runs. Each entry is ~52 bytes.
+pub const MAX_SCENE_GLYPHS: u32 = 16384;
+
 /// Maximum shadows per frame
 pub const MAX_SHADOWS_PER_FRAME: u32 = 4096;
 
@@ -102,6 +106,18 @@ pub const MAX_SHAPED_RUN_CACHE: u32 = 256;
 
 /// Maximum text length for single-line inputs
 pub const MAX_TEXT_LEN: u32 = 512;
+
+/// Maximum font file path length for a fontconfig match copy (init-time).
+pub const MAX_FONT_PATH_LEN: u32 = 512;
+
+/// Maximum faces held open by one font collection (init-time).
+pub const MAX_FONT_FACES: u32 = 8;
+
+/// Maximum glyphs cached in the glyph atlas.
+pub const MAX_ATLAS_GLYPHS: u32 = 1024;
+
+/// Glyph atlas pixel pool in bytes (8-bit coverage, bump-allocated).
+pub const MAX_ATLAS_PIXELS: u32 = 1024 * 1024;
 
 // =============================================================================
 // Accessibility Limits
@@ -241,6 +257,87 @@ pub const ESTIMATED_FRAME_MESH_MEMORY: u32 = MAX_FRAME_MESHES * ESTIMATED_PATH_M
 pub const MAX_EVENTS_PER_FRAME: u32 = 256;
 
 // =============================================================================
+// GPU Resource Limits (`gpu/device.zig` fixed handle pools)
+// =============================================================================
+
+/// Maximum GPU buffers alive at once (vertex/index/indirect/storage).
+pub const MAX_GPU_BUFFERS: u32 = 1024;
+
+/// Maximum GPU transfer (staging) buffers alive at once.
+pub const MAX_GPU_TRANSFER_BUFFERS: u32 = 256;
+
+/// Maximum GPU textures alive at once (includes swapchain images acquired
+/// per frame, which are driver-owned and never enter this pool).
+pub const MAX_GPU_TEXTURES: u32 = 1024;
+
+/// Maximum GPU samplers alive at once.
+pub const MAX_GPU_SAMPLERS: u32 = 256;
+
+/// Maximum compiled shaders alive at once.
+pub const MAX_GPU_SHADERS: u32 = 256;
+
+/// Maximum graphics pipelines alive at once.
+pub const MAX_GPU_GRAPHICS_PIPELINES: u32 = 256;
+
+/// Maximum compute pipelines alive at once.
+pub const MAX_GPU_COMPUTE_PIPELINES: u32 = 128;
+
+/// Maximum fences alive at once. Must cover frames in flight plus readbacks.
+pub const MAX_GPU_FENCES: u32 = 256;
+
+/// Maximum frames a device may keep in flight (SDL default is 2; 3 allows
+/// triple-buffered present modes).
+pub const MAX_GPU_FRAMES_IN_FLIGHT: u32 = 3;
+
+/// Maximum color targets in one render pass (matches SDL_gpu).
+pub const MAX_GPU_COLOR_TARGETS: u32 = 4;
+
+/// Maximum vertex buffer slots bound in one draw.
+pub const MAX_GPU_VERTEX_BUFFER_SLOTS: u32 = 16;
+
+/// Maximum bytes pushed as uniforms in one call (drivers stage these into
+/// a ring buffer; large constants belong in storage buffers instead).
+pub const MAX_GPU_UNIFORM_PUSH_BYTES: u32 = 4096;
+
+/// Maximum clipboard UTF-8 bytes kept by the null backend (real backends
+/// stream through the OS; this only bounds headless copy/paste tests).
+pub const MAX_CLIPBOARD_BYTES: u32 = 65536;
+
+/// Maximum keymap bindings per window (single chords and sequences).
+pub const MAX_KEYMAP_BINDINGS: u32 = 64;
+
+/// Maximum predicate nodes per binding (fits u8 child indices).
+pub const MAX_KEYMAP_PREDICATE_NODES: u32 = 24;
+
+/// Maximum entries per keymap context frame.
+pub const MAX_KEYMAP_CONTEXT_ENTRIES: u32 = 8;
+/// Scratch bytes the null/software devices expose for transfer-buffer
+/// mapping tests. Real drivers map real staging memory instead.
+pub const NULL_DEVICE_MAP_BYTES: u32 = 65536;
+
+// =============================================================================
+// Image Limits
+// =============================================================================
+
+/// Maximum decoded image dimension (width or height) in pixels.
+pub const MAX_IMAGE_DIMENSION: u32 = 4096;
+
+/// Maximum decoded image pixels (w*h); bounds single-image CPU/RAM cost.
+pub const MAX_IMAGE_PIXELS: u32 = 2048 * 2048;
+
+/// Decoded RGBA8 pool bytes owned by the App image cache (bump-allocated).
+pub const MAX_IMAGE_POOL_BYTES: u32 = 8 * 1024 * 1024;
+
+/// Maximum cached images (pool entries) at once.
+pub const MAX_CACHED_IMAGES: u32 = 64;
+
+/// Maximum image blits per frame (rectangles referencing pool bytes).
+pub const MAX_IMAGE_BLITS_PER_FRAME: u32 = 64;
+
+/// Maximum SVG source bytes parsed in one go (cold path).
+pub const MAX_SVG_BYTES: u32 = 1024 * 1024;
+
+// =============================================================================
 // Compile-time Validation
 // =============================================================================
 
@@ -264,6 +361,15 @@ comptime {
     // Indices are derived from vertices correctly
     std.debug.assert(MAX_PATH_TRIANGLES == MAX_PATH_VERTICES - 2);
     std.debug.assert(MAX_PATH_INDICES == MAX_PATH_TRIANGLES * 3);
+
+    // GPU pools stay balanced: fences must cover in-flight frames with
+    // headroom for readbacks, and every pool holds at least one entry.
+    std.debug.assert(MAX_GPU_FENCES >= MAX_GPU_FRAMES_IN_FLIGHT * 2);
+    std.debug.assert(MAX_GPU_COLOR_TARGETS >= 1);
+    std.debug.assert(MAX_GPU_COLOR_TARGETS <= 4);
+    std.debug.assert(MAX_GPU_BUFFERS >= 1);
+    std.debug.assert(MAX_GPU_TEXTURES >= 1);
+    std.debug.assert(NULL_DEVICE_MAP_BYTES >= 4096);
 
     // Stroke limits are self-consistent
     std.debug.assert(MAX_STROKE_OUTPUT >= MAX_STROKE_INPUT);

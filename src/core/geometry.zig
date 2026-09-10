@@ -2,8 +2,8 @@
 //!
 //! Why plain f32 structs: layout works in logical pixels, the painter
 //! converts to physical once via content scale. Keeping one canonical
-//! type avoids per-backend drift (same lesson as GLFW's shared
-//! `_GLFWwindow` common fields + SDL's `SDL_Rect`).
+//! type avoids per-backend drift (shared window-struct fields and one
+//! rect type everywhere).
 
 const std = @import("std");
 

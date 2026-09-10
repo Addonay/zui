@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const layout_mod = b.addModule("layout", .{
-        .root_source_file = b.path("src/layout_module.zig"),
+        .root_source_file = b.path("src/layout/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -19,6 +19,13 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "layout", .module = layout_mod },
         },
+    });
+
+    // Vendored C image backends (nanosvg + stb_image, zero deps).
+    mod.addIncludePath(b.path("third_party"));
+    mod.addCSourceFile(.{
+        .file = b.path("third_party/images.c"),
+        .flags = &.{ "-O2", "-std=c99", "-fno-sanitize=all" },
     });
 
     const mod_tests = b.addTest(.{
@@ -38,41 +45,25 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_layout_tests.step);
 
-    // Layout benchmarks (reproducible, ReleaseFast). Writes table to stdout;
-    // copy into BENCHMARKS.md after verifying on your machine.
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("src/layout/bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-        .imports = &.{
-            .{ .name = "layout", .module = layout_mod },
-        },
-    });
-    const bench = b.addExecutable(.{
-        .name = "layout-bench",
-        .root_module = bench_mod,
-    });
-    const run_bench = b.addRunArtifact(bench);
-    const bench_step = b.step("bench-layout", "Run layout benchmarks (ReleaseFast)");
-    bench_step.dependOn(&run_bench.step);
-
-    // Optional cross-check against the vendored Taffy 0.14 reference. It is
-    // intentionally a separate step because Cargo may need network access to
-    // fetch Criterion's transitive dependencies.
-    const taffy_compare = b.addSystemCommand(&.{
-        "cargo",
-        "run",
-        "--release",
-        "--manifest-path",
-        "src/layout/bench/Cargo.toml",
-    });
-    const taffy_step = b.step("bench-taffy", "Run the Taffy release comparison benchmark");
-    taffy_step.dependOn(&taffy_compare.step);
+    const use_llvm = b.option(bool, "use-llvm", "use llvm for compilation");
 
     const todo = b.addExecutable(.{
         .name = "todo",
+        .root_module = b.createModule(.{ .root_source_file = b.path("examples/todo/main.zig"), .target = target, .optimize = optimize, .imports = &.{.{
+            .name = "zui",
+            .module = mod,
+        }}, .strip = true }),
+        .use_llvm = use_llvm,
+    });
+    const run_todo = b.addRunArtifact(todo);
+
+    const run_todo_step = b.step("run-todo", "Run the todo example");
+    run_todo_step.dependOn(&run_todo.step);
+
+    const images_demo = b.addExecutable(.{
+        .name = "images-demo",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/todo/main.zig"),
+            .root_source_file = b.path("examples/images/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{
@@ -81,8 +72,8 @@ pub fn build(b: *std.Build) void {
             }},
         }),
     });
-    const run_todo = b.addRunArtifact(todo);
+    const run_images = b.addRunArtifact(images_demo);
 
-    const run_todo_step = b.step("run-todo", "Run the todo example");
-    run_todo_step.dependOn(&run_todo.step);
+    const run_images_step = b.step("run-images", "Render the images demo to a PPM snapshot");
+    run_images_step.dependOn(&run_images.step);
 }

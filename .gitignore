@@ -2,3 +2,6 @@ zig-out
 .zig-cache
 .references
 target
+.zig-global
+.zig-cache-layout
+.opencode

@@ -14,13 +14,33 @@ pub fn measure(frame: *element.Frame, index: u16) core.Size {
     var natural = core.Size{};
 
     switch (node.kind) {
+        .image => {
+            // Intrinsic size; one explicit axis derives the other by aspect
+            // (explicit w+h / square below still win).
+            natural.w = node.image.intrinsic_w;
+            natural.h = node.image.intrinsic_h;
+            if (node.style.width != null and node.style.height == null and
+                node.image.intrinsic_w > 0 and node.image.intrinsic_h > 0)
+            {
+                natural.h = node.style.width.? * node.image.intrinsic_h / node.image.intrinsic_w;
+            } else if (node.style.height != null and node.style.width == null and
+                node.image.intrinsic_w > 0 and node.image.intrinsic_h > 0)
+            {
+                natural.w = node.style.height.? * node.image.intrinsic_w / node.image.intrinsic_h;
+            }
+        },
         .text => {
-            var glyphs: usize = 0;
-            for (node.text_value) |byte| if ((byte & 0xc0) != 0x80) {
-                glyphs += 1;
-            };
-            const count = @as(f32, @floatFromInt(glyphs));
-            natural.w = count * (node.text_style.size * 0.64 + node.text_style.tracking);
+            if (frame.fonts) |fc| {
+                // Shaped width: the exact advances the painter places with.
+                natural.w = fc.measureText(node.text_value, node.text_style.size, node.text_style.tracking, node.text_style.font);
+            } else {
+                var glyphs: usize = 0;
+                for (node.text_value) |byte| if ((byte & 0xc0) != 0x80) {
+                    glyphs += 1;
+                };
+                const count = @as(f32, @floatFromInt(glyphs));
+                natural.w = count * element.textAdvance(node.text_style.size, node.text_style.tracking, node.text_style.weight);
+            }
             natural.h = node.text_style.line_height orelse node.text_style.size * 1.25;
         },
         .spacer => {},
@@ -125,6 +145,11 @@ fn place(frame: *element.Frame, index: u16, available: core.Rect, forced: bool) 
         if (node.style.direction == .row) {
             if (child_node.style.flex_grow > 0 and flex_total > 0) child_size.w = remaining * child_node.style.flex_grow / flex_total;
             if (child_node.style.full_height) child_size.h = content.h;
+            // Explicit heights must survive even when measured height is 0
+            // (e.g. an empty gradient fill in a flex row); otherwise the
+            // forced place below clamps them to the 0 measured height.
+            if (child_node.style.height) |h| child_size.h = h;
+            if (child_node.style.square) |s| child_size.h = s;
             var y = content.y;
             if (node.style.alignment == .center) y += (content.h - child_size.h) / 2;
             place(frame, child_index, .{ .x = cursor, .y = y, .w = child_size.w, .h = child_size.h }, true);
@@ -165,4 +190,68 @@ test "column layout applies padding and gap" {
     layout(&frame, root, .{ .w = 100, .h = 100 });
     try std.testing.expectEqual(@as(f32, 10), frame.nodes[1].bounds.x);
     try std.testing.expectEqual(@as(f32, 35), frame.nodes[2].bounds.y);
+}
+
+test "text measure matches painter advance" {
+    const t = std.testing;
+    var frame = element.Frame{};
+    frame.reset(@ptrFromInt(1), .{});
+    element.beginFrame(&frame);
+    defer element.endFrame();
+    const root = element.text("abc", .{ .size = 14 });
+    layout(&frame, root, .{ .w = 500, .h = 100 });
+    const want = 3 * element.textAdvance(14, 0, .normal);
+    // NOTE: root text bounds stretch to the forced viewport; measured width
+    // is what must match the painter's advance.
+    try t.expectApproxEqAbs(want, frame.nodes[root.index].measured.w, 0.001);
+}
+
+test "progress track fill is proportional and fits parent" {
+    const t = std.testing;
+    var frame = element.Frame{};
+    frame.reset(@ptrFromInt(1), .{});
+    element.beginFrame(&frame);
+    defer element.endFrame();
+    const root = element.progressTrack(0.5);
+    layout(&frame, root, .{ .w = 200, .h = 10 });
+    try t.expectApproxEqAbs(@as(f32, 200), frame.nodes[root.index].bounds.w, 0.5);
+    const fill_idx = frame.nodes[root.index].first_child.?;
+    // Half of the 200px track (the old fixed 520px child overflowed here).
+    try t.expectApproxEqAbs(@as(f32, 100), frame.nodes[fill_idx].bounds.w, 2.0);
+    try t.expectApproxEqAbs(@as(f32, 4), frame.nodes[fill_idx].bounds.h, 0.5);
+}
+
+test "row child keeps explicit height with zero measured height" {
+    const t = std.testing;
+    var frame = element.Frame{};
+    frame.reset(@ptrFromInt(1), .{});
+    element.beginFrame(&frame);
+    defer element.endFrame();
+    const root = element.div().flex_row().w(200).h(10)
+        .child(element.div().h(4));
+    layout(&frame, root, .{ .w = 200, .h = 10 });
+    const child_idx = frame.nodes[root.index].first_child.?;
+    try t.expectApproxEqAbs(@as(f32, 4), frame.nodes[child_idx].bounds.h, 0.001);
+}
+
+test "shaped measure matches collection measure" {
+    const t = std.testing;
+    const fonts = @import("../fonts/root.zig");
+    if (!fonts.tables.FontconfigApi.isAvailable() or !fonts.tables.FreeTypeApi.isAvailable() or !fonts.tables.HarfBuzzApi.isAvailable()) return;
+    var stack = try fonts.Collection.init();
+    defer stack.deinit();
+
+    var frame = element.Frame{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.fonts = &stack;
+    element.beginFrame(&frame);
+    defer element.endFrame();
+    const root = element.text("Hello", .{ .size = 14 });
+    layout(&frame, root, .{ .w = 500, .h = 100 });
+    const want = stack.measureText("Hello", 14, 0, "");
+    try t.expectApproxEqAbs(want, frame.nodes[root.index].measured.w, 0.001);
+    // And the shaped width differs from the bitmap estimate (or the test
+    // proves nothing about which path ran).
+    const estimate = 5 * element.textAdvance(14, 0, .normal);
+    try t.expect(@abs(want - estimate) > 1.0);
 }

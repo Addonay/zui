@@ -1,6 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("../core/root.zig");
 const platform = @import("../platform/root.zig");
+const fonts = @import("../fonts/root.zig");
+const images = @import("../images/root.zig");
 
 pub const max_nodes = core.limits.MAX_LAYOUT_ELEMENTS;
 pub const max_regions = 512;
@@ -104,13 +107,42 @@ pub const TextStyle = struct {
     strike: bool = false,
 };
 
-pub const NodeKind = enum { container, text, spacer };
+pub const NodeKind = enum { container, text, spacer, image };
+
+/// Object-fit behavior for image nodes (GPUI `ObjectFit` parity).
+pub const ImageFit = enum { contain, cover, fill };
+
+/// Image content source. Slices are borrowed (same contract as text_value):
+/// static bytes, `@embedFile`, or a caller-owned path string.
+pub const ImageSource = union(enum) {
+    bytes: []const u8,
+    path: []const u8,
+    handle: images.Handle,
+};
+
+pub const ImageDesc = struct {
+    source: ImageSource = .{ .bytes = &.{} },
+    /// True for `svg()`: rasterize as vector at draw size with tint.
+    /// False for `img()`: decode raster bytes (SVG bytes still accepted
+    /// and rasterized at intrinsic size, GPUI `img()` parity).
+    svg: bool = false,
+    fit: ImageFit = .contain,
+    gray: bool = false,
+    /// Replaces `currentColor` in SVGs (GPUI icon tint); multiplies alpha
+    /// into raster blits together with style opacity.
+    tint: ?core.Color = null,
+    /// Intrinsic pixel size resolved at build (probe/header, no full
+    /// decode); zero when unknown so layout collapses the node.
+    intrinsic_w: f32 = 0,
+    intrinsic_h: f32 = 0,
+};
 
 pub const Node = struct {
     kind: NodeKind = .container,
     style: Style = .{},
     text_style: TextStyle = .{},
     text_value: []const u8 = "",
+    image: ImageDesc = .{},
     first_child: ?u16 = null,
     last_child: ?u16 = null,
     next_sibling: ?u16 = null,
@@ -131,6 +163,18 @@ pub const Frame = struct {
     text_len: usize = 0,
     window: ?*anyopaque = null,
     pointer: core.Point = .{ .x = -10000, .y = -10000 },
+    /// Borrowed font stack for shaped measure/paint. Null keeps the bitmap
+    /// fallback (headless tests, machines without fontconfig). Set per frame
+    /// from `Window.fonts`; never owned here.
+    fonts: ?*fonts.Collection = null,
+    /// Borrowed image cache for img()/svg() resolution. Null drops images.
+    /// Set per frame from `Window.images`; never owned here.
+    images: ?*images.Cache = null,
+    /// Owning App's step counter at render; pins image-cache entries.
+    frame_id: u64 = 0,
+    /// Allocator for cold image work (file reads, decode dividends).
+    /// Null drops path sources and uncached decodes.
+    allocator: ?std.mem.Allocator = null,
 
     pub fn reset(self: *Frame, window: *anyopaque, pointer: core.Point) void {
         self.node_count = 0;
@@ -354,6 +398,18 @@ pub const Element = struct {
         self.node().style.pointer = true;
         return self;
     }
+    pub fn object_fit(self: Element, fit: ImageFit) Element {
+        self.node().image.fit = fit;
+        return self;
+    }
+    pub fn grayscale(self: Element) Element {
+        self.node().image.gray = true;
+        return self;
+    }
+    pub fn tint(self: Element, value: core.Color) Element {
+        self.node().image.tint = value;
+        return self;
+    }
     pub fn hover_bg(self: Element, value: core.Color) Element {
         self.node().style.hover_background = value;
         return self;
@@ -426,6 +482,104 @@ pub fn spacer() Element {
     return result.flex_1();
 }
 
+/// Resolve intrinsic pixel size without a full decode: raster headers via
+/// probe, SVG via width/height (or nanosvg's viewBox fallback). Path
+/// sources read through the frame allocator; anything missing yields 0x0
+/// so layout collapses the node instead of guessing.
+fn resolveIntrinsic(source: ImageSource, is_svg: bool, allocator: ?std.mem.Allocator) struct { w: f32, h: f32 } {
+    switch (source) {
+        .handle => |h| return .{ .w = @floatFromInt(h.w), .h = @floatFromInt(h.h) },
+        .bytes => |bytes| {
+            if (is_svg or images.sniff(bytes) == .svg) {
+                const s = images.svg.intrinsicSize(bytes) catch return .{ .w = 0, .h = 0 };
+                return .{ .w = s.w, .h = s.h };
+            }
+            const p = images.raster.probe(bytes) catch return .{ .w = 0, .h = 0 };
+            return .{ .w = @floatFromInt(p.w), .h = @floatFromInt(p.h) };
+        },
+        .path => |path| {
+            const alloc = allocator orelse return .{ .w = 0, .h = 0 };
+            const bytes = readPath(alloc, path) catch return .{ .w = 0, .h = 0 };
+            defer alloc.free(bytes);
+            return resolveIntrinsic(.{ .bytes = bytes }, is_svg, null);
+        },
+    }
+}
+
+/// Read a whole file (cold path: dirty-frame builds only). Caller frees.
+/// Plain libc I/O, same pattern as the snapshot writer in examples/todo.
+pub fn readPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (!builtin.link_libc) return error.Unreadable;
+    var path_buf: [4096]u8 = undefined;
+    if (path.len == 0 or path.len >= path_buf.len) return error.BadPath;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const name: [*:0]const u8 = path_buf[0..path.len :0];
+    const f = std.c.fopen(name, "rb") orelse return error.Unreadable;
+    defer _ = std.c.fclose(f);
+    // Chunked read; a short fread ends input (regular files).
+    var cap: usize = 8192;
+    var out = allocator.alloc(u8, cap) catch return error.OutOfMemory;
+    errdefer allocator.free(out);
+    var len: usize = 0;
+    while (true) {
+        if (len == cap) {
+            if (cap >= core.limits.MAX_IMAGE_POOL_BYTES) return error.Unreadable;
+            cap = @min(cap * 2, core.limits.MAX_IMAGE_POOL_BYTES);
+            out = allocator.realloc(out, cap) catch return error.OutOfMemory;
+        }
+        const n = std.c.fread(out.ptr + len, 1, cap - len, f);
+        len += n;
+        if (n == 0) break;
+    }
+    if (!allocator.resize(out, len)) {
+        const exact = allocator.alloc(u8, len) catch return error.OutOfMemory;
+        @memcpy(exact, out[0..len]);
+        allocator.free(out);
+        return exact;
+    }
+    return out[0..len];
+}
+
+/// Image element from raw bytes (PNG/JPEG/GIF/BMP, or SVG which rasterizes
+/// at intrinsic size — GPUI `img()` parity).
+pub fn img(source: []const u8) Element {
+    return makeImage(.{ .bytes = source }, false);
+}
+
+/// Image element from a file path (read at build on dirty frames).
+pub fn imgPath(path: []const u8) Element {
+    return makeImage(.{ .path = path }, false);
+}
+
+/// Image element from a decoded cache handle.
+pub fn imgHandle(handle: images.Handle) Element {
+    return makeImage(.{ .handle = handle }, false);
+}
+
+/// SVG element from raw bytes, tinted through `currentColor` (GPUI icon
+/// parity: `.tint(text_color)` recolors lucide-style stroke icons).
+pub fn svg(source: []const u8) Element {
+    return makeImage(.{ .bytes = source }, true);
+}
+
+/// SVG element from a file path.
+pub fn svgPath(path: []const u8) Element {
+    return makeImage(.{ .path = path }, true);
+}
+
+fn makeImage(source: ImageSource, is_svg: bool) Element {
+    const frame = currentFrame();
+    const result = Element{ .index = frame.createNode(.image) };
+    const n = result.node();
+    n.image.source = source;
+    n.image.svg = is_svg;
+    const size = resolveIntrinsic(source, is_svg, frame.allocator);
+    n.image.intrinsic_w = size.w;
+    n.image.intrinsic_h = size.h;
+    return result;
+}
+
 pub fn text(value: []const u8, options: anytype) Element {
     const frame = currentFrame();
     const result = Element{ .index = frame.createNode(.text) };
@@ -460,10 +614,34 @@ pub fn progressBar(value: f32, width: f32) Element {
         .child(div().w(width * fraction).h(6).rounded_full().bg_gradient(core.Color.hex(0x7c5cff), core.Color.hex(0x46d5e8)));
 }
 
+pub fn textAdvance(size: f32, tracking: f32, weight: FontWeight) f32 {
+    // Single source of truth for horizontal text metrics. The painter draws
+    // each glyph cell as scale*6 wide (scale = size/8, min 1px) plus tracking,
+    // with bold/semibold widening pixels by ~30% of scale. Layout measure and
+    // the TextField cursor must use this exact function or text overflows or
+    // gaps (the old measure used size*0.64 vs the painter's size*0.75).
+    const scale = @max(1.0, size / 8.0);
+    const bold_extra = if (weight == .bold or weight == .semibold) scale * 0.3 else 0;
+    return scale * 6.0 + tracking + bold_extra;
+}
+
 pub fn progressTrack(value: f32) Element {
+    // Flex-proportioned fill: the old fixed 520px child overflowed windows
+    // narrower than the design 560px column. Fill flexes with `fraction`,
+    // spacer takes the rest, so the track always fits its parent.
     const fraction = std.math.clamp(value, 0, 1);
-    return div().size_full().h(4).rounded_full().bg(core.Color.hex(0xffffff10))
-        .child(div().w(520 * fraction).h(4).rounded_full().bg_gradient(core.Color.hex(0x7c5cff), core.Color.hex(0x46d5e8)));
+    var track = div().w_full().h(4).flex_row().rounded_full().bg(core.Color.hex(0xffffff10));
+    if (fraction > 0.0001) {
+        var fill = div().h(4).rounded_full().bg_gradient(core.Color.hex(0x7c5cff), core.Color.hex(0x46d5e8));
+        fill.node().style.flex_grow = @max(0.0001, fraction);
+        track = track.child(fill);
+    }
+    if (fraction < 0.9999) {
+        var rest = spacer();
+        rest.node().style.flex_grow = @max(0.0001, 1 - fraction);
+        track = track.child(rest);
+    }
+    return track;
 }
 
 pub fn formatToday() []const u8 {

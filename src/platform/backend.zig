@@ -1,10 +1,10 @@
 //! Backend interface shared by every windowing/GPU target.
 //!
-//! Why a vtable: SDL's `SDL_VideoDevice` and GLFW's `_GLFWplatform` are
-//! both plain fn-pointer tables filled per-backend and probed in priority
-//! order. Zig gets the same with an explicit `VTable` + `Backend` fat
-//! pointer, plus a comptime backend list. Backends translate OS events
-//! into `event.Event`; they never own the queue.
+//! Why a vtable: cross-platform toolkits fill one fn-pointer table per
+//! backend and probe in priority order. Zig gets the same with an explicit
+//! `VTable` + `Backend` fat pointer, plus a comptime backend list.
+//! Backends translate OS events into `event.Event`; they never own the
+//! queue.
 
 const geometry = @import("../core/geometry.zig");
 const event = @import("event.zig");
@@ -25,13 +25,67 @@ pub const WindowInfo = struct {
     focused: bool = true,
 };
 
+/// Native pointer shapes. Every backend implements all three; where the
+/// compositor owns the cursor (Wayland) the backend resolves the shape
+/// through the system theme, elsewhere through native cursor APIs.
+pub const CursorShape = enum {
+    default,
+    text,
+    pointer,
+};
+
+/// Window edge for interactive resize. Ordinals match the
+/// `_NET_WM_MOVERESIZE` action codes (0-7) so X11 passes them through.
+pub const ResizeEdge = enum(u32) {
+    top_left = 0,
+    top = 1,
+    top_right = 2,
+    right = 3,
+    bottom_right = 4,
+    bottom = 5,
+    bottom_left = 6,
+    left = 7,
+};
+
 pub const VTable = struct {
     kind: *const fn (*anyopaque) BackendKind,
     poll: *const fn (*anyopaque, *event.EventQueue) void,
     waitTimeoutNs: *const fn (*anyopaque, u64) void,
     wakeup: *const fn (*anyopaque) void,
     windowInfo: *const fn (*anyopaque) WindowInfo,
-    present: *const fn (*anyopaque, *const gpu.Scene) void,
+    /// Push a new title to the native window (taskbar/window list).
+    /// Called at creation and on every `Window.setTitle`.
+    setTitle: *const fn (*anyopaque, []const u8) void,
+    /// Request a native window size (client area, logical pixels).
+    /// X11/Cocoa/Win32 honor it; Wayland ignores it (the compositor owns
+    /// sizing and answers with configure events instead).
+    setSize: *const fn (*anyopaque, u32, u32) void,
+    /// Framed (server/native titlebar) vs frameless (app-drawn chrome).
+    /// Wayland negotiates client-side decorations, X11 sets motif hints,
+    /// Cocoa switches the titlebar mode, Win32 restyles the frame.
+    setDecorated: *const fn (*anyopaque, bool) void,
+    /// Begin a native window drag using the last input serial/position.
+    /// Custom titlebars call this on mouse-down.
+    dragWindow: *const fn (*anyopaque) void,
+    /// Begin a native edge resize using the last input serial/position.
+    resizeWindow: *const fn (*anyopaque, ResizeEdge) void,
+    /// Minimize to taskbar/dock.
+    minimizeWindow: *const fn (*anyopaque) void,
+    /// Toggle maximized/restored. Tracks state from configure/size events.
+    toggleMaximizeWindow: *const fn (*anyopaque) void,
+    /// Switch the native pointer shape.
+    setCursor: *const fn (*anyopaque, CursorShape) void,
+    /// Copy `text` into the system clipboard. False when unavailable.
+    setClipboardText: *const fn (*anyopaque, []const u8) bool,
+    /// Paste system clipboard UTF-8 into `out`. Returns bytes written;
+    /// zero means empty or unavailable. Never exceeds `out.len`.
+    clipboardText: *const fn (*anyopaque, []u8) usize,
+    /// `glyph_pixels` is the font atlas pool backing `Scene` glyph entries
+    /// (empty when fonts are unavailable). `image_pixels` is the App
+    /// image-cache pool backing `Scene` image entries (empty headless).
+    /// Backends forward both to the software rasterizer; the null backend
+    /// ignores them.
+    present: *const fn (*anyopaque, *const gpu.Scene, []const u8, []const u8) void,
 };
 
 pub const Backend = struct {
@@ -58,13 +112,53 @@ pub const Backend = struct {
         return self.vtable.windowInfo(self.ptr);
     }
 
-    pub fn present(self: @This(), scene: *const gpu.Scene) void {
-        self.vtable.present(self.ptr, scene);
+    pub fn setTitle(self: @This(), title: []const u8) void {
+        self.vtable.setTitle(self.ptr, title);
+    }
+
+    pub fn setSize(self: @This(), w: u32, h: u32) void {
+        self.vtable.setSize(self.ptr, w, h);
+    }
+
+    pub fn setDecorated(self: @This(), decorated: bool) void {
+        self.vtable.setDecorated(self.ptr, decorated);
+    }
+
+    pub fn dragWindow(self: @This()) void {
+        self.vtable.dragWindow(self.ptr);
+    }
+
+    pub fn resizeWindow(self: @This(), edge: ResizeEdge) void {
+        self.vtable.resizeWindow(self.ptr, edge);
+    }
+
+    pub fn minimizeWindow(self: @This()) void {
+        self.vtable.minimizeWindow(self.ptr);
+    }
+
+    pub fn toggleMaximizeWindow(self: @This()) void {
+        self.vtable.toggleMaximizeWindow(self.ptr);
+    }
+
+    pub fn setCursor(self: @This(), shape: CursorShape) void {
+        self.vtable.setCursor(self.ptr, shape);
+    }
+
+    pub fn setClipboardText(self: @This(), text: []const u8) bool {
+        return self.vtable.setClipboardText(self.ptr, text);
+    }
+
+    pub fn clipboardText(self: @This(), out: []u8) usize {
+        return self.vtable.clipboardText(self.ptr, out);
+    }
+
+    pub fn present(self: @This(), scene: *const gpu.Scene, glyph_pixels: []const u8, image_pixels: []const u8) void {
+        self.vtable.present(self.ptr, scene, glyph_pixels, image_pixels);
     }
 };
 
-/// Priority order for probing, mirroring SDL/GLFW: try the native
-/// compositor first, fall back to X11, always have null for headless.
+/// Priority order for probing: try the native compositor first, fall
+/// back to X11, always have null for headless.
 pub fn preferredOrder() [3]BackendKind {
     return .{ .wayland, .x11, .null };
 }

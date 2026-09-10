@@ -7,10 +7,26 @@ const color = @import("../core/color.zig");
 const gpu = @import("../gpu/root.zig");
 const platform = @import("../platform/root.zig");
 const elements = @import("../elements/root.zig");
+const fonts = @import("../fonts/root.zig");
+const images = @import("../images/root.zig");
+const keymap = @import("keymap.zig");
 
 pub const Chrome = enum {
     system,
     custom,
+};
+
+/// Native window operations installed by `App.openWindow`. Backends hold
+/// one native window; every call pushes straight through.
+pub const OsHooks = struct {
+    ctx: *anyopaque,
+    setTitle: *const fn (*anyopaque, []const u8) void,
+    setCursor: *const fn (*anyopaque, platform.CursorShape) void,
+    getClipboard: *const fn (*anyopaque, []u8) usize,
+    setClipboard: *const fn (*anyopaque, []const u8) bool,
+    dragWindow: *const fn (*anyopaque) void,
+    minimizeWindow: *const fn (*anyopaque) void,
+    toggleMaximizeWindow: *const fn (*anyopaque) void,
 };
 
 pub const WindowOptions = struct {
@@ -37,6 +53,10 @@ pub const Window = struct {
     app: *anyopaque,
     wakeup_fn: *const fn (*anyopaque) void,
     remove_fn: *const fn (*anyopaque, *Window) void,
+    /// Allocator for cold frame work (image file reads/decodes).
+    allocator: ?std.mem.Allocator = null,
+    os: ?OsHooks = null,
+    cursor_shape: platform.CursorShape = .default,
     bounds: geometry.Bounds,
     min_size: ?geometry.Size = null,
     max_size: ?geometry.Size = null,
@@ -50,11 +70,22 @@ pub const Window = struct {
     closed: bool = false,
     scene: gpu.Scene = .{},
     renderer: ?Renderer = null,
+    /// Last App.step_count that rendered this window; feeds image-cache
+    /// pinning so eviction never drops the current frame's entries.
+    frame_id: u64 = 0,
     ui_frame: elements.Frame = .{},
+    /// Borrowed font stack (owned by `App`, null without system fonts).
+    /// Fed to the frame each render for shaped measure/paint.
+    fonts: ?*fonts.Collection = null,
+    /// Borrowed image cache (owned by `App`, null headless-without-cache).
+    /// Fed to the frame each render for img()/svg() resolution.
+    images: ?*images.Cache = null,
     pointer_position: geometry.Point = .{ .x = -10000, .y = -10000 },
     focused: elements.FocusHandle = .{},
-    key_bindings: [32]KeyBinding = undefined,
-    key_binding_count: usize = 0,
+    keymap: keymap.Keymap = .{},
+    /// Window-level context tags (outermost keymap frame, after "Window").
+    context_tags: [4][]const u8 = undefined,
+    context_tag_count: usize = 0,
     actions: [32]Action = undefined,
     action_count: usize = 0,
 
@@ -66,6 +97,24 @@ pub const Window = struct {
         const tlen = @min(new_title.len, self.title_buf.len);
         @memcpy(self.title_buf[0..tlen], new_title[0..tlen]);
         self.title_len = tlen;
+        if (self.os) |os| os.setTitle(os.ctx, self.title());
+    }
+
+    /// Push a cursor shape, filtered so repeats don't hammer the server.
+    pub fn setCursorShape(self: *Window, shape: platform.CursorShape) void {
+        if (shape == self.cursor_shape) return;
+        self.cursor_shape = shape;
+        if (self.os) |os| os.setCursor(os.ctx, shape);
+    }
+
+    pub fn readClipboard(self: *Window, out: []u8) usize {
+        if (self.os) |os| return os.getClipboard(os.ctx, out);
+        return 0;
+    }
+
+    pub fn writeClipboard(self: *Window, text: []const u8) bool {
+        if (self.os) |os| return os.setClipboard(os.ctx, text);
+        return false;
     }
 
     pub fn requestRender(self: *Window) void {
@@ -170,17 +219,18 @@ pub const Window = struct {
     }
 
     /// Ask the backend to begin a native window drag (used by custom
-    /// titlebars). No-op until a backend implements window dragging.
+    /// titlebars for frameless move).
     pub fn startDrag(self: *Window) void {
-        _ = self;
+        if (self.os) |os| os.dragWindow(os.ctx);
     }
 
     pub fn minimize(self: *Window) void {
-        _ = self;
+        if (self.os) |os| os.minimizeWindow(os.ctx);
     }
 
     pub fn toggleMaximize(self: *Window) void {
         self.maximized = !self.maximized;
+        if (self.os) |os| os.toggleMaximizeWindow(os.ctx);
         self.requestRender();
     }
 
@@ -201,10 +251,25 @@ pub const Window = struct {
     }
 
     pub fn addKeyBinding(self: *Window, key_name: []const u8, action: []const u8) void {
-        if (self.key_binding_count >= self.key_bindings.len) return;
-        const key = keyFromName(key_name) orelse return;
-        self.key_bindings[self.key_binding_count] = .{ .key = key, .action = action };
-        self.key_binding_count += 1;
+        // Legacy single-key form: no modifiers, global context. Richer
+        // chords/sequences go through bindKeystrokes.
+        _ = self.keymap.bind(key_name, action, null);
+    }
+
+    /// Bind `"ctrl-s"` / `"g g"` to an action in an optional context
+    /// (`"TodoList && mode == normal"`). False when unparsable or full.
+    pub fn bindKeystrokes(self: *Window, keys: []const u8, action: []const u8, context: ?[]const u8) bool {
+        return self.keymap.bind(keys, action, context);
+    }
+
+    pub fn pushContextTag(self: *Window, tag: []const u8) void {
+        if (self.context_tag_count >= self.context_tags.len) return;
+        self.context_tags[self.context_tag_count] = tag;
+        self.context_tag_count += 1;
+    }
+
+    pub fn clearContextTags(self: *Window) void {
+        self.context_tag_count = 0;
     }
 
     pub fn updateHitRegions(self: *Window) void {
@@ -258,46 +323,49 @@ pub const Window = struct {
                     return;
                 }
                 switch (event) {
-                    .key => |key_event| if (key_event.pressed) self.dispatchKeyAction(key_event.key),
+                    .key => |key_event| if (key_event.pressed) self.dispatchKeyAction(key_event.key, key_event.modifiers),
                     .text => {},
                     else => unreachable,
                 }
+            },
+            .scroll => |scroll| {
+                self.pointer_position = scroll.pos;
+                if (self.focused.dispatch(event, self)) {
+                    self.requestRender();
+                    return;
+                }
+                self.requestRender();
             },
             .window => {},
         }
     }
 
-    fn dispatchKeyAction(self: *Window, key: platform.event.Key) void {
-        for (self.key_bindings[0..self.key_binding_count]) |binding| {
-            if (binding.key != key) continue;
-            for (self.actions[0..self.action_count]) |action| {
-                if (std.mem.eql(u8, action.name, binding.action)) {
-                    action.listener.call(self);
-                    return;
-                }
+    fn dispatchKeyAction(self: *Window, key: platform.event.Key, modifiers: platform.event.Modifiers) void {
+        var frame = keymap.ContextFrame{};
+        _ = frame.put("Window", "");
+        for (self.context_tags[0..self.context_tag_count]) |tag| {
+            _ = frame.put(tag, "");
+        }
+        const stack = [_]keymap.ContextFrame{frame};
+        const stroke = keymap.Keystroke{ .key = key, .modifiers = modifiers };
+        const action_name = self.keymap.dispatch(stroke, &stack) orelse return;
+        self.fireAction(action_name);
+    }
+
+    pub fn fireAction(self: *Window, action_name: []const u8) void {
+        for (self.actions[0..self.action_count]) |action| {
+            if (std.mem.eql(u8, action.name, action_name)) {
+                action.listener.call(self);
+                return;
             }
         }
     }
-};
-
-const KeyBinding = struct {
-    key: platform.event.Key,
-    action: []const u8,
 };
 
 const Action = struct {
     name: []const u8,
     listener: elements.Listener,
 };
-
-fn keyFromName(name: []const u8) ?platform.event.Key {
-    if (std.mem.eql(u8, name, "enter")) return .enter;
-    if (std.mem.eql(u8, name, "space")) return .space;
-    if (std.mem.eql(u8, name, "backspace")) return .backspace;
-    if (std.mem.eql(u8, name, "delete")) return .delete;
-    if (std.mem.eql(u8, name, "escape")) return .escape;
-    return null;
-}
 
 test "window basic properties and render" {
     const TestApp = @import("app.zig").App;
@@ -325,4 +393,34 @@ test "window basic properties and render" {
 
     win.requestRender();
     try std.testing.expect(win.dirty);
+}
+
+test "window os hooks push title cursor and clipboard" {
+    const TestApp = @import("app.zig").App;
+    var app = try TestApp.initHeadless(std.testing.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{ .title = "Hooked" }, struct {
+        fn draw(w: *Window, sc: *gpu.Scene) void {
+            _ = w;
+            _ = sc;
+        }
+    }.draw);
+
+    // openWindow pushed the title straight to the backend.
+    const nb = app.getNullBackend().?;
+    try std.testing.expectEqualStrings("Hooked", nb.title_buf[0..nb.title_len]);
+    win.setTitle("Renamed");
+    try std.testing.expectEqualStrings("Renamed", nb.title_buf[0..nb.title_len]);
+
+    // Cursor pushes filter repeats.
+    win.setCursorShape(.text);
+    try std.testing.expectEqual(platform.CursorShape.text, nb.cursor);
+    win.setCursorShape(.text);
+    win.setCursorShape(.default);
+    try std.testing.expectEqual(platform.CursorShape.default, nb.cursor);
+
+    // Clipboard round-trips through the backend store.
+    try std.testing.expect(win.writeClipboard("hello"));
+    var out: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("hello", out[0..win.readClipboard(&out)]);
 }

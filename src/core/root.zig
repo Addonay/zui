@@ -4,6 +4,7 @@ pub const geometry = @import("geometry.zig");
 pub const color = @import("color.zig");
 pub const limits = @import("limits.zig");
 pub const shared_string = @import("shared_string.zig");
+pub const log = @import("log.zig");
 
 pub const Point = geometry.Point;
 pub const Size = geometry.Size;
@@ -22,4 +23,5 @@ test {
     _ = @import("color.zig");
     _ = @import("limits.zig");
     _ = @import("shared_string.zig");
+    _ = @import("log.zig");
 }
