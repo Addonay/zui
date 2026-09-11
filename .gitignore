@@ -1,7 +1,18 @@
-zig-out
-.zig-cache
-.references
-target
-.zig-global
-.zig-cache-layout
-.opencode
+# Root reference checkouts are reconstructed by tools/fetch-references.sh.
+/.references/
+
+# Reference checkouts and local build products inside ports are never source.
+/.ports/**/.reference/
+/.ports/**/.references/
+/.ports/**/.zig-cache/
+/.ports/**/zig-out/
+/.ports/**/zig-pkg/
+/.ports/**/target/
+
+# Root build products and local tool state.
+/zig-out/
+/.zig-cache/
+/target/
+/.zig-global/
+/.zig-cache-layout/
+/.opencode/

@@ -1,0 +1,19 @@
+[package]
+name = "vellz-oracle"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Renders the vellz scene corpus with the pinned upstream vello_cpu"
+
+[dependencies]
+# Path dependency into the pinned checkout. This crate is tooling only and is
+# never part of the distributed vellz package.
+vello_cpu = { path = "../../.reference/vello/vello_cpu", features = ["f32_pipeline"] }
+# Enable the pure-scalar Fallback level so oracle output does not depend on the
+# host's SIMD feature set. The feature is additive; it only affects this tool.
+fearless_simd = { version = "0.7.0", default-features = false, features = ["force_support_fallback"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+debug = false

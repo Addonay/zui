@@ -1,0 +1,29 @@
+.{
+    .name = .vellz,
+    .version = "0.1.0",
+    .fingerprint = 0x841d6b8e47fec155, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0-dev.2085+5e36170b5",
+    // The GPU backend links against the sibling wgpu package (which itself
+    // links wgpu-native). The dependency is lazy: a CPU-only build never
+    // resolves it, so no wgpu source, native library, or sibling checkout is
+    // required unless `-Dgpu=true` is passed.
+    .dependencies = .{
+        .wgpu = .{
+            .path = "../wgpu",
+            .lazy = true,
+        },
+    },
+    // Only files required to compile the package are distributed. Reference
+    // checkouts (.reference/), build outputs, examples beyond the CPU set, and
+    // tooling that depends on the host are intentionally excluded.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "plan.md",
+        "docs",
+        "LICENSE-APACHE",
+        "LICENSE-MIT",
+    },
+}

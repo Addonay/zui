@@ -1,0 +1,16 @@
+.{
+    .name = .wgpu_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0xc2e9c31ff2afe771,
+    .minimum_zig_version = "0.17.0-dev.2085+5e36170b5",
+    .dependencies = .{
+        // Path dependency on the package in .ports/wgpu. A real consumer
+        // would use `zig fetch --save=wgpu <url-or-path>` instead.
+        .wgpu = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

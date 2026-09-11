@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "quality", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "rgba8": [200, 60, 20, 255] },
+    { "op": "fill_rect", "rect": [20, 20, 20, 50] },
+    { "op": "set_paint", "rgba8": [20, 60, 200, 128] },
+    { "op": "fill_path", "path": "M5 5 L5 5 Z" },
+    { "op": "stroke_path", "path": "M10 10 L10 10" }
+  ]
+}

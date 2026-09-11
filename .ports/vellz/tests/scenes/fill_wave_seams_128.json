@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "width": 128,
+  "height": 128,
+  "settings": { "mode": "quality", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "rgba8": [255, 255, 255, 255] },
+    { "op": "fill_rect", "rect": [0, 0, 128, 128] },
+    { "op": "set_paint", "rgba8": [120, 30, 200, 96] },
+    { "op": "fill_path", "path": "M4 64 C 20 4, 44 4, 60 64 C 76 124, 100 124, 116 64 C 100 4, 76 4, 60 64 C 44 124, 20 124, 4 64 Z" }
+  ]
+}

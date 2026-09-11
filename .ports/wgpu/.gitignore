@@ -1,0 +1,5 @@
+# Reference checkouts, fetched release binaries and build artifacts are never
+# part of the distributed package (see the `paths` list in build.zig.zon).
+/.reference/
+/zig-out/
+/.zig-cache/

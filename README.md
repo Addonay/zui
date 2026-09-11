@@ -28,6 +28,20 @@ ZUI_BACKEND=null ZUI_TODO_DEMO=1 zig build run-todo       # seeded, headless
 ZUI_SNAPSHOT=/tmp/todo.ppm zig build run-todo             # one-frame PPM dump
 ```
 
+## Reconstructing source references
+
+The upstream implementation references are deliberately not stored in this
+repository. They are pinned by immutable commit ID and can be restored after a
+fresh clone with:
+
+```sh
+bash tools/fetch-references.sh
+```
+
+The command restores root references plus the Cozmic, WGPU, and Vellz port
+references. It will never replace an existing checkout at a different commit;
+inspect or remove that checkout explicitly before rerunning it.
+
 ## Architecture
 
 ```text

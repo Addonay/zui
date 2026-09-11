@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "quality", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "gradient": {
+        "kind": { "sweep": {
+          "center": [32, 32],
+          "start_angle": 0.0,
+          "end_angle": 6.283185307179586
+        } },
+        "stops": [
+          { "offset": 0.0, "rgba8": [255, 40, 40, 255] },
+          { "offset": 1.0, "rgba8": [255, 220, 40, 255] }
+        ],
+        "extend": "pad"
+    } },
+    { "op": "fill_rect", "rect": [6, 6, 58, 58] }
+  ]
+}

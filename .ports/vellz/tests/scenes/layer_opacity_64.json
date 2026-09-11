@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "quality", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "rgba8": [245, 245, 245, 255] },
+    { "op": "fill_rect", "rect": [0, 0, 64, 64] },
+    { "op": "push_layer", "kind": "opacity", "opacity": 0.5 },
+    { "op": "set_paint", "rgba8": [220, 40, 40, 255] },
+    { "op": "fill_rect", "rect": [8, 8, 48, 48] },
+    { "op": "push_layer", "kind": "opacity", "opacity": 0.5 },
+    { "op": "set_paint", "rgba8": [30, 60, 220, 255] },
+    { "op": "fill_rect", "rect": [24, 24, 58, 58] },
+    { "op": "pop_layer" },
+    { "op": "pop_layer" }
+  ]
+}

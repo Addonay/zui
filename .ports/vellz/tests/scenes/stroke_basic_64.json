@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "quality", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_stroke", "width": 3.5, "join": "round", "start_cap": "round", "end_cap": "round" },
+    { "op": "set_paint", "rgba8": [20, 160, 60, 255] },
+    { "op": "stroke_path", "path": "M12 20 C 24 4, 40 4, 52 20 L 52 44" }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "quality", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "rgba8": [20, 20, 20, 255] },
+    { "op": "fill_rect", "rect": [0, 0, 64, 64] },
+    { "op": "push_layer", "kind": "mask", "mask": {
+        "asset": "assets/mask16.rgba",
+        "width": 16,
+        "height": 16,
+        "format": "rgba8",
+        "alpha_type": "alpha",
+        "kind": "luminance"
+    } },
+    { "op": "set_paint", "rgba8": [250, 210, 60, 255] },
+    { "op": "fill_rect", "rect": [4, 4, 60, 60] },
+    { "op": "pop_layer" }
+  ]
+}

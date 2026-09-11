@@ -1,0 +1,31 @@
+{
+  "revision": "1e63b4a40ccb484f82e1d85b83df97ab95bcfbe7",
+  "shaders": {
+    "blend": {
+      "bytes": 7416,
+      "const": "BLEND",
+      "sha256": "133ffae43e2b05bef6727a2c1a113c71cf116aeb882b7fefb6ba10aa72fa1f6c"
+    },
+    "clear": {
+      "bytes": 964,
+      "const": "CLEAR",
+      "sha256": "c049bfe1abd6f6959a46480fccf6f1944b87c7c917b5df9547912a016921347a"
+    },
+    "copy": {
+      "bytes": 908,
+      "const": "COPY",
+      "sha256": "c8edca78bbb511c96a0de0ffb12318ae44fe02a0c3bf2e05458c6e65d8026665"
+    },
+    "filter": {
+      "bytes": 7151,
+      "const": "FILTER",
+      "sha256": "7867b317a76fd460a0a1a74e79ee5f11db3907fb5cb168a49c3cab911b5dc104"
+    },
+    "render": {
+      "bytes": 15696,
+      "const": "RENDER",
+      "sha256": "55ccaec27af010587e2b11126123cc9471408e1c24f4ca06fdff3b836d0e370f"
+    }
+  },
+  "source": ".reference/vello/target/release/build/vello_gpu_shaders-ef3d0d27315fc834/out/compiled_shaders.rs"
+}

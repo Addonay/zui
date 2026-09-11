@@ -1,0 +1,17 @@
+# Pinned upstream reference checkouts and their build outputs. These are
+# reconstruction inputs, never part of the package distribution (see the
+# `paths` field in build.zig.zon).
+.reference/
+.references/
+target/
+
+# Zig build outputs and caches.
+zig-out/
+.zig-cache/
+zig-pkg/
+
+# Local comparison/benchmark outputs.
+out/
+*.ppm
+*.png
+!tests/fixtures/**/*.png

@@ -1,0 +1,234 @@
+# CPU pipeline interfaces
+
+Fixed signatures for the Zig port of `vello_common` (strips) and `vello_cpu`
+(rows and kernels). Implementations must follow these names so separately
+ported modules link into one pipeline. Upstream file references are in the
+coverage ledger (`plan.md` §5).
+
+## Strip generation (`src/common`)
+
+Cycle-split note (Zig has no import cycles; upstream `strip_generator.rs` and
+`clip.rs` import each other):
+
+- `strip_storage.zig` owns `StripStorage`, `GenerationMode`, `PathDataRef`.
+- `intersect.zig` owns the strip-intersection algorithm (`intersect` and its
+  row iterators); it depends only on strip/tile/geometry/util.
+- `strip_generator.zig` imports `intersect.zig` and `strip_storage.zig`;
+  `clip.zig` imports `strip_generator.zig`.
+
+```zig
+// common/flatten.zig
+pub const Point = struct { x: f32, y: f32 };
+pub const Line = struct { p0: Point, p1: Point };
+pub const FlattenCtx = struct { /* upstream fields */ };
+
+/// Appends flattened, culled lines for `path` under `affine` to `line_buf`.
+/// `line_buf` is cleared first. `cull_bbox` is in scene pixels.
+pub fn fill(
+    allocator: std.mem.Allocator,
+    level: simd.Level,
+    path: []const kurbo.PathEl,
+    affine: kurbo.Affine,
+    line_buf: *std.ArrayList(Line),
+    ctx: *FlattenCtx,
+    cull_bbox: geometry.RectU16,
+) !void;
+
+pub fn stroke(...) !void; // M2 (needs kurbo stroke port)
+```
+
+```zig
+// common/tile.zig
+pub const Tile = struct {
+    x: u16,
+    y: u16,
+    packed_winding_line_idx: u32,
+    /* upstream bit accessors as methods */
+};
+pub const Tiles = struct {
+    pub fn init(allocator: std.mem.Allocator, level: simd.Level, width: u16, height: u16) Tiles;
+    pub fn deinit(self: *Tiles, allocator: std.mem.Allocator) void;
+    /// Returns whether geometry left of the viewport was culled (upstream culled flag).
+    pub fn makeTilesAnalyticAa(self: *Tiles, allocator: std.mem.Allocator, lines: []const flatten.Line, width: u16, height: u16) !bool;
+    pub fn sortTiles(self: *Tiles) void;
+    pub fn get(self: *const Tiles, idx: usize) Tile;
+    pub fn items(self: *const Tiles) []const Tile; // requires sorted
+};
+```
+
+```zig
+// common/strip.zig
+pub const Strip = struct {
+    x: u16, // pixel, multiple of 4
+    y: u16, // pixel, multiple of 4
+    packed_alpha_idx_fill_gap: u32,
+    /* alphaIdx(), setAlphaIdx(), fillGap(), setFillGap(), stripY(), widthTo(next) */
+};
+pub const StripAlphaFillSegment = struct { fill: peniko.Fill, alpha_idx: u32 };
+pub const StripFillSegment = struct { tile_x0: u16, tile_x1: u16, tile_y: u16, /* pixel/tile rect helpers */ };
+
+/// Port of strip.rs::render; appends strips + alphas (does not clear).
+pub fn render(
+    allocator: std.mem.Allocator,
+    level: simd.Level,
+    tiles: *const Tiles,
+    strip_buf: *std.ArrayList(Strip),
+    alpha_buf: *std.ArrayList(u8),
+    fill_rule: peniko.Fill,
+    aliasing_threshold: ?u8,
+    lines: []const flatten.Line,
+) !void;
+
+pub fn visitStripFillSegments(
+    strips: []const Strip,
+    tile_bounds: ?geometry.RectU16,
+    context: anytype, // methods onFillSegment(ctx, StripFillSegment), onAlphaSegment(ctx, StripAlphaFillSegment)
+    alpha_fill: bool,
+    fill: bool,
+) void;
+
+/// Moved from upstream util.rs (imports Strip/Tile).
+pub fn stripBbox(strips: []const Strip) ?geometry.RectU16;
+```
+
+```zig
+// common/strip_generator.zig
+pub const GenerationMode = union(enum) { replace, append, replace_after: usize };
+pub const StripStorage = struct { ... }; // moved to strip_storage.zig in the port
+pub const PathDataRef = struct {
+    strips: []const Strip,
+    alphas: []const u8,
+    bbox: geometry.RectU16,
+};
+pub const StripGenerator = struct {
+    pub fn init(allocator: std.mem.Allocator, width: u16, height: u16, level: simd.Level) StripGenerator;
+    pub fn deinit(self: *StripGenerator, allocator: std.mem.Allocator) void;
+    pub fn generateFilledPath(
+        self: *StripGenerator,
+        allocator: std.mem.Allocator,
+        path: []const kurbo.PathEl,
+        fill_rule: peniko.Fill,
+        transform: kurbo.Affine,
+        aliasing_threshold: ?u8,
+        storage: *StripStorage,
+        clip: ?PathDataRef,
+    ) !void;
+    pub fn generateFilledRectFast(...) !void; // common/rect.zig; M1 optional
+    pub fn reset(self: *StripGenerator, width: u16, height: u16) void;
+};
+```
+
+## CPU rows (`src/cpu`)
+
+```zig
+// cpu/coarse/cmd.zig
+pub const Span = struct { start: u32, end: u32 };
+pub const PaintFillAttrs = struct { paint: common.paint.Paint, blend_mode: peniko.BlendMode, mask: ?*const common.mask.Mask, draw_id: u32, thread_idx: u8, origin: common.geometry.RectU16 };
+pub const LayerFillAttrs = struct { blend_mode: peniko.BlendMode, opacity: f32, mask: ?*const common.mask.Mask, draw_id: u32, thread_idx: u8 };
+pub const PaintFill = struct { span: Span, alpha_idx: ?u32, attrs_idx: u32 };
+pub const DepthFill = struct { bucket_range: BucketRange, attrs_idx: u32 };
+pub const LayerFill = struct { span: Span, alpha_idx: ?u32, attrs_idx: u32 };
+pub const RenderCmd = union(enum) {
+    paint_fill: PaintFill,
+    push_buf: ?Span,
+    pop_buf,
+    layer_fill: LayerFill,
+};
+```
+
+```zig
+// cpu/coarse/depth.zig
+pub const DEPTH_BUCKET_WIDTH = 128;
+pub const BucketRange = struct { ... };
+pub fn splitOpaqueSpan(span: Span, cb: anytype) void;
+pub const DepthBuffer = struct {
+    pub fn forEachVisibleRun(self: *const DepthBuffer, span: Span, draw_id: u32, cb: anytype) void;
+};
+```
+
+```zig
+// cpu/coarse/bucketer.zig
+pub const CommandBucketer = struct {
+    pub fn init(allocator: std.mem.Allocator, width: u16, height: u16) CommandBucketer;
+    pub fn deinit(self: *CommandBucketer, allocator: std.mem.Allocator) void;
+    pub fn reset(self: *CommandBucketer, allocator: std.mem.Allocator, width: u16, height: u16) void;
+    pub fn bucketCommands(
+        self: *CommandBucketer,
+        allocator: std.mem.Allocator,
+        recorder: *const common.record.CommandRecorder(cpu.record.RecordedFill),
+        strips: []const Strip,
+        encoded_paints: []const common.encode.EncodedPaint,
+        filter_ctx: *const cpu.filter.FilterContext,
+    ) !void;
+    pub fn rows(self: *CommandBucketer) []RowState;
+};
+```
+
+## Fine rasterization
+
+```zig
+// cpu/fine/mod.zig
+pub fn Fine(comptime K: type) type { ... } // buffers + pushBuf/popBuf/pack/unpack
+
+/// K is the kernel type (cpu/fine/highp.zig `F32Kernel`, later lowp `U8Kernel`).
+/// Required K surface: Numeric, Composite, NumericVec types; extractColor,
+/// pack, unpack, initUncoveredRange, copySolid, applyMask, applyTint,
+/// alphaCompositeSolid, alphaCompositeBuffer, blend, fillSolid, painters.
+pub fn rasterizeRegion(
+    comptime K: type,
+    fine: *Fine(K),
+    depth: *coarse.DepthBuffer,
+    region: Region,
+    bucketer: *const coarse.CommandBucketer,
+    resources: FineResources,
+    target_init: common.target.TargetInit,
+    root_is_blend_target: bool,
+) void;
+```
+
+`fine/mod.zig` is specialized to the f32 kernel for M1 but keeps `Fine(K)`
+generic so the u8 kernel and painters drop in without a redesign. Operators on
+the buffer are dispatched through comptime `K`, never through a runtime vtable.
+
+## Dispatch and public renderer
+
+```zig
+// cpu/dispatch/mod.zig
+pub const Dispatcher = struct { ptr: *anyopaque, vtable: *const VTable, ... };
+// Single-threaded implementation first; MT added in M4 behind the same vtable.
+
+// cpu/render.zig
+pub const RenderMode = enum { optimize_speed, optimize_quality };
+pub const PixelFormat = enum { rgba8 };
+pub const RenderSettings = struct { level: simd.Level, num_threads: u16 };
+pub const RasterizerSettings = struct { render_mode: RenderMode, target_init: TargetInit, pixel_format: PixelFormat, offset: struct { x: u16, y: u16 } };
+pub const Resources = struct { ... };
+pub const RenderContext = struct {
+    pub fn init(allocator: std.mem.Allocator, width: u16, height: u16, settings: RenderSettings) !RenderContext;
+    pub fn deinit(self: *RenderContext, allocator: std.mem.Allocator) void;
+    pub fn setPaint(self: *RenderContext, paint: anytype) void; // Into<PaintType>
+    pub fn setTransform(self: *RenderContext, affine: kurbo.Affine) void;
+    pub fn setFillRule(self: *RenderContext, rule: peniko.Fill) void;
+    pub fn setStroke(self: *RenderContext, stroke: kurbo.Stroke) void;
+    pub fn fillPath(self: *RenderContext, allocator: std.mem.Allocator, path: []const kurbo.PathEl) !void;
+    pub fn fillRect(self: *RenderContext, allocator: std.mem.Allocator, rect: kurbo.Rect) !void;
+    pub fn strokePath(self: *RenderContext, allocator: std.mem.Allocator, path: []const kurbo.PathEl) !void; // M2
+    pub fn pushClipPath(self: *RenderContext, allocator: std.mem.Allocator, path: []const kurbo.PathEl) !void;
+    pub fn popClipPath(self: *RenderContext) void;
+    pub fn flush(self: *RenderContext) void;
+    pub fn renderWith(self: *RenderContext, pixmap: *common.pixmap.Pixmap, resources: *Resources, settings: RasterizerSettings) !void;
+    pub fn render(self: *RenderContext, pixmap: *common.pixmap.Pixmap, resources: *Resources) !void;
+    pub fn reset(self: *RenderContext) void;
+};
+```
+
+## Error policy
+
+- Invalid usage (unpopped layers at render, mismatched mask sizes, missing
+  image ids) returns a typed error where upstream would panic or assert; the
+  upstream behavior and message are referenced in a comment.
+- Unsupported upstream features (external textures, multi-primitive filter
+  graphs, MT filters) return `error.Unsupported`; they are never silently
+  skipped.
+- `flush` is required before `renderWith` in the MT configuration; the
+  single-threaded implementation is a no-op like upstream.
