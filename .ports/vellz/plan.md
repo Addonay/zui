@@ -536,7 +536,7 @@ of panics, thread ownership).
   runtime vtable), mirroring upstream when both pipeline features are on.
   Oracle evidence: 13 new `*_speed` scenes render byte-exact vs the pinned
   oracle at `OptimizeSpeed` (`tolerance=0`, four channels); f32 quality
-  scenes remain 22/22 byte-exact. `zig build test` = 571/571; `zig build
-  corpus` = 35/35. Remaining: SIMD-level dispatch, multithreading, measured
-  speedups, filters/glyphs on the u8 path.
+  scenes remain 22/22 byte-exact. `zig build test` = 567 library + 6 scene
+  tests; `zig build corpus` = 35/35. Remaining: SIMD-level dispatch,
+  multithreading, measured speedups, filters/glyphs on the u8 path.
 

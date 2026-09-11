@@ -635,6 +635,48 @@ test "pack_unpack_roundtrip" {
     try testPackUnpackRoundtrip(TILE_WIDTH * 2 + 1, U8Kernel.pack, U8Kernel.unpack);
 }
 
+test "kernel conversions scale f32 and keep u8" {
+    // `u8x16::from_f32`: `f32_to_u8(v * 255.0 + 0.5)`.
+    const from_f32 = U8Kernel.numericVecFromF32(@as(F32x16, @splat(0.5)));
+    try testing.expectEqual(@as(u8, 128), from_f32[0]);
+
+    const from_u8 = U8Kernel.numericVecFromU8(@as(U8x16, @splat(200)));
+    try testing.expectEqual(@as(u8, 200), from_u8[0]);
+
+    const color = PremulColor.fromAlphaColor(peniko.Color.fromRgb8(255, 128, 64));
+    try testing.expectEqualSlices(
+        u8,
+        &color.asPremulRgba8().toU8Array(),
+        &U8Kernel.extractColor(color),
+    );
+
+    try testing.expectEqual(@as(u8, 255), U8Kernel.ONE);
+    try testing.expectEqual(@as(u8, 0), U8Kernel.ZERO);
+}
+
+test "apply_tint alpha_mask and multiply" {
+    // Opaque red tint: (255, 0, 0, 255).
+    const alpha_tint = Tint{ .color = peniko.Color.fromRgb8(255, 0, 0), .mode = .alpha_mask };
+    var dest: [32]u8 = @splat(128);
+    U8Kernel.applyTint(.fallback, &dest, &alpha_tint);
+
+    // tint_v * pixel_alpha = (255, 0, 0, 255) * (128, ...) / 255.
+    inline for (0..8) |pixel| {
+        try testing.expectEqual(@as(u8, 128), dest[4 * pixel + 0]);
+        try testing.expectEqual(@as(u8, 0), dest[4 * pixel + 1]);
+        try testing.expectEqual(@as(u8, 0), dest[4 * pixel + 2]);
+        try testing.expectEqual(@as(u8, 128), dest[4 * pixel + 3]);
+    }
+
+    // A white multiply tint is the identity.
+    const white_tint = Tint{ .color = peniko.Color.WHITE, .mode = .multiply };
+    var dest2: [32]u8 = @splat(200);
+    U8Kernel.applyTint(.fallback, &dest2, &white_tint);
+    inline for (0..32) |i| {
+        try testing.expectEqual(@as(u8, 200), dest2[i]);
+    }
+}
+
 test "extract_masks_repeats_each_byte_four_times" {
     const masks = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const extracted = extractMasks(masks);
