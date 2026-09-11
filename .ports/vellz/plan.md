@@ -437,9 +437,12 @@ of panics, thread ownership).
 
 - u8 low-precision pipeline ported and connected behind
   `RenderMode.optimize_speed` (`cpu/fine/lowp/*`, dispatcher kernel selection).
-- **u8 oracle gate:** 13 `*_speed` corpus scenes byte-exact (`tolerance=0`,
+- **u8 oracle gate:** 16 `*_speed` corpus scenes byte-exact (`tolerance=0`,
   four channels) against the pinned oracle rendered with
-  `RenderMode::OptimizeSpeed`; the original 22 quality scenes stay byte-exact.
+  `RenderMode::OptimizeSpeed`; they cover the u8-native gradient LUT and
+  bilinear painters, the f32 painter `paintU8` conversion (nearest/bicubic
+  images, undefined radial gradients), and the integer blend/composite/mask
+  paths. The original 22 quality scenes stay byte-exact.
 - **Rough timings** (ReleaseFast CLI, 200 runs each, includes ~2.4 ms process
   startup; not a methodology-complete G4 record): `fill_wave_seams_128`
   3.6 -> 2.0 ms, `fill_tile_grid_128` 4.4 -> 1.9 ms, `gradient_repeat_128`
@@ -541,9 +544,9 @@ of panics, thread ownership).
   painters by `K.Numeric`, and `dispatch/single_threaded.zig` routes
   `RenderMode.optimize_speed` to `U8Kernel` with comptime dispatch (no
   runtime vtable), mirroring upstream when both pipeline features are on.
-  Oracle evidence: 13 new `*_speed` scenes render byte-exact vs the pinned
+  Oracle evidence: 16 new `*_speed` scenes render byte-exact vs the pinned
   oracle at `OptimizeSpeed` (`tolerance=0`, four channels); f32 quality
   scenes remain 22/22 byte-exact. `zig build test` = 567 library + 6 scene
-  tests; `zig build corpus` = 35/35. Remaining: SIMD-level dispatch,
-  multithreading, measured speedups, filters/glyphs on the u8 path.
+  tests; `zig build corpus` = 38/38. Remaining: SIMD-level dispatch,
+  multithreading, more measured speedups, filters/glyphs on the u8 path.
 

@@ -65,17 +65,22 @@ must fail loudly or be absent from the corpus, not produce approximate output.
 | linear / radial / sweep gradients | `gradient_linear_64`, `gradient_radial_64`, `gradient_sweep_64` |
 | gradient LUT + repeat extend | `gradient_repeat_128` |
 | image sampling: nearest, bilinear + reflect | `image_nearest_64`, `image_bilinear_64` |
+| image sampling: skewed bilinear, bicubic | `image_bilinear_skew_64_speed`, `image_bicubic_64_speed` |
+| two-point radial with undefined region | `gradient_radial_undefined_64_speed` |
 | blend layer (multiply) | `layer_blend_multiply_64` |
 | nested opacity layers | `layer_opacity_64` |
 | alpha / luminance masks | `mask_alpha_64`, `mask_luminance_64` |
 
-The `*_speed` variants of the scenes above (13 scenes) are identical except for
+The `*_speed` variants of the scenes above (16 scenes) are identical except for
 `"mode": "speed"` and exercise the low-precision (u8) pipeline. Their fixtures
 are produced by the same pinned oracle with `RenderMode::OptimizeSpeed`, so
 they are gold for the u8 kernel exactly like the quality scenes are for f32.
+They cover the u8-native gradient LUT and bilinear painters, the f32-painter
+`paintU8` conversion (nearest/bicubic images and undefined radial gradients),
+and the integer blend/composite/mask paths.
 
-All scenes above render byte-exact with `zig build corpus` (35/35,
-`tolerance=0`: 22 quality/f32 + 13 speed/u8). The f32 and u8 pipelines are not
+All scenes above render byte-exact with `zig build corpus` (38/38,
+`tolerance=0`: 22 quality/f32 + 16 speed/u8). The f32 and u8 pipelines are not
 byte-equal to each other in general (integer `div_255` rounding vs f32); the
 corpus compares each pipeline against its own oracle output, never against the
 other pipeline. Filter layers and blurred rounded rectangles are the remaining
