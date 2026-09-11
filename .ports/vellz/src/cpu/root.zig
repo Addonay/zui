@@ -58,5 +58,9 @@ test {
     _ = @import("fine/mod.zig");
     _ = @import("fine/highp/mod.zig");
     _ = @import("fine/lowp/mod.zig");
+    _ = @import("fine/lowp/blend.zig");
+    _ = @import("fine/lowp/compose.zig");
+    _ = @import("fine/lowp/gradient.zig");
+    _ = @import("fine/lowp/image.zig");
     _ = @import("render.zig");
 }
