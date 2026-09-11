@@ -36,9 +36,18 @@ pub fn build(b: *std.Build) void {
     const options_module = options.createModule();
 
     // ------------------------------------------------------------- module
-    var import_buf: [2]std.Build.Module.Import = undefined;
+    // The probe reference is a fixture (raw bytes), imported so that
+    // `@embedFile("probe_reference")` in `src/common/probe.zig` can read it:
+    // `@embedFile` paths must stay inside the module's package path.
+    const probe_reference_module = b.createModule(.{
+        .root_source_file = b.path("tests/fixtures/upstream/probe.rgba"),
+    });
+
+    var import_buf: [3]std.Build.Module.Import = undefined;
     var import_count: usize = 0;
     import_buf[import_count] = .{ .name = "build_options", .module = options_module };
+    import_count += 1;
+    import_buf[import_count] = .{ .name = "probe_reference", .module = probe_reference_module };
     import_count += 1;
 
     if (gpu_enabled) {
@@ -131,6 +140,19 @@ pub fn build(b: *std.Build) void {
     corpus.step.dependOn(&b.addInstallArtifact(cli, .{}).step);
     const corpus_step = b.step("corpus", "Run the oracle corpus gate (G1)");
     corpus_step.dependOn(&corpus.step);
+
+    // ---------------------------------------------------------- probe gate
+    // Renders the ported upstream probe scene (src/common/probe.zig) at the
+    // settings that generated the pinned upstream reference and compares the
+    // un-premultiplied RGBA8 output. The same comparison also runs inside
+    // `zig build test` through the embedded fixture.
+    const probe = b.addSystemCommand(&.{"tools/check_probe.sh"});
+    probe.step.dependOn(&b.addInstallArtifact(cli, .{}).step);
+    const probe_step = b.step(
+        "probe",
+        "Render the upstream probe fixture and compare against the pinned reference",
+    );
+    probe_step.dependOn(&probe.step);
 
     // ---------------------------------------------------------------- tests
     const unit_tests = b.addTest(.{ .root_module = mod });

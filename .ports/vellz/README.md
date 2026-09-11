@@ -27,15 +27,18 @@ corpus — solid fills, strokes, gradients, images, layers, and masks — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 547/547 unit and integration tests
+zig build test     # 553/553 unit and integration tests
 zig build corpus   # 22/22 corpus scenes byte-exact vs the upstream oracle
+zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 ```
 
 Coverage: antialiased fills, translucent overlap, NonZero/EvenOdd, nested
 clips and isolated clip layers, transforms, round-capped strokes, degenerate
 and empty scenes, tile seams, wide curvature at 128×128, linear/radial/sweep
 gradients with LUT/repeat extend, nearest/bilinear image sampling with
-reflect, opacity and multiply-blend layers, and alpha/luminance masks.
+reflect, opacity and multiply-blend layers, alpha/luminance masks, and the
+ported upstream probe scene (solid, alpha blending, gradient, nearest/bilinear
+images, opacity layer, difference blend, rotation).
 
 Not yet implemented (explicit errors, never placeholder pixels): filter
 layers (gaussian blur, drop shadow, flood, offset), blurred rounded
@@ -74,6 +77,7 @@ CPU-only, no GPU dependency:
 zig build test                  # unit + integration tests
 zig build check                 # compile without running
 zig build corpus                # G1 corpus gate against pinned oracle fixtures
+zig build probe                 # upstream probe fixture (tolerance-3 policy)
 zig build run-cpu-example       # writes cpu_example.ppm
 zig build vellz-cli             # corpus renderer CLI -> zig-out/bin
 ```
@@ -99,7 +103,9 @@ tools/generate_shaders.sh                # refresh checked-in WGSL (GPU)
 
 `tools/oracle-rs` is our own Rust driver around the pinned `vello_cpu`;
 `tools/compare_corpus.sh` renders the shared corpus with `vellz-cli` and
-compares raw premultiplied RGBA8 byte-for-byte. See
+compares raw premultiplied RGBA8 byte-for-byte. `tools/check_probe.sh` renders
+the ported upstream probe scene and compares it against the imported
+`tests/fixtures/upstream/probe.rgba`. See
 [`tests/README.md`](tests/README.md) and
 [`docs/gpu-compatibility.md`](docs/gpu-compatibility.md).
 

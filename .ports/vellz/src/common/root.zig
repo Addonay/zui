@@ -44,6 +44,7 @@ pub const filter = @import("filter.zig");
 pub const blurred_rounded_rect = @import("blurred_rounded_rect.zig");
 pub const record = @import("record.zig");
 pub const encode = @import("encode.zig");
+pub const probe = @import("probe.zig");
 
 test {
     // `refAllDecls` does not force analysis of imported files in this Zig
@@ -72,4 +73,5 @@ test {
     _ = @import("blurred_rounded_rect.zig");
     _ = @import("record.zig");
     _ = @import("encode.zig");
+    _ = @import("probe.zig");
 }

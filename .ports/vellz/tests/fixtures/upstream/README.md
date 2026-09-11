@@ -19,9 +19,14 @@ SHA-256:
 ```
 
 The `probe.rgba` scene is defined in `vello_common/src/probe.rs` (upstream) and
-becomes usable when the corresponding features (solid fill, alpha blending,
-gradient, nearest/bilinear image, opacity layer, difference blend, rotation)
-are ported. Until then it is a pinned reference, not a passing test.
+is ported in `src/common/probe.zig`; `vellz.cpu.probe.renderProbePixmap`
+renders it with the exact reference settings. As of 2026-09-11 the f32/scalar
+port is byte-exact against this fixture, checked by the embedded-fixture test
+in `zig build test` and by `zig build probe`
+(`vellz-cli --probe` + `tools/compare_raw.py`). The upstream tolerance-3
+policy is what `vellz.common.probe` implements, so both checks always report
+the measured maximum channel difference instead of silently relying on the
+tolerance.
 
 Upstream `vello_tests/snapshots/*.png` (523 files, Git LFS) are the broader
 gold corpus. They are imported one at a time together with the ported scene
