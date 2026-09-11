@@ -531,6 +531,7 @@ pub const SingleThreadedDispatcher = struct {
             self.recorder.draws.items,
             self.recorder.layers.items,
             self.strip_storage.strips.items,
+            encoded_paints,
             filter_ctx,
         );
 

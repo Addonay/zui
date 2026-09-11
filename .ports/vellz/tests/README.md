@@ -69,10 +69,11 @@ must fail loudly or be absent from the corpus, not produce approximate output.
 | nested opacity layers | `layer_opacity_64` |
 | alpha / luminance masks | `mask_alpha_64`, `mask_luminance_64` |
 
-The Milestone 2 scenes are rendered by the pinned oracle; the vellz CLI
-consumes them once the corresponding renderer feature lands. Until then,
-`zig build corpus` stops on these scenes instead of approximating their
-output.
+All scenes above render byte-exact with `zig build corpus` (22/22,
+`tolerance=0`). Filter layers and blurred rounded rectangles are the remaining
+M2 features; their scenes will be added here together with oracle support, and
+until then the renderer fails those commands loudly instead of approximating
+their output.
 
 Planned: filters, positioned glyphs, mixed scripts, resource exhaustion,
 repeated resize.

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Render the shared corpus with vellz and compare against the pinned oracle
-# fixtures. Milestone 1 gate (G1) runner.
+# fixtures. Gates G1 (foundation) and the landed M2 CPU features; M2 filter
+# scenes are absent until filters land.
 #
 # Usage:
 #   tools/compare_corpus.sh [--tolerance N] [--jobs N]
@@ -69,7 +70,7 @@ else
 fi
 
 if [ "$failures" -ne 0 ]; then
-    echo "G1: FAIL (see $out/*.compare)"
+    echo "corpus: FAIL (see $out/*.compare)"
     exit 1
 fi
-echo "G1: PASS (${#scenes[@]} scenes, tolerance=$tolerance)"
+echo "corpus: PASS (${#scenes[@]} scenes, tolerance=$tolerance)"

@@ -5,19 +5,19 @@
 //! `pop_buf` pairs for layers, and `layer_fill`s that composite a layer into
 //! its parent.
 //!
-//! Scope of this port (M1): solid paints, regular layers (clip/opacity/blend),
-//! coarse depth culling of opaque fills, alpha segments from `fill_gap`
-//! handling, viewport origins, and clip bounding boxes. Deferred features fail
-//! with `error.Unsupported` instead of emitting placeholder pixels:
+//! Scope of this port: solid and indexed (gradient/image) paints, regular
+//! layers (clip/opacity/blend), coarse depth culling of opaque fills, alpha
+//! segments from `fill_gap` handling, viewport origins, and clip bounding
+//! boxes. Deferred features fail with `error.Unsupported` instead of emitting
+//! placeholder pixels:
 //!
 //! - **Filter layers**: `bucketCommands` rejects a recorded
 //!   `RecordedLayerKind.filter` node outright. `FilterContext` (see
-//!   `cpu/filter.zig`) stays empty in M1.
-//! - **Indexed paints**: a `Paint.indexed` payload is rejected in
-//!   `generateFill`. The encoder in `cpu/render.zig` never produces one for
-//!   M1. The `encoded_paints` argument upstream's `generate_fill` takes is
-//!   therefore not part of this M1 signature; M2 adds it together with the
-//!   indexed-paint painters.
+//!   `cpu/filter.zig`) stays empty until M2 filter rasterization lands.
+//! - **Indexed paints** are supported: `generateFill` consults the scene's
+//!   `encoded_paints` through `encode.paintMayHaveTransparency` exactly like
+//!   upstream, so a gradient/image fill disables depth culling when it may be
+//!   translucent.
 //!
 //! Ownership/allocator note (following the repository convention): the
 //! bucketer owns `row_states`, `clip_bboxes`, `active_layers`,
@@ -41,6 +41,7 @@ const geometry = @import("../../common/geometry.zig");
 const common_util = @import("../../common/util.zig");
 const mask_mod = @import("../../common/mask.zig");
 const paint_mod = @import("../../common/paint.zig");
+const encode_mod = @import("../../common/encode.zig");
 const strip_mod = @import("../../common/strip.zig");
 const peniko = @import("../../peniko/root.zig");
 const cmd = @import("cmd.zig");
@@ -75,8 +76,8 @@ const TILE_WIDTH: u16 = util_cpu.TILE_WIDTH;
 /// The tile height in pixels (`Tile::HEIGHT`).
 const TILE_HEIGHT: u16 = util_cpu.TILE_HEIGHT;
 
-/// Errors from bucketing: allocation failure plus the explicitly deferred M1
-/// features (filter layers, indexed paints).
+/// Errors from bucketing: allocation failure plus the explicitly deferred
+/// features (filter layers).
 pub const Error = std.mem.Allocator.Error || error{Unsupported};
 
 fn isDefaultBlendMode(blend_mode: BlendMode) bool {
@@ -432,6 +433,7 @@ pub const CommandBucketer = struct {
         draws: []const RecordedFill,
         layers: []const RecordedLayer,
         strips: []const Strip,
+        encoded_paints: []const encode_mod.EncodedPaint,
         filter_ctx: *const FilterContext,
     ) Error!void {
         std.debug.assert(self.viewport.x0 % TILE_WIDTH == 0);
@@ -456,6 +458,7 @@ pub const CommandBucketer = struct {
                     allocator,
                     strips[strip_range.start..strip_range.end],
                     attrs,
+                    encoded_paints,
                 );
             }
 
@@ -472,6 +475,7 @@ pub const CommandBucketer = struct {
                             draws,
                             layers,
                             strips,
+                            encoded_paints,
                             filter_ctx,
                         );
                         try self.popLayer(allocator, strips);
@@ -630,12 +634,13 @@ pub const CommandBucketer = struct {
     ///
     /// `attrs.draw_id` must be non-zero. Depth culling is only enabled when
     /// the fill is outside of every layer, uses the default blend mode, has no
-    /// mask, and its paint is opaque.
+    /// mask, and its paint cannot produce transparent pixels.
     pub fn generateFill(
         self: *CommandBucketer,
         allocator: std.mem.Allocator,
         strip_buf: []const Strip,
         attrs: PaintFillAttrs,
+        encoded_paints: []const encode_mod.EncodedPaint,
     ) Error!void {
         if (strip_buf.len == 0) return;
 
@@ -648,12 +653,7 @@ pub const CommandBucketer = struct {
             if (self.active_layers.items.len != 0) break :blk null;
             if (!isDefaultBlendMode(attrs.blend_mode)) break :blk null;
             if (attrs.mask != null) break :blk null;
-            switch (attrs.paint) {
-                .solid => |premul| {
-                    if (!premul.isOpaque()) break :blk null;
-                },
-                .indexed => return error.Unsupported,
-            }
+            if (encode_mod.paintMayHaveTransparency(attrs.paint, encoded_paints)) break :blk null;
             break :blk attrs.draw_id;
         };
 
@@ -883,6 +883,7 @@ const PushFillCtx = struct {
 
 const testing = std.testing;
 const palette = peniko.palette.css;
+const kurbo = @import("../../kurbo/root.zig");
 
 fn fillAttrs(paint: Paint) PaintFillAttrs {
     return .{
@@ -949,6 +950,7 @@ test "opaque fill inside layer does not use depth write" {
         allocator,
         &strips,
         fillAttrs(Paint.fromAlphaColor(palette.RED)),
+        &.{},
     );
 
     const row = &bucketer.rows()[0];
@@ -980,6 +982,7 @@ test "alpha fill is clipped to active layer bbox" {
         allocator,
         &strips,
         fillAttrs(Paint.fromAlphaColor(palette.RED)),
+        &.{},
     );
 
     const row = &bucketer.rows()[0];
@@ -1013,6 +1016,7 @@ test "disjoint nested clip bounds do not emit commands" {
         allocator,
         &strips,
         fillAttrs(Paint.fromAlphaColor(palette.RED)),
+        &.{},
     );
 
     for (bucketer.rows()) |row| {
@@ -1050,6 +1054,7 @@ test "opaque fill uses depth write when possible" {
         allocator,
         &strips,
         fillAttrs(Paint.fromAlphaColor(palette.RED)),
+        &.{},
     );
 
     const row = &bucketer.rows()[0];
@@ -1095,6 +1100,7 @@ test "non opaque fill uses regular commands" {
         allocator,
         &strips,
         fillAttrs(Paint.fromAlphaColor(palette.BLUE.withAlpha(0.5))),
+        &.{},
     );
 
     const row = &bucketer.rows()[0];
@@ -1131,6 +1137,7 @@ test "clips fills correctly inside nonzero origin viewport" {
         allocator,
         &strips,
         fillAttrs(Paint.fromAlphaColor(palette.RED)),
+        &.{},
     );
 
     const row = &bucketer.rows()[0];
@@ -1175,6 +1182,7 @@ test "culls clip strips above viewport origin" {
         allocator,
         strips[0..2],
         fillAttrs(Paint.fromAlphaColor(palette.RED)),
+        &.{},
     );
     try bucketer.popLayer(allocator, &strips);
 
@@ -1218,7 +1226,7 @@ test "bucketer rows are tile aligned" {
     }
 }
 
-test "generate_fill rejects indexed paints" {
+test "generate_fill supports indexed paints without depth culling" {
     const allocator = testing.allocator;
     var bucketer = try CommandBucketer.init(allocator, 8, 4);
     defer bucketer.deinit(allocator);
@@ -1227,11 +1235,35 @@ test "generate_fill rejects indexed paints" {
         Strip.new(0, 0, 0, false),
         Strip.new(8, 0, 0, true),
     };
+
+    // Blurred rounded rects always report `may_have_transparency`, so the
+    // indexed fill must not enter the depth-culling path.
+    const encoded = [_]encode_mod.EncodedPaint{.{
+        .blurred_rounded_rect = .{
+            .exponent = 1.0,
+            .recip_exponent = 1.0,
+            .scale = 1.0,
+            .std_dev_inv = 1.0,
+            .min_edge = 0.0,
+            .w = 1.0,
+            .h = 1.0,
+            .width = 1.0,
+            .height = 1.0,
+            .r1 = 1.0,
+            .invert = false,
+            .color = paint_mod.PremulColor.fromAlphaColor(palette.RED),
+            .transform = kurbo.Affine.IDENTITY,
+            .x_advance = .{ .x = 1.0, .y = 0.0 },
+            .y_advance = .{ .x = 0.0, .y = 1.0 },
+        },
+    }};
+
     var attrs = fillAttrs(.{ .indexed = try paint_mod.IndexedPaint.new(0) });
     attrs.draw_id = 1;
 
-    try testing.expectError(
-        error.Unsupported,
-        bucketer.generateFill(allocator, &strips, attrs),
-    );
+    try bucketer.generateFill(allocator, &strips, attrs, &encoded);
+
+    const row = &bucketer.rows()[0];
+    try testing.expectEqual(@as(usize, 0), row.depth_cmds.items.len);
+    try testing.expectEqual(@as(usize, 1), row.render_cmds.items.len);
 }

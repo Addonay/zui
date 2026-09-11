@@ -18,25 +18,29 @@ package (wgpu-native `v29.0.1.1`) rather than re-binding the C API locally.
 
 ## Status
 
-**Milestone 1 complete (G1 met 2026-09-11).** The CPU renderer produces
-premultiplied RGBA8 pixels through the full upstream pipeline (path encoding →
-flatten → tiles → sparse strips → coarse bucketing → f32 fine rasterization)
-and every scene in the shared corpus is **byte-exact against the pinned
-upstream oracle** (`tolerance=0`, all four channels) in Debug, ReleaseSafe, and
-ReleaseFast:
+**Milestone 1 complete (G1 met 2026-09-11); Milestone 2 CPU features
+oracle-verified.** The CPU renderer produces premultiplied RGBA8 pixels through
+the full upstream pipeline (path encoding → flatten → tiles → sparse strips →
+coarse bucketing → f32 fine rasterization) and every scene in the shared
+corpus — solid fills, strokes, gradients, images, layers, and masks — is
+**byte-exact against the pinned upstream oracle** (`tolerance=0`, all four
+channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 483/483 unit and integration tests
-zig build corpus   # G1: 12/12 corpus scenes byte-exact vs the upstream oracle
+zig build test     # 547/547 unit and integration tests
+zig build corpus   # 22/22 corpus scenes byte-exact vs the upstream oracle
 ```
 
 Coverage: antialiased fills, translucent overlap, NonZero/EvenOdd, nested
 clips and isolated clip layers, transforms, round-capped strokes, degenerate
-and empty scenes, tile seams, and wide curvature at 128×128.
+and empty scenes, tile seams, wide curvature at 128×128, linear/radial/sweep
+gradients with LUT/repeat extend, nearest/bilinear image sampling with
+reflect, opacity and multiply-blend layers, and alpha/luminance masks.
 
-Not yet implemented (explicit errors, never placeholder pixels): gradients,
-images, masks, filters, and u8-speed rasterization on the CPU; multithreading;
-glyph rendering; the GPU backend. See [`plan.md`](plan.md) for the ledgers and
+Not yet implemented (explicit errors, never placeholder pixels): filter
+layers (gaussian blur, drop shadow, flood, offset), blurred rounded
+rectangles, and u8-speed rasterization on the CPU; multithreading; glyph
+rendering; the GPU backend. See [`plan.md`](plan.md) for the ledgers and
 milestones.
 
 ## Layout

@@ -166,27 +166,26 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `rect.rs` (fast pixel-aligned rect) | `common/rect.zig` | port | upstream tests ported |
 | `clip.rs` (`ClipState`, `PathDataRef`, `intersect`) | `common/clip.zig`, `common/intersect.zig` | port | 22 tests (13 upstream); cycle split documented in docs/cpu-pipeline.md |
 | `viewport.rs` (`ViewportState`) | `common/viewport.zig` | port | 3 tests; not connected until cpu/render lands |
-| `paint.rs` (`Paint`, `IndexedPaint`, `Tint`, ...) | `common/paint.zig` | n/s | `PaintType = peniko Brush` |
-| `encode.rs` (gradients/images/BRR encoding + LUTs) | `common/encode.zig` | defer | M2; must match `EncodedGradient` fields |
-| `render_state.rs` | `common/render_state.zig` | n/s | |
-| `transforms.rs` | `common/transforms.zig` | n/s | scene + paint transforms, roots |
-| `pixmap.rs` (`Pixmap`, `PixmapMut`, premultiply) | `common/pixmap.zig` | n/s | RGBA8 premultiplied sRGB |
+| `paint.rs` (`Paint`, `IndexedPaint`, `Tint`, ...) | `common/paint.zig` | port | connected; indexed (gradient/image) paints oracle-verified via the corpus; `PaintType = peniko Brush` |
+| `encode.rs` (gradients/images/BRR encoding + LUTs) | `common/encode.zig` | port | connected; gradient/image encoding + LUTs oracle-verified (4 gradient + 2 image scenes byte-exact); BRR encoding deferred (M2-later) |
+| `render_state.rs` | `common/render_state.zig` | port | 2 tests |
+| `transforms.rs` | `common/transforms.zig` | port | connected; 5 tests |
+| `pixmap.rs` (`Pixmap`, `PixmapMut`, premultiply) | `common/pixmap.zig` | port | connected (CPU targets, image assets); RGBA8 premultiplied sRGB |
 | `mask.rs` | `common/mask.zig` | port | Shared(MaskRepr); 6 tests |
 | `record.rs` (layers/commands) | `common/record.zig` | port | 18 tests (11 upstream), transactional OOM-safe pushes |
 | `filter_effects.rs` + `filter/mod.rs` | `common/filter_effects.zig`, `common/filter.zig` | port (data model) | declaration + expansion math; algorithms deferred to M2 (`PreparedFilter.new` -> `error.Unsupported`); 22 tests |
-| `blurred_rounded_rect.rs` | `common/blurred_rounded_rect.zig` | port | 1 test |
-| `blurred_rounded_rect.rs` | `common/blurred_rounded_rect.zig` | defer | M2 |
+| `blurred_rounded_rect.rs` | `common/blurred_rounded_rect.zig` | port (data model) | 1 test; encode deferred to the filter work |
 | `image_cache.rs`, `multi_atlas.rs` (guillotiere) | `common/atlas.zig` | defer | M3 (glyph atlas), M2 (images) |
-| `target.rs` (`TargetInit`) | `common/target.zig` | n/s | clear vs src-over |
+| `target.rs` (`TargetInit`) | `common/target.zig` | port | 1 test; connected via `RasterizerSettings` |
 | `probe.rs`, `pico_svg.rs` | `common/probe.zig` | defer | oracle/dev only |
 
 ### `vello_cpu` → `src/cpu/`
 
 | Upstream module | Zig target | Status | Notes |
 | --- | --- | --- | --- |
-| `lib.rs` (exports, `RenderMode`) | `cpu/root.zig` | n/s | at least one of u8/f32 pipelines |
-| `render.rs` (`RenderContext`, settings, Resources) | `cpu/render.zig`, `cpu/settings.zig` | port | connected; solid paints + masks (`setMask`/`resetMask`/`pushMaskLayer`, recordings own mask handles); image registry (`registerImage`/`resolveImage`/`destroyImage`/`clearImages` + resolver view); gradients/images paint encoding (M2, in flight) |
-| `record.rs` (`RecordedFill`) | `cpu/record.zig` | partial | `bbox` waits on `stripBBox` |
+| `lib.rs` (exports, `RenderMode`) | `cpu/root.zig` | port | connected; f32 pipeline (`optimize_quality`) |
+| `render.rs` (`RenderContext`, settings, Resources) | `cpu/render.zig`, `cpu/settings.zig` | port | connected; solid/indexed paints + masks (`setMask`/`resetMask`/`pushMaskLayer`), layers (clip/opacity/blend), image registry; gradient/image encoding oracle-verified |
+| `record.rs` (`RecordedFill`) | `cpu/record.zig` | port | connected; `bbox` waits on filter work |
 | `region.rs` (`Region`, `Regions`) | `cpu/region.zig` | port | 4 tests |
 | `coarse/cmd.rs` | `cpu/coarse/cmd.zig` | port | 4 tests |
 | `coarse/depth.rs` | `cpu/coarse/depth.zig` | port | 10 tests, 128-px buckets |
@@ -194,9 +193,9 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `fine/mod.rs` (`Fine`, `rasterize_region`, traits) | `cpu/fine/mod.zig` | port | connected; error-returning per port policy |
 | `fine/highp/*` (f32 kernel) | `cpu/fine/highp/mod.zig`, `blend.zig`, `compose.zig` | port | connected; 16 mix + 14 compose modes |
 | `fine/lowp/*` (u8 kernel) | `cpu/fine/lowp.zig` | defer | M4 speed path |
-| `fine/common/gradient/*` | `cpu/fine/gradient.zig` | defer | M2 |
-| `fine/common/image.rs` | `cpu/fine/image.zig` | defer | M2 |
-| `fine/common/rounded_blurred_rect.rs` | `cpu/fine/blurred_rect.zig` | defer | M2 |
+| `fine/common/gradient/*` | `cpu/fine/gradient.zig` | port | connected; oracle-verified (linear/radial/sweep/repeat scenes byte-exact) |
+| `fine/common/image.rs` | `cpu/fine/image.zig` | port | connected; oracle-verified (nearest/bilinear scenes byte-exact) |
+| `fine/common/rounded_blurred_rect.rs` | `cpu/fine/blurred_rect.zig` | defer | M2 filter work |
 | `dispatch/single_threaded.rs` | `cpu/dispatch/single_threaded.zig` | port | connected; f32 kernel; u8 kernel explicit `error.Unsupported` (M4) |
 | `dispatch/multi_threaded*.rs` | `cpu/dispatch/multi_threaded.zig` | defer | M4 |
 | `filter/*` | `cpu/filter/*.zig` | defer | M2; upstream limitations recorded |
@@ -417,6 +416,12 @@ of panics, thread ownership).
 
 - Strokes, gradients, images, layers/blending, masks, supported filters,
   upstream fixtures imported with provenance.
+- **Landed and oracle-verified:** strokes, linear/radial/sweep/repeat
+  gradients, nearest/bilinear images, nested opacity and multiply-blend
+  layers, alpha/luminance masks. `zig build corpus` = 22/22 scenes byte-exact
+  (`tolerance=0`, four channels); `zig build test` = 547/547.
+- **Remaining:** filter layers (gaussian blur, drop shadow, flood, offset),
+  blurred rounded rectangles, and the matching scene/oracle support.
 - **Gate:** corpus scenes for each feature pass; error paths and teardown
   covered by tests (`G2`).
 
@@ -501,4 +506,17 @@ of panics, thread ownership).
   by pinned SHA-256 only. `vello_common/assets/probe.rgba` is an independent
   deterministic fixture (unpremultiplied RGBA8, tolerance 3 upstream) for later
   import.
+- 2026-09-11 later: M2 CPU features verified end to end. The in-flight
+  gradient/image encoder (`common/encode.zig`) and fine-side painters
+  (`cpu/fine/gradient.zig`, `cpu/fine/image.zig`) were already written; the
+  missing link was upstream `generate_fill`'s indexed-paint path in
+  `cpu/coarse/bucketer.zig`: the bucketer now threads `encoded_paints` through
+  `bucketCommands`/`generateFill` and gates depth culling on
+  `encode.paintMayHaveTransparency` instead of rejecting `Paint.indexed`.
+  `zig build corpus` now reports 22/22 scenes byte-exact (`tolerance=0`, four
+  channels) — adding linear/radial/sweep/repeat gradients,
+  nearest/bilinear images, opacity/multiply layers, and alpha/luminance masks
+  to the M1 set; `zig build test` 547/547. Remaining for G2: filter layers
+  (gaussian blur, drop shadow, flood, offset), blurred rounded rectangles,
+  upstream fixture import.
 
