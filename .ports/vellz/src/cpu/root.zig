@@ -12,7 +12,7 @@
 //! - `filter.zig`      <- `filter/context.rs` (M1 empty-context seam)
 //! - `dispatch/single_threaded.zig` <- `dispatch/single_threaded.rs`
 //! - `fine/`           <- `fine/` (`Fine(K)`, `rasterizeRegion`,
-//!   `highp.F32Kernel`)
+//!   `highp.F32Kernel`, `lowp.U8Kernel`)
 //! - `render.zig`      <- `render.rs` (`RenderContext`, `Resources`, and the
 //!   re-exported settings types)
 
@@ -30,6 +30,7 @@ pub const render = @import("render.zig");
 
 pub const Span = util.Span;
 pub const F32Kernel = fine.F32Kernel;
+pub const U8Kernel = fine.U8Kernel;
 pub const FilterContext = filter.FilterContext;
 
 pub const RenderContext = render.RenderContext;
@@ -55,5 +56,7 @@ test {
     _ = @import("coarse/depth.zig");
     _ = @import("dispatch/single_threaded.zig");
     _ = @import("fine/mod.zig");
+    _ = @import("fine/highp/mod.zig");
+    _ = @import("fine/lowp/mod.zig");
     _ = @import("render.zig");
 }

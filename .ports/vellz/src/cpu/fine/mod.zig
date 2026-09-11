@@ -2,8 +2,9 @@
 //!
 //! Fine rasterization stage: processes strip rows at pixel level into
 //! column-major 4-row blocks (see the layout note below), supporting both the
-//! high-precision f32 kernel (ported, `highp/mod.zig`) and, later, the u8 kernel
-//! (`U8Kernel`, M4).
+//! high-precision f32 kernel (`highp/mod.zig`) and the low-precision u8 kernel
+//! (`lowp/mod.zig`). `SingleThreadedDispatcher.rasterize` selects the kernel
+//! from `RenderMode`.
 //!
 //! Buffer layout: for a pixel column `dx` of a 4-row strip and row `y`, the
 //! scratch index of component `c` is `COLOR_COMPONENTS * (TILE_HEIGHT * dx + y) + c`.
@@ -17,15 +18,16 @@
 //! the root is a blend target, the background is isolated into the parent
 //! buffer so blend modes cannot destructively touch it.
 //!
-//! `indexed_fill` (gradients and images) is implemented in M2 via
-//! `gradient.zig` and `image.zig`; the painters are f32-only until the u8
-//! kernel lands in M4. Still deferred (explicit `error.Unsupported`, never
-//! placeholder pixels): blurred rounded rects, external textures, and filter
-//! paints (`filter_paints` is carried but always empty for now).
+//! `indexed_fill` (gradients and images) dispatches painter selection on
+//! `K.Numeric`: the u8 kernel uses the u8-native bilinear image painters and
+//! the u8 LUT gradient painter where upstream's `U8Kernel` overrides the
+//! defaults; the remaining painters stay f32 and expose `paintU8` for the
+//! conversion. Still deferred (explicit `error.Unsupported`, never placeholder
+//! pixels): blurred rounded rects, external textures, and filter paints
+//! (`filter_paints` is carried but always empty for now).
 //!
-//! Kernel (`K`) surface required at instantiation time
-//! (`ComptimeKernel` documents it; only `highp.F32Kernel` is instantiated in
-//! M1):
+//! Kernel (`K`) surface required at instantiation time (implemented by
+//! `highp.F32Kernel` and `lowp.U8Kernel`):
 //!
 //! ```text
 //! Numeric, Composite, NumericVec        types
@@ -46,6 +48,10 @@
 //! numericVecFromF32(f32x16) NumericVec
 //! numericVecFromU8(u8x16) NumericVec
 //! ```
+//!
+//! Painters are selected by `indexed_fill`, not by the kernel, but every
+//! painter must expose `paint(dest: []f32)` and `paintU8(dest: []u8)` so the
+//! same `applyComplexPaint` body serves both kernels.
 //!
 //! Ownership/allocator note: unlike the `Pool`/`Pixmap` convention of taking
 //! an allocator per growing call, `Fine` stores the allocator it was created
@@ -91,6 +97,10 @@ const BlendMode = peniko.BlendMode;
 pub const highp = @import("highp/mod.zig");
 /// Re-export of `highp.F32Kernel` (upstream `pub use highp::F32Kernel`).
 pub const F32Kernel = highp.F32Kernel;
+/// The low-precision (u8/u16) kernel.
+pub const lowp = @import("lowp/mod.zig");
+/// Re-export of `lowp.U8Kernel` (upstream `pub use lowp::U8Kernel`).
+pub const U8Kernel = lowp.U8Kernel;
 
 /// Offset to shift from pixel corner to pixel center for sampling.
 pub const PIXEL_CENTER_OFFSET: f64 = 0.5;
@@ -120,6 +130,18 @@ pub const Error = error{ Unsupported, OutOfMemory, MissingImage, InvalidPaintInd
 /// `blend_mode == BlendMode::default()`.
 pub fn isDefaultBlendMode(blend_mode: BlendMode) bool {
     return blend_mode.mix == .normal and blend_mode.compose == .src_over;
+}
+
+/// Apply a painter to a numeric buffer (upstream `FineKernel::apply_painter`).
+///
+/// The f32 kernel uses the painter's `paint`; the u8 kernel uses `paintU8`,
+/// which either produces bytes natively or converts the f32 output.
+fn applyPainter(comptime K: type, painter: anytype, dest: []K.Numeric) void {
+    if (comptime K.Numeric == f32) {
+        painter.paint(dest);
+    } else {
+        painter.paintU8(dest);
+    }
 }
 
 /// A source of composite vectors for blending: either one repeated color or a
@@ -688,8 +710,12 @@ pub fn Fine(comptime K: type) type {
         /// size paint_buf/f32_buf; select painter; apply/blend.
         /// ```
         ///
-        /// Still-deferred kinds (blurred rounded rects, external textures)
-        /// return `error.Unsupported` rather than placeholder pixels.
+        /// The painter selection follows the kernel. Upstream's `U8Kernel`
+        /// overrides the gradient painter and both medium-quality image
+        /// painters; everything else stays on the f32 implementation and is
+        /// converted by `paintU8`. Still-deferred kinds (blurred rounded
+        /// rects, external textures) return `error.Unsupported` rather than
+        /// placeholder pixels.
         pub fn indexedFill(
             self: *Self,
             span: Span,
@@ -698,9 +724,6 @@ pub fn Fine(comptime K: type) type {
             resources: FineResources,
             alphas: ?[]const u8,
         ) Error!void {
-            // The M2 painters are f32-only; the u8 kernel arrives in M4.
-            comptime std.debug.assert(K.Numeric == f32);
-
             const x = span.pixelX();
             const y = self.row_y;
             const sample_x = @as(u32, x) +| @as(u32, self.origin[0]);
@@ -743,19 +766,55 @@ pub fn Fine(comptime K: type) type {
                     // vectorized, then consume them in the painter.
                     const t_vals = self.f32_buf.items[0..t_len];
                     gradient_mod.computeTVals(gradient_mut, t_vals, sampler_x, sampler_y);
-                    var painter = try gradient_mod.GradientPainter.init(
-                        gradient_mut,
-                        self.allocator,
-                        t_vals,
-                    );
-                    self.applyComplexPaint(
-                        span,
-                        attrs,
-                        alphas,
-                        gradient.may_have_transparency,
-                        null,
-                        &painter,
-                    );
+                    if (comptime K.Numeric == u8) {
+                        if (gradient.has_undefined) {
+                            // Upstream's `U8Kernel` does not override
+                            // `gradient_painter_with_undefined`, so radial
+                            // gradients with undefined positions stay on the
+                            // f32 painter and convert to u8.
+                            var painter = try gradient_mod.GradientPainter.init(
+                                gradient_mut,
+                                self.allocator,
+                                t_vals,
+                            );
+                            self.applyComplexPaint(
+                                span,
+                                attrs,
+                                alphas,
+                                gradient.may_have_transparency,
+                                null,
+                                &painter,
+                            );
+                        } else {
+                            var painter = try lowp.gradient.GradientPainter.init(
+                                gradient_mut,
+                                self.allocator,
+                                t_vals,
+                            );
+                            self.applyComplexPaint(
+                                span,
+                                attrs,
+                                alphas,
+                                gradient.may_have_transparency,
+                                null,
+                                &painter,
+                            );
+                        }
+                    } else {
+                        var painter = try gradient_mod.GradientPainter.init(
+                            gradient_mut,
+                            self.allocator,
+                            t_vals,
+                        );
+                        self.applyComplexPaint(
+                            span,
+                            attrs,
+                            alphas,
+                            gradient.may_have_transparency,
+                            null,
+                            &painter,
+                        );
+                    }
                 },
                 .image => |*image| {
                     // Upstream clones the `Arc<Pixmap>`; this port borrows the
@@ -777,15 +836,74 @@ pub fn Fine(comptime K: type) type {
                     };
 
                     const tint: ?*const paint_mod.Tint = if (image.tint) |*value| value else null;
-                    var painter = image_mod.ImagePainter.init(image, pixmap, sampler_x, sampler_y);
-                    self.applyComplexPaint(
-                        span,
-                        attrs,
-                        alphas,
-                        image.may_have_transparency,
-                        tint,
-                        &painter,
-                    );
+                    if (comptime K.Numeric == u8) {
+                        if (image.sampler.quality == .medium) {
+                            // Upstream `U8Kernel` overrides both
+                            // medium-quality painters with u8-native bilinear
+                            // ones; `Low` and `High` stay on the f32 painters.
+                            if (util.hasSkew(image)) {
+                                var painter = lowp.image.BilinearImagePainter.init(
+                                    image,
+                                    pixmap,
+                                    sampler_x,
+                                    sampler_y,
+                                );
+                                self.applyComplexPaint(
+                                    span,
+                                    attrs,
+                                    alphas,
+                                    image.may_have_transparency,
+                                    tint,
+                                    &painter,
+                                );
+                            } else {
+                                var painter = lowp.image.PlainBilinearImagePainter.init(
+                                    image,
+                                    pixmap,
+                                    sampler_x,
+                                    sampler_y,
+                                );
+                                self.applyComplexPaint(
+                                    span,
+                                    attrs,
+                                    alphas,
+                                    image.may_have_transparency,
+                                    tint,
+                                    &painter,
+                                );
+                            }
+                        } else {
+                            var painter = image_mod.ImagePainter.init(
+                                image,
+                                pixmap,
+                                sampler_x,
+                                sampler_y,
+                            );
+                            self.applyComplexPaint(
+                                span,
+                                attrs,
+                                alphas,
+                                image.may_have_transparency,
+                                tint,
+                                &painter,
+                            );
+                        }
+                    } else {
+                        var painter = image_mod.ImagePainter.init(
+                            image,
+                            pixmap,
+                            sampler_x,
+                            sampler_y,
+                        );
+                        self.applyComplexPaint(
+                            span,
+                            attrs,
+                            alphas,
+                            image.may_have_transparency,
+                            tint,
+                            &painter,
+                        );
+                    }
                 },
                 // Blurred rounded rects belong to the filter/BRR work.
                 .blurred_rounded_rect => return error.Unsupported,
@@ -816,7 +934,7 @@ pub fn Fine(comptime K: type) type {
             if (may_have_transparency or alphas != null or
                 !isDefaultBlendMode(attrs.blend_mode) or attrs.mask != null)
             {
-                painter.paint(color_buf);
+                applyPainter(K, painter, color_buf);
                 if (tint) |value| K.applyTint(self.level, color_buf, value);
 
                 if (isDefaultBlendMode(attrs.blend_mode) and attrs.mask == null) {
@@ -835,7 +953,7 @@ pub fn Fine(comptime K: type) type {
                 }
             } else {
                 // A fully opaque paint can overwrite the previous values.
-                painter.paint(dest);
+                applyPainter(K, painter, dest);
                 if (tint) |value| K.applyTint(self.level, dest, value);
             }
         }
@@ -963,7 +1081,8 @@ fn emptyResources() FineResources {
     };
 }
 
-fn rasterize(
+fn rasterizeKernel(
+    comptime K: type,
     allocator: std.mem.Allocator,
     pixmap: *Pixmap,
     bucketer: *const CommandBucketer,
@@ -974,13 +1093,13 @@ fn rasterize(
     var depth = try DepthBuffer.init(allocator, pixmap.width);
     defer depth.deinit(allocator);
 
-    var fine = try Fine(F32Kernel).init(simd.Level.fallback, allocator, pixmap.width);
+    var fine = try Fine(K).init(simd.Level.fallback, allocator, pixmap.width);
     defer fine.deinit();
 
     var pixmap_mut = pixmap.asMut();
     var region = Region.init(&pixmap_mut, RectU16.new(0, 0, pixmap.width, pixmap.height));
     try rasterizeRegion(
-        F32Kernel,
+        K,
         &fine,
         &depth,
         &region,
@@ -993,6 +1112,25 @@ fn rasterize(
         },
         target_init,
         root_is_blend_target,
+    );
+}
+
+fn rasterize(
+    allocator: std.mem.Allocator,
+    pixmap: *Pixmap,
+    bucketer: *const CommandBucketer,
+    target_init: TargetInit,
+    root_is_blend_target: bool,
+    alpha_buffers: []const []const u8,
+) !void {
+    return rasterizeKernel(
+        F32Kernel,
+        allocator,
+        pixmap,
+        bucketer,
+        target_init,
+        root_is_blend_target,
+        alpha_buffers,
     );
 }
 
@@ -1264,6 +1402,163 @@ test "rasterize_region_depth_commands_render_front_to_back" {
     const blue = pixmap.sample(200, 0);
     try testing.expectEqual(@as(u8, 0), blue.r);
     try testing.expectEqual(@as(u8, 255), blue.b);
+}
+
+/// Largest per-byte difference between two pixmaps of equal size.
+fn pixelByteDelta(a: *const Pixmap, b: *const Pixmap) !u8 {
+    const a_bytes = a.dataAsU8Slice();
+    const b_bytes = b.dataAsU8Slice();
+    try testing.expectEqual(a_bytes.len, b_bytes.len);
+
+    var max_delta: u8 = 0;
+    for (a_bytes, b_bytes) |x, y| {
+        const delta = if (x > y) x - y else y - x;
+        max_delta = @max(max_delta, delta);
+    }
+    return max_delta;
+}
+
+test "u8 kernel matches f32 byte-for-byte for opaque solid fills" {
+    const allocator = testing.allocator;
+
+    var f32_pixmap = try Pixmap.init(allocator, 8, 4);
+    defer f32_pixmap.deinit(allocator);
+    var u8_pixmap = try Pixmap.init(allocator, 8, 4);
+    defer u8_pixmap.deinit(allocator);
+
+    var bucketer = try makeBucketer(allocator, 8, 4);
+    defer bucketer.deinit(allocator);
+
+    const color = peniko.Color.fromRgb8(200, 100, 50);
+    try bucketer.paint_fill_attrs.append(allocator, solidAttrs(color));
+    // A partial span leaves the rest of the row to the uncovered-range
+    // initialization (transparent clear here).
+    try bucketer.row_states.items[0].pushCmd(allocator, .{
+        .paint_fill = PaintFill.new(Span.new(2, 4), null, 0),
+    });
+
+    const clear = TargetInit.initClear(PremulColor.fromAlphaColor(peniko.Color.TRANSPARENT));
+    try rasterizeKernel(U8Kernel, allocator, &u8_pixmap, &bucketer, clear, false, &empty_alpha_buffers);
+    try rasterizeKernel(F32Kernel, allocator, &f32_pixmap, &bucketer, clear, false, &empty_alpha_buffers);
+
+    // Opaque premultiplied colors are exact in both kernels, so the whole
+    // pixmap must be byte-identical (including the clear outside the span).
+    try testing.expectEqualSlices(
+        u8,
+        f32_pixmap.dataAsU8Slice(),
+        u8_pixmap.dataAsU8Slice(),
+    );
+}
+
+test "u8 pipeline differs from f32 only by integer rounding on translucent fills" {
+    const allocator = testing.allocator;
+
+    var f32_pixmap = try Pixmap.init(allocator, 8, 4);
+    defer f32_pixmap.deinit(allocator);
+    var u8_pixmap = try Pixmap.init(allocator, 8, 4);
+    defer u8_pixmap.deinit(allocator);
+
+    // Existing opaque blue target, exactly like the f32 src-over test.
+    const background = PremulColor.fromAlphaColor(peniko.Color.fromRgb8(0, 0, 255));
+    for (f32_pixmap.dataMut()) |*pixel| pixel.* = background.asPremulRgba8();
+    for (u8_pixmap.dataMut()) |*pixel| pixel.* = background.asPremulRgba8();
+
+    var bucketer = try makeBucketer(allocator, 8, 4);
+    defer bucketer.deinit(allocator);
+
+    const color = peniko.Color.fromRgb8(255, 0, 0).multiplyAlpha(0.5);
+    try bucketer.paint_fill_attrs.append(allocator, solidAttrs(color));
+    try bucketer.row_states.items[0].pushCmd(allocator, .{
+        .paint_fill = PaintFill.new(Span.new(0, 8), null, 0),
+    });
+
+    try rasterizeKernel(U8Kernel, allocator, &u8_pixmap, &bucketer, TargetInit.DEFAULT, false, &empty_alpha_buffers);
+    try rasterizeKernel(F32Kernel, allocator, &f32_pixmap, &bucketer, TargetInit.DEFAULT, false, &empty_alpha_buffers);
+
+    // The f32 path yields (128, 0, 128, 255); the u8 path's
+    // `div_255(255 * 127) = 127` makes blue one lower. This is the documented
+    // u8/f32 rounding difference: the pipelines are not byte-equal in
+    // general (tests/README.md), so the differential test bounds the delta
+    // instead of claiming exactness.
+    const delta = try pixelByteDelta(&f32_pixmap, &u8_pixmap);
+    try testing.expect(delta <= 1);
+    try testing.expectEqual(@as(u8, 1), delta);
+}
+
+test "u8 masked blend stays within integer rounding of f32" {
+    const allocator = testing.allocator;
+
+    // A 2-column x 4-row mask (8 pixels) with a spread of coverage values.
+    const mask = try Mask.fromParts(
+        allocator,
+        &.{ 0, 64, 128, 255, 255, 128, 64, 0 },
+        2,
+        4,
+    );
+    defer mask.deinit(allocator);
+
+    // 8 premultiplied pixels of opaque green backdrop (2 columns x 4 rows).
+    var dest_u8: [32]u8 = undefined;
+    var dest_f32: [32]f32 = undefined;
+    inline for (0..8) |pixel| {
+        dest_u8[4 * pixel + 0] = 0;
+        dest_u8[4 * pixel + 1] = 255;
+        dest_u8[4 * pixel + 2] = 0;
+        dest_u8[4 * pixel + 3] = 255;
+
+        dest_f32[4 * pixel + 0] = 0.0;
+        dest_f32[4 * pixel + 1] = 1.0;
+        dest_f32[4 * pixel + 2] = 0.0;
+        dest_f32[4 * pixel + 3] = 1.0;
+    }
+
+    // 50% premultiplied red source, identical in both representations.
+    const src_u8 = CompositeIter(U8Kernel).initSolid(
+        U8Kernel.compositeFromColor(.{ 128, 0, 0, 128 }),
+    );
+    U8Kernel.blend(
+        .fallback,
+        &dest_u8,
+        0,
+        0,
+        src_u8,
+        BlendMode.default,
+        null,
+        &mask,
+    );
+
+    const src_f32 = CompositeIter(F32Kernel).initSolid(
+        F32Kernel.compositeFromColor(.{ 0.5, 0.0, 0.0, 0.5 }),
+    );
+    F32Kernel.blend(
+        .fallback,
+        &dest_f32,
+        0,
+        0,
+        src_f32,
+        BlendMode.default,
+        null,
+        &mask,
+    );
+
+    // Convert the f32 result (`v * 255 + 0.5`, saturating) and bound the
+    // per-byte difference.
+    inline for (0..2) |chunk| {
+        const scaled = simd.mulAddUnfused(
+            simd.fromSlice(simd.F32x16, dest_f32[16 * chunk ..][0..16]),
+            @as(simd.F32x16, @splat(255.0)),
+            @as(simd.F32x16, @splat(0.5)),
+        );
+        const converted = common_util.f32ToU8(scaled);
+        inline for (0..16) |i| {
+            const f32_byte = converted[i];
+            const u8_byte = dest_u8[16 * chunk + i];
+            const delta = if (f32_byte > u8_byte) f32_byte - u8_byte else u8_byte - f32_byte;
+            // The mask path keeps the same shape; only `div_255` vs f32
+            // rounding differs (measured max delta 1 here).
+            try testing.expect(delta <= 1);
+        }
+    }
 }
 
 test "indexed fill without an encoded paint fails explicitly" {

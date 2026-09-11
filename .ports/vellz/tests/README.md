@@ -69,8 +69,16 @@ must fail loudly or be absent from the corpus, not produce approximate output.
 | nested opacity layers | `layer_opacity_64` |
 | alpha / luminance masks | `mask_alpha_64`, `mask_luminance_64` |
 
-All scenes above render byte-exact with `zig build corpus` (22/22,
-`tolerance=0`). Filter layers and blurred rounded rectangles are the remaining
+The `*_speed` variants of the scenes above (13 scenes) are identical except for
+`"mode": "speed"` and exercise the low-precision (u8) pipeline. Their fixtures
+are produced by the same pinned oracle with `RenderMode::OptimizeSpeed`, so
+they are gold for the u8 kernel exactly like the quality scenes are for f32.
+
+All scenes above render byte-exact with `zig build corpus` (35/35,
+`tolerance=0`: 22 quality/f32 + 13 speed/u8). The f32 and u8 pipelines are not
+byte-equal to each other in general (integer `div_255` rounding vs f32); the
+corpus compares each pipeline against its own oracle output, never against the
+other pipeline. Filter layers and blurred rounded rectangles are the remaining
 M2 features; their scenes will be added here together with oracle support, and
 until then the renderer fails those commands loudly instead of approximating
 their output.

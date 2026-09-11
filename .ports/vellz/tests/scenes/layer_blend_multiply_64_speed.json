@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "speed", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "rgba8": [230, 60, 40, 255] },
+    { "op": "fill_rect", "rect": [6, 10, 50, 54] },
+    { "op": "push_layer", "kind": "blend", "blend": { "mix": "multiply", "compose": "src_over" } },
+    { "op": "set_paint", "rgba8": [60, 140, 240, 255] },
+    { "op": "fill_rect", "rect": [20, 4, 60, 44] },
+    { "op": "pop_layer" }
+  ]
+}

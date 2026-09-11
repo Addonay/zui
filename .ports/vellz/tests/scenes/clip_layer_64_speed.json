@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "speed", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "rgba8": [250, 250, 250, 255] },
+    { "op": "fill_rect", "rect": [0, 0, 64, 64] },
+    { "op": "push_clip_layer", "path": "M32 4 L60 32 L32 60 L4 32 Z" },
+    { "op": "set_paint", "rgba8": [255, 128, 0, 200] },
+    { "op": "fill_rect", "rect": [0, 0, 64, 64] },
+    { "op": "pop_layer" }
+  ]
+}

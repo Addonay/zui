@@ -40,6 +40,7 @@ const kurbo = @import("../../kurbo/root.zig");
 const peniko = @import("../../peniko/root.zig");
 const encode = @import("../../common/encode.zig");
 const pixmap_mod = @import("../../common/pixmap.zig");
+const common_util = @import("../../common/util.zig");
 const cpu_util = @import("../util.zig");
 
 const F32x4 = simd.F32x4;
@@ -112,7 +113,31 @@ pub const ImagePainter = union(enum) {
             inline else => |*painter| painter.paint(dest),
         }
     }
+
+    /// Paint complete columns as u8 bytes, converting the f32 painter output.
+    ///
+    /// This is the `U8Kernel::apply_painter` path for painters that upstream
+    /// leaves on the f32 implementation (`Low`/`High` quality): the
+    /// `f32x16_painter!` macro's `paint_u8` converts each column with
+    /// `u8x16::from_f32` (`value * 255.0 + 0.5`, saturating).
+    pub fn paintU8(self: *ImagePainter, dest: []u8) void {
+        switch (self.*) {
+            inline else => |*painter| painter.paintU8(dest),
+        }
+    }
 };
+
+/// Convert one normalized f32 pixel column to bytes.
+///
+/// Matches `u8x16::from_f32` (upstream `NumericVec`): `f32_to_u8(v * 255 + 0.5)`
+/// with the unfused multiply-add of the baseline backend.
+fn columnToU8(column: F32x16) simd.U8x16 {
+    return common_util.f32ToU8(simd.mulAddUnfused(
+        column,
+        @as(F32x16, @splat(255.0)),
+        @as(F32x16, @splat(0.5)),
+    ));
+}
 
 // ---------------------------------------------------------------------------
 // Common painter data
@@ -216,16 +241,29 @@ pub const PlainNN = struct {
     pub fn paint(self: *Self, dest: []f32) void {
         var offset: usize = 0;
         while (offset + 16 <= dest.len) : (offset += 16) {
-            const x_pos = extend(
-                self.cur_x_pos,
-                self.data.image.sampler.x_extend,
-                self.data.width,
-                self.data.width_inv,
-            );
-            const samples = sample(&self.data, x_pos, self.y_positions);
-            self.cur_x_pos += @as(F32x4, @splat(self.advance));
-            simd.storeSlice(samples * @as(F32x16, @splat(ONE_OVER_255)), dest[offset..][0..16]);
+            simd.storeSlice(self.nextColumn(), dest[offset..][0..16]);
         }
+    }
+
+    /// Paint complete columns as u8 bytes (upstream `paint_u8` conversion).
+    pub fn paintU8(self: *Self, dest: []u8) void {
+        var offset: usize = 0;
+        while (offset + 16 <= dest.len) : (offset += 16) {
+            simd.storeSlice(columnToU8(self.nextColumn()), dest[offset..][0..16]);
+        }
+    }
+
+    /// Compute one pixel column, normalized to `[0, 1]` per component.
+    fn nextColumn(self: *Self) F32x16 {
+        const x_pos = extend(
+            self.cur_x_pos,
+            self.data.image.sampler.x_extend,
+            self.data.width,
+            self.data.width_inv,
+        );
+        const samples = sample(&self.data, x_pos, self.y_positions);
+        self.cur_x_pos += @as(F32x4, @splat(self.advance));
+        return samples * @as(F32x16, @splat(ONE_OVER_255));
     }
 };
 
@@ -248,22 +286,35 @@ pub const NN = struct {
     pub fn paint(self: *Self, dest: []f32) void {
         var offset: usize = 0;
         while (offset + 16 <= dest.len) : (offset += 16) {
-            const x_positions = extend(
-                splatPos(@floatCast(self.data.cur_pos.x), self.data.y_advances[0]),
-                self.data.image.sampler.x_extend,
-                self.data.width,
-                self.data.width_inv,
-            );
-            const y_positions = extend(
-                splatPos(@floatCast(self.data.cur_pos.y), self.data.y_advances[1]),
-                self.data.image.sampler.y_extend,
-                self.data.height,
-                self.data.height_inv,
-            );
-            const samples = sample(&self.data, x_positions, y_positions);
-            self.data.cur_pos = self.data.cur_pos.addVec(self.data.image.x_advance);
-            simd.storeSlice(samples * @as(F32x16, @splat(ONE_OVER_255)), dest[offset..][0..16]);
+            simd.storeSlice(self.nextColumn(), dest[offset..][0..16]);
         }
+    }
+
+    /// Paint complete columns as u8 bytes (upstream `paint_u8` conversion).
+    pub fn paintU8(self: *Self, dest: []u8) void {
+        var offset: usize = 0;
+        while (offset + 16 <= dest.len) : (offset += 16) {
+            simd.storeSlice(columnToU8(self.nextColumn()), dest[offset..][0..16]);
+        }
+    }
+
+    /// Compute one pixel column, normalized to `[0, 1]` per component.
+    fn nextColumn(self: *Self) F32x16 {
+        const x_positions = extend(
+            splatPos(@floatCast(self.data.cur_pos.x), self.data.y_advances[0]),
+            self.data.image.sampler.x_extend,
+            self.data.width,
+            self.data.width_inv,
+        );
+        const y_positions = extend(
+            splatPos(@floatCast(self.data.cur_pos.y), self.data.y_advances[1]),
+            self.data.image.sampler.y_extend,
+            self.data.height,
+            self.data.height_inv,
+        );
+        const samples = sample(&self.data, x_positions, y_positions);
+        self.data.cur_pos = self.data.cur_pos.addVec(self.data.image.x_advance);
+        return samples * @as(F32x16, @splat(ONE_OVER_255));
     }
 };
 
@@ -298,6 +349,14 @@ pub fn Filtered(comptime quality: u8) type {
             var offset: usize = 0;
             while (offset + 16 <= dest.len) : (offset += 16) {
                 simd.storeSlice(self.nextColumn(), dest[offset..][0..16]);
+            }
+        }
+
+        /// Paint complete columns as u8 bytes (upstream `paint_u8` conversion).
+        pub fn paintU8(self: *Self, dest: []u8) void {
+            var offset: usize = 0;
+            while (offset + 16 <= dest.len) : (offset += 16) {
+                simd.storeSlice(columnToU8(self.nextColumn()), dest[offset..][0..16]);
             }
         }
 

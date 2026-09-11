@@ -190,13 +190,13 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `coarse/cmd.rs` | `cpu/coarse/cmd.zig` | port | 4 tests |
 | `coarse/depth.rs` | `cpu/coarse/depth.zig` | port | 10 tests, 128-px buckets |
 | `coarse/bucketer.rs` | `cpu/coarse/bucketer.zig` | port | full `bucketCommands` (fills, layers, depth, alpha segments) |
-| `fine/mod.rs` (`Fine`, `rasterize_region`, traits) | `cpu/fine/mod.zig` | port | connected; error-returning per port policy |
+| `fine/mod.rs` (`Fine`, `rasterize_region`, traits) | `cpu/fine/mod.zig` | port | connected; error-returning per port policy; painter selection dispatches on `K.Numeric` |
 | `fine/highp/*` (f32 kernel) | `cpu/fine/highp/mod.zig`, `blend.zig`, `compose.zig` | port | connected; 16 mix + 14 compose modes |
-| `fine/lowp/*` (u8 kernel) | `cpu/fine/lowp.zig` | defer | M4 speed path |
+| `fine/lowp/*` (u8 kernel) | `cpu/fine/lowp/mod.zig`, `blend.zig`, `compose.zig`, `gradient.zig`, `image.zig` | port + conn + ver | connected via `optimize_speed`; scalar u8 fast paths + f32 fallback for the remaining mix modes; oracle-verified (13 speed scenes byte-exact vs pinned oracle) |
 | `fine/common/gradient/*` | `cpu/fine/gradient.zig` | port | connected; oracle-verified (linear/radial/sweep/repeat scenes byte-exact) |
 | `fine/common/image.rs` | `cpu/fine/image.zig` | port | connected; oracle-verified (nearest/bilinear scenes byte-exact) |
 | `fine/common/rounded_blurred_rect.rs` | `cpu/fine/blurred_rect.zig` | defer | M2 filter work |
-| `dispatch/single_threaded.rs` | `cpu/dispatch/single_threaded.zig` | port | connected; f32 kernel; u8 kernel explicit `error.Unsupported` (M4) |
+| `dispatch/single_threaded.rs` | `cpu/dispatch/single_threaded.zig` | port | connected; comptime kernel selection (`optimize_speed` -> u8, `optimize_quality` -> f32), mirroring upstream with both pipelines enabled |
 | `dispatch/multi_threaded*.rs` | `cpu/dispatch/multi_threaded.zig` | defer | M4 |
 | `filter/*` | `cpu/filter/*.zig` | defer | M2; upstream limitations recorded |
 | `text.rs`, `text_debug.rs` | `cpu/text.zig` | defer | M3 |
@@ -435,9 +435,14 @@ of panics, thread ownership).
 
 ### Milestone 4 — CPU optimization
 
-- SIMD dispatch and multithreading ported, scalar reference retained.
-- **Gate:** scalar/portable/SIMD results agree exactly on the corpus; measured
-  speedups recorded with methodology (`G4`).
+- u8 low-precision pipeline ported and connected behind
+  `RenderMode.optimize_speed` (`cpu/fine/lowp/*`, dispatcher kernel selection).
+- **u8 oracle gate:** 13 `*_speed` corpus scenes byte-exact (`tolerance=0`,
+  four channels) against the pinned oracle rendered with
+  `RenderMode::OptimizeSpeed`; the original 22 quality scenes stay byte-exact.
+- **Remaining:** SIMD-level dispatch (the port currently pins fallback
+  semantics in `src/simd`), multithreading, measured speedups. Gate G4 is not
+  claimed until scalar/portable/SIMD agreement and timings are recorded.
 
 ### Milestone 5 — Hybrid GPU implementation
 
@@ -519,4 +524,19 @@ of panics, thread ownership).
   to the M1 set; `zig build test` 547/547. Remaining for G2: filter layers
   (gaussian blur, drop shadow, flood, offset), blurred rounded rectangles,
   upstream fixture import.
+- 2026-09-11 later: M4 u8 speed path landed. Ported upstream
+  `fine/lowp/{mod,blend,compose,gradient,image}.rs` into
+  `cpu/fine/lowp/{mod,blend,compose,gradient,image}.zig` (u8/u16 integer
+  compositing and blend fast paths with the f32 fallback for the remaining
+  mix modes; u8 LUT gradient painter; u8-native bilinear image painters;
+  the f32 painters gained `paintU8` conversion for the paths upstream keeps
+  on f32). `cpu/fine/mod.zig` `indexedFill`/`applyComplexPaint` select
+  painters by `K.Numeric`, and `dispatch/single_threaded.zig` routes
+  `RenderMode.optimize_speed` to `U8Kernel` with comptime dispatch (no
+  runtime vtable), mirroring upstream when both pipeline features are on.
+  Oracle evidence: 13 new `*_speed` scenes render byte-exact vs the pinned
+  oracle at `OptimizeSpeed` (`tolerance=0`, four channels); f32 quality
+  scenes remain 22/22 byte-exact. `zig build test` = 571/571; `zig build
+  corpus` = 35/35. Remaining: SIMD-level dispatch, multithreading, measured
+  speedups, filters/glyphs on the u8 path.
 

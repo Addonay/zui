@@ -170,10 +170,12 @@ pub const CommandBucketer = struct {
 // cpu/fine/mod.zig
 pub fn Fine(comptime K: type) type { ... } // buffers + pushBuf/popBuf/pack/unpack
 
-/// K is the kernel type (cpu/fine/highp.zig `F32Kernel`, later lowp `U8Kernel`).
+/// K is the kernel type (`highp.F32Kernel` or `lowp.U8Kernel`).
 /// Required K surface: Numeric, Composite, NumericVec types; extractColor,
-/// pack, unpack, initUncoveredRange, copySolid, applyMask, applyTint,
-/// alphaCompositeSolid, alphaCompositeBuffer, blend, fillSolid, painters.
+/// pack, unpack, copySolid, applyMask, applyTint, alphaCompositeSolid,
+/// alphaCompositeBuffer, blend, fillSolid. Painters are selected in
+/// `Fine.indexedFill` by `K.Numeric` and implement both `paint` (f32) and
+/// `paintU8` (converted or native u8).
 pub fn rasterizeRegion(
     comptime K: type,
     fine: *Fine(K),
@@ -186,9 +188,10 @@ pub fn rasterizeRegion(
 ) void;
 ```
 
-`fine/mod.zig` is specialized to the f32 kernel for M1 but keeps `Fine(K)`
-generic so the u8 kernel and painters drop in without a redesign. Operators on
-the buffer are dispatched through comptime `K`, never through a runtime vtable.
+`fine/mod.zig` is generic over the kernel (`highp.F32Kernel` for
+`optimize_quality`, `lowp.U8Kernel` for `optimize_speed`). Operators on the
+buffer are dispatched through comptime `K`, never through a runtime vtable;
+`dispatch/single_threaded.zig` passes the kernel as a comptime parameter.
 
 ## Dispatch and public renderer
 
