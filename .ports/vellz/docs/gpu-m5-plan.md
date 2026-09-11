@@ -4,6 +4,16 @@ Recon date: 2026-09-11. Status: plan only; no code changed. Pin:
 `linebender/vello @ 1e63b4a40ccb484f82e1d85b83df97ab95bcfbe7` (`v0.10.0-51-g1e63b4a4`),
 `.ports/wgpu` wgpu-native `v29.0.1.1` (`6aed50955d934ac36049ba8d002034841633ae02`).
 
+**Go/no-go resolved 2026-09-11:** `.ports/wgpu` prebuilt `v29.0.1.1` fetched
+(`tools/fetch-release.sh`, `libwgpu_native.{so,a}`) and its `zig build check`
+passed end to end on the **llvmpipe software Vulkan** adapter
+(`backend=vulkan type=cpu execution=software-adapter`, Mesa 25.2.8, LLVM
+20.1.2): compute output verified and the offscreen 64×64 render matched all
+expected pixels exactly. The intentional `--force-adapter-failure` path
+returned `error.NoAdapter` as designed. GPU work can proceed in this container;
+no hardware node (`/dev/dri`) is required.
+
+
 ## 1. Confirmed environment facts
 
 | Fact | Evidence |
