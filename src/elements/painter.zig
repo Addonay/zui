@@ -3,6 +3,7 @@ const core = @import("../core/root.zig");
 const gpu = @import("../gpu/root.zig");
 const fonts = @import("../fonts/root.zig");
 const images = @import("../images/root.zig");
+const platform = @import("../platform/root.zig");
 const element = @import("element.zig");
 
 pub fn paint(frame: *element.Frame, root: element.Element, scene: *gpu.Scene) void {
@@ -132,7 +133,7 @@ fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_col
         // control cannot be clicked. Empty clips register nothing.
         const hit = intersect(node.bounds, clip);
         if (hit.w > 0 and hit.h > 0) {
-            _ = frame.addRegion(.{ .bounds = hit, .listener = node.listener, .mouse_down_listener = node.mouse_down_listener, .double_click_listener = node.double_click_listener, .focus = node.focus });
+            _ = frame.addRegion(.{ .bounds = hit, .listener = node.listener, .mouse_down_listener = node.mouse_down_listener, .double_click_listener = node.double_click_listener, .focus = node.focus, .cursor = node.style.cursor });
         }
     }
 
@@ -981,6 +982,32 @@ test "hit regions obey the painter clip" {
     try t.expectEqual(@as(f32, 5), r.h);
     try t.expect(!r.contains(.{ .x = 25, .y = 16 }));
     try t.expect(r.contains(.{ .x = 16, .y = 16 }));
+}
+
+test "painted regions carry the style cursor" {
+    // .cursor_pointer() must reach the hit region so hover can show the
+    // hand; plain regions carry no opinion (null, not a forced default).
+    const t = @import("std").testing;
+    var frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const L = struct {
+        fn noop(_: *anyopaque, _: *const element.ListenerPayload, _: *anyopaque) void {}
+    }.noop;
+    const root = element.div().w(100).h(100)
+        .child(element.div().w(10).h(10).cursor_pointer().on_click(.{ .target = frame, .call_fn = L }))
+        .child(element.div().w(10).h(10).on_click(.{ .target = frame, .call_fn = L }));
+    @import("layout.zig").layout(frame, root, .{ .w = 100, .h = 100 });
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
+    try t.expectEqual(@as(usize, 2), frame.region_count);
+    try t.expectEqual(@as(?platform.CursorShape, .pointer), frame.regions[0].cursor);
+    try t.expectEqual(@as(?platform.CursorShape, null), frame.regions[1].cursor);
 }
 
 test "region overflow counts instead of silently dropping clicks" {

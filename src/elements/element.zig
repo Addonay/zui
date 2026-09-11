@@ -50,6 +50,9 @@ pub const HitRegion = struct {
     mouse_down_listener: ?Listener = null,
     double_click_listener: ?Listener = null,
     focus: ?FocusHandle = null,
+    /// Hover cursor for this region, if any. Window picks the topmost
+    /// region under the pointer; null means "no opinion".
+    cursor: ?platform.CursorShape = null,
 };
 
 pub const EdgeValues = struct {
@@ -94,7 +97,8 @@ pub const Style = struct {
     blur: f32 = 0,
     shadow: bool = false,
     text_color: ?core.Color = null,
-    pointer: bool = false,
+    /// Hover cursor override for this node's hit region (see HitRegion).
+    cursor: ?platform.CursorShape = null,
 };
 
 pub const TextStyle = struct {
@@ -409,7 +413,11 @@ pub const Element = struct {
         return self;
     }
     pub fn cursor_pointer(self: Element) Element {
-        self.node().style.pointer = true;
+        self.node().style.cursor = .pointer;
+        return self;
+    }
+    pub fn cursor_text(self: Element) Element {
+        self.node().style.cursor = .text;
         return self;
     }
     pub fn object_fit(self: Element, fit: ImageFit) Element {

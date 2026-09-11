@@ -1,37 +1,33 @@
-# Todo — ZUI example app
+# Daybook — ZUI todo example
 
-`main.zig` next to this file is a working retained todo app: it builds,
-runs natively (`zig build run-todo`), renders headless snapshots, and
-self-tests through synthetic input. It mirrors GPUI's shape, translated
-to Zig:
+A native task workspace with a light blue-gray palette, a sidebar on wide
+windows, compact filters on smaller windows, and a four-row paginated list.
+The old `main.zig` has been replaced by `daybook.zig`.
 
-- `App` / `Window` / `Context(T)` / `Entity(T)` — one foreground thread owns state.
-- Views are structs with `render(self, window, cx) Element`.
-- Elements are small value builders: `zui.div().flex_row().gap(12).child(...)`.
-- Interaction is `cx.listener()` / `cx.listenerWith()` + `on_click` / `on_action`, then `cx.notify()`.
-- Retained widgets (the composer input) are child entities: `Entity(zui.TextField)`.
+```sh
+zig build run-todo
+# Optional sample tasks:
+ZUI_TODO_DEMO=1 zig build run-todo
+```
 
-## Build-out status
+Click the composer or press Tab to start typing. Enter adds a task; Escape
+releases focus. Clicking outside the composer also releases focus.
+Select a row and press Space to toggle it or Delete to remove it.
+All / Active / Done filter the list; Previous / Next navigate long lists.
 
-Shipped (see root `README.md` + `plan.md` for limits and roadmap):
+Tasks are held in memory for the current run; this example does not save them.
+The shared text field supports UTF-8 codepoint movement and editing, but not
+selection, mouse caret positioning, or full IME composition.
 
-1. `App` + event loop + one native window (`ZUI_BACKEND` override, headless `null`).
-2. `Entity` store + `Context.notify()` dirty bit + re-render every dirty frame (no diffing).
-3. Elements `div / text / spacer / when / children` + flexbox measure/layout.
-4. Software-first painter: quads, glyph runs, image blits (`gpu/software`).
-5. Input: mouse hit-test, focus handles, keymap → actions, `TextField` widget.
-6. Next: correct scene ordering/clipping, layout-port adapter, GPU vertical slice.
+## Validation
 
-## What to look at in `main.zig`
+```sh
+zig build test
+zig build selftest-todo
+ZUI_TODO_DEMO=1 ZUI_SNAPSHOT=/tmp/daybook.ppm zig build run-todo
+ZUI_TODO_DEMO=1 ZUI_SNAPSHOT=/tmp/daybook-small.ppm ZUI_SNAPSHOT_WIDTH=540 ZUI_SNAPSHOT_HEIGHT=740 zig build run-todo
+```
 
-- `TodoApp.render` — root `div`, backdrop blobs, 560px centered column.
-- `renderComposer` — `Entity(TextField)` + gradient Add button, Enter to submit.
-- `renderRow` / `checkBox` / `filterPill` — per-row `listenerWith(id, ...)` handlers.
-- `counts / progress / isVisible` — pure derived helpers, tested headless at the bottom.
-- `onOpen` — `openWindow` + initial `window.focus` + key bindings, same as `gpui/examples/input.rs`.
-
-## Fashion notes
-
-Dark `#0e0e13` bg, blurred accent blobs, `#1e1f2a` cards, 16px radius,
-violet→cyan gradient CTA, pill filters with counts, progress track,
-hover-reveal delete, empty states per filter. No emoji, system font stack.
+Snapshots use the actual ZUI layout and software painter, without a desktop
+window. Integration checks drive the backend event queue, including focus,
+typing, submission, completion, Escape, Tab, and pagination.

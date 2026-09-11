@@ -1128,7 +1128,8 @@ pub const WaylandBackend = struct {
     /// Shared press/release translation for real transitions and repeat
     /// ticks. xkb order: the caller updates key state first (real events),
     /// repeats only re-read it.
-    fn emitKeycode(self: *WaylandBackend, evdev_code: u32, wl_key: u32, pressed: bool, repeat: bool) void {
+    fn emitKeycode(self: *WaylandBackend, evdev_code: u32, pressed: bool, repeat: bool) void {
+        const xkb_code = evdev_code + 8;
         const mods = evdev.modifiersFromMask(self.mods_mask);
         // evdev mapping is the default; xkb overrides it when live.
         var mapped: event.Key = evdev.keyFromEvdev(evdev_code);
@@ -1136,10 +1137,10 @@ pub const WaylandBackend = struct {
         var text_buf: [32]u8 = undefined;
         if (self.xkb) |*x| {
             if (x.hasLiveState()) {
-                const sym = x.keysym(wl_key);
+                const sym = x.keysym(xkb_code);
                 if (sym != xkb.XKB_KEY_NoSymbol) mapped = xkb.keyFromKeysym(sym);
                 if (pressed) {
-                    const n = x.utf8(wl_key, text_buf[0..]);
+                    const n = x.utf8(xkb_code, text_buf[0..]);
                     if (isPrintableText(text_buf[0..n])) text_len = n;
                 }
             } else if (pressed) {
@@ -1175,19 +1176,19 @@ pub const WaylandBackend = struct {
     fn isPrintableText(bytes: []const u8) bool {
         if (bytes.len == 0 or bytes.len > 32) return false;
         if (bytes.len == 1 and bytes[0] == '\t') return true;
-        return bytes[0] >= 0x20;
+        return bytes[0] >= 0x20 and bytes[0] != 0x7f;
     }
 
     fn keyboardKey(data: ?*anyopaque, _: *Keyboard, _: u32, time: u32, key: u32, state: u32) callconv(.c) void {
         const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
         _ = time;
-        // Wayland keycodes are evdev+8; guard cheap devices reporting below.
-        const evdev_code = if (key >= 8) key - 8 else 0;
+        // wl_keyboard.key carries evdev codes; only xkbcommon needs +8.
+        const evdev_code = key;
         const pressed = state == 1;
         if (self.xkb) |*x| {
-            if (x.hasLiveState()) x.updateKey(key, pressed);
+            if (x.hasLiveState()) x.updateKey(key + 8, pressed);
         }
-        self.emitKeycode(evdev_code, key, pressed, false);
+        self.emitKeycode(evdev_code, pressed, false);
         if (pressed) {
             // Arm client-side repeat on the wall clock (compositor event
             // timestamps live on a different epoch — never mix them).
@@ -1527,8 +1528,7 @@ pub const WaylandBackend = struct {
         const now = wallMs();
         if (now < self.repeat_next_ms) return;
         self.repeat_next_ms = now + self.repeat_interval_ms;
-        // xkb keycode is evdev+8 — the same numbering Wayland reports.
-        self.emitKeycode(evdev_code, evdev_code + 8, true, true);
+        self.emitKeycode(evdev_code, true, true);
     }
 
     fn xdgPing(data: ?*anyopaque, wm: *XdgWmBase, serial: u32) callconv(.c) void {
@@ -1913,7 +1913,7 @@ test "wayland key emission and repeat bookkeeping" {
     b.target_queue = &q;
 
     // evdev fallback path (no xkb): press emits key + text.
-    b.emitKeycode(30, 38, true, false);
+    b.emitKeycode(30, true, false);
     const first = q.pop().?;
     try t.expectEqual(event.Key.a, first.key.key);
     try t.expect(first.key.pressed and !first.key.repeat);
@@ -1922,7 +1922,7 @@ test "wayland key emission and repeat bookkeeping" {
     try t.expect(q.pop() == null);
 
     // Release emits bare key, no text.
-    b.emitKeycode(30, 38, false, false);
+    b.emitKeycode(30, false, false);
     const rel = q.pop().?;
     try t.expect(!rel.key.pressed);
     try t.expect(q.pop() == null);
@@ -1931,7 +1931,7 @@ test "wayland key emission and repeat bookkeeping" {
     b.repeat_rate = 30;
     b.repeat_interval_ms = 33;
     b.repeat_delay_ms = 500;
-    WaylandBackend.keyboardKey(@ptrCast(&b), @ptrCast(@alignCast(@as(*Keyboard, @ptrFromInt(4)))), 0, 0, 38, 1);
+    WaylandBackend.keyboardKey(@ptrCast(&b), @ptrCast(@alignCast(@as(*Keyboard, @ptrFromInt(4)))), 0, 0, 30, 1);
     try t.expectEqual(@as(?u32, 30), b.repeat_evdev);
     _ = q.pop();
     _ = q.pop();
@@ -1947,7 +1947,7 @@ test "wayland key emission and repeat bookkeeping" {
     const rep_text = q.pop().?;
     try t.expectEqualStrings("a", rep_text.text.slice());
     // Release disarms.
-    WaylandBackend.keyboardKey(@ptrCast(&b), @ptrCast(@alignCast(@as(*Keyboard, @ptrFromInt(4)))), 0, 0, 38, 0);
+    WaylandBackend.keyboardKey(@ptrCast(&b), @ptrCast(@alignCast(@as(*Keyboard, @ptrFromInt(4)))), 0, 0, 30, 0);
     try t.expect(b.repeat_evdev == null);
     _ = q.pop();
     b.tickRepeat();
@@ -1963,13 +1963,44 @@ test "wayland key emission and repeat bookkeeping" {
         x.updateKey(38, true);
         // Move into the backend (single owner from here on).
         b.xkb = x;
-        b.emitKeycode(30, 38, true, false);
+        b.emitKeycode(30, true, false);
         const xk = q.pop().?;
         try t.expectEqual(event.Key.a, xk.key.key);
         const xt = q.pop().?;
         try t.expectEqualStrings("a", xt.text.slice());
         if (b.xkb) |*bx| bx.deinit();
         b.xkb = null;
+    }
+}
+
+test "wayland wire keycodes translate reported letters and editing keys" {
+    var b = WaylandBackend{
+        .allocator = std.testing.allocator,
+        .lib = undefined,
+        .api = undefined,
+        .display = @ptrFromInt(1),
+        .registry = @ptrFromInt(2),
+    };
+    var q = event.EventQueue{};
+    b.target_queue = &q;
+    defer if (b.xkb) |*x| x.deinit();
+    // Exercise actual protocol callbacks, first fallback then live XKB.
+    for (0..2) |mode| {
+        if (mode == 1) {
+            b.xkb = try xkb.Xkb.init();
+            try b.xkb.?.setKeymapString(xkb.us_test_keymap);
+        }
+        const codes = [_]u32{ 49, 17, 18, 14, 105, 106, 111 };
+        const keys = [_]event.Key{ .n, .w, .e, .backspace, .left, .right, .delete };
+        for (codes, keys, 0..) |code, expected, i| {
+            WaylandBackend.keyboardKey(@ptrCast(&b), @ptrFromInt(4), 0, 0, code, 1);
+            try std.testing.expectEqual(expected, q.pop().?.key.key);
+            if (i < 3) try std.testing.expectEqualStrings(([_][]const u8{ "n", "w", "e" })[i], q.pop().?.text.slice());
+            try std.testing.expect(q.pop() == null);
+            WaylandBackend.keyboardKey(@ptrCast(&b), @ptrFromInt(4), 0, 0, code, 0);
+            try std.testing.expect(!q.pop().?.key.pressed);
+            try std.testing.expect(q.pop() == null);
+        }
     }
 }
 

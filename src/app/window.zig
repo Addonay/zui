@@ -135,6 +135,26 @@ pub const Window = struct {
         if (self.renderer) |r| {
             r.call(self, &self.scene);
         }
+        // Regions were rebuilt above; refresh the cursor for a stationary
+        // pointer sitting over changed content.
+        self.updateHoverCursor();
+    }
+
+    /// Cursor follows hover, not focus: topmost region under the pointer
+    /// with a cursor opinion wins, otherwise the default arrow. Called on
+    /// mouse input and after every render.
+    pub fn updateHoverCursor(self: *Window) void {
+        var i = self.ui_frame.region_count;
+        while (i > 0) {
+            i -= 1;
+            const region = self.ui_frame.regions[i];
+            if (!region.bounds.contains(self.pointer_position)) continue;
+            if (region.cursor) |shape| {
+                self.setCursorShape(shape);
+                return;
+            }
+        }
+        self.setCursorShape(.default);
     }
 
     /// Mark closed; destruction is deferred to `App.reapClosed` at a safe
@@ -297,6 +317,7 @@ pub const Window = struct {
         switch (event) {
             .mouse => |mouse| {
                 self.pointer_position = mouse.pos;
+                self.updateHoverCursor();
                 if (mouse.pressed and mouse.button == .left) {
                     // Double-click needs wall time, which lives with the OS
                     // backend (both Wayland and X11 timestamp input). Events
@@ -313,6 +334,8 @@ pub const Window = struct {
                         self.last_click_ms = mouse.time_ms;
                         self.last_click_pos = mouse.pos;
                     }
+                    // Clicking outside a focusable control releases keyboard focus.
+                    self.focused = .{};
                     var i = self.ui_frame.region_count;
                     while (i > 0) {
                         i -= 1;
@@ -342,6 +365,7 @@ pub const Window = struct {
             },
             .scroll => |scroll| {
                 self.pointer_position = scroll.pos;
+                self.updateHoverCursor();
                 if (self.focused.dispatch(event, self)) {
                     self.requestRender();
                     return;
@@ -435,6 +459,35 @@ test "window os hooks push title cursor and clipboard" {
     try std.testing.expect(win.writeClipboard("hello"));
     var out: [16]u8 = undefined;
     try std.testing.expectEqualStrings("hello", out[0..win.readClipboard(&out)]);
+}
+
+test "hover cursor follows topmost region opinion" {
+    const TestApp = @import("app.zig").App;
+    var app = try TestApp.initHeadless(std.testing.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, struct {
+        fn draw(w: *Window, sc: *gpu.Scene) void {
+            _ = w;
+            _ = sc;
+        }
+    }.draw);
+    const nb = app.getNullBackend().?;
+
+    win.ui_frame.region_count = 2;
+    win.ui_frame.regions[0] = .{ .bounds = .{ .x = 0, .y = 0, .w = 100, .h = 100 } };
+    win.ui_frame.regions[1] = .{ .bounds = .{ .x = 10, .y = 10, .w = 20, .h = 20 }, .cursor = .pointer };
+    // Over the inner region: pointer cursor wins (topmost).
+    win.pointer_position = .{ .x = 15, .y = 15 };
+    win.updateHoverCursor();
+    try std.testing.expectEqual(platform.CursorShape.pointer, nb.cursor);
+    // Over the outer region only: no opinion -> default arrow.
+    win.pointer_position = .{ .x = 50, .y = 50 };
+    win.updateHoverCursor();
+    try std.testing.expectEqual(platform.CursorShape.default, nb.cursor);
+    // Outside everything: default arrow.
+    win.pointer_position = .{ .x = 500, .y = 500 };
+    win.updateHoverCursor();
+    try std.testing.expectEqual(platform.CursorShape.default, nb.cursor);
 }
 
 test "stale focus clears when its region disappears" {

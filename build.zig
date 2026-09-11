@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
 
     const todo = b.addExecutable(.{
         .name = "todo",
-        .root_module = b.createModule(.{ .root_source_file = b.path("examples/todo/main.zig"), .target = target, .optimize = optimize, .imports = &.{.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("examples/todo/daybook.zig"), .target = target, .optimize = optimize, .imports = &.{.{
             .name = "zui",
             .module = mod,
         }}, .strip = true }),
@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
     // this, `zig build test` silently skips them.
     const todo_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/todo/main.zig"),
+            .root_source_file = b.path("examples/todo/daybook.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "zui", .module = mod }},

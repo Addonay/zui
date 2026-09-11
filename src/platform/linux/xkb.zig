@@ -32,7 +32,7 @@ pub const us_test_keymap: [*:0]const u8 =
     \\  xkb_types { include "complete" };
     \\  xkb_compat { include "complete" };
     \\  xkb_symbols { include "pc+us+inet(evdev)" };
-    \\}
+    \\};
 ;
 
 pub const Context = opaque {};

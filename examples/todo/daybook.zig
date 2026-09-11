@@ -1,18 +1,4 @@
-//! ZUI Todo — a retained, GPUI-inspired example.
-//!
-//! This is the design target for `zui`, a naive Zig port of GPUI's ideas:
-//!   - one foreground thread owns all state (`App`, `Context`, `Window`)
-//!   - state lives in `Entity(T)` handles, views are `T` with `render()`
-//!   - UI is built from small value-type elements (`div()`, `text()`, ...)
-//!     with Tailwind-like chained styles, laid out with flexbox
-//!   - interaction is `cx.listener()` + `on_click` / `on_action`, then `cx.notify()`
-//!
-//! It exercises the naive retained core: entities, flex elements, software
-//! painting, focus, pointer listeners, key bindings, and a text field.
-//!
-//! Run:
-//!   zig build run-todo
-
+//! Daybook: a small native task workspace built with ZUI.
 const std = @import("std");
 const zui = @import("zui");
 
@@ -23,37 +9,24 @@ const Entity = zui.Entity;
 const Element = zui.Element;
 const FocusHandle = zui.FocusHandle;
 
-// ---------------------------------------------------------------------------
-// Theme — fashionable dark, one accent gradient, generous radius.
-// ---------------------------------------------------------------------------
-
 const theme = struct {
-    const bg = zui.hex(0x0e0e13);
-    const panel = zui.hex(0x17181f);
-    const card = zui.hex(0x1e1f2a);
-    const card_hover = zui.hex(0x262736);
-    const border = zui.hex(0xffffff18);
-    const text = zui.hex(0xf2f2f5);
-    const muted = zui.hex(0x9b9bab);
-    const faint = zui.hex(0x5d5d6e);
-    const accent = zui.hex(0x7c5cff);
-    const accent_hi = zui.hex(0x46d5e8);
-    const good = zui.hex(0x3ddc84);
-    const danger = zui.hex(0xff5d5d);
-
-    // One sans stack, one mono stack. Every size below is paired with a
-    // line height — bare sizes with default leading are what made the
-    // old UI look off — and numerals always render in mono tabular so
-    // counts don't jitter as they change.
+    const bg = zui.hex(0xeaf0f6);
+    const panel = zui.hex(0xf8fafc);
+    const card = zui.hex(0xffffff);
+    const card_hover = zui.hex(0xe4edf7);
+    const border = zui.hex(0xcbd6e3);
+    const text = zui.hex(0x20344a);
+    const muted = zui.hex(0x54677b);
+    const faint = zui.hex(0x64758a);
+    const accent = zui.hex(0x315fa4);
+    const good = zui.hex(0x277060);
+    const danger = zui.hex(0xa43643);
     const font = struct {
-        const sans = "Inter, SF Pro Text, Segoe UI, Noto Sans, sans-serif";
-        const mono = "JetBrains Mono, SF Mono, Cascadia Code, Menlo, monospace";
+        const sans = "Noto Sans, sans-serif";
+        const display = "Noto Sans Display, Noto Sans, sans-serif";
+        const mono = "DejaVu Sans Mono, monospace";
     };
 };
-
-// ---------------------------------------------------------------------------
-// Model — plain Zig, no UI imports, trivially testable.
-// ---------------------------------------------------------------------------
 
 const Todo = struct {
     id: u32,
@@ -81,12 +54,14 @@ const Filter = enum {
 
 const TodoApp = struct {
     pub const Options = struct {};
+    const page_size = 4;
 
     alloc: std.mem.Allocator,
     todos: std.ArrayList(Todo),
     next_id: u32 = 1,
     filter: Filter = .all,
     selected: ?u32 = null,
+    page: usize = 0,
     input: Entity(zui.TextField),
     focus_root: FocusHandle,
 
@@ -95,7 +70,10 @@ const TodoApp = struct {
             .alloc = cx.allocator(),
             .todos = .empty,
             .input = cx.new(zui.TextField, .{
-                .placeholder = "What needs doing?  Press Enter to add",
+                .placeholder = "What would you like to get done?",
+                .text_color = theme.text,
+                .placeholder_color = theme.muted,
+                .focus_color = theme.accent,
             }),
             .focus_root = cx.focusHandle(),
         };
@@ -117,6 +95,7 @@ const TodoApp = struct {
         self.add(text, cx) catch return;
         self.input.update(zui.TextField.clear);
         self.filter = .all;
+        self.page = (self.todos.items.len - 1) / page_size;
         cx.notify();
     }
 
@@ -153,6 +132,7 @@ const TodoApp = struct {
 
     fn setFilter(self: *@This(), f: Filter, cx: *Context(@This())) void {
         self.filter = f;
+        self.page = 0;
         cx.notify();
     }
 
@@ -208,327 +188,170 @@ const TodoApp = struct {
 
     pub fn render(self: *@This(), window: *Window, cx: *Context(@This())) Element {
         const c = self.counts();
-
-        return zui.div()
-            .flex_col()
-            .size_full()
-            .bg(theme.bg)
-            .child(self.renderBackdrop())
-            .child(self.renderTitlebar(window, cx))
-            .child(zui.div()
-            .flex_col()
-            .flex_1()
-            .w_full()
-            .items_center()
-            .child(zui.div()
-            .flex_col()
-            .gap(16)
-            .w(560)
-            .max_w_full()
-            .p(24)
-            .child(self.renderHeader(c.total, c.done, c.left))
-            .child(self.renderComposer(cx))
-            .child(self.renderFilterBar(c, cx))
-            .child(self.renderList(cx))
-            .child(self.renderFooter(c, cx))));
-    }
-
-    // Custom chrome: icon + title on the left, window controls on the
-    // right. The bar itself starts a native drag; buttons hit-test first
-    // (deepest child wins) so clicks on them never start a drag.
-    fn renderTitlebar(self: *@This(), window: *Window, cx: *Context(@This())) Element {
-        _ = self;
-        const maximized = window.isMaximized();
-        return zui.div()
-            .flex_row()
-            .items_center()
-            .h(44)
-            .w_full()
-            .pl(12)
-            .pr(8)
-            .gap(8)
-            .bg(theme.panel)
-            .border_b_1()
-            .border_color(theme.border)
-            .on_mouse_down(cx.listener(@This(), beginDrag))
-            .on_double_click(cx.listener(@This(), toggleMaximize))
-            .child(appIcon())
-            .child(zui.text("Tasks", .{ .font = theme.font.sans, .size = 13, .line_height = 18, .weight = .semibold, .color = theme.text }))
+        const wide = window.bounds.size.w >= 800;
+        var body = zui.div().flex_row().flex_1().w_full();
+        if (wide) body = body.child(zui.div().flex_col().w(200).h(window.bounds.size.h - 48).p(24).gap(24).bg(theme.panel)
+            .child(label("MY WORKSPACE", 11, theme.muted))
+            .child(zui.div().flex_col().gap(8)
+                .child(filterButton(cx, .all, self.filter, c.total))
+                .child(filterButton(cx, .active, self.filter, c.left))
+                .child(filterButton(cx, .done, self.filter, c.done)))
             .child(zui.spacer())
-            .child(winButton(cx, "—", TodoApp.minimizeWindow, false))
-            .child(winButton(cx, if (maximized) "▢" else "□", TodoApp.toggleMaximize, false))
-            .child(winButton(cx, "×", TodoApp.closeWindow, true));
-    }
-
-    fn beginDrag(self: *@This(), window: *Window, cx: *Context(@This())) void {
-        _ = self;
-        _ = cx;
-        window.startDrag();
-    }
-
-    fn closeWindow(self: *@This(), window: *Window, cx: *Context(@This())) void {
-        _ = self;
-        _ = cx;
-        window.close();
-    }
-
-    fn minimizeWindow(self: *@This(), window: *Window, cx: *Context(@This())) void {
-        _ = self;
-        _ = cx;
-        window.minimize();
-    }
-
-    fn toggleMaximize(self: *@This(), window: *Window, cx: *Context(@This())) void {
-        _ = self;
-        window.toggleMaximize();
-        cx.notify(); // re-render so the □/▢ glyph swaps
-    }
-
-    fn renderBackdrop(self: *@This()) Element {
-        _ = self;
-        // Naive v0: two blurred gradient blobs. The real painter can just
-        // draw two large rounded quads with blur; no shader graph needed.
-        return zui.div()
-            .absolute()
-            .inset(0)
-            .child(zui.div().absolute().top(-120).left(-80).size(420).rounded_full().bg(theme.accent).opacity(0.22).blur(120))
-            .child(zui.div().absolute().top(-60).right(-100).size(380).rounded_full().bg(theme.accent_hi).opacity(0.16).blur(120));
-    }
-
-    fn renderHeader(self: *@This(), total: usize, done: usize, left: usize) Element {
-        _ = left;
-        return zui.div().flex_col().gap(10).pt(28)
-            .child(zui.div().flex_row().items_center().justify_between()
-            .child(zui.div().flex_row().items_center().gap(10)
-                .child(zui.div().size(36).rounded_xl().bg_gradient(theme.accent, theme.accent_hi).items_center().justify_center()
-                    .child(zui.text("✦", .{ .font = theme.font.sans, .size = 18, .line_height = 18, .color = zui.white() })))
-                .child(zui.div().flex_col()
-                .child(display("Tasks"))
-                .child(caption(zui.formatToday(), theme.muted))))
-            .child(zui.div().flex_row().items_center().gap(8)
-            .child(numeral("{d}/{d} done", .{ done, total }))
-            .child(zui.progressBar(self.progress(), 96))));
-    }
-
-    fn renderComposer(self: *@This(), cx: *Context(@This())) Element {
-        return zui.div()
-            .flex_row()
-            .items_center()
-            .gap(10)
-            .p(10)
-            .rounded_2xl()
-            .bg(theme.panel)
-            .border_1()
-            .border_color(theme.border)
-            .shadow_lg()
-            .child(zui.div().flex_1()
-                .child(self.input))
-            .child(zui.div()
-            .h(40)
-            .px(18)
-            .rounded_xl()
-            .bg_gradient(theme.accent, theme.accent_hi)
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .hover_bg(theme.accent_hi)
-            .on_click(cx.listener(@This(), addFromDraft))
-            .child(zui.text("+  Add", .{ .font = theme.font.sans, .size = 14, .line_height = 20, .weight = .semibold, .color = zui.white() })));
-    }
-
-    fn renderFilterBar(self: *@This(), c: anytype, cx: *Context(@This())) Element {
-        return zui.div().flex_row().items_center().gap(8)
-            .child(filterPill(cx, .all, self.filter, c.total))
-            .child(filterPill(cx, .active, self.filter, c.left))
-            .child(filterPill(cx, .done, self.filter, c.done))
-            .child(zui.spacer())
-            .child(numeral("{d} left", .{c.left}));
+            .child(label("A little more done.", 14, theme.text))
+            .child(label("One task at a time.", 12, theme.muted)));
+        var content = zui.div().flex_col().flex_1().p(if (wide) 32 else 20).gap(20);
+        content = content.child(zui.div().flex_row().items_center().justify_between()
+            .child(zui.div().flex_col().gap(6)
+                .child(zui.text("Your day, in order.", .{ .font = theme.font.display, .size = 28, .line_height = 36, .weight = .bold, .color = theme.text }))
+                .child(label("Make room for what matters next.", 14, theme.muted)))
+            .child(zui.div().flex_col().items_center().gap(4)
+            .child(zui.textFmt("{d}", .{c.left}, .{ .font = theme.font.mono, .size = 28, .line_height = 36, .color = theme.accent }))
+            .child(label("remaining", 11, theme.muted))));
+        content = content.child(zui.div().flex_col().gap(8)
+            .child(label("NEW TASK", 11, theme.muted))
+            .child(zui.div().flex_row().items_center().gap(8).p(6).rounded_lg().bg(theme.card).border_1().border_color(theme.border)
+            .child(zui.div().flex_1().child(self.input))
+            .child(button("Add task", cx.listener(@This(), addFromDraft), true))));
+        if (!wide) content = content.child(zui.div().flex_row().gap(8)
+            .child(filterButton(cx, .all, self.filter, c.total))
+            .child(filterButton(cx, .active, self.filter, c.left))
+            .child(filterButton(cx, .done, self.filter, c.done)));
+        content = content.child(zui.div().flex_row().items_center().justify_between()
+            .child(label(switch (self.filter) {
+                .all => "All tasks",
+                .active => "Still to do",
+                .done => "Completed",
+            }, 17, theme.text))
+            .child(zui.textFmt("{d} of {d} complete", .{ c.done, c.total }, .{ .font = theme.font.sans, .size = 12, .line_height = 18, .color = theme.muted })));
+        content = content.child(self.renderList(cx));
+        content = content.child(zui.div().flex_row().items_center().justify_between()
+            .child(label("Select a task · Space to complete", 12, theme.muted))
+            .child(button("Clear completed", cx.listener(@This(), clearCompleted), false)));
+        body = body.child(content);
+        return zui.div().flex_col().size_full().bg(theme.bg)
+            .child(zui.div().flex_row().items_center().h(48).px(20).gap(10).bg(theme.panel).border_b_1().border_color(theme.border)
+                .on_mouse_down(cx.listener(@This(), beginDrag))
+                .on_double_click(cx.listener(@This(), toggleMaximize))
+                .child(zui.div().w(4).h(20).rounded_lg().bg(theme.accent))
+                .child(zui.text("daybook", .{ .font = theme.font.display, .size = 17, .line_height = 24, .weight = .bold, .color = theme.text }))
+                .child(zui.spacer())
+                .child(winButton(cx, "—", minimizeWindow))
+                .child(winButton(cx, if (window.isMaximized()) "▢" else "□", toggleMaximize))
+                .child(winButton(cx, "×", closeWindow)))
+            .child(body);
     }
 
     fn renderList(self: *@This(), cx: *Context(@This())) Element {
-        var visible_count: usize = 0;
-        for (self.todos.items) |t| {
-            if (self.isVisible(t)) visible_count += 1;
+        var count: usize = 0;
+        for (self.todos.items) |todo| {
+            if (self.isVisible(todo)) {
+                count += 1;
+            }
         }
-
-        if (self.todos.items.len == 0) {
-            return emptyState("A calm, empty list", "Capture your first task above and press Enter.");
+        if (count == 0) return zui.div().flex_col().h(220).items_center().justify_center().gap(12).rounded_lg().bg(theme.card)
+            .child(label(if (self.filter == .done) "Your finished tasks will appear here." else if (self.filter == .active) "Everything is checked off." else "Start with one small thing.", 18, theme.text))
+            .child(label(if (self.filter == .all) "Write a task above, then choose Add task." else "Choose All to see your whole list.", 13, theme.muted));
+        const current_page = @min(self.page, (count - 1) / page_size);
+        var list = zui.div().flex_col().gap(8);
+        var index: usize = 0;
+        for (self.todos.items) |todo| {
+            if (!self.isVisible(todo)) continue;
+            if (index >= current_page * page_size and index < (current_page + 1) * page_size) list = list.child(self.renderRow(todo, cx));
+            index += 1;
         }
-        if (visible_count == 0) {
-            return emptyState("Nothing under this filter", "Switch filters to see the rest of your tasks.");
-        }
-
-        return zui.div().flex_col().gap(10).children(self.todos.items, @This(), renderRow, cx);
+        if (count > page_size) list = list.child(zui.div().flex_row().items_center().justify_between()
+            .child(button("Previous", cx.listener(@This(), previousPage), false))
+            .child(zui.textFmt("Page {d} of {d}", .{ current_page + 1, (count + page_size - 1) / page_size }, .{ .size = 12, .color = theme.muted }))
+            .child(button("Next", cx.listener(@This(), nextPage), false)));
+        return list;
     }
 
-    fn renderRow(self: *@This(), todo: Todo, cx: *Context(@This())) ?Element {
-        if (!self.isVisible(todo)) return null;
-        const is_selected = if (self.selected) |s| s == todo.id else false;
-
-        return zui.div()
-            .flex_row()
-            .items_center()
-            .gap(12)
-            .p(12)
-            .pl(14)
-            .rounded_2xl()
-            .bg(if (is_selected) theme.card_hover else theme.card)
-            .border_1()
-            .border_color(if (is_selected) theme.accent else theme.border)
-            .hover_bg(theme.card_hover)
+    fn renderRow(self: *@This(), todo: Todo, cx: *Context(@This())) Element {
+        const selected = self.selected == todo.id;
+        return zui.div().flex_row().items_center().gap(14).p(14).rounded_lg()
+            .bg(if (selected) theme.card_hover else theme.card)
+            .border_1().border_color(if (selected) theme.accent else theme.border)
+            .hover_bg(theme.card_hover).cursor_pointer()
             .on_click(cx.listenerWith(u32, @This(), selectRow, todo.id))
-            .child(checkBox(cx, self, todo))
-            .child(zui.div().flex_col().flex_1().gap(2)
-                .child(zui.text(todo.title.slice(), .{
-                    .font = theme.font.sans,
-                    .size = 15,
-                    .line_height = 22,
-                    .color = if (todo.done) theme.faint else theme.text,
-                    .strike = todo.done,
-                }))
-                .child(zui.textFmt("#{d}  ·  tap space to toggle", .{todo.id}, .{ .font = theme.font.mono, .size = 12, .line_height = 16, .color = theme.faint })))
-            .child(zui.div()
-            .size(30)
-            .rounded_lg()
-            .items_center()
-            .justify_center()
-            .text_color(theme.muted)
-            .hover_bg(theme.danger)
-            .cursor_pointer()
+            .child(zui.div().size(24).rounded_lg().border_2()
+                .border_color(if (todo.done) theme.good else theme.faint)
+                .bg(if (todo.done) theme.good else theme.card)
+                .items_center().justify_center().cursor_pointer()
+                .on_click(cx.listenerWith(u32, @This(), toggle, todo.id))
+                .child(zui.when(todo.done, zui.text("✓", .{ .size = 14, .color = zui.white() }))))
+            .child(zui.div().flex_1().child(zui.text(todo.title.slice(), .{
+                .font = theme.font.sans,
+                .size = 15,
+                .line_height = 22,
+                .color = if (todo.done) theme.muted else theme.text,
+                .strike = todo.done,
+            })))
+            .child(zui.div().px(8).h(30).items_center().justify_center().rounded_lg().hover_bg(theme.border).cursor_pointer()
             .on_click(cx.listenerWith(u32, @This(), remove, todo.id))
-            .child(zui.text("×", .{ .font = theme.font.sans, .size = 18, .line_height = 18 })));
+            .child(label("Delete", 12, theme.muted)));
     }
 
+    fn previousPage(self: *@This(), cx: *Context(@This())) void {
+        self.page -|= 1;
+        cx.notify();
+    }
+    fn nextPage(self: *@This(), cx: *Context(@This())) void {
+        var count: usize = 0;
+        for (self.todos.items) |todo| {
+            if (self.isVisible(todo)) {
+                count += 1;
+            }
+        }
+        self.page = @min(self.page + 1, (count -| 1) / page_size);
+        cx.notify();
+    }
     fn selectRow(self: *@This(), id: u32, window: *Window, cx: *Context(@This())) void {
         self.selected = id;
         window.focus(self.focus_root, cx);
         cx.notify();
     }
-
-    fn renderFooter(self: *@This(), c: anytype, cx: *Context(@This())) Element {
-        return zui.div().flex_col().gap(10).pt(4)
-            .child(zui.progressTrack(self.progress()))
-            .child(zui.div().flex_row().items_center().justify_between()
-            .child(numeral("{d} of {d} complete", .{ c.done, c.total }))
-            .child(zui.div()
-            .px(12)
-            .h(32)
-            .rounded_lg()
-            .items_center()
-            .justify_center()
-            .border_1()
-            .border_color(theme.border)
-            .text_color(theme.muted)
-            .cursor_pointer()
-            .hover_border(theme.faint)
-            .on_click(cx.listener(@This(), clearCompleted))
-            .child(zui.text("Clear completed", .{ .font = theme.font.sans, .size = 13, .line_height = 18 }))));
+    fn focusComposer(self: *@This(), window: *Window, cx: *Context(@This())) void {
+        window.focus(self.input.focusHandle(cx), cx);
     }
-
-    pub fn focusHandle(self: *@This(), cx: *Context(@This())) FocusHandle {
-        _ = cx;
+    fn blurComposer(_: *@This(), window: *Window, cx: *Context(@This())) void {
+        window.focus(@as(FocusHandle, .{}), cx);
+    }
+    fn beginDrag(_: *@This(), window: *Window, _: *Context(@This())) void {
+        window.startDrag();
+    }
+    fn closeWindow(_: *@This(), window: *Window, _: *Context(@This())) void {
+        window.close();
+    }
+    fn minimizeWindow(_: *@This(), window: *Window, _: *Context(@This())) void {
+        window.minimize();
+    }
+    fn toggleMaximize(_: *@This(), window: *Window, cx: *Context(@This())) void {
+        window.toggleMaximize();
+        cx.notify();
+    }
+    pub fn focusHandle(self: *@This(), _: *Context(@This())) FocusHandle {
         return self.focus_root;
     }
 };
 
-// ---------------------------------------------------------------------------
-// Small components — all value types, `renderOnce`-style.
-// ---------------------------------------------------------------------------
-
-// Type helpers: every size ships with a line height and a stack, so text
-// never falls back to platform-default leading.
-fn display(str: []const u8) Element {
-    return zui.text(str, .{ .font = theme.font.sans, .size = 26, .line_height = 32, .tracking = -0.4, .weight = .bold, .color = theme.text });
+fn label(value: []const u8, size: f32, color: zui.Color) Element {
+    return zui.text(value, .{ .font = theme.font.sans, .size = size, .line_height = size + 6, .color = color });
 }
-
-fn caption(str: []const u8, color: @TypeOf(theme.text)) Element {
-    return zui.text(str, .{ .font = theme.font.sans, .size = 13, .line_height = 18, .color = color });
+fn button(value: []const u8, listener: anytype, primary: bool) Element {
+    return zui.div().h(40).px(14).items_center().justify_center().rounded_lg().cursor_pointer()
+        .bg(if (primary) theme.accent else theme.panel).hover_bg(if (primary) theme.text else theme.card_hover)
+        .on_click(listener).child(label(value, 13, if (primary) zui.white() else theme.muted));
 }
-
-fn numeral(comptime fmt: []const u8, args: anytype) Element {
-    return zui.textFmt(fmt, args, .{ .font = theme.font.mono, .size = 12, .line_height = 16, .color = theme.muted });
+fn filterButton(cx: *Context(TodoApp), filter: Filter, current: Filter, count: usize) Element {
+    return zui.div().flex_row().h(40).px(12).gap(10).items_center().rounded_lg().cursor_pointer()
+        .bg(if (filter == current) theme.card_hover else theme.panel).hover_bg(theme.card_hover)
+        .on_click(cx.listenerWith(Filter, TodoApp, TodoApp.setFilter, filter))
+        .child(label(filter.label(), 13, if (filter == current) theme.accent else theme.muted))
+        .child(zui.textFmt("{d}", .{count}, .{ .font = theme.font.mono, .size = 12, .line_height = 18, .color = theme.muted }));
 }
-
-fn appIcon() Element {
-    return zui.div().size(22).rounded_lg().bg_gradient(theme.accent, theme.accent_hi).items_center().justify_center()
-        .child(zui.text("✓", .{ .font = theme.font.sans, .size = 13, .line_height = 13, .weight = .bold, .color = zui.white() }));
-}
-
-fn winButton(cx: *Context(TodoApp), glyph: []const u8, handler: fn (*TodoApp, *Window, *Context(TodoApp)) void, danger: bool) Element {
-    return zui.div()
-        .w(40)
-        .h(28)
-        .rounded_lg()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .bg(zui.transparent())
-        .hover_bg(if (danger) theme.danger else theme.card_hover)
-        .on_click(cx.listener(TodoApp, handler))
-        .child(zui.text(glyph, .{ .font = theme.font.sans, .size = 13, .line_height = 13, .color = theme.muted }));
-}
-
-fn filterPill(cx: *Context(TodoApp), f: Filter, active_filter: Filter, n: usize) Element {
-    const active = f == active_filter;
-    return zui.div()
-        .flex_row()
-        .items_center()
-        .gap(8)
-        .h(32)
-        .px(14)
-        .rounded_full()
-        .cursor_pointer()
-        .bg(if (active) theme.text else theme.panel)
-        .text_color(if (active) theme.bg else theme.muted)
-        .border_1()
-        .border_color(if (active) theme.text else theme.border)
-        .hover_bg(if (active) theme.text else theme.card_hover)
-        .on_click(cx.listenerWith(Filter, TodoApp, TodoApp.setFilter, f))
-        .child(zui.text(f.label(), .{ .font = theme.font.sans, .size = 13, .line_height = 18, .weight = .medium }))
-        .child(zui.div()
-        .px(8)
-        .h(20)
-        .rounded_full()
-        // NOTE: `hex` branches on magnitude (<=0xFFFFFF is opaque RRGGBB),
-        // so translucent black must be spelled `rgba`, not `hex(0x00000022)`
-        // (which parses as opaque navy #000022).
-        .bg(if (active) zui.rgba(0, 0, 0, 0.13) else zui.hex(0xffffff14))
-        .items_center()
-        .justify_center()
-        .child(zui.textFmt("{d}", .{n}, .{ .font = theme.font.mono, .size = 12, .line_height = 16, .weight = .semibold })));
-}
-
-fn checkBox(cx: *Context(TodoApp), app: *TodoApp, todo: Todo) Element {
-    _ = app;
-    return zui.div()
-        .size(24)
-        .rounded_full()
-        .border_2()
-        .border_color(if (todo.done) theme.good else theme.faint)
-        .bg(if (todo.done) theme.good else zui.transparent())
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .on_click(cx.listenerWith(u32, TodoApp, TodoApp.toggle, todo.id))
-        .child(zui.when(todo.done, zui.text("✓", .{ .font = theme.font.sans, .size = 14, .line_height = 14, .color = zui.hex(0x0b1510), .weight = .bold })));
-}
-
-fn emptyState(title: []const u8, body: []const u8) Element {
-    return zui.div()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap(8)
-        .py(48)
-        .rounded_2xl()
-        .bg(theme.panel)
-        .border_dashed()
-        .border_1()
-        .border_color(theme.border)
-        .child(zui.div().size(48).rounded_2xl().bg(theme.card).items_center().justify_center()
-            .child(zui.text("○", .{ .font = theme.font.sans, .size = 22, .line_height = 22, .color = theme.faint })))
-        .child(zui.text(title, .{ .font = theme.font.sans, .size = 15, .line_height = 22, .weight = .semibold, .color = theme.text }))
-        .child(zui.text(body, .{ .font = theme.font.sans, .size = 13, .line_height = 20, .color = theme.muted }));
+fn winButton(cx: *Context(TodoApp), value: []const u8, comptime handler: anytype) Element {
+    return zui.div().w(34).h(30).rounded_lg().items_center().justify_center().cursor_pointer()
+        .hover_bg(theme.card_hover).on_click(cx.listener(TodoApp, handler)).child(label(value, 15, theme.muted));
 }
 
 // ---------------------------------------------------------------------------
@@ -536,17 +359,19 @@ fn emptyState(title: []const u8, body: []const u8) Element {
 // ---------------------------------------------------------------------------
 
 fn buildRoot(window: *Window, vcx: *Context(TodoApp)) Entity(TodoApp) {
-    // Focus the composer on launch, like gpui's `window.focus(...)`.
     const view = vcx.new(TodoApp, .{});
-    window.focus(view.read().input.focusHandle(vcx), vcx);
     vcx.bindKeys(TodoApp, &.{
         .{ .key = "enter", .action = "add" },
         .{ .key = "space", .action = "toggle-selected" },
-        .{ .key = "backspace", .action = "delete-selected" },
+        .{ .key = "delete", .action = "delete-selected" },
+        .{ .key = "tab", .action = "focus-composer" },
+        .{ .key = "escape", .action = "blur-composer" },
     });
     window.on_action("add", view, TodoApp.addFromDraft);
     window.on_action("toggle-selected", view, TodoApp.toggleSelected);
     window.on_action("delete-selected", view, TodoApp.removeSelected);
+    window.on_action("focus-composer", view, TodoApp.focusComposer);
+    window.on_action("blur-composer", view, TodoApp.blurComposer);
     seedDemo(view);
     return view;
 }
@@ -564,11 +389,11 @@ fn seedDemo(view: Entity(TodoApp)) void {
 }
 
 fn onOpen(cx: *App) void {
-    const bounds = zui.Bounds.centered(null, zui.size(680, 760), cx);
+    const bounds = zui.Bounds.centered(null, zui.size(960, 800), cx);
     _ = cx.openWindow(.{
         .bounds = bounds,
-        .title = "Tasks — zui",
-        .min_size = zui.size(440, 520),
+        .title = "Daybook",
+        .min_size = zui.size(540, 740),
         // Native titlebar off: renderTitlebar above draws our own chrome
         // (icon, title, min/max/close) so the app looks identical on
         // Wayland, X11, Win32, and Cocoa.
@@ -580,15 +405,21 @@ fn onOpen(cx: *App) void {
 /// Headless snapshot: ZUI_SNAPSHOT=/path.ppm renders one frame through the
 /// exact layout+painter path and dumps it as PPM. No window needed, so visual
 /// regressions can be checked in CI or over ssh.
+fn snapshotDimension(name: [*:0]const u8, fallback: u32) u32 {
+    const raw = std.c.getenv(name) orelse return fallback;
+    const value = std.fmt.parseInt(u32, std.mem.span(raw), 10) catch return fallback;
+    return if (value >= 100 and value <= 4096) value else fallback;
+}
+
 fn snapshotHeadless(gpa: std.mem.Allocator, path: []const u8) !void {
-    const width: u32 = 680;
-    const height: u32 = 760;
+    const width = snapshotDimension("ZUI_SNAPSHOT_WIDTH", 960);
+    const height = snapshotDimension("ZUI_SNAPSHOT_HEIGHT", 800);
     var app = try App.initHeadless(gpa);
     defer app.deinit();
     const win = try app.openWindow(.{
-        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 680, .h = 760 } },
-        .title = "Tasks — zui",
-        .min_size = zui.size(440, 520),
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = @floatFromInt(width), .h = @floatFromInt(height) } },
+        .title = "Daybook",
+        .min_size = zui.size(540, 740),
         .chrome = .custom,
     }, buildRoot);
     _ = app.step();
@@ -692,9 +523,9 @@ fn selftestHeadless(gpa: std.mem.Allocator) !void {
     var app = try App.initHeadless(gpa);
     defer app.deinit();
     const win = try app.openWindow(.{
-        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 680, .h = 760 } },
-        .title = "Tasks — zui",
-        .min_size = zui.size(440, 520),
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 960, .h = 800 } },
+        .title = "Daybook",
+        .min_size = zui.size(540, 740),
         .chrome = .custom,
     }, selftestBuildRoot);
     _ = app.step(); // initial render populates hit regions
@@ -717,7 +548,21 @@ fn selftestHeadless(gpa: std.mem.Allocator) !void {
     check(view.read().todos.items.len == 3, &failures, "seed has 3 todos (got {d})", .{view.read().todos.items.len});
     check(view.read().todos.items[0].done, &failures, "first todo starts done", .{});
 
-    // -- 1. type "Test task" into the composer (focus starts on input).
+    check(win.focused.id == 0, &failures, "composer is not focused on launch", .{});
+    // Click the composer through its real hit region before typing.
+    var clicked_input = false;
+    for (win.ui_frame.regions[0..win.ui_frame.region_count]) |region| {
+        if (region.focus) |focus| {
+            if (focus.id == view.read().input.focusHandle(null).id) {
+                _ = null_backend.pushEvent(.{ .mouse = .{ .pos = .{ .x = region.bounds.x + 10, .y = region.bounds.y + 10 }, .button = .left, .pressed = true } });
+                clicked_input = true;
+                break;
+            }
+        }
+    }
+    _ = app.step();
+    check(clicked_input and win.focused.id == view.read().input.focusHandle(null).id, &failures, "click focuses composer", .{});
+    // -- 1. type "Test task" into the composer.
     // Real backends emit one `.text` per physical press; `.key` alone
     // must never insert (that path is for bindings and editing keys).
     for ("Test task") |byte| {
@@ -757,6 +602,19 @@ fn selftestHeadless(gpa: std.mem.Allocator) !void {
     _ = app.step();
     check(!view.read().todos.items[0].done, &failures, "click toggles first todo off", .{});
 
+    check(win.focused.id != view.read().input.focusHandle(null).id, &failures, "clicking a checkbox blurs composer", .{});
+
+    _ = null_backend.pushEvent(.{ .key = .{ .key = .tab, .pressed = true } });
+    _ = app.step();
+    check(win.focused.id == view.read().input.focusHandle(null).id, &failures, "Tab focuses composer", .{});
+    _ = null_backend.pushEvent(.{ .key = .{ .key = .escape, .pressed = true } });
+    _ = app.step();
+    check(win.focused.id == 0, &failures, "Escape releases focus", .{});
+    for (0..8) |_| try view.updateWith("Another task", TodoApp.add);
+    view.update(TodoApp.nextPage);
+    view.update(TodoApp.nextPage);
+    _ = app.step();
+    check(view.read().page == 2, &failures, "long list reaches its final page", .{});
     // -- 4. UI re-rendered with regions intact --
     check(win.ui_frame.region_count > 0, &failures, "regions present after input (got {d})", .{win.ui_frame.region_count});
 
@@ -821,4 +679,20 @@ test "toggle / filter / clear are pure" {
 
     view.update(TodoApp.clearCompleted);
     try t.expectEqual(@as(usize, 1), view.read().todos.items.len);
+}
+
+test "pagination clamps at list ends and resets on filtering" {
+    var harness = try zui.TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const view = harness.new(TodoApp, .{});
+    for (0..12) |_| try view.updateWith("Task", TodoApp.add);
+    view.update(TodoApp.nextPage);
+    try std.testing.expectEqual(@as(usize, 1), view.read().page);
+    view.update(TodoApp.nextPage);
+    view.update(TodoApp.nextPage);
+    try std.testing.expectEqual(@as(usize, 2), view.read().page);
+    view.updateWith(.active, TodoApp.setFilter);
+    try std.testing.expectEqual(@as(usize, 0), view.read().page);
+    view.update(TodoApp.previousPage);
+    try std.testing.expectEqual(@as(usize, 0), view.read().page);
 }
