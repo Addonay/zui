@@ -440,9 +440,16 @@ of panics, thread ownership).
 - **u8 oracle gate:** 13 `*_speed` corpus scenes byte-exact (`tolerance=0`,
   four channels) against the pinned oracle rendered with
   `RenderMode::OptimizeSpeed`; the original 22 quality scenes stay byte-exact.
+- **Rough timings** (ReleaseFast CLI, 200 runs each, includes ~2.4 ms process
+  startup; not a methodology-complete G4 record): `fill_wave_seams_128`
+  3.6 -> 2.0 ms, `fill_tile_grid_128` 4.4 -> 1.9 ms, `gradient_repeat_128`
+  5.0 -> 3.5 ms; but `image_bilinear_64` 3.4 -> 4.8 ms slower in u8, because
+  the ported u8 painters run scalar lane loops while the f32 painters
+  vectorize through `@Vector`.
 - **Remaining:** SIMD-level dispatch (the port currently pins fallback
-  semantics in `src/simd`), multithreading, measured speedups. Gate G4 is not
-  claimed until scalar/portable/SIMD agreement and timings are recorded.
+  semantics in `src/simd`), multithreading, per-stage measured speedups. Gate
+  G4 is not claimed until scalar/portable/SIMD agreement and timings are
+  recorded.
 
 ### Milestone 5 — Hybrid GPU implementation
 
