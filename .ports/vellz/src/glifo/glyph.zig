@@ -29,8 +29,12 @@
 //! - Decoration (`renderDecoration`) is ported: the upstream `Vec` of merged
 //!   exclusion spans lives on `GlyphPrepCache` and the Rust iterator/closure
 //!   pair becomes one pass over that list.
-//! - Synthetic embolden (`kurbo::expand_path`) and non-empty variation
-//!   coordinates remain explicit `error.Unsupported`.
+//! - Synthetic embolden is ported: `GlyphRunBuilder.fontEmbolden` flows
+//!   through `PreparedGlyphRun.font_embolden` into every outline cache lookup
+//!   (and the atlas/outline cache keys), and `outline_cache.getOrInsert`
+//!   dilates the drawn outline with `kurbo.expandPath` exactly like upstream.
+//!   Ink extents used for decoration skip-ink therefore include the dilation.
+//!   Non-empty variation coordinates remain explicit `error.Unsupported`.
 //! - Upstream's `OutlineCacheSession` is replaced by an explicit
 //!   `*OutlineCache` threaded through the draw loop and `renderer.fillGlyph`/
 //!   `strokeGlyph`.
@@ -64,8 +68,7 @@ pub const FontData = font_mod.FontData;
 
 /// Errors from glyph run preparation and drawing.
 pub const Error = font_mod.Error || glyf.DrawError || error{
-    /// A feature that is scoped but not ported yet: hinting, embolden,
-    /// variation coordinates, and bitmap glyphs.
+    /// A feature that is scoped but not ported yet: variation coordinates.
     Unsupported,
 };
 
@@ -581,9 +584,10 @@ pub const GlyphScaleProperties = struct {
 
 /// Prepare a glyph run for rendering.
 ///
-/// Fails with `error.Unsupported` for deferred inputs: hinting, non-empty
-/// variation coordinates, synthetic embolden, and faces without any glyph
-/// source the port can render (CFF/CFF2-only, or no bitmap strike either).
+/// Fails with `error.Unsupported` for deferred inputs: non-empty variation
+/// coordinates and faces without any glyph source the port can render
+/// (CFF/CFF2-only, or no bitmap strike either). Synthetic embolden is part of
+/// the prepared run and is applied per outline draw.
 pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun {
     // No hint cache: hinted-scale absorption is rejected with
     // `error.Unsupported` (the allocator is never used).
@@ -597,7 +601,6 @@ pub fn prepareGlyphRunWithCache(
     allocator: std.mem.Allocator,
 ) Error!PreparedGlyphRun {
     if (run.normalized_coords.len != 0) return error.Unsupported;
-    if (!run.font_embolden.isDefault()) return error.Unsupported;
 
     const full_transform = run.transform.compose(run.glyph_transform orelse kurbo.Affine.IDENTITY);
     const c = full_transform.asCoeffs();
@@ -1880,7 +1883,7 @@ test "hinted run is rejected with Unsupported" {
     _ = allocator;
 }
 
-test "non-empty variation coordinates and embolden are rejected" {
+test "non-empty variation coordinates are rejected; embolden is prepared" {
     const font = try testFontData();
     const base: GlyphRun = .{
         .font = font,
@@ -1894,7 +1897,8 @@ test "non-empty variation coordinates and embolden are rejected" {
 
     var with_embolden = base;
     with_embolden.font_embolden = FontEmbolden.new(.{ 1.0, 0.0 });
-    try testing.expectError(error.Unsupported, prepareGlyphRun(with_embolden));
+    const prepared = try prepareGlyphRun(with_embolden);
+    try testing.expectEqual([2]f32{ 1.0, 0.0 }, prepared.font_embolden.amount);
 }
 
 test "unhinted run absorbs uniform scale" {

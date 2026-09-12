@@ -10,7 +10,8 @@
 //! `maintain`, `clear` or `deinit` that evicts it; callers must not hold it
 //! across frames. Variable-font coordinate maps (`variable_map` upstream) are
 //! not implemented because non-empty coordinates are `error.Unsupported`;
-//! the key still carries the `hint`/embolden fields for API parity.
+//! the key still carries the `hint`/embolden fields, and non-default embolden
+//! runs `kurbo.expandPath` on the drawn outline like upstream.
 //!
 //! Divergence from upstream (documented per plan.md §3): upstream holds
 //! `Arc<BezPath>` and only recycles uniquely-owned paths through its free
@@ -34,8 +35,8 @@ pub const FontInfo = struct {
     upem: f32,
 };
 
-/// Synthetic embolden request. Only the default (zero amount) is supported;
-/// anything else is `error.Unsupported` until kurbo `expand_path` is ported.
+/// Synthetic embolden request. Matches `glifo`'s `FontEmbolden`: a dilation
+/// amount per axis plus the expansion controls used by `kurbo::expand_path`.
 pub const FontEmbolden = struct {
     amount: [2]f32 = .{ 0.0, 0.0 },
     join: kurbo.Join = .miter,
@@ -148,8 +149,10 @@ pub const OutlineCache = struct {
     ///
     /// `hint_instance` runs the TrueType interpreter (configured for `size`)
     /// and makes the cache key hint-distinct; `null` draws unhinted. Rejects
-    /// the remaining deferred inputs with `error.Unsupported`: non-empty
-    /// variation coordinates and non-default embolden.
+    /// the remaining deferred input with `error.Unsupported`: non-empty
+    /// variation coordinates. A non-default `embolden` dilates the drawn
+    /// outline with `kurbo.expandPath` exactly like upstream's
+    /// `OutlineCacheSession::get_or_insert`.
     pub fn getOrInsert(
         self: *OutlineCache,
         allocator: std.mem.Allocator,
@@ -162,7 +165,6 @@ pub const OutlineCache = struct {
         hint_instance: ?*const glyf.HintInstance,
     ) glyf.DrawError!CachedOutline {
         if (coords.len != 0) return error.Unsupported;
-        if (!embolden.isDefault()) return error.Unsupported;
 
         const key = OutlineKey{
             .font_id = font_info.id,
@@ -198,6 +200,22 @@ pub const OutlineCache = struct {
             .hint_instance = hint_instance,
         }, &path_pen);
         _ = metrics;
+        if (!embolden.isDefault()) {
+            // Upstream replaces the drawing buffer's path with
+            // `kurbo::expand_path(&path, amount, join, miter_limit, tolerance)`.
+            // The expansion is applied after hinting, at the cache size, and
+            // is part of the cache key (amount/join/limit/tolerance bits).
+            const expanded = try kurbo.expandPath(
+                allocator,
+                path.elementsSlice(),
+                .{ .xx = embolden.amount[0], .yy = embolden.amount[1] },
+                embolden.join,
+                embolden.miter_limit,
+                embolden.tolerance,
+            );
+            path.deinit(allocator);
+            path.* = expanded;
+        }
         const bbox = path.boundingBox();
         const entry = try allocator.create(OutlineEntry);
         errdefer allocator.destroy(entry);
@@ -435,17 +453,55 @@ test "outline cache rejects unsupported inputs" {
         error.Unsupported,
         cache.getOrInsert(std.testing.allocator, &outlines, 37, testFontInfo(), 16.0, .{}, &.{0}, null),
     );
-    try std.testing.expectError(
-        error.Unsupported,
-        cache.getOrInsert(
-            std.testing.allocator,
-            &outlines,
-            37,
-            testFontInfo(),
-            16.0,
-            FontEmbolden.new(.{ 0.5, 0.0 }),
-            &.{},
-            null,
-        ),
+}
+
+test "outline cache emboldens and keys by the embolden parameters" {
+    const fixture = @import("test_fixture.zig");
+    const font = try font_mod.Font.init(try fixture.roboto(), 0);
+    const outlines = try font.outlines();
+    var cache = OutlineCache{};
+    defer cache.deinit(std.testing.allocator);
+
+    const plain = try cache.getOrInsert(
+        std.testing.allocator,
+        &outlines,
+        37,
+        testFontInfo(),
+        16.0,
+        .{},
+        &.{},
+        null,
     );
+    const plain_elements = plain.path.elementsSlice().len;
+    const plain_bbox = plain.bbox;
+
+    // A non-default embolden dilates the outline: more elements and a wider
+    // bounding box than the plain draw.
+    const emboldened = try cache.getOrInsert(
+        std.testing.allocator,
+        &outlines,
+        37,
+        testFontInfo(),
+        16.0,
+        FontEmbolden.new(.{ 1.0, 1.0 }),
+        &.{},
+        null,
+    );
+    try std.testing.expect(emboldened.path.elementsSlice().len >= plain_elements);
+    try std.testing.expect(emboldened.bbox.width() > plain_bbox.width());
+    try std.testing.expect(emboldened.bbox.height() > plain_bbox.height());
+
+    // Distinct parameters are distinct cache entries even at the same size.
+    const bevel = try cache.getOrInsert(
+        std.testing.allocator,
+        &outlines,
+        37,
+        testFontInfo(),
+        16.0,
+        FontEmbolden.new(.{ 1.0, 1.0 }).withJoin(.bevel),
+        &.{},
+        null,
+    );
+    try std.testing.expect(bevel.path != emboldened.path);
+    try std.testing.expectEqual(@as(usize, 3), cache.cachedCount());
 }

@@ -399,9 +399,10 @@ fn renderScene(
 
 /// Draw one positioned glyph run through `vellz.glifo`.
 ///
-/// Deferred features (non-zero `embolden`, non-empty `normalized_coords`) are
-/// typed `error.Unsupported`, never silently dropped. `decoration` is drawn
-/// after the fill/stroke pass, matching the upstream decoration tests.
+/// Deferred features (non-empty `normalized_coords`) are typed
+/// `error.Unsupported`, never silently dropped. `embolden` is forwarded as
+/// `FontEmbolden` (synthetic dilation via `kurbo.expandPath`). `decoration` is
+/// drawn after the fill/stroke pass, matching the upstream decoration tests.
 fn renderGlyphRun(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -412,9 +413,6 @@ fn renderGlyphRun(
     spec: scene_mod.GlyphRunSpec,
 ) !void {
     const glifo = vellz.glifo;
-    if (spec.embolden) |amount| {
-        if (amount[0] != 0.0 or amount[1] != 0.0) return error.Unsupported;
-    }
     if (spec.normalized_coords) |coords| {
         if (coords.len != 0) return error.Unsupported;
     }
@@ -438,6 +436,9 @@ fn renderGlyphRun(
         .fontSize(spec.font_size)
         .hint(spec.hint)
         .atlasCache(spec.atlas_cache);
+    if (spec.embolden) |amount| {
+        builder = builder.fontEmbolden(glifo.FontEmbolden.new(amount));
+    }
     if (spec.glyph_transform) |transform| {
         builder = builder.glyphTransform(kurbo.Affine.new(transform));
     }
