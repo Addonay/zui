@@ -66,8 +66,8 @@ pub const FontData = font_mod.FontData;
 
 /// Errors from glyph run preparation and drawing.
 pub const Error = font_mod.Error || glyf.DrawError || error{
-    /// A feature that is scoped but not ported yet: hinting, embolden,
-    /// variation coordinates, and bitmap glyphs.
+    /// A feature that is scoped but not ported yet: CFF/CFF2 outlines,
+    /// synthetic embolden, the autohinter and COLRv1 variation deltas.
     Unsupported,
 };
 
@@ -184,9 +184,9 @@ pub fn GlyphRunBuilder(comptime Backend: type) type {
 
         /// Set whether font hinting is enabled.
         ///
-        /// Hinting is not ported yet: a run whose transform is eligible for
-        /// vertical hinting fails with `error.Unsupported` when drawn. Runs
-        /// that upstream would render `Direct` (no hinting applied) proceed.
+        /// Eligible runs go through the TrueType interpreter (M3 G3b) and are
+        /// cached in `HintCache` by font, size and coordinates. Autohinter-
+        /// only fonts fail with `error.Unsupported` when drawn.
         pub fn hint(self: Self, enabled: bool) Self {
             var result = self;
             result.run.hint = enabled;
@@ -194,6 +194,11 @@ pub fn GlyphRunBuilder(comptime Backend: type) type {
         }
 
         /// Set normalized variation coordinates for variable fonts.
+        ///
+        /// `coords` is a slice of F2Dot14 `i16` values (`glifo`'s
+        /// `NormalizedCoord`), borrowed for the lifetime of the run. Empty or
+        /// all-zero coordinates take the static path; on a font without variation
+        /// tables they are a no-op.
         pub fn normalizedCoords(self: Self, coords: []const NormalizedCoord) Self {
             var result = self;
             result.run.normalized_coords = coords;
@@ -592,9 +597,12 @@ pub const GlyphScaleProperties = struct {
 
 /// Prepare a glyph run for rendering.
 ///
-/// Fails with `error.Unsupported` for deferred inputs: hinting, non-empty
-/// variation coordinates, synthetic embolden, and faces without any glyph
-/// source the port can render (CFF/CFF2-only, or no bitmap strike either).
+/// Fails with `error.Unsupported` for deferred inputs: synthetic embolden
+/// and faces without any glyph source the port can render (CFF/CFF2-only, or
+/// no bitmap strike either). Hinted runs whose transform would absorb a
+/// uniform vertical scale need a hint cache and are rejected by this entry
+/// point; variation coordinates are carried on the prepared run (and are a
+/// no-op without variation tables, like upstream).
 pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun {
     // No hint cache: hinted-scale absorption is rejected with
     // `error.Unsupported` (the allocator is never used).
