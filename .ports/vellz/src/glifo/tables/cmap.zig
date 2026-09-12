@@ -239,6 +239,31 @@ test "cmap format 12 mappings match the oracle dump" {
     try std.testing.expectEqual(@as(?u32, null), charmap.map('A'));
 }
 
+test "symbol subtables remap U+0000..U+00FF from U+F000..F0FF" {
+    // One segment mapping U+F001 -> gid 1; platform 3 / encoding 0 selects the
+    // symbol path, which also accepts codepoint 1.
+    var table: [36]u8 = @splat(0);
+    std.mem.writeInt(u16, table[2..4], 1, .big); // one encoding record
+    std.mem.writeInt(u16, table[4..6], 3, .big); // platform 3 (Windows)
+    std.mem.writeInt(u16, table[6..8], 0, .big); // encoding 0 (symbol)
+    std.mem.writeInt(u32, table[8..12], 12, .big); // subtable offset
+    const sub = table[12..];
+    std.mem.writeInt(u16, sub[0..2], 4, .big); // format
+    std.mem.writeInt(u16, sub[2..4], 24, .big); // length
+    std.mem.writeInt(u16, sub[6..8], 2, .big); // segCountX2 = 1 segment
+    std.mem.writeInt(u16, sub[14..16], 0xF001, .big); // endCode[0]
+    std.mem.writeInt(u16, sub[18..20], 0xF001, .big); // startCode[0]
+    // idDelta for U+F001 -> gid 1 is 1 - 0xF001, which wraps to 0x1000 in i16.
+    std.mem.writeInt(i16, sub[20..22], @bitCast(@as(u16, 0x1000)), .big); // idDelta[0]
+    std.mem.writeInt(u16, sub[22..24], 0, .big); // idRangeOffset[0]
+    const charmap = Charmap.init(&table);
+    try std.testing.expect(charmap.hasMap());
+    try std.testing.expect(charmap.isSymbol());
+    try std.testing.expectEqual(@as(?u32, 1), charmap.map(0xF001));
+    try std.testing.expectEqual(@as(?u32, 1), charmap.map(1));
+    try std.testing.expectEqual(@as(?u32, null), charmap.map('A'));
+}
+
 test "format 4 binary search misses and deltas" {
     // Two segments: 'A'-'B' maps by delta, 'Z' uses an idRangeOffset.
     var sub: [64]u8 = @splat(0);

@@ -945,6 +945,16 @@ test "empty glyph emits no elements" {
     const metrics = try outlines.draw(std.testing.allocator, 1, .{ .size = 16.0 }, &pen);
     try std.testing.expectEqual(@as(usize, 0), pen.elements.items.len);
     try std.testing.expectEqual(@as(f32, 0.0), metrics.advance_width.?);
+    // `gid == numGlyphs` and beyond: `loca` has no end offset, matching
+    // upstream's `ReadError::OutOfBounds`.
+    try std.testing.expectError(
+        error.OutOfBounds,
+        outlines.draw(std.testing.allocator, font.numGlyphs(), .{ .size = 16.0 }, &pen),
+    );
+    try std.testing.expectError(
+        error.OutOfBounds,
+        outlines.draw(std.testing.allocator, 9999, .{ .size = 16.0 }, &pen),
+    );
 }
 
 test "unsupported inputs fail with typed errors" {

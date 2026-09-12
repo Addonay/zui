@@ -9,6 +9,10 @@
 //! Deliberately not ported: table checksums, `WOFF`/`WOFF2`, data-source
 //! abstraction, and the generated table machinery (see
 //! `.ports/vellz/docs/glifo-m3-plan.md` §2).
+//!
+//! Table lookup is a linear first-match scan; `read-fonts` binary-searches
+//! directories it detected as sorted. Only fonts with duplicate records
+//! (malformed) can observe the difference.
 
 const std = @import("std");
 
