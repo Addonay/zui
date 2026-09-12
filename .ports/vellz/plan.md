@@ -874,14 +874,25 @@ of panics, thread ownership).
   `run-gpu-errors` (now also covering `MissingTextureBinding` and
   `TextureFeedbackLoop`), and `gpu-corpus` all green; per-scene metrics are in
   `tests/README.md`'s tolerance registry.
-- 2026-09-12: **glyph scene generator decode fix; COLR fractional-position gap
-  found.** `tools/gen_glyph_scenes.py` decoded `--dump-glyphs` advances
-  little-endian, so the committed 15 baseline + 27 COLR scenes stack every
-  glyph at x=0 (byte-exact, but not exercising positioning). The generator is
-  fixed (merged with `vellz-cozmic`), and regenerating the scenes shows the
-  outline, decoration, and color-font test scenes still byte-exact but 39
-  Noto/composition COLR scenes differing from the oracle by max-abs 1 on a few
-  pixels at fractional glyph positions. The regenerated scenes/fixtures are
-  intentionally not on `main` yet: `zig build corpus` stays 96/96 green on the
-  existing fixtures while the COLR subpixel path is fixed on a branch; the fix
-  lands together with the regenerated corpus.
+- 2026-09-12: **glyph scene generator decode fix and COLR stop-padding fix
+  landed together.** `tools/gen_glyph_scenes.py` decoded `--dump-glyphs`
+  advances little-endian, so the committed 15 baseline + 27 COLR scenes stacked
+  every glyph at x=0 (byte-exact, but not exercising positioning). The
+  generator is fixed; regenerating exposes a real COLR gap on the Noto party
+  popper and its scaled/rotated/stroked/composition variants: upstream's
+  `convert_stops` pads a first/last stop that is not already at 0.0/1.0 to
+  *exactly* those offsets before dropping the superfluous near-1.0 duplicate,
+  but `glifo/colr.zig` appended the stop unchanged. Traversal renormalizes the
+  font's 0.0235/1.0 offsets in f32, and the last one lands one ulp below 1.0
+  (0.99999994); the port therefore kept a near-one stop, `encode_gradient`
+  padded it into a second near-empty range, and the gradient used a
+  4096-entry LUT instead of upstream's 256. The finer ramp rounded some
+  interior sRGB channels one step away from the oracle. Fix: set the padded
+  stop offsets to exactly 0.0/1.0, matching upstream, with a new
+  `convert_stops` regression test. The regenerated scene JSONs, oracle
+  `.rgba`/`.json`/`.png` fixtures and the fix are committed together:
+  `zig build corpus` is 96/96 byte-exact (tolerance 0, regenerated fixtures)
+  in Debug, ReleaseSafe and ReleaseFast, `zig build test` is green,
+  `zig build glyphs` (12 glyph + 3 cmap vectors) and `zig build probe` stay
+  byte-exact, and `tests/README.md` records the updated cache-on/off fixture
+  deltas.
