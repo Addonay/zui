@@ -432,12 +432,12 @@ fn renderOutlineToAtlas(
     const outline_transform = Affine
         .scaleNonUniform(scale, -scale)
         .thenTranslate(Vec2.new(
-            @as(f64, @floatFromInt(atlas_slot.x)) -
-                @as(f64, @floatFromInt(raster_metrics.bearing_x)) +
-                @as(f64, subpixel_offset),
-            @as(f64, @floatFromInt(atlas_slot.y)) -
-                @as(f64, @floatFromInt(raster_metrics.bearing_y)),
-        ));
+        @as(f64, @floatFromInt(atlas_slot.x)) -
+            @as(f64, @floatFromInt(raster_metrics.bearing_x)) +
+            @as(f64, subpixel_offset),
+        @as(f64, @floatFromInt(atlas_slot.y)) -
+            @as(f64, @floatFromInt(raster_metrics.bearing_y)),
+    ));
     try recorder.setTransform(allocator, outline_transform);
     try recorder.setPaintAtlas(allocator, .{ .solid = peniko.Color.BLACK });
     try recorder.fillPath(allocator, path);

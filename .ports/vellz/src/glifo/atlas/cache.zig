@@ -577,4 +577,3 @@ test "replay clears commands even when the callback errors" {
     // Upstream clears every recorder after replay, success or failure.
     try testing.expectEqual(@as(usize, 0), recorder.commands.items.len);
 }
-

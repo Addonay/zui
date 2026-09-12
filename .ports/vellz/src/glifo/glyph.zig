@@ -656,9 +656,9 @@ fn calculateColrTransform(metrics: *const ColrMetrics) kurbo.Affine {
         ))
         // Shift the pixmap back so the bbox aligns with the glyph position.
         .compose(kurbo.Affine.translate(kurbo.Vec2.new(
-            metrics.scaled_bbox.x0,
-            metrics.scaled_bbox.y0,
-        )));
+        metrics.scaled_bbox.x0,
+        metrics.scaled_bbox.y0,
+    )));
 }
 
 /// Create COLR glyph data with intermediate texture parameters.
