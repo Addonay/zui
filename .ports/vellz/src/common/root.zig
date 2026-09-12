@@ -12,6 +12,7 @@
 //!   -> pixmap
 //!   -> transforms, target
 //!   -> paint -> render_state -> transforms
+//!   -> guillotiere -> multi_atlas -> image_cache -> paint.ImageId
 //! ```
 //!
 //! Allocator contract: types that own heap memory (`Pixmap`, `Pool`,
@@ -45,6 +46,9 @@ pub const blurred_rounded_rect = @import("blurred_rounded_rect.zig");
 pub const record = @import("record.zig");
 pub const encode = @import("encode.zig");
 pub const probe = @import("probe.zig");
+pub const guillotiere = @import("guillotiere.zig");
+pub const multi_atlas = @import("multi_atlas.zig");
+pub const image_cache = @import("image_cache.zig");
 
 test {
     // `refAllDecls` does not force analysis of imported files in this Zig
@@ -74,4 +78,7 @@ test {
     _ = @import("record.zig");
     _ = @import("encode.zig");
     _ = @import("probe.zig");
+    _ = @import("guillotiere.zig");
+    _ = @import("multi_atlas.zig");
+    _ = @import("image_cache.zig");
 }
