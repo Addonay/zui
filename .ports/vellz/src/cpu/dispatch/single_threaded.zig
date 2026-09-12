@@ -14,8 +14,10 @@
 //!   layers cannot be recorded through this dispatcher either:
 //!   `pushLayer` rejects a non-null `filter_data` with `error.Unsupported`, so
 //!   the bucketer never sees a filter node.
-//! - Multi-threaded dispatch is M4; there is no vtable yet and this type is
-//!   used directly by `cpu/render.zig`.
+//! - Multi-threaded dispatch lives in `dispatch/multi_threaded.zig` (M4).
+//!   Both implementations are reached through the `Dispatcher` vtable in
+//!   `dispatch/mod.zig`; `RenderContext` picks between them from
+//!   `RenderSettings.num_threads`.
 //!
 //! Ownership/allocator note: the dispatcher owns the bucketer, viewport,
 //! recorder, and strip storage; every method that can grow them takes the
@@ -73,13 +75,9 @@ const TargetInit = target_mod.TargetInit(PremulColor);
 const ViewportState = viewport_mod.ViewportState;
 
 /// Per-target parameters for fine rasterization (upstream
-/// `FineRenderParams`).
-pub const FineRenderParams = struct {
-    /// Size of the scene in pixels.
-    scene_size: [2]u16,
-    /// Offset in the destination pixmap where the scene origin is placed.
-    target_offset: [2]u16,
-};
+/// `FineRenderParams`, now owned by `cpu/fine/mod.zig`; kept as an alias for
+/// existing callers).
+pub const FineRenderParams = fine_mod.FineRenderParams;
 
 /// Single-threaded implementation of the rendering dispatcher.
 pub const SingleThreadedDispatcher = struct {

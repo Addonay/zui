@@ -196,8 +196,9 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `fine/common/gradient/*` | `cpu/fine/gradient.zig` | port | connected; oracle-verified (linear/radial/sweep/repeat scenes byte-exact) |
 | `fine/common/image.rs` | `cpu/fine/image.zig` | port | connected; oracle-verified (nearest/bilinear scenes byte-exact) |
 | `fine/common/rounded_blurred_rect.rs` | `cpu/fine/blurred_rect.zig` | defer | M2 filter work |
-| `dispatch/single_threaded.rs` | `cpu/dispatch/single_threaded.zig` | port | connected; f32 kernel; u8 kernel explicit `error.Unsupported` (M4) |
-| `dispatch/multi_threaded*.rs` | `cpu/dispatch/multi_threaded.zig` | defer | M4 |
+| `dispatch/single_threaded.rs` | `cpu/dispatch/single_threaded.zig` | port | connected; f32 kernel; u8 kernel explicit `error.Unsupported` (M4 follow-up) |
+| `dispatch/mod.rs` (`Dispatcher`, selection) | `cpu/dispatch/mod.zig` | port | connected; vtable + `num_threads` selection |
+| `dispatch/multi_threaded*.rs` | `cpu/dispatch/multi_threaded.zig` + `multi_threaded/{task,cost,worker,sync}.zig` | conn | f32 MT byte-identical to ST on the differential scene (`render.zig`); u8/filters `error.Unsupported`; corpus stays threads=0 |
 | `filter/*` | `cpu/filter/*.zig` | defer | M2; upstream limitations recorded |
 | `text.rs`, `text_debug.rs` | `cpu/text.zig` | defer | M3 |
 | `util.rs` (`Span`, `div255`, `Premultiply`) | `cpu/util.zig` | port | 6 tests |
@@ -436,6 +437,11 @@ of panics, thread ownership).
 ### Milestone 4 — CPU optimization
 
 - SIMD dispatch and multithreading ported, scalar reference retained.
+- **Landed:** multi-threaded f32 dispatch (`dispatch/mod.zig` `Dispatcher`
+  vtable + `multi_threaded.zig`) with persistent `std.Thread` workers,
+  upstream batch/cost/row splitting, and byte-identical output to the
+  single-threaded f32 path. Remaining: u8 lowp kernel
+  (`optimize_speed` still `error.Unsupported`), filter layers in MT.
 - **Gate:** scalar/portable/SIMD results agree exactly on the corpus; measured
   speedups recorded with methodology (`G4`).
 
@@ -519,4 +525,22 @@ of panics, thread ownership).
   to the M1 set; `zig build test` 547/547. Remaining for G2: filter layers
   (gaussian blur, drop shadow, flood, offset), blurred rounded rectangles,
   upstream fixture import.
+- 2026-09-12 M4 multithreading landed. `cpu/dispatch/mod.zig` now owns the
+  upstream `Dispatcher` vtable and the `num_threads` selection (0 =
+  single-threaded); `cpu/dispatch/multi_threaded.zig` + `multi_threaded/`
+  port the worker/job structure with persistent `std.Thread` workers replacing
+  rayon/crossbeam: batched `RenderTask`s with `cost.COST_THRESHOLD`, in-order
+  completion slots for recording, per-worker strip/alpha storage, and
+  strip-row `Region` splitting for fine rasterization. Zig 0.17 moved
+  `Mutex`/`Condition` behind `std.Io`; `multi_threaded/sync.zig` centralizes
+  the stateless futex-backed `global_single_threaded` instance (documented
+  adapt). `RenderContext.flush` became fallible (`error.NotFlushed` when a MT
+  render starts before flush; upstream panics). Differential test renders a
+  layered gradient/image/mask/clip/stroke scene with 0..4 threads and compares
+  all four channels byte-for-byte; upstream MT tests (`allocations`, reset /
+  drop with pending tasks, empty frame after reset, clip before draw) are
+  ported. `zig build test` = 563/563 (557 unit + 6 scene), `zig build corpus`
+  = 22/22 byte-exact (corpus stays `threads: 0`, single-threaded). Remaining
+  for G4: the u8 lowp kernel (`optimize_speed` still `error.Unsupported`),
+  native SIMD levels, MT filters, and measured speedups.
 

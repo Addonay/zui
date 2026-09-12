@@ -48,9 +48,13 @@ pub const Offset = struct {
 pub const RenderSettings = struct {
     /// The SIMD level that should be used for rendering operations.
     level: simd.Level,
-    /// Number of worker threads. The M1 dispatcher is single-threaded, so this
-    /// is currently ignored (multi-threading is M4); it is kept so callers and
-    /// scene files match the upstream settings shape.
+    /// Number of worker threads (M4).
+    ///
+    /// `0` selects the single-threaded dispatcher (upstream's
+    /// `#[cfg(not(feature = "multithreading"))]` default); any value in
+    /// `1..=255` selects the multi-threaded dispatcher, whose f32 output is
+    /// byte-identical to the single-threaded one. `256+` is reported as
+    /// `error.TooManyThreads` (worker ids are `u8` upstream).
     num_threads: u16 = 0,
 
     /// The upstream default: detected baseline level, no worker threads.

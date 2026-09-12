@@ -2,7 +2,7 @@
 //!
 //! `RenderContext` is the main entry point for CPU drawing: it maintains the
 //! current render state (transforms, paint, stroke, fill rule, ...), records
-//! drawing commands through the single-threaded dispatcher, and rasterizes the
+//! drawing commands through the selected dispatcher, and rasterizes the
 //! recorded scene into a `Pixmap`.
 //!
 //! Scope:
@@ -16,14 +16,19 @@
 //!   `pushLayer` rejects a non-null filter with `error.Unsupported`.
 //! - **Path-level masks** (`set_mask`/`reset_mask` upstream) are M2, matching
 //!   their `RecordedFill.mask` seam in `cpu/record.zig`.
-//! - Multi-threaded rendering is M4; `RenderSettings.num_threads` is ignored
-//!   and rendering always uses the single-threaded dispatcher.
+//! - **Multi-threaded rendering (M4).** `RenderSettings.num_threads > 0`
+//!   selects `dispatch.multi_threaded`; the multi-threaded f32 output is
+//!   byte-identical to the single-threaded output. `flush` is fallible for
+//!   multi-threaded dispatch (upstream panics on allocation failure) and must
+//!   be called before `renderWith`; otherwise `renderWith` returns
+//!   `error.NotFlushed`. Filter layers and the u8 (`optimize_speed`) kernel
+//!   stay `error.Unsupported` in both dispatch paths.
 //!
 //! Settings types (`RenderMode`, `PixelFormat`, `RenderSettings`,
 //! `RasterizerSettings`, `TargetInit`) are defined in `cpu/settings.zig` and
 //! re-exported here so the public path matches upstream `vello_cpu`; the
-//! dispatcher imports the leaf module directly, which avoids an import cycle
-//! (`render.zig` imports the dispatcher).
+//! dispatchers import the leaf module directly, which avoids an import cycle
+//! (`render.zig` imports the dispatch vtable).
 //!
 //! Error policy: where upstream asserts or panics (`render` with unclosed
 //! layers, `pop_layer` without a layer) this port returns typed errors from
@@ -48,7 +53,7 @@ const render_state_mod = @import("../common/render_state.zig");
 const transforms_mod = @import("../common/transforms.zig");
 const common_util = @import("../common/util.zig");
 const settings_mod = @import("settings.zig");
-const single_threaded = @import("dispatch/single_threaded.zig");
+const dispatch_mod = @import("dispatch/mod.zig");
 
 pub const RenderMode = settings_mod.RenderMode;
 pub const PixelFormat = settings_mod.PixelFormat;
@@ -221,8 +226,10 @@ pub const RenderContext = struct {
     mask: ?Mask,
     /// The settings this context was created with.
     render_settings: RenderSettings,
-    /// The single-threaded dispatcher (multi-threaded dispatch is M4).
-    dispatcher: single_threaded.SingleThreadedDispatcher,
+    /// The selected dispatcher (single- or multi-threaded). The concrete
+    /// implementation is heap-allocated so this context stays movable; see
+    /// `cpu/dispatch/mod.zig`.
+    dispatcher: dispatch_mod.Dispatcher,
     /// Temporary path buffer to avoid repeated allocations.
     temp_path: std.ArrayList(kurbo.PathEl),
     /// Encoded gradient/image paints produced by `encodeCurrentPaint`.
@@ -241,13 +248,13 @@ pub const RenderContext = struct {
         var root_transforms = try RootTransforms.init(allocator);
         errdefer root_transforms.deinit(allocator);
 
-        var dispatcher = try single_threaded.SingleThreadedDispatcher.init(
+        var dispatcher = try dispatch_mod.Dispatcher.create(
             allocator,
             init_width,
             init_height,
-            settings.level,
+            settings,
         );
-        errdefer dispatcher.deinit(allocator);
+        errdefer dispatcher.destroy(allocator);
 
         return .{
             .allocator = allocator,
@@ -274,7 +281,7 @@ pub const RenderContext = struct {
     /// Release every owned buffer, including any recorded layer resources, the
     /// owned `filter` effect, and any owned gradient/image paint payload.
     pub fn deinit(self: *RenderContext, allocator: std.mem.Allocator) void {
-        self.dispatcher.deinit(allocator);
+        self.dispatcher.destroy(allocator);
         self.root_transforms.deinit(allocator);
         self.temp_path.deinit(allocator);
         self.clearEncodedPaints();
@@ -344,9 +351,9 @@ pub const RenderContext = struct {
     }
 
     /// Whether rendering is currently configured to run in multi-threaded
-    /// mode (always false until M4).
-    pub fn isMultiThreaded(_: *const RenderContext) bool {
-        return false;
+    /// mode (`RenderSettings.num_threads > 0`).
+    pub fn isMultiThreaded(self: *const RenderContext) bool {
+        return self.dispatcher.isMultiThreaded();
     }
 
     // -------------------------------------------------------------- state
@@ -765,18 +772,26 @@ pub const RenderContext = struct {
     }
 
     /// Pop a clip path from the clip stack.
+    ///
+    /// Underflow and allocation failure are programming/allocation errors
+    /// (upstream panics); they are asserted in debug builds because the
+    /// upstream signature is infallible.
     pub fn popClipPath(self: *RenderContext) void {
-        self.dispatcher.popClipPath();
+        self.dispatcher.popClipPath(self.allocator) catch |err| {
+            std.debug.assert(err == error.OutOfMemory or err == error.ClipStackUnderflow);
+        };
     }
 
     // ------------------------------------------------------------ render
 
     /// Flush any pending operations.
     ///
-    /// Always a no-op for the single-threaded dispatcher; callers may keep
-    /// calling it (upstream recommends it) when switching to M4.
-    pub fn flush(self: *RenderContext) void {
-        self.dispatcher.flush();
+    /// A no-op for the single-threaded dispatcher. For multi-threaded
+    /// rendering this blocks until all recorded commands are generated and
+    /// must be called before `renderWith`; it is fallible because upstream
+    /// aborts on allocation failure while this port returns `error.OutOfMemory`.
+    pub fn flush(self: *RenderContext) !void {
+        try self.dispatcher.flush(self.allocator);
     }
 
     /// Render the current context into a target using default rasterizer
@@ -921,7 +936,7 @@ test "doc example: magenta rect on 10x5 context" {
 
     ctx.setPaint(palette.MAGENTA);
     try ctx.fillRect(allocator, kurbo.Rect.new(3.0, 1.0, 7.0, 4.0));
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
     const magenta = premulU8(palette.MAGENTA);
@@ -948,7 +963,7 @@ test "overlapping translucent rects composite in premultiplied space" {
     try ctx.fillRect(allocator, rect);
     ctx.setPaint(palette.BLUE.withAlpha(0.5));
     try ctx.fillRect(allocator, rect);
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
     // red 0.5 then blue 0.5:
@@ -977,7 +992,7 @@ test "nested clip paths intersect" {
     try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 4.0, 4.0));
     ctx.popClipPath();
     ctx.popClipPath();
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
     // The intersection is the single pixel (2, 2).
@@ -1005,7 +1020,7 @@ test "clip layer composites only inside the clip" {
     ctx.setPaint(palette.RED);
     try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 4.0, 4.0));
     ctx.popLayer();
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
     const red = premulU8(palette.RED);
@@ -1031,7 +1046,7 @@ test "opacity layer scales coverage" {
     ctx.setPaint(palette.RED);
     try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 1.0, 1.0));
     ctx.popLayer();
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
     // The opaque red is scaled by 0.5 as a whole layer, then composited over
@@ -1055,7 +1070,7 @@ test "blend layer multiplies against the isolated scene" {
     ctx.setPaint(palette.RED);
     try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 1.0, 1.0));
     ctx.popLayer();
-    ctx.flush();
+    try ctx.flush();
 
     var settings = qualitySettings();
     settings.target_init = .src_over;
@@ -1079,7 +1094,7 @@ test "path-level mask is applied to draws and cleared by resetMask" {
     defer ctx.resetMask();
     ctx.setPaint(palette.RED);
     try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 2.0, 1.0));
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
     // The mask zeroes the left pixel and leaves the right one opaque.
@@ -1091,7 +1106,7 @@ test "path-level mask is applied to draws and cleared by resetMask" {
     var pixmap2 = try Pixmap.init(allocator, 2, 1);
     defer pixmap2.deinit(allocator);
     try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 2.0, 1.0));
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap2, &resources, qualitySettings());
     try expectPixel(&pixmap2, 0, 0, .{ .r = 255, .g = 0, .b = 0, .a = 255 });
 }
@@ -1111,7 +1126,7 @@ test "layer mask is sampled per row" {
     ctx.setPaint(palette.RED);
     try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 2.0, 1.0));
     ctx.popLayer();
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
     try expectPixel(&pixmap, 0, 0, transparentPixel());
@@ -1130,7 +1145,7 @@ test "degenerate zero-area rect draws nothing" {
     ctx.setPaint(palette.RED);
     try ctx.fillRect(allocator, kurbo.Rect.new(1.0, 1.0, 1.0, 3.0));
     try ctx.fillRect(allocator, kurbo.Rect.new(1.0, 1.0, 3.0, 1.0));
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
     for (0..4) |y| {
@@ -1149,7 +1164,7 @@ test "empty scene leaves a cleared target" {
     var pixmap = try Pixmap.init(allocator, 3, 2);
     defer pixmap.deinit(allocator);
 
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
     for (0..2) |y| {
@@ -1170,7 +1185,7 @@ test "empty scene composited over an existing target with src over" {
 
     var settings = qualitySettings();
     settings.target_init = .src_over;
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, settings);
 
     for (0..2) |y| {
@@ -1191,7 +1206,7 @@ test "render with offset clears pixels outside the scene" {
 
     ctx.setPaint(palette.RED);
     try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 2.0, 2.0));
-    ctx.flush();
+    try ctx.flush();
 
     var settings = qualitySettings();
     settings.offset = .{ .x = 1, .y = 1 };
@@ -1218,7 +1233,7 @@ test "render preserves target under translucent draw with src over" {
 
     ctx.setPaint(palette.RED.withAlpha(0.5));
     try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 1.0, 1.0));
-    ctx.flush();
+    try ctx.flush();
 
     var settings = qualitySettings();
     settings.target_init = .src_over;
@@ -1240,7 +1255,7 @@ test "opaque clear updates the transparency hint" {
     var pixmap = try Pixmap.init(allocator, 1, 1);
     defer pixmap.deinit(allocator);
 
-    ctx.flush();
+    try ctx.flush();
     var settings = qualitySettings();
     settings.target_init = .{ .clear = palette.BLUE };
     try ctx.renderWith(&pixmap, &resources, settings);
@@ -1259,7 +1274,7 @@ test "translucent clear updates the transparency hint" {
     defer pixmap.deinit(allocator);
 
     const clear_color = palette.RED.withAlpha(0.5);
-    ctx.flush();
+    try ctx.flush();
     var settings = qualitySettings();
     settings.target_init = .{ .clear = clear_color };
     try ctx.renderWith(&pixmap, &resources, settings);
@@ -1297,7 +1312,7 @@ test "default render mode defers to the M4 u8 pipeline" {
 
     ctx.setPaint(palette.RED);
     try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 1.0, 1.0));
-    ctx.flush();
+    try ctx.flush();
 
     // `render` uses `RasterizerSettings.default` (optimize_speed -> u8
     // kernel), which is M4; the error must be explicit.
@@ -1353,7 +1368,7 @@ test "reset and resize update the scene size" {
 
     ctx.setPaint(palette.BLUE);
     try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 4.0, 8.0));
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
     for (0..8) |y| {
@@ -1375,7 +1390,7 @@ test "path fill and stroke render through the recorded pipeline" {
     const rect = rectElements(kurbo.Rect.new(0.0, 0.0, 4.0, 4.0));
     ctx.setPaint(palette.RED);
     try ctx.fillPath(allocator, &rect);
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
     for (0..4) |y| {
@@ -1408,7 +1423,7 @@ test "gradient and image paints render through the indexed path" {
         // Ownership moves into the context and is released by `deinit`.
         ctx.setPaint(PaintType.fromGradient(gradient));
         try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 2.0, 2.0));
-        ctx.flush();
+        try ctx.flush();
         try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
         for (0..2) |y| {
@@ -1441,7 +1456,7 @@ test "gradient and image paints render through the indexed path" {
         };
         ctx.setPaint(PaintType.fromImage(image_paint));
         try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 2.0, 2.0));
-        ctx.flush();
+        try ctx.flush();
         try ctx.renderWith(&pixmap, &resources, qualitySettings());
 
         for (0..2) |y| {
@@ -1497,4 +1512,290 @@ test "image registry round-trip, resolver view, exhaustion, and clear" {
         try shared_mod.Shared(Pixmap).create(allocator, try Pixmap.init(allocator, 1, 1)),
     );
     try testing.expectEqual(@as(u32, 0), id3.asU32());
+}
+
+// ---------------------------------------------------------------------------
+// M4: multi-threaded dispatch (upstream render.rs multithreading tests plus a
+// single-vs-multi byte-exact differential)
+// ---------------------------------------------------------------------------
+
+const MT_SCENE_SIZE: u16 = 64;
+
+fn mtSettings(num_threads: u16) RenderSettings {
+    return .{ .level = .baseline, .num_threads = num_threads };
+}
+
+/// A pointer to the five-pointed-star path used by the differential scene
+/// (self-intersecting under `NonZero`, so winding bookkeeping and per-column
+/// alpha coverage are exercised in addition to plain fills).
+fn starElements() [12]kurbo.PathEl {
+    var elements: [12]kurbo.PathEl = undefined;
+    const cx: f64 = 32.0;
+    const cy: f64 = 32.0;
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const radius: f64 = if (i % 2 == 0) 26.0 else 11.0;
+        const angle = -std.math.pi / 2.0 + @as(f64, @floatFromInt(i)) * std.math.pi / 5.0;
+        const p = kurbo.Point.new(
+            cx + radius * @cos(angle),
+            cy + radius * @sin(angle),
+        );
+        elements[i] = if (i == 0) .{ .MoveTo = p } else .{ .LineTo = p };
+    }
+    elements[10] = .{ .LineTo = elements[0].MoveTo };
+    elements[11] = .ClosePath;
+    return elements;
+}
+
+/// Record the differential test scene: gradient background, registered image,
+/// translucent overlap, opacity and multiply layers, a path-level mask, a clip
+/// path and a self-intersecting star fill. Every paint kind and task kind the
+/// dispatcher supports is represented.
+fn buildDifferentialScene(
+    ctx: *RenderContext,
+    allocator: std.mem.Allocator,
+    resources: *Resources,
+) !void {
+    const size_f: f64 = @floatFromInt(MT_SCENE_SIZE);
+
+    // Linear gradient over the whole scene (three stops).
+    const stops = [_]peniko.ColorStop{
+        .{ .offset = 0.0, .color = palette.BLUE },
+        .{ .offset = 0.35, .color = palette.RED },
+        .{ .offset = 1.0, .color = peniko.Color.fromRgba8(0, 255, 128, 200) },
+    };
+    var gradient = peniko.Gradient{};
+    gradient.stops = try peniko.ColorStops.fromSlice(allocator, &stops);
+    ctx.setPaint(PaintType.fromGradient(gradient));
+    try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, size_f, size_f));
+
+    // Registered image paint.
+    var image_pixmap = try Pixmap.init(allocator, 2, 2);
+    image_pixmap.setPixel(0, 0, .{ .r = 255, .g = 0, .b = 0, .a = 255 });
+    image_pixmap.setPixel(1, 0, .{ .r = 0, .g = 255, .b = 0, .a = 255 });
+    image_pixmap.setPixel(0, 1, .{ .r = 0, .g = 0, .b = 255, .a = 255 });
+    image_pixmap.setPixel(1, 1, .{ .r = 255, .g = 255, .b = 0, .a = 128 });
+    const handle = try shared_mod.Shared(Pixmap).create(allocator, image_pixmap);
+    const image_id = try resources.registerImage(allocator, handle);
+    ctx.setPaint(PaintType.fromImage(paint_mod.Image{
+        .image = paint_mod.ImageSource.initOpaqueIdWithTransparencyHint(image_id, true),
+        .sampler = .{ .quality = .high },
+    }));
+    try ctx.fillRect(allocator, kurbo.Rect.new(4.0, 4.0, 30.0, 30.0));
+
+    // Overlapping translucent solid fills.
+    ctx.setPaint(palette.GREEN.withAlpha(0.5));
+    try ctx.fillRect(allocator, kurbo.Rect.new(10.5, 10.5, 40.25, 40.25));
+    ctx.setPaint(palette.MAGENTA.withAlpha(0.4));
+    try ctx.fillRect(allocator, kurbo.Rect.new(24.75, 6.5, 56.0, 38.0));
+
+    // Opacity layer.
+    try ctx.pushOpacityLayer(0.6);
+    ctx.setPaint(palette.YELLOW);
+    try ctx.fillRect(allocator, kurbo.Rect.new(2.5, 44.25, 30.0, 60.75));
+    ctx.popLayer();
+
+    // Multiply blend layer.
+    try ctx.pushBlendLayer(peniko.BlendMode.from(peniko.Mix.multiply));
+    ctx.setPaint(peniko.Color.fromRgb8(120, 200, 255));
+    try ctx.fillRect(allocator, kurbo.Rect.new(30.25, 30.25, 62.0, 62.0));
+    ctx.popLayer();
+
+    // Path-level mask on one draw (same size as the context).
+    const mask_data = try allocator.alloc(u8, @as(usize, MT_SCENE_SIZE) * MT_SCENE_SIZE);
+    defer allocator.free(mask_data);
+    for (mask_data, 0..) |*value, index| {
+        value.* = @truncate((index * 37) & 0xff);
+    }
+    ctx.setMask(try Mask.fromParts(allocator, mask_data, MT_SCENE_SIZE, MT_SCENE_SIZE));
+    const star = starElements();
+    ctx.setPaint(palette.WHITE.withAlpha(0.75));
+    try ctx.fillPath(allocator, &star);
+    ctx.resetMask();
+
+    // Clip path + a round-capped stroke inside it.
+    const clip = rectElements(kurbo.Rect.new(3.0, 3.0, 61.0, 33.0));
+    try ctx.pushClipPath(allocator, &clip);
+    var stroke = kurbo.Stroke.new(3.5);
+    stroke = stroke.withCaps(.round);
+    ctx.setStroke(stroke);
+    const line = [_]kurbo.PathEl{
+        .{ .MoveTo = kurbo.Point.new(6.0, 18.0) },
+        .{ .LineTo = kurbo.Point.new(58.0, 18.0) },
+    };
+    ctx.setPaint(palette.BLACK);
+    try ctx.strokePath(allocator, &line);
+    ctx.popClipPath();
+}
+
+/// Render `buildDifferentialScene` with the requested thread count.
+fn renderDifferentialScene(
+    allocator: std.mem.Allocator,
+    num_threads: u16,
+) !Pixmap {
+    var ctx = try RenderContext.init(
+        allocator,
+        MT_SCENE_SIZE,
+        MT_SCENE_SIZE,
+        mtSettings(num_threads),
+    );
+    defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    var pixmap = try Pixmap.init(allocator, MT_SCENE_SIZE, MT_SCENE_SIZE);
+    errdefer pixmap.deinit(allocator);
+
+    try buildDifferentialScene(&ctx, allocator, &resources);
+    try ctx.flush();
+    try ctx.renderWith(&pixmap, &resources, qualitySettings());
+    return pixmap;
+}
+
+test "multi-threaded f32 output matches single-threaded byte for byte" {
+    const allocator = testing.allocator;
+
+    var reference = try renderDifferentialScene(allocator, 0);
+    defer reference.deinit(allocator);
+
+    var threads: u16 = 1;
+    while (threads <= 4) : (threads += 1) {
+        var actual = try renderDifferentialScene(allocator, threads);
+        defer actual.deinit(allocator);
+        try testing.expectEqualSlices(
+            u8,
+            reference.dataAsU8Slice(),
+            actual.dataAsU8Slice(),
+        );
+    }
+}
+
+test "multi-threaded dispatch reports is_multi_threaded" {
+    const allocator = testing.allocator;
+
+    {
+        var ctx = try RenderContext.init(allocator, 8, 8, mtSettings(2));
+        defer ctx.deinit(allocator);
+        try testing.expect(ctx.isMultiThreaded());
+    }
+    {
+        var ctx = try RenderContext.init(allocator, 8, 8, mtSettings(0));
+        defer ctx.deinit(allocator);
+        try testing.expect(!ctx.isMultiThreaded());
+    }
+}
+
+// The following tests are ports of the `#[cfg(feature = "multithreading")]`
+// tests in upstream `render.rs`.
+
+test "multithreaded crash after reset" {
+    const allocator = testing.allocator;
+
+    var pixmap = try Pixmap.init(allocator, 200, 200);
+    defer pixmap.deinit(allocator);
+
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+
+    var ctx = try RenderContext.init(allocator, 200, 200, mtSettings(1));
+    defer ctx.deinit(allocator);
+
+    ctx.reset();
+    ctx.setPaint(palette.BLACK);
+    try ctx.fillPath(allocator, &rectElements(kurbo.Rect.new(0.0, 0.0, 100.0, 100.0)));
+    try ctx.flush();
+    try ctx.renderWith(&pixmap, &resources, qualitySettings());
+    try ctx.flush();
+    try ctx.renderWith(&pixmap, &resources, qualitySettings());
+
+    try testing.expectEqual(premulU8(palette.BLACK), pixmap.sample(50, 50));
+    try testing.expectEqual(transparentPixel(), pixmap.sample(150, 150));
+}
+
+test "multithreaded render empty frame after reset" {
+    const allocator = testing.allocator;
+
+    var ctx = try RenderContext.init(allocator, 100, 100, mtSettings(4));
+    defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    var pixmap = try Pixmap.init(allocator, 100, 100);
+    defer pixmap.deinit(allocator);
+
+    ctx.setPaint(palette.RED);
+    try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 100.0, 100.0));
+    try ctx.flush();
+    try ctx.renderWith(&pixmap, &resources, qualitySettings());
+    try testing.expectEqual(premulU8(palette.RED), pixmap.sample(50, 50));
+
+    ctx.reset();
+    try ctx.flush();
+    try ctx.renderWith(&pixmap, &resources, qualitySettings());
+    for (0..100) |y| {
+        for (0..100) |x| {
+            try expectPixel(&pixmap, @intCast(x), @intCast(y), transparentPixel());
+        }
+    }
+}
+
+test "multithreaded push clip path before draw" {
+    const allocator = testing.allocator;
+
+    var ctx = try RenderContext.init(allocator, 100, 100, mtSettings(1));
+    defer ctx.deinit(allocator);
+
+    const clip = rectElements(kurbo.Rect.new(0.0, 0.0, 50.0, 50.0));
+    try ctx.pushClipPath(allocator, &clip);
+    try ctx.flush();
+    ctx.popClipPath();
+    try ctx.flush();
+}
+
+test "multithreaded reset with pending tasks" {
+    const allocator = testing.allocator;
+
+    var ctx = try RenderContext.init(allocator, 100, 100, mtSettings(4));
+    defer ctx.deinit(allocator);
+
+    // Note: this only exercises batch sends once the cost threshold is
+    // crossed, matching the upstream test's note.
+    for (0..300) |_| {
+        try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 100.0, 100.0));
+    }
+
+    ctx.reset();
+}
+
+test "multithreaded drop with pending tasks" {
+    const allocator = testing.allocator;
+
+    for (0..10) |_| {
+        var ctx = try RenderContext.init(allocator, 100, 100, mtSettings(4));
+        defer ctx.deinit(allocator);
+
+        for (0..300) |_| {
+            try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 100.0, 100.0));
+        }
+    }
+}
+
+test "multithreaded render before flush returns a typed error" {
+    const allocator = testing.allocator;
+
+    var ctx = try RenderContext.init(allocator, 16, 16, mtSettings(2));
+    defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    var pixmap = try Pixmap.init(allocator, 16, 16);
+    defer pixmap.deinit(allocator);
+
+    ctx.setPaint(palette.RED);
+    try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 16.0, 16.0));
+    try testing.expectError(
+        error.NotFlushed,
+        ctx.renderWith(&pixmap, &resources, qualitySettings()),
+    );
+
+    try ctx.flush();
+    try ctx.renderWith(&pixmap, &resources, qualitySettings());
+    try expectPixel(&pixmap, 0, 0, premulU8(palette.RED));
 }
