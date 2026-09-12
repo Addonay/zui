@@ -11,10 +11,12 @@ const std = @import("std");
 pub const roboto_path = "tests/fixtures/upstream/Roboto-Regular.ttf";
 pub const noto_color_path = "tests/fixtures/upstream/NotoColorEmoji-Subset.ttf";
 pub const noto_cbtf_path = "tests/fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf";
+pub const colr_test_glyphs_path = "tests/fixtures/upstream/test_glyphs-glyf_colr_1.ttf";
 
 var roboto_cache: ?[]const u8 = null;
 var noto_color_cache: ?[]const u8 = null;
 var noto_cbtf_cache: ?[]const u8 = null;
+var colr_test_glyphs_cache: ?[]const u8 = null;
 
 fn load(path: []const u8) ![]const u8 {
     return std.Io.Dir.cwd().readFileAlloc(
@@ -40,8 +42,14 @@ pub fn notoCbtf() ![]const u8 {
     return noto_cbtf_cache.?;
 }
 
+pub fn colrTestGlyphs() ![]const u8 {
+    if (colr_test_glyphs_cache == null) colr_test_glyphs_cache = try load(colr_test_glyphs_path);
+    return colr_test_glyphs_cache.?;
+}
+
 test "fixtures are readable and non-empty" {
     try std.testing.expect((try roboto()).len > 100_000);
     try std.testing.expect((try notoColor()).len > 1_000);
     try std.testing.expect((try notoCbtf()).len > 1_000);
+    try std.testing.expect((try colrTestGlyphs()).len > 10_000);
 }

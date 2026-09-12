@@ -39,6 +39,7 @@ pub const tag_loca = Tag{ 'l', 'o', 'c', 'a' };
 pub const tag_glyf = Tag{ 'g', 'l', 'y', 'f' };
 /// Color/bitmap tables used to detect deferred glyph sources (T4/T3b).
 pub const tag_colr = Tag{ 'C', 'O', 'L', 'R' };
+pub const tag_cpal = Tag{ 'C', 'P', 'A', 'L' };
 pub const tag_cbdt = Tag{ 'C', 'B', 'D', 'T' };
 pub const tag_cblc = Tag{ 'C', 'B', 'L', 'C' };
 pub const tag_sbix = Tag{ 's', 'b', 'i', 'x' };
