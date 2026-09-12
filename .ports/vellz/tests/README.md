@@ -48,6 +48,46 @@ reduction order) and must state:
 Tolerances never mask missing geometry: a scene whose feature is unimplemented
 must fail loudly or be absent from the corpus, not produce approximate output.
 
+## GPU (hybrid) corpus tolerance
+
+The offscreen GPU backend renders the root-pass scene subset and compares the
+premultiplied RGBA8 output against the same oracle fixtures with
+`tools/compare_raw.py` (all four channels). The gate is:
+
+```sh
+zig build -Dgpu=true gpu-corpus     # tools/gpu_corpus.sh + the built renderer
+```
+
+Policy (same as CPU): start at `--max-abs-diff 1 --max-diff-pixels 0`
+(upstream's `DEFAULT_HYBRID_TOLERANCE = 1`); a scene may raise the pixel
+allowance only with a written reason. Always run on the same adapter class and
+record the adapter line printed by the renderer (`execution=software-adapter`
+for lavapipe/llvmpipe).
+
+| Scene | max abs diff | differing pixels | Reason |
+| --- | --- | --- | --- |
+| `empty_64` | 0 | 0 | clear only; byte-exact |
+| `fill_overlap_alpha_64` | 0 | 0 | byte-exact |
+| `fill_path_nonzero_64` | 0 | 0 | byte-exact |
+| `fill_path_evenodd_64` | 0 | 0 | byte-exact |
+| `fill_rect_64` | 1 | 41 / 4096 | GPU per-fragment fractional rect-edge coverage vs CPU sparse-strip coverage; every difference is one channel step (upstream's hybrid tests allow tolerance 1) |
+| `transform_rotate_64` | 1 | 84 / 4096 | rotated-edge AA coverage; every difference is one channel step |
+| `stroke_basic_64` | 0 | 0 | byte-exact |
+| `clip_nested_64` | 0 | 0 | byte-exact |
+| `degenerate_64` | 0 | 0 | byte-exact |
+
+Measured on the container's **llvmpipe software Vulkan** adapter
+(`backend=vulkan type=cpu execution=software-adapter`, Mesa 25.2.8, LLVM
+20.1.2).
+
+Measured but not gated yet (renderer succeeds, all channel diffs are 1):
+`fill_tile_grid_128` (4948 / 16384 pixels) and `fill_wave_seams_128`
+(280 / 16384 pixels) — tile-seam coverage rounding; a bounded allowance needs
+its own written reason before entering the gate. Scenes using layers,
+gradients, images, or filters are not in the GPU subset yet: their scene
+commands return `error.Unsupported` from the root strip renderer, never
+approximated output.
+
 ## Upstream probe fixture
 
 `tests/fixtures/upstream/probe.rgba` is the pinned upstream probe reference

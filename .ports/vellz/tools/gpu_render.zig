@@ -97,19 +97,27 @@ pub fn main(init: std.process.Init) !void {
                 .evenodd => .even_odd,
             }),
             .fill_rect => |r| try gpu.fillRect(&kurbo.Rect.new(r[0], r[1], r[2], r[3])),
+            .stroke_rect => |r| try gpu.strokeRect(&kurbo.Rect.new(r[0], r[1], r[2], r[3])),
+            .set_stroke => |spec| gpu.setStroke(try strokeFromSpec(spec)),
             .fill_path => |svg| {
                 try parseSvg(allocator, &scratch_path, svg);
                 defer resetScratch(allocator, &scratch_path);
                 try gpu.fillPath(scratch_path.elements.items);
             },
+            .stroke_path => |svg| {
+                try parseSvg(allocator, &scratch_path, svg);
+                defer resetScratch(allocator, &scratch_path);
+                try gpu.strokePath(scratch_path.elements.items);
+            },
             .reset => try gpu.reset(),
             .set_aliasing_threshold => |threshold| gpu.setAliasingThreshold(threshold),
-            .stroke_rect,
-            .stroke_path,
-            .set_stroke,
+            .push_clip_path => |svg| {
+                try parseSvg(allocator, &scratch_path, svg);
+                defer resetScratch(allocator, &scratch_path);
+                try gpu.pushClipPath(scratch_path.elements.items);
+            },
+            .pop_clip_path => try gpu.popClipPath(),
             .fill_blurred_rounded_rect,
-            .push_clip_path,
-            .pop_clip_path,
             .push_clip_layer,
             .push_layer,
             .pop_layer,
@@ -218,6 +226,17 @@ fn parseSvg(
     svg: []const u8,
 ) !void {
     scratch.* = kurbo.bezpath.fromSvg(allocator, svg) catch return error.InvalidPath;
+}
+
+/// Map a corpus stroke spec onto `kurbo.Stroke` (same mapping as `vellz-cli`).
+fn strokeFromSpec(spec: scene_mod.StrokeSpec) !kurbo.Stroke {
+    var stroke = kurbo.Stroke.new(spec.width);
+    if (spec.join) |join| stroke = stroke.withJoin(@fromBackingInt(@intCast(@backingInt(join))));
+    if (spec.start_cap) |cap| stroke = stroke.withStartCap(@fromBackingInt(@intCast(@backingInt(cap))));
+    if (spec.end_cap) |cap| stroke = stroke.withEndCap(@fromBackingInt(@intCast(@backingInt(cap))));
+    if (spec.miter_limit) |limit| stroke = stroke.withMiterLimit(limit);
+    if (spec.dash) |dash| stroke = try stroke.withDashes(spec.dash_offset, dash);
+    return stroke;
 }
 
 fn resetScratch(allocator: std.mem.Allocator, scratch: *kurbo.BezPath) void {

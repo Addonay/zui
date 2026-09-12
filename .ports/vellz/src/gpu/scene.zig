@@ -44,6 +44,7 @@ pub const Error = std.mem.Allocator.Error || error{
     Unsupported,
     RootViewportStackUnderflow,
     ClipStackUnderflow,
+    ClipGenerationFailed,
     NoActiveLayer,
 };
 
@@ -525,6 +526,7 @@ pub const Scene = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             if (err == error.RootViewportStackUnderflow) return error.RootViewportStackUnderflow;
             if (err == error.ClipStackUnderflow) return error.ClipStackUnderflow;
+            if (err == error.ClipGenerationFailed) return error.ClipGenerationFailed;
             if (err == error.NoActiveLayer) return error.NoActiveLayer;
             return error.Unsupported;
         };

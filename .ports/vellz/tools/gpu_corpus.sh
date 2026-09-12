@@ -30,6 +30,9 @@ SCENES=(
     fill_path_nonzero_64
     fill_path_evenodd_64
     transform_rotate_64
+    stroke_basic_64
+    clip_nested_64
+    degenerate_64
 )
 
 usage() {
