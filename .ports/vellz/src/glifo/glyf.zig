@@ -15,18 +15,27 @@
 //!
 //! Ported scope: simple glyphs, composite glyphs with transforms and point
 //! matching, empty glyphs, phantom-point lsb/advance adjustment,
-//! `PathStyle::FreeType`, and the embedded TrueType interpreter
-//! (`hint.zig`): hinted scaling (`computeHintedScale`, phantom rounding),
-//! `HintOutline` buffers, simple/composite glyf programs and the rounded
-//! hinted advance. Hinted outlines are bit-identical to skrifa; any
-//! interpreter failure is `error.HintError`, never a silent unhinted draw.
+//! `PathStyle::FreeType`, `gvar` deltas with IUP interpolation, and the
+//! embedded TrueType interpreter (`hint.zig`): hinted scaling
+//! (`computeHintedScale`, phantom rounding), `HintOutline` buffers,
+//! simple/composite glyf programs and the rounded hinted advance. Hinted
+//! outlines are bit-identical to skrifa; any interpreter failure is
+//! `error.HintError`, never a silent unhinted draw.
+//!
+//! Variation coordinates are normalized F2Dot14 values (upstream
+//! `NormalizedCoord`). Missing trailing axes read as zero and extra coordinates
+//! are ignored, exactly like `LocationRef`; an all-zero (or empty) coordinate
+//! slice takes the static path because skrifa's `effective_coords` collapses
+//! it. A font without a `gvar` table ignores non-empty coordinates entirely
+//! (upstream's `outlines.gvar.is_none()` short-circuit). Malformed tuple data
+//! degrades like upstream: bad glyph data ranges mean "no deltas" while still
+//! running the delta application path, bad packed point/delta streams fall back
+//! to the plain scaler, and truncated tuple headers end iteration.
 //!
 //! Deferred with typed errors: HarfBuzz path style (`error.Unsupported`),
-//! non-empty variation coordinates (`error.Unsupported`; `gvar`/`HVAR` deltas
-//! are not ported), CFF/bitmap faces (rejected by `font.Font.outlines`),
-//! autohinter-only fonts (`prefer_interpreter == false`), `hdmx` advances
-//! outside backward compatibility, and embolden (rejected by the outline
-//! cache).
+//! CFF/bitmap faces (rejected by `font.Font.outlines`), autohinter-only fonts
+//! (`prefer_interpreter == false`), `hdmx` advances outside backward
+//! compatibility, and embolden (rejected by the outline cache).
 
 const std = @import("std");
 
@@ -34,6 +43,7 @@ const font_mod = @import("font.zig");
 const tables = @import("tables/root.zig");
 const sfnt = tables.sfnt;
 const raw = tables.glyf;
+const gvar_mod = tables.gvar;
 const Loca = tables.loca.Loca;
 const hint_mod = @import("hint.zig");
 
@@ -108,6 +118,12 @@ pub fn roundF26Point(bits: i32) i32 {
     return (bits +% 32) & ~@as(i32, 63);
 }
 
+/// `Fixed::to_f26dot6`: `(bits + 0x200) >> 10`, wrapping add.
+pub fn fixedToF26Dot6(bits: i32) i32 {
+    const wrapped: i32 = @bitCast(@as(u32, @bitCast(bits)) +% 0x200);
+    return wrapped >> 10;
+}
+
 /// `F26Dot6::from_i32`: `bits << 6` (high bits discarded, like Rust's shift).
 pub fn f26FromI32(value: i32) i32 {
     return @bitCast(@as(u32, @bitCast(value)) << 6);
@@ -163,9 +179,19 @@ pub const Scale26Dot6 = struct {
         return fixedMul(value, self.scale_bits);
     }
 
+    /// `Scale26Dot6::apply_point`.
+    pub fn applyPoint(self: Scale26Dot6, point: hint_mod.Point) hint_mod.Point {
+        return .{ .x = self.apply(point.x), .y = self.apply(point.y) };
+    }
+
     /// `Scale26Dot6::mul`: `F26Dot6` bits to scaled `F26Dot6` bits.
     pub fn mul(self: Scale26Dot6, value: i32) i32 {
         return fixedMul(value, self.scale_bits);
+    }
+
+    /// `Scale26Dot6::mul_point`.
+    pub fn mulPoint(self: Scale26Dot6, point: hint_mod.Point) hint_mod.Point {
+        return .{ .x = self.mul(point.x), .y = self.mul(point.y) };
     }
 };
 
@@ -189,6 +215,14 @@ fn roundPpemForHinting(ppem: f32) f32 {
 pub const PointI32 = hint_mod.Point;
 pub const Point26 = hint_mod.Point;
 
+/// `LocationRef::effective_coords`: empty when every coordinate is zero.
+pub fn effectiveCoords(coords: []const NormalizedCoord) []const NormalizedCoord {
+    for (coords) |coord| {
+        if (coord != 0) return coords;
+    }
+    return &.{};
+}
+
 /// Emitted path style; only `FreeType` is ported.
 pub const PathStyle = enum {
     freetype,
@@ -198,8 +232,10 @@ pub const PathStyle = enum {
 pub const DrawSettings = struct {
     /// Pixel size; `null` means unscaled (font units in 26.6).
     size: ?f32 = null,
-    /// Normalized variation coordinates. Non-empty is `error.Unsupported`
-    /// until `gvar`/`HVAR` deltas land.
+    /// Normalized variation coordinates in F2Dot14. Missing trailing axes
+    /// read as zero and extra coordinates are ignored (`LocationRef`
+    /// semantics); all-zero/empty coordinates take the static path. A font
+    /// without `gvar` ignores non-empty coordinates (no-op, like upstream).
     coords: []const NormalizedCoord = &.{},
     path_style: PathStyle = .freetype,
     /// Hinting instance already configured for `size` (glifo's `HintCache`
@@ -241,6 +277,14 @@ pub const Outlines = struct {
     glyph_count: u16,
     /// `fpgm`/`prep`/`cvt` plus the `maxp` interpreter limits (M3 hinting).
     program: hint_mod.ProgramData = .{},
+    /// The parsed `gvar` table, or `null` (`Font.gvar` degrades malformed
+    /// tables to null like `FontRef::gvar().ok()`).
+    gvar: ?gvar_mod.Gvar = null,
+    /// A usable `cvar` table, or `null`.
+    cvar: ?gvar_mod.Cvar = null,
+    /// `HVAR` present and at least header-sized; selects FreeType's
+    /// integer rounding for phantom-point gvar deltas.
+    has_hvar: bool = false,
     /// OS/2 `sTypoAscender`/`sTypoDescender` (0 without the table), used for
     /// the vertical phantom points.
     ascent: i32 = 0,
@@ -272,16 +316,22 @@ pub const Outlines = struct {
             descent = sfnt.readI16(os2, 70) orelse 0;
         }
         const max_instructions: u16 = maxp.maxSizeOfInstructions() orelse 0;
+        const gvar = font.gvar();
+        const cvar = font.cvar();
         return .{
             .font = font,
             .loca = Loca.parse(loca_data, head.indexToLocFormat() == 1),
             .glyf_data = glyf_data,
             .upem = head.unitsPerEm(),
             .glyph_count = maxp.numGlyphs(),
+            .gvar = gvar,
+            .cvar = cvar,
+            .has_hvar = font.hasHvar(),
             .program = .{
                 .fpgm = fpgm,
                 .prep = prep,
                 .cvt = cvt,
+                .cvar = cvar,
                 .max_function_defs = maxp.maxFunctionDefs() orelse 0,
                 .max_instruction_defs = maxp.maxInstructionDefs() orelse 0,
                 // +4 phantom points, saturating like upstream.
@@ -289,7 +339,9 @@ pub const Outlines = struct {
                 // FreeType heuristic for buggy fonts: +32 stack elements.
                 .max_stack_elements = (maxp.maxStackElements() orelse 0) +| 32,
                 .max_storage = maxp.maxStorage() orelse 0,
-                .axis_count = 0,
+                // `HintInstance::setup` derives the interpreter's axis count
+                // from `gvar` (0 without the table), not `fvar`.
+                .axis_count = if (gvar) |g| g.axis_count else 0,
             },
             .ascent = ascent,
             .descent = descent,
@@ -350,12 +402,13 @@ pub const Outlines = struct {
         self: *const Outlines,
         allocator: std.mem.Allocator,
         size: f32,
+        coords: []const NormalizedCoord,
         target: hint_mod.Target,
     ) DrawError!hint_mod.HintInstance {
         var instance = hint_mod.HintInstance.init(allocator);
         errdefer instance.deinit();
         const sp = self.hintedScaleAndPpem(size);
-        instance.reconfigure(self.program, sp.scale, sp.ppem, target, &.{}, size) catch |err| switch (err) {
+        instance.reconfigure(self.program, sp.scale, sp.ppem, target, coords, size) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.HintError,
         };
@@ -444,7 +497,9 @@ pub const Outlines = struct {
         settings: DrawSettings,
         pen: anytype,
     ) DrawError!AdjustedMetrics {
-        if (settings.coords.len != 0) return error.Unsupported;
+        // `LocationRef::effective_coords`: an all-zero slice is equivalent to
+        // no coordinates and skips the variation path entirely.
+        const coords = effectiveCoords(settings.coords);
         switch (settings.path_style) {
             .freetype => {},
             .harfbuzz => return error.Unsupported,
@@ -484,6 +539,7 @@ pub const Outlines = struct {
             self,
             &info,
             settings.size,
+            coords,
             hint_instance,
             settings.pedantic_hinting,
         );
@@ -521,6 +577,8 @@ const Scaler = struct {
     outlines: *const Outlines,
     allocator: std.mem.Allocator,
     scale: Scale26Dot6,
+    /// Effective normalized coordinates (all-zero collapsed to empty).
+    coords: []const NormalizedCoord = &.{},
     point_count: usize = 0,
     contour_count: usize = 0,
     phantom: [phantom_point_count]Point26 = .{
@@ -533,6 +591,12 @@ const Scaler = struct {
     unscaled: std.ArrayList(PointI32) = .empty,
     contours: std.ArrayList(u16) = .empty,
     flags: std.ArrayList(u8) = .empty,
+    // Variation state (`skrifa`'s `FreeTypeOutlineMemory` delta buffers). Only
+    // allocated when the face has `gvar` and coordinates are in effect.
+    deltas: std.ArrayList(gvar_mod.Point16) = .empty,
+    iup_buffer: std.ArrayList(gvar_mod.Point16) = .empty,
+    composite_deltas: std.ArrayList(gvar_mod.Point16) = .empty,
+    component_delta_count: usize = 0,
     // M3 hinting state. The interpreter buffers are only allocated when
     // `is_hinted` so unhinted draws keep the old behavior (and the old
     // allocations/leak profile).
@@ -553,6 +617,7 @@ const Scaler = struct {
         outlines: *const Outlines,
         outline: *const Outline,
         ppem: ?f32,
+        coords: []const NormalizedCoord,
         hint_instance: ?*const hint_mod.HintInstance,
         pedantic_hinting: bool,
     ) DrawError!Scaler {
@@ -563,6 +628,7 @@ const Scaler = struct {
                 outlines.computeHintedScale(ppem)
             else
                 outlines.computeScale(ppem),
+            .coords = coords,
             .hint_instance = hint_instance,
             .pedantic_hinting = pedantic_hinting,
         };
@@ -576,6 +642,18 @@ const Scaler = struct {
         try scaler.unscaled.ensureTotalCapacity(allocator, other_capacity);
         try scaler.flags.ensureTotalCapacity(allocator, outline.points + phantom_point_count);
         try scaler.contours.ensureTotalCapacity(allocator, outline.contours);
+        if (outlines.gvar != null and coords.len != 0) {
+            // Upstream allocates these whenever `gvar` exists; only their use
+            // depends on non-empty coordinates.
+            try scaler.deltas.resize(allocator, other_capacity);
+            try scaler.iup_buffer.resize(allocator, other_capacity);
+            try scaler.composite_deltas.ensureTotalCapacity(allocator, other_capacity);
+            // Upstream's early "glyph variation data is malformed" path can
+            // leave stale deltas in these buffers; zeroing keeps the behavior
+            // deterministic without changing well-formed fonts.
+            @memset(scaler.deltas.items, .{});
+            @memset(scaler.iup_buffer.items, .{});
+        }
         if (scaler.is_hinted) {
             const program = outlines.program;
             try scaler.stack.resize(allocator, program.max_stack_elements);
@@ -601,6 +679,9 @@ const Scaler = struct {
         self.unscaled.deinit(self.allocator);
         self.contours.deinit(self.allocator);
         self.flags.deinit(self.allocator);
+        self.deltas.deinit(self.allocator);
+        self.iup_buffer.deinit(self.allocator);
+        self.composite_deltas.deinit(self.allocator);
         self.stack.deinit(self.allocator);
         self.cvt.deinit(self.allocator);
         self.storage.deinit(self.allocator);
@@ -642,7 +723,7 @@ const Scaler = struct {
                 .composite => try self.loadComposite(g.composite(), gid, recurse_depth),
             }
         } else {
-            try self.loadEmpty();
+            try self.loadEmpty(gid);
         }
     }
 
@@ -666,16 +747,32 @@ const Scaler = struct {
         self.phantom[3].y = self.phantom[2].y -% vadvance;
     }
 
-    fn loadEmpty(self: *Scaler) DrawError!void {
+    fn loadEmpty(self: *Scaler, gid: GlyphId) DrawError!void {
+        // `unscaled` are the phantom points in font units (raw F26Dot6 bits).
+        var unscaled: [phantom_point_count]PointI32 = undefined;
+        for (0..phantom_point_count) |i| {
+            unscaled[i] = .{ .x = self.phantom[i].x, .y = self.phantom[i].y };
+        }
+        if (self.outlines.gvar != null and self.coords.len != 0) {
+            // `Gvar::phantom_point_deltas` for the empty-glyph case: the
+            // metrics glyph is the glyph itself with zero points.
+            const result = phantomPointDeltas(self.outlines.gvar.?, gid, self.coords);
+            if (result) |maybe_deltas| {
+                if (maybe_deltas) |deltas| {
+                    unscaled[0].x +%= gvar_mod.fixedToI32(deltas[0].x);
+                    unscaled[1].x +%= gvar_mod.fixedToI32(deltas[1].x);
+                }
+            } else |_| {}
+        }
         if (self.scale.is_scaled) {
             for (0..phantom_point_count) |i| {
-                self.phantom[i] = self.scalePoint(self.phantom[i]);
+                self.phantom[i] = self.scale.applyPoint(unscaled[i]);
             }
         } else {
             for (0..phantom_point_count) |i| {
                 self.phantom[i] = .{
-                    .x = f26FromI32(self.phantom[i].x),
-                    .y = f26FromI32(self.phantom[i].y),
+                    .x = f26FromI32(unscaled[i].x),
+                    .y = f26FromI32(unscaled[i].y),
                 };
             }
         }
@@ -683,6 +780,84 @@ const Scaler = struct {
 
     fn scalePoint(self: Scaler, point: Point26) Point26 {
         return .{ .x = self.scale.mul(point.x), .y = self.scale.mul(point.y) };
+    }
+
+    /// Port of `deltas::simple_glyph`: computes the (possibly IUP-interpolated)
+    /// 16.16 deltas for one simple glyph into `self.deltas`.
+    ///
+    /// Errors mirror the upstream fallback: a malformed glyph-data range means
+    /// "no deltas" (the caller still takes the delta application path), while a
+    /// malformed packed point/delta stream propagates and makes the caller fall
+    /// back to the plain scaler.
+    fn applySimpleDeltas(
+        self: *Scaler,
+        gvar: gvar_mod.Gvar,
+        gid: GlyphId,
+        points: []const PointI32,
+        flags: []u8,
+        contours: []const u16,
+        deltas: []gvar_mod.Point16,
+        iup: []gvar_mod.Point16,
+    ) gvar_mod.Error!void {
+        // Zero first so the malformed-glyph-data early out (which upstream
+        // takes without clearing its reused buffer) stays deterministic.
+        @memset(deltas, .{});
+        // Upstream's `simple_glyph` treats a malformed glyph-data range as
+        // "no deltas" and still runs the delta application path.
+        const maybe = gvar.glyphVariationData(gid) catch return;
+        const var_data = maybe orelse return;
+        var iter = var_data.activeTuples(self.coords);
+        while (iter.next()) |active| {
+            if (active.tuple.hasDeltasForAllPoints()) {
+                try active.tuple.accumulateDenseDeltas(deltas, active.scalar);
+            } else {
+                for (points, 0..) |point, i| {
+                    iup[i] = .{
+                        .x = gvar_mod.fixedFromI32(point.x),
+                        .y = gvar_mod.fixedFromI32(point.y),
+                    };
+                    flags[i] &= ~@as(u8, 0x04);
+                }
+                try active.tuple.accumulateSparseDeltas(
+                    iup[0..points.len],
+                    flags[0..points.len],
+                    active.scalar,
+                );
+                try interpolateDeltas(points, flags, contours, iup[0..points.len]);
+                for (deltas[0..points.len], iup[0..points.len], points) |*delta, out, point| {
+                    delta.* = delta.add(out.sub(.{
+                        .x = gvar_mod.fixedFromI32(point.x),
+                        .y = gvar_mod.fixedFromI32(point.y),
+                    }));
+                }
+            }
+        }
+    }
+
+    /// Port of `deltas::composite_glyph`: accumulates per-component and
+    /// phantom-point deltas into `self.composite_deltas`.
+    fn applyCompositeDeltas(
+        self: *Scaler,
+        gvar: gvar_mod.Gvar,
+        gid: GlyphId,
+        delta_base: usize,
+        count: usize,
+    ) gvar_mod.Error!void {
+        // Upstream's `compute_deltas_for_glyph` treats a malformed glyph-data
+        // range as zero deltas and still reports success.
+        const maybe = gvar.glyphVariationData(gid) catch return;
+        const var_data = maybe orelse return;
+        var iter = var_data.activeTuples(self.coords);
+        while (iter.next()) |active| {
+            var delta_iter = active.tuple.deltas(true);
+            while (delta_iter.next()) |delta| {
+                const ix: usize = delta.position;
+                if (ix >= count) continue;
+                const slot = &self.composite_deltas.items[delta_base + ix];
+                slot.x +%= gvar_mod.fixedMul(gvar_mod.fixedFromI32(delta.x), active.scalar);
+                slot.y +%= gvar_mod.fixedMul(gvar_mod.fixedFromI32(delta.y), active.scalar);
+            }
+        }
     }
 
     fn loadSimple(self: *Scaler, glyph: raw.SimpleGlyph, gid: GlyphId) DrawError!void {
@@ -724,14 +899,79 @@ const Scaler = struct {
             unscaled[phantom_start + i] = .{ .x = self.phantom[i].x, .y = self.phantom[i].y };
         }
 
-        if (self.scale.is_scaled) {
-            for (unscaled, 0..) |point, ix| {
-                self.scaled.items[points_start + ix] = .{
-                    .x = self.scale.apply(point.x),
-                    .y = self.scale.apply(point.y),
+        const local_len = point_count + phantom_point_count;
+        const flags_local = self.flags.items[points_start..points_end];
+        const contours_local =
+            self.contours.items[self.contour_count - contour_count .. self.contour_count];
+        var have_deltas = false;
+        if (self.outlines.gvar) |gvar| {
+            if (self.coords.len != 0) {
+                have_deltas = true;
+                self.applySimpleDeltas(
+                    gvar,
+                    gid,
+                    unscaled,
+                    flags_local,
+                    contours_local,
+                    self.deltas.items[0..local_len],
+                    self.iup_buffer.items[0..local_len],
+                ) catch {
+                    // Upstream ignores malformed tuple bodies and draws the
+                    // plain outline instead of failing the glyph.
+                    have_deltas = false;
                 };
             }
+        }
+
+        if (self.scale.is_scaled) {
+            if (have_deltas) {
+                for (self.scaled.items[points_start..points_end], unscaled, self.deltas.items[0..local_len]) |*point, un, delta| {
+                    const sum = Point26{
+                        .x = f26FromI32(un.x) +% fixedToF26Dot6(delta.x),
+                        .y = f26FromI32(un.y) +% fixedToF26Dot6(delta.y),
+                    };
+                    const scaled = self.scale.mulPoint(sum);
+                    // `F26Dot6::from_bits(v.to_i32())`: the computed scale
+                    // factor has an i32 -> 26.6 conversion built in, and
+                    // `to_i32` undoes the extra shift.
+                    point.* = .{ .x = f26ToI32(scaled.x), .y = f26ToI32(scaled.y) };
+                }
+                // FreeType applies different rounding to HVAR deltas; mimic
+                // that for phantom-point deltas when an HVAR table is present.
+                if (self.outlines.has_hvar) {
+                    for (self.scaled.items[points_start + phantom_start .. points_end], unscaled[phantom_start..], self.deltas.items[phantom_start..local_len]) |*point, un, delta| {
+                        const sum = Point26{
+                            .x = f26FromI32(un.x) +% f26FromI32(gvar_mod.fixedToI32(delta.x)),
+                            .y = f26FromI32(un.y) +% f26FromI32(gvar_mod.fixedToI32(delta.y)),
+                        };
+                        const scaled = self.scale.mulPoint(sum);
+                        point.* = .{ .x = f26ToI32(scaled.x), .y = f26ToI32(scaled.y) };
+                    }
+                }
+                if (self.is_hinted) {
+                    // For hinting, adjust the unscaled points as well: deltas
+                    // are rounded to integers.
+                    for (unscaled, self.deltas.items[0..local_len]) |*un, delta| {
+                        un.x +%= gvar_mod.fixedToI32(delta.x);
+                        un.y +%= gvar_mod.fixedToI32(delta.y);
+                    }
+                }
+            } else {
+                for (unscaled, 0..) |point, ix| {
+                    self.scaled.items[points_start + ix] = .{
+                        .x = self.scale.apply(point.x),
+                        .y = self.scale.apply(point.y),
+                    };
+                }
+            }
         } else {
+            if (have_deltas) {
+                // Round off deltas for unscaled outlines.
+                for (unscaled, self.deltas.items[0..local_len]) |*un, delta| {
+                    un.x +%= gvar_mod.fixedToI32(delta.x);
+                    un.y +%= gvar_mod.fixedToI32(delta.y);
+                }
+            }
             for (unscaled, 0..) |point, ix| {
                 self.scaled.items[points_start + ix] = .{
                     .x = f26FromI32(point.x),
@@ -749,12 +989,8 @@ const Scaler = struct {
         const instructions = glyph.instructions();
         if (self.is_hinted) {
             const hinter = self.hint_instance.?;
-            const contours_local =
-                self.contours.items[self.contour_count - contour_count .. self.contour_count];
             if (instructions.len != 0) {
-                const local_len = point_count + phantom_point_count;
                 const scaled = self.scaled.items[points_start..points_end];
-                const flags = self.flags.items[points_start..points_end];
                 @memcpy(self.original_scaled.items[0..local_len], scaled);
                 for (scaled[phantom_start..]) |*point| {
                     point.x = roundF26Point(point.x);
@@ -765,7 +1001,7 @@ const Scaler = struct {
                     .unscaled = unscaled,
                     .scaled = scaled,
                     .original_scaled = self.original_scaled.items[0..local_len],
-                    .flags = flags,
+                    .flags = flags_local,
                     .contours = contours_local,
                     .phantom = self.phantom[0..],
                     .bytecode = instructions,
@@ -776,7 +1012,7 @@ const Scaler = struct {
                     .twilight_original_scaled = self.twilight_original.items,
                     .twilight_flags = self.twilight_flags.items,
                     .is_composite = false,
-                    .coords = &.{},
+                    .coords = self.coords,
                 };
                 try self.runHint(&input);
             } else if (!hinter.backwardCompatibility()) {
@@ -802,6 +1038,32 @@ const Scaler = struct {
     ) DrawError!void {
         const point_base = self.point_count;
         const contour_base = self.contour_count;
+        // Per-component deltas are computed before scaling the phantom points.
+        // Composite glyphs can nest, so the deltas live on a stack.
+        var have_deltas = false;
+        const delta_base = self.component_delta_count;
+        if (self.outlines.gvar) |gvar| {
+            if (self.coords.len != 0) {
+                const count = glyph.countAndInstructions().count + phantom_point_count;
+                try self.composite_deltas.resize(self.allocator, delta_base + count);
+                @memset(self.composite_deltas.items[delta_base .. delta_base + count], .{});
+                have_deltas = true;
+                self.applyCompositeDeltas(gvar, gid, delta_base, count) catch {
+                    // Upstream ignores malformed tuple bodies (`is_ok()`).
+                    have_deltas = false;
+                };
+                if (have_deltas) {
+                    // Apply the trailing four deltas to the phantom points.
+                    var phantom_ix: usize = 0;
+                    while (phantom_ix < phantom_point_count) : (phantom_ix += 1) {
+                        const delta = self.composite_deltas.items[delta_base + count - phantom_point_count + phantom_ix];
+                        self.phantom[phantom_ix].x +%= gvar_mod.fixedToI32(delta.x);
+                        self.phantom[phantom_ix].y +%= gvar_mod.fixedToI32(delta.y);
+                    }
+                }
+                self.component_delta_count += count;
+            }
+        }
         if (self.scale.is_scaled) {
             for (0..phantom_point_count) |i| {
                 self.phantom[i] = self.scalePoint(self.phantom[i]);
@@ -815,8 +1077,9 @@ const Scaler = struct {
             }
         }
 
+        var component_ix: usize = 0;
         var it = glyph.componentIterator();
-        while (it.next()) |component| {
+        while (it.next()) |component| : (component_ix += 1) {
             const saved_phantom = self.phantom;
             const start_point = self.point_count;
             const component_glyph = try self.outlines.getGlyph(component.glyph);
@@ -863,6 +1126,13 @@ const Scaler = struct {
                         x = fixedMul(x, hypotFixed(xx, xy));
                         y = fixedMul(y, hypotFixed(yy, yx));
                     }
+                    if (have_deltas) {
+                        // For composite glyphs, FreeType rounds off the
+                        // fractional parts of the component deltas.
+                        const delta = self.composite_deltas.items[delta_base + component_ix];
+                        x +%= gvar_mod.fixedToI32(delta.x);
+                        y +%= gvar_mod.fixedToI32(delta.y);
+                    }
                     if (self.scale.is_scaled) {
                         var scaled_offset = Point26{
                             .x = self.scale.apply(x),
@@ -901,6 +1171,9 @@ const Scaler = struct {
                     point.y +%= anchor_offset.y;
                 }
             }
+        }
+        if (have_deltas) {
+            self.component_delta_count = delta_base;
         }
         // Composite glyph programs run over the accumulated component points
         // plus the phantom points; `unscaled` and `original_scaled` are copies
@@ -954,7 +1227,7 @@ const Scaler = struct {
                     .twilight_original_scaled = self.twilight_original.items,
                     .twilight_flags = self.twilight_flags.items,
                     .is_composite = true,
-                    .coords = &.{},
+                    .coords = self.coords,
                 };
                 try self.runHint(&input);
                 if (point_base != 0) {
@@ -965,6 +1238,178 @@ const Scaler = struct {
         }
     }
 };
+
+/// Port of `deltas::phantom_point_deltas` for the empty-glyph case (the
+/// metrics source is the glyph itself with zero points).
+fn phantomPointDeltas(
+    gvar: gvar_mod.Gvar,
+    gid: GlyphId,
+    coords: []const NormalizedCoord,
+) gvar_mod.Error!?[phantom_point_count]gvar_mod.Point16 {
+    const var_data = (try gvar.glyphVariationData(gid)) orelse return null;
+    var result = [_]gvar_mod.Point16{ .{}, .{}, .{}, .{} };
+    var iter = var_data.activeTuples(coords);
+    while (iter.next()) |active| {
+        var delta_iter = active.tuple.deltas(true);
+        while (delta_iter.next()) |delta| {
+            const ix: usize = delta.position;
+            if (ix >= phantom_point_count) continue;
+            result[ix] = result[ix].add(.{
+                .x = gvar_mod.fixedMul(gvar_mod.fixedFromI32(delta.x), active.scalar),
+                .y = gvar_mod.fixedMul(gvar_mod.fixedFromI32(delta.y), active.scalar),
+            });
+        }
+    }
+    return result;
+}
+
+/// `deltas::interpolate_deltas`: IUP-style interpolation of unreferenced
+/// deltas, modeled after FreeType's `ttgxvar.c`.
+fn interpolateDeltas(
+    points: []const PointI32,
+    flags: []const u8,
+    contours: []const u16,
+    out: []gvar_mod.Point16,
+) gvar_mod.Error!void {
+    const has_delta: u8 = 0x04;
+    var point_ix: usize = 0;
+    for (contours) |end_pt| {
+        const end_point_ix: usize = end_pt;
+        if (end_point_ix >= points.len or end_point_ix >= flags.len or end_point_ix >= out.len) {
+            return error.OutOfBounds;
+        }
+        const first_point_ix = point_ix;
+        while (point_ix <= end_point_ix and (flags[point_ix] & has_delta) == 0) {
+            point_ix += 1;
+        }
+        if (point_ix > end_point_ix) continue;
+        const first_delta_ix = point_ix;
+        var cur_delta_ix = point_ix;
+        point_ix += 1;
+        while (point_ix <= end_point_ix) : (point_ix += 1) {
+            if ((flags[point_ix] & has_delta) != 0) {
+                try jigglerInterpolate(
+                    points,
+                    out,
+                    cur_delta_ix + 1,
+                    point_ix - 1,
+                    cur_delta_ix,
+                    point_ix,
+                );
+                cur_delta_ix = point_ix;
+            }
+        }
+        if (cur_delta_ix == first_delta_ix) {
+            try jigglerShift(points, out, first_point_ix, end_point_ix, cur_delta_ix);
+        } else {
+            try jigglerInterpolate(points, out, cur_delta_ix + 1, end_point_ix, cur_delta_ix, first_delta_ix);
+            if (first_delta_ix > 0) {
+                try jigglerInterpolate(points, out, first_point_ix, first_delta_ix - 1, cur_delta_ix, first_delta_ix);
+            }
+        }
+    }
+}
+
+/// `Jiggler::shift`: shifts a range by the delta of a reference point.
+fn jigglerShift(
+    points: []const PointI32,
+    out: []gvar_mod.Point16,
+    start: usize,
+    end: usize,
+    ref_ix: usize,
+) gvar_mod.Error!void {
+    if (ref_ix >= points.len or ref_ix >= out.len) return error.OutOfBounds;
+    if (start > ref_ix) return error.OutOfBounds;
+    if (end >= out.len) return error.OutOfBounds;
+    const ref_in = gvar_mod.Point16{
+        .x = gvar_mod.fixedFromI32(points[ref_ix].x),
+        .y = gvar_mod.fixedFromI32(points[ref_ix].y),
+    };
+    const delta = out[ref_ix].sub(ref_in);
+    if (delta.x == 0 and delta.y == 0) return;
+    for (out[start..ref_ix]) |*point| point.* = point.add(delta);
+    if (ref_ix + 1 <= end) {
+        for (out[ref_ix + 1 .. end + 1]) |*point| point.* = point.add(delta);
+    }
+}
+
+/// `Jiggler::interpolate` over the x and y coordinates.
+fn jigglerInterpolate(
+    points: []const PointI32,
+    out: []gvar_mod.Point16,
+    start: usize,
+    end: usize,
+    ref1_ix: usize,
+    ref2_ix: usize,
+) gvar_mod.Error!void {
+    if (start > end) return;
+    if (end >= points.len or end >= out.len) return error.OutOfBounds;
+    try jigglerInterpolateCoord(.x, points, out, start, end, ref1_ix, ref2_ix);
+    try jigglerInterpolateCoord(.y, points, out, start, end, ref1_ix, ref2_ix);}
+
+/// Coordinate axis for the IUP jiggler (`x`/`y` share one algorithm).
+const JigglerAxis = enum { x, y };
+
+fn pointCoord(point: PointI32, axis: JigglerAxis) i32 {
+    return switch (axis) {
+        .x => point.x,
+        .y => point.y,
+    };
+}
+
+fn setPoint16Coord(point: *gvar_mod.Point16, axis: JigglerAxis, value: i32) void {
+    switch (axis) {
+        .x => point.x = value,
+        .y => point.y = value,
+    }
+}
+
+fn jigglerInterpolateCoord(
+    axis: JigglerAxis,
+    points: []const PointI32,
+    out: []gvar_mod.Point16,
+    start: usize,
+    end: usize,
+    ref1_ix: usize,
+    ref2_ix: usize,
+) gvar_mod.Error!void {
+    var r1 = ref1_ix;
+    var r2 = ref2_ix;
+    if (r1 >= points.len or r2 >= points.len or r1 >= out.len or r2 >= out.len) {
+        return error.OutOfBounds;
+    }
+    if (pointCoord(points[r1], axis) > pointCoord(points[r2], axis)) {
+        const tmp = r1;
+        r1 = r2;
+        r2 = tmp;
+    }
+    const in1 = gvar_mod.fixedFromI32(pointCoord(points[r1], axis));
+    const in2 = gvar_mod.fixedFromI32(pointCoord(points[r2], axis));
+    const out1 = switch (axis) {
+        .x => out[r1].x,
+        .y => out[r1].y,
+    };
+    const out2 = switch (axis) {
+        .x => out[r2].x,
+        .y => out[r2].y,
+    };
+    if (in1 != in2 or out1 == out2) {
+        const scale = if (in1 != in2) fixedDiv(out2 -% out1, in2 -% in1) else 0;
+        const d1 = out1 -% in1;
+        const d2 = out2 -% in2;
+        var i = start;
+        while (i <= end) : (i += 1) {
+            const value = gvar_mod.fixedFromI32(pointCoord(points[i], axis));
+            const result: i32 = if (value <= in1)
+                value +% d1
+            else if (value >= in2)
+                value +% d2
+            else
+                out1 +% fixedMul(value -% in1, scale);
+            setPoint16Coord(&out[i], axis, result);
+        }
+    }
+}
 
 fn fixedFromF2Dot14(value: i16) i32 {
     return @as(i32, value) * 4;
@@ -1323,10 +1768,19 @@ test "unsupported inputs fail with typed errors" {
     const outlines = try font.outlines();
     var pen = pen_mod.PathElementPen.init(std.testing.allocator);
     defer pen.deinit();
-    try std.testing.expectError(
-        error.Unsupported,
-        outlines.draw(std.testing.allocator, 37, .{ .size = 16.0, .coords = &.{0} }, &pen),
+    // Roboto has no `gvar`: non-empty coordinates are a no-op (upstream's
+    // `outlines.gvar.is_none()` short-circuit), not an error.
+    const plain = try outlines.draw(std.testing.allocator, 37, .{ .size = 16.0 }, &pen);
+    pen.clearRetainingCapacity();
+    const varied = try outlines.draw(
+        std.testing.allocator,
+        37,
+        .{ .size = 16.0, .coords = &.{0} },
+        &pen,
     );
+    try std.testing.expectEqual(plain.lsb, varied.lsb);
+    try std.testing.expectEqual(plain.advance_width, varied.advance_width);
+    try std.testing.expect(pen.elements.items.len > 0);
     try std.testing.expectError(
         error.Unsupported,
         outlines.draw(

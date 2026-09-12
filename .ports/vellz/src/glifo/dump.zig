@@ -24,6 +24,9 @@ fn optF32Hex(value: ?f32, buf: *[8]u8) []const u8 {
 ///
 /// `hint` runs the TrueType interpreter (`glifo`'s `HintingOptions`) instead
 /// of the unhinted scaler and emits the extra `hint 1` marker line.
+/// Non-empty `coords` are normalized F2Dot14 values and emit a
+/// `coords <n> <value...>` line so a coordinate-conversion mismatch is
+/// visible in the diff as well as in the outlines.
 pub fn writeGlyphDump(
     writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
@@ -31,17 +34,28 @@ pub fn writeGlyphDump(
     font_index: u32,
     size: f32,
     hint: bool,
+    coords: []const font_mod.NormalizedCoord,
     gids: []const u32,
 ) Error!void {
     try writer.print("vellz-glyph-dump v1\n", .{});
     try writer.print("face {d}\n", .{font_index});
     try writer.print("size {x:0>8}\n", .{@as(u32, @bitCast(size))});
     if (hint) try writer.print("hint 1\n", .{});
+    if (coords.len != 0) {
+        try writer.print("coords {d}", .{coords.len});
+        for (coords) |coord| try writer.print(" {d}", .{coord});
+        try writer.print("\n", .{});
+    }
 
     var instance: ?glyf.HintInstance = null;
     defer if (instance) |*inst| inst.deinit();
     if (hint) {
-        instance = try outlines.createHintInstance(allocator, size, glyf.glifo_hint_target);
+        instance = try outlines.createHintInstance(
+            allocator,
+            size,
+            coords,
+            glyf.glifo_hint_target,
+        );
     }
 
     var pen = pen_mod.PathElementPen.init(allocator);
@@ -50,6 +64,7 @@ pub fn writeGlyphDump(
         pen.clearRetainingCapacity();
         const metrics = try outlines.draw(allocator, gid, .{
             .size = size,
+            .coords = coords,
             .hint_instance = if (instance) |*inst| inst else null,
         }, &pen);
         var lsb_buf: [8]u8 = undefined;
@@ -143,6 +158,7 @@ fn fontBlob(font_id: u8) ![]const u8 {
         manifest.font_roboto => try fixture.roboto(),
         manifest.font_noto => try fixture.notoColor(),
         manifest.font_noto_cbtf => try fixture.notoCbtf(),
+        manifest.font_inconsolata => try fixture.inconsolata(),
         else => error.TestUnexpectedResult,
     };
 }
@@ -164,6 +180,7 @@ fn dumpGlyphVector(allocator: std.mem.Allocator, vector: manifest.GlyphVector) !
         0,
         @bitCast(vector.size_bits),
         vector.hint,
+        vector.coords,
         gids.items,
     );
     return allocating.toOwnedSlice();

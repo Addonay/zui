@@ -81,6 +81,9 @@ pub const FontData = font.FontData;
 pub const Font = font.Font;
 pub const GlyphId = font.GlyphId;
 pub const NormalizedCoord = font.NormalizedCoord;
+/// `F2Dot14::from_f32` (round half away from zero, saturating): the same
+/// conversion the oracle applies to `--coords` values.
+pub const f2dot14FromF32 = font.f2dot14FromF32;
 pub const Charmap = font.Charmap;
 
 pub const Outlines = glyf.Outlines;

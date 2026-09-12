@@ -5,12 +5,16 @@
 //! (`MAX_ENTRY_AGE = 64`, `PRUNE_FREQUENCY = 64`,
 //! `CACHED_COUNT_THRESHOLD = 256`, `MAX_FREE_LIST_SIZE = 128`).
 //!
+//! Variable fonts use upstream's two-level map: an empty coordinate slice goes
+//! to `static_map`, anything else to `variable_map[coords]`. The partition key
+//! is the *raw* slice (all-zero coordinates still get a variable entry, exactly
+//! like `OutlineCacheSession` upstream), while `skrifa` collapses all-zero
+//! coordinates to "no variation" when drawing through `effective_coords`.
+//!
 //! Ownership: entries own heap-allocated `BezPath`s and hand out borrowed
 //! pointers (`CachedOutline.path`). A borrowed path is valid until the next
 //! `maintain`, `clear` or `deinit` that evicts it; callers must not hold it
-//! across frames. Variable-font coordinate maps (`variable_map` upstream) are
-//! not implemented because non-empty coordinates are `error.Unsupported`;
-//! the key still carries the `hint`/embolden fields for API parity.
+//! across frames.
 //!
 //! Divergence from upstream (documented per plan.md §3): upstream holds
 //! `Arc<BezPath>` and only recycles uniquely-owned paths through its free
@@ -70,7 +74,9 @@ pub const FontEmbolden = struct {
 };
 
 /// Cache key; field-for-field the upstream `OutlineKey` (u32 bit patterns for
-/// every float and the packed join discriminant).
+/// every float and the packed join discriminant). Variation coordinates are
+/// deliberately absent: the two-level map partitions by them, matching
+/// upstream.
 pub const OutlineKey = struct {
     font_id: u64,
     font_index: u32,
@@ -115,6 +121,31 @@ const OutlineMap = std.HashMapUnmanaged(
     std.hash_map.default_max_load_percentage,
 );
 
+/// Owned variation-coordinate key for the second-level map. Lookups use a
+/// borrowed slice with the same content hash, so `get` never allocates.
+pub const VarKey = struct {
+    coords: []const NormalizedCoord,
+};
+
+const VarContext = struct {
+    pub fn hash(_: VarContext, key: VarKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.sliceAsBytes(key.coords));
+        return h.final();
+    }
+
+    pub fn eql(_: VarContext, a: VarKey, b: VarKey) bool {
+        return std.mem.eql(NormalizedCoord, a.coords, b.coords);
+    }
+};
+
+const VariableMap = std.HashMapUnmanaged(
+    VarKey,
+    *OutlineMap,
+    VarContext,
+    std.hash_map.default_max_load_percentage,
+);
+
 const OutlineEntry = struct {
     path: *kurbo.BezPath,
     bbox: kurbo.Rect,
@@ -140,6 +171,7 @@ const max_free_list_size: usize = 128;
 pub const OutlineCache = struct {
     free_list: std.ArrayList(*kurbo.BezPath) = .empty,
     static_map: OutlineMap = .empty,
+    variable_map: VariableMap = .empty,
     cached_count: usize = 0,
     serial: u32 = 0,
     last_prune_serial: u32 = 0,
@@ -147,9 +179,10 @@ pub const OutlineCache = struct {
     /// Looks up, or draws and stores, the outline for `gid`.
     ///
     /// `hint_instance` runs the TrueType interpreter (configured for `size`)
-    /// and makes the cache key hint-distinct; `null` draws unhinted. Rejects
-    /// the remaining deferred inputs with `error.Unsupported`: non-empty
-    /// variation coordinates and non-default embolden.
+    /// and makes the cache key hint-distinct; `null` draws unhinted. Non-empty
+    /// `coords` on a font without variation tables are a no-op (they only
+    /// select the variable map), matching upstream. Non-default embolden is
+    /// still `error.Unsupported`.
     pub fn getOrInsert(
         self: *OutlineCache,
         allocator: std.mem.Allocator,
@@ -161,7 +194,6 @@ pub const OutlineCache = struct {
         coords: []const NormalizedCoord,
         hint_instance: ?*const glyf.HintInstance,
     ) glyf.DrawError!CachedOutline {
-        if (coords.len != 0) return error.Unsupported;
         if (!embolden.isDefault()) return error.Unsupported;
 
         const key = OutlineKey{
@@ -176,7 +208,52 @@ pub const OutlineCache = struct {
             .embolden_tolerance_bits = @bitCast(@as(f32, @floatCast(embolden.tolerance))),
             .hint = hint_instance != null,
         };
-        if (self.static_map.getPtr(key)) |entry_ptr| {
+        if (coords.len == 0) {
+            return self.mapGetOrInsert(
+                allocator,
+                &self.static_map,
+                key,
+                outlines,
+                gid,
+                size,
+                coords,
+                hint_instance,
+            );
+        }
+        const lookup = VarKey{ .coords = coords };
+        const map = if (self.variable_map.getPtr(lookup)) |existing| existing.* else blk: {
+            const owned = try allocator.dupe(NormalizedCoord, coords);
+            errdefer allocator.free(owned);
+            const created = try allocator.create(OutlineMap);
+            created.* = .empty;
+            errdefer allocator.destroy(created);
+            try self.variable_map.put(allocator, .{ .coords = owned }, created);
+            break :blk created;
+        };
+        return self.mapGetOrInsert(
+            allocator,
+            map,
+            key,
+            outlines,
+            gid,
+            size,
+            coords,
+            hint_instance,
+        );
+    }
+
+    fn mapGetOrInsert(
+        self: *OutlineCache,
+        allocator: std.mem.Allocator,
+        map: *OutlineMap,
+        key: OutlineKey,
+        outlines: *const glyf.Outlines,
+        gid: GlyphId,
+        size: f32,
+        coords: []const NormalizedCoord,
+        hint_instance: ?*const glyf.HintInstance,
+    ) glyf.DrawError!CachedOutline {
+        if (map.getPtr(key)) |entry_ptr| {
             const entry = entry_ptr.*;
             entry.serial = self.serial;
             return .{ .path = entry.path, .bbox = entry.bbox };
@@ -195,6 +272,7 @@ pub const OutlineCache = struct {
         var path_pen = pen_mod.PathPen.init(allocator, path);
         const metrics = try outlines.draw(allocator, gid, .{
             .size = size,
+            .coords = coords,
             .hint_instance = hint_instance,
         }, &path_pen);
         _ = metrics;
@@ -202,7 +280,7 @@ pub const OutlineCache = struct {
         const entry = try allocator.create(OutlineEntry);
         errdefer allocator.destroy(entry);
         entry.* = .{ .path = path, .bbox = bbox, .serial = self.serial };
-        try self.static_map.put(allocator, key, entry);
+        try map.put(allocator, key, entry);
         self.cached_count += 1;
         return .{ .path = path, .bbox = bbox };
     }
@@ -222,6 +300,9 @@ pub const OutlineCache = struct {
 
         var expired: std.ArrayList(OutlineKey) = .empty;
         defer expired.deinit(allocator);
+        var expired_var: std.ArrayList(VarKey) = .empty;
+        defer expired_var.deinit(allocator);
+
         var iterator = self.static_map.iterator();
         while (iterator.next()) |map_entry| {
             const entry = map_entry.value_ptr.*;
@@ -235,19 +316,58 @@ pub const OutlineCache = struct {
         }
         for (expired.items) |key| {
             const entry = self.static_map.fetchRemove(key).?.value;
-            if (self.free_list.items.len < max_free_list_size) {
-                entry.path.truncate(0);
-                self.free_list.append(allocator, entry.path) catch {
-                    entry.path.deinit(allocator);
-                    allocator.destroy(entry.path);
-                };
-            } else {
+            self.recycle(allocator, entry);
+        }
+
+        var var_iterator = self.variable_map.iterator();
+        while (var_iterator.next()) |outer| {
+            const map = outer.value_ptr.*;
+            var inner_iterator = map.iterator();
+            while (inner_iterator.next()) |map_entry| {
+                const entry = map_entry.value_ptr.*;
+                if (self.serial -% entry.serial > max_entry_age) {
+                    expired_var.append(allocator, outer.key_ptr.*) catch break;
+                    break;
+                }
+            }
+        }
+        for (expired_var.items) |var_key| {
+            const map = self.variable_map.get(var_key) orelse continue;
+            var inner_iterator = map.iterator();
+            var remove_keys: std.ArrayList(OutlineKey) = .empty;
+            defer remove_keys.deinit(allocator);
+            while (inner_iterator.next()) |map_entry| {
+                const entry = map_entry.value_ptr.*;
+                if (self.serial -% entry.serial > max_entry_age) {
+                    remove_keys.append(allocator, map_entry.key_ptr.*) catch break;
+                }
+            }
+            for (remove_keys.items) |key| {
+                const entry = map.fetchRemove(key).?.value;
+                self.recycle(allocator, entry);
+            }
+            if (map.count() == 0) {
+                const removed = self.variable_map.fetchRemove(var_key).?;
+                removed.value.deinit(allocator);
+                allocator.destroy(removed.value);
+                allocator.free(removed.key.coords);
+            }
+        }
+    }
+
+    fn recycle(self: *OutlineCache, allocator: std.mem.Allocator, entry: *OutlineEntry) void {
+        if (self.free_list.items.len < max_free_list_size) {
+            entry.path.truncate(0);
+            self.free_list.append(allocator, entry.path) catch {
                 entry.path.deinit(allocator);
                 allocator.destroy(entry.path);
-            }
-            allocator.destroy(entry);
-            self.cached_count -= 1;
+            };
+        } else {
+            entry.path.deinit(allocator);
+            allocator.destroy(entry.path);
         }
+        allocator.destroy(entry);
+        self.cached_count -= 1;
     }
 
     /// Drops every cached outline and the free list.
@@ -260,6 +380,21 @@ pub const OutlineCache = struct {
             allocator.destroy(entry);
         }
         self.static_map.clearRetainingCapacity();
+        var var_iterator = self.variable_map.iterator();
+        while (var_iterator.next()) |outer| {
+            const map = outer.value_ptr.*;
+            var inner_iterator = map.iterator();
+            while (inner_iterator.next()) |map_entry| {
+                const entry = map_entry.value_ptr.*;
+                entry.path.deinit(allocator);
+                allocator.destroy(entry.path);
+                allocator.destroy(entry);
+            }
+            map.deinit(allocator);
+            allocator.destroy(map);
+            allocator.free(outer.key_ptr.coords);
+        }
+        self.variable_map.clearRetainingCapacity();
         self.cached_count = 0;
         self.serial = 0;
         self.last_prune_serial = 0;
@@ -275,6 +410,7 @@ pub const OutlineCache = struct {
         self.clear(allocator);
         self.free_list.deinit(allocator);
         self.static_map.deinit(allocator);
+        self.variable_map.deinit(allocator);
         self.* = .{};
     }
 
@@ -408,6 +544,74 @@ test "outline cache evicts unused entries after max age" {
     try std.testing.expectEqual(@as(usize, 0), cache.free_list.items.len);
 }
 
+test "outline cache separates variable coordinates" {
+    const fixture = @import("test_fixture.zig");
+    const font = try font_mod.Font.init(try fixture.roboto(), 0);
+    const outlines = try font.outlines();
+    var cache = OutlineCache{};
+    defer cache.deinit(std.testing.allocator);
+    // A non-variable font ignores the coordinates (no-op), but upstream still
+    // separates the entries by the raw coordinate slice.
+    const static_entry = try cache.getOrInsert(
+        std.testing.allocator,
+        &outlines,
+        37,
+        testFontInfo(),
+        16.0,
+        .{},
+        &.{},
+        null,
+    );
+    const var_entry = try cache.getOrInsert(
+        std.testing.allocator,
+        &outlines,
+        37,
+        testFontInfo(),
+        16.0,
+        .{},
+        &.{0},
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 2), cache.cachedCount());
+    try std.testing.expectEqual(@as(usize, 1), cache.variable_map.count());
+    try std.testing.expect(static_entry.path != var_entry.path);
+    // Same coordinates reuse the variable entry.
+    const again = try cache.getOrInsert(
+        std.testing.allocator,
+        &outlines,
+        37,
+        testFontInfo(),
+        16.0,
+        .{},
+        &.{0},
+        null,
+    );
+    try std.testing.expectEqual(var_entry.path, again.path);
+    try std.testing.expectEqual(@as(usize, 2), cache.cachedCount());
+
+    // A second coordinate key adds a second outer entry.
+    _ = try cache.getOrInsert(
+        std.testing.allocator,
+        &outlines,
+        37,
+        testFontInfo(),
+        16.0,
+        .{},
+        &.{ 100, -100 },
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 2), cache.variable_map.count());
+    try std.testing.expectEqual(@as(usize, 3), cache.cachedCount());
+
+    // Eviction releases the nested maps and their owned coordinate keys.
+    var i: usize = 0;
+    while (i <= max_entry_age * 2 + 2) : (i += 1) {
+        cache.maintain(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 0), cache.cachedCount());
+    try std.testing.expectEqual(@as(usize, 0), cache.variable_map.count());
+}
+
 test "outline cache rejects unsupported inputs" {
     const fixture = @import("test_fixture.zig");
     const font = try font_mod.Font.init(try fixture.roboto(), 0);
@@ -417,6 +621,7 @@ test "outline cache rejects unsupported inputs" {
     var instance = try outlines.createHintInstance(
         std.testing.allocator,
         16.0,
+        &.{},
         glyf.glifo_hint_target,
     );
     defer instance.deinit();
@@ -431,10 +636,6 @@ test "outline cache rejects unsupported inputs" {
         &instance,
     );
     try std.testing.expect(hinted.path.elementsSlice().len > 0);
-    try std.testing.expectError(
-        error.Unsupported,
-        cache.getOrInsert(std.testing.allocator, &outlines, 37, testFontInfo(), 16.0, .{}, &.{0}, null),
-    );
     try std.testing.expectError(
         error.Unsupported,
         cache.getOrInsert(

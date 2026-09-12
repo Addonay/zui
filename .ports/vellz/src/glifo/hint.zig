@@ -8,11 +8,14 @@
 //!
 //! This module is deliberately self-contained: it does not import `glyf.zig`.
 //! The caller (the glyf scaler) supplies the font program tables through
-//! [`ProgramData`] and the per-glyph buffers through [`HintOutline`].
+//! [`ProgramData`] and the per-glyph buffers through [`HintOutline`]. `cvar`
+//! deltas are applied to the CVT during instance setup (the only variation
+//! consumer inside the interpreter); the `GETVARIATION` opcode reads the
+//! normalized coordinates passed by the scaler.
 //!
-//! Deferred with typed errors, never approximated: autohinting, CFF hinting
-//! and variation deltas (`cvar`/`gvar`). Unhandled opcodes raise
-//! `error.UnhandledOpcode` (or dispatch to user `IDEF`s, matching upstream).
+//! Deferred with typed errors, never approximated: autohinting and CFF
+//! hinting. Unhandled opcodes raise `error.UnhandledOpcode` (or dispatch to
+//! user `IDEF`s, matching upstream).
 
 const std = @import("std");
 
@@ -1387,6 +1390,12 @@ fn readBeI16(data: []const u8, offset: usize) i16 {
     return @bitCast((hi << 8) | lo);
 }
 
+/// `Fixed::to_f26dot6`: `(bits + 0x200) >> 10`, wrapping add.
+fn fixedToF26Dot6(bits: i32) i32 {
+    const wrapped: i32 = @bitCast(@as(u32, @bitCast(bits)) +% 0x200);
+    return wrapped >> 10;
+}
+
 // ------------------------------------------------------------------- cvt/storage
 
 /// Copy-on-write backing store for CVT and storage.
@@ -1496,6 +1505,8 @@ pub const ProgramData = struct {
     prep: []const u8 = &.{},
     /// Raw `cvt` table bytes (big-endian i16 entries).
     cvt: []const u8 = &.{},
+    /// `cvar` deltas, applied to the scaled CVT during setup.
+    cvar: ?@import("tables/gvar.zig").Cvar = null,
     max_function_defs: u16 = 0,
     max_instruction_defs: u16 = 0,
     max_twilight_points: u16 = 0,
@@ -3047,6 +3058,9 @@ pub const HintInstance = struct {
     twilight_scaled: std.ArrayList(Point) = .empty,
     twilight_original_scaled: std.ArrayList(Point) = .empty,
     twilight_flags: std.ArrayList(u8) = .empty,
+    /// Owned copy of the normalized coordinates, used for cache-key equality
+    /// (`HintKey.coords` upstream) and `cvar` deltas during setup.
+    coords: std.ArrayList(i16) = .empty,
     graphics: RetainedGraphicsState = .{},
     axis_count: u16 = 0,
     max_stack: usize = 0,
@@ -3066,7 +3080,14 @@ pub const HintInstance = struct {
         self.twilight_scaled.deinit(self.allocator);
         self.twilight_original_scaled.deinit(self.allocator);
         self.twilight_flags.deinit(self.allocator);
+        self.coords.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// The normalized coordinates this instance was configured for
+    /// (`HintingInstance::location`).
+    pub fn location(self: *const HintInstance) []const i16 {
+        return self.coords.items;
     }
 
     /// Reconfigures this instance for a new font/size/location, running the
@@ -3082,6 +3103,8 @@ pub const HintInstance = struct {
     ) HintError!void {
         self.size = size;
         self.target = target;
+        try self.coords.resize(self.allocator, coords.len);
+        @memcpy(self.coords.items, coords);
         try self.setup(data, scale, ppem, coords, target, size);
         const twilight_count: u16 = @intCast(self.twilight_scaled.items.len);
         const twilight_contours = [1]u16{twilight_count};
@@ -3206,7 +3229,6 @@ pub const HintInstance = struct {
         target: Target,
         size: f32,
     ) HintError!void {
-        _ = coords;
         _ = size;
         self.axis_count = data.axis_count;
         self.functions.clearRetainingCapacity();
@@ -3215,13 +3237,26 @@ pub const HintInstance = struct {
         self.instructions.clearRetainingCapacity();
         try self.instructions.resize(self.allocator, data.max_instruction_defs);
         for (self.instructions.items) |*def| def.* = .{};
-        // CVT entries are converted to 26.6 on load, then scaled by the
-        // instance scale (already in 26.6 form, hence the extra shift).
+        // CVT entries are converted to 26.6 on load; `cvar` deltas (when the
+        // table exists) are accumulated in 16.16 first and converted, exactly
+        // like `HintInstance::setup`.
         const cvt_len = data.cvtLen();
         self.cvt.clearRetainingCapacity();
         try self.cvt.resize(self.allocator, cvt_len);
-        for (0..cvt_len) |i| {
-            self.cvt.items[i] = @as(i32, readBeI16(data.cvt, 2 * i)) *% 64;
+        if (data.cvar) |cvar| {
+            @memset(self.cvt.items, 0);
+            // Upstream discards malformed `cvar` errors and keeps whatever
+            // deltas were accumulated.
+            cvar.deltas(data.axis_count, coords, self.cvt.items[0..cvt_len]) catch {};
+            for (0..cvt_len) |i| {
+                const delta = fixedToF26Dot6(self.cvt.items[i]);
+                const base_value: i32 = @as(i32, readBeI16(data.cvt, 2 * i)) *% 64;
+                self.cvt.items[i] = base_value +% delta;
+            }
+        } else {
+            for (0..cvt_len) |i| {
+                self.cvt.items[i] = @as(i32, readBeI16(data.cvt, 2 * i)) *% 64;
+            }
         }
         const scale_bits = scale >> 6;
         for (self.cvt.items) |*value| {

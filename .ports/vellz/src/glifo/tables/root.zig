@@ -15,6 +15,7 @@ pub const cmap = @import("cmap.zig");
 pub const colr = @import("colr.zig");
 pub const cpal = @import("cpal.zig");
 pub const bitmap = @import("bitmap.zig");
+pub const gvar = @import("gvar.zig");
 
 pub const Head = head.Head;
 pub const Maxp = maxp.Maxp;
@@ -37,4 +38,5 @@ test {
     _ = colr;
     _ = cpal;
     _ = bitmap;
+    _ = gvar;
 }

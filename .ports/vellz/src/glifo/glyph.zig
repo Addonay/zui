@@ -280,8 +280,9 @@ pub const HintCache = struct {
         self.serial = 0;
     }
 
-    /// Returns a hinting instance configured for `(font, size)`, reusing an
-    /// exact match or reconfiguring the least-recently-used entry when full.
+    /// Returns a hinting instance configured for `(font, size, coords)`,
+    /// reusing an exact match or reconfiguring the least-recently-used entry
+    /// when full.
     pub fn get(
         self: *HintCache,
         allocator: std.mem.Allocator,
@@ -289,11 +290,13 @@ pub const HintCache = struct {
         font_index: u32,
         outlines: *const glyf.Outlines,
         size: f32,
+        coords: []const i16,
     ) Error!*const glyf.HintInstance {
         for (self.entries.items) |*entry| {
             if (entry.font_id == font_id and
                 entry.font_index == font_index and
-                entry.size == size)
+                entry.size == size and
+                std.mem.eql(i16, entry.instance.location(), coords))
             {
                 self.serial += 1;
                 entry.serial = self.serial;
@@ -317,7 +320,7 @@ pub const HintCache = struct {
                 sp.scale,
                 sp.ppem,
                 glyf.glifo_hint_target,
-                &.{},
+                coords,
                 size,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -330,7 +333,12 @@ pub const HintCache = struct {
             entry.serial = self.serial;
             return &entry.instance;
         }
-        var instance = try outlines.createHintInstance(allocator, size, glyf.glifo_hint_target);
+        var instance = try outlines.createHintInstance(
+            allocator,
+            size,
+            coords,
+            glyf.glifo_hint_target,
+        );
         errdefer instance.deinit();
         try self.entries.append(allocator, .{
             .font_id = font_id,
@@ -596,7 +604,6 @@ pub fn prepareGlyphRunWithCache(
     hint_cache: ?*HintCache,
     allocator: std.mem.Allocator,
 ) Error!PreparedGlyphRun {
-    if (run.normalized_coords.len != 0) return error.Unsupported;
     if (!run.font_embolden.isDefault()) return error.Unsupported;
 
     const full_transform = run.transform.compose(run.glyph_transform orelse kurbo.Affine.IDENTITY);
@@ -653,6 +660,7 @@ pub fn prepareGlyphRunWithCache(
                 run.font.index,
                 &hinted_outlines,
                 vertical_font_size,
+                run.normalized_coords,
             );
             // The scale has been absorbed into the font size, so remove it
             // from the skew coefficient as well: otherwise the skew would be
@@ -1880,7 +1888,7 @@ test "hinted run is rejected with Unsupported" {
     _ = allocator;
 }
 
-test "non-empty variation coordinates and embolden are rejected" {
+test "non-empty variation coordinates are accepted and embolden is rejected" {
     const font = try testFontData();
     const base: GlyphRun = .{
         .font = font,
@@ -1888,9 +1896,15 @@ test "non-empty variation coordinates and embolden are rejected" {
         .scene_paint_transform = kurbo.Affine.IDENTITY,
         .hint = false,
     };
+    // Roboto has no `gvar`, so coordinates are a no-op but must not fail.
     var with_coords = base;
     with_coords.normalized_coords = &.{0};
-    try testing.expectError(error.Unsupported, prepareGlyphRun(with_coords));
+    const prepared = try prepareGlyphRun(with_coords);
+    try testing.expectEqualSlices(
+        NormalizedCoord,
+        &.{0},
+        prepared.normalized_coords,
+    );
 
     var with_embolden = base;
     with_embolden.font_embolden = FontEmbolden.new(.{ 1.0, 0.0 });
@@ -2298,11 +2312,11 @@ test "hint cache configures, reuses and reconfigures instances" {
     var cache = HintCache{};
     defer cache.deinit(allocator);
 
-    const first = try cache.get(allocator, font_id, 0, &outlines, 16.0);
+    const first = try cache.get(allocator, font_id, 0, &outlines, 16.0, &.{});
     try testing.expect(first.isEnabled());
-    const second = try cache.get(allocator, font_id, 0, &outlines, 16.0);
+    const second = try cache.get(allocator, font_id, 0, &outlines, 16.0, &.{});
     try testing.expectEqual(first, second);
-    const other_size = try cache.get(allocator, font_id, 0, &outlines, 24.0);
+    const other_size = try cache.get(allocator, font_id, 0, &outlines, 24.0, &.{});
     try testing.expect(other_size != first);
     try testing.expectEqual(@as(usize, 2), cache.entries.items.len);
     try testing.expectEqual(@as(f32, 24.0), other_size.size);

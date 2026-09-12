@@ -21,6 +21,7 @@ const hhea_mod = @import("tables/hhea.zig");
 const hmtx_mod = @import("tables/hmtx.zig");
 const cmap_mod = @import("tables/cmap.zig");
 const bitmap_mod = @import("tables/bitmap.zig");
+const gvar_mod = @import("tables/gvar.zig");
 const glyf_mod = @import("glyf.zig");
 
 pub const Head = head_mod.Head;
@@ -36,6 +37,22 @@ pub const NOTDEF: GlyphId = 0;
 /// Normalized variation coordinate in 2.14 fixed point, matching `glifo`'s
 /// `NormalizedCoord` alias for `skrifa::instance::NormalizedCoord`.
 pub const NormalizedCoord = i16;
+
+/// Rust `f32 as i16` for the coordinate conversion: saturating, NaN maps to 0.
+fn saturatingF32ToI16(value: f32) i16 {
+    if (std.math.isNan(value)) return 0;
+    if (value >= 32768.0) return std.math.maxInt(i16);
+    if (value <= -32768.0) return std.math.minInt(i16);
+    return @intFromFloat(value);
+}
+
+/// `F2Dot14::from_f32`: `(x * 16384 + (sign ? 1 : 0) - 0.5) as i16`, the
+/// conversion upstream applies to user-facing normalized coordinates
+/// (round half away from zero, then a saturating cast).
+pub fn f2dot14FromF32(value: f32) NormalizedCoord {
+    const frac: f32 = (if (std.math.signbit(value)) @as(f32, 0.0) else @as(f32, 1.0)) - 0.5;
+    return saturatingF32ToI16(value * 16384.0 + frac);
+}
 
 pub const Error = sfnt.Error || error{
     /// The requested feature is not ported yet (CFF, bitmaps, variations).
@@ -133,6 +150,33 @@ pub const Font = struct {
     /// Embedded bitmap strikes (`sbix` > `CBDT` > `EBDT`), or an empty set.
     pub fn bitmapStrikes(self: Font) bitmap_mod.Strikes {
         return bitmap_mod.Strikes.init(self);
+    }
+
+    /// The parsed `gvar` table, or `null` when absent/malformed.
+    ///
+    /// Mirrors `FontRef::gvar().ok()`: a table shorter than the 20-byte header
+    /// (or an unparsable offset array) is treated as "no variations", not an
+    /// error, so a broken variation table never blocks static outlines.
+    pub fn gvar(self: Font) ?gvar_mod.Gvar {
+        const data = self.face.table(sfnt.tag_gvar) orelse return null;
+        return gvar_mod.Gvar.parse(data) catch null;
+    }
+
+    /// The parsed `cvar` table, or `null` when absent/malformed.
+    pub fn cvar(self: Font) ?gvar_mod.Cvar {
+        const data = self.face.table(sfnt.tag_cvar) orelse return null;
+        return gvar_mod.Cvar.parse(data) catch null;
+    }
+
+    /// True when a usable `HVAR` table is present.
+    ///
+    /// The `glyf` scaler only consults HVAR's *presence* to mirror FreeType's
+    /// different rounding of phantom-point gvar deltas; the advances
+    /// themselves come from the phantom points. Requires the 20-byte header
+    /// (`Hvar::read`'s minimum), like `FontRef::hvar().ok()`.
+    pub fn hasHvar(self: Font) bool {
+        const data = self.face.table(sfnt.tag_hvar) orelse return false;
+        return data.len >= 20;
     }
 };
 

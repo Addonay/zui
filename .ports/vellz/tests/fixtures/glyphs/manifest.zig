@@ -8,6 +8,7 @@
 pub const font_roboto: u8 = 0;
 pub const font_noto: u8 = 1;
 pub const font_noto_cbtf: u8 = 2;
+pub const font_inconsolata: u8 = 3;
 
 pub const GlyphVector = struct {
     font: u8,
@@ -15,6 +16,8 @@ pub const GlyphVector = struct {
     gid_start: u32,
     gid_end: u32,
     hint: bool,
+    /// Normalized F2Dot14 coordinates; empty for static vectors.
+    coords: []const i16 = &.{},
     elements: usize,
     coordinates: usize,
     sha256: [32]u8,
