@@ -264,7 +264,8 @@ pub const Resources = struct {
 pub fn RenderContext.glyphRun(self, resources, font) GlyphRunBuilder;
 
 // Frame protocol, same order as upstream `render_with`:
-//   beforeRender  -> replay pending atlas commands into the page pixmaps,
+//   beforeRender  -> copy pending bitmap uploads into their page pixmaps,
+//                    replay pending atlas commands into the page pixmaps,
 //                    register atlas pages in the image registry
 //   target clear  -> rasterize (image ids >= ATLAS_IMAGE_ID_BASE resolve pages)
 //   afterRender   -> maintain/evict, unregister pages, clear evicted regions
@@ -287,11 +288,14 @@ pub fn RenderContext.glyphRun(self, resources, font) GlyphRunBuilder;
   Palette-indexed and foreground colors, gradients, transforms, clip boxes and
   composite modes match upstream; `AtlasPaint::Gradient` is recorded with owned
   stops that replay/clear frees.
+- Embedded bitmaps (T5) are ported: `sbix`/`CBDT`/`EBDT` strike selection,
+  `calculate_bitmap_transform`, direct pixmap sampling and the atlas upload
+  path. `Bgra`/`Mask` payloads and PNG features outside the decoder (16-bit,
+  Adam7) fall through to the outline branch, exactly like upstream's
+  `.ok()`-filtered `Pixmap::from_png`.
 - Deferred with typed errors, never approximated: hinting interpreter/autohint
-  (an eligible hinted run fails up front), `gvar`/`HVAR` coordinates, CFF/CFF2,
-  CBDT/CBLC/sbix bitmaps and decoration. A font carrying a bitmap table
-  rejects the whole run with `error.Unsupported` instead of silently dropping a
-  glyph that could fall back to a bitmap.
+  (an eligible hinted run fails up front), `gvar`/`HVAR` coordinates, CFF/CFF2
+  and decoration.
 
 ## Error policy
 

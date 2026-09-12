@@ -550,6 +550,7 @@ fn run() -> Result<(), String> {
     match argv.first().map(String::as_str) {
         Some("--dump-glyphs") => return dump_glyphs(&argv[1..]),
         Some("--dump-cmap") => return dump_cmap(&argv[1..]),
+        Some("--dump-advances") => return dump_advances(&argv[1..]),
         _ => {}
     }
 
@@ -911,6 +912,36 @@ fn format_opt_f32(value: Option<f32>) -> String {
         Some(value) => format!("{:08x}", value.to_bits()),
         None => "none".to_string(),
     }
+}
+
+/// Advance/lsb dump companion to [`dump_glyphs`] for fonts without outlines
+/// (bitmap-only faces): `glyph_metrics(Size::new(ppem)).advance_width/lsb`.
+fn dump_advances(args: &[String]) -> Result<(), String> {
+    let parsed = parse_dump_args(args, true, "gid")?;
+    let size = parsed.size.ok_or("missing --size PPEM")?;
+    let data = std::fs::read(&parsed.font)
+        .map_err(|e| format!("reading {}: {e}", parsed.font.display()))?;
+    let font = skrifa::FontRef::from_index(&data, parsed.index)
+        .map_err(|e| format!("loading {}[{}]: {e}", parsed.font.display(), parsed.index))?;
+    let metrics = font.glyph_metrics(
+        SkrifaSize::new(size),
+        skrifa::instance::LocationRef::default(),
+    );
+    let mut out = String::new();
+    out.push_str("vellz-advance-dump v1\n");
+    out.push_str(&format!("face {}\n", parsed.index));
+    out.push_str(&format!("size {:08x}\n", size.to_bits()));
+    for gid in parsed.ids {
+        let glyph = skrifa::GlyphId::new(gid);
+        out.push_str(&format!(
+            "gid {gid} lsb {} advance {}\n",
+            format_opt_f32(metrics.left_side_bearing(glyph)),
+            format_opt_f32(metrics.advance_width(glyph)),
+        ));
+    }
+    out.push_str("end\n");
+    print!("{out}");
+    Ok(())
 }
 
 struct DumpArgs {

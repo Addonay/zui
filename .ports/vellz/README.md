@@ -29,8 +29,8 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 830/830 unit and integration tests (822 lib + 8 scene)
-zig build corpus   # 90/90 corpus scenes byte-exact vs the upstream oracle
+zig build test     # 845/845 unit and integration tests (837 lib + 8 scene)
+zig build corpus   # 95/95 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
@@ -69,7 +69,13 @@ oracle with the glyph atlas cache on and off (15 new scenes; 63/63 corpus,
 tolerance 0). T4 adds COLRv0/v1 + CPAL (paint-graph traversal, linear/radial/
 sweep gradients, transforms, clip boxes, composite modes, palette and
 foreground colors) and its 27-scene G3c corpus; all render byte-exact against
-the pinned oracle, atlas cache on and off (90/90 corpus, tolerance 0). The GPU
+the pinned oracle, atlas cache on and off (90/90 corpus, tolerance 0). T5 adds embedded
+bitmap glyphs (`CBDT`/`CBLC`, `sbix`, `EBDT`/`EBLC`), the upstream
+COLR > bitmap > outline cascade, the pending-upload atlas path, and a
+`png 0.18`-compatible PNG decoder (indexed `PLTE`+`tRNS`, filters 0–4); its
+5-scene G3d corpus (Noto CBTF colour emoji, cache on/off, stroked and
+transform-composition rows) renders byte-exact at tolerance 0, so the corpus is
+95/95. The GPU
 side has the wgpu-native device bootstrap, the full host/shader layout
 contract, the schedule/layer executor, encoded paints (gradients and images),
 GPU filters, and a 44-scene `gpu-corpus` gate (27 byte-exact, the rest within
@@ -78,7 +84,7 @@ device-loss/unsupported-capability/missing-binding/feedback-loop errors)
 running on the llvmpipe software adapter.
 
 Not yet implemented (explicit typed errors, never placeholder pixels): hinted
-outlines (the interpreter), bitmap glyphs, glyph decoration and the Cozmic
+outlines (the interpreter), glyph decoration and the Cozmic
 adapter (M3 remainder); GPU masks, atlas-backed images, GPU text, and the full
 G5 corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
 SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage

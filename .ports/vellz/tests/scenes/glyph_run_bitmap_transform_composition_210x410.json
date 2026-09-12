@@ -1,0 +1,698 @@
+{
+  "version": 1,
+  "width": 210,
+  "height": 410,
+  "settings": {
+    "mode": "quality",
+    "threads": 0,
+    "level": "fallback"
+  },
+  "target_init": "clear",
+  "commands": [
+    {
+      "op": "set_paint",
+      "rgba8": [
+        0,
+        0,
+        0,
+        255
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        16.0,
+        28.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 20.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        20.0,
+        0.0,
+        0.0,
+        20.0,
+        16.0,
+        58.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 1.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        16.0,
+        88.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 10.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        2.0,
+        0.0,
+        0.0,
+        2.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        2.0,
+        0.0,
+        0.0,
+        2.0,
+        16.0,
+        118.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 5.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        2.0,
+        0.0,
+        0.0,
+        2.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        12.0,
+        148.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 20.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        4.0,
+        0.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        4.0,
+        0.0,
+        0.0,
+        4.0,
+        12.0,
+        178.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 5.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        15.0,
+        208.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        0.5,
+        0.0,
+        0.0,
+        0.5,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        16.0,
+        238.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 20.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        0.7071067811865476,
+        0.7071067811865475,
+        -0.7071067811865475,
+        0.7071067811865476,
+        -4.142135623730951,
+        -10.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        16.0,
+        268.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 20.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        1.0,
+        0.0,
+        0.35,
+        1.0,
+        3.5,
+        0.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        16.0,
+        298.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 20.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        1.0,
+        0.2,
+        0.0,
+        1.0,
+        0.0,
+        -2.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        -1.0,
+        16.0,
+        308.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 20.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        -1.0,
+        0.0,
+        0.0,
+        1.0,
+        116.0,
+        358.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 20.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        -1.0,
+        0.0,
+        0.0,
+        -1.0,
+        116.0,
+        368.35
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 20.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ],
+      "glyph_transform": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ]
+    }
+  ]
+}

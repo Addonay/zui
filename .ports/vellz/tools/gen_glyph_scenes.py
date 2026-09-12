@@ -27,6 +27,7 @@ import subprocess
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(ROOT, "zig-out", "bin", "vellz-cli")
+ORACLE = os.path.join(ROOT, "tools", "oracle-rs", "target", "release", "vellz-oracle")
 FONT_REL = "../fixtures/upstream/Roboto-Regular.ttf"
 FONT = os.path.join(ROOT, "tests", "fixtures", "upstream", "Roboto-Regular.ttf")
 UPEM = 2048.0
@@ -93,6 +94,17 @@ def mul(a, b):
 def run_cli(args):
     return subprocess.run(
         [CLI, *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def run_oracle(args):
+    """Pinned-oracle dump used where the port has no equivalent mode."""
+    if not os.path.exists(ORACLE):
+        raise SystemExit(
+            f"missing {ORACLE}; build it with `cd tools/oracle-rs && cargo build --release`"
+        )
+    return subprocess.run(
+        [ORACLE, *args], check=True, capture_output=True, text=True
     ).stdout
 
 
@@ -631,6 +643,184 @@ def main():
     noto = Layout(NOTO_FONT, NOTO_UPEM)
     noto.prepare(["✅👀🎉🤠"])
     write_colr_scenes(noto)
+
+    # G3e bitmap scenes (M3 T5).
+    write_bitmap_scenes()
+
+
+# ------------------------------------------------------------ bitmap scenes (M3 T5)
+
+
+def _f32(value):
+    """Round `value` to the nearest f32 (Rust f32 semantics)."""
+    return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+
+
+def dump_advances_at(glyph_ids, font, size):
+    """Exact f32 advances from the oracle `--dump-advances` mode.
+
+    `--dump-glyphs` draws outlines and fails for bitmap-only fonts; the
+    advance dump only needs `hmtx` + the font's upem, exactly like
+    `layout_glyphs` uses `glyph_metrics(Size::new(size)).advance_width`.
+    """
+    text = run_oracle(
+        [
+            "--dump-advances",
+            "--font",
+            font,
+            "--size",
+            repr(float(size)),
+            "--gids",
+            ",".join(str(g) for g in sorted(set(glyph_ids))),
+        ]
+    )
+    advances = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 6 and parts[0] == "gid" and parts[2] == "lsb":
+            advances[int(parts[1])] = struct.unpack("<f", bytes.fromhex(parts[5]))[0]
+    return advances
+
+
+class BitmapLayout:
+    """Explicitly positions bitmap glyphs with exact f32 advance accumulation."""
+
+    def __init__(self, font):
+        self.font = font
+        self.cmap = dump_cmap([ord(c) for c in "✅👀🎉🤠"], font)
+        self._advances = {}
+
+    def run(self, text, size, origin_x=0.0, origin_y=0.0):
+        ids = [self.cmap[ord(c)] for c in text]
+        key = float(size)
+        if key not in self._advances:
+            self._advances[key] = dump_advances_at(ids, self.font, key)
+        advances = self._advances[key]
+        glyphs = []
+        x = _f32(origin_x)
+        y = origin_y
+        for ch in text:
+            if ch == "\n":
+                y += size
+                x = _f32(origin_x)
+                continue
+            gid = self.cmap[ord(ch)]
+            glyphs.append({"id": gid, "x": round(x, 6), "y": round(y, 6)})
+            x = _f32(x + advances[gid])
+        return glyphs
+
+
+def write_bitmap_scenes():
+    """G3e-style bitmap scenes mirroring upstream `glyphs_bitmap_noto`,
+    `glyphs_bitmap_noto_stroked` and `glyphs_transform_composition_rows_bitmap`.
+    Hinting is forced off (G3b is not ported); the bitmap branch ignores it.
+    """
+    font_rel = "../fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf"
+    font = os.path.join(
+        ROOT, "tests", "fixtures", "upstream", "NotoColorEmoji-CBTF-Subset.ttf"
+    )
+    layout = BitmapLayout(font)
+
+    fs = 50.0
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        write(
+            f"glyph_run_bitmap_noto{suffix}_250x70.json",
+            scene(
+                250,
+                70,
+                [
+                    {"op": "set_paint", "rgba8": BLACK},
+                    {"op": "set_transform", "affine": translate(0.0, fs)},
+                    glyph_run(
+                        layout.run("✅👀🎉🤠", fs),
+                        fs,
+                        atlas_cache=cache,
+                        font_rel=font_rel,
+                    ),
+                ],
+            ),
+        )
+
+    write(
+        "glyph_run_bitmap_noto_stroked_250x70.json",
+        scene(
+            250,
+            70,
+            [
+                {"op": "set_paint", "rgba8": BLACK},
+                {"op": "set_transform", "affine": translate(0.0, fs)},
+                glyph_run(
+                    layout.run("✅👀🎉🤠", fs),
+                    fs,
+                    style="stroke",
+                    font_rel=font_rel,
+                ),
+            ],
+        ),
+    )
+
+    # glyphs_transform_composition_rows_bitmap: the same 13 rows as the
+    # outline/COLR scenes, with the Noto CBTF glyphs.
+    reverse_x_shift = 100.0
+    rows = [
+        (translate(0.0, 0.0), 20.0, translate(0.0, 0.0)),
+        (scale(20.0), 1.0, translate(0.0, 0.0)),
+        (translate(0.0, 0.0), 10.0, scale(2.0)),
+        (scale(2.0), 5.0, scale(2.0)),
+        (translate(-4.0, 0.0), 20.0, translate(4.0, 0.0)),
+        (mul(translate(-4.0, 0.0), scale(4.0)), 5.0, translate(1.0, 0.0)),
+        (translate(-1.0, 0.0), 40.0, mul(scale(0.5), translate(2.0, 0.0))),
+        (
+            translate(0.0, 0.0),
+            20.0,
+            mul(translate(10.0, -10.0), mul(rotate(math.pi / 4.0), translate(-10.0, 10.0))),
+        ),
+        (
+            translate(0.0, 0.0),
+            20.0,
+            mul(translate(10.0, -10.0), mul(skew(0.35, 0.0), translate(-10.0, 10.0))),
+        ),
+        (
+            translate(0.0, 0.0),
+            20.0,
+            mul(translate(10.0, -10.0), mul(skew(0.0, 0.2), translate(-10.0, 10.0))),
+        ),
+        (mul(scale_non_uniform(1.0, -1.0), translate(0.0, 20.0)), 20.0, translate(0.0, 0.0)),
+        (
+            mul(scale_non_uniform(-1.0, 1.0), translate(-reverse_x_shift, 0.0)),
+            20.0,
+            translate(0.0, 0.0),
+        ),
+        (
+            mul(scale_non_uniform(-1.0, -1.0), translate(-reverse_x_shift, 20.0)),
+            20.0,
+            translate(0.0, 0.0),
+        ),
+    ]
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        commands = [{"op": "set_paint", "rgba8": BLACK}]
+        y = 28.35
+        for run_transform, font_size, glyph_transform in rows:
+            commands.append(
+                {"op": "set_transform", "affine": mul(translate(16.0, y), run_transform)}
+            )
+            commands.append(
+                glyph_run(
+                    layout.run("✅👀🎉🤠", font_size),
+                    font_size,
+                    atlas_cache=cache,
+                    glyph_transform=glyph_transform,
+                    font_rel=font_rel,
+                )
+            )
+            y += 30.0
+        write(
+            f"glyph_run_bitmap_transform_composition{suffix}_210x410.json",
+            scene(210, 410, commands),
+        )
+
 
 
 if __name__ == "__main__":

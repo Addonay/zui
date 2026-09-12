@@ -7,9 +7,10 @@
 //! outline pipeline needs (`head`, `maxp`, `hhea`, `hmtx`; `loca`/`glyf`/
 //! `cmap` are resolved on demand).
 //!
-//! Unsupported inputs are explicit: CFF/CFF2 outlines, bitmap-only fonts, and
-//! variable-font instances all fail with `error.Unsupported` instead of being
-//! approximated (see `.ports/vellz/docs/glifo-m3-plan.md` §2).
+//! Unsupported inputs are explicit: CFF/CFF2 outlines and variable-font
+//! instances fail with `error.Unsupported` instead of being approximated (see
+//! `.ports/vellz/docs/glifo-m3-plan.md` §2). Bitmap-only faces have no
+//! `outlines()` but expose their embedded strikes through `bitmapStrikes()`.
 
 const std = @import("std");
 

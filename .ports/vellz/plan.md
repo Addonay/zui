@@ -231,9 +231,10 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | Upstream module | Zig target | Status | Notes |
 | --- | --- | --- | --- |
 | `lib.rs`, `interface.rs` (Glyph, DrawSink, GlyphRenderer) | `glifo/root.zig`, `glifo/interface.zig` | port | comptime duck-typing contracts + `assert*` helpers |
-| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, COLR > bitmap > outline draw loop, COLR metrics; hinting/embolden/coords/bitmap/decoration -> typed `error.Unsupported` |
-| `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline/COLR fill/stroke, subpixel keys, COLR command recording, command replay, raster metrics; bitmap paths deferred |
+| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, COLR > bitmap > outline draw loop, COLR metrics, bitmap transform + decode; hinting/embolden/coords/decoration -> typed `error.Unsupported` |
+| `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline/bitmap/COLR fill/stroke, subpixel keys, COLR command recording, command replay, raster metrics, pending bitmap uploads |
 | `colr.rs` (COLR/CPAL painting) + `skrifa/src/color/*` | `glifo/colr.zig`, `glifo/tables/{colr,cpal}.zig` | port | COLRv0/v1 paint graph, gradients, transforms, clip boxes, composite modes, palette/foreground colors (M3 T4) |
+| `skrifa/src/bitmap.rs` + `read-fonts` `sbix`/`CBDT`/`CBLC`/`EBDT`/`EBLC` | `glifo/tables/bitmap.zig`, `glifo/png.zig` | port | strike selection (sbix > CBDT > EBDT, nearest strike), CBLC/EBLC index subtable formats 1–5, CBDT/EBDT record decode (PNG/BGRA/mask), sbix glyph records, png 0.18-compatible decode; 16-bit/Adam7 -> typed `error.Unsupported` (M3 T5) |
 | `atlas/*` (cache, keys, regions, commands) | `glifo/atlas/*.zig` | port | cache/eviction, fixed-seed key hashing, recorder + replay; variable-font second-level map deferred with `gvar` |
 | `util.rs` | `glifo/util.zig` | port | T2 |
 
@@ -796,6 +797,29 @@ of panics, thread ownership).
   boxes, all composite modes, cache on/off), all byte-exact at
   `--max-abs-diff 0 --max-diff-pixels 0`; corpus 90/90, `zig build test` =
   799/799 (791 lib + 8 scene), also green in ReleaseSafe.
+- 2026-09-12: **M3 T5 landed** (branch `vellz-bitmap`). Embedded bitmap
+  glyphs: `glifo/tables/bitmap.zig` ports the `skrifa 0.44` bitmap facade and
+  the `read-fonts 0.41` `sbix`/`CBDT`/`CBLC`/`EBDT`/`EBLC` subset (strike
+  selection prefers `sbix` > `CBDT` > `EBDT`, exact-then-larger-then-smaller
+  size fold, CBLC/EBLC index subtable formats 1-5, CBDT/EBDT record decode,
+  `MaskData` decode); `glifo/png.zig` ports the `png 0.18`
+  `normalize_to_color8() | ALPHA` decode path (indexed `PLTE`+`tRNS`, 8-bit
+  RGB/gray/gray-alpha, filters 0-4, CRC checks) returning straight RGBA8 for
+  `Pixmap.fromParts`; 16-bit and Adam7 are typed `error.Unsupported`.
+  `prepareGlyphRun` accepts bitmap-only faces (empty outline collection,
+  `has_outlines=false`) and the draw loop runs the upstream
+  COLR > bitmap > outline cascade with `calculate_bitmap_transform`;
+  `renderer.zig` adds direct pixmap sampling and atlas insertion via
+  `PendingBitmapUpload`, and `cpu/text.zig` copies queued uploads into the
+  atlas page at frame start. Oracle adds `--dump-advances` (bitmap-only faces
+  have no `--dump-glyphs` outlines) and the generator emits 5 bitmap G3e scenes
+  (`glyph_run_bitmap_noto*`, `..._transform_composition_*`, cache on/off,
+  mirroring `glyphs_bitmap_noto*` and
+  `glyphs_transform_composition_rows_bitmap`). Gate: all 5 scenes byte-exact
+  against the pinned oracle at `tolerance=0` -- including the
+  transform-composition rows upstream marks `cpu_u8_tolerance = 3`, so no
+  allowance is recorded -- with the atlas cache off and on; corpus 95/95,
+  `zig build test` = 845/845 (837 lib + 8 scene), `zig build glyphs` green.
 - 2026-09-12 (branch `vellz-simd`): **M4 remainder landed; G4 MET.** Added
   real SIMD backends behind the runtime `simd.Level` dispatch
   (`Level.detect`/`fromName`, `dispatch()` mirroring `fearless_simd::dispatch!`,

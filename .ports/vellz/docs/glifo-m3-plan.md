@@ -38,7 +38,7 @@ Staged-only inventory (see §5 remainder): `skrifa/outline/glyf/hint/*` (30 file
 | autohinter | **defer** | only selected for instruction-less fonts, none in the M3 fixture set → explicit error |
 | CFF/CFF2 | **defer** | Roboto/Noto/`test_glyphs-glyf_colr_1` are all `glyf` |
 | COLRv0/v1 + CPAL, `ColorPainter` traversal, brushes, composite modes | **port** | required by the milestone; glifo never hints COLR |
-| CBDT/CBLC/sbix + PNG bitmap glyphs | **defer** | PNG decode is itself deferred (plan §9); explicit error |
+| CBDT/CBLC/sbix + PNG bitmap glyphs | **port** (T5) | `sbix`/`CBDT`/`EBDT` strike selection + decode, `png 0.18`-compatible decoder; 16-bit/Adam7 -> `error.Unsupported` |
 | `FontEmbolden`/`kurbo::expand_path`/`Diagonal2` | **defer** | kurbo `expand` not ported; non-zero amount → `error.Unsupported` |
 | `metrics`/advances outside the oracle | **tooling-only adapt** | scene format carries explicit gid+x, so the core never needs shaping metrics |
 
@@ -53,7 +53,7 @@ Zig adaptations to document: trait objects become comptime duck typing; `DrawSin
 
 Cache ownership/invalidation (upstream semantics, to preserve):
 - `Resources` owns `glyph_prep_cache` (outline cache, hint cache, underline spans) and lazily `glyph_resources` (`GlyphAtlas` + `ImageCache` + a page-sized `RenderContext` + `[]Shared(Pixmap)` pages). `RenderContext` owns the scene/encoded paints only.
-- Frame protocol: `before_render` → drain pending uploads (bitmap; deferred), `replay_pending_atlas_commands` into the page renderer per page, register atlas pages; rasterize; `after_render` → `maintain`, drain evicted rects, clear page regions, unregister pages. vellz `renderWith` must call the hooks in the same order (upstream calls `before_render` before target clear).
+- Frame protocol: `before_render` → drain pending uploads (bitmap), `replay_pending_atlas_commands` into the page renderer per page, register atlas pages; rasterize; `after_render` → `maintain`, drain evicted rects, clear page regions, unregister pages. vellz `renderWith` must call the hooks in the same order (upstream calls `before_render` before target clear).
 - Key = font id, font index, glyph id, size bits, hinted, subpixel bucket (4 buckets, sentinels 4/5), packed context color, embolden bits, var coords (coords held in a second-level map, excluded from Eq/Hash). Any mutation invalidates; `clear()` drops everything; `maintain()` uses max age 64, eviction frequency 64, threshold 256; `HintCache` is a 16-entry LRU. Deterministic map type required (upstream `foldhash` fixed seed 0); Zig `AutoHashMapUnmanaged` is deterministic but its iteration/eviction order differs — pixels are unaffected (slots are disjoint and sampled at integer offsets), record as a documented divergence.
 
 ### `vello_cpu` text surface to mirror
@@ -71,7 +71,7 @@ Cache ownership/invalidation (upstream semantics, to preserve):
 
 ## 4. Tests, fixtures, staged gates
 
-Byte-exact is achievable: fixed-point 26.6 glyf scaling, `PathStyle::FreeType`, f32-scalar upstream gold (`DEFAULT_CPU_F32_TOLERANCE=0`, `diff_pixels=0`), raw `.rgba` comparison. Not achievable without extra ports: hinted outlines (interpreter), bitmap/CBDT, embolden. Upstream allows 55 `diff_pixels` for `glyphs_colr_test_glyphs`; vellz should aim exact and record the allowance only if the COLR pipeline can't close it, per the tolerance policy.
+Byte-exact is achievable: fixed-point 26.6 glyf scaling, `PathStyle::FreeType`, f32-scalar upstream gold (`DEFAULT_CPU_F32_TOLERANCE=0`, `diff_pixels=0`), raw `.rgba` comparison. Not achievable without extra ports: hinted outlines (interpreter), embolden. Upstream allows 55 `diff_pixels` for `glyphs_colr_test_glyphs`; vellz should aim exact and record the allowance only if the COLR pipeline can't close it, per the tolerance policy.
 
 Oracle/scene changes needed in `tools/oracle-rs/src/main.rs`, `tools/scene.zig`, `tools/vellz_cli.zig`, `tools/oracle-rs/README.md`:
 - new command `glyph_run`: `font{asset,index}`, `font_size`, `hint`, `glyph_transform`, `embolden`, `normalized_coords`, `atlas_cache`, `style:"fill"|"stroke"`, `glyphs:[{id,x,y}]`; optional `decoration{x_range,baseline_y,offset,size,buffer}`; assets relative to the scene dir (use `../fixtures/upstream/Roboto-Regular.ttf`).
@@ -79,7 +79,7 @@ Oracle/scene changes needed in `tools/oracle-rs/src/main.rs`, `tools/scene.zig`,
 - metadata: add `font_sha256`; keep FNV hashes; corpus gate uses the existing `tools/compare_corpus.sh`/`tools/compare_raw.py` (plan.md's `tools/compare.py` is stale naming).
 - import upstream fonts (with licenses) and pin SHA-256 in `tests/fixtures/upstream/README.md`; do not consume `vello_tests/snapshots/*.png` (Git LFS, PNG variance) — reproduce the upstream scene parameters from `vello_tests/tests/glyph.rs` as JSON and regenerate `.rgba` with the pinned oracle.
 
-Staged gates: **G3a** unhinted outline corpus (Roboto `glyphs_{filled,small,skewed,scaled,glyph_transform}_unhinted`, transform-composition rows) byte-exact with atlas cache on and off in Debug/ReleaseSafe/ReleaseFast; **G3b** hinted outline scenes after the interpreter; **G3c** COLR (Noto COLR + `colr_test_glyphs`) byte-exact; **G3d** Cozmic adapter consumes Cozmic output with a no-reshape assertion and pixel equality vs the same direct glyph list; error-path tests (CFF, bitmap, embolden, non-default coords, autohint-needed font).
+Staged gates: **G3a** unhinted outline corpus (bitmap landed as **G3e**: `glyph_run_bitmap_noto*` + `..._transform_composition_*`, byte-exact) — (Roboto `glyphs_{filled,small,skewed,scaled,glyph_transform}_unhinted`, transform-composition rows) byte-exact with atlas cache on and off in Debug/ReleaseSafe/ReleaseFast; **G3b** hinted outline scenes after the interpreter; **G3c** COLR (Noto COLR + `colr_test_glyphs`) byte-exact; **G3d** Cozmic adapter consumes Cozmic output with a no-reshape assertion and pixel equality vs the same direct glyph list; error-path tests (CFF, unsupported PNG features, embolden, non-default coords, autohint-needed font).
 
 ## 5. First five implementation tasks
 
@@ -93,7 +93,7 @@ Staged gates: **G3a** unhinted outline corpus (Roboto `glyphs_{filled,small,skew
 
 **T5 — Cozmic adapter + decoration.** Files: `src/cozmic_adapter.zig`, `src/glifo/glyph.rs→.zig` decoration, `src/kurbo/bezpath.zig` (`PathSeg.transform`), `tests/cozmic_adapter_test.zig`, `build.zig` (opt-in test). Deps: T3 (outline fill/stroke), optionally T4. Acceptance: positioned-glyph mapping is 1:1 (ids/positions, no shaping calls, asserted by a counter/probe); `renderDecoration` skip-ink spans match upstream on crafted glyphs; adapter test skips explicitly when `.ports/cozmic` is absent; `zig build test`.
 
-M3 remainder after these five: hint interpreter (`src/glifo/hint/*`, `HintCache`, staged G3b), autohint, `gvar`/variation, CFF, bitmap/PNG, embolden — each explicit `error.Unsupported` until then.
+M3 remainder after these five: hint interpreter (`src/glifo/hint/*`, `HintCache`, staged G3b), autohint, `gvar`/variation, CFF, embolden — each explicit `error.Unsupported` until then. (Bitmap/PNG landed as T5; see `plan.md`'s ledger.)
 
 ## Evidence inspected
 `plan.md` §2/§5/§9/§10/§11/§13; `README.md`; `docs/port-contracts.md`; `docs/cpu-pipeline.md`; `tests/README.md`; `tests/fixtures/upstream/README.md`; `build.zig`, `build.zig.zon`, `src/root.zig`, `src/cpu/render.zig`, `src/common/render_state.zig`, `src/common/paint.zig`, relevant `src/kurbo` APIs; `tools/{scene.zig,vellz_cli.zig,oracle-rs/src/main.rs,import_upstream_fixtures.sh}`. Upstream: all `glifo/src/*`, `vello_cpu/src/{text,text_debug,render}.rs` text paths, `vello_common/src/{multi_atlas,image_cache}.rs`, `vello_tests/tests/{glyph,util,renderer}.rs`, `vello_dev_macros/src/{test,lib}.rs`, fixture READMEs, plus registry copies of `skrifa 0.44.0`, `read-fonts 0.41.0`, `guillotiere 0.7.0`. Cozmic: `src/layout.zig`, `glyph_cache.zig`, `shape_hb.zig`, `render.zig`; ZUI `README.md` font/atlas notes and `src/fonts/{atlas,shaper}.zig`.
@@ -106,7 +106,7 @@ Port the atlas stack first, then a fixed-point-exact `glyf` outline subset with 
 - Unhinted glyf must use 26.6 `Fixed` scaling; f32 shortcuts silently break byte-exactness.
 - Hash-map iteration differences vs `foldhash` fixed-state change eviction/packing order (argued pixel-invisible; needs confirmation).
 - COLR exactness across composition layers/gradients is the least certain; upstream itself allows 55 pixels.
-- Deferrals (CFF, bitmap, embolden, variation) shrink coverage vs upstream test names.
+- Deferrals (CFF, embolden, variation, hinted outlines) shrink coverage vs upstream test names.
 
 ## Open questions
 1. Is G3 (unhinted + COLR + adapter) acceptable, or is hinted-Roboto parity required before declaring M3?

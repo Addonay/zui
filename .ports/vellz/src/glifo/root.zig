@@ -26,9 +26,10 @@
 //!   COLR > bitmap > outline draw loop; `colr` — the COLRv0/COLRv1 paint graph
 //!   traversal (`skrifa` color subset) and `ColrPainter`; `renderer` —
 //!   atlas-first fill/stroke, cached glyph sampling, COLR atlas recording and
-//!   command replay; `atlas` — `GlyphAtlas`/`GlyphCacheKey`/
-//!   `AtlasCommandRecorder`/`ImageCache`; `interface` — the comptime
-//!   `DrawSink`/`GlyphRenderer` duck-typing contracts.
+//!   command replay; `png`/`tables/bitmap.zig` — the embedded-bitmap stack
+//!   (`sbix`/`CBDT`/`EBDT` strikes, PNG decode); `atlas` — `GlyphAtlas`/
+//!   `GlyphCacheKey`/`AtlasCommandRecorder`/`ImageCache`; `interface` — the
+//!   comptime `DrawSink`/`GlyphRenderer` duck-typing contracts.
 //! - `NormalizedCoord = i16` and `FontEmbolden` — carried in cache keys for
 //!   API parity; non-default values are rejected with `error.Unsupported`.
 //! - `util` — the `glifo` float/affine predicates used by run preparation.
@@ -42,11 +43,13 @@
 //! # Deferred with typed errors
 //!
 //! Hinting (`HintingInstance`, interpreter), autohinting, `gvar`/`HVAR`/`avar`
-//! variation deltas (any non-empty coords), CFF/CFF2, CBDT/CBLC/sbix bitmaps,
-//! synthetic embolden and decoration are all `error.Unsupported`. None are
-//! approximated; fonts carrying bitmap tables reject the whole run instead of
-//! silently dropping a glyph that could fall back to a bitmap. COLRv0/COLRv1
-//! (T4) is ported, including gradients, transforms, clip boxes and composite
+//! variation deltas (any non-empty coords), CFF/CFF2, synthetic embolden and
+//! decoration are all `error.Unsupported`. None are approximated. Embedded
+//! bitmaps (`sbix`/`CBDT`/`EBDT`) are ported (T5), including the upstream
+//! COLR > bitmap > outline cascade and PNG decoding; `Bgra`/`Mask` payloads
+//! and PNG features outside the decoder (16-bit, Adam7) fall through to the
+//! outline branch exactly like upstream's `.ok()` filter. COLRv0/COLRv1 (T4)
+//! is ported, including gradients, transforms, clip boxes and composite
 //! modes.
 //!
 //! # Oracle comparison
