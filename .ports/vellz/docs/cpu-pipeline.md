@@ -198,7 +198,18 @@ buffer are dispatched through comptime `K`, never through a runtime vtable;
 ```zig
 // cpu/dispatch/mod.zig
 pub const Dispatcher = struct { ptr: *anyopaque, vtable: *const VTable, ... };
-// Single-threaded implementation first; MT added in M4 behind the same vtable.
+// Vtable methods mirror upstream's `Dispatcher` trait. `Dispatcher.create`
+// selects `single_threaded.SingleThreadedDispatcher` for `num_threads == 0`
+// and `multi_threaded.MultiThreadedDispatcher` otherwise (M4); the concrete
+// dispatcher is heap-allocated so `RenderContext` stays movable.
+
+// cpu/dispatch/multi_threaded.zig (+ multi_threaded/{task,cost,worker,sync}.zig)
+// Persistent `std.Thread` workers replace rayon; a mutex/condvar queue carries
+// `RenderTask` batches main -> worker and in-order completion slots carry
+// strips/commands back. Rasterization splits the target into disjoint strip-row
+// `Region`s claimed with an atomic cursor (row splitting as upstream). The f32
+// output is byte-identical to the single-threaded path (differential test in
+// `cpu/render.zig`).
 
 // cpu/render.zig
 pub const RenderMode = enum { optimize_speed, optimize_quality };
@@ -218,7 +229,7 @@ pub const RenderContext = struct {
     pub fn strokePath(self: *RenderContext, allocator: std.mem.Allocator, path: []const kurbo.PathEl) !void; // M2
     pub fn pushClipPath(self: *RenderContext, allocator: std.mem.Allocator, path: []const kurbo.PathEl) !void;
     pub fn popClipPath(self: *RenderContext) void;
-    pub fn flush(self: *RenderContext) void;
+    pub fn flush(self: *RenderContext) !void; // fallible for MT dispatch (upstream panics)
     pub fn renderWith(self: *RenderContext, pixmap: *common.pixmap.Pixmap, resources: *Resources, settings: RasterizerSettings) !void;
     pub fn render(self: *RenderContext, pixmap: *common.pixmap.Pixmap, resources: *Resources) !void;
     pub fn reset(self: *RenderContext) void;
@@ -233,5 +244,8 @@ pub const RenderContext = struct {
 - Unsupported upstream features (external textures, multi-primitive filter
   graphs, MT filters) return `error.Unsupported`; they are never silently
   skipped.
-- `flush` is required before `renderWith` in the MT configuration; the
-  single-threaded implementation is a no-op like upstream.
+- `flush` is required before `renderWith` in the MT configuration and returns
+  `error.NotFlushed` otherwise (upstream panics); the single-threaded
+  implementation is a no-op like upstream.
+- Multi-threaded dispatch with more than 255 threads returns
+  `error.TooManyThreads` (worker ids are `u8` upstream and silently wrap).

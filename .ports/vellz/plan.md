@@ -197,7 +197,8 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `fine/common/gradient/*` | `cpu/fine/gradient.zig` | port | connected; oracle-verified (linear/radial/sweep/repeat scenes byte-exact) |
 | `fine/common/image.rs` | `cpu/fine/image.zig` | port | connected; oracle-verified (nearest/bilinear scenes byte-exact) |
 | `dispatch/single_threaded.rs` | `cpu/dispatch/single_threaded.zig` | port | connected; comptime kernel selection (`optimize_speed` -> u8, `optimize_quality` -> f32), mirroring upstream with both pipelines enabled |
-| `dispatch/multi_threaded*.rs` | `cpu/dispatch/multi_threaded.zig` | defer | M4 |
+| `dispatch/mod.rs` (`Dispatcher`, selection) | `cpu/dispatch/mod.zig` | port | connected; vtable + `num_threads` selection |
+| `dispatch/multi_threaded*.rs` | `cpu/dispatch/multi_threaded.zig` + `multi_threaded/{task,cost,worker,sync}.zig` | conn | f32 MT byte-identical to ST on the differential scene (`render.zig`); u8/filters `error.Unsupported`; corpus stays threads=0 |
 | `filter/*` | `cpu/filter/*.zig` | port | connected; oracle-verified (8 filter scenes byte-exact); highp uses upstream's lowp blur/drop-shadow internals; multi-primitive graphs -> `error.Unsupported` |
 | `fine/common/rounded_blurred_rect.rs` | `cpu/fine/blurred_rect.zig` | port | connected; oracle-verified (normal + inverted scenes byte-exact) |
 | `text.rs`, `text_debug.rs` | `cpu/text.zig` | defer | M3 |
@@ -449,12 +450,21 @@ of panics, thread ownership).
 
 - u8 low-precision pipeline ported and connected behind
   `RenderMode.optimize_speed` (`cpu/fine/lowp/*`, dispatcher kernel selection).
+- Multi-threaded f32 dispatch ported: `dispatch/mod.zig` `Dispatcher` vtable +
+  `multi_threaded.zig` with persistent `std.Thread` workers and upstream
+  batch/cost/row splitting; output is byte-identical to the single-threaded
+  f32 path (`render.zig` differential test, threads 1–4). u8 + MT and MT
+  filter layers return typed `error.Unsupported` (upstream limitation).
 - **u8 oracle gate:** 16 `*_speed` corpus scenes byte-exact (`tolerance=0`,
   four channels) against the pinned oracle rendered with
   `RenderMode::OptimizeSpeed`; they cover the u8-native gradient LUT and
   bilinear painters, the f32 painter `paintU8` conversion (nearest/bicubic
   images, undefined radial gradients), and the integer blend/composite/mask
-  paths. The original 22 quality scenes stay byte-exact.
+  paths. All 32 quality scenes (including filters and blurred rounded rects)
+  stay byte-exact.
+- **MT equivalence:** the single- vs multi-threaded f32 output is asserted
+  byte-identical on a layered differential scene in `cpu/render.zig`; the
+  corpus itself runs with the committed scenes' `threads` setting (0).
 - **Rough timings** (ReleaseFast CLI, 200 runs each, includes ~2.4 ms process
   startup; not a methodology-complete G4 record): `fill_wave_seams_128`
   3.6 -> 2.0 ms, `fill_tile_grid_128` 4.4 -> 1.9 ms, `gradient_repeat_128`
@@ -462,8 +472,8 @@ of panics, thread ownership).
   the ported u8 painters run scalar lane loops while the f32 painters
   vectorize through `@Vector`.
 - **Remaining:** SIMD-level dispatch (the port currently pins fallback
-  semantics in `src/simd`), multithreading, per-stage measured speedups. Gate
-  G4 is not claimed until scalar/portable/SIMD agreement and timings are
+  semantics in `src/simd`), MT filters, u8 + MT, per-stage measured speedups.
+  Gate G4 is not claimed until scalar/portable/SIMD agreement and timings are
   recorded.
 
 ### Milestone 5 — Hybrid GPU implementation
@@ -590,4 +600,24 @@ of panics, thread ownership).
   `OptimizeSpeed` (`tolerance=0`, four channels); quality scenes stay
   byte-exact. Remaining: SIMD-level dispatch, multithreading, more measured
   speedups, glyphs on the u8 path.
+- 2026-09-12 (merged 2026-09-12): M4 multithreading landed. `cpu/dispatch/mod.zig`
+  owns the upstream `Dispatcher` vtable and the `num_threads` selection
+  (0 = single-threaded); `cpu/dispatch/multi_threaded.zig` + `multi_threaded/`
+  port the worker/job structure with persistent `std.Thread` workers replacing
+  rayon/crossbeam: batched `RenderTask`s with `cost.COST_THRESHOLD`, in-order
+  completion slots for recording, per-worker strip/alpha storage, and
+  strip-row `Region` splitting for fine rasterization. Zig 0.17 moved
+  `Mutex`/`Condition` behind `std.Io`; `multi_threaded/sync.zig` centralizes
+  the stateless futex-backed `global_single_threaded` instance (documented
+  adapt). `RenderContext.flush` became fallible (`error.NotFlushed` when a MT
+  render starts before flush; upstream panics). Differential test renders a
+  layered gradient/image/mask/clip/stroke scene with 0..4 threads and compares
+  all four channels byte-for-byte; upstream MT tests (`allocations`, reset /
+  drop with pending tasks, empty frame after reset, clip before draw) are
+  ported. Branch evidence: `zig build test` = 563/563 (557 unit + 6 scene),
+  `zig build corpus` = 22/22 byte-exact (corpus stays `threads: 0`,
+  single-threaded). Extra MT evidence: rewriting corpus scenes to
+  `"threads": 4` and rendering them with the CLI matches the pinned oracle
+  fixtures byte-for-byte in Debug, ReleaseSafe, and ReleaseFast. Remaining
+  for G4: native SIMD levels, MT filters, u8 + MT, and measured speedups.
 

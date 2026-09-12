@@ -8,16 +8,16 @@
 //!
 //! Scope and deferrals:
 //!
-//! - `rasterize` selects the fine kernel from `RasterizerSettings.render_mode`:
-//!   the u8 kernel (`U8Kernel`) for `optimize_speed` and the f32 kernel
-//!   (`F32Kernel`) for `optimize_quality`, mirroring upstream with both
-//!   pipeline features enabled.
 //! - Filter layers are supported: `rasterizeFilterLayers` renders every
 //!   recorded filter layer in reverse dependency order into its placement
 //!   pixmap and applies the filter, then the root pass composites the
-//!   resulting pixmaps through `filter_paints`.
-//! - Multi-threaded dispatch is M4; there is no vtable yet and this type is
-//!   used directly by `cpu/render.zig`.
+//!   resulting pixmaps through `filter_paints`. The layer contents are
+//!   rasterized with the selected kernel, as upstream's generic
+//!   `rasterize_filter_layers` does.
+//! - Multi-threaded dispatch lives in `dispatch/multi_threaded.zig`. Both
+//!   implementations are reached through the `Dispatcher` vtable in
+//!   `dispatch/mod.zig`; `RenderContext` picks between them from
+//!   `RenderSettings.num_threads`.
 //!
 //! Ownership/allocator note: the dispatcher owns the bucketer, viewport,
 //! recorder, and strip storage; every method that can grow them takes the
@@ -77,13 +77,9 @@ const TargetInit = target_mod.TargetInit(PremulColor);
 const ViewportState = viewport_mod.ViewportState;
 
 /// Per-target parameters for fine rasterization (upstream
-/// `FineRenderParams`).
-pub const FineRenderParams = struct {
-    /// Size of the scene in pixels.
-    scene_size: [2]u16,
-    /// Offset in the destination pixmap where the scene origin is placed.
-    target_offset: [2]u16,
-};
+/// `FineRenderParams`, now owned by `cpu/fine/mod.zig`; kept as an alias for
+/// existing callers).
+pub const FineRenderParams = fine_mod.FineRenderParams;
 
 /// Single-threaded implementation of the rendering dispatcher.
 pub const SingleThreadedDispatcher = struct {

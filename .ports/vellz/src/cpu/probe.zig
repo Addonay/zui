@@ -42,7 +42,7 @@ pub fn renderProbePixmap(allocator: std.mem.Allocator) !Pixmap {
         try common_probe.probeImageSource(allocator),
     );
 
-    ctx.flush();
+    try ctx.flush();
 
     var resources = render_mod.Resources.init();
     defer resources.deinit(allocator);

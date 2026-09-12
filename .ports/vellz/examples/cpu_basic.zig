@@ -57,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
     ctx.setPaint(peniko.color.palette.css.GREEN);
     try ctx.strokePath(allocator, &line);
 
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, .{
         .render_mode = .optimize_quality,
         .target_init = .{ .clear = peniko.Color.TRANSPARENT },

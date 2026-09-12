@@ -125,6 +125,19 @@ pub const TILE_HEIGHT_COMPONENTS: usize = @as(usize, TILE_HEIGHT) * COLOR_COMPON
 /// index; this port reports `MissingImage`/`InvalidPaintIndex` instead.
 pub const Error = error{ Unsupported, OutOfMemory, MissingImage, InvalidPaintIndex };
 
+/// Placement and compositing settings for fine rasterization into a target
+/// pixmap (upstream `FineRenderParams`).
+///
+/// Moved here from `cpu/dispatch/single_threaded.zig` in M4 so both the
+/// single- and multi-threaded dispatchers can share it (upstream defines it in
+/// `fine/mod.rs`).
+pub const FineRenderParams = struct {
+    /// Scene/filter dimensions before clipping to the destination pixmap.
+    scene_size: [2]u16,
+    /// Destination offset in the target pixmap.
+    target_offset: [2]u16,
+};
+
 /// Returns whether a blend mode is the upstream default (normal + src-over).
 ///
 /// Zig structs do not support `==`, so this replaces

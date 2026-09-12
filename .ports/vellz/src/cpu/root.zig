@@ -12,7 +12,11 @@
 //! - `filter.zig`      <- `filter/` (`context.rs`, `flood.rs`,
 //!   `gaussian_blur.rs`, `drop_shadow.rs`, `offset.rs`, `shift.rs`, and the
 //!   `FilterEffect` dispatch)
+//! - `dispatch/mod.zig` <- `dispatch/mod.rs` (`Dispatcher` vtable +
+//!   dispatch selection)
 //! - `dispatch/single_threaded.zig` <- `dispatch/single_threaded.rs`
+//! - `dispatch/multi_threaded.zig` + `dispatch/multi_threaded/*.zig`
+//!   <- `dispatch/multi_threaded.rs` + `dispatch/multi_threaded/{worker,cost}.rs`
 //! - `fine/`           <- `fine/` (`Fine(K)`, `rasterizeRegion`,
 //!   `highp.F32Kernel`, `lowp.U8Kernel`, `common/rounded_blurred_rect.rs`)
 //! - `render.zig`      <- `render.rs` (`RenderContext`, `Resources`, and the
@@ -26,7 +30,9 @@ pub const region = @import("region.zig");
 pub const settings = @import("settings.zig");
 pub const filter = @import("filter.zig");
 pub const coarse = @import("coarse/mod.zig");
+pub const dispatch = @import("dispatch/mod.zig");
 pub const single_threaded = @import("dispatch/single_threaded.zig");
+pub const multi_threaded = @import("dispatch/multi_threaded.zig");
 pub const fine = @import("fine/mod.zig");
 pub const render = @import("render.zig");
 pub const probe = @import("probe.zig");
@@ -57,7 +63,13 @@ test {
     _ = @import("coarse/bucketer.zig");
     _ = @import("coarse/cmd.zig");
     _ = @import("coarse/depth.zig");
+    _ = @import("dispatch/mod.zig");
     _ = @import("dispatch/single_threaded.zig");
+    _ = @import("dispatch/multi_threaded.zig");
+    _ = @import("dispatch/multi_threaded/task.zig");
+    _ = @import("dispatch/multi_threaded/cost.zig");
+    _ = @import("dispatch/multi_threaded/worker.zig");
+    _ = @import("dispatch/multi_threaded/sync.zig");
     _ = @import("fine/mod.zig");
     _ = @import("fine/blurred_rect.zig");
     _ = @import("fine/highp/mod.zig");

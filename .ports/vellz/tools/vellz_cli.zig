@@ -214,7 +214,7 @@ fn renderScene(
         }
     }
 
-    ctx.flush();
+    try ctx.flush();
     try ctx.renderWith(&pixmap, &resources, rasterizer);
 
     const pixels = pixmap.dataAsU8Slice();
