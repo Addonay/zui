@@ -15,6 +15,7 @@ root:
 """
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -200,6 +201,11 @@ def main() -> None:
     lines.append("")
 
     OUT.write_text("\n".join(lines), encoding="utf-8")
+    # Keep the generated file `zig fmt`-clean like the rest of the package.
+    try:
+        subprocess.run(["zig", "fmt", str(OUT)], check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"warning: could not run zig fmt: {exc}", file=sys.stderr)
     print(f"wrote {OUT} ({len(scripts)} scripts, {len(styles)} styles, {len(ranges)} ranges)")
 
 

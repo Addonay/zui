@@ -103,6 +103,13 @@ glyph_vectors=(
     "NotoSans-Regular.ttf 100.0 0 3883 h"
     "NotoSans-Regular.ttf 0.5 0 3883 h"
     "NotoSans-Regular.ttf 2048.0 0 3883 h"
+    # G3b autohint coverage: monospace digits exercise the fixed-width /
+    # same-width digit advance path, and Devanagari exercises the Indic
+    # script group.
+    "NotoSansMono-Regular.ttf 16.0 0 3919 h"
+    "NotoSansMono-Regular.ttf 7.0 0 3919 h"
+    "NotoSansDevanagari-Regular.ttf 16.0 0 844 h"
+    "NotoSansDevanagari-Regular.ttf 7.0 0 844 h"
 )
 
 # font filename, first codepoint, last codepoint
@@ -118,6 +125,8 @@ font_id() {
         NotoColorEmoji-Subset.ttf) echo 1 ;;
         NotoColorEmoji-CBTF-Subset.ttf) echo 2 ;;
         NotoSans-Regular.ttf) echo 3 ;;
+        NotoSansMono-Regular.ttf) echo 4 ;;
+        NotoSansDevanagari-Regular.ttf) echo 5 ;;
         *) echo "unknown font $1" >&2; exit 2 ;;
     esac
 }
@@ -215,6 +224,8 @@ if [ "$update_manifest" -eq 1 ]; then
         echo "pub const font_noto: u8 = 1;"
         echo "pub const font_noto_cbtf: u8 = 2;"
         echo "pub const font_notosans: u8 = 3;"
+        echo "pub const font_notosans_mono: u8 = 4;"
+        echo "pub const font_notosans_devanagari: u8 = 5;"
         echo ""
         echo "pub const GlyphVector = struct {"
         echo "    font: u8,"

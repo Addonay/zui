@@ -145,7 +145,7 @@ pub const SCRIPT_CLASSES: [data.SCRIPT_CLASSES.len]ScriptClass = blk: {
     for (data.SCRIPT_CLASSES, 0..) |raw, ix| {
         out[ix] = .{
             .name = raw.name,
-            .group = @enumFromInt(raw.group),
+            .group = @fromBackingInt(@intCast(raw.group)),
             .tag = raw.tag,
             .hint_top_to_bottom = raw.hint_top_to_bottom,
             .std_chars = raw.std_chars,

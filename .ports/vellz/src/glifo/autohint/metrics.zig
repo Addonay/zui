@@ -493,6 +493,12 @@ test "sort and quantize widths matches upstream" {
     try std.testing.expectEqualSlices(i32, &[_]i32{1}, single.asSlice());
 }
 
+test "generated script tables fit the fixed metric capacities" {
+    for (styles.SCRIPT_CLASSES) |script_class| {
+        try std.testing.expect(script_class.blues.len <= max_blues);
+    }
+}
+
 test "scale flags for glifo target" {
     const scale = Scale.new(16.0, 2048, false, hint.glifo_target, .default);
     try std.testing.expect(scale.flags.contains(ScaleFlags.no_horizontal));

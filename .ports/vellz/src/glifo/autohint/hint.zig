@@ -71,14 +71,14 @@ pub fn hintOutline(
         topo.linkSegments(
             outline,
             &axis,
-            scaled_metrics.axes[@intFromEnum(dim)].scale,
+            scaled_metrics.axes[@backingInt(dim)].scale,
             script_group,
-            unscaled_metrics.axes[@intFromEnum(dim)].maxWidth(),
+            unscaled_metrics.axes[@backingInt(dim)].maxWidth(),
         );
         try topo.computeEdges(
             allocator,
             &axis,
-            &scaled_metrics.axes[@intFromEnum(dim)],
+            &scaled_metrics.axes[@backingInt(dim)],
             hint_top_to_bottom,
             scaled_metrics.scale.y_scale,
             script_group,
@@ -102,7 +102,7 @@ pub fn hintOutline(
         }
         hint_edges.hintEdges(
             &axis,
-            &scaled_metrics.axes[@intFromEnum(dim)],
+            &scaled_metrics.axes[@backingInt(dim)],
             script_group,
             scaled_scale,
             hint_top_to_bottom,

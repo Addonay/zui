@@ -16,7 +16,9 @@ regenerated so tests never need a Rust toolchain or Git LFS.
 | `test_glyphs-glyf_colr_1.ttf` | `assets/colr_test_glyphs/test_glyphs-glyf_colr_1.ttf` | Apache-2.0; see `colr_test_glyphs-LICENSE.txt`. The upstream COLRv1 test font ("Font is taken from https://github.com/googlefonts/color-fonts"): COLRv0 glyphs 168..175 plus a COLRv1 paint graph exercising layers, solids, linear/radial/sweep gradients, glyph clips, all transform formats and all composite modes; also carries the CPAL fixture used by the COLR tests. Not a Git LFS object (`file` header, not a pointer). |
 | `colr_test_glyphs-LICENSE.txt` | `assets/colr_test_glyphs/LICENSE.txt` | Apache-2.0 notice. |
 | `NotoSans-Regular.ttf` | `notofonts/notofonts.github.io` at `28b15b4b43b7bed62b5cf6e6b0b5ff5846270535`, `fonts/NotoSans/unhinted/ttf/NotoSans-Regular.ttf` | SIL OFL-1.1 (`NotoSans-OFL.txt`); from the Noto project's explicitly *unhinted* build tree. Static Regular, 3884 glyphs, `fpgm`/`prep` absent and `maxp.maxSizeOfInstructions == 0`, so skrifa's `Engine::AutoFallback` selects the autohinter. The M3 autohint fixture (`glyph_run` hinted scenes and `--dump-glyphs --hint` vectors). Downloaded by `tools/import_upstream_fixtures.sh` and checksum-verified. |
-| `NotoSans-OFL.txt` | `notofonts/latin-greek-cyrillic` at `4bc63d7ebca1faed49c6c685f380ba0abc2c1941`, `OFL.txt` | SIL OFL-1.1 notice for Noto Sans. |
+| `NotoSansMono-Regular.ttf` | `notofonts/notofonts.github.io` at `28b15b4b43b7bed62b5cf6e6b0b5ff5846270535`, `fonts/NotoSansMono/unhinted/ttf/NotoSansMono-Regular.ttf` | SIL OFL-1.1 (`NotoSans-OFL.txt`). Same unhinted build tree; monospace advances and same-width digits exercise the autohint advance paths. |
+| `NotoSansDevanagari-Regular.ttf` | `notofonts/notofonts.github.io` at `28b15b4b43b7bed62b5cf6e6b0b5ff5846270535`, `fonts/NotoSansDevanagari/unhinted/ttf/NotoSansDevanagari-Regular.ttf` | SIL OFL-1.1 (`NotoSans-OFL.txt`). Same unhinted build tree; exercises the autohinter's Indic script group. |
+| `NotoSans-OFL.txt` | `notofonts/latin-greek-cyrillic` at `4bc63d7ebca1faed49c6c685f380ba0abc2c1941`, `OFL.txt` | SIL OFL-1.1 notice for the Noto Sans fixtures. |
 
 SHA-256:
 
@@ -29,6 +31,8 @@ b505bbd72ed997810e346931fa31f3bc59d1e131080182de959c4978ea20eb45  NotoColorEmoji
 8aa611b1ca97044ac6f13dc982fde29256612f0a5acc6ef47ca541a7a5b99b28  test_glyphs-glyf_colr_1.ttf
 0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9  colr_test_glyphs-LICENSE.txt
 f3961a9cde016d41a4879aecda1474d3a36d6bf54fa0e4643de029cc2248b0e8  NotoSans-Regular.ttf
+87f8ce0522a6c99b743ee5fc75b4073cfdd575639119672828b7b9944b65b4f4  NotoSansMono-Regular.ttf
+216921eded5a97435fa0638deca66496bf51f52fa3467f566deb9938c25a71de  NotoSansDevanagari-Regular.ttf
 cee9892f9f0cc8fe882c9e9537ee6a89621d86ee7ceaf70b02e2b2b1c25c061a  NotoSans-OFL.txt
 ```
 

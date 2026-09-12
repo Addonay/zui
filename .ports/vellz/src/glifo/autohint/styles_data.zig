@@ -39,10 +39,10 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𞤌 𞤮",
         .blues = &.{
-    .{ .chars = "𞤌 𞤅 𞤈 𞤏 𞤔 𞤚", .zones = .{ .bits = 2 } },
-    .{ .chars = "𞤂 𞤖", .zones = .{ .bits = 0 } },
-    .{ .chars = "𞤬 𞤮 𞤻 𞤼 𞤾", .zones = .{ .bits = 34 } },
-    .{ .chars = "𞤤 𞤨 𞤩 𞤭 𞤴 𞤸 𞤺 𞥀", .zones = .{ .bits = 0 } },
+            .{ .chars = "𞤌 𞤅 𞤈 𞤏 𞤔 𞤚", .zones = .{ .bits = 2 } },
+            .{ .chars = "𞤂 𞤖", .zones = .{ .bits = 0 } },
+            .{ .chars = "𞤬 𞤮 𞤻 𞤼 𞤾", .zones = .{ .bits = 34 } },
+            .{ .chars = "𞤤 𞤨 𞤩 𞤭 𞤴 𞤸 𞤺 𞥀", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -52,9 +52,9 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ل ح ـ",
         .blues = &.{
-    .{ .chars = "ا إ ل ك ط ظ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ت ث ط ظ ك", .zones = .{ .bits = 0 } },
-    .{ .chars = "ـ", .zones = .{ .bits = 8 } },
+            .{ .chars = "ا إ ل ك ط ظ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ت ث ط ظ ك", .zones = .{ .bits = 0 } },
+            .{ .chars = "ـ", .zones = .{ .bits = 8 } },
         },
     },
     .{
@@ -64,12 +64,12 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ս Ս",
         .blues = &.{
-    .{ .chars = "Ա Մ Ւ Ս Բ Գ Դ Օ", .zones = .{ .bits = 2 } },
-    .{ .chars = "Ւ Ո Դ Ճ Շ Ս Տ Օ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ե է ի մ վ ֆ ճ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ա յ ւ ս գ շ ր օ", .zones = .{ .bits = 34 } },
-    .{ .chars = "հ ո ճ ա ե ծ ս օ", .zones = .{ .bits = 0 } },
-    .{ .chars = "բ ը ի լ ղ պ փ ց", .zones = .{ .bits = 0 } },
+            .{ .chars = "Ա Մ Ւ Ս Բ Գ Դ Օ", .zones = .{ .bits = 2 } },
+            .{ .chars = "Ւ Ո Դ Ճ Շ Ս Տ Օ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ե է ի մ վ ֆ ճ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ա յ ւ ս գ շ ր օ", .zones = .{ .bits = 34 } },
+            .{ .chars = "հ ո ճ ա ե ծ ս օ", .zones = .{ .bits = 0 } },
+            .{ .chars = "բ ը ի լ ղ պ փ ց", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -79,8 +79,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𐬚",
         .blues = &.{
-    .{ .chars = "𐬀 𐬁 𐬐 𐬛", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐬀 𐬁", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐬀 𐬁 𐬐 𐬛", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐬀 𐬁", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -90,8 +90,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ꛁ ꛯ",
         .blues = &.{
-    .{ .chars = "ꚧ ꚨ ꛛ ꛉ ꛁ ꛈ ꛫ ꛯ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ꚭ ꚳ ꚶ ꛬ ꚢ ꚽ ꛯ ꛲", .zones = .{ .bits = 0 } },
+            .{ .chars = "ꚧ ꚨ ꛛ ꛉ ꛁ ꛈ ꛫ ꛯ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ꚭ ꚳ ꚶ ꛬ ꚢ ꚽ ꛯ ꛲", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -101,10 +101,10 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = true,
         .std_chars = "০ ৪",
         .blues = &.{
-    .{ .chars = "ই ট ঠ ি ী ৈ ৗ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ও এ ড ত ন ব ল ক", .zones = .{ .bits = 2 } },
-    .{ .chars = "অ ড ত ন ব ভ ল ক", .zones = .{ .bits = 42 } },
-    .{ .chars = "অ ড ত ন ব ভ ল ক", .zones = .{ .bits = 0 } },
+            .{ .chars = "ই ট ঠ ি ী ৈ ৗ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ও এ ড ত ন ব ল ক", .zones = .{ .bits = 2 } },
+            .{ .chars = "অ ড ত ন ব ভ ল ক", .zones = .{ .bits = 42 } },
+            .{ .chars = "অ ড ত ন ব ভ ল ক", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -114,10 +114,10 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ᝋ ᝏ",
         .blues = &.{
-    .{ .chars = "ᝐ ᝈ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ᝅ ᝊ ᝎ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ᝂ ᝃ ᝉ ᝌ", .zones = .{ .bits = 34 } },
-    .{ .chars = "ᝀ ᝃ ᝆ ᝉ ᝋ ᝏ ᝑ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᝐ ᝈ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ᝅ ᝊ ᝎ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ᝂ ᝃ ᝉ ᝌ", .zones = .{ .bits = 34 } },
+            .{ .chars = "ᝀ ᝃ ᝆ ᝉ ᝋ ᝏ ᝑ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -127,9 +127,9 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𑄤 𑄉 𑄛",
         .blues = &.{
-    .{ .chars = "𑄃 𑄅 𑄉 𑄙 𑄗", .zones = .{ .bits = 2 } },
-    .{ .chars = "𑄅 𑄛 𑄝 𑄗 𑄓", .zones = .{ .bits = 0 } },
-    .{ .chars = "𑄖𑄳𑄢 𑄘𑄳𑄢 𑄙𑄳𑄢 𑄤𑄳𑄢 𑄥𑄳𑄢", .zones = .{ .bits = 0 } },
+            .{ .chars = "𑄃 𑄅 𑄉 𑄙 𑄗", .zones = .{ .bits = 2 } },
+            .{ .chars = "𑄅 𑄛 𑄝 𑄗 𑄓", .zones = .{ .bits = 0 } },
+            .{ .chars = "𑄖𑄳𑄢 𑄘𑄳𑄢 𑄙𑄳𑄢 𑄤𑄳𑄢 𑄥𑄳𑄢", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -139,12 +139,12 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ᑌ ᓚ",
         .blues = &.{
-    .{ .chars = "ᗜ ᖴ ᐁ ᒣ ᑫ ᑎ ᔑ ᗰ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ᗶ ᖵ ᒧ ᐃ ᑌ ᒍ ᔑ ᗢ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ᓓ ᓕ ᓀ ᓂ ᓄ ᕄ ᕆ ᘣ", .zones = .{ .bits = 34 } },
-    .{ .chars = "ᕃ ᓂ ᓀ ᕂ ᓗ ᓚ ᕆ ᘣ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ᐪ ᙆ ᣘ ᐢ ᒾ ᣗ ᔆ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ᙆ ᗮ ᒻ ᐞ ᔆ ᒡ ᒢ ᓑ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᗜ ᖴ ᐁ ᒣ ᑫ ᑎ ᔑ ᗰ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ᗶ ᖵ ᒧ ᐃ ᑌ ᒍ ᔑ ᗢ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᓓ ᓕ ᓀ ᓂ ᓄ ᕄ ᕆ ᘣ", .zones = .{ .bits = 34 } },
+            .{ .chars = "ᕃ ᓂ ᓀ ᕂ ᓗ ᓚ ᕆ ᘣ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᐪ ᙆ ᣘ ᐢ ᒾ ᣗ ᔆ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ᙆ ᗮ ᒻ ᐞ ᔆ ᒡ ᒢ ᓑ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -154,8 +154,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𐊫 𐋉",
         .blues = &.{
-    .{ .chars = "𐊧 𐊫 𐊬 𐊭 𐊱 𐊺 𐊼 𐊿", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐊣 𐊧 𐊷 𐋀 𐊫 𐊸 𐋉", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐊧 𐊫 𐊬 𐊭 𐊱 𐊺 𐊼 𐊿", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐊣 𐊧 𐊷 𐋀 𐊫 𐊸 𐋉", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -165,12 +165,12 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "Ꭴ Ꮕ ꮕ",
         .blues = &.{
-    .{ .chars = "Ꮖ Ꮋ Ꭼ Ꮓ Ꭴ Ꮳ Ꭶ Ꮥ", .zones = .{ .bits = 2 } },
-    .{ .chars = "Ꮖ Ꮋ Ꭼ Ꮓ Ꭴ Ꮳ Ꭶ Ꮥ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ꮒ ꮤ ꮶ ꭴ ꭾ ꮗ ꮝ ꮿ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ꮖ ꭼ ꮓ ꮠ ꮳ ꭶ ꮥ ꮻ", .zones = .{ .bits = 34 } },
-    .{ .chars = "ꮖ ꭼ ꮓ ꮠ ꮳ ꭶ ꮥ ꮻ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ᏸ ꮐ ꭹ ꭻ", .zones = .{ .bits = 0 } },
+            .{ .chars = "Ꮖ Ꮋ Ꭼ Ꮓ Ꭴ Ꮳ Ꭶ Ꮥ", .zones = .{ .bits = 2 } },
+            .{ .chars = "Ꮖ Ꮋ Ꭼ Ꮓ Ꭴ Ꮳ Ꭶ Ꮥ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ꮒ ꮤ ꮶ ꭴ ꭾ ꮗ ꮝ ꮿ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ꮖ ꭼ ꮓ ꮠ ꮳ ꭶ ꮥ ꮻ", .zones = .{ .bits = 34 } },
+            .{ .chars = "ꮖ ꭼ ꮓ ꮠ ꮳ ꭶ ꮥ ꮻ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᏸ ꮐ ꭹ ꭻ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -180,10 +180,10 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "Ⲟ ⲟ",
         .blues = &.{
-    .{ .chars = "Ⲍ Ⲏ Ⲡ Ⳟ Ⲟ Ⲑ Ⲥ Ⳋ", .zones = .{ .bits = 2 } },
-    .{ .chars = "Ⳑ Ⳙ Ⳟ Ⲏ Ⲟ Ⲑ Ⳝ Ⲱ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ⲍ ⲏ ⲡ ⳟ ⲟ ⲑ ⲥ ⳋ", .zones = .{ .bits = 34 } },
-    .{ .chars = "ⳑ ⳙ ⳟ ⲏ ⲟ ⲑ ⳝ Ⳓ", .zones = .{ .bits = 0 } },
+            .{ .chars = "Ⲍ Ⲏ Ⲡ Ⳟ Ⲟ Ⲑ Ⲥ Ⳋ", .zones = .{ .bits = 2 } },
+            .{ .chars = "Ⳑ Ⳙ Ⳟ Ⲏ Ⲟ Ⲑ Ⳝ Ⲱ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ⲍ ⲏ ⲡ ⳟ ⲟ ⲑ ⲥ ⳋ", .zones = .{ .bits = 34 } },
+            .{ .chars = "ⳑ ⳙ ⳟ ⲏ ⲟ ⲑ ⳝ Ⳓ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -193,10 +193,10 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𐠅 𐠣",
         .blues = &.{
-    .{ .chars = "𐠍 𐠙 𐠳 𐠱 𐠅 𐠓 𐠣 𐠦", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐠃 𐠊 𐠛 𐠣 𐠳 𐠵 𐠐", .zones = .{ .bits = 0 } },
-    .{ .chars = "𐠈 𐠏 𐠖", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐠈 𐠏 𐠖", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐠍 𐠙 𐠳 𐠱 𐠅 𐠓 𐠣 𐠦", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐠃 𐠊 𐠛 𐠣 𐠳 𐠵 𐠐", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐠈 𐠏 𐠖", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐠈 𐠏 𐠖", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -206,11 +206,11 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "о О",
         .blues = &.{
-    .{ .chars = "Б В Е П З О С Э", .zones = .{ .bits = 2 } },
-    .{ .chars = "Б В Е Ш З О С Э", .zones = .{ .bits = 0 } },
-    .{ .chars = "х п н ш е з о с", .zones = .{ .bits = 34 } },
-    .{ .chars = "х п н ш е з о с", .zones = .{ .bits = 0 } },
-    .{ .chars = "р у ф", .zones = .{ .bits = 0 } },
+            .{ .chars = "Б В Е П З О С Э", .zones = .{ .bits = 2 } },
+            .{ .chars = "Б В Е Ш З О С Э", .zones = .{ .bits = 0 } },
+            .{ .chars = "х п н ш е з о с", .zones = .{ .bits = 34 } },
+            .{ .chars = "х п н ш е з о с", .zones = .{ .bits = 0 } },
+            .{ .chars = "р у ф", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -220,11 +220,11 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = true,
         .std_chars = "ठ व ट",
         .blues = &.{
-    .{ .chars = "ई ऐ ओ औ ि ी ो ौ", .zones = .{ .bits = 2 } },
-    .{ .chars = "क म अ आ थ ध भ श", .zones = .{ .bits = 2 } },
-    .{ .chars = "क न म उ छ ट ठ ड", .zones = .{ .bits = 42 } },
-    .{ .chars = "क न म उ छ ट ठ ड", .zones = .{ .bits = 0 } },
-    .{ .chars = "ु ृ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ई ऐ ओ औ ि ी ो ौ", .zones = .{ .bits = 2 } },
+            .{ .chars = "क म अ आ थ ध भ श", .zones = .{ .bits = 2 } },
+            .{ .chars = "क न म उ छ ट ठ ड", .zones = .{ .bits = 42 } },
+            .{ .chars = "क न म उ छ ट ठ ड", .zones = .{ .bits = 0 } },
+            .{ .chars = "ु ृ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -234,10 +234,10 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𐐄 𐐬",
         .blues = &.{
-    .{ .chars = "𐐂 𐐄 𐐋 𐐗 𐐑", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐐀 𐐂 𐐄 𐐗 𐐛", .zones = .{ .bits = 0 } },
-    .{ .chars = "𐐪 𐐬 𐐳 𐐿 𐐹", .zones = .{ .bits = 34 } },
-    .{ .chars = "𐐨 𐐪 𐐬 𐐿 𐑃", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐐂 𐐄 𐐋 𐐗 𐐑", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐐀 𐐂 𐐄 𐐗 𐐛", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐐪 𐐬 𐐳 𐐿 𐐹", .zones = .{ .bits = 34 } },
+            .{ .chars = "𐐨 𐐪 𐐬 𐐿 𐑃", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -247,8 +247,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ዐ",
         .blues = &.{
-    .{ .chars = "ሀ ሃ ዘ ፐ ማ በ ዋ ዐ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ለ ሐ በ ዘ ሀ ሪ ዐ ጨ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ሀ ሃ ዘ ፐ ማ በ ዋ ዐ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ለ ሐ በ ዘ ሀ ሪ ዐ ጨ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -258,12 +258,12 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ი ე ა Ჿ",
         .blues = &.{
-    .{ .chars = "გ დ ე ვ თ ი ო ღ", .zones = .{ .bits = 34 } },
-    .{ .chars = "ა ზ მ ს შ ძ ხ პ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ს ხ ქ ზ მ შ ჩ წ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ე ვ ჟ ტ უ ფ ქ ყ", .zones = .{ .bits = 0 } },
-    .{ .chars = "Ნ Ჟ Ჳ Ჸ Გ Ე Ო Ჴ", .zones = .{ .bits = 2 } },
-    .{ .chars = "Ი Ჲ Ო Ჩ Მ Შ Ჯ Ჽ", .zones = .{ .bits = 0 } },
+            .{ .chars = "გ დ ე ვ თ ი ო ღ", .zones = .{ .bits = 34 } },
+            .{ .chars = "ა ზ მ ს შ ძ ხ პ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ს ხ ქ ზ მ შ ჩ წ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ე ვ ჟ ტ უ ფ ქ ყ", .zones = .{ .bits = 0 } },
+            .{ .chars = "Ნ Ჟ Ჳ Ჸ Გ Ე Ო Ჴ", .zones = .{ .bits = 2 } },
+            .{ .chars = "Ი Ჲ Ო Ჩ Მ Შ Ჯ Ჽ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -273,12 +273,12 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "Ⴖ Ⴑ ⴙ",
         .blues = &.{
-    .{ .chars = "Ⴑ Ⴇ Ⴙ Ⴜ Ⴄ Ⴅ Ⴓ Ⴚ", .zones = .{ .bits = 2 } },
-    .{ .chars = "Ⴄ Ⴅ Ⴇ Ⴈ Ⴆ Ⴑ Ⴊ Ⴋ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ⴁ ⴗ ⴂ ⴄ ⴅ ⴇ ⴔ ⴖ", .zones = .{ .bits = 34 } },
-    .{ .chars = "ⴈ ⴌ ⴖ ⴎ ⴃ ⴆ ⴋ ⴢ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ⴐ ⴑ ⴓ ⴕ ⴙ ⴛ ⴡ ⴣ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ⴄ ⴅ ⴔ ⴕ ⴁ ⴂ ⴘ ⴝ", .zones = .{ .bits = 0 } },
+            .{ .chars = "Ⴑ Ⴇ Ⴙ Ⴜ Ⴄ Ⴅ Ⴓ Ⴚ", .zones = .{ .bits = 2 } },
+            .{ .chars = "Ⴄ Ⴅ Ⴇ Ⴈ Ⴆ Ⴑ Ⴊ Ⴋ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ⴁ ⴗ ⴂ ⴄ ⴅ ⴇ ⴔ ⴖ", .zones = .{ .bits = 34 } },
+            .{ .chars = "ⴈ ⴌ ⴖ ⴎ ⴃ ⴆ ⴋ ⴢ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ⴐ ⴑ ⴓ ⴕ ⴙ ⴛ ⴡ ⴣ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ⴄ ⴅ ⴔ ⴕ ⴁ ⴂ ⴘ ⴝ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -288,10 +288,10 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "Ⱅ ⱅ",
         .blues = &.{
-    .{ .chars = "Ⰵ Ⱄ Ⱚ Ⰴ Ⰲ Ⰺ Ⱛ Ⰻ", .zones = .{ .bits = 2 } },
-    .{ .chars = "Ⰵ Ⰴ Ⰲ Ⱚ Ⱎ Ⱑ Ⰺ Ⱄ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ⰵ ⱄ ⱚ ⰴ ⰲ ⰺ ⱛ ⰻ", .zones = .{ .bits = 34 } },
-    .{ .chars = "ⰵ ⰴ ⰲ ⱚ ⱎ ⱑ ⰺ ⱄ", .zones = .{ .bits = 0 } },
+            .{ .chars = "Ⰵ Ⱄ Ⱚ Ⰴ Ⰲ Ⰺ Ⱛ Ⰻ", .zones = .{ .bits = 2 } },
+            .{ .chars = "Ⰵ Ⰴ Ⰲ Ⱚ Ⱎ Ⱑ Ⰺ Ⱄ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ⰵ ⱄ ⱚ ⰴ ⰲ ⰺ ⱛ ⰻ", .zones = .{ .bits = 34 } },
+            .{ .chars = "ⰵ ⰴ ⰲ ⱚ ⱎ ⱑ ⰺ ⱄ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -301,8 +301,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = true,
         .std_chars = "𐌴 𐌾 𐍃",
         .blues = &.{
-    .{ .chars = "𐌲 𐌶 𐍀 𐍄 𐌴 𐍃 𐍈 𐌾", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐌶 𐌴 𐍃 𐍈", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐌲 𐌶 𐍀 𐍄 𐌴 𐍃 𐍈 𐌾", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐌶 𐌴 𐍃 𐍈", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -312,12 +312,12 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ο Ο",
         .blues = &.{
-    .{ .chars = "Γ Β Ε Ζ Θ Ο Ω", .zones = .{ .bits = 2 } },
-    .{ .chars = "Β Δ Ζ Ξ Θ Ο", .zones = .{ .bits = 0 } },
-    .{ .chars = "β θ δ ζ λ ξ", .zones = .{ .bits = 2 } },
-    .{ .chars = "α ε ι ο π σ τ ω", .zones = .{ .bits = 34 } },
-    .{ .chars = "α ε ι ο π σ τ ω", .zones = .{ .bits = 0 } },
-    .{ .chars = "β γ η μ ρ φ χ ψ", .zones = .{ .bits = 0 } },
+            .{ .chars = "Γ Β Ε Ζ Θ Ο Ω", .zones = .{ .bits = 2 } },
+            .{ .chars = "Β Δ Ζ Ξ Θ Ο", .zones = .{ .bits = 0 } },
+            .{ .chars = "β θ δ ζ λ ξ", .zones = .{ .bits = 2 } },
+            .{ .chars = "α ε ι ο π σ τ ω", .zones = .{ .bits = 34 } },
+            .{ .chars = "α ε ι ο π σ τ ω", .zones = .{ .bits = 0 } },
+            .{ .chars = "β γ η μ ρ φ χ ψ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -327,11 +327,11 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ટ ૦",
         .blues = &.{
-    .{ .chars = "ત ન ઋ ઌ છ ટ ર ૦", .zones = .{ .bits = 34 } },
-    .{ .chars = "ખ ગ ઘ ઞ ઇ ઈ ઠ જ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ઈ ઊ િ ી લી શ્ચિ જિ સી", .zones = .{ .bits = 2 } },
-    .{ .chars = "ુ ૃ ૄ ખુ છૃ છૄ", .zones = .{ .bits = 0 } },
-    .{ .chars = "૦ ૧ ૨ ૩ ૭", .zones = .{ .bits = 2 } },
+            .{ .chars = "ત ન ઋ ઌ છ ટ ર ૦", .zones = .{ .bits = 34 } },
+            .{ .chars = "ખ ગ ઘ ઞ ઇ ઈ ઠ જ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ઈ ઊ િ ી લી શ્ચિ જિ સી", .zones = .{ .bits = 2 } },
+            .{ .chars = "ુ ૃ ૄ ખુ છૃ છૄ", .zones = .{ .bits = 0 } },
+            .{ .chars = "૦ ૧ ૨ ૩ ૭", .zones = .{ .bits = 2 } },
         },
     },
     .{
@@ -341,11 +341,11 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = true,
         .std_chars = "ਠ ਰ ੦",
         .blues = &.{
-    .{ .chars = "ਇ ਈ ਉ ਏ ਓ ੳ ਿ ੀ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ਕ ਗ ਙ ਚ ਜ ਤ ਧ ਸ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ਕ ਗ ਙ ਚ ਜ ਤ ਧ ਸ", .zones = .{ .bits = 42 } },
-    .{ .chars = "ਅ ਏ ਓ ਗ ਜ ਠ ਰ ਸ", .zones = .{ .bits = 0 } },
-    .{ .chars = "੦ ੧ ੨ ੩ ੭", .zones = .{ .bits = 2 } },
+            .{ .chars = "ਇ ਈ ਉ ਏ ਓ ੳ ਿ ੀ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ਕ ਗ ਙ ਚ ਜ ਤ ਧ ਸ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ਕ ਗ ਙ ਚ ਜ ਤ ਧ ਸ", .zones = .{ .bits = 42 } },
+            .{ .chars = "ਅ ਏ ਓ ਗ ਜ ਠ ਰ ਸ", .zones = .{ .bits = 0 } },
+            .{ .chars = "੦ ੧ ੨ ੩ ੭", .zones = .{ .bits = 2 } },
         },
     },
     .{
@@ -355,9 +355,9 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ם",
         .blues = &.{
-    .{ .chars = "ב ד ה ח ך כ ם ס", .zones = .{ .bits = 66 } },
-    .{ .chars = "ב ט כ ם ס צ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ק ך ן ף ץ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ב ד ה ח ך כ ם ס", .zones = .{ .bits = 66 } },
+            .{ .chars = "ב ט כ ם ס צ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ק ך ן ף ץ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -367,8 +367,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𞄨",
         .blues = &.{
-    .{ .chars = "𞄀 𞄁 𞄈 𞄑 𞄧 𞄬", .zones = .{ .bits = 2 } },
-    .{ .chars = "𞄁 𞄜 𞄠 𞄡 𞄤 𞅂", .zones = .{ .bits = 0 } },
+            .{ .chars = "𞄀 𞄁 𞄈 𞄑 𞄧 𞄬", .zones = .{ .bits = 2 } },
+            .{ .chars = "𞄁 𞄜 𞄠 𞄡 𞄤 𞅂", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -378,11 +378,11 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ꤍ ꤀",
         .blues = &.{
-    .{ .chars = "꤅ ꤏ ꤁ ꤋ ꤀ ꤍ", .zones = .{ .bits = 34 } },
-    .{ .chars = "꤈ ꤘ ꤀ ꤍ ꤢ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ꤖ ꤡ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ꤑ ꤜ ꤞ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ꤑ꤬ ꤜ꤭ ꤔ꤬", .zones = .{ .bits = 0 } },
+            .{ .chars = "꤅ ꤏ ꤁ ꤋ ꤀ ꤍ", .zones = .{ .bits = 34 } },
+            .{ .chars = "꤈ ꤘ ꤀ ꤍ ꤢ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ꤖ ꤡ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ꤑ ꤜ ꤞ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ꤑ꤬ ꤜ꤭ ꤔ꤬", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -392,11 +392,11 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "០",
         .blues = &.{
-    .{ .chars = "ខ ទ ន ឧ ឩ ា", .zones = .{ .bits = 34 } },
-    .{ .chars = "ក្ក ក្ខ ក្គ ក្ថ", .zones = .{ .bits = 4 } },
-    .{ .chars = "ខ ឃ ច ឋ ប ម យ ឲ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ត្រ រៀ ឲ្យ អឿ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ន្ត្រៃ ង្ខ្យ ក្បៀ ច្រៀ ន្តឿ ល្បឿ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ខ ទ ន ឧ ឩ ា", .zones = .{ .bits = 34 } },
+            .{ .chars = "ក្ក ក្ខ ក្គ ក្ថ", .zones = .{ .bits = 4 } },
+            .{ .chars = "ខ ឃ ច ឋ ប ម យ ឲ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ត្រ រៀ ឲ្យ អឿ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ន្ត្រៃ ង្ខ្យ ក្បៀ ច្រៀ ន្តឿ ល្បឿ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -406,8 +406,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "᧡ ᧪",
         .blues = &.{
-    .{ .chars = "᧠ ᧡", .zones = .{ .bits = 34 } },
-    .{ .chars = "᧶ ᧹", .zones = .{ .bits = 0 } },
+            .{ .chars = "᧠ ᧡", .zones = .{ .bits = 34 } },
+            .{ .chars = "᧶ ᧹", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -417,8 +417,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "೦ ಬ",
         .blues = &.{
-    .{ .chars = "ಇ ಊ ಐ ಣ ಸಾ ನಾ ದಾ ರಾ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ಅ ಉ ಎ ಲ ೦ ೨ ೬ ೭", .zones = .{ .bits = 0 } },
+            .{ .chars = "ಇ ಊ ಐ ಣ ಸಾ ನಾ ದಾ ರಾ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ಅ ಉ ಎ ಲ ೦ ೨ ೬ ೭", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -428,11 +428,11 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "໐",
         .blues = &.{
-    .{ .chars = "າ ດ ອ ມ ລ ວ ຣ ງ", .zones = .{ .bits = 34 } },
-    .{ .chars = "າ ອ ບ ຍ ຣ ຮ ວ ຢ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ປ ຢ ຟ ຝ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ໂ ໄ ໃ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ງ ຊ ຖ ຽ ໆ ຯ", .zones = .{ .bits = 0 } },
+            .{ .chars = "າ ດ ອ ມ ລ ວ ຣ ງ", .zones = .{ .bits = 34 } },
+            .{ .chars = "າ ອ ບ ຍ ຣ ຮ ວ ຢ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ປ ຢ ຟ ຝ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ໂ ໄ ໃ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ງ ຊ ຖ ຽ ໆ ຯ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -442,12 +442,12 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "o O 0",
         .blues = &.{
-    .{ .chars = "T H E Z O C Q S", .zones = .{ .bits = 2 } },
-    .{ .chars = "H E Z L O C U S", .zones = .{ .bits = 0 } },
-    .{ .chars = "f i j k d b h", .zones = .{ .bits = 2 } },
-    .{ .chars = "u v x z o e s c", .zones = .{ .bits = 34 } },
-    .{ .chars = "n r x z o e s c", .zones = .{ .bits = 0 } },
-    .{ .chars = "p q g j y", .zones = .{ .bits = 0 } },
+            .{ .chars = "T H E Z O C Q S", .zones = .{ .bits = 2 } },
+            .{ .chars = "H E Z L O C U S", .zones = .{ .bits = 0 } },
+            .{ .chars = "f i j k d b h", .zones = .{ .bits = 2 } },
+            .{ .chars = "u v x z o e s c", .zones = .{ .bits = 34 } },
+            .{ .chars = "n r x z o e s c", .zones = .{ .bits = 0 } },
+            .{ .chars = "p q g j y", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -457,12 +457,12 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ₒ ₀",
         .blues = &.{
-    .{ .chars = "₀ ₃ ₅ ₇ ₈", .zones = .{ .bits = 2 } },
-    .{ .chars = "₀ ₁ ₂ ₃ ₈", .zones = .{ .bits = 0 } },
-    .{ .chars = "ᵢ ⱼ ₕ ₖ ₗ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ₐ ₑ ₒ ₓ ₙ ₛ ᵥ ᵤ ᵣ", .zones = .{ .bits = 34 } },
-    .{ .chars = "ₐ ₑ ₒ ₓ ₙ ₛ ᵥ ᵤ ᵣ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ᵦ ᵧ ᵨ ᵩ ₚ", .zones = .{ .bits = 0 } },
+            .{ .chars = "₀ ₃ ₅ ₇ ₈", .zones = .{ .bits = 2 } },
+            .{ .chars = "₀ ₁ ₂ ₃ ₈", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᵢ ⱼ ₕ ₖ ₗ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ₐ ₑ ₒ ₓ ₙ ₛ ᵥ ᵤ ᵣ", .zones = .{ .bits = 34 } },
+            .{ .chars = "ₐ ₑ ₒ ₓ ₙ ₛ ᵥ ᵤ ᵣ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᵦ ᵧ ᵨ ᵩ ₚ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -472,12 +472,12 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ᵒ ᴼ ⁰",
         .blues = &.{
-    .{ .chars = "⁰ ³ ⁵ ⁷ ᵀ ᴴ ᴱ ᴼ", .zones = .{ .bits = 2 } },
-    .{ .chars = "⁰ ¹ ² ³ ᴱ ᴸ ᴼ ᵁ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ᵇ ᵈ ᵏ ʰ ʲ ᶠ ⁱ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ᵉ ᵒ ʳ ˢ ˣ ᶜ ᶻ", .zones = .{ .bits = 34 } },
-    .{ .chars = "ᵉ ᵒ ʳ ˢ ˣ ᶜ ᶻ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ᵖ ʸ ᵍ", .zones = .{ .bits = 0 } },
+            .{ .chars = "⁰ ³ ⁵ ⁷ ᵀ ᴴ ᴱ ᴼ", .zones = .{ .bits = 2 } },
+            .{ .chars = "⁰ ¹ ² ³ ᴱ ᴸ ᴼ ᵁ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᵇ ᵈ ᵏ ʰ ʲ ᶠ ⁱ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ᵉ ᵒ ʳ ˢ ˣ ᶜ ᶻ", .zones = .{ .bits = 34 } },
+            .{ .chars = "ᵉ ᵒ ʳ ˢ ˣ ᶜ ᶻ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᵖ ʸ ᵍ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -487,8 +487,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ꓳ",
         .blues = &.{
-    .{ .chars = "ꓡ ꓧ ꓱ ꓶ ꓩ ꓚ ꓵ ꓳ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ꓕ ꓜ ꓞ ꓡ ꓛ ꓢ ꓳ ꓴ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ꓡ ꓧ ꓱ ꓶ ꓩ ꓚ ꓵ ꓳ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ꓕ ꓜ ꓞ ꓡ ꓛ ꓢ ꓳ ꓴ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -498,8 +498,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ഠ റ",
         .blues = &.{
-    .{ .chars = "ഒ ട ഠ റ ച പ ച്ച പ്പ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ട ഠ ധ ശ ഘ ച ഥ ല", .zones = .{ .bits = 0 } },
+            .{ .chars = "ഒ ട ഠ റ ച പ ച്ച പ്പ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ട ഠ ധ ശ ഘ ച ഥ ല", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -509,13 +509,13 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𖹡 𖹛 𖹯",
         .blues = &.{
-    .{ .chars = "𖹀 𖹁 𖹂 𖹃 𖹏 𖹚 𖹟", .zones = .{ .bits = 2 } },
-    .{ .chars = "𖹀 𖹁 𖹂 𖹃 𖹏 𖹚 𖹒 𖹓", .zones = .{ .bits = 0 } },
-    .{ .chars = "𖹤 𖹬 𖹧 𖹴 𖹶 𖹾", .zones = .{ .bits = 2 } },
-    .{ .chars = "𖹠 𖹡 𖹢 𖹹 𖹳 𖹮", .zones = .{ .bits = 34 } },
-    .{ .chars = "𖹠 𖹡 𖹢 𖹳 𖹭 𖹽", .zones = .{ .bits = 0 } },
-    .{ .chars = "𖹥 𖹨 𖹩", .zones = .{ .bits = 0 } },
-    .{ .chars = "𖺀 𖺅 𖺈 𖺄 𖺍", .zones = .{ .bits = 2 } },
+            .{ .chars = "𖹀 𖹁 𖹂 𖹃 𖹏 𖹚 𖹟", .zones = .{ .bits = 2 } },
+            .{ .chars = "𖹀 𖹁 𖹂 𖹃 𖹏 𖹚 𖹒 𖹓", .zones = .{ .bits = 0 } },
+            .{ .chars = "𖹤 𖹬 𖹧 𖹴 𖹶 𖹾", .zones = .{ .bits = 2 } },
+            .{ .chars = "𖹠 𖹡 𖹢 𖹹 𖹳 𖹮", .zones = .{ .bits = 34 } },
+            .{ .chars = "𖹠 𖹡 𖹢 𖹳 𖹭 𖹽", .zones = .{ .bits = 0 } },
+            .{ .chars = "𖹥 𖹨 𖹩", .zones = .{ .bits = 0 } },
+            .{ .chars = "𖺀 𖺅 𖺈 𖺄 𖺍", .zones = .{ .bits = 2 } },
         },
     },
     .{
@@ -525,8 +525,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = true,
         .std_chars = "ᡂ ᠪ",
         .blues = &.{
-    .{ .chars = "ᠳ ᠴ ᠶ ᠽ ᡂ ᡊ \\u{200d}ᡡ\\u{200d} \\u{200d}ᡳ\\u{200d}", .zones = .{ .bits = 2 } },
-    .{ .chars = "ᡃ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᠳ ᠴ ᠶ ᠽ ᡂ ᡊ \\u{200d}ᡡ\\u{200d} \\u{200d}ᡳ\\u{200d}", .zones = .{ .bits = 2 } },
+            .{ .chars = "ᡃ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -536,10 +536,10 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ဝ င ဂ",
         .blues = &.{
-    .{ .chars = "ခ ဂ င ဒ ဝ ၥ ၊ ။", .zones = .{ .bits = 34 } },
-    .{ .chars = "င ဎ ဒ ပ ဗ ဝ ၊ ။", .zones = .{ .bits = 0 } },
-    .{ .chars = "ဩ ြ ၍ ၏ ၆ ါ ိ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ဉ ည ဥ ဩ ဨ ၂ ၅ ၉", .zones = .{ .bits = 0 } },
+            .{ .chars = "ခ ဂ င ဒ ဝ ၥ ၊ ။", .zones = .{ .bits = 34 } },
+            .{ .chars = "င ဎ ဒ ပ ဗ ဝ ၊ ။", .zones = .{ .bits = 0 } },
+            .{ .chars = "ဩ ြ ၍ ၏ ၆ ါ ိ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ဉ ည ဥ ဩ ဨ ၂ ၅ ၉", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -549,10 +549,10 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ߋ ߀",
         .blues = &.{
-    .{ .chars = "ߐ ߉ ߒ ߟ ߖ ߜ ߠ ߥ", .zones = .{ .bits = 2 } },
-    .{ .chars = "߀ ߘ ߡ ߠ ߥ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ߏ ߛ ߋ", .zones = .{ .bits = 34 } },
-    .{ .chars = "ߎ ߏ ߛ ߋ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ߐ ߉ ߒ ߟ ߖ ߜ ߠ ߥ", .zones = .{ .bits = 2 } },
+            .{ .chars = "߀ ߘ ߡ ߠ ߥ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ߏ ߛ ߋ", .zones = .{ .bits = 34 } },
+            .{ .chars = "ߎ ߏ ߛ ߋ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -561,8 +561,7 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .tag = .{ 0x4e, 0x6f, 0x6e, 0x65 },
         .hint_top_to_bottom = false,
         .std_chars = "",
-        .blues = &.{
-        },
+        .blues = &.{},
     },
     .{
         .name = "Ol Chiki",
@@ -571,8 +570,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ᱛ",
         .blues = &.{
-    .{ .chars = "ᱛ ᱜ ᱝ ᱡ ᱢ ᱥ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ᱛ ᱜ ᱝ ᱡ ᱢ ᱥ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᱛ ᱜ ᱝ ᱡ ᱢ ᱥ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ᱛ ᱜ ᱝ ᱡ ᱢ ᱥ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -582,8 +581,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𐰗",
         .blues = &.{
-    .{ .chars = "𐰗 𐰘 𐰧", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐰉 𐰗 𐰦 𐰧", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐰗 𐰘 𐰧", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐰉 𐰗 𐰦 𐰧", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -593,13 +592,13 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𐓂 𐓪",
         .blues = &.{
-    .{ .chars = "𐒾 𐓍 𐓒 𐓓 𐒻 𐓂 𐒵 𐓆", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐒰 𐓍 𐓂 𐒿 𐓎 𐒹", .zones = .{ .bits = 0 } },
-    .{ .chars = "𐒼 𐒽 𐒾", .zones = .{ .bits = 0 } },
-    .{ .chars = "𐓵 𐓶 𐓺 𐓻 𐓝 𐓣 𐓪 𐓮", .zones = .{ .bits = 34 } },
-    .{ .chars = "𐓘 𐓚 𐓣 𐓵 𐓡 𐓧 𐓪 𐓶", .zones = .{ .bits = 0 } },
-    .{ .chars = "𐓤 𐓦 𐓸 𐓹 𐓛", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐓤 𐓥 𐓦", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐒾 𐓍 𐓒 𐓓 𐒻 𐓂 𐒵 𐓆", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐒰 𐓍 𐓂 𐒿 𐓎 𐒹", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐒼 𐒽 𐒾", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐓵 𐓶 𐓺 𐓻 𐓝 𐓣 𐓪 𐓮", .zones = .{ .bits = 34 } },
+            .{ .chars = "𐓘 𐓚 𐓣 𐓵 𐓡 𐓧 𐓪 𐓶", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐓤 𐓦 𐓸 𐓹 𐓛", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐓤 𐓥 𐓦", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -609,8 +608,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𐒆 𐒠",
         .blues = &.{
-    .{ .chars = "𐒆 𐒉 𐒐 𐒒 𐒘 𐒛 𐒠 𐒣", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐒀 𐒂 𐒆 𐒈 𐒊 𐒒 𐒠 𐒩", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐒆 𐒉 𐒐 𐒒 𐒘 𐒛 𐒠 𐒣", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐒀 𐒂 𐒆 𐒈 𐒊 𐒒 𐒠 𐒩", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -620,9 +619,9 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𐴰",
         .blues = &.{
-    .{ .chars = "𐴃 𐴀 𐴆 𐴖 𐴕", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐴔 𐴖 𐴕 𐴑 𐴐", .zones = .{ .bits = 0 } },
-    .{ .chars = "ـ", .zones = .{ .bits = 8 } },
+            .{ .chars = "𐴃 𐴀 𐴆 𐴖 𐴕", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐴔 𐴖 𐴕 𐴑 𐴐", .zones = .{ .bits = 0 } },
+            .{ .chars = "ـ", .zones = .{ .bits = 8 } },
         },
     },
     .{
@@ -632,8 +631,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ꢝ ꣐",
         .blues = &.{
-    .{ .chars = "ꢜ ꢞ ꢳ ꢂ ꢖ ꢒ ꢝ ꢛ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ꢂ ꢨ ꢺ ꢤ ꢎ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ꢜ ꢞ ꢳ ꢂ ꢖ ꢒ ꢝ ꢛ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ꢂ ꢨ ꢺ ꢤ ꢎ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -643,11 +642,11 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "𐑴",
         .blues = &.{
-    .{ .chars = "𐑕 𐑙", .zones = .{ .bits = 2 } },
-    .{ .chars = "𐑔 𐑖 𐑗 𐑹 𐑻", .zones = .{ .bits = 0 } },
-    .{ .chars = "𐑟 𐑣", .zones = .{ .bits = 0 } },
-    .{ .chars = "𐑱 𐑲 𐑳 𐑴 𐑸 𐑺 𐑼", .zones = .{ .bits = 34 } },
-    .{ .chars = "𐑴 𐑻 𐑹", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐑕 𐑙", .zones = .{ .bits = 2 } },
+            .{ .chars = "𐑔 𐑖 𐑗 𐑹 𐑻", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐑟 𐑣", .zones = .{ .bits = 0 } },
+            .{ .chars = "𐑱 𐑲 𐑳 𐑴 𐑸 𐑺 𐑼", .zones = .{ .bits = 34 } },
+            .{ .chars = "𐑴 𐑻 𐑹", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -657,9 +656,9 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ට",
         .blues = &.{
-    .{ .chars = "ඉ ක ඝ ඳ ප ය ල ෆ", .zones = .{ .bits = 2 } },
-    .{ .chars = "එ ඔ ඝ ජ ට ථ ධ ර", .zones = .{ .bits = 0 } },
-    .{ .chars = "ද ඳ උ ල තූ තු බු දු", .zones = .{ .bits = 0 } },
+            .{ .chars = "ඉ ක ඝ ඳ ප ය ල ෆ", .zones = .{ .bits = 2 } },
+            .{ .chars = "එ ඔ ඝ ජ ට ථ ධ ර", .zones = .{ .bits = 0 } },
+            .{ .chars = "ද ඳ උ ල තූ තු බු දු", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -669,9 +668,9 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "᮰",
         .blues = &.{
-    .{ .chars = "ᮋ ᮞ ᮮ ᮽ ᮰ ᮈ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ᮄ ᮔ ᮕ ᮗ ᮰ ᮆ ᮈ ᮉ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ᮼ ᳄", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᮋ ᮞ ᮮ ᮽ ᮰ ᮈ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ᮄ ᮔ ᮕ ᮗ ᮰ ᮆ ᮈ ᮉ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ᮼ ᳄", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -681,8 +680,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "௦",
         .blues = &.{
-    .{ .chars = "உ ஒ ஓ ற ஈ க ங ச", .zones = .{ .bits = 2 } },
-    .{ .chars = "க ச ல ஶ உ ங ட ப", .zones = .{ .bits = 0 } },
+            .{ .chars = "உ ஒ ஓ ற ஈ க ங ச", .zones = .{ .bits = 2 } },
+            .{ .chars = "க ச ல ஶ உ ங ட ப", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -692,8 +691,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ꪒ ꪫ",
         .blues = &.{
-    .{ .chars = "ꪆ ꪔ ꪒ ꪖ ꪫ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ꪉ ꪫ ꪮ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ꪆ ꪔ ꪒ ꪖ ꪫ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ꪉ ꪫ ꪮ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -703,8 +702,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "౦ ౧",
         .blues = &.{
-    .{ .chars = "ఇ ఌ ఙ ఞ ణ ఱ ౯", .zones = .{ .bits = 2 } },
-    .{ .chars = "అ క చ ర ఽ ౨ ౬", .zones = .{ .bits = 0 } },
+            .{ .chars = "ఇ ఌ ఙ ఞ ణ ఱ ౯", .zones = .{ .bits = 2 } },
+            .{ .chars = "అ క చ ర ఽ ౨ ౬", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -714,8 +713,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ⵔ",
         .blues = &.{
-    .{ .chars = "ⵔ ⵙ ⵛ ⵞ ⴵ ⴼ ⴹ ⵎ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ⵔ ⵙ ⵛ ⵞ ⴵ ⴼ ⴹ ⵎ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ⵔ ⵙ ⵛ ⵞ ⴵ ⴼ ⴹ ⵎ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ⵔ ⵙ ⵛ ⵞ ⴵ ⴼ ⴹ ⵎ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -725,13 +724,13 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "า ๅ ๐",
         .blues = &.{
-    .{ .chars = "บ เ แ อ ก า", .zones = .{ .bits = 34 } },
-    .{ .chars = "บ ป ษ ฯ อ ย ฮ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ป ฝ ฟ", .zones = .{ .bits = 2 } },
-    .{ .chars = "โ ใ ไ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ฎ ฏ ฤ ฦ", .zones = .{ .bits = 0 } },
-    .{ .chars = "ญ ฐ", .zones = .{ .bits = 0 } },
-    .{ .chars = "๐ ๑ ๓", .zones = .{ .bits = 0 } },
+            .{ .chars = "บ เ แ อ ก า", .zones = .{ .bits = 34 } },
+            .{ .chars = "บ ป ษ ฯ อ ย ฮ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ป ฝ ฟ", .zones = .{ .bits = 2 } },
+            .{ .chars = "โ ใ ไ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ฎ ฏ ฤ ฦ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ญ ฐ", .zones = .{ .bits = 0 } },
+            .{ .chars = "๐ ๑ ๓", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -741,8 +740,8 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "ꘓ ꖜ ꖴ",
         .blues = &.{
-    .{ .chars = "ꗍ ꘖ ꘙ ꘜ ꖜ ꖝ ꔅ ꕢ", .zones = .{ .bits = 2 } },
-    .{ .chars = "ꗍ ꘖ ꘙ ꗞ ꔅ ꕢ ꖜ ꔆ", .zones = .{ .bits = 0 } },
+            .{ .chars = "ꗍ ꘖ ꘙ ꘜ ꖜ ꖝ ꔅ ꕢ", .zones = .{ .bits = 2 } },
+            .{ .chars = "ꗍ ꘖ ꘙ ꗞ ꔅ ꕢ ꖜ ꔆ", .zones = .{ .bits = 0 } },
         },
     },
     .{
@@ -751,8 +750,7 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .tag = .{ 0x4c, 0x69, 0x6d, 0x62 },
         .hint_top_to_bottom = false,
         .std_chars = "o",
-        .blues = &.{
-        },
+        .blues = &.{},
     },
     .{
         .name = "Oriya",
@@ -760,8 +758,7 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .tag = .{ 0x4f, 0x72, 0x79, 0x61 },
         .hint_top_to_bottom = false,
         .std_chars = "o",
-        .blues = &.{
-        },
+        .blues = &.{},
     },
     .{
         .name = "Syloti Nagri",
@@ -769,8 +766,7 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .tag = .{ 0x53, 0x79, 0x6c, 0x6f },
         .hint_top_to_bottom = false,
         .std_chars = "o",
-        .blues = &.{
-        },
+        .blues = &.{},
     },
     .{
         .name = "Tibetan",
@@ -778,8 +774,7 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .tag = .{ 0x54, 0x69, 0x62, 0x74 },
         .hint_top_to_bottom = false,
         .std_chars = "o",
-        .blues = &.{
-        },
+        .blues = &.{},
     },
     .{
         .name = "CJKV ideographs",
@@ -788,10 +783,10 @@ pub const SCRIPT_CLASSES = [_]RawScript{
         .hint_top_to_bottom = false,
         .std_chars = "田 囗",
         .blues = &.{
-    .{ .chars = "他 们 你 來 們 到 和 地 对 對 就 席 我 时 時 會 来 為 能 舰 說 说 这 這 齊 | 军 同 已 愿 既 星 是 景 民 照 现 現 理 用 置 要 軍 那 配 里 開 雷 露 面 顾", .zones = .{ .bits = 2 } },
-    .{ .chars = "个 为 人 他 以 们 你 來 個 們 到 和 大 对 對 就 我 时 時 有 来 為 要 說 说 | 主 些 因 它 想 意 理 生 當 看 着 置 者 自 著 裡 过 还 进 進 過 道 還 里 面", .zones = .{ .bits = 0 } },
-    .{ .chars = " 些 们 你 來 們 到 和 地 她 将 將 就 年 得 情 最 样 樣 理 能 說 说 这 這 通 | 即 吗 吧 听 呢 品 响 嗎 师 師 收 断 斷 明 眼 間 间 际 陈 限 除 陳 随 際 隨", .zones = .{ .bits = 4 } },
-    .{ .chars = "事 前 學 将 將 情 想 或 政 斯 新 样 樣 民 沒 没 然 特 现 現 球 第 經 谁 起 | 例 別 别 制 动 動 吗 嗎 增 指 明 朝 期 构 物 确 种 調 调 費 费 那 都 間 间", .zones = .{ .bits = 6 } },
+            .{ .chars = "他 们 你 來 們 到 和 地 对 對 就 席 我 时 時 會 来 為 能 舰 說 说 这 這 齊 | 军 同 已 愿 既 星 是 景 民 照 现 現 理 用 置 要 軍 那 配 里 開 雷 露 面 顾", .zones = .{ .bits = 2 } },
+            .{ .chars = "个 为 人 他 以 们 你 來 個 們 到 和 大 对 對 就 我 时 時 有 来 為 要 說 说 | 主 些 因 它 想 意 理 生 當 看 着 置 者 自 著 裡 过 还 进 進 過 道 還 里 面", .zones = .{ .bits = 0 } },
+            .{ .chars = " 些 们 你 來 們 到 和 地 她 将 將 就 年 得 情 最 样 樣 理 能 說 说 这 這 通 | 即 吗 吧 听 呢 品 响 嗎 师 師 收 断 斷 明 眼 間 间 际 陈 限 除 陳 随 際 隨", .zones = .{ .bits = 4 } },
+            .{ .chars = "事 前 學 将 將 情 想 或 政 斯 新 样 樣 民 沒 没 然 特 现 現 球 第 經 谁 起 | 例 別 别 制 动 動 吗 嗎 增 指 明 朝 期 构 物 确 种 調 调 費 费 那 都 間 间", .zones = .{ .bits = 6 } },
         },
     },
 };
@@ -1691,159 +1686,159 @@ pub const STYLE_RANGES = [_]RawRange{
 };
 
 pub const script_index = struct {
-    pub const adlm : usize = 0;
-    pub const arab : usize = 1;
-    pub const armn : usize = 2;
-    pub const avst : usize = 3;
-    pub const bamu : usize = 4;
-    pub const beng : usize = 5;
-    pub const buhd : usize = 6;
-    pub const cakm : usize = 7;
-    pub const cans : usize = 8;
-    pub const cari : usize = 9;
-    pub const cher : usize = 10;
-    pub const copt : usize = 11;
-    pub const cprt : usize = 12;
-    pub const cyrl : usize = 13;
-    pub const deva : usize = 14;
-    pub const dsrt : usize = 15;
-    pub const ethi : usize = 16;
-    pub const geor : usize = 17;
-    pub const geok : usize = 18;
-    pub const glag : usize = 19;
-    pub const goth : usize = 20;
-    pub const grek : usize = 21;
-    pub const gujr : usize = 22;
-    pub const guru : usize = 23;
-    pub const hebr : usize = 24;
-    pub const hmnp : usize = 25;
-    pub const kali : usize = 26;
-    pub const khmr : usize = 27;
-    pub const khms : usize = 28;
-    pub const knda : usize = 29;
-    pub const laoo : usize = 30;
-    pub const latn : usize = 31;
-    pub const latb : usize = 32;
-    pub const latp : usize = 33;
-    pub const lisu : usize = 34;
-    pub const mlym : usize = 35;
-    pub const medf : usize = 36;
-    pub const mong : usize = 37;
-    pub const mymr : usize = 38;
-    pub const nkoo : usize = 39;
-    pub const none : usize = 40;
-    pub const olck : usize = 41;
-    pub const orkh : usize = 42;
-    pub const osge : usize = 43;
-    pub const osma : usize = 44;
-    pub const rohg : usize = 45;
-    pub const saur : usize = 46;
-    pub const shaw : usize = 47;
-    pub const sinh : usize = 48;
-    pub const sund : usize = 49;
-    pub const taml : usize = 50;
-    pub const tavt : usize = 51;
-    pub const telu : usize = 52;
-    pub const tfng : usize = 53;
-    pub const thai : usize = 54;
-    pub const vaii : usize = 55;
-    pub const limb : usize = 56;
-    pub const orya : usize = 57;
-    pub const sylo : usize = 58;
-    pub const tibt : usize = 59;
-    pub const hani : usize = 60;
+    pub const adlm: usize = 0;
+    pub const arab: usize = 1;
+    pub const armn: usize = 2;
+    pub const avst: usize = 3;
+    pub const bamu: usize = 4;
+    pub const beng: usize = 5;
+    pub const buhd: usize = 6;
+    pub const cakm: usize = 7;
+    pub const cans: usize = 8;
+    pub const cari: usize = 9;
+    pub const cher: usize = 10;
+    pub const copt: usize = 11;
+    pub const cprt: usize = 12;
+    pub const cyrl: usize = 13;
+    pub const deva: usize = 14;
+    pub const dsrt: usize = 15;
+    pub const ethi: usize = 16;
+    pub const geor: usize = 17;
+    pub const geok: usize = 18;
+    pub const glag: usize = 19;
+    pub const goth: usize = 20;
+    pub const grek: usize = 21;
+    pub const gujr: usize = 22;
+    pub const guru: usize = 23;
+    pub const hebr: usize = 24;
+    pub const hmnp: usize = 25;
+    pub const kali: usize = 26;
+    pub const khmr: usize = 27;
+    pub const khms: usize = 28;
+    pub const knda: usize = 29;
+    pub const laoo: usize = 30;
+    pub const latn: usize = 31;
+    pub const latb: usize = 32;
+    pub const latp: usize = 33;
+    pub const lisu: usize = 34;
+    pub const mlym: usize = 35;
+    pub const medf: usize = 36;
+    pub const mong: usize = 37;
+    pub const mymr: usize = 38;
+    pub const nkoo: usize = 39;
+    pub const none: usize = 40;
+    pub const olck: usize = 41;
+    pub const orkh: usize = 42;
+    pub const osge: usize = 43;
+    pub const osma: usize = 44;
+    pub const rohg: usize = 45;
+    pub const saur: usize = 46;
+    pub const shaw: usize = 47;
+    pub const sinh: usize = 48;
+    pub const sund: usize = 49;
+    pub const taml: usize = 50;
+    pub const tavt: usize = 51;
+    pub const telu: usize = 52;
+    pub const tfng: usize = 53;
+    pub const thai: usize = 54;
+    pub const vaii: usize = 55;
+    pub const limb: usize = 56;
+    pub const orya: usize = 57;
+    pub const sylo: usize = 58;
+    pub const tibt: usize = 59;
+    pub const hani: usize = 60;
 };
 
 pub const style_index = struct {
-    pub const adlm : usize = 0;
-    pub const arab : usize = 1;
-    pub const armn : usize = 2;
-    pub const avst : usize = 3;
-    pub const bamu : usize = 4;
-    pub const beng : usize = 5;
-    pub const buhd : usize = 6;
-    pub const cakm : usize = 7;
-    pub const cans : usize = 8;
-    pub const cari : usize = 9;
-    pub const cher : usize = 10;
-    pub const copt : usize = 11;
-    pub const cprt : usize = 12;
-    pub const cyrl_c2cp : usize = 13;
-    pub const cyrl_c2sc : usize = 14;
-    pub const cyrl_ordn : usize = 15;
-    pub const cyrl_pcap : usize = 16;
-    pub const cyrl_ruby : usize = 17;
-    pub const cyrl_sinf : usize = 18;
-    pub const cyrl_smcp : usize = 19;
-    pub const cyrl_subs : usize = 20;
-    pub const cyrl_sups : usize = 21;
-    pub const cyrl_titl : usize = 22;
-    pub const cyrl : usize = 23;
-    pub const deva : usize = 24;
-    pub const dsrt : usize = 25;
-    pub const ethi : usize = 26;
-    pub const geor : usize = 27;
-    pub const geok : usize = 28;
-    pub const glag : usize = 29;
-    pub const goth : usize = 30;
-    pub const grek_c2cp : usize = 31;
-    pub const grek_c2sc : usize = 32;
-    pub const grek_ordn : usize = 33;
-    pub const grek_pcap : usize = 34;
-    pub const grek_ruby : usize = 35;
-    pub const grek_sinf : usize = 36;
-    pub const grek_smcp : usize = 37;
-    pub const grek_subs : usize = 38;
-    pub const grek_sups : usize = 39;
-    pub const grek_titl : usize = 40;
-    pub const grek : usize = 41;
-    pub const gujr : usize = 42;
-    pub const guru : usize = 43;
-    pub const hebr : usize = 44;
-    pub const hmnp : usize = 45;
-    pub const kali : usize = 46;
-    pub const khmr : usize = 47;
-    pub const khms : usize = 48;
-    pub const knda : usize = 49;
-    pub const laoo : usize = 50;
-    pub const latn_c2cp : usize = 51;
-    pub const latn_c2sc : usize = 52;
-    pub const latn_ordn : usize = 53;
-    pub const latn_pcap : usize = 54;
-    pub const latn_ruby : usize = 55;
-    pub const latn_sinf : usize = 56;
-    pub const latn_smcp : usize = 57;
-    pub const latn_subs : usize = 58;
-    pub const latn_sups : usize = 59;
-    pub const latn_titl : usize = 60;
-    pub const latn : usize = 61;
-    pub const latb : usize = 62;
-    pub const latp : usize = 63;
-    pub const lisu : usize = 64;
-    pub const mlym : usize = 65;
-    pub const medf : usize = 66;
-    pub const mong : usize = 67;
-    pub const mymr : usize = 68;
-    pub const nkoo : usize = 69;
-    pub const none : usize = 70;
-    pub const olck : usize = 71;
-    pub const orkh : usize = 72;
-    pub const osge : usize = 73;
-    pub const osma : usize = 74;
-    pub const rohg : usize = 75;
-    pub const saur : usize = 76;
-    pub const shaw : usize = 77;
-    pub const sinh : usize = 78;
-    pub const sund : usize = 79;
-    pub const taml : usize = 80;
-    pub const tavt : usize = 81;
-    pub const telu : usize = 82;
-    pub const tfng : usize = 83;
-    pub const thai : usize = 84;
-    pub const vaii : usize = 85;
-    pub const limb : usize = 86;
-    pub const orya : usize = 87;
-    pub const sylo : usize = 88;
-    pub const tibt : usize = 89;
-    pub const hani : usize = 90;
+    pub const adlm: usize = 0;
+    pub const arab: usize = 1;
+    pub const armn: usize = 2;
+    pub const avst: usize = 3;
+    pub const bamu: usize = 4;
+    pub const beng: usize = 5;
+    pub const buhd: usize = 6;
+    pub const cakm: usize = 7;
+    pub const cans: usize = 8;
+    pub const cari: usize = 9;
+    pub const cher: usize = 10;
+    pub const copt: usize = 11;
+    pub const cprt: usize = 12;
+    pub const cyrl_c2cp: usize = 13;
+    pub const cyrl_c2sc: usize = 14;
+    pub const cyrl_ordn: usize = 15;
+    pub const cyrl_pcap: usize = 16;
+    pub const cyrl_ruby: usize = 17;
+    pub const cyrl_sinf: usize = 18;
+    pub const cyrl_smcp: usize = 19;
+    pub const cyrl_subs: usize = 20;
+    pub const cyrl_sups: usize = 21;
+    pub const cyrl_titl: usize = 22;
+    pub const cyrl: usize = 23;
+    pub const deva: usize = 24;
+    pub const dsrt: usize = 25;
+    pub const ethi: usize = 26;
+    pub const geor: usize = 27;
+    pub const geok: usize = 28;
+    pub const glag: usize = 29;
+    pub const goth: usize = 30;
+    pub const grek_c2cp: usize = 31;
+    pub const grek_c2sc: usize = 32;
+    pub const grek_ordn: usize = 33;
+    pub const grek_pcap: usize = 34;
+    pub const grek_ruby: usize = 35;
+    pub const grek_sinf: usize = 36;
+    pub const grek_smcp: usize = 37;
+    pub const grek_subs: usize = 38;
+    pub const grek_sups: usize = 39;
+    pub const grek_titl: usize = 40;
+    pub const grek: usize = 41;
+    pub const gujr: usize = 42;
+    pub const guru: usize = 43;
+    pub const hebr: usize = 44;
+    pub const hmnp: usize = 45;
+    pub const kali: usize = 46;
+    pub const khmr: usize = 47;
+    pub const khms: usize = 48;
+    pub const knda: usize = 49;
+    pub const laoo: usize = 50;
+    pub const latn_c2cp: usize = 51;
+    pub const latn_c2sc: usize = 52;
+    pub const latn_ordn: usize = 53;
+    pub const latn_pcap: usize = 54;
+    pub const latn_ruby: usize = 55;
+    pub const latn_sinf: usize = 56;
+    pub const latn_smcp: usize = 57;
+    pub const latn_subs: usize = 58;
+    pub const latn_sups: usize = 59;
+    pub const latn_titl: usize = 60;
+    pub const latn: usize = 61;
+    pub const latb: usize = 62;
+    pub const latp: usize = 63;
+    pub const lisu: usize = 64;
+    pub const mlym: usize = 65;
+    pub const medf: usize = 66;
+    pub const mong: usize = 67;
+    pub const mymr: usize = 68;
+    pub const nkoo: usize = 69;
+    pub const none: usize = 70;
+    pub const olck: usize = 71;
+    pub const orkh: usize = 72;
+    pub const osge: usize = 73;
+    pub const osma: usize = 74;
+    pub const rohg: usize = 75;
+    pub const saur: usize = 76;
+    pub const shaw: usize = 77;
+    pub const sinh: usize = 78;
+    pub const sund: usize = 79;
+    pub const taml: usize = 80;
+    pub const tavt: usize = 81;
+    pub const telu: usize = 82;
+    pub const tfng: usize = 83;
+    pub const thai: usize = 84;
+    pub const vaii: usize = 85;
+    pub const limb: usize = 86;
+    pub const orya: usize = 87;
+    pub const sylo: usize = 88;
+    pub const tibt: usize = 89;
+    pub const hani: usize = 90;
 };

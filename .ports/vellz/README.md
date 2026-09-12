@@ -101,10 +101,10 @@ device-loss/unsupported-capability/missing-binding/feedback-loop errors)
 running on the llvmpipe software adapter.
 
 Not yet implemented (explicit typed errors, never placeholder pixels): PNG
-16-bit/Adam7 decode, plus fonts that would need the autohinter or hinted
-advances from `hdmx` without backward compatibility (all typed
-`error.Unsupported`); GPU masks, atlas-backed images, GPU text, and the full
-G5 corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
+16-bit/Adam7 decode, hinted advances from `hdmx` without backward
+compatibility, `gvar`/`HVAR` coordinates, CFF/CFF2 outlines and synthetic
+embolden (all typed `error.Unsupported`); GPU masks, atlas-backed images, GPU
+text, and the full G5 corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
 SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage
 benchmarks in `docs/benchmarks.md` (u8-vs-f32 speedups 1.9–3.4× on the
 representative scenes). MT filter layers and u8 + MT return

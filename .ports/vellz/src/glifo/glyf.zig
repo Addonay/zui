@@ -519,45 +519,44 @@ pub const Outlines = struct {
         };
     }
 
-/// `OutlineGlyph::draw_unscaled` for `glyf`: runs the unhinted FreeType
-/// scaler with no ppem and pushes raw font-unit points into `sink`.
-///
-/// `sink` is duck-typed and must provide `tryReserve(usize) DrawError!void`
-/// and `push(UnscaledSinkPoint) DrawError!void`. Returns the adjusted
-/// advance width in font units (`>> 6`), like upstream.
-pub fn drawUnscaled(
-    self: *const Outlines,
-    allocator: std.mem.Allocator,
-    gid: GlyphId,
-    sink: anytype,
-) DrawError!i32 {
-    const info = try self.outline(gid);
-    if (info.points > max_points) return error.TooManyPoints;
-    var scaler = try Scaler.init(allocator, self, &info, null, null, false);
-    defer scaler.deinit();
-    try scaler.load(info.glyph, gid, 0);
-    try sink.tryReserve(scaler.point_count);
-    var contour_start: usize = 0;
-    for (scaler.contours.items) |contour_end_raw| {
-        const contour_end: usize = contour_end_raw;
-        if (contour_end >= contour_start) {
-            var ix = contour_start;
-            while (ix <= contour_end) : (ix += 1) {
-                const point = scaler.scaled.items[ix];
-                try sink.push(.{
-                    .x = @truncate(point.x >> 6),
-                    .y = @truncate(point.y >> 6),
-                    .flags = scaler.flags.items[ix] & raw.flag_on_curve_point,
-                    .is_contour_start = ix == contour_start,
-                });
+    /// `OutlineGlyph::draw_unscaled` for `glyf`: runs the unhinted FreeType
+    /// scaler with no ppem and pushes raw font-unit points into `sink`.
+    ///
+    /// `sink` is duck-typed and must provide `tryReserve(usize) DrawError!void`
+    /// and `push(UnscaledSinkPoint) DrawError!void`. Returns the adjusted
+    /// advance width in font units (`>> 6`), like upstream.
+    pub fn drawUnscaled(
+        self: *const Outlines,
+        allocator: std.mem.Allocator,
+        gid: GlyphId,
+        sink: anytype,
+    ) DrawError!i32 {
+        const info = try self.outline(gid);
+        if (info.points > max_points) return error.TooManyPoints;
+        var scaler = try Scaler.init(allocator, self, &info, null, null, false);
+        defer scaler.deinit();
+        try scaler.load(info.glyph, gid, 0);
+        try sink.tryReserve(scaler.point_count);
+        var contour_start: usize = 0;
+        for (scaler.contours.items) |contour_end_raw| {
+            const contour_end: usize = contour_end_raw;
+            if (contour_end >= contour_start) {
+                var ix = contour_start;
+                while (ix <= contour_end) : (ix += 1) {
+                    const point = scaler.scaled.items[ix];
+                    try sink.push(.{
+                        .x = @truncate(point.x >> 6),
+                        .y = @truncate(point.y >> 6),
+                        .flags = scaler.flags.items[ix] & raw.flag_on_curve_point,
+                        .is_contour_start = ix == contour_start,
+                    });
+                }
             }
+            contour_start = contour_end + 1;
         }
-        contour_start = contour_end + 1;
+        const advance = scaler.phantom[1].x -% scaler.phantom[0].x;
+        return advance >> 6;
     }
-    const advance = scaler.phantom[1].x -% scaler.phantom[0].x;
-    return advance >> 6;
-}
-
 };
 
 /// One raw unscaled outline point for the autohinter (`UnscaledPoint`).

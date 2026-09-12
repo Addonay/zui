@@ -148,6 +148,8 @@ fn fontBlob(font_id: u8) ![]const u8 {
         manifest.font_noto => try fixture.notoColor(),
         manifest.font_noto_cbtf => try fixture.notoCbtf(),
         manifest.font_notosans => try fixture.notoSans(),
+        manifest.font_notosans_mono => try fixture.notoSansMono(),
+        manifest.font_notosans_devanagari => try fixture.notoSansDevanagari(),
         else => error.TestUnexpectedResult,
     };
 }

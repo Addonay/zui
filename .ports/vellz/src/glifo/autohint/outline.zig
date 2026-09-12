@@ -64,11 +64,11 @@ pub const Direction = enum(i8) {
     }
 
     pub fn isOpposite(self: Direction, other: Direction) bool {
-        return @as(i8, @intFromEnum(self)) +% @as(i8, @intFromEnum(other)) == 0;
+        return @as(i8, @backingInt(self)) +% @as(i8, @backingInt(other)) == 0;
     }
 
     pub fn isSameAxis(self: Direction, other: Direction) bool {
-        return @abs(@as(i8, @intFromEnum(self))) == @abs(@as(i8, @intFromEnum(other)));
+        return @abs(@as(i8, @backingInt(self))) == @abs(@as(i8, @backingInt(other)));
     }
 
     pub fn normalize(self: Direction) Direction {
