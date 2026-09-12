@@ -10,6 +10,10 @@ pub const TextField = struct {
         text_color: @import("../core/color.zig").Color = .hex(0xf2f2f5),
         placeholder_color: @import("../core/color.zig").Color = .hex(0x6f7082),
         focus_color: @import("../core/color.zig").Color = .hex(0x7c5cff),
+        /// Inner horizontal padding of the field box. The caret origin is
+        /// read back from the built node's actual style, so text and caret
+        /// stay aligned when this changes.
+        padding: f32 = 8,
     };
 
     buffer: [limits.MAX_TEXT_LEN]u8 = undefined,
@@ -36,21 +40,34 @@ pub const TextField = struct {
         const focused = window.focused.eql(cx.focusHandle());
         const value = if (self.len == 0) self.placeholder else self.buffer[0..self.len];
         const color = if (self.len == 0) self.options.placeholder_color else self.options.text_color;
-        var field = elements.div().flex_row().h(40).size_full().px(8).items_center()
+        const text_element = elements.text(value, .{ .size = 14, .color = color });
+        var field = elements.div().flex_row().h(40).size_full().px(self.options.padding).items_center()
             .rounded_lg()
             .cursor_text()
             .border_1()
             .border_color(if (focused) self.options.focus_color else @import("../core/color.zig").Color.transparent)
-            .child(elements.text(value, .{ .size = 14, .color = color }));
+            .child(text_element);
         if (focused) {
-            // Shaped width when fonts are present so the caret tracks the
-            // ink; bitmap estimate otherwise (same fallback as measure).
-            const text_w = if (window.fonts) |fc|
-                fc.measureText(self.buffer[0..self.caret], 14, 0, "")
-            else
-                @as(f32, @floatFromInt(std.unicode.utf8CountCodepoints(self.buffer[0..self.caret]) catch 0)) * elements.element.textAdvance(14, 0, .normal);
-            const cursor_x = text_w + 8;
-            field = field.child(elements.div().absolute().left(cursor_x).top(10).w(1).h(20).bg(self.options.focus_color));
+            // Caret advance comes from the same engine that paints the text
+            // (`text_engine.caretX` shapes through the shared cozmic path),
+            // so it cannot drift from the painted advances. `.unavailable`
+            // (no engine installed, or no line-0 caret position) omits the
+            // caret rather than mixing in a guessed advance.
+            const frame = elements.element.currentFrame();
+            const text_node = &frame.nodes[text_element.index];
+            const caret = elements.text_engine.caretX(frame, text_node, self.caret);
+            const local_x: ?f32 = switch (caret.source) {
+                .cozmic => caret.x,
+                .unavailable => null,
+            };
+            if (local_x) |x| {
+                // The caret is an absolute child of the field and positions
+                // from the field's border box, so its origin is the field's
+                // own content offset (actual style padding, not a hardcoded
+                // 8px) plus the engine-local prefix x.
+                const origin_x = frame.nodes[field.index].style.padding.left;
+                field = field.child(elements.div().absolute().left(origin_x + x).top(10).w(1).h(20).bg(self.options.focus_color));
+            }
         }
         return field.withFocus(cx.focusHandle());
     }
@@ -244,4 +261,80 @@ test "caret editing preserves UTF-8 and inserts in the middle" {
     field.append("é");
     try std.testing.expectEqual(field.buffer.len - 1, field.len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(field.buffer[0..field.len]));
+}
+
+test "caret x follows the engine's prefix width; no engine omits it" {
+    // Regression: the caret used the old collection measure, so under the
+    // engine it drifted from the painted advances with every prefix byte.
+    // `text_engine.caretX` shapes through the same path paint uses.
+    const t = std.testing;
+    const text_engine = @import("../fonts/text_engine.zig");
+    const App = @import("../app/app.zig").App;
+    const Window = @import("../app/window.zig").Window;
+    const gpu = @import("../gpu/root.zig");
+
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+    const engine = text_engine.Engine.init(t.allocator) catch |err| switch (err) {
+        error.ShaperUnavailable, error.LibraryUnavailable, error.NoFontsAvailable, error.FontCorpusIncomplete => return error.SkipZigTest,
+        else => return err,
+    };
+    defer engine.deinit();
+
+    var store = runtime.EntityStore.init(t.allocator);
+    defer store.deinit();
+    const ent = store.create(TextField, .{ .placeholder = "ph" }, null);
+    const field = ent.readMut();
+    field.append("abc");
+    field.caret = 2;
+
+    const win = try app.openWindow(.{}, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+    var cx = runtime.Context(TextField){ .store = &store, .current = ent, .window = win };
+    win.focused = cx.focusHandle();
+    const frame = &win.ui_frame;
+
+    // Engine installed: caret x == the engine's prefix advance + the 8px pad.
+    frame.reset(win, .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    elements.element.beginFrame(frame);
+    const rendered = field.render(win, &cx);
+    const text_index = frame.nodes[rendered.index].first_child.?;
+    const caret_index = frame.nodes[text_index].next_sibling.?;
+    const engine_caret_x = frame.nodes[caret_index].style.left.?;
+    elements.element.endFrame();
+
+    const attrs = elements.text_engine.attrs(&frame.nodes[text_index]);
+    const prefix_w = try engine.measure(t.allocator, "ab", attrs);
+    try t.expectApproxEqAbs(prefix_w + 8, engine_caret_x, 0.001);
+
+    // A non-default field pad moves the caret origin with the field's actual
+    // style (content offset + engine-local x), not a hardcoded 8px.
+    field.options.padding = 12;
+    frame.reset(win, .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    elements.element.beginFrame(frame);
+    const rendered_wide = field.render(win, &cx);
+    const wide_text_index = frame.nodes[rendered_wide.index].first_child.?;
+    const wide_caret_index = frame.nodes[wide_text_index].next_sibling.?;
+    const wide_pad = frame.nodes[rendered_wide.index].style.padding.left;
+    const wide_caret_x = frame.nodes[wide_caret_index].style.left.?;
+    elements.element.endFrame();
+    try t.expectApproxEqAbs(@as(f32, 12), wide_pad, 0.001);
+    try t.expectApproxEqAbs(prefix_w + wide_pad, wide_caret_x, 0.001);
+    field.options.padding = 8;
+
+    // No engine: the caret is omitted (`.unavailable`) instead of guessing
+    // an advance that the painter would not match. The old fallbacks are
+    // gone, so there must be no caret sibling at all.
+    frame.reset(win, .{});
+    frame.allocator = t.allocator;
+    elements.element.beginFrame(frame);
+    const rendered_bare = field.render(win, &cx);
+    const bare_text_index = frame.nodes[rendered_bare.index].first_child.?;
+    try t.expectEqual(@as(?u16, null), frame.nodes[bare_text_index].next_sibling);
+    elements.element.endFrame();
 }

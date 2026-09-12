@@ -1,8 +1,26 @@
 .{
     .name = .zui,
     .version = "0.0.1",
-    .minimum_zig_version = "0.17.0-dev.1970+67f39b551",
+    // cozmic (v0.0.1, published package) declares 0.17.0-dev.2085+5e36170b5
+    // as its minimum; keep the root at the same floor so `zig build` cannot
+    // accept a toolchain that the dependency rejects.
+    .minimum_zig_version = "0.17.0-dev.2085+5e36170b5",
     .fingerprint = 0xc00160dbcf146dfd,
+    .dependencies = .{
+        // Text layout/editing engine: https://github.com/Addonay/cozmic,
+        // pinned to the v0.0.1 release commit (immutable SHA + package hash).
+        .cozmic = .{
+            .url = "git+https://github.com/Addonay/cozmic.git#83e791d1752a1d86d7eadb19987a10fcd44307a8",
+            .hash = "cozmic-0.0.1-wv6CLXwXdACzzBiH7DZ0nw4RpxnyTkxVGwxxk6s6pc8u",
+        },
+        // Standalone layout-engine package: https://github.com/Addonay/zlay,
+        // pinned to the initial release commit. It has its own build, tests,
+        // fixtures and benchmarks (`cd ../zlay && zig build test [-Dserde=true]`).
+        .zlay = .{
+            .url = "git+https://github.com/Addonay/zlay.git#dbce9266163ba5400385693aebd86c0726464a94",
+            .hash = "zlay-0.1.0-0OJsDbPRDgDhk2RghWTtm2uGYh5ze2D6GrPo-wDSEj5r",
+        },
+    },
     .paths = .{
         "src",
         "examples",

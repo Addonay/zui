@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("../core/root.zig");
 const element = @import("element.zig");
+const text_engine = @import("text_engine.zig");
 
 fn childCount(frame: *element.Frame, node: *const element.Node) usize {
     var count: usize = 0;
@@ -30,18 +31,25 @@ pub fn measure(frame: *element.Frame, index: u16) core.Size {
             }
         },
         .text => {
-            if (frame.fonts) |fc| {
-                // Shaped width: the exact advances the painter places with.
-                natural.w = fc.measureText(node.text_value, node.text_style.size, node.text_style.tracking, node.text_style.font);
-            } else {
-                var glyphs: usize = 0;
-                for (node.text_value) |byte| if ((byte & 0xc0) != 0x80) {
-                    glyphs += 1;
-                };
-                const count = @as(f32, @floatFromInt(glyphs));
-                natural.w = count * element.textAdvance(node.text_style.size, node.text_style.tracking, node.text_style.weight);
+            // Text is always cozmic. With no engine installed the node has
+            // no measurable ink (zero box, nothing painted); there is no
+            // legacy/bitmap fallback.
+            node.cozmic_measured = false;
+            // Re-measuring owns the node's measure→paint handoff: drop the
+            // previous layout first so a failed shape can never leave stale
+            // cozmic state for paint to see.
+            node.clearCozmicLayout();
+            if (text_engine.engineFor(frame)) |engine| {
+                if (text_engine.measureCached(engine, node, text_engine.frameAllocator(frame))) |size| {
+                    natural.w = size.w;
+                    natural.h = size.h;
+                    node.cozmic_measured = true;
+                } else |_| {
+                    // Invalid metrics or OOM: the node keeps its zero natural
+                    // size and paint counts the mismatch instead of drawing
+                    // stale ink.
+                }
             }
-            natural.h = node.text_style.line_height orelse node.text_style.size * 1.25;
         },
         .spacer => {},
         .container => {
@@ -72,6 +80,13 @@ pub fn measure(frame: *element.Frame, index: u16) core.Size {
     if (node.style.square) |side| {
         natural = .{ .w = side, .h = side };
     }
+    // Measured-box semantics: an explicit width is the measured slot, not
+    // the wrapped text extent. Cozmic shapes with the same value as its wrap
+    // constraint (`text_engine.wrapWidth` returns `style.width`), so the
+    // painted layout fits this slot, while row siblings and justification
+    // advance by the slot.
+    // The branch above only replaces the text advance, and only when the
+    // cozmic measure actually ran; this clamp always wins.
     if (node.style.width) |width| natural.w = width;
     if (node.style.height) |height| natural.h = height;
     node.measured = natural;
@@ -192,18 +207,25 @@ test "column layout applies padding and gap" {
     try std.testing.expectEqual(@as(f32, 35), frame.nodes[2].bounds.y);
 }
 
-test "text measure matches painter advance" {
+test "text measure matches engine measure" {
     const t = std.testing;
+    const engine = try testEngine();
+    defer engine.deinit();
     var frame = element.Frame{};
     frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
     element.beginFrame(&frame);
     defer element.endFrame();
     const root = element.text("abc", .{ .size = 14 });
     layout(&frame, root, .{ .w = 500, .h = 100 });
-    const want = 3 * element.textAdvance(14, 0, .normal);
+    const node = &frame.nodes[root.index];
+    try t.expect(node.cozmic_measured);
     // NOTE: root text bounds stretch to the forced viewport; measured width
-    // is what must match the painter's advance.
-    try t.expectApproxEqAbs(want, frame.nodes[root.index].measured.w, 0.001);
+    // must match the engine layout the painter replays.
+    const want = try engine.measure(t.allocator, "abc", text_engine.attrs(node));
+    try t.expectApproxEqAbs(want, node.measured.w, 0.001);
+    try t.expect(want > 0);
 }
 
 test "progress track fill is proportional and fits parent" {
@@ -234,29 +256,89 @@ test "row child keeps explicit height with zero measured height" {
     try t.expectApproxEqAbs(@as(f32, 4), frame.nodes[child_idx].bounds.h, 0.001);
 }
 
-test "shaped measure matches collection measure" {
+test "shaped measure matches the engine's own layout" {
     const t = std.testing;
-    const fonts = @import("../fonts/root.zig");
-    if (!fonts.tables.FontconfigApi.isAvailable() or !fonts.tables.FreeTypeApi.isAvailable() or !fonts.tables.HarfBuzzApi.isAvailable()) return;
-    // Heap-allocated: Collection.init() needs ~8.7MB of Debug frame (see
-    // the "hot frame structs stay within stack budget" test in
-    // painter.zig); keep the test frame small.
-    const stack = try t.allocator.create(fonts.Collection);
-    defer t.allocator.destroy(stack);
-    stack.* = try fonts.Collection.init();
-    defer stack.deinit();
+    const engine = try testEngine();
+    defer engine.deinit();
 
     var frame = element.Frame{};
     frame.reset(@ptrFromInt(1), .{});
-    frame.fonts = stack;
+    frame.engine = engine;
+    frame.allocator = t.allocator;
     element.beginFrame(&frame);
     defer element.endFrame();
     const root = element.text("Hello", .{ .size = 14 });
     layout(&frame, root, .{ .w = 500, .h = 100 });
-    const want = stack.measureText("Hello", 14, 0, "");
-    try t.expectApproxEqAbs(want, frame.nodes[root.index].measured.w, 0.001);
-    // And the shaped width differs from the bitmap estimate (or the test
-    // proves nothing about which path ran).
-    const estimate = 5 * element.textAdvance(14, 0, .normal);
-    try t.expect(@abs(want - estimate) > 1.0);
+    const node = &frame.nodes[root.index];
+    const want = try engine.measure(t.allocator, "Hello", text_engine.attrs(node));
+    try t.expectApproxEqAbs(want, node.measured.w, 0.001);
+    // And the shaped width is a real advance, not a zero box.
+    try t.expect(want > 1.0);
+}
+
+test "text explicit width stays the measured slot" {
+    // Regression: cozmic mode used to measure `.w(200)` text as its wrapped
+    // extent, so a row sibling after it started at the text ink instead of
+    // the 200px slot. The explicit slot is the measured box (the same value
+    // is also cozmic's wrap constraint).
+    const t = std.testing;
+    const engine = try testEngine();
+    defer engine.deinit();
+
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const root = element.div().w(500).h(50).flex_row()
+        .child(element.text("x", .{ .size = 14 }).w(200))
+        .child(element.text("y", .{ .size = 14 }));
+    layout(frame, root, .{ .w = 500, .h = 50 });
+    const x_index = frame.nodes[root.index].first_child.?;
+    const y_index = frame.nodes[x_index].next_sibling.?;
+    try t.expect(frame.nodes[x_index].cozmic_measured);
+    try t.expectApproxEqAbs(@as(f32, 200), frame.nodes[x_index].measured.w, 0.001);
+    try t.expectApproxEqAbs(@as(f32, 200), frame.nodes[y_index].bounds.x, 0.001);
+}
+
+test "text explicit width clamps when cozmic measure fails" {
+    // The `.w()` measured-slot clamp is applied after the measure branch,
+    // so it must hold on a failed cozmic shape too (invalid metrics), not
+    // only when the layout succeeded.
+    const t = std.testing;
+    const engine = try testEngine();
+    defer engine.deinit();
+
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    element.beginFrame(frame);
+    defer element.endFrame();
+    // line_height 0 is invalid cozmic input; the explicit 200px slot must
+    // still win.
+    const root = element.div().w(500).h(50).flex_row()
+        .child(element.text("x", .{ .size = 14, .line_height = 0 }).w(200))
+        .child(element.text("y", .{ .size = 14 }));
+    layout(frame, root, .{ .w = 500, .h = 50 });
+    const x_index = frame.nodes[root.index].first_child.?;
+    const y_index = frame.nodes[x_index].next_sibling.?;
+    try t.expect(!frame.nodes[x_index].cozmic_measured);
+    try t.expectApproxEqAbs(@as(f32, 200), frame.nodes[x_index].measured.w, 0.001);
+    try t.expectApproxEqAbs(@as(f32, 200), frame.nodes[y_index].bounds.x, 0.001);
+}
+
+/// Corpus engine, skipping when the host lacks the libraries cozmic loads
+/// via `dlopen`.
+fn testEngine() !*@import("../fonts/text_engine.zig").Engine {
+    const fonts = @import("../fonts/text_engine.zig");
+    return fonts.Engine.init(std.testing.allocator) catch |err| switch (err) {
+        error.ShaperUnavailable, error.LibraryUnavailable, error.NoFontsAvailable, error.FontCorpusIncomplete => return error.SkipZigTest,
+        else => return err,
+    };
 }

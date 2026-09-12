@@ -11,6 +11,7 @@
 
 # Root build products and local tool state.
 /zig-out/
+/zig-pkg/
 /.zig-cache/
 /target/
 /.zig-global/

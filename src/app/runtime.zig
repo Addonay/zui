@@ -254,8 +254,16 @@ pub fn mountView(store: *EntityStore, window: *Window, build_fn: anytype) void {
                 const entity = Entity(T){ .header = header, .value = value };
                 var render_cx = Context(T){ .store = header.store, .current = entity, .window = win };
                 win.ui_frame.reset(win, win.pointer_position);
-                win.ui_frame.fonts = win.fonts;
                 win.ui_frame.images = win.images;
+                // Text is always cozmic: install the App-owned engine (null
+                // when the host has no fonts or init failed; text then draws
+                // nothing). The provider is memoized, so a failed init is
+                // not retried per frame.
+                win.ui_frame.engine = null;
+                if (win.cozmic_engine_fn) |provide| {
+                    const ctx: *anyopaque = if (win.cozmic_engine_ctx) |c| c else win;
+                    win.ui_frame.engine = provide(ctx);
+                }
                 win.ui_frame.frame_id = win.frame_id;
                 win.ui_frame.allocator = win.allocator;
                 elements.element.beginFrame(&win.ui_frame);
@@ -288,3 +296,70 @@ pub const TestHarness = struct {
         return self.store.create(T, options, null);
     }
 };
+
+test "element frames install the provider's engine" {
+    // Regression: measure and paint must share one engine (or neither), so
+    // the frame's `engine` is exactly what the provider returned. There is
+    // no font-stack gate any more.
+    const t = std.testing;
+    const App = @import("app.zig").App;
+    const text_engine = @import("../fonts/text_engine.zig");
+
+    const TestView = struct {
+        pub const Options = struct {};
+        pub fn init(_: *Context(@This()), _: Options) @This() {
+            return .{};
+        }
+        pub fn render(_: *@This(), _: *Window, _: *Context(@This())) elements.Element {
+            return elements.div().w(10).h(10);
+        }
+    };
+
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+
+    var provider_calls: u32 = 0;
+    var provided_engine: ?*text_engine.Engine = null;
+    const Provider = struct {
+        var calls: *u32 = undefined;
+        var result: *?*text_engine.Engine = undefined;
+        fn provide(_: *anyopaque) ?*text_engine.Engine {
+            calls.* += 1;
+            return result.*;
+        }
+    };
+    Provider.calls = &provider_calls;
+    Provider.result = &provided_engine;
+
+    const win = try app.openWindow(.{}, struct {
+        fn build(_: *Window, cx: *Context(TestView)) Entity(TestView) {
+            return cx.new(TestView, .{});
+        }
+    }.build);
+    win.cozmic_engine_fn = Provider.provide;
+    win.cozmic_engine_ctx = &provider_calls;
+
+    // Provider returns null: the frame has no engine and text would draw
+    // nothing; the provider is still consulted once per frame.
+    win.render();
+    try t.expectEqual(@as(u32, 1), provider_calls);
+    try t.expect(win.ui_frame.engine == null);
+
+    // Provider returns an engine: the frame installs exactly that pointer.
+    // Use a real corpus engine (the view has no text, so it is only touched
+    // by the frame-level `beginFrame`).
+    const engine = text_engine.Engine.init(t.allocator) catch |err| switch (err) {
+        error.ShaperUnavailable, error.LibraryUnavailable, error.NoFontsAvailable, error.FontCorpusIncomplete => return error.SkipZigTest,
+        else => return err,
+    };
+    defer engine.deinit();
+    provided_engine = engine;
+    win.render();
+    try t.expectEqual(@as(u32, 2), provider_calls);
+    try t.expect(win.ui_frame.engine == engine);
+
+    // reset() clears per-frame installs but not the provider wiring.
+    win.ui_frame.reset(win, .{});
+    try t.expect(win.ui_frame.engine == null);
+    provided_engine = null;
+}

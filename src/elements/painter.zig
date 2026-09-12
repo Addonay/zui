@@ -1,22 +1,37 @@
 const std = @import("std");
+const cozmic = @import("cozmic");
 const core = @import("../core/root.zig");
 const gpu = @import("../gpu/root.zig");
-const fonts = @import("../fonts/root.zig");
+const engine_mod = @import("../fonts/text_engine.zig");
 const images = @import("../images/root.zig");
 const platform = @import("../platform/root.zig");
 const element = @import("element.zig");
+const text_engine = @import("text_engine.zig");
 
 pub fn paint(frame: *element.Frame, root: element.Element, scene: *gpu.Scene) void {
+    // Counters describe one paint: a second paint on the same frame (e.g. a
+    // repaint without `reset`) must report that paint's values, not the sum
+    // of both. Per-node counters are cleared in `paintText` likewise.
+    frame.cozmic_painted_extent = 0;
+    frame.cozmic_painted_glyphs = 0;
+    frame.cozmic_skipped_glyphs = 0;
+    frame.cozmic_paint_failures = 0;
+
     // Frame boundary for the glyph atlas: applies any eviction deferred
     // past the previous frame's emitted glyphs (safe — that frame already
     // presented before this paint runs).
-    if (frame.fonts) |fc| fc.glyphs.beginFrame();
+    if (frame.engine) |engine| engine.glyphs.beginFrame();
     paintNode(frame, root.index, scene, core.Color.white, 1, .{
         .x = -1e9,
         .y = -1e9,
         .w = 2e9,
         .h = 2e9,
     });
+    // The measure→paint handoff is consumed: release every retained layout
+    // so repaints, teardown, and layout+paint loops that never call `reset`
+    // cannot leak a shaped buffer. A paint without a new measure reshapes
+    // (retainedLayout then finds nothing).
+    frame.clearCozmicLayouts();
 }
 
 fn alpha(color: core.Color, opacity: f32) core.Color {
@@ -283,251 +298,258 @@ fn resolveBytes(
     return cache.imageFromBytes(alloc, bytes, frame_id) catch null;
 }
 
-fn paintText(frame: *element.Frame, scene: *gpu.Scene, node: *const element.Node, color: core.Color, clip: core.Rect) void { // Shaped path when the font stack is present, bitmap fallback without
-    // system fonts (headless CI) or if sizing fails mid-frame.
-    if (frame.fonts) |fc| {
-        paintShaped(fc, scene, node, color, clip);
-    } else {
-        paintBitmapText(scene, node, color, clip);
+fn paintText(frame: *element.Frame, scene: *gpu.Scene, node: *element.Node, color: core.Color, clip: core.Rect) void {
+    // Node counters describe this paint only: a reused node must not carry
+    // stale values from an earlier paint, and the frame aggregates stay the
+    // sum of node values.
+    node.cozmic_painted_extent = 0;
+    node.cozmic_painted_glyphs = 0;
+    node.cozmic_skipped_glyphs = 0;
+    node.cozmic_paint_failures = 0;
+
+    // Text is always cozmic. Without an engine installed there is no legacy
+    // fallback: emit nothing and count the node as a paint failure so the gap
+    // stays observable.
+    const engine = frame.engine orelse {
+        node.cozmic_paint_failures += 1;
+        frame.cozmic_paint_failures += 1;
+        return;
+    };
+    // Measure→paint ownership: only a node whose measure actually produced a
+    // cozmic box may paint. A node that measured as skipped (no engine at
+    // measure time, invalid metrics) has a zero natural box, and painting a
+    // fresh shape into it would put ink in a box nobody sized; count the
+    // mismatch instead.
+    if (!node.cozmic_measured) {
+        node.cozmic_paint_failures += 1;
+        frame.cozmic_paint_failures += 1;
+        return;
     }
+    paintShapedCozmic(frame, engine, scene, node, color, clip);
 }
 
-/// Shape, cache, and emit atlas glyphs. Placement uses the shaped advances
-/// verbatim — the same numbers `Collection.measureText` returns, so
-/// measurement matches output by construction.
-fn paintShaped(fc: *fonts.Collection, scene: *gpu.Scene, node: *const element.Node, color: core.Color, clip: core.Rect) void {
-    const px = fonts.sizeToPx(node.text_style.size);
-    const shaper = fc.shaperFor(node.text_style.font);
-    shaper.setPixelSize(px) catch return;
-    const face = fc.faceFor(node.text_style.font);
-    if (fc.symbols) |*sym| sym.setPixelSize(px) catch {};
-    const run = shaper.shape(node.text_value);
+/// Cozmic paint path: one layout for the node, glyphs placed from cozmic's
+/// physical positions and rasterized through `Engine.cache`.
+///
+/// The layout is the one `layout.measure` retained when it matches the node's
+/// current inputs and this engine (`text_engine.retainedLayout`); the emit
+/// pass below is the same code either way, so reuse cannot change positions,
+/// decorations, or fallback policy. Without a valid handoff the node is
+/// reshaped here from the same inputs as measure. A glyph that cannot be
+/// rasterized (unknown face, atlas full, color-only ink) is skipped and
+/// counted, and a layout that cannot be shaped emits nothing — the measured
+/// box stays valid either way.
+fn paintShapedCozmic(
+    frame: *element.Frame,
+    engine: *engine_mod.Engine,
+    scene: *gpu.Scene,
+    node: *element.Node,
+    color: core.Color,
+    clip: core.Rect,
+) void {
+    // Measure→paint reuse. The retained layout is valid only for the exact
+    // inputs it was shaped from; a mismatch (style change, wrap width
+    // change, engine switch) falls through to a fresh shape, never stale
+    // metrics.
+    if (text_engine.retainedLayout(frame, node)) |cached| {
+        paintLayoutCozmic(frame, engine, scene, node, &cached.layout, color, clip);
+        return;
+    }
 
-    const lm = face.lineMetrics();
-    const line_h = node.text_style.line_height orelse node.text_style.size * 1.25;
-    const baseline = node.bounds.y + @max(0, (node.bounds.h - line_h) / 2) + lm.ascender_px;
+    var layout = text_engine.shape(engine, node, text_engine.frameAllocator(frame)) catch {
+        // Same shape inputs as measure; only resource failures land here.
+        // The measured box stays, and the empty result is observable.
+        node.cozmic_paint_failures += 1;
+        frame.cozmic_paint_failures += 1;
+        return;
+    };
+    defer layout.deinit();
+    paintLayoutCozmic(frame, engine, scene, node, &layout, color, clip);
+}
 
-    var pen = node.bounds.x;
-    // Semibold/bold have no separate faces loaded; embolden the cached ink
-    // instead (1px dilation, metrics untouched so measure still matches).
-    const bold = node.text_style.weight == .semibold or node.text_style.weight == .bold;
-    for (run.glyphs) |g| {
-        // Tofu substitution: a shaped `.notdef` (gid 0) is re-resolved in
-        // the symbol face by source codepoint. Fallback advance comes from
-        // the raster (documented deviation, symbols only).
-        var use_face = face;
-        var use_gid = g.glyph_id;
-        var use_adv = g.advance_px;
-        if (use_gid == 0) {
-            if (clusterCodepoint(node.text_value, g.cluster)) |cp| {
-                if (fc.symbols) |*sym| {
-                    if (sym.glyphIndex(cp) != 0) {
-                        use_face = sym;
-                        use_gid = sym.glyphIndex(cp);
-                        use_adv = 0; // filled from the raster below
-                    }
-                }
-            }
+/// Per-glyph sink for `Layout.render`. Checks the atlas, rasterizes through
+/// `Engine.cache.getImage` on a miss, uploads masks through
+/// `Atlas.putBitmap`, and pushes the scene glyph at the atlas entry's
+/// placement. Color and subpixel images are treated as misses (the
+/// single-channel atlas cannot represent them) rather than emitting garbage.
+const GlyphSink = struct {
+    engine: *engine_mod.Engine,
+    scene: *gpu.Scene,
+    node: *const element.Node,
+    color: core.Color,
+    clip: core.Rect,
+    /// Layout-local origin: node content x plus the vertical centering
+    /// offset. Cozmic's physical glyph coordinates are relative to it.
+    origin_x: f32,
+    origin_y: f32,
+    emitted: u64 = 0,
+    skipped: u64 = 0,
+
+    fn renderer(self: *GlyphSink) cozmic.render.Renderer {
+        return .{ .ctx = @ptrCast(self), .vtable = &vtable };
+    }
+
+    const vtable = cozmic.render.Renderer.VTable{
+        .rectangle = rectangle,
+        .glyph = glyph,
+    };
+
+    /// Text decorations from cozmic land as quads at layout-local
+    /// coordinates. No decoration attrs are requested today; the strike rule
+    /// is emitted by `paintLayoutCozmic`.
+    fn rectangle(ctx: *anyopaque, x: i32, y: i32, w: u32, h: u32, color: cozmic.Color) void {
+        _ = color;
+        const self: *GlyphSink = @ptrCast(@alignCast(ctx));
+        quad(self.scene, .{
+            .x = self.origin_x + @as(f32, @floatFromInt(x)),
+            .y = self.origin_y + @as(f32, @floatFromInt(y)),
+            .w = @as(f32, @floatFromInt(w)),
+            .h = @as(f32, @floatFromInt(h)),
+        }, self.color, 0, self.clip);
+    }
+
+    fn glyph(ctx: *anyopaque, physical_glyph: cozmic.layout.PhysicalGlyph, color: cozmic.Color) void {
+        _ = color; // ZUI resolves the node color once (group opacity).
+        const self: *GlyphSink = @ptrCast(@alignCast(ctx));
+        // `.notdef` has no usable ink (the symbol-face substitution it used
+        // to fall back to is gone): skip and count it, never rasterize the
+        // tofu box.
+        if (physical_glyph.cache_key.glyph_id == 0) {
+            self.skipped += 1;
+            return;
         }
-        const key = fonts.atlas.AtlasKey{ .face_id = use_face.id, .glyph_id = use_gid, .size_px = @intCast(px), .bold = bold };
-        const entry = fc.glyphs.get(key) orelse blk: {
-            const raster = use_face.rasterizeGlyphId(use_gid) catch {
-                pen += if (use_adv > 0) use_adv else g.advance_px;
-                continue;
+        const key = atlasKeyFor(self.engine, self.node.text_style.weight, physical_glyph);
+        const entry = self.engine.glyphs.get(key) orelse blk: {
+            const image = self.engine.cache.getImage(physical_glyph.cache_key) catch {
+                self.skipped += 1;
+                return;
             };
-            break :blk fc.glyphs.put(key, &raster, bold) catch {
-                pen += if (use_adv > 0) use_adv else g.advance_px;
-                continue;
+            const view = image orelse {
+                self.skipped += 1;
+                return;
+            };
+            // The pool is single-channel coverage: color/subpixel images are
+            // an explicit miss, never bytes reinterpreted as a mask.
+            if (view.content != .mask) {
+                self.skipped += 1;
+                return;
+            }
+            const bytes = @as(usize, view.placement.width) * view.placement.height;
+            if (view.data.len < bytes) {
+                self.skipped += 1;
+                return;
+            }
+            break :blk self.engine.glyphs.putBitmap(
+                key,
+                view.placement.width,
+                view.placement.height,
+                view.placement.width,
+                view.data.ptr,
+                view.placement.left,
+                view.placement.top,
+                .mask,
+                key.synthetic_bold,
+            ) catch {
+                self.skipped += 1;
+                return;
             };
         };
-        if (use_adv == 0) use_adv = entry.advance_px;
-        if (entry.width > 0 and entry.height > 0) {
-            _ = scene.pushGlyph(.{
-                .x = pen + g.offset_px[0] + @as(f32, @floatFromInt(entry.bearing_x)),
-                .y = baseline - @as(f32, @floatFromInt(entry.bearing_y)) + g.offset_px[1],
-                .w = entry.width,
-                .h = entry.height,
-                .color = color,
-                .atlas_offset = entry.offset,
-                .clip = clip,
-            });
+        if (entry.width == 0 or entry.height == 0) {
+            self.skipped += 1; // empty raster (spaces)
+            return;
         }
-        pen += use_adv;
-    }
-    if (node.text_style.strike) {
-        const thickness = @max(1.0, @as(f32, @floatFromInt(px)) / 14.0);
-        quad(scene, .{ .x = node.bounds.x, .y = node.bounds.y + node.bounds.h / 2, .w = node.bounds.w, .h = thickness }, color, 0, clip);
-    }
-}
-
-fn paintBitmapText(scene: *gpu.Scene, node: *const element.Node, color: core.Color, clip: core.Rect) void {
-    // NOTE: bitmap fallback renderer for machines without system fonts.
-    // Glyphs come from the 5x7 table below (ASCII + a hand-drawn symbol set
-    // for chrome icons).
-    const scale = @max(1.0, node.text_style.size / 8.0);
-    const advance = element.textAdvance(node.text_style.size, node.text_style.tracking, node.text_style.weight);
-    var x = node.bounds.x;
-    const y = node.bounds.y + @max(0, (node.bounds.h - scale * 7) / 2);
-    var index: usize = 0;
-    while (index < node.text_value.len) {
-        const first = node.text_value[index];
-        var codepoint: u21 = first;
-        var len: usize = 1;
-        if (first >= 0x80) {
-            const seq_len = std.unicode.utf8ByteSequenceLength(first) catch {
-                index += 1;
-                continue;
-            };
-            if (index + seq_len > node.text_value.len) break;
-            codepoint = std.unicode.utf8Decode(node.text_value[index..][0..seq_len]) catch {
-                index += 1;
-                continue;
-            };
-            len = seq_len;
+        if (self.scene.pushGlyph(.{
+            .x = self.origin_x + @as(f32, @floatFromInt(physical_glyph.x)) + @as(f32, @floatFromInt(entry.bearing_x)),
+            .y = self.origin_y + @as(f32, @floatFromInt(physical_glyph.y)) - @as(f32, @floatFromInt(entry.bearing_y)),
+            .w = entry.width,
+            .h = entry.height,
+            .color = self.color,
+            .atlas_offset = entry.offset,
+            .clip = self.clip,
+        })) {
+            self.emitted += 1;
+        } else {
+            self.skipped += 1; // scene full: no ink emitted
         }
-        index += len;
-        const rows = glyphFor(codepoint);
-        drawRows(scene, x, y, scale, rows, color, node.text_style.weight, clip);
-        x += advance;
     }
-    if (node.text_style.strike) {
-        quad(scene, .{ .x = node.bounds.x, .y = node.bounds.y + node.bounds.h / 2, .w = node.bounds.w, .h = @max(1, scale * 0.65) }, color, 0, clip);
-    }
-}
+};
 
-/// Decode the codepoint at a shaping cluster (byte index). Null on
-/// truncation or invalid bytes; used for symbol-fallback resolution.
-fn clusterCodepoint(text: []const u8, cluster: u32) ?u21 {
-    if (cluster >= text.len) return null;
-    const first = text[cluster];
-    if (first < 0x80) return first;
-    const len = std.unicode.utf8ByteSequenceLength(first) catch return null;
-    if (cluster + len > text.len) return null;
-    return std.unicode.utf8Decode(text[cluster..][0..len]) catch null;
-}
-
-fn glyphFor(codepoint: u21) [7]u5 {
-    // ASCII renders as-is: lowercase has its own x-height forms below.
-    // (The old build folded a-z to A-Z, which is why the whole app shouted.)
-    if (codepoint < 0x80) {
-        const byte: u8 = @intCast(codepoint);
-        return glyph(byte);
-    }
-    return switch (codepoint) {
-        0x2713 => .{ 0, 0, 0b00001, 0b00010, 0b10100, 0b01000, 0 }, // ✓ check
-        0x00D7 => .{ 0, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0 }, // × close
-        0x2014 => .{ 0, 0, 0, 0b11111, 0, 0, 0 }, // — em dash (minimize)
-        0x25A1 => .{ 0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111 }, // □ maximize
-        0x25A2 => .{ 0b11111, 0b11111, 0b11011, 0b11011, 0b11011, 0b11111, 0b11111 }, // ▢ restore
-        0x25CB => .{ 0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110 }, // ○ empty state
-        0x2726 => .{ 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0, 0 }, // ✦ sparkle
-        0x00B7 => .{ 0, 0, 0, 0b00100, 0, 0, 0 }, // · middle dot
-        else => .{ 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0, 0 }, // fallback star
+/// Atlas key for one physical glyph. Mirrors the FULL cozmic raster key
+/// (subpixel bins, weight, flags) — each of those changes the rasterized
+/// image — plus the synthetic-dilation variant flag, so a dilated entry can
+/// never alias the same weight's undilated ink.
+fn atlasKeyFor(
+    engine: *engine_mod.Engine,
+    requested: element.FontWeight,
+    physical_glyph: cozmic.layout.PhysicalGlyph,
+) engine_mod.AtlasKey {
+    const cache_key = physical_glyph.cache_key;
+    return .{
+        .face_id = cache_key.font_id,
+        .glyph_id = cache_key.glyph_id,
+        .size_px = engine_mod.sizeToPx(cache_key.fontSize()),
+        .x_bin = cache_key.x_bin,
+        .y_bin = cache_key.y_bin,
+        .font_weight = cache_key.font_weight,
+        .flags = cache_key.flags,
+        .synthetic_bold = text_engine.syntheticBold(engine, requested, cache_key.font_id),
     };
 }
 
-fn drawRows(scene: *gpu.Scene, x: f32, y: f32, scale: f32, rows: [7]u5, color: core.Color, weight: element.FontWeight, clip: core.Rect) void {
-    const bold = weight == .bold or weight == .semibold;
-    for (rows, 0..) |bits, row| {
-        for (0..5) |column| {
-            const shift: u3 = @intCast(4 - column);
-            if (((bits >> shift) & 1) == 0) continue;
-            const width = scale + if (bold) @min(1.0, scale * 0.3) else 0;
-            quad(scene, .{ .x = x + @as(f32, @floatFromInt(column)) * scale, .y = y + @as(f32, @floatFromInt(row)) * scale, .w = width, .h = scale }, color, 0, clip);
+/// Emit one shaped cozmic layout into the scene. Shared verbatim by the
+/// retained-layout path and the reshape path, so a cache hit is
+/// indistinguishable in the scene from a fresh shape.
+fn paintLayoutCozmic(
+    frame: *element.Frame,
+    engine: *engine_mod.Engine,
+    scene: *gpu.Scene,
+    node: *element.Node,
+    layout: *engine_mod.Layout,
+    color: core.Color,
+    clip: core.Rect,
+) void {
+    // Baseline = node origin + vertical centering + cozmic's run baseline;
+    // physical glyph y already includes the run baseline.
+    const v_offset = node.bounds.y + @max(0, (node.bounds.h - layout.height) / 2);
+    var sink = GlyphSink{
+        .engine = engine,
+        .scene = scene,
+        .node = node,
+        .color = color,
+        .clip = clip,
+        .origin_x = node.bounds.x,
+        .origin_y = v_offset,
+    };
+    if (layout.render(sink.renderer(), cozmic.Color{ .value = 0xFF00_0000 })) |_| {} else |_| {
+        // Resource failure: the scene may hold partial ink, so keep the
+        // sink's counts and make the node observable as failed.
+        node.cozmic_paint_failures += 1;
+        frame.cozmic_paint_failures += 1;
+    }
+
+    // Strike: one rule per layout run at that run's baseline, so wrapped
+    // and multi-line text gets a rule on every line instead of only the
+    // first. Cozmic's default strikethrough offset is 0.3em above the
+    // baseline; line_y is cozmic's baseline.
+    if (node.text_style.strike) {
+        const thickness = @max(1.0, @as(f32, @floatFromInt(engine_mod.sizeToPx(node.text_style.size))) / 14.0);
+        var runs = layout.runs();
+        while (runs.next()) |run| {
+            quad(scene, .{
+                .x = node.bounds.x,
+                .y = v_offset + run.line_y - node.text_style.size * 0.3,
+                .w = node.bounds.w,
+                .h = thickness,
+            }, color, 0, clip);
         }
     }
-}
 
-fn glyph(ch: u8) [7]u5 {
-    return switch (ch) {
-        'A' => .{ 0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001 },
-        'B' => .{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110 },
-        'C' => .{ 0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111 },
-        'D' => .{ 0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110 },
-        'E' => .{ 0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111 },
-        'F' => .{ 0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000 },
-        'G' => .{ 0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111 },
-        'H' => .{ 0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001 },
-        'I' => .{ 0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111 },
-        'J' => .{ 0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100 },
-        'K' => .{ 0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001 },
-        'L' => .{ 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111 },
-        'M' => .{ 0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001 },
-        'N' => .{ 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001 },
-        'O' => .{ 0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110 },
-        'P' => .{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000 },
-        'Q' => .{ 0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101 },
-        'R' => .{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001 },
-        'S' => .{ 0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110 },
-        'T' => .{ 0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100 },
-        'U' => .{ 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110 },
-        'V' => .{ 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100 },
-        'W' => .{ 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010 },
-        'X' => .{ 0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001 },
-        'Y' => .{ 0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100 },
-        'Z' => .{ 0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111 },
-        'a' => .{ 0, 0, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111 },
-        'b' => .{ 0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b11110 },
-        'c' => .{ 0, 0, 0b01110, 0b10000, 0b10000, 0b10001, 0b01110 },
-        'd' => .{ 0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10001, 0b01111 },
-        'e' => .{ 0, 0, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110 },
-        'f' => .{ 0b00110, 0b00100, 0b00100, 0b11110, 0b00100, 0b00100, 0b00100 },
-        'g' => .{ 0, 0, 0b01110, 0b10001, 0b01111, 0b00001, 0b01110 },
-        'h' => .{ 0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001 },
-        'i' => .{ 0b00100, 0, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110 },
-        'j' => .{ 0b00010, 0, 0b00110, 0b00010, 0b00010, 0b10010, 0b01100 },
-        'k' => .{ 0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010 },
-        'l' => .{ 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110 },
-        'm' => .{ 0, 0, 0b11010, 0b10101, 0b10101, 0b10001, 0b10001 },
-        'n' => .{ 0, 0, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001 },
-        'o' => .{ 0, 0, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110 },
-        'p' => .{ 0, 0, 0b11110, 0b10001, 0b11110, 0b10000, 0b10000 },
-        'q' => .{ 0, 0, 0b01111, 0b10001, 0b01111, 0b00001, 0b00001 },
-        'r' => .{ 0, 0, 0b10111, 0b11000, 0b10000, 0b10000, 0b10000 },
-        's' => .{ 0, 0, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110 },
-        't' => .{ 0b00100, 0b00100, 0b11110, 0b00100, 0b00100, 0b00101, 0b00010 },
-        'u' => .{ 0, 0, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101 },
-        'v' => .{ 0, 0, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100 },
-        'w' => .{ 0, 0, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010 },
-        'x' => .{ 0, 0, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001 },
-        'y' => .{ 0, 0, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110 },
-        'z' => .{ 0, 0, 0b11111, 0b00010, 0b00100, 0b01000, 0b11111 },
-        '0' => .{ 0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110 },
-        '1' => .{ 0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110 },
-        '2' => .{ 0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111 },
-        '3' => .{ 0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110 },
-        '4' => .{ 0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010 },
-        '5' => .{ 0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110 },
-        '6' => .{ 0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110 },
-        '7' => .{ 0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000 },
-        '8' => .{ 0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110 },
-        '9' => .{ 0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110 },
-        '+' => .{ 0, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0 },
-        '-' => .{ 0, 0, 0, 0b11111, 0, 0, 0 },
-        '#' => .{ 0b01010, 0b11111, 0b01010, 0b01010, 0b11111, 0b01010, 0 },
-        '/' => .{ 0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000 },
-        ':' => .{ 0, 0b00100, 0b00100, 0, 0b00100, 0b00100, 0 },
-        '.' => .{ 0, 0, 0, 0, 0, 0b00110, 0b00110 },
-        ',' => .{ 0, 0, 0, 0, 0b00110, 0b00100, 0b01000 },
-        '!' => .{ 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0b00100 },
-        '?' => .{ 0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0, 0b00100 },
-        '(' => .{ 0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010 },
-        ')' => .{ 0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000 },
-        '*' => .{ 0, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0 },
-        ' ' => .{ 0, 0, 0, 0, 0, 0, 0 },
-        else => .{ 0b11111, 0b10001, 0b00110, 0b00110, 0, 0b00100, 0 },
-    };
-}
-
-test "lowercase glyphs differ from uppercase" {
-    const t = @import("std").testing;
-    // Regression: the old painter folded a-z to A-Z so the app shouted.
-    try t.expect(!std.mem.eql(u5, &glyphFor('a'), &glyphFor('A')));
-    try t.expect(!std.mem.eql(u5, &glyphFor('e'), &glyphFor('E')));
-    // Lowercase sits on the x-height: top row empty, body in lower rows.
-    try t.expectEqual(@as(u5, 0), glyphFor('a')[0]);
-    try t.expectEqual(@as(u5, 0), glyphFor('e')[0]);
-    try t.expect(glyphFor('A')[0] != 0);
+    node.cozmic_painted_extent = layout.width;
+    node.cozmic_painted_glyphs = sink.emitted;
+    node.cozmic_skipped_glyphs = sink.skipped;
+    frame.cozmic_painted_extent = @max(frame.cozmic_painted_extent, layout.width);
+    frame.cozmic_painted_glyphs += sink.emitted;
+    frame.cozmic_skipped_glyphs += sink.skipped;
 }
 
 test "gradient background emits a single quad" {
@@ -554,10 +576,14 @@ test "gradient background emits a single quad" {
 
 test "overflowing text clips to parent content box" {
     const t = @import("std").testing;
+    const engine = try testEngine();
+    defer engine.deinit();
     const frame = try t.allocator.create(element.Frame);
     defer t.allocator.destroy(frame);
     frame.* = .{};
     frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
     element.beginFrame(frame);
     defer element.endFrame();
     const root = element.div().w(60).h(30).bg(core.Color.hex(0x1e1f2a))
@@ -567,7 +593,7 @@ test "overflowing text clips to parent content box" {
     defer t.allocator.destroy(scene);
     scene.* = .{};
     paint(frame, root, scene);
-    try t.expect(scene.slice().len > 1); // bg + (clipped) glyph pixels
+    try t.expect(scene.glyphSlice().len > 0); // clipped glyph ink, no bitmap quads
     // Scene geometry is logical (uncut); the clip binds at rasterization.
     // Render and assert no painted pixel escapes the 60px field.
     var buf: [200 * 100 * 4]u8 = undefined;
@@ -611,13 +637,12 @@ test "blurred background emits soft falloff layers" {
 
 test "hot frame structs stay within stack budget" {
     // Regression for flaky segfaults: in Debug, Frame (~2.5MB) + Scene
-    // (~5.9MB, quads carry their clip) stack to ~8.6MB frames, and
-    // Collection.init() needs ~8.7MB of its own. Deep stack growth into
-    // heap-mmap territory segfaults depending on order/ASLR — never on a
-    // fixed threshold, so the rule is structural, not numeric: heap-allocate
-    // whenever a function holds more than one of Frame/Scene/Collection (or
-    // calls Collection.init beneath them). Production keeps all three on
-    // the heap (Window, App); tests use the allocator (see the font tests).
+    // (~5.9MB, quads carry their clip) stack to ~8.6MB frames. Deep stack
+    // growth into heap-mmap territory segfaults depending on order/ASLR —
+    // never on a fixed threshold, so the rule is structural, not numeric:
+    // heap-allocate whenever a function holds more than one of Frame/Scene
+    // (or calls an engine init beneath them). Production keeps them on the
+    // heap (Window, App); tests use the allocator (see the font tests).
     // Structural fix (pools behind init/deinit) is plan M10; until then
     // these pins fail loudly on growth instead of segfaulting rarely.
     const t = @import("std").testing;
@@ -628,20 +653,15 @@ test "hot frame structs stay within stack budget" {
 
 test "shaped text emits atlas glyphs, not bitmap quads" {
     const t = @import("std").testing;
-    if (!fonts.tables.FontconfigApi.isAvailable() or !fonts.tables.FreeTypeApi.isAvailable() or !fonts.tables.HarfBuzzApi.isAvailable()) return;
-    // Heap-allocated: Collection.init() needs ~8.7MB of Debug frame (see
-    // the budget test above), so Frame/Scene must not sit on the stack
-    // beneath the call. Production code keeps them in the heap Window.
-    const stack = try t.allocator.create(fonts.Collection);
-    defer t.allocator.destroy(stack);
-    stack.* = try fonts.Collection.init();
-    defer stack.deinit();
+    const engine = try testEngine();
+    defer engine.deinit();
 
     const frame = try t.allocator.create(element.Frame);
     defer t.allocator.destroy(frame);
     frame.* = .{};
     frame.reset(@ptrFromInt(1), .{});
-    frame.fonts = stack;
+    frame.engine = engine;
+    frame.allocator = t.allocator;
     element.beginFrame(frame);
     defer element.endFrame();
     const root = element.text("Hi", .{ .size = 16 });
@@ -659,45 +679,36 @@ test "shaped text emits atlas glyphs, not bitmap quads" {
     for (glyphs) |g| {
         try t.expect(g.w > 0 and g.h > 0);
         const bytes = @as(usize, g.w) * g.h;
-        try t.expect(g.atlas_offset + bytes <= stack.glyphs.pixels_used);
+        try t.expect(g.atlas_offset + bytes <= engine.glyphs.pixels_used);
     }
 }
 
-test "tofu codepoint substitutes the symbol face" {
+test "missing glyph emits no ink and is counted" {
     const t = @import("std").testing;
-    if (!fonts.tables.FontconfigApi.isAvailable() or !fonts.tables.FreeTypeApi.isAvailable() or !fonts.tables.HarfBuzzApi.isAvailable()) return;
-    // Heap-allocated: see "shaped text emits atlas glyphs" above.
-    const stack = try t.allocator.create(fonts.Collection);
-    defer t.allocator.destroy(stack);
-    stack.* = try fonts.Collection.init();
-    defer stack.deinit();
-    if (stack.symbols == null) return;
+    const engine = try testEngine();
+    defer engine.deinit();
 
     const frame = try t.allocator.create(element.Frame);
     defer t.allocator.destroy(frame);
     frame.* = .{};
     frame.reset(@ptrFromInt(1), .{});
-    frame.fonts = stack;
+    frame.engine = engine;
+    frame.allocator = t.allocator;
     element.beginFrame(frame);
     defer element.endFrame();
-    const root = element.text("✓", .{ .size = 16 });
+    // U+6F22 (CJK) is covered by none of the vendored corpus faces and the
+    // old symbol-face substitution is gone: the `.notdef` glyph must be
+    // skipped (counted) instead of emitting garbage.
+    const root = element.text("A漢B", .{ .size = 16 });
     @import("layout.zig").layout(frame, root, .{ .w = 500, .h = 100 });
     const scene = try t.allocator.create(gpu.Scene);
     defer t.allocator.destroy(scene);
     scene.* = .{};
     paint(frame, root, scene);
 
-    // The sans face has no U+2713, so the glyph must come from the symbol
-    // face (id 3) with real ink — not dropped, not `.notdef`.
-    try t.expectEqual(@as(usize, 1), scene.glyphSlice().len);
-    const g = scene.glyphSlice()[0];
-    try t.expect(g.w > 0 and g.h > 0);
-    const bytes = @as(usize, g.w) * g.h;
-    var ink: usize = 0;
-    for (stack.glyphs.pixels[g.atlas_offset..][0..bytes]) |v| {
-        if (v > 0) ink += 1;
-    }
-    try t.expect(ink > 0);
+    try t.expectEqual(@as(usize, 2), scene.glyphSlice().len); // A, B
+    try t.expectEqual(@as(u64, 1), frame.cozmic_skipped_glyphs);
+    try t.expectEqual(@as(u64, 2), frame.cozmic_painted_glyphs);
 }
 
 test "rounded border ring leaves no notches" {
@@ -1021,4 +1032,446 @@ test "region overflow counts instead of silently dropping clicks" {
     }
     try t.expectEqual(@as(usize, element.max_regions), frame.region_count);
     try t.expectEqual(@as(u64, 10), frame.dropped_regions);
+}
+
+test "text frame without an engine emits no text" {
+    // There is no legacy or bitmap fallback: with no engine installed the
+    // text node measures as zero and paints nothing, and the gap is
+    // observable as a paint failure instead of silent stale ink.
+    const t = @import("std").testing;
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.allocator = t.allocator;
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const root = element.text("abc", .{ .size = 14 });
+    @import("layout.zig").layout(frame, root, .{ .w = 500, .h = 100 });
+    const node = &frame.nodes[root.index];
+    try t.expect(!node.cozmic_measured);
+    try t.expectEqual(@as(f32, 0), node.measured.w);
+
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
+    try t.expectEqual(@as(usize, 0), scene.glyphSlice().len);
+    try t.expectEqual(@as(usize, 0), scene.slice().len);
+    try t.expectEqual(@as(u64, 1), node.cozmic_paint_failures);
+    try t.expectEqual(@as(u64, 1), frame.cozmic_paint_failures);
+    try t.expectEqual(@as(u64, 0), frame.cozmic_painted_glyphs);
+}
+
+test "shape failure at paint skips ink instead of stale metrics" {
+    // A paint-time replay that cannot shape must keep the measured box and
+    // emit no ink into it (there is no second engine to repaint with).
+    const t = @import("std").testing;
+    const engine = try testEngine();
+    defer engine.deinit();
+
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const root = element.text("Hi", .{ .size = 16, .line_height = 20 });
+    @import("layout.zig").layout(frame, root, .{ .w = 500, .h = 100 });
+    const node = &frame.nodes[root.index];
+    try t.expect(node.cozmic_measured);
+    const box_w = node.measured.w;
+    try t.expect(box_w > 0);
+    const shaped_by_measure = engine.layout_calls;
+
+    // Make the paint-time replay of the same shape inputs fail (measure
+    // already succeeded): an invalid metric only the paint pass sees.
+    node.text_style.line_height = 0;
+
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
+    // The attrs mismatch (line_height 20 -> 0) must force a paint-side
+    // reshape, which is the shape that fails here; the retained layout was
+    // never reused with stale metrics.
+    try t.expectEqual(shaped_by_measure + 1, engine.layout_calls);
+    try t.expectEqual(@as(usize, 0), scene.glyphSlice().len);
+    try t.expectEqual(@as(usize, 0), scene.slice().len);
+    try t.expectEqual(@as(u64, 1), node.cozmic_paint_failures);
+    try t.expectEqual(@as(u64, 1), frame.cozmic_paint_failures);
+    try t.expectEqual(@as(u64, 0), frame.cozmic_painted_glyphs);
+    try t.expectApproxEqAbs(box_w, node.measured.w, 0.001); // box untouched
+}
+
+test "strike draws one rule per wrapped line" {
+    // Regression: the strike was a single rule at the first run's baseline,
+    // so multi-line/wrapped text only had a line on its first line.
+    const t = @import("std").testing;
+    const engine = try testEngine();
+    defer engine.deinit();
+
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const root = element.text("The quick brown fox jumps over the lazy dog", .{ .size = 14, .strike = true }).w(80);
+    @import("layout.zig").layout(frame, root, .{ .w = 500, .h = 200 });
+    const node = &frame.nodes[root.index];
+    try t.expect(node.cozmic_measured);
+
+    // Run count from the same engine inputs the painter uses: one strike
+    // rule per run, i.e. per wrapped line.
+    var reference = try text_engine.shape(engine, node, t.allocator);
+    defer reference.deinit();
+    var runs = reference.runs();
+    var run_count: usize = 0;
+    while (runs.next()) |_| run_count += 1;
+    try t.expect(run_count > 1);
+
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
+
+    // Only strike rules emit quads for a bare text node.
+    try t.expectEqual(run_count, scene.slice().len);
+    var previous_y = scene.slice()[0].y;
+    for (scene.slice()[1..]) |rule| {
+        try t.expect(rule.y > previous_y);
+        previous_y = rule.y;
+    }
+}
+
+test "counters track emitted glyphs and per-node values" {
+    // Regression: glyphs were counted before the atlas/emission check
+    // (spaces counted as placed) and the frame-wide counters were documented
+    // as node-local. Emitted counts must equal the scene; laid-out glyphs
+    // are emitted or skipped; per-node values sum into the frame aggregates.
+    const t = @import("std").testing;
+    const engine = try testEngine();
+    defer engine.deinit();
+
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const root = element.div().w(300).h(100).flex_col()
+        .child(element.text("Hi", .{ .size = 16 }))
+        .child(element.text("i i", .{ .size = 16 }));
+    @import("layout.zig").layout(frame, root, .{ .w = 300, .h = 100 });
+    const a_index = frame.nodes[root.index].first_child.?;
+    const b_index = frame.nodes[a_index].next_sibling.?;
+    const a = &frame.nodes[a_index];
+    const b = &frame.nodes[b_index];
+    try t.expect(a.cozmic_measured and b.cozmic_measured);
+
+    var ref_a = try text_engine.shape(engine, a, t.allocator);
+    defer ref_a.deinit();
+    var ref_b = try text_engine.shape(engine, b, t.allocator);
+    defer ref_b.deinit();
+    const laid_out: u64 = @intCast(ref_a.glyphCount() + ref_b.glyphCount());
+
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
+
+    // Only glyphs that reached the scene are "painted".
+    try t.expectEqual(@as(u64, @intCast(scene.glyphSlice().len)), frame.cozmic_painted_glyphs);
+    try t.expectEqual(laid_out, frame.cozmic_painted_glyphs + frame.cozmic_skipped_glyphs);
+    // Per-node values are real (and the frame values are their aggregate).
+    try t.expectEqual(frame.cozmic_painted_glyphs, a.cozmic_painted_glyphs + b.cozmic_painted_glyphs);
+    try t.expectEqual(frame.cozmic_skipped_glyphs, a.cozmic_skipped_glyphs + b.cozmic_skipped_glyphs);
+    try t.expectEqual(laid_out, a.cozmic_painted_glyphs + a.cozmic_skipped_glyphs + b.cozmic_painted_glyphs + b.cozmic_skipped_glyphs);
+    // The space in "i i" carries no ink.
+    try t.expect(b.cozmic_skipped_glyphs >= 1);
+    // Frame extent is the max over nodes, not the last or the sum.
+    try t.expectApproxEqAbs(
+        @max(a.cozmic_painted_extent, b.cozmic_painted_extent),
+        frame.cozmic_painted_extent,
+        0.001,
+    );
+
+    // Double paint on the same frame (no reset in between): the aggregates
+    // describe the latest paint only and still equal the node sums, so a
+    // second paint can never double-count.
+    const first_glyphs = frame.cozmic_painted_glyphs;
+    const first_skipped = frame.cozmic_skipped_glyphs;
+    scene.* = .{};
+    paint(frame, root, scene);
+    try t.expectEqual(first_glyphs, frame.cozmic_painted_glyphs);
+    try t.expectEqual(first_skipped, frame.cozmic_skipped_glyphs);
+    try t.expectEqual(frame.cozmic_painted_glyphs, a.cozmic_painted_glyphs + b.cozmic_painted_glyphs);
+    try t.expectEqual(frame.cozmic_skipped_glyphs, a.cozmic_skipped_glyphs + b.cozmic_skipped_glyphs);
+    try t.expectEqual(@as(u64, @intCast(scene.glyphSlice().len)), frame.cozmic_painted_glyphs);
+    try t.expectApproxEqAbs(
+        @max(a.cozmic_painted_extent, b.cozmic_painted_extent),
+        frame.cozmic_painted_extent,
+        0.001,
+    );
+}
+
+test "engine lost between measure and paint counts the mismatch" {
+    // Regression: `paintText` returned silently when the node was
+    // cozmic-measured but no engine was installed at paint time: no ink, no
+    // counter, and a repaint would have placed wrong metrics. The mismatch
+    // must be observable on the node and frame, and the node counters must
+    // reset instead of keeping the first paint's values.
+    const t = @import("std").testing;
+    const engine = try testEngine();
+    defer engine.deinit();
+
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const root = element.text("Hi", .{ .size = 16, .line_height = 20 });
+    @import("layout.zig").layout(frame, root, .{ .w = 500, .h = 100 });
+    const node = &frame.nodes[root.index];
+    try t.expect(node.cozmic_measured);
+    const box_w = node.measured.w;
+    try t.expect(box_w > 0);
+
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
+    try t.expect(node.cozmic_painted_glyphs > 0);
+    try t.expectEqual(frame.cozmic_painted_glyphs, node.cozmic_painted_glyphs);
+
+    // Engine cleared between measure and paint: the cozmic box stays, no ink
+    // may land in it, and the mismatch is counted once.
+    frame.engine = null;
+    scene.* = .{};
+    paint(frame, root, scene);
+    try t.expectEqual(@as(usize, 0), scene.glyphSlice().len);
+    try t.expectEqual(@as(usize, 0), scene.slice().len);
+    try t.expectEqual(@as(u64, 1), node.cozmic_paint_failures);
+    try t.expectEqual(@as(u64, 1), frame.cozmic_paint_failures);
+    try t.expectEqual(frame.cozmic_paint_failures, node.cozmic_paint_failures);
+    // Node counters were reset by the second paint, not left stale.
+    try t.expectEqual(@as(u64, 0), node.cozmic_painted_glyphs);
+    try t.expectEqual(@as(u64, 0), node.cozmic_skipped_glyphs);
+    try t.expectEqual(@as(f32, 0), node.cozmic_painted_extent);
+    try t.expectEqual(@as(u64, 0), frame.cozmic_painted_glyphs);
+    try t.expectEqual(@as(u64, 0), frame.cozmic_skipped_glyphs);
+    try t.expectEqual(@as(f32, 0), frame.cozmic_painted_extent);
+    try t.expectApproxEqAbs(box_w, node.measured.w, 0.001);
+}
+
+test "real bold face skips synthetic embolden" {
+    // Regression: the painter always applied the 1px synthetic embolden, so
+    // when cozmic matched a 600/700 face the ink was bolded twice and the
+    // atlas key disagreed with the cached pixels. The decision keys off the
+    // matched face's own weight.
+    const t = @import("std").testing;
+    // Host-dependent: the vendored corpus only ships 400/500 faces, where
+    // synthetic embolden is the correct approximation. Find a real bold face
+    // on the host; skip when there is none.
+    const engine = engine_mod.Engine.initSystem(t.allocator) catch |err| switch (err) {
+        error.ShaperUnavailable, error.LibraryUnavailable, error.NoFontsAvailable, error.FontCorpusIncomplete => return error.SkipZigTest,
+        else => return err,
+    };
+    defer engine.deinit();
+    var bold_family: ?[]const u8 = null;
+    for (engine.fs.db.faces.items) |fi| {
+        if (fi.weight < 700 or fi.families.len == 0) continue;
+        bold_family = fi.families[0];
+        break;
+    }
+    const family = bold_family orelse return error.SkipZigTest;
+
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const root = element.text("Hi", .{ .font = family, .size = 16, .line_height = 20, .weight = .bold });
+    @import("layout.zig").layout(frame, root, .{ .w = 500, .h = 100 });
+    const node = &frame.nodes[root.index];
+    if (!node.cozmic_measured) return error.SkipZigTest;
+
+    // The shaped face must really be >= 700, or synthetic embolden is the
+    // right behavior and the test could not observe the fix.
+    var reference = try text_engine.shape(engine, node, t.allocator);
+    defer reference.deinit();
+    var shaped_phys: ?cozmic.layout.PhysicalGlyph = null;
+    const shaped = blk: {
+        var runs = reference.runs();
+        while (runs.next()) |run| {
+            for (run.glyphs) |g| if (g.glyph_id != 0) {
+                shaped_phys = g.physical(0, run.line_y, 1.0);
+                break :blk g;
+            };
+        }
+        return error.SkipZigTest;
+    };
+    const info = engine.fs.db.face(shaped.font_id) orelse return error.SkipZigTest;
+    if (info.weight < 700) return error.SkipZigTest;
+
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
+    try t.expect(scene.glyphSlice().len > 0);
+
+    // The atlas entry is the un-emboldened variant: the painter's own key
+    // (full raster key + synthetic_bold) exists with dilation off, and no
+    // dilated twin was written for that ink.
+    const key = atlasKeyFor(engine, .bold, shaped_phys.?);
+    try t.expect(!key.synthetic_bold);
+    try t.expect(engine.glyphs.get(key) != null);
+    var dilated = key;
+    dilated.synthetic_bold = true;
+    try t.expect(engine.glyphs.get(dilated) == null);
+}
+
+test "atlas keys mirror the full cozmic cache key" {
+    // Regression: the painter used to key on (face, glyph, size, bold), so
+    // weight/flags/bin variants of one glyph aliased each other.
+    const t = @import("std").testing;
+    const engine = try testEngine();
+    defer engine.deinit();
+
+    const base = cozmic.glyph_cache.CacheKey{
+        .font_id = 0,
+        .glyph_id = 65,
+        .font_size_bits = @bitCast(@as(f32, 16)),
+        .x_bin = .zero,
+        .y_bin = .zero,
+        .font_weight = 400,
+        .flags = .{},
+    };
+    const physical = cozmic.layout.PhysicalGlyph{ .cache_key = base, .x = 0, .y = 0 };
+    const key = atlasKeyFor(engine, .normal, physical);
+    try t.expectEqual(base.font_id, key.face_id);
+    try t.expectEqual(@as(u32, base.glyph_id), key.glyph_id);
+    try t.expectEqual(@as(u16, 16), key.size_px);
+    try t.expectEqual(base.font_weight, key.font_weight);
+    try t.expect(key.synthetic_bold == false); // 400 never dilates
+
+    var bin = base;
+    bin.x_bin = .two;
+    bin.y_bin = .one;
+    const bin_key = atlasKeyFor(engine, .normal, .{ .cache_key = bin, .x = 0, .y = 0 });
+    try t.expect(!engine_mod.AtlasKey.eql(key, bin_key));
+
+    var heavy = base;
+    heavy.font_weight = 700;
+    const heavy_key = atlasKeyFor(engine, .normal, .{ .cache_key = heavy, .x = 0, .y = 0 });
+    try t.expect(!engine_mod.AtlasKey.eql(key, heavy_key));
+
+    var italic = base;
+    italic.flags = .fake_italic;
+    const italic_key = atlasKeyFor(engine, .normal, .{ .cache_key = italic, .x = 0, .y = 0 });
+    try t.expect(!engine_mod.AtlasKey.eql(key, italic_key));
+
+    // Requesting bold mirrors the axis-aware decision into the key flag.
+    const bold_key = atlasKeyFor(engine, .bold, physical);
+    try t.expectEqual(engine.needsSyntheticBold(base.font_id, 700), bold_key.synthetic_bold);
+}
+
+test "paint reshapes when the wrap width changed since measure" {
+    const t = @import("std").testing;
+    const engine = try testEngine();
+    defer engine.deinit();
+
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    element.beginFrame(frame);
+    defer element.endFrame();
+
+    // Measured unbounded (one line) with a per-run strike rule.
+    const root = element.text("The quick brown fox jumps over the lazy dog, and then the dog jumps back.", .{ .size = 14, .line_height = 20, .strike = true });
+    @import("layout.zig").layout(frame, root, .{ .w = 500, .h = 300 });
+    const node = &frame.nodes[root.index];
+    try t.expect(node.cozmic_measured);
+    try t.expect(node.cozmic_layout != null);
+    const shaped_by_measure = engine.layout_calls;
+
+    // Wrap width changes between measure and paint: a reused unbounded layout
+    // would paint one stale line. Paint must reshape at the new width.
+    node.style.width = 80;
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    paint(frame, root, scene);
+    try t.expectEqual(shaped_by_measure + 1, engine.layout_calls);
+    try t.expectEqual(@as(u64, 0), frame.cozmic_paint_failures);
+    try t.expect(scene.slice().len > 1); // one rule per wrapped run
+}
+
+test "retained layout is invalidated by reset and re-measure" {
+    const t = @import("std").testing;
+    const engine = try testEngine();
+    defer engine.deinit();
+
+    const frame = try t.allocator.create(element.Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    element.beginFrame(frame);
+    defer element.endFrame();
+
+    const root = element.div().w(300).h(100).flex_col()
+        .child(element.text("first", .{ .size = 14 }))
+        .child(element.text("second", .{ .size = 14 }));
+    @import("layout.zig").layout(frame, root, .{ .w = 300, .h = 100 });
+    const first_index = frame.nodes[root.index].first_child.?;
+    try t.expect(frame.nodes[first_index].cozmic_layout != null);
+    const shaped_first = engine.layout_calls;
+
+    // A new frame drops (and frees) the previous handoff: the testing
+    // allocator would flag the entry at test end if reset leaked it.
+    frame.reset(@ptrFromInt(1), .{});
+    try t.expect(frame.nodes[first_index].cozmic_layout == null);
+
+    // Rebuilding into the reused slot measures fresh text through a fresh
+    // handoff.
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    const root2 = element.div().w(300).h(100).flex_col()
+        .child(element.text("third", .{ .size = 14 }));
+    @import("layout.zig").layout(frame, root2, .{ .w = 300, .h = 100 });
+    try t.expectEqual(shaped_first + 1, engine.layout_calls);
+    const third_index = frame.nodes[root2.index].first_child.?;
+    try t.expect(frame.nodes[third_index].cozmic_layout != null);
+
+    // Re-measuring the same node replaces and frees the previous entry.
+    @import("layout.zig").layout(frame, root2, .{ .w = 300, .h = 100 });
+    try t.expectEqual(shaped_first + 2, engine.layout_calls);
+    try t.expect(frame.nodes[third_index].cozmic_layout != null);
+}
+
+/// Corpus engine, skipping only when the host lacks the runtime libraries
+/// cozmic loads via `dlopen` (or the vendored corpus is absent).
+fn testEngine() !*engine_mod.Engine {
+    return engine_mod.Engine.init(std.testing.allocator) catch |err| switch (err) {
+        error.ShaperUnavailable, error.LibraryUnavailable, error.NoFontsAvailable => return error.SkipZigTest,
+        else => return err,
+    };
 }

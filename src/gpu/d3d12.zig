@@ -7,8 +7,8 @@
 //! `HWND` from `platform/windows/win32.zig` (supplied as
 //! `device.SurfaceHandle{ .tag = .win32 }`), and consumes DXBC/DXIL shaders
 //! compiled offline (see `device.shaderFormatsFor`). COM vtables are
-//! expressed as Zig `extern struct`s of function pointers, mirroring how
-//! `src/text/bindings.zig` maps C ABIs. Cannot be verified on this Linux
+//! expressed as Zig `extern struct`s of function pointers, mirroring how the
+//! platform bindings map C ABIs. Cannot be verified on this Linux
 //! box: `isAvailable()` is Windows-only and `init()` stays
 //! `error.Unsupported` until the driver lands.
 

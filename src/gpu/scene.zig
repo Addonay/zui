@@ -57,7 +57,7 @@ pub const CommandKind = enum(u8) {
 /// Ordered draw payload for one frame (quads + glyph runs + image blits).
 /// Multi-MB inline storage (~5.9MB: quads carry their clip): heap-allocate
 /// or embed in a heap owner (e.g. `Window`). Never hold more than one of
-/// Scene/Frame/Collection on a single stack — combined Debug frames force
+/// Scene/Frame/Engine on a single stack — combined Debug frames force
 /// deep stack growth that collides with heap mmaps (flaky segfault, order
 /// and ASLR dependent). See the "hot frame structs stay within stack
 /// budget" test.
@@ -182,8 +182,8 @@ pub const ImageBlit = struct {
     clip: geometry.Rect,
 };
 
-/// One rasterized glyph instance. Coverage bytes live in the font atlas
-/// pixel pool (owned by `fonts.Collection`); `atlas_offset` indexes it.
+/// One rasterized glyph instance. Coverage bytes live in the engine's atlas
+/// pixel pool (`Engine.glyphs`); `atlas_offset` indexes it.
 /// The atlas entry is COPIED here (offset + dims), never referenced, and
 /// mid-frame eviction is deferred past emitted glyphs (see fonts/atlas.zig),
 /// so the pool bytes stay valid through present. Each window renders and

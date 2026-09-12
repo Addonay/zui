@@ -7,7 +7,7 @@ const color = @import("../core/color.zig");
 const gpu = @import("../gpu/root.zig");
 const platform = @import("../platform/root.zig");
 const elements = @import("../elements/root.zig");
-const fonts = @import("../fonts/root.zig");
+const text_engine = @import("../fonts/text_engine.zig");
 const images = @import("../images/root.zig");
 const keymap = @import("keymap.zig");
 
@@ -74,12 +74,13 @@ pub const Window = struct {
     /// pinning so eviction never drops the current frame's entries.
     frame_id: u64 = 0,
     ui_frame: elements.Frame = .{},
-    /// Borrowed font stack (owned by `App`, null without system fonts).
-    /// Fed to the frame each render for shaped measure/paint.
-    fonts: ?*fonts.Collection = null,
     /// Borrowed image cache (owned by `App`, null headless-without-cache).
     /// Fed to the frame each render for img()/svg() resolution.
     images: ?*images.Cache = null,
+    /// Optional provider for the App-owned cozmic engine. Called once per
+    /// element frame; null leaves text with no engine (draws nothing).
+    cozmic_engine_fn: ?*const fn (*anyopaque) ?*text_engine.Engine = null,
+    cozmic_engine_ctx: ?*anyopaque = null,
     pointer_position: geometry.Point = .{ .x = -10000, .y = -10000 },
     focused: elements.FocusHandle = .{},
     keymap: keymap.Keymap = .{},
@@ -163,6 +164,14 @@ pub const Window = struct {
     pub fn close(self: *Window) void {
         if (self.closed) return;
         self.closed = true;
+    }
+
+    /// Release frame-owned resources before the owner frees this window.
+    /// Retained measure→paint text layouts are heap entries owned by the
+    /// frame allocator; a window destroyed before a final `painter.paint`
+    /// (which normally clears them) must not leak them.
+    pub fn deinit(self: *Window) void {
+        self.ui_frame.clearCozmicLayouts();
     }
 
     pub fn isClosed(self: *const Window) bool {

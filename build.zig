@@ -4,12 +4,38 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const layout_mod = b.addModule("layout", .{
-        .root_source_file = b.path("src/layout/root.zig"),
+    // Build options for the text engine: the deterministic vendored corpus
+    // path the tests derive their font directory from. There is no engine
+    // switch any more: text is always cozmic.
+    const build_options = b.addOptions();
+
+    // Standalone layout-engine package, fetched from
+    // https://github.com/Addonay/zlay (pinned by commit in build.zig.zon).
+    // The `zlay` module is aliased to `layout` so every existing
+    // `@import("layout")` call site and the package-boundary test below stay
+    // unchanged. `-Dserde=true` is forwarded to the package, which owns its
+    // optional serde dependency; run the package's own gates with:
+    //   cd ../zlay && zig build test [ -Dserde=true ]
+    const enable_serde = b.option(bool, "serde", "Enable Taffy-compatible JSON serde in the layout package") orelse false;
+    const zlay_dep = b.dependency("zlay", .{
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
+        .serde = enable_serde,
     });
+    const layout_mod = zlay_dep.module("zlay");
+
+    // Cozmic text engine (published package: https://github.com/Addonay/cozmic,
+    // pinned in build.zig.zon). The `layout` module deliberately keeps no
+    // cozmic dependency.
+    const cozmic_dep = b.dependency("cozmic", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    // Deterministic test corpus shipped inside the fetched package. Passing a
+    // file from it (directories cannot be hashed by the options step) lets the
+    // tests derive the corpus directory, so no `.ports/cozmic` checkout is
+    // required at runtime.
+    build_options.addOptionPath("cozmic_corpus_font", cozmic_dep.path("tests/fonts/Inter-Regular.ttf"));
 
     const mod = b.addModule("zui", .{
         .root_source_file = b.path("src/root.zig"),
@@ -18,6 +44,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "layout", .module = layout_mod },
+            .{ .name = "cozmic", .module = cozmic_dep.module("cozmic") },
+            .{ .name = "build_options", .module = build_options.createModule() },
         },
     });
 
@@ -100,4 +128,27 @@ pub fn build(b: *std.Build) void {
 
     const run_images_step = b.step("run-images", "Render the images demo to a PPM snapshot");
     run_images_step.dependOn(&run_images.step);
+
+    // Headless text-frame benchmark (no window, no `ZUI_BACKEND` selection):
+    // drives the real `elements.layout` + `elements.painter` path over frames
+    // of N text nodes on the cozmic engine.
+    //   zig build bench-text
+    // Extra harness flags go after `--`: `zig build bench-text -- --format json`.
+    const bench_text_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench_text.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zui", .module = mod },
+            .{ .name = "cozmic", .module = cozmic_dep.module("cozmic") },
+        },
+    });
+    const bench_text_exe = b.addExecutable(.{ .name = "bench-text", .root_module = bench_text_mod });
+    const run_bench_text = b.addRunArtifact(bench_text_exe);
+    // The corpus dirs (`corpus_dirs`) resolve against the package root, not
+    // the invocation cwd, so every row reads the same vendored fonts.
+    run_bench_text.setCwd(b.path("."));
+    run_bench_text.addPassthruArgs();
+    const bench_text_step = b.step("bench-text", "Benchmark the text element frame path (headless, no window)");
+    bench_text_step.dependOn(&run_bench_text.step);
 }

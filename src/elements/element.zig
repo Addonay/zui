@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("../core/root.zig");
 const platform = @import("../platform/root.zig");
-const fonts = @import("../fonts/root.zig");
+const fonts = @import("../fonts/text_engine.zig");
 const images = @import("../images/root.zig");
 
 pub const max_nodes = core.limits.MAX_LAYOUT_ELEMENTS;
@@ -156,12 +156,59 @@ pub const Node = struct {
     mouse_down_listener: ?Listener = null,
     double_click_listener: ?Listener = null,
     focus: ?FocusHandle = null,
+    /// True when `layout.measure` actually ran the cozmic layout for this
+    /// text node; false when no engine was installed or the shape failed.
+    /// Paint gates on this flag (plus `Frame.engine`) so one node can never
+    /// be measured with one engine and painted with another.
+    cozmic_measured: bool = false,
+    /// Measure→paint handoff: the cozmic layout `layout.measure`
+    /// shaped for this node, retained so `painter.paintShapedCozmic` emits
+    /// from it instead of shaping a second time. Owned by this node's
+    /// `Frame` (the entry owns a `cozmic.Buffer` and is heap-allocated on the
+    /// frame allocator):
+    ///   - installed by `text_engine.measureCached` when the intrinsic
+    ///     cozmic measure ran for the exact inputs paint will replay;
+    ///   - reused only through `text_engine.retainedLayout`, which rejects a
+    ///     layout whose key (engine, text, attrs, wrap width) no longer
+    ///     matches the node's current inputs;
+    ///   - freed by `clearCozmicLayout` (re-measure / node reuse),
+    ///     `Frame.clearCozmicLayouts` (new frame, end of paint) and before it
+    ///     is replaced.
+    /// Null when no valid handoff exists — paint then reshapes from the same
+    /// inputs.
+    cozmic_layout: ?*fonts.CachedLayout = null,
+    /// Cozmic paint observability for this node (frame-wide aggregates live
+    /// on `Frame`): max laid-out glyph extent (`glyph.x + glyph.w`), glyphs
+    /// emitted into the scene, laid-out glyphs that emitted no ink (spaces,
+    /// `.notdef`, atlas misses) and layout/mismatch failures that skipped
+    /// the whole node. Reset at the start of every paint of this node, so
+    /// the values describe the most recent paint; all zero when nothing was
+    /// painted.
+    cozmic_painted_extent: f32 = 0,
+    cozmic_painted_glyphs: u64 = 0,
+    cozmic_skipped_glyphs: u64 = 0,
+    cozmic_paint_failures: u64 = 0,
+
+    /// Free and drop the retained measure→paint layout. Idempotent. Called
+    /// before every re-measure of the node and for every live node by
+    /// `Frame.clearCozmicLayouts` (frame reset / end of paint).
+    pub fn clearCozmicLayout(self: *Node) void {
+        if (self.cozmic_layout) |cached| cached.deinit();
+        self.cozmic_layout = null;
+    }
+
+    /// Install a retained layout, freeing any previous one first, so
+    /// re-measuring a node mid-frame cannot leak the earlier handoff.
+    pub fn setCozmicLayout(self: *Node, cached: *fonts.CachedLayout) void {
+        self.clearCozmicLayout();
+        self.cozmic_layout = cached;
+    }
 };
 
 /// Transient per-frame element tree (~2.5MB inline). Lives in the heap
-/// `Window` (`ui_frame`); hold at most one of Frame/Scene/Collection per
-/// stack in tests too (heap-allocate the rest). See the "hot frame structs
-/// stay within stack budget" test in painter.zig.
+/// `Window` (`ui_frame`); hold at most one of Frame/Scene per stack in tests
+/// too (heap-allocate the rest). See the "hot frame structs stay within stack
+/// budget" test in painter.zig.
 pub const Frame = struct {
     nodes: [max_nodes]Node = undefined,
     node_count: usize = 0,
@@ -175,10 +222,26 @@ pub const Frame = struct {
     text_len: usize = 0,
     window: ?*anyopaque = null,
     pointer: core.Point = .{ .x = -10000, .y = -10000 },
-    /// Borrowed font stack for shaped measure/paint. Null keeps the bitmap
-    /// fallback (headless tests, machines without fontconfig). Set per frame
-    /// from `Window.fonts`; never owned here.
-    fonts: ?*fonts.Collection = null,
+    /// Borrowed cozmic text engine. When set, text measure and paint both go
+    /// through cozmic layouts; null means text draws nothing (no legacy
+    /// fallback). Installed per frame from the owning App/Window; never owned
+    /// here, and this struct is only valid while the engine outlives it.
+    engine: ?*fonts.Engine = null,
+    /// Cozmic paint observability: frame-wide aggregates over every text
+    /// node painted by the cozmic path (per-node values live on `Node`).
+    /// `cozmic_painted_extent` is the max laid-out glyph extent across those
+    /// nodes (one layout's `width`, which is `measured.w` when no explicit
+    /// width clamps the box); `cozmic_painted_glyphs` sums glyphs actually
+    /// emitted into the scene; `cozmic_skipped_glyphs` sums laid-out glyphs
+    /// that emitted no ink; `cozmic_paint_failures` counts nodes whose
+    /// layout could not be shaped at paint time or whose node measured on
+    /// cozmic while the engine was gone. Reset by `reset()` and at the start
+    /// of every `painter.paint` (the values describe one paint, never the sum
+    /// of two).
+    cozmic_painted_extent: f32 = 0,
+    cozmic_painted_glyphs: u64 = 0,
+    cozmic_skipped_glyphs: u64 = 0,
+    cozmic_paint_failures: u64 = 0,
     /// Borrowed image cache for img()/svg() resolution. Null drops images.
     /// Set per frame from `Window.images`; never owned here.
     images: ?*images.Cache = null,
@@ -189,11 +252,32 @@ pub const Frame = struct {
     allocator: ?std.mem.Allocator = null,
 
     pub fn reset(self: *Frame, window: *anyopaque, pointer: core.Point) void {
+        // A new frame owns no retained layouts from the previous one: free
+        // them before node slots are overwritten (createNode starts writing
+        // at index 0, which would otherwise drop the only pointer to them).
+        // Non-text nodes are null, so this is a cheap pass.
+        self.clearCozmicLayouts();
         self.node_count = 0;
         self.region_count = 0;
         self.text_len = 0;
         self.window = window;
         self.pointer = pointer;
+        // New frame installs its own engine (`runtime.mountView` does it
+        // right after reset): text without an install draws nothing.
+        self.engine = null;
+        self.cozmic_painted_extent = 0;
+        self.cozmic_painted_glyphs = 0;
+        self.cozmic_skipped_glyphs = 0;
+        self.cozmic_paint_failures = 0;
+    }
+
+    /// Free every retained cozmic layout for nodes built in this frame.
+    /// Called by `reset` (new frame) and at the end of `painter.paint` (the
+    /// measure→paint handoff is consumed there), so a frame never leaks
+    /// layouts even when a caller repaints, tears down, or drives
+    /// layout+paint in a loop without calling `reset` in between.
+    pub fn clearCozmicLayouts(self: *Frame) void {
+        for (self.nodes[0..self.node_count]) |*node| node.clearCozmicLayout();
     }
 
     fn createNode(self: *Frame, kind: NodeKind) u16 {
@@ -233,6 +317,11 @@ pub fn beginFrame(frame: *Frame) void {
 }
 
 pub fn endFrame() void {
+    // The element-build scope ends: release any measure→paint layout still
+    // retained (paint normally consumes it, see `painter.paint`). This
+    // covers callers that measure and never paint; `Frame.reset` and the end
+    // of `painter.paint` cover layout+paint loops driven outside begin/end.
+    if (active_frame) |frame| frame.clearCozmicLayouts();
     active_frame = null;
 }
 
@@ -634,17 +723,6 @@ pub fn progressBar(value: f32, width: f32) Element {
     const fraction = std.math.clamp(value, 0, 1);
     return div().w(width).h(6).rounded_full().bg(core.Color.hex(0xffffff14))
         .child(div().w(width * fraction).h(6).rounded_full().bg_gradient(core.Color.hex(0x7c5cff), core.Color.hex(0x46d5e8)));
-}
-
-pub fn textAdvance(size: f32, tracking: f32, weight: FontWeight) f32 {
-    // Single source of truth for horizontal text metrics. The painter draws
-    // each glyph cell as scale*6 wide (scale = size/8, min 1px) plus tracking,
-    // with bold/semibold widening pixels by ~30% of scale. Layout measure and
-    // the TextField cursor must use this exact function or text overflows or
-    // gaps (the old measure used size*0.64 vs the painter's size*0.75).
-    const scale = @max(1.0, size / 8.0);
-    const bold_extra = if (weight == .bold or weight == .semibold) scale * 0.3 else 0;
-    return scale * 6.0 + tracking + bold_extra;
 }
 
 pub fn progressTrack(value: f32) Element {

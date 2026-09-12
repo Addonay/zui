@@ -12,17 +12,18 @@
 //! - DVUI: tiny `Backend` contract, `@src()`-derived IDs, headless testing
 //!   backend (patterns only).
 //! - Gooey: Zig module layout, static caps, hand-written C `extern`
-//!   bindings. `core/limits` and `text/bindings` are direct MIT-licensed
-//!   ports, attributed in-file.
-//! - SDL3 (`gpu/device` shape) and Taffy (`layout/` port) are API/algorithm
-//!   references; see `plan.md` for what is actually wired up.
+//!   bindings. `core/limits` is a direct MIT-licensed port, attributed
+//!   in-file.
+//! - SDL3 (`gpu/device` shape) and Taffy (the standalone `zlay` package,
+//!   consumed as a dependency) are API/algorithm references; see `plan.md`
+//!   for what is actually wired up.
 
 pub const core = @import("core/root.zig");
-pub const layout = @import("layout/root.zig");
+pub const layout = @import("layout");
 pub const platform = @import("platform/root.zig");
 pub const gpu = @import("gpu/root.zig");
-pub const text_system = @import("text/root.zig");
-pub const fonts = @import("fonts/root.zig");
+pub const atlas = @import("fonts/atlas.zig");
+pub const text_engine = @import("fonts/text_engine.zig");
 pub const images = @import("images/root.zig");
 pub const app = @import("app/root.zig");
 pub const elements = @import("elements/root.zig");
@@ -98,11 +99,11 @@ pub fn transparent() Color {
 
 test {
     _ = @import("core/root.zig");
-    _ = @import("layout/root.zig");
+    _ = @import("layout");
     _ = @import("platform/root.zig");
     _ = @import("gpu/root.zig");
-    _ = @import("text/root.zig");
-    _ = @import("fonts/root.zig");
+    _ = @import("fonts/atlas.zig");
+    _ = @import("fonts/text_engine.zig");
     _ = @import("images/root.zig");
     _ = @import("app/root.zig");
     _ = @import("elements/root.zig");

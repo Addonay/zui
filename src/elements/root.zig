@@ -1,6 +1,7 @@
 pub const element = @import("element.zig");
 pub const layout = @import("layout.zig");
 pub const painter = @import("painter.zig");
+pub const text_engine = @import("text_engine.zig");
 
 pub const Element = element.Element;
 pub const Frame = element.Frame;
@@ -28,4 +29,5 @@ test {
     _ = @import("element.zig");
     _ = @import("layout.zig");
     _ = @import("painter.zig");
+    _ = @import("text_engine.zig");
 }

@@ -6,7 +6,7 @@ const limits = @import("../core/limits.zig");
 const color = @import("../core/color.zig");
 const platform = @import("../platform/root.zig");
 const gpu = @import("../gpu/root.zig");
-const fonts = @import("../fonts/root.zig");
+const text_engine = @import("../fonts/text_engine.zig");
 const window_mod = @import("window.zig");
 const runtime = @import("runtime.zig");
 const zlog = @import("../core/log.zig");
@@ -21,12 +21,19 @@ pub const App = struct {
     backend: platform.Backend,
     entities: runtime.EntityStore,
     owned_backend: ?platform.BackendInstance = null,
-    /// Owned font stack (null without system fonts → bitmap fallback).
-    /// Borrowed by windows/frames per render; never grows after init.
-    fonts: ?*fonts.Collection = null,
     /// Owned decoded-image pool (always present; empty until first image).
-    /// Borrowed by windows/frames per render like the font stack.
+    /// Borrowed by windows/frames per render like the engine.
     image_cache: ?*images.Cache = null,
+    /// Owned cozmic text engine. Created lazily on the first frame; init
+    /// failure is non-fatal (text draws nothing) and counted in
+    /// `cozmic_engine_failures`. The engine owns the glyph atlas, so it must
+    /// be deinitialized before any window/frame that borrows it is reused.
+    cozmic_engine: ?*text_engine.Engine = null,
+    /// True once creation was attempted, so a failed init is not retried on
+    /// every frame.
+    cozmic_engine_attempted: bool = false,
+    /// Failed cozmic engine inits (text stays empty). Observable.
+    cozmic_engine_failures: u64 = 0,
     windows: [limits.MAX_WINDOWS]?*Window = @splat(null),
     active_window_count: usize = 0,
     next_window_id: u32 = 1,
@@ -40,18 +47,12 @@ pub const App = struct {
     pub fn init(allocator: std.mem.Allocator) !App {
         var instance = try platform.createAuto(allocator, "ZUI Application", 800, 600);
         errdefer instance.deinit(allocator);
-        const font_stack = try initFonts(allocator);
-        errdefer if (font_stack) |fc| {
-            fc.deinit();
-            allocator.destroy(fc);
-        };
         const cache = try images.Cache.init(allocator);
         return .{
             .allocator = allocator,
             .backend = instance.handle(),
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = instance,
-            .fonts = font_stack,
             .image_cache = cache,
         };
     }
@@ -60,18 +61,12 @@ pub const App = struct {
         const nb = try allocator.create(platform.null_backend.NullBackend);
         errdefer allocator.destroy(nb);
         nb.* = .{};
-        const font_stack = try initFonts(allocator);
-        errdefer if (font_stack) |fc| {
-            fc.deinit();
-            allocator.destroy(fc);
-        };
         const cache = try images.Cache.init(allocator);
         return .{
             .allocator = allocator,
             .backend = nb.backendHandle(),
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = .{ .null_backend = nb },
-            .fonts = font_stack,
             .image_cache = cache,
         };
     }
@@ -82,24 +77,38 @@ pub const App = struct {
             .backend = be,
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = null,
-            .fonts = initFonts(allocator) catch null,
             .image_cache = images.Cache.init(allocator) catch null,
         };
     }
 
-    fn initFonts(allocator: std.mem.Allocator) !?*fonts.Collection {
-        // Font failure degrades to the bitmap fallback; only allocator OOM
-        // propagates. Stack-first ordering keeps this leak-free.
-        const stack = fonts.Collection.init() catch return null;
-        const owned = try allocator.create(fonts.Collection);
-        owned.* = stack;
-        return owned;
+    /// Lazily create (once) the App-owned cozmic engine. Returns null when
+    /// creation already failed or host system fonts are unavailable — both
+    /// non-fatal: text then draws nothing and the failure count stays
+    /// observable.
+    pub fn ensureCozmicEngine(self: *App) ?*text_engine.Engine {
+        if (self.cozmic_engine) |engine| return engine;
+        if (self.cozmic_engine_attempted) return null;
+        self.cozmic_engine_attempted = true;
+        const engine = text_engine.Engine.initSystem(self.allocator) catch |err| {
+            self.cozmic_engine_failures += 1;
+            zlog.log("cozmic", "text engine init failed: {s}; text draws nothing", .{@errorName(err)});
+            return null;
+        };
+        self.cozmic_engine = engine;
+        zlog.log("cozmic", "text engine ready ({d} faces)", .{engine.fs.db.len()});
+        return engine;
+    }
+
+    fn provideCozmicEngine(raw: *anyopaque) ?*text_engine.Engine {
+        const app: *App = @ptrCast(@alignCast(raw));
+        return app.ensureCozmicEngine();
     }
 
     /// Atlas pixel pool backing the current frame's glyph entries (empty
-    /// without fonts). Valid only until the next render mutates the atlas.
+    /// before the lazy engine init or after an init failure). Valid only
+    /// until the next render mutates the atlas.
     pub fn glyphPixels(self: *App) []const u8 {
-        if (self.fonts) |fc| return fc.glyphs.pixels[0..fc.glyphs.pixels_used];
+        if (self.cozmic_engine) |engine| return engine.glyphs.pixels[0..engine.glyphs.pixels_used];
         return &.{};
     }
 
@@ -113,16 +122,16 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         for (&self.windows) |*maybe_win| {
             if (maybe_win.*) |win| {
+                win.deinit();
                 self.allocator.destroy(win);
                 maybe_win.* = null;
             }
         }
         self.active_window_count = 0;
         self.entities.deinit();
-        if (self.fonts) |fc| {
-            fc.deinit();
-            self.allocator.destroy(fc);
-            self.fonts = null;
+        if (self.cozmic_engine) |engine| {
+            engine.deinit();
+            self.cozmic_engine = null;
         }
         if (self.image_cache) |ic| {
             ic.deinit(self.allocator);
@@ -253,8 +262,9 @@ pub const App = struct {
             .closed = false,
             .scene = .{},
             .renderer = null,
-            .fonts = self.fonts,
             .images = self.image_cache,
+            .cozmic_engine_fn = provideCozmicEngine,
+            .cozmic_engine_ctx = self,
         };
         self.next_window_id += 1;
 
@@ -291,6 +301,7 @@ pub const App = struct {
                 if (self.active_window_count > 0) {
                     self.active_window_count -= 1;
                 }
+                win.deinit();
                 self.allocator.destroy(win);
                 break;
             }
@@ -318,6 +329,7 @@ pub const App = struct {
                     if (self.active_window_count > 0) {
                         self.active_window_count -= 1;
                     }
+                    win.deinit();
                     self.allocator.destroy(win);
                 }
             }
@@ -664,13 +676,73 @@ test "app auto probe initializes available backend" {
     try std.testing.expect(k == .wayland or k == .x11 or k == .null);
 }
 
-test "app owns the font stack when system fonts exist" {
-    const font_tables = @import("../fonts/root.zig").tables;
-    if (!font_tables.FontconfigApi.isAvailable() or !font_tables.FreeTypeApi.isAvailable() or !font_tables.HarfBuzzApi.isAvailable()) return;
+test "app owns no font stack; the engine owns the atlas" {
     var app = try App.initHeadless(std.testing.allocator);
     defer app.deinit();
-    try std.testing.expect(app.fonts != null);
+    // No font stack exists any more and the engine is lazy: nothing to
+    // upload until the first render installs it.
+    try std.testing.expect(app.cozmic_engine == null);
     try std.testing.expectEqual(@as(usize, 0), app.glyphPixels().len);
+}
+
+test "cozmic engine wiring installs the App-owned engine" {
+    var app = try App.initHeadless(std.testing.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{ .title = "Engine" }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+
+    // The window provider is always wired; creation is lazy and a host
+    // without system fonts records a non-fatal failure (text draws nothing).
+    try std.testing.expect(win.cozmic_engine_fn != null);
+    const ctx = win.cozmic_engine_ctx orelse return error.TestUnexpectedResult;
+    const engine = win.cozmic_engine_fn.?(ctx);
+    if (engine) |e| {
+        try std.testing.expect(e == app.cozmic_engine.?);
+        try std.testing.expectEqual(@as(u64, 0), app.cozmic_engine_failures);
+    } else {
+        try std.testing.expectEqual(@as(u64, 1), app.cozmic_engine_failures);
+    }
+    // A second attempt is memoized: no new failures even without fonts.
+    try std.testing.expectEqual(engine, app.ensureCozmicEngine());
+    try std.testing.expectEqual(@as(u64, if (engine == null) 1 else 0), app.cozmic_engine_failures);
+}
+
+test "window teardown frees retained text layouts" {
+    // Regression: `reapClosed`/`removeWindow` used to destroy the window
+    // without clearing the frame's measure→paint layouts, leaking a shaped
+    // cozmic buffer per window torn down before a paint. The testing
+    // allocator fails this test unless `Window.deinit` frees the entry.
+    const t = std.testing;
+    const elements = @import("../elements/root.zig");
+
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+    const engine = text_engine.Engine.init(t.allocator) catch |err| switch (err) {
+        error.ShaperUnavailable, error.LibraryUnavailable, error.NoFontsAvailable, error.FontCorpusIncomplete => return error.SkipZigTest,
+        else => return err,
+    };
+    defer engine.deinit();
+
+    const win = try app.openWindow(.{}, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+
+    // Build and measure text on the window frame but stop before paint, so
+    // the retained layout is still live when the window is torn down.
+    const frame = &win.ui_frame;
+    frame.reset(win, .{});
+    frame.engine = engine;
+    frame.allocator = t.allocator;
+    elements.element.beginFrame(frame);
+    const root = elements.text("retained layout", .{ .size = 14 });
+    elements.layout.layout(frame, root, .{ .w = 200, .h = 60 });
+    try t.expect(frame.nodes[root.index].cozmic_layout != null);
+    elements.element.endFrame();
+
+    win.close();
+    app.reapClosed();
+    try t.expectEqual(@as(usize, 0), app.active_window_count);
 }
 
 test "close defers destruction until reap" {
