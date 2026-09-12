@@ -33,6 +33,7 @@ zig build test     # 729/729 unit and integration tests (722 lib + 7 scene)
 zig build corpus   # 48/48 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo
+zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
 ```
 
 Coverage: antialiased fills, translucent overlap, NonZero/EvenOdd, nested
@@ -100,6 +101,7 @@ zig build corpus                # corpus gate: 48 scenes byte-exact vs pinned fi
 zig build probe                 # upstream probe fixture (tolerance-3 policy)
 zig build run-cpu-example       # writes cpu_example.ppm
 zig build vellz-cli             # corpus renderer CLI -> zig-out/bin
+zig build bench                 # per-stage CPU benchmark (docs/benchmarks.md)
 ```
 
 GPU backend (resolves the sibling `../wgpu` package and links wgpu-native):
