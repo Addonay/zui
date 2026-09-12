@@ -24,9 +24,23 @@ for arg in "$@"; do
     esac
 done
 
-if [ ! -x "$oracle" ]; then
+# `cargo` may live under ~/.cargo/bin, which is not always on PATH.
+if ! command -v cargo >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/cargo" ]; then
+    PATH="$HOME/.cargo/bin:$PATH"
+fi
+
+# Always (re)build when cargo is available: an up-to-date check is ~1s and a
+# stale binary otherwise fails at the first scene using a newer command
+# (e.g. `glyph_run`).
+if command -v cargo >/dev/null 2>&1; then
     echo "building vellz-oracle..."
-    (cd tools/oracle-rs && cargo build --release)
+    (cd tools/oracle-rs && cargo build --release) || {
+        echo "error: building tools/oracle-rs failed" >&2
+        exit 2
+    }
+elif [ ! -x "$oracle" ]; then
+    echo "error: $oracle missing and cargo not available" >&2
+    exit 2
 fi
 
 mkdir -p "$out_dir"
