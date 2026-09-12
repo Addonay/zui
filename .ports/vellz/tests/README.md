@@ -48,6 +48,17 @@ reduction order) and must state:
 Tolerances never mask missing geometry: a scene whose feature is unimplemented
 must fail loudly or be absent from the corpus, not produce approximate output.
 
+## Opt-in Cozmic adapter tests
+
+`zig build test` compiles `src/cozmic_adapter.zig` with a recording fake
+backend, and, when the `../cozmic` sibling checkout is present,
+`tests/cozmic_adapter_test.zig` + `tests/cozmic_bridge.zig`. The bridge is the
+only code allowed to import Cozmic: it maps `cozmic.LayoutGlyph` /
+`cozmic.PhysicalGlyph` to `PositionedGlyph` (`p.x + cache_key.x_bin.asFloat()`,
+same for y) and asserts 1:1 ids/positions, one font resolution per run, and
+byte-identical pixels against a direct `glyph_run`. On a standalone vellz
+checkout the bridge test reports an explicit `SkipZigTest` instead of failing.
+
 ## GPU (hybrid) corpus tolerance
 
 The offscreen GPU backend renders a scene subset and compares the

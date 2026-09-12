@@ -230,9 +230,69 @@ pub fn build(b: *std.Build) void {
     });
     const run_scene_tests = b.addRunArtifact(scene_tests);
 
+    // ------------------------------------------------ Cozmic adapter (opt-in)
+    // `src/cozmic_adapter.zig` is never imported by the rendering core; it is
+    // compiled by this opt-in test artifact (and the bridge test below). The
+    // adapter unit tests use a recording fake backend and need no Cozmic
+    // checkout.
+    const adapter_mod = b.createModule(.{
+        .root_source_file = b.path("src/cozmic_adapter.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "vellz", .module = mod }},
+    });
+    const adapter_unit_tests = b.addTest(.{ .root_module = adapter_mod });
+    const run_adapter_unit_tests = b.addRunArtifact(adapter_unit_tests);
+
+    // The bridge test is the only build target that may import
+    // `.ports/cozmic`. Detect the sibling checkout at configure time; when it
+    // is absent the test reports an explicit skip instead of failing.
+    // `zig build` is invoked from the package root by the repo tooling; a
+    // different invocation directory conservatively reports "unavailable".
+    const cozmic_candidates = [_][]const u8{
+        // ZUI layout: this package is `zui/.ports/vellz`, Cozmic is
+        // `zui/.ports/cozmic`.
+        "../cozmic/src/layout.zig",
+        // Vendored inside the package itself.
+        ".ports/cozmic/src/layout.zig",
+        // Sibling of an enclosing checkout.
+        "../../cozmic/src/layout.zig",
+    };
+    const cozmic_layout_rel: ?[]const u8 = blk: {
+        for (cozmic_candidates) |candidate| {
+            std.Io.Dir.cwd().access(b.graph.io, candidate, .{}) catch continue;
+            break :blk candidate;
+        }
+        break :blk null;
+    };
+    const adapter_options = b.addOptions();
+    adapter_options.addOption(bool, "cozmic_available", cozmic_layout_rel != null);
+
+    const bridge_mod = b.createModule(.{
+        .root_source_file = b.path("tests/cozmic_adapter_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vellz", .module = mod },
+            .{ .name = "cozmic_adapter", .module = adapter_mod },
+            .{ .name = "cozmic_options", .module = adapter_options.createModule() },
+        },
+    });
+    if (cozmic_layout_rel) |layout_rel| {
+        bridge_mod.addImport("cozmic", b.createModule(.{
+            .root_source_file = b.path(layout_rel),
+            .target = target,
+            .optimize = optimize,
+        }));
+    }
+    const bridge_tests = b.addTest(.{ .root_module = bridge_mod });
+    const run_bridge_tests = b.addRunArtifact(bridge_tests);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_scene_tests.step);
+    test_step.dependOn(&run_adapter_unit_tests.step);
+    test_step.dependOn(&run_bridge_tests.step);
 
     // ---------------------------------------------------------------- check
     // Compile everything in the default configuration without running it.

@@ -11,12 +11,15 @@
 //!   method set. Allocating sink methods take the allocator and return
 //!   `!void` (upstream aborts on allocation failure).
 //! - Iterators are plain values with a `next() ?Glyph` method and are not
-//!   required to be cloneable: the decoration path that needed cloning is
-//!   deferred.
+//!   required to be cloneable: the decoration pass drains the run's iterator
+//!   once instead of cloning it.
 //! - Hinting (`HintingInstance`), synthetic embolden (`kurbo::expand_path`),
 //!   non-empty variation coordinates and bitmap glyphs (CBDT/CBLC/sbix) are
 //!   explicit `error.Unsupported`; a run whose transform would require
 //!   hinting is rejected up front instead of silently rendering unhinted.
+//! - Decoration (`renderDecoration`) is ported: the upstream `Vec` of merged
+//!   exclusion spans lives on `GlyphPrepCache` and the Rust iterator/closure
+//!   pair becomes one pass over that list.
 //! - A font carrying bitmap tables rejects the whole run: upstream resolves
 //!   glyphs through a COLR > bitmap > outline cascade, and a glyph without a
 //!   COLR entry could fall back to a bitmap that is not ported, so the
@@ -48,7 +51,7 @@ pub const FontData = font_mod.FontData;
 /// Errors from glyph run preparation and drawing.
 pub const Error = font_mod.Error || glyf.DrawError || error{
     /// A feature that is scoped but not ported yet: hinting, embolden,
-    /// variation coordinates, bitmap glyphs, decoration.
+    /// variation coordinates, and bitmap glyphs.
     Unsupported,
 };
 
@@ -196,13 +199,33 @@ pub fn GlyphRunBuilder(comptime Backend: type) type {
             return self.backend.strokeGlyphs(allocator, self.run, glyphs);
         }
 
-        /// Render a decoration (underline/strikethrough) with skip-ink
-        /// behavior. Deferred with a typed error until T5.
-        pub fn renderDecoration(self: Self, allocator: std.mem.Allocator, glyphs: anytype) !void {
-            _ = self;
-            _ = allocator;
-            _ = glyphs;
-            return error.Unsupported;
+        /// Render a decoration (underline/overline/strikethrough) with
+        /// skip-ink behavior, using the builder's current run settings.
+        ///
+        /// `x_range` is the horizontal span in run space; `baseline_y`,
+        /// `offset` and `size` place the line relative to the baseline
+        /// (positive `offset` points up, font space) and `buffer` widens each
+        /// glyph's ink exclusion zone. See `GlyphRunRenderer.renderDecoration`.
+        pub fn renderDecoration(
+            self: Self,
+            allocator: std.mem.Allocator,
+            glyphs: anytype,
+            x_range: [2]f32,
+            baseline_y: f32,
+            offset: f32,
+            size: f32,
+            buffer: f32,
+        ) !void {
+            return self.backend.renderDecoration(
+                allocator,
+                self.run,
+                glyphs,
+                x_range,
+                baseline_y,
+                offset,
+                size,
+                buffer,
+            );
         }
     };
 }
@@ -624,9 +647,9 @@ fn calculateColrTransform(metrics: *const ColrMetrics) kurbo.Affine {
         ))
         // Shift the pixmap back so the bbox aligns with the glyph position.
         .compose(kurbo.Affine.translate(kurbo.Vec2.new(
-            metrics.scaled_bbox.x0,
-            metrics.scaled_bbox.y0,
-        )));
+        metrics.scaled_bbox.x0,
+        metrics.scaled_bbox.y0,
+    )));
 }
 
 /// Create COLR glyph data with intermediate texture parameters.
@@ -678,6 +701,9 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
 
         prepared_run: PreparedGlyphRun,
         outline_cache: *outline_cache.OutlineCache,
+        /// Horizontal spans excluded from "ink-skipping" decorations; reused
+        /// across draws (upstream `underline_span_cache`).
+        underline_span_cache: *std.ArrayListUnmanaged([2]f64),
         glyph_iterator: Glyphs,
         atlas_cacher: AtlasCacher,
 
@@ -699,11 +725,166 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
             return @as(f64, self.prepared_run.draw_props.font_size / run_size);
         }
 
-        /// Render a decoration with skip-ink behavior. Deferred until T5.
-        pub fn renderDecoration(self: *Self, allocator: std.mem.Allocator) !void {
-            _ = self;
-            _ = allocator;
-            return error.Unsupported;
+        /// Render a decoration (like an underline) that skips over glyph
+        /// descenders.
+        ///
+        /// Implements `text-decoration-skip-ink`-like behavior: the line is
+        /// interrupted where it would overlap glyph outlines. `x_range` is the
+        /// horizontal span in run space; `baseline_y` places it vertically;
+        /// `offset` (positive = above the baseline, font space) and `size`
+        /// give its position and thickness; `buffer` widens each exclusion.
+        pub fn renderDecoration(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            x_range: [2]f32,
+            baseline_y: f32,
+            offset: f32,
+            size: f32,
+            buffer: f32,
+            renderer: anytype,
+        ) !void {
+            interface.assertGlyphRenderer(@TypeOf(renderer.*));
+            try self.decorationSpans(
+                allocator,
+                x_range,
+                baseline_y,
+                offset,
+                size,
+                buffer,
+                renderer,
+            );
+        }
+
+        /// Port of upstream `GlyphRunRenderer::decoration_spans`.
+        ///
+        /// The upstream method returns a lazy iterator over the merged
+        /// exclusion list and `render_decoration` drains it into
+        /// `fill_rect` calls. Here the collection and the emission are one
+        /// pass; the numeric order of the emitted rectangles is identical.
+        fn decorationSpans(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            x_range: [2]f32,
+            baseline_y: f32,
+            offset: f32,
+            size: f32,
+            buffer: f32,
+            renderer: anytype,
+        ) !void {
+            const prepared = &self.prepared_run;
+            const hinted = false; // supported runs never carry a HintingInstance
+
+            // Upstream derives the scale from the prepared run's hint state.
+            // Hinted runs are rejected in `prepareGlyphRun`, so the cache
+            // size is always the unhinted fill size.
+            const scale_props = GlyphScaleProperties.new(
+                prepared.draw_props.font_size,
+                prepared.font_info.upem,
+                hinted,
+                .fill,
+            );
+            // adapt: upstream widens an f32 division (`run_size / cache_size`)
+            // to f64; keep the intermediate in f32.
+            const outline_to_nominal_scale: f64 = @as(f64, prepared.run_size / scale_props.cache_size);
+            const glyph_transform = prepared.glyph_transform orelse kurbo.Affine.IDENTITY;
+            const outline_transform = glyph_transform
+                .compose(kurbo.Affine.scaleNonUniform(1.0, -1.0))
+                .compose(kurbo.Affine.scale(outline_to_nominal_scale));
+
+            const buffer_f: f64 = @floatCast(buffer);
+            const x0: f64 = @floatCast(x_range[0]);
+            const x1: f64 = @floatCast(x_range[1]);
+            const layout_y0: f64 = @floatCast(-offset);
+            const layout_y1: f64 = @floatCast(-offset + size);
+
+            // Collect and merge exclusion zones from all glyphs.
+            self.underline_span_cache.clearRetainingCapacity();
+
+            while (self.glyph_iterator.next()) |glyph| {
+                // Upstream `outlines.get()` returns `None` for glyph ids the
+                // font does not contain and skips them.
+                const raw_glyph = prepared.outlines.getGlyph(glyph.id) catch |err| switch (err) {
+                    error.OutOfBounds => continue,
+                    else => return err,
+                };
+                _ = raw_glyph;
+
+                const cached = try self.outline_cache.getOrInsert(
+                    allocator,
+                    &prepared.outlines,
+                    glyph.id,
+                    prepared.font_info,
+                    scale_props.cache_size,
+                    prepared.font_embolden,
+                    prepared.normalized_coords,
+                    hinted,
+                );
+
+                // If the glyph's bounding box doesn't intersect the decoration
+                // at all, skip the (much more expensive) segment intersections.
+                // Only the y-extent of the transformed bbox is needed:
+                // y' = b*x + d*y + f.
+                const c = outline_transform.asCoeffs();
+                const b = c[1];
+                const d = c[3];
+                const f = c[5];
+                const bx0 = b * cached.bbox.x0;
+                const bx1 = b * cached.bbox.x1;
+                const dy0 = d * cached.bbox.y0;
+                const dy1 = d * cached.bbox.y1;
+                const y_min = f + @min(bx0, bx1) + @min(dy0, dy1);
+                const y_max = f + @max(bx0, bx1) + @max(dy0, dy1);
+                if (y_max < layout_y0 or y_min > layout_y1) continue;
+
+                var rect = kurbo.Rect.new(
+                    std.math.inf(f64),
+                    layout_y0,
+                    -std.math.inf(f64),
+                    layout_y1,
+                );
+
+                var segments = cached.path.segments();
+                while (segments.next()) |segment| {
+                    const transformed = segment.transform(outline_transform);
+                    expandRectWithSegment(&rect, transformed, layout_y0, layout_y1);
+                }
+
+                // Add glyph position and buffer, then clip to the decoration
+                // x-range.
+                const glyph_x: f64 = @floatCast(glyph.x);
+                const excl_start = @max(rect.x0 + glyph_x - buffer_f, x0);
+                const excl_end = @min(rect.x1 + glyph_x + buffer_f, x1);
+
+                // Skip if no valid exclusion (empty intersection or outside
+                // the x-range).
+                if (excl_start >= excl_end) continue;
+
+                // Insert in sorted order and merge with overlapping ranges.
+                try insertAndMergeRange(
+                    self.underline_span_cache,
+                    allocator,
+                    excl_start,
+                    excl_end,
+                );
+            }
+
+            // Draw decoration segments, skipping the exclusion zones.
+            const y0 = @as(f64, @floatCast(baseline_y)) + layout_y0;
+            const y1 = @as(f64, @floatCast(baseline_y)) + layout_y1;
+
+            var current_x = x0;
+            for (self.underline_span_cache.items) |range| {
+                // adapt: upstream emits the pre-exclusion rectangle
+                // unconditionally (it may be empty or inverted); only the
+                // trailing rectangle is width-filtered.
+                try renderer.fillRect(allocator, kurbo.Rect.new(current_x, y0, range[0], y1));
+                current_x = range[1];
+            }
+
+            const final_rect = kurbo.Rect.new(current_x, y0, x1, y1);
+            if (final_rect.width() > 0.0) {
+                try renderer.fillRect(allocator, final_rect);
+            }
         }
 
         fn drawGlyphs(
@@ -909,6 +1090,145 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
     };
 }
 
+/// Insert a range into a sorted list, merging with any overlapping ranges.
+///
+/// Port of upstream `insert_and_merge_range`; `ranges` stays sorted and
+/// non-overlapping. The allocator is explicit because the Zig `Vec` is
+/// `ArrayListUnmanaged`.
+fn insertAndMergeRange(
+    ranges: *std.ArrayListUnmanaged([2]f64),
+    allocator: std.mem.Allocator,
+    start: f64,
+    end: f64,
+) std.mem.Allocator.Error!void {
+    // Search backwards from the end to find the insertion point. Glyphs come
+    // in visual (left-to-right) order, so new ranges are usually at or near
+    // the end, making this O(1) in the common case.
+    var insert_pos: usize = 0;
+    var i = ranges.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (ranges.items[i][0] <= start) {
+            insert_pos = i + 1;
+            break;
+        }
+    }
+
+    // Check whether the previous range overlaps the new one.
+    const merge_start = if (insert_pos > 0 and ranges.items[insert_pos - 1][1] >= start)
+        insert_pos - 1
+    else
+        insert_pos;
+
+    // Find all overlapping ranges and compute the merged bounds.
+    var new_end = end;
+    var j = merge_start;
+    while (j < ranges.items.len and ranges.items[j][0] <= end) : (j += 1) {
+        new_end = @max(new_end, ranges.items[j][1]);
+    }
+    var merge_end = merge_start;
+    while (merge_end < ranges.items.len and ranges.items[merge_end][0] <= new_end) {
+        merge_end += 1;
+    }
+
+    // Replace the overlapping ranges with the merged range.
+    if (merge_start < merge_end) {
+        const new_start = @min(start, ranges.items[merge_start][0]);
+        try ranges.replaceRange(
+            allocator,
+            merge_start,
+            merge_end - merge_start,
+            &.{.{ new_start, new_end }},
+        );
+    } else {
+        try ranges.insert(allocator, insert_pos, .{ start, end });
+    }
+}
+
+/// Expand `rect`'s x-bounds by where `seg` intersects the decoration's top
+/// and bottom lines.
+///
+/// Port of upstream `expand_rect_with_segment`. The bounds are deliberately
+/// rough (control-point hull plus intersection with two horizontal lines):
+/// this matches upstream's skip-ink geometry, not a tight bbox.
+fn expandRectWithSegment(
+    rect: *kurbo.Rect,
+    seg: kurbo.PathSeg,
+    y_start: f64,
+    y_end: f64,
+) void {
+    var x_min: f64 = undefined;
+    var x_max: f64 = undefined;
+    var y_min: f64 = undefined;
+    var y_max: f64 = undefined;
+    switch (seg) {
+        .Line => |line| {
+            x_min = @min(line.p0.x, line.p1.x);
+            x_max = @max(line.p0.x, line.p1.x);
+            y_min = @min(line.p0.y, line.p1.y);
+            y_max = @max(line.p0.y, line.p1.y);
+        },
+        .Quad => |quad| {
+            x_min = @min(@min(quad.p0.x, quad.p1.x), quad.p2.x);
+            x_max = @max(@max(quad.p0.x, quad.p1.x), quad.p2.x);
+            y_min = @min(@min(quad.p0.y, quad.p1.y), quad.p2.y);
+            y_max = @max(@max(quad.p0.y, quad.p1.y), quad.p2.y);
+        },
+        .Cubic => |cubic| {
+            x_min = @min(@min(@min(cubic.p0.x, cubic.p1.x), cubic.p2.x), cubic.p3.x);
+            x_max = @max(@max(@max(cubic.p0.x, cubic.p1.x), cubic.p2.x), cubic.p3.x);
+            y_min = @min(@min(@min(cubic.p0.y, cubic.p1.y), cubic.p2.y), cubic.p3.y);
+            y_max = @max(@max(@max(cubic.p0.y, cubic.p1.y), cubic.p2.y), cubic.p3.y);
+        },
+    }
+    // Skip segments entirely outside the y-span.
+    if (y_max < y_start or y_min > y_end) return;
+
+    // Only the x-intersections matter. The intersection methods do not work
+    // on infinitely long lines, so construct a "long enough" line based on
+    // the segment bounds (expanded for a little error).
+    x_min -= 1.0;
+    x_max += 1.0;
+    const top_line = kurbo.Line.new(
+        kurbo.Point.new(x_min, y_start),
+        kurbo.Point.new(x_max, y_start),
+    );
+    const bottom_line = kurbo.Line.new(
+        kurbo.Point.new(x_min, y_end),
+        kurbo.Point.new(x_max, y_end),
+    );
+
+    const top_intersections = seg.intersectLine(top_line);
+    for (top_intersections.slice()) |intersection| {
+        const point = top_line.eval(intersection.line_t);
+        // There might be slight inaccuracy calculating `point` from `line_t`,
+        // so only the x-values are adjusted (upstream `union_pt` would also
+        // expand y).
+        rect.x0 = @min(rect.x0, point.x);
+        rect.x1 = @max(rect.x1, point.x);
+    }
+
+    const bottom_intersections = seg.intersectLine(bottom_line);
+    for (bottom_intersections.slice()) |intersection| {
+        const point = bottom_line.eval(intersection.line_t);
+        rect.x0 = @min(rect.x0, point.x);
+        rect.x1 = @max(rect.x1, point.x);
+    }
+
+    // Also check segment endpoints that lie within the y-range.
+    const endpoints: [2]kurbo.Point = switch (seg) {
+        .Line => |line| .{ line.p0, line.p1 },
+        .Quad => |quad| .{ quad.p0, quad.p2 },
+        .Cubic => |cubic| .{ cubic.p0, cubic.p3 },
+    };
+    for (endpoints) |point| {
+        if (point.y >= y_start and point.y <= y_end) {
+            rect.x0 = @min(rect.x0, point.x);
+            rect.x1 = @max(rect.x1, point.x);
+        }
+    }
+}
+
 /// Build a renderer for a glyph run.
 ///
 /// `glyphs` is any iterator value with `next() ?Glyph`; `prep_cache` and
@@ -923,6 +1243,7 @@ pub fn buildRenderer(
     return .{
         .prepared_run = prepared_run,
         .outline_cache = prep_cache.outline_cache,
+        .underline_span_cache = prep_cache.underline_exclusions,
         .glyph_iterator = glyphs,
         .atlas_cacher = atlas_cacher,
     };
@@ -947,6 +1268,9 @@ const RecordingRenderer = struct {
     fill_rect_count: usize = 0,
     tint: ?paint_mod.Tint = null,
     last_fill_rect: kurbo.Rect = kurbo.Rect.ZERO,
+    /// Every rectangle passed to `fillRect`, in call order (decoration spans
+    /// include empty/inverted pre-exclusion rectangles, like upstream).
+    fill_rects: std.ArrayListUnmanaged(kurbo.Rect) = .empty,
 
     pub fn saveState(self: *RecordingRenderer) !RenderStateClone {
         return .{
@@ -987,10 +1311,13 @@ const RecordingRenderer = struct {
         self.paint = paint;
     }
 
-    /// Release the currently held paint payload at test end.
+    /// Release the currently held paint payload and recorded decoration
+    /// rectangles at test end.
     pub fn deinit(self: *RecordingRenderer) void {
         self.paint.deinit(std.testing.allocator);
         self.paint = paint_mod.PaintType.fromAlphaColor(peniko.Color.BLACK);
+        self.fill_rects.deinit(std.testing.allocator);
+        self.fill_rects = .empty;
     }
 
     pub fn fillPath(self: *RecordingRenderer, allocator: std.mem.Allocator, path: []const kurbo.PathEl) !void {
@@ -1006,9 +1333,9 @@ const RecordingRenderer = struct {
     }
 
     pub fn fillRect(self: *RecordingRenderer, allocator: std.mem.Allocator, rect: kurbo.Rect) !void {
-        _ = allocator;
         self.last_fill_rect = rect;
         self.fill_rect_count += 1;
+        try self.fill_rects.append(allocator, rect);
     }
 
     pub fn pushClipLayer(self: *RecordingRenderer, allocator: std.mem.Allocator, clip: []const kurbo.PathEl) !void {
@@ -1280,4 +1607,197 @@ test "colr glyph is not cached when atlas cache is disabled" {
     try drawTestGlyph(allocator, font, glyph, false, .fill, &renderer, &prep_cache, &glyph_atlas, &image_cache);
     try testing.expectEqual(@as(usize, 0), glyph_atlas.len());
     try testing.expectEqual(@as(u64, 0), glyph_atlas.cacheMisses());
+}
+
+// ------------------------------------------------------------ decoration
+
+/// Glyphs of the first `glyph_run` in
+/// `tests/scenes/glyph_run_decoration_offset_values_300x180.json`
+/// (`font_size = 30`, `offset = -6`, `size = 1.5`, `buffer = 1.5`,
+/// `x_range = [0, 176.408203]`).
+const decoration_skip_ink_glyphs = [_]Glyph{
+    .{ .id = 44, .x = 0.0, .y = 0.0 },
+    .{ .id = 69, .x = 21.386719, .y = 0.0 },
+    .{ .id = 84, .x = 37.705078, .y = 0.0 },
+    .{ .id = 84, .x = 54.536133, .y = 0.0 },
+    .{ .id = 93, .x = 71.367188, .y = 0.0 },
+    .{ .id = 4, .x = 85.561523, .y = 0.0 },
+    .{ .id = 78, .x = 92.988281, .y = 0.0 },
+    .{ .id = 83, .x = 100.151367, .y = 0.0 },
+    .{ .id = 93, .x = 117.260742, .y = 0.0 },
+    .{ .id = 74, .x = 131.455078, .y = 0.0 },
+    .{ .id = 89, .x = 141.870117, .y = 0.0 },
+    .{ .id = 80, .x = 158.408203, .y = 0.0 },
+};
+
+/// Expected `fillRect` sequence for the glyphs above, in call order, as f64
+/// bit patterns captured from the pinned oracle:
+///
+///     tools/oracle-rs/target/release/vellz-oracle --dump-decoration \
+///         --scene tests/scenes/glyph_run_decoration_offset_values_300x180.json
+///
+/// The first five rectangles are the gaps before each skip-ink exclusion; the
+/// last one is the trailing rectangle after the final descender.
+const decoration_skip_ink_expected = [_][4]u64{
+    .{ 0x0000000000000000, 0x4018000000000000, 0x404320c000000000, 0x401e000000000000 },
+    .{ 0x4045fba000000000, 0x4018000000000000, 0x404b8b2000000000, 0x401e000000000000 },
+    .{ 0x404e660000000000, 0x4018000000000000, 0x4051c64000000000, 0x401e000000000000 },
+    .{ 0x40535fd5cabc9f67, 0x4018000000000000, 0x4056a25000000000, 0x401e000000000000 },
+    .{ 0x40585232c5545386, 0x4018000000000000, 0x405d3f7000000000, 0x401e000000000000 },
+    .{ 0x405ed905cabc9f67, 0x4018000000000000, 0x40660d1000000000, 0x401e000000000000 },
+};
+
+test "decoration skip-ink spans match the pinned oracle" {
+    const allocator = testing.allocator;
+    const font = try testFontData();
+    var renderer = RecordingRenderer{};
+    defer renderer.fill_rects.deinit(allocator);
+    var prep_cache = GlyphPrepCache{};
+    defer prep_cache.deinit(allocator);
+
+    const run: GlyphRun = .{
+        .font = font,
+        .font_size = 30.0,
+        .transform = kurbo.Affine.IDENTITY,
+        .scene_paint_transform = kurbo.Affine.IDENTITY,
+        .hint = false,
+    };
+    var run_renderer = try buildRenderer(
+        run,
+        iterate(&decoration_skip_ink_glyphs),
+        prep_cache.asMut(),
+        .disabled,
+    );
+    try run_renderer.renderDecoration(
+        allocator,
+        .{ 0.0, 176.408203 },
+        0.0,
+        -6.0,
+        1.5,
+        1.5,
+        &renderer,
+    );
+
+    try testing.expectEqual(decoration_skip_ink_expected.len, renderer.fill_rects.items.len);
+    for (decoration_skip_ink_expected, renderer.fill_rects.items) |expected, rect| {
+        const actual: [4]u64 = .{
+            @bitCast(rect.x0),
+            @bitCast(rect.y0),
+            @bitCast(rect.x1),
+            @bitCast(rect.y1),
+        };
+        try testing.expectEqualDeep(expected, actual);
+    }
+}
+
+test "decoration with no descenders emits one trailing rectangle" {
+    const allocator = testing.allocator;
+    const font = try testFontData();
+    var renderer = RecordingRenderer{};
+    defer renderer.fill_rects.deinit(allocator);
+    var prep_cache = GlyphPrepCache{};
+    defer prep_cache.deinit(allocator);
+
+    // "HELLO" glyphs from
+    // `tests/scenes/glyph_run_decoration_no_descenders_180x70.json`
+    // (font_size 50, offset -2, size 2, buffer 1.5, x_range [0, 147.871094]).
+    const hello_glyphs = [_]Glyph{
+        .{ .id = 44, .x = 0.0, .y = 0.0 },
+        .{ .id = 41, .x = 35.644531, .y = 0.0 },
+        .{ .id = 48, .x = 64.0625, .y = 0.0 },
+        .{ .id = 48, .x = 90.966797, .y = 0.0 },
+        .{ .id = 51, .x = 117.871094, .y = 0.0 },
+    };
+    const run: GlyphRun = .{
+        .font = font,
+        .font_size = 50.0,
+        .transform = kurbo.Affine.IDENTITY,
+        .scene_paint_transform = kurbo.Affine.IDENTITY,
+        .hint = false,
+    };
+    var run_renderer = try buildRenderer(run, iterate(&hello_glyphs), prep_cache.asMut(), .disabled);
+    try run_renderer.renderDecoration(
+        allocator,
+        .{ 0.0, 147.871094 },
+        0.0,
+        -2.0,
+        2.0,
+        1.5,
+        &renderer,
+    );
+
+    try testing.expectEqual(@as(usize, 1), renderer.fill_rects.items.len);
+    const rect = renderer.fill_rects.items[0];
+    try testing.expectEqual(@as(f64, 0.0), rect.x0);
+    try testing.expectEqual(@as(f64, 2.0), rect.y0);
+    try testing.expectEqual(@as(f64, 147.87109375), rect.x1);
+    try testing.expectEqual(@as(f64, 4.0), rect.y1);
+}
+
+test "decoration exclusion ranges insert and merge like upstream" {
+    const allocator = testing.allocator;
+    var ranges: std.ArrayListUnmanaged([2]f64) = .empty;
+    defer ranges.deinit(allocator);
+
+    try insertAndMergeRange(&ranges, allocator, 2.0, 3.0);
+    try testing.expectEqualDeep([2]f64{ 2.0, 3.0 }, ranges.items[0]);
+
+    // Overlapping insert grows both bounds.
+    try insertAndMergeRange(&ranges, allocator, 1.0, 5.0);
+    try testing.expectEqual(@as(usize, 1), ranges.items.len);
+    try testing.expectEqualDeep([2]f64{ 1.0, 5.0 }, ranges.items[0]);
+
+    // Insert before the first range.
+    try insertAndMergeRange(&ranges, allocator, 0.5, 1.5);
+    try testing.expectEqual(@as(usize, 1), ranges.items.len);
+    try testing.expectEqualDeep([2]f64{ 0.5, 5.0 }, ranges.items[0]);
+
+    // Non-overlapping insert appends and keeps sorted order.
+    try insertAndMergeRange(&ranges, allocator, 6.0, 7.0);
+    try testing.expectEqual(@as(usize, 2), ranges.items.len);
+    try testing.expectEqualDeep([2]f64{ 6.0, 7.0 }, ranges.items[1]);
+
+    // An insert bridging two ranges merges them into one.
+    try insertAndMergeRange(&ranges, allocator, 4.0, 6.5);
+    try testing.expectEqual(@as(usize, 1), ranges.items.len);
+    try testing.expectEqualDeep([2]f64{ 0.5, 7.0 }, ranges.items[0]);
+
+    // An insert touching (but not crossing) the previous range's end merges.
+    try insertAndMergeRange(&ranges, allocator, 7.0, 8.5);
+    try testing.expectEqual(@as(usize, 1), ranges.items.len);
+    try testing.expectEqualDeep([2]f64{ 0.5, 8.5 }, ranges.items[0]);
+}
+
+test "decoration segment expansion matches upstream skip-ink geometry" {
+    var rect = kurbo.Rect.new(std.math.inf(f64), 2.0, -std.math.inf(f64), 4.0);
+    const diagonal = kurbo.PathSeg{ .Line = kurbo.Line.new(
+        kurbo.Point.new(0.0, 0.0),
+        kurbo.Point.new(10.0, 10.0),
+    ) };
+    expandRectWithSegment(&rect, diagonal, 2.0, 4.0);
+    // Crosses the y = 2 and y = 4 lines at x = 2 and x = 4.
+    try testing.expectEqual(@as(f64, 2.0), rect.x0);
+    try testing.expectEqual(@as(f64, 4.0), rect.x1);
+    // The decoration's y bounds are never expanded.
+    try testing.expectEqual(@as(f64, 2.0), rect.y0);
+    try testing.expectEqual(@as(f64, 4.0), rect.y1);
+
+    // A horizontal segment inside the span only contributes its endpoints
+    // (coincident with the probe lines, so the intersections return none).
+    const horizontal = kurbo.PathSeg{ .Line = kurbo.Line.new(
+        kurbo.Point.new(5.0, 2.0),
+        kurbo.Point.new(7.0, 2.0),
+    ) };
+    expandRectWithSegment(&rect, horizontal, 2.0, 4.0);
+    try testing.expectEqual(@as(f64, 2.0), rect.x0);
+    try testing.expectEqual(@as(f64, 7.0), rect.x1);
+
+    // Segments entirely above/below the span are ignored.
+    const below = kurbo.PathSeg{ .Line = kurbo.Line.new(
+        kurbo.Point.new(-100.0, 10.0),
+        kurbo.Point.new(100.0, 20.0),
+    ) };
+    expandRectWithSegment(&rect, below, 2.0, 4.0);
+    try testing.expectEqual(@as(f64, 2.0), rect.x0);
+    try testing.expectEqual(@as(f64, 7.0), rect.x1);
 }

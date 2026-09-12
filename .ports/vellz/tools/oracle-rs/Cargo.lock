@@ -409,6 +409,7 @@ name = "vellz-oracle"
 version = "0.1.0"
 dependencies = [
  "fearless_simd",
+ "glifo",
  "serde",
  "serde_json",
  "skrifa",

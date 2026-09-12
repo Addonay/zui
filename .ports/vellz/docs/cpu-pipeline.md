@@ -287,11 +287,16 @@ pub fn RenderContext.glyphRun(self, resources, font) GlyphRunBuilder;
   Palette-indexed and foreground colors, gradients, transforms, clip boxes and
   composite modes match upstream; `AtlasPaint::Gradient` is recorded with owned
   stops that replay/clear frees.
+- Decoration (`renderDecoration`) is ported: underline/overline/
+  strikethrough spans with skip-ink exclusions, using the prep cache's
+  `underline_exclusions` buffer. Upstream's lazy span iterator becomes one
+  pass over the merged exclusion list; rectangle values and order match the
+  pinned oracle (`--dump-decoration`).
 - Deferred with typed errors, never approximated: hinting interpreter/autohint
   (an eligible hinted run fails up front), `gvar`/`HVAR` coordinates, CFF/CFF2,
-  CBDT/CBLC/sbix bitmaps and decoration. A font carrying a bitmap table
-  rejects the whole run with `error.Unsupported` instead of silently dropping a
-  glyph that could fall back to a bitmap.
+  and CBDT/CBLC/sbix bitmaps. A font carrying a bitmap table rejects the whole
+  run with `error.Unsupported` instead of silently dropping a glyph that could
+  fall back to a bitmap.
 
 ## Error policy
 

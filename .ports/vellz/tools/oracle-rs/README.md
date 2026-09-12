@@ -69,6 +69,23 @@ Fixture hashes for the vectors gated by `zig build test` live in
 `tests/fixtures/glyphs/manifest.zig`; regenerate them with
 `tools/compare_glyphs.sh --update-manifest`.
 
+## Decoration span dump (M3 T5)
+
+`--dump-decoration --scene PATH` drives the pinned `glifo` skip-ink span
+computation for every `glyph_run` command that carries a `decoration` block
+and prints each emitted rectangle in call order as f64 bit patterns:
+
+```sh
+tools/oracle-rs/target/release/vellz-oracle --dump-decoration \
+    --scene tests/scenes/glyph_run_decoration_offset_values_300x180.json
+# command=2 x0=... y0=... x1=... y1=... (one line per fill_rect)
+```
+
+This is the ground truth for `vellz.glifo`'s `renderDecoration`: the Zig unit
+tests compare `RecordingRenderer.fill_rects` against these values. The dump
+uses a recording `DrawSink` and does not rasterize, so it is cheap and exactly
+reflects the decoration geometry (including empty pre-exclusion rectangles).
+
 ## Scene format
 
 Version 1. All coordinates are f64 logical pixels; affine values are

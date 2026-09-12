@@ -29,7 +29,9 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 830/830 unit and integration tests (822 lib + 8 scene)
+zig build test     # 830/830 unit and integration tests (822 lib + 8 scene),
+                   #   plus opt-in Cozmic adapter/bridge tests that skip when
+                   #   the .ports/cozmic sibling checkout is absent
 zig build corpus   # 90/90 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo
@@ -65,12 +67,19 @@ outlines, compared across 250,016 path elements / 685,392 coordinates and
 placement trace. T3 wires the stack end to end: positioned `glyph_run` scenes
 (fill/stroke, transform absorption, skew, glyph transforms, gradient paint)
 render through `vellz.glifo` + `vellz.cpu` byte-exact against the pinned
-oracle with the glyph atlas cache on and off (15 new scenes; 63/63 corpus,
-tolerance 0). T4 adds COLRv0/v1 + CPAL (paint-graph traversal, linear/radial/
-sweep gradients, transforms, clip boxes, composite modes, palette and
-foreground colors) and its 27-scene G3c corpus; all render byte-exact against
-the pinned oracle, atlas cache on and off (90/90 corpus, tolerance 0). The GPU
-side has the wgpu-native device bootstrap, the full host/shader layout
+oracle with the glyph atlas cache on and off (15 new scenes; tolerance 0). T4
+adds COLRv0/v1 + CPAL (paint-graph traversal, linear/radial/sweep gradients,
+transforms, clip boxes, composite modes, palette and foreground colors) and
+its 27-scene G3c corpus. T5 adds the skip-ink decoration path
+(`renderDecoration`: underline/overline/strikethrough spans, buffer,
+transforms; 6 new scenes mirroring `vello_tests`' decoration cases and an
+oracle `--dump-decoration` span dump) and the opt-in Cozmic adapter
+(`vellz.cozmic_adapter`, never a dependency of the rendering core): it maps
+already-positioned glyphs 1:1 onto `glifo.GlyphRun` runs and is gated by a
+bridge test that renders byte-identical pixels to a direct `glyph_run`, with
+an explicit skip when `.ports/cozmic` is absent. All of it renders byte-exact
+against the pinned oracle, atlas cache on and off (90/90 corpus, tolerance 0).
+The GPU side has the wgpu-native device bootstrap, the full host/shader layout
 contract, the schedule/layer executor, encoded paints (gradients and images),
 GPU filters, and a 44-scene `gpu-corpus` gate (27 byte-exact, the rest within
 the documented per-scene tolerance registry, plus typed
@@ -78,9 +87,9 @@ device-loss/unsupported-capability/missing-binding/feedback-loop errors)
 running on the llvmpipe software adapter.
 
 Not yet implemented (explicit typed errors, never placeholder pixels): hinted
-outlines (the interpreter), bitmap glyphs, glyph decoration and the Cozmic
-adapter (M3 remainder); GPU masks, atlas-backed images, GPU text, and the full
-G5 corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
+outlines (the interpreter) and embedded bitmaps (M3 remainder); GPU masks,
+atlas-backed images, GPU text, and the full G5 corpus (M5 remainder). G4 is
+met: `zig build corpus` is byte-exact at every
 SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage
 benchmarks in `docs/benchmarks.md` (u8-vs-f32 speedups 1.9–3.4× on the
 representative scenes). MT filter layers and u8 + MT return
