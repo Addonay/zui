@@ -67,7 +67,7 @@ fi
 
 mkdir -p "$out" "$(dirname "$manifest")"
 
-# font filename, size in px, first gid, last gid
+# font filename, size in px, first gid, last gid, hint (n = unhinted, h = hinted)
 glyph_vectors=(
     "Roboto-Regular.ttf 12.0 0 1293"
     "Roboto-Regular.ttf 16.0 0 1293"
@@ -81,6 +81,17 @@ glyph_vectors=(
     "NotoColorEmoji-Subset.ttf 16.0 0 43"
     "NotoColorEmoji-Subset.ttf 48.0 0 43"
     "NotoColorEmoji-Subset.ttf 7.0 0 43"
+    # G3b: hinted outlines through the TrueType interpreter. Same vectors as
+    # the unhinted ones (fonts whose glyph programs fail with a typed error are
+    # gated, never approximated).
+    "Roboto-Regular.ttf 12.0 0 1293 h"
+    "Roboto-Regular.ttf 16.0 0 1293 h"
+    "Roboto-Regular.ttf 23.5 0 1293 h"
+    "Roboto-Regular.ttf 7.0 0 1293 h"
+    "Roboto-Regular.ttf 14.5 0 1293 h"
+    "Roboto-Regular.ttf 100.0 0 1293 h"
+    "Roboto-Regular.ttf 0.5 0 1293 h"
+    "Roboto-Regular.ttf 2048.0 0 1293 h"
 )
 
 # font filename, first codepoint, last codepoint
@@ -114,13 +125,20 @@ total_coordinates=0
 
 glyph_rows=""
 for vector in "${glyph_vectors[@]}"; do
-    read -r font size gid_start gid_end <<<"$vector"
+    read -r font size gid_start gid_end hint_flag <<<"$vector"
     name="${font%.ttf}_s${size}_${gid_start}-${gid_end}"
+    hint_arg=""
+    manifest_hint="false"
+    if [ "$hint_flag" = "h" ]; then
+        name="${name}_hint"
+        hint_arg="--hint"
+        manifest_hint="true"
+    fi
     oracle_dump="$out/oracle_$name.txt"
     zig_dump="$out/zig_$name.txt"
-    "$oracle" --dump-glyphs --font "$fonts_dir/$font" --size "$size" \
+    "$oracle" --dump-glyphs --font "$fonts_dir/$font" --size "$size" $hint_arg \
         --gids "$gid_start-$gid_end" >"$oracle_dump"
-    "$cli" --dump-glyphs --font "$fonts_dir/$font" --size "$size" \
+    "$cli" --dump-glyphs --font "$fonts_dir/$font" --size "$size" $hint_arg \
         --gids "$gid_start-$gid_end" >"$zig_dump"
     count_elements="$(elements "$oracle_dump")"
     count_coordinates="$(coordinates "$oracle_dump")"
@@ -138,7 +156,7 @@ for vector in "${glyph_vectors[@]}"; do
         hex="$(sha256sum "$oracle_dump" | awk '{print $1}')"
         bytes="$(printf '%s' "$hex" | sed 's/../0x&, /g')"
         size_bits="$(python3 -c 'import struct,sys; print("%08x" % struct.unpack("<I", struct.pack("<f", float(sys.argv[1])))[0])' "$size")"
-        glyph_rows+="    .{ .font = $(font_id "$font"), .size_bits = 0x$size_bits, .gid_start = $gid_start, .gid_end = $gid_end, .elements = $count_elements, .coordinates = $count_coordinates, .sha256 = .{ $bytes} },\n"
+        glyph_rows+="    .{ .font = $(font_id "$font"), .size_bits = 0x$size_bits, .gid_start = $gid_start, .gid_end = $gid_end, .hint = $manifest_hint, .elements = $count_elements, .coordinates = $count_coordinates, .sha256 = .{ $bytes} },\n"
     fi
 done
 
@@ -190,6 +208,7 @@ if [ "$update_manifest" -eq 1 ]; then
         echo "    size_bits: u32,"
         echo "    gid_start: u32,"
         echo "    gid_end: u32,"
+        echo "    hint: bool,"
         echo "    elements: usize,"
         echo "    coordinates: usize,"
         echo "    sha256: [32]u8,"

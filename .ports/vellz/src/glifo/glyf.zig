@@ -13,15 +13,20 @@
 //! `F26Dot6::to_f32` converts to `f32`. A f32 reimplementation is not
 //! bit-identical; see `.ports/vellz/docs/glifo-m3-plan.md` §2.
 //!
-//! Ported scope (unhinted only): simple glyphs, composite glyphs with
-//! transforms and point matching, empty glyphs, phantom-point lsb/advance
-//! adjustment, and `PathStyle::FreeType`.
+//! Ported scope: simple glyphs, composite glyphs with transforms and point
+//! matching, empty glyphs, phantom-point lsb/advance adjustment,
+//! `PathStyle::FreeType`, and the embedded TrueType interpreter
+//! (`hint.zig`): hinted scaling (`computeHintedScale`, phantom rounding),
+//! `HintOutline` buffers, simple/composite glyf programs and the rounded
+//! hinted advance. Hinted outlines are bit-identical to skrifa; any
+//! interpreter failure is `error.HintError`, never a silent unhinted draw.
 //!
-//! Deferred with typed errors: hinting (`error.Unsupported`), HarfBuzz path
-//! style (`error.Unsupported`), non-empty variation coordinates
-//! (`error.Unsupported`; `gvar`/`HVAR` deltas are not ported), CFF/bitmap
-//! faces (rejected by `font.Font.outlines`), and embolden (rejected by the
-//! outline cache).
+//! Deferred with typed errors: HarfBuzz path style (`error.Unsupported`),
+//! non-empty variation coordinates (`error.Unsupported`; `gvar`/`HVAR` deltas
+//! are not ported), CFF/bitmap faces (rejected by `font.Font.outlines`),
+//! autohinter-only fonts (`prefer_interpreter == false`), `hdmx` advances
+//! outside backward compatibility, and embolden (rejected by the outline
+//! cache).
 
 const std = @import("std");
 
@@ -30,10 +35,19 @@ const tables = @import("tables/root.zig");
 const sfnt = tables.sfnt;
 const raw = tables.glyf;
 const Loca = tables.loca.Loca;
+const hint_mod = @import("hint.zig");
 
 pub const GlyphId = font_mod.GlyphId;
 pub const NormalizedCoord = font_mod.NormalizedCoord;
 pub const Font = font_mod.Font;
+
+/// The TrueType interpreter instance (one per font/size/location).
+pub const HintInstance = hint_mod.HintInstance;
+pub const HintProgram = hint_mod.ProgramData;
+pub const HintTarget = hint_mod.Target;
+pub const HintSmoothMode = hint_mod.SmoothMode;
+/// The configured hinting target glifo uses (see `hint.glifo_target`).
+pub const glifo_hint_target = hint_mod.glifo_target;
 
 /// Kept in sync with `skrifa`'s `GLYF_COMPOSITE_RECURSION_LIMIT`.
 pub const composite_recursion_limit: usize = 32;
@@ -52,6 +66,9 @@ pub const DrawError = sfnt.Error || error{
     ExpectedQuad,
     ExpectedQuadOrOnCurve,
     ExpectedCubic,
+    /// The interpreter rejected the glyph's bytecode. Never approximated:
+    /// hinted output is only emitted when the full program ran bit-exactly.
+    HintError,
     /// Not ported yet; never approximated.
     Unsupported,
     OutOfMemory,
@@ -84,6 +101,11 @@ pub fn fixedDiv(a: i32, b: i32) i32 {
 pub fn fixedToI32(bits: i32) i32 {
     const wrapped: i32 = @bitCast(@as(u32, @bitCast(bits)) +% 0x8000);
     return wrapped >> 16;
+}
+
+/// `F26Dot6::round` (font-types): `(bits + 32) & !63`, wrapping add.
+pub fn roundF26Point(bits: i32) i32 {
+    return (bits +% 32) & ~@as(i32, 63);
 }
 
 /// `F26Dot6::from_i32`: `bits << 6` (high bits discarded, like Rust's shift).
@@ -147,8 +169,25 @@ pub const Scale26Dot6 = struct {
     }
 };
 
-pub const PointI32 = struct { x: i32, y: i32 };
-pub const Point26 = struct { x: i32, y: i32 };
+/// Rust `f64 as i32`: saturating, NaN maps to 0, truncation toward zero.
+fn saturatingF64ToI32(value: f64) i32 {
+    if (std.math.isNan(value)) return 0;
+    if (value >= 2147483648.0) return std.math.maxInt(i32);
+    if (value < -2147483648.0) return std.math.minInt(i32);
+    return @intFromFloat(value);
+}
+
+/// `F26Dot6::from_f64(ppem).round().to_f32()`: the ppem quantization applied
+/// when the font does not support fractional scaling (head bit 3 unset).
+fn roundPpemForHinting(ppem: f32) f32 {
+    const frac: f64 = (if (std.math.signbit(ppem)) @as(f64, 0.0) else @as(f64, 1.0)) - 0.5;
+    const bits = saturatingF64ToI32(@as(f64, ppem) * 64.0 + frac);
+    const rounded = (bits +% 32) & ~@as(i32, 63);
+    return @as(f32, @floatFromInt(rounded)) * (1.0 / 64.0);
+}
+
+pub const PointI32 = hint_mod.Point;
+pub const Point26 = hint_mod.Point;
 
 /// Emitted path style; only `FreeType` is ported.
 pub const PathStyle = enum {
@@ -163,6 +202,12 @@ pub const DrawSettings = struct {
     /// until `gvar`/`HVAR` deltas land.
     coords: []const NormalizedCoord = &.{},
     path_style: PathStyle = .freetype,
+    /// Hinting instance already configured for `size` (glifo's `HintCache`
+    /// owns it). `null` draws unhinted. The instance is ignored when
+    /// `is_enabled()` is false, matching `skrifa`'s `OutlineGlyph::draw`.
+    hint_instance: ?*const hint_mod.HintInstance = null,
+    /// Enables the interpreter's pedantic error checking.
+    pedantic_hinting: bool = false,
 };
 
 /// Mirrors `skrifa::outline::AdjustedMetrics` (only the fields the `glyf`
@@ -194,6 +239,21 @@ pub const Outlines = struct {
     glyf_data: []const u8,
     upem: u16,
     glyph_count: u16,
+    /// `fpgm`/`prep`/`cvt` plus the `maxp` interpreter limits (M3 hinting).
+    program: hint_mod.ProgramData = .{},
+    /// OS/2 `sTypoAscender`/`sTypoDescender` (0 without the table), used for
+    /// the vertical phantom points.
+    ascent: i32 = 0,
+    descent: i32 = 0,
+    /// `head` bit 3 unset: fractional ppem is rounded before hinting.
+    fractional_size_hinting: bool = true,
+    /// True when the font carries bytecode (`fpgm`/`prep`/maxp instructions).
+    /// `Engine::AutoFallback` selects the interpreter only for these fonts;
+    /// everything else would need the deferred autohinter.
+    prefer_interpreter: bool = false,
+    /// The font carries `hdmx` width records; hinted advances would need them
+    /// (not ported), so hinting such fonts is a typed error.
+    has_hdmx: bool = false,
 
     pub fn init(
         font: Font,
@@ -202,12 +262,40 @@ pub const Outlines = struct {
         loca_data: []const u8,
         glyf_data: []const u8,
     ) Outlines {
+        const fpgm = font.face.table(sfnt.tag_fpgm) orelse &.{};
+        const prep = font.face.table(sfnt.tag_prep) orelse &.{};
+        const cvt = font.face.table(sfnt.tag_cvt) orelse &.{};
+        var ascent: i32 = 0;
+        var descent: i32 = 0;
+        if (font.face.table(sfnt.tag_os2)) |os2| {
+            ascent = sfnt.readI16(os2, 68) orelse 0;
+            descent = sfnt.readI16(os2, 70) orelse 0;
+        }
+        const max_instructions: u16 = maxp.maxSizeOfInstructions() orelse 0;
         return .{
             .font = font,
             .loca = Loca.parse(loca_data, head.indexToLocFormat() == 1),
             .glyf_data = glyf_data,
             .upem = head.unitsPerEm(),
             .glyph_count = maxp.numGlyphs(),
+            .program = .{
+                .fpgm = fpgm,
+                .prep = prep,
+                .cvt = cvt,
+                .max_function_defs = maxp.maxFunctionDefs() orelse 0,
+                .max_instruction_defs = maxp.maxInstructionDefs() orelse 0,
+                // +4 phantom points, saturating like upstream.
+                .max_twilight_points = (maxp.maxTwilightPoints() orelse 0) +| 4,
+                // FreeType heuristic for buggy fonts: +32 stack elements.
+                .max_stack_elements = (maxp.maxStackElements() orelse 0) +| 32,
+                .max_storage = maxp.maxStorage() orelse 0,
+                .axis_count = 0,
+            },
+            .ascent = ascent,
+            .descent = descent,
+            .fractional_size_hinting = !head.forceIntegerPpem(),
+            .prefer_interpreter = !(max_instructions == 0 and fpgm.len == 0 and prep.len == 0),
+            .has_hdmx = font.face.table(sfnt.tag_hdmx) != null,
         };
     }
 
@@ -221,6 +309,43 @@ pub const Outlines = struct {
 
     pub fn computeScale(self: *const Outlines, ppem: ?f32) Scale26Dot6 {
         return Scale26Dot6.init(ppem, self.upem);
+    }
+
+    /// `skrifa::outline::glyf::Outlines::compute_hinted_scale`: rounds ppem
+    /// through 26.6 when the font does not support fractional scaling.
+    pub fn computeHintedScale(self: *const Outlines, ppem: ?f32) Scale26Dot6 {
+        if (ppem) |size| {
+            if (!self.fractional_size_hinting) {
+                return self.computeScale(roundPpemForHinting(size));
+            }
+        }
+        return self.computeScale(ppem);
+    }
+
+    /// The `(scale, rounded_ppem)` pair `HintingInstance::reconfigure` derives
+    /// from the hinted scale, exactly as skrifa does.
+    pub fn hintedScaleAndPpem(self: *const Outlines, size: f32) struct { scale: i32, ppem: i32 } {
+        const scale = self.computeHintedScale(size).scale_bits;
+        const ppem = (fixedMul(scale, @as(i32, self.upem)) +% 32) >> 6;
+        return .{ .scale = scale, .ppem = ppem };
+    }
+
+    /// Builds and configures a `HintInstance` for this face (runs `fpgm` and
+    /// `prep`). Callers own the instance through glifo's `HintCache`.
+    pub fn createHintInstance(
+        self: *const Outlines,
+        allocator: std.mem.Allocator,
+        size: f32,
+        target: hint_mod.Target,
+    ) DrawError!hint_mod.HintInstance {
+        var instance = hint_mod.HintInstance.init(allocator);
+        errdefer instance.deinit();
+        const sp = self.hintedScaleAndPpem(size);
+        instance.reconfigure(self.program, sp.scale, sp.ppem, target, &.{}, size) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.HintError,
+        };
+        return instance;
     }
 
     pub fn getGlyph(self: *const Outlines, gid: GlyphId) DrawError!?raw.Glyph {
@@ -292,6 +417,12 @@ pub const Outlines = struct {
     /// The pen is duck-typed (`pen.zig` provides `PathElementPen` and
     /// `PathPen`); its methods take f32 coordinates and may fail with an
     /// allocation error, which is why this entry point returns an error union.
+    ///
+    /// When `settings.hint_instance` is set, the TrueType interpreter runs
+    /// (`fpgm`/`prep` during instance configuration, the glyph program here);
+    /// any interpreter failure is reported as `error.HintError` instead of
+    /// being swallowed, so a hinted outline is never approximated by an
+    /// unhinted one.
     pub fn draw(
         self: *const Outlines,
         allocator: std.mem.Allocator,
@@ -304,9 +435,44 @@ pub const Outlines = struct {
             .freetype => {},
             .harfbuzz => return error.Unsupported,
         }
+        var hint_instance: ?*const hint_mod.HintInstance = null;
+        if (settings.hint_instance) |instance| {
+            if (instance.isEnabled()) {
+                if (!self.prefer_interpreter) {
+                    // `Engine::AutoFallback` would choose the (deferred)
+                    // autohinter; never silently draw unhinted.
+                    return error.Unsupported;
+                }
+                // `hdmx` advances are only consulted when backward
+                // compatibility is off; that path is not ported, so gate it.
+                if (self.has_hdmx and !instance.backwardCompatibility()) {
+                    return error.Unsupported;
+                }
+                hint_instance = instance;
+            } else {
+                // Upstream draws unhinted at the instance's size and rounds
+                // the advance.
+                var metrics = try self.draw(allocator, gid, .{
+                    .size = instance.size,
+                    .coords = settings.coords,
+                    .path_style = settings.path_style,
+                }, pen);
+                if (metrics.advance_width) |advance| {
+                    metrics.advance_width = @round(advance);
+                }
+                return metrics;
+            }
+        }
         const info = try self.outline(gid);
         if (info.points > max_points) return error.TooManyPoints;
-        var scaler = try Scaler.init(allocator, self, &info, settings.size);
+        var scaler = try Scaler.init(
+            allocator,
+            self,
+            &info,
+            settings.size,
+            hint_instance,
+            settings.pedantic_hinting,
+        );
         defer scaler.deinit();
 
         try scaler.load(info.glyph, gid, 0);
@@ -326,10 +492,12 @@ pub const Outlines = struct {
             pen,
         );
         const advance = phantom[1].x -% phantom[0].x;
+        // `HintingInstance::draw` rounds the advance when hinting is applied.
+        const final_advance = if (hint_instance != null) roundF26Point(advance) else advance;
         return .{
             .has_overlaps = info.has_overlaps,
             .lsb = f26ToF32(phantom[0].x),
-            .advance_width = f26ToF32(advance),
+            .advance_width = f26ToF32(final_advance),
         };
     }
 };
@@ -351,18 +519,40 @@ const Scaler = struct {
     unscaled: std.ArrayList(PointI32) = .empty,
     contours: std.ArrayList(u16) = .empty,
     flags: std.ArrayList(u8) = .empty,
+    // M3 hinting state. The interpreter buffers are only allocated when
+    // `is_hinted` so unhinted draws keep the old behavior (and the old
+    // allocations/leak profile).
+    hint_instance: ?*const hint_mod.HintInstance = null,
+    is_hinted: bool = false,
+    pedantic_hinting: bool = false,
+    stack: std.ArrayList(i32) = .empty,
+    cvt: std.ArrayList(i32) = .empty,
+    storage: std.ArrayList(i32) = .empty,
+    twilight_scaled: std.ArrayList(Point26) = .empty,
+    twilight_original: std.ArrayList(Point26) = .empty,
+    twilight_flags: std.ArrayList(u8) = .empty,
+    original_scaled: std.ArrayList(Point26) = .empty,
+    unscaled_copy: std.ArrayList(Point26) = .empty,
 
     fn init(
         allocator: std.mem.Allocator,
         outlines: *const Outlines,
         outline: *const Outline,
         ppem: ?f32,
+        hint_instance: ?*const hint_mod.HintInstance,
+        pedantic_hinting: bool,
     ) DrawError!Scaler {
         var scaler = Scaler{
             .outlines = outlines,
             .allocator = allocator,
-            .scale = outlines.computeScale(ppem),
+            .scale = if (hint_instance != null)
+                outlines.computeHintedScale(ppem)
+            else
+                outlines.computeScale(ppem),
+            .hint_instance = hint_instance,
+            .pedantic_hinting = pedantic_hinting,
         };
+        scaler.is_hinted = hint_instance != null and scaler.scale.is_scaled;
         errdefer scaler.deinit();
         const other_capacity = @max(
             @max(outline.max_simple_points, outline.max_other_points),
@@ -372,6 +562,23 @@ const Scaler = struct {
         try scaler.unscaled.ensureTotalCapacity(allocator, other_capacity);
         try scaler.flags.ensureTotalCapacity(allocator, outline.points + phantom_point_count);
         try scaler.contours.ensureTotalCapacity(allocator, outline.contours);
+        if (scaler.is_hinted) {
+            const program = outlines.program;
+            try scaler.stack.resize(allocator, program.max_stack_elements);
+            try scaler.cvt.resize(allocator, program.cvtLen());
+            @memset(scaler.cvt.items, 0);
+            try scaler.storage.resize(allocator, program.max_storage);
+            @memset(scaler.storage.items, 0);
+            try scaler.twilight_scaled.resize(allocator, program.max_twilight_points);
+            try scaler.twilight_original.resize(allocator, program.max_twilight_points);
+            for (scaler.twilight_scaled.items) |*p| p.* = .{};
+            for (scaler.twilight_original.items) |*p| p.* = .{};
+            try scaler.twilight_flags.resize(allocator, program.max_twilight_points);
+            @memset(scaler.twilight_flags.items, 0);
+            // Component-local scratch buffers for the interpreter input.
+            try scaler.original_scaled.resize(allocator, other_capacity);
+            try scaler.unscaled_copy.resize(allocator, other_capacity);
+        }
         return scaler;
     }
 
@@ -380,7 +587,25 @@ const Scaler = struct {
         self.unscaled.deinit(self.allocator);
         self.contours.deinit(self.allocator);
         self.flags.deinit(self.allocator);
+        self.stack.deinit(self.allocator);
+        self.cvt.deinit(self.allocator);
+        self.storage.deinit(self.allocator);
+        self.twilight_scaled.deinit(self.allocator);
+        self.twilight_original.deinit(self.allocator);
+        self.twilight_flags.deinit(self.allocator);
+        self.original_scaled.deinit(self.allocator);
+        self.unscaled_copy.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Runs the glyf program for one hint input; interpreter errors are
+    /// surfaced as `error.HintError` (never swallowed).
+    fn runHint(self: *Scaler, input: *hint_mod.HintOutline) DrawError!void {
+        const hinter = self.hint_instance orelse return;
+        hinter.hint(self.outlines.program, input, self.pedantic_hinting) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.HintError,
+        };
     }
 
     /// `Scaler::load`: sets up phantom points, then dispatches.
@@ -399,7 +624,7 @@ const Scaler = struct {
         self.setupPhantomPoints(bounds, lsb, advance);
         if (glyph) |g| {
             switch (g.kind) {
-                .simple => try self.loadSimple(g.simple()),
+                .simple => try self.loadSimple(g.simple(), gid),
                 .composite => try self.loadComposite(g.composite(), gid, recurse_depth),
             }
         } else {
@@ -407,19 +632,24 @@ const Scaler = struct {
         }
     }
 
-    /// The horizontal phantom points as computed by FreeType.
+    /// The four "phantom" points as computed by FreeType.
     ///
-    /// The vertical pair (indices 2/3) needs OS/2 ascender/descender and only
-    /// feeds hinted/vertical metrics, which are out of scope, so it stays
-    /// zero. Horizontal points 0/1 are the ones that shift the outline and
-    /// produce the adjusted lsb/advance.
+    /// Points 0/1 shift the outline and produce the adjusted lsb/advance;
+    /// points 2/3 come from the OS/2 vertical metrics and participate in the
+    /// interpreter's glyph zone.
     fn setupPhantomPoints(self: *Scaler, bounds: [4]i16, lsb: i32, advance: i32) void {
         self.phantom[0].x = bounds[0] - lsb;
         self.phantom[0].y = 0;
         self.phantom[1].x = self.phantom[0].x +% advance;
         self.phantom[1].y = 0;
-        self.phantom[2] = .{ .x = 0, .y = 0 };
-        self.phantom[3] = .{ .x = 0, .y = 0 };
+        const ascent = self.outlines.ascent;
+        const descent = self.outlines.descent;
+        const tsb = ascent - @as(i32, bounds[3]);
+        const vadvance = ascent - descent;
+        self.phantom[2].x = 0;
+        self.phantom[2].y = @as(i32, bounds[3]) +% tsb;
+        self.phantom[3].x = 0;
+        self.phantom[3].y = self.phantom[2].y -% vadvance;
     }
 
     fn loadEmpty(self: *Scaler) DrawError!void {
@@ -441,7 +671,7 @@ const Scaler = struct {
         return .{ .x = self.scale.mul(point.x), .y = self.scale.mul(point.y) };
     }
 
-    fn loadSimple(self: *Scaler, glyph: raw.SimpleGlyph) DrawError!void {
+    fn loadSimple(self: *Scaler, glyph: raw.SimpleGlyph, gid: GlyphId) DrawError!void {
         const points_start = self.point_count;
         const point_count = glyph.numPoints();
         const phantom_start = point_count;
@@ -499,6 +729,50 @@ const Scaler = struct {
             self.phantom[phantom_ix] = self.scaled.items[points_start + phantom_start + phantom_ix];
         }
 
+        // Hint this glyph (or component) if the font's program is active for
+        // it. Upstream never hints when instructions are missing, but still
+        // rounds the phantom points when backward compatibility is off.
+        const instructions = glyph.instructions();
+        if (self.is_hinted) {
+            const hinter = self.hint_instance.?;
+            const contours_local =
+                self.contours.items[self.contour_count - contour_count .. self.contour_count];
+            if (instructions.len != 0) {
+                const local_len = point_count + phantom_point_count;
+                const scaled = self.scaled.items[points_start..points_end];
+                const flags = self.flags.items[points_start..points_end];
+                @memcpy(self.original_scaled.items[0..local_len], scaled);
+                for (scaled[phantom_start..]) |*point| {
+                    point.x = roundF26Point(point.x);
+                    point.y = roundF26Point(point.y);
+                }
+                var input = hint_mod.HintOutline{
+                    .glyph_id = gid,
+                    .unscaled = unscaled,
+                    .scaled = scaled,
+                    .original_scaled = self.original_scaled.items[0..local_len],
+                    .flags = flags,
+                    .contours = contours_local,
+                    .phantom = self.phantom[0..],
+                    .bytecode = instructions,
+                    .stack = self.stack.items,
+                    .cvt = self.cvt.items,
+                    .storage = self.storage.items,
+                    .twilight_scaled = self.twilight_scaled.items,
+                    .twilight_original_scaled = self.twilight_original.items,
+                    .twilight_flags = self.twilight_flags.items,
+                    .is_composite = false,
+                    .coords = &.{},
+                };
+                try self.runHint(&input);
+            } else if (!hinter.backwardCompatibility()) {
+                for (self.scaled.items[points_start + phantom_start .. points_end]) |*point| {
+                    point.x = roundF26Point(point.x);
+                    point.y = roundF26Point(point.y);
+                }
+            }
+        }
+
         if (points_start != 0) {
             for (self.contours.items[self.contour_count - contour_count ..]) |*contour_end| {
                 contour_end.* +%= @truncate(points_start);
@@ -513,6 +787,7 @@ const Scaler = struct {
         recurse_depth: usize,
     ) DrawError!void {
         const point_base = self.point_count;
+        const contour_base = self.contour_count;
         if (self.scale.is_scaled) {
             for (0..phantom_point_count) |i| {
                 self.phantom[i] = self.scalePoint(self.phantom[i]);
@@ -575,8 +850,18 @@ const Scaler = struct {
                         y = fixedMul(y, hypotFixed(yy, yx));
                     }
                     if (self.scale.is_scaled) {
-                        // ROUND_XY_TO_GRID only applies when hinting.
-                        break :blk .{ .x = self.scale.apply(x), .y = self.scale.apply(y) };
+                        var scaled_offset = Point26{
+                            .x = self.scale.apply(x),
+                            .y = self.scale.apply(y),
+                        };
+                        // ROUND_XY_TO_GRID only applies when hinting, and
+                        // only the y coordinate is rounded (FreeType).
+                        if (self.is_hinted and
+                            (component.flags & raw.composite_round_xy_to_grid) != 0)
+                        {
+                            scaled_offset.y = roundF26Point(scaled_offset.y);
+                        }
+                        break :blk scaled_offset;
                     }
                     break :blk .{ .x = f26FromI32(x), .y = f26FromI32(y) };
                 },
@@ -603,7 +888,67 @@ const Scaler = struct {
                 }
             }
         }
-        _ = gid;
+        // Composite glyph programs run over the accumulated component points
+        // plus the phantom points; `unscaled` and `original_scaled` are copies
+        // of the current scaled point set and contours are made relative to
+        // the composite's point base.
+        if (self.is_hinted) {
+            const instructions = glyph.countAndInstructions().instructions orelse &.{};
+            if (instructions.len != 0) {
+                const end_point = self.point_count + phantom_point_count;
+                const range_len = end_point - point_base;
+                if (range_len > self.original_scaled.items.len or
+                    range_len > self.unscaled_copy.items.len)
+                {
+                    return error.OutOfMemory;
+                }
+                const scaled = self.scaled.items[point_base..end_point];
+                const flags = self.flags.items[point_base..end_point];
+                const phantom_start = range_len - phantom_point_count;
+                for (0..phantom_point_count) |i| {
+                    scaled[phantom_start + i] = self.phantom[i];
+                    flags[phantom_start + i] = 0;
+                }
+                for (scaled, 0..) |point, ix| {
+                    self.unscaled_copy.items[ix] = point;
+                }
+                @memcpy(self.original_scaled.items[0..range_len], scaled);
+                for (scaled[phantom_start..]) |*point| {
+                    point.x = roundF26Point(point.x);
+                    point.y = roundF26Point(point.y);
+                }
+                // Clear the "touched" flags used during IUP processing.
+                for (flags) |*flag| flag.* &= ~hint_mod.marker_touched;
+                const contours_local = self.contours.items[contour_base..self.contour_count];
+                if (point_base != 0) {
+                    const delta: u16 = @truncate(point_base);
+                    for (contours_local) |*contour_end| contour_end.* -%= delta;
+                }
+                var input = hint_mod.HintOutline{
+                    .glyph_id = gid,
+                    .unscaled = self.unscaled_copy.items[0..range_len],
+                    .scaled = scaled,
+                    .original_scaled = self.original_scaled.items[0..range_len],
+                    .flags = flags,
+                    .contours = contours_local,
+                    .phantom = self.phantom[0..],
+                    .bytecode = instructions,
+                    .stack = self.stack.items,
+                    .cvt = self.cvt.items,
+                    .storage = self.storage.items,
+                    .twilight_scaled = self.twilight_scaled.items,
+                    .twilight_original_scaled = self.twilight_original.items,
+                    .twilight_flags = self.twilight_flags.items,
+                    .is_composite = true,
+                    .coords = &.{},
+                };
+                try self.runHint(&input);
+                if (point_base != 0) {
+                    const delta: u16 = @truncate(point_base);
+                    for (contours_local) |*contour_end| contour_end.* +%= delta;
+                }
+            }
+        }
     }
 };
 

@@ -21,23 +21,37 @@ fn optF32Hex(value: ?f32, buf: *[8]u8) []const u8 {
 }
 
 /// Writes the canonical `--dump-glyphs` text for `gids`.
+///
+/// `hint` runs the TrueType interpreter (`glifo`'s `HintingOptions`) instead
+/// of the unhinted scaler and emits the extra `hint 1` marker line.
 pub fn writeGlyphDump(
     writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     outlines: *const glyf.Outlines,
     font_index: u32,
     size: f32,
+    hint: bool,
     gids: []const u32,
 ) Error!void {
     try writer.print("vellz-glyph-dump v1\n", .{});
     try writer.print("face {d}\n", .{font_index});
     try writer.print("size {x:0>8}\n", .{@as(u32, @bitCast(size))});
+    if (hint) try writer.print("hint 1\n", .{});
+
+    var instance: ?glyf.HintInstance = null;
+    defer if (instance) |*inst| inst.deinit();
+    if (hint) {
+        instance = try outlines.createHintInstance(allocator, size, glyf.glifo_hint_target);
+    }
 
     var pen = pen_mod.PathElementPen.init(allocator);
     defer pen.deinit();
     for (gids) |gid| {
         pen.clearRetainingCapacity();
-        const metrics = try outlines.draw(allocator, gid, .{ .size = size }, &pen);
+        const metrics = try outlines.draw(allocator, gid, .{
+            .size = size,
+            .hint_instance = if (instance) |*inst| inst else null,
+        }, &pen);
         var lsb_buf: [8]u8 = undefined;
         var advance_buf: [8]u8 = undefined;
         try writer.print("gid {d} format glyf elems {d} lsb {s} advance {s}\n", .{
@@ -149,6 +163,7 @@ fn dumpGlyphVector(allocator: std.mem.Allocator, vector: manifest.GlyphVector) !
         &outlines,
         0,
         @bitCast(vector.size_bits),
+        vector.hint,
         gids.items,
     );
     return allocating.toOwnedSlice();

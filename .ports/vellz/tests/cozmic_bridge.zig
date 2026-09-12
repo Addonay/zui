@@ -107,6 +107,7 @@ fn render(
     positioned: []const adapter.PositionedGlyph,
     resolver: adapter.FontResolver,
     via_adapter: bool,
+    hint: bool,
 ) ![]u8 {
     var ctx = try vellz.cpu.RenderContext.init(allocator, width, height, .{
         .level = .baseline,
@@ -121,7 +122,7 @@ fn render(
 
     if (via_adapter) {
         try adapter.drawRun(allocator, &ctx, &resources, resolver, positioned, .{
-            .hint = false,
+            .hint = hint,
             .atlas_cache = false,
         });
     } else if (positioned.len > 0) {
@@ -148,7 +149,7 @@ fn render(
         }
         try ctx.glyphRun(&resources, font)
             .fontSize(first.font_size)
-            .hint(false)
+            .hint(hint)
             .atlasCache(false)
             .fillGlyphs(allocator, vellz.glifo.iterate(glyphs));
     }
@@ -200,13 +201,13 @@ test "adapter pixels are byte-identical to a direct glyph_run" {
     defer testing.allocator.free(positioned);
 
     var font_map = FontMap{};
-    const from_adapter = try render(testing.allocator, positioned, font_map.resolver(), true);
+    const from_adapter = try render(testing.allocator, positioned, font_map.resolver(), true, false);
     defer testing.allocator.free(from_adapter);
     // No shaping: the resolver is consulted once for the whole run, not once
     // per glyph or per character.
     try testing.expectEqual(@as(usize, 1), font_map.calls);
 
-    const direct = try render(testing.allocator, positioned, font_map.resolver(), false);
+    const direct = try render(testing.allocator, positioned, font_map.resolver(), false, false);
     defer testing.allocator.free(direct);
     try testing.expectEqual(@as(usize, 2), font_map.calls);
 
@@ -241,29 +242,18 @@ test "adapter forwards embolden to the core, which rejects it" {
     ));
 }
 
-test "adapter rejects hint-requiring transforms through the core" {
+test "adapter forwards hinting through the core" {
     const physicals = try layoutHello();
     const positioned = try fromPhysicalSlice(testing.allocator, &physicals);
     defer testing.allocator.free(positioned);
 
-    var ctx = try vellz.cpu.RenderContext.init(testing.allocator, width, height, .{
-        .level = .baseline,
-        .num_threads = 0,
-    });
-    defer ctx.deinit(testing.allocator);
-    var resources = vellz.cpu.Resources.init();
-    defer resources.deinit(testing.allocator);
-
     var font_map = FontMap{};
-    try testing.expectError(error.Unsupported, adapter.drawRun(
-        testing.allocator,
-        &ctx,
-        &resources,
-        font_map.resolver(),
-        positioned,
-        .{
-            .hint = true,
-            .atlas_cache = false,
-        },
-    ));
+    const from_adapter = try render(testing.allocator, positioned, font_map.resolver(), true, true);
+    defer testing.allocator.free(from_adapter);
+    const direct = try render(testing.allocator, positioned, font_map.resolver(), false, true);
+    defer testing.allocator.free(direct);
+
+    // Hinted runs absorb the (identity) scale and draw through the
+    // interpreter on both paths; the adapter must be byte-identical.
+    try testing.expectEqualSlices(u8, direct, from_adapter);
 }

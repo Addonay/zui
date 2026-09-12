@@ -231,7 +231,7 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | Upstream module | Zig target | Status | Notes |
 | --- | --- | --- | --- |
 | `lib.rs`, `interface.rs` (Glyph, DrawSink, GlyphRenderer) | `glifo/root.zig`, `glifo/interface.zig` | port | comptime duck-typing contracts + `assert*` helpers |
-| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, COLR > bitmap > outline draw loop, COLR metrics, skip-ink `renderDecoration`; hinting/embolden/coords/bitmap -> typed `error.Unsupported` |
+| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, `HintCache` (16-entry LRU), COLR > bitmap > outline draw loop, COLR metrics, skip-ink `renderDecoration`; embolden/coords/bitmap -> typed `error.Unsupported`; TrueType hinting ported (M3 G3b, `glifo/hint.zig`) |
 | `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline/COLR fill/stroke, subpixel keys, COLR command recording, command replay, raster metrics; bitmap paths deferred |
 | `colr.rs` (COLR/CPAL painting) + `skrifa/src/color/*` | `glifo/colr.zig`, `glifo/tables/{colr,cpal}.zig` | port | COLRv0/v1 paint graph, gradients, transforms, clip boxes, composite modes, palette/foreground colors (M3 T4) |
 | `atlas/*` (cache, keys, regions, commands) | `glifo/atlas/*.zig` | port | cache/eviction, fixed-seed key hashing, recorder + replay; variable-font second-level map deferred with `gvar` |
@@ -896,3 +896,22 @@ of panics, thread ownership).
   `zig build glyphs` (12 glyph + 3 cmap vectors) and `zig build probe` stay
   byte-exact, and `tests/README.md` records the updated cache-on/off fixture
   deltas.
+- 2026-09-12: **M3 G3b merged with the T5/COLR-parity line** (no-ff merge of
+  `vellz-hint`). The TrueType hinting interpreter (`glifo/hint.zig`:
+  `fpgm`/`prep`/`cvt`, glyph programs, phantom points, compound rounding,
+  `HintingInstance`) lands together with the 16-entry LRU `HintCache` wired
+  through `GlyphPrepCache`/`buildRenderer`/`OutlineCache::getOrInsert(..,
+  hint_instance)` and 7 hinted `glyph_run` scenes. The merge composes rather
+  than picks: `glyph.zig` keeps the decoration tests *and* the hint-cache
+  tests, and `renderDecoration` now passes the run's hint instance (upstream
+  behavior); `tools/gen_glyph_scenes.py` keeps main's big-endian advance decode
+  (real positions) plus the decoration/COLR families *and* the hinted scene
+  variants, so the hinted scenes were regenerated with real advances and their
+  oracle `.rgba`/`.json`/`.png` fixtures rebuilt via
+  `tools/render_corpus.sh --png` (all 103 scenes re-rendered
+  deterministically). Evidence: `zig build test` = 860/860 (843 lib + 8 scene
+  + 4 adapter + 5 Cozmic bridge), `zig build corpus` = 103/103 byte-exact at
+  tolerance 0 in Debug, ReleaseSafe and ReleaseFast, `zig build glyphs` = 20
+  glyph + 3 cmap vectors (including 1,361,120 hinted coordinates) byte-exact,
+  `zig build probe` byte-exact, and `zig build -Dgpu=true gpu-corpus` 44/44 on
+  llvmpipe.

@@ -29,12 +29,12 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 844/844 unit and integration tests (827 lib + 8 scene
+zig build test     # 860/860 unit and integration tests (843 lib + 8 scene
                    #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
                    #   the .ports/cozmic sibling checkout is absent)
-zig build corpus   # 96/96 corpus scenes byte-exact vs the upstream oracle
+zig build corpus   # 103/103 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
-zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo
+zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo (hinted + unhinted)
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
 ```
 
@@ -60,9 +60,12 @@ to single-threaded). The imported upstream `probe.rgba` fixture is byte-exact
 
 Progress toward M3 and M5 (both staged): the glyph outline engine is ported and
 bit-exact against upstream `skrifa`/`glifo` — sfnt/`head`/`maxp`/`hhea`/`hmtx`/
-`loca`/`glyf`/`cmap` parsing with fixed-point 26.6 scaling and simple/composite
-outlines, compared across 250,016 path elements / 685,392 coordinates and
-327,680 cmap mappings at tolerance 0 (`zig build glyphs`) — and the atlas stack
+`loca`/`glyf`/`cmap` parsing with fixed-point 26.6 scaling, simple/composite
+outlines and the TrueType hinting interpreter (`fpgm`/`prep`/`cvt`, phantom
+points, `HintingInstance`/`HintCache`), compared across 250,016 path elements /
+685,392 unhinted coordinates, 1,361,120 hinted coordinates (8 Roboto size
+sweeps × 1294 glyphs) and 327,680 cmap mappings at tolerance 0 (`zig build
+glyphs`) — and the atlas stack
 (`guillotiere`, `multi_atlas`, `image_cache`) is ported with a Rust-golden
 placement trace. T3 wires the stack end to end: positioned `glyph_run` scenes
 (fill/stroke, transform absorption, skew, glyph transforms, gradient paint)
@@ -70,7 +73,10 @@ render through `vellz.glifo` + `vellz.cpu` byte-exact against the pinned
 oracle with the glyph atlas cache on and off (15 new scenes; tolerance 0). T4
 adds COLRv0/v1 + CPAL (paint-graph traversal, linear/radial/sweep gradients,
 transforms, clip boxes, composite modes, palette and foreground colors) and
-its 27-scene G3c corpus. T5 adds the skip-ink decoration path
+its 27-scene G3c corpus. G3b adds 7 hinted `glyph_run` scenes (fill, atlas
+cache on/off, scaled, horizontally skewed, glyph transform, transform
+composition, composite-heavy accented glyphs), all byte-exact against the
+pinned oracle. T5 adds the skip-ink decoration path
 (`renderDecoration`: underline/overline/strikethrough spans, buffer,
 transforms; 6 new scenes mirroring `vello_tests`' decoration cases and an
 oracle `--dump-decoration` span dump) and the opt-in Cozmic adapter
@@ -78,18 +84,20 @@ oracle `--dump-decoration` span dump) and the opt-in Cozmic adapter
 already-positioned glyphs 1:1 onto `glifo.GlyphRun` runs and is gated by a
 bridge test that renders byte-identical pixels to a direct `glyph_run`, with
 an explicit skip when `.ports/cozmic` is absent. All of it renders byte-exact
-against the pinned oracle, atlas cache on and off (90/90 corpus, tolerance 0).
-The GPU side has the wgpu-native device bootstrap, the full host/shader layout
+against the pinned oracle, atlas cache on and off (103/103 corpus, tolerance
+0). The GPU side has the wgpu-native device bootstrap, the full host/shader
+layout
 contract, the schedule/layer executor, encoded paints (gradients and images),
 GPU filters, and a 44-scene `gpu-corpus` gate (27 byte-exact, the rest within
 the documented per-scene tolerance registry, plus typed
 device-loss/unsupported-capability/missing-binding/feedback-loop errors)
 running on the llvmpipe software adapter.
 
-Not yet implemented (explicit typed errors, never placeholder pixels): hinted
-outlines (the interpreter) and embedded bitmaps (M3 remainder); GPU masks,
-atlas-backed images, GPU text, and the full G5 corpus (M5 remainder). G4 is
-met: `zig build corpus` is byte-exact at every
+Not yet implemented (explicit typed errors, never placeholder pixels):
+embedded bitmaps (M3 remainder), plus fonts that would need the autohinter or
+hinted advances from `hdmx` without backward compatibility (both typed
+`error.Unsupported`); GPU masks, atlas-backed images, GPU text, and the full
+G5 corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
 SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage
 benchmarks in `docs/benchmarks.md` (u8-vs-f32 speedups 1.9–3.4× on the
 representative scenes). MT filter layers and u8 + MT return
@@ -127,7 +135,7 @@ CPU-only, no GPU dependency:
 ```sh
 zig build test                  # unit + integration tests
 zig build check                 # compile without running
-zig build corpus                # corpus gate: 48 scenes byte-exact vs pinned fixtures
+zig build corpus                # corpus gate: 103 scenes byte-exact vs pinned fixtures
 zig build probe                 # upstream probe fixture (tolerance-3 policy)
 zig build run-cpu-example       # writes cpu_example.ppm
 zig build vellz-cli             # corpus renderer CLI -> zig-out/bin

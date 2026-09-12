@@ -245,10 +245,11 @@ pub const GlyphRun = struct {
     transform: Affine, scene_paint_transform: Affine,
     glyph_transform: ?Affine, normalized_coords: []const NormalizedCoord, hint: bool,
 };
-pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun; // error.Unsupported: hinting/embolden/coords
+pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun; // no hint cache; error.Unsupported: embolden/coords
+pub fn prepareGlyphRunWithCache(run, hint_cache: ?*HintCache, allocator) Error!PreparedGlyphRun;
 pub fn GlyphRunBuilder(comptime Backend: type) type; // fontSize/fontEmbolden/glyphTransform/hint/
                                                      // normalizedCoords/atlasCache/fillGlyphs/strokeGlyphs
-pub fn buildRenderer(run, glyphs, prep_cache, atlas_cacher) Error!GlyphRunRenderer(Glyphs);
+pub fn buildRenderer(allocator, run, glyphs, prep_cache, atlas_cacher) Error!GlyphRunRenderer(Glyphs);
 
 // glifo/renderer.zig: fillGlyph / strokeGlyph / renderCachedGlyph /
 // replayAtlasCommands / calculateRasterMetrics / supportsAtlasCaching.
@@ -287,16 +288,24 @@ pub fn RenderContext.glyphRun(self, resources, font) GlyphRunBuilder;
   Palette-indexed and foreground colors, gradients, transforms, clip boxes and
   composite modes match upstream; `AtlasPaint::Gradient` is recorded with owned
   stops that replay/clear frees.
+- TrueType hinting (M3 G3b) is ported: `HintCache` is a 16-entry LRU of
+  `HintInstance`s keyed by (font id/index, size) which run `fpgm`/`prep` on
+  configure; eligible runs (positive uniform scale or horizontal skew only)
+  absorb the scale, get a `HintingInstance`, round the glyph Y translation and
+  draw through `OutlineCache::getOrInsert(.., hint_instance)`. Hinting is
+  never silently dropped: an interpreter failure is `error.HintError`, and a
+  font that would select the autohinter is `error.Unsupported`.
 - Decoration (`renderDecoration`) is ported: underline/overline/
   strikethrough spans with skip-ink exclusions, using the prep cache's
   `underline_exclusions` buffer. Upstream's lazy span iterator becomes one
   pass over the merged exclusion list; rectangle values and order match the
   pinned oracle (`--dump-decoration`).
-- Deferred with typed errors, never approximated: hinting interpreter/autohint
-  (an eligible hinted run fails up front), `gvar`/`HVAR` coordinates, CFF/CFF2,
-  and CBDT/CBLC/sbix bitmaps. A font carrying a bitmap table rejects the whole
-  run with `error.Unsupported` instead of silently dropping a glyph that could
-  fall back to a bitmap.
+- Deferred with typed errors, never approximated: autohinting (a hinted run on
+  a font without `fpgm`/`prep` fails up front), `hdmx` advances outside
+  backward compatibility, `gvar`/`HVAR` coordinates, CFF/CFF2, CBDT/CBLC/sbix
+  bitmaps. A font carrying a bitmap table rejects the whole run with
+  `error.Unsupported` instead of silently dropping a glyph that could fall
+  back to a bitmap.
 
 ## Error policy
 
