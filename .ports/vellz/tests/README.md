@@ -191,8 +191,9 @@ They cover the u8-native gradient LUT and bilinear painters, the f32-painter
 `paintU8` conversion (nearest/bicubic images and undefined radial gradients),
 and the integer blend/composite/mask paths.
 
-All scenes above render byte-exact with `zig build corpus` (90/90,
-`tolerance=0`: 32 quality/f32 + 16 speed/u8 + 15 outline glyph + 27 COLR). The
+All scenes above render byte-exact with `zig build corpus` (96/96,
+`tolerance=0`: 32 quality/f32 + 16 speed/u8 + 15 outline glyph +
+6 decoration + 27 COLR). The
 f32 and u8 pipelines are not byte-equal to each other in general (integer
 `div_255` rounding vs f32); the corpus compares each pipeline against its own
 oracle output, never against the other pipeline.
@@ -248,20 +249,28 @@ Cache-on vs cache-off: upstream's own note that "the cached versions of COLR
 glyphs seem to have a slight shift" is observable in the oracle fixtures. The
 `_cache` scenes reproduce that shift byte-for-byte instead of diverging, for
 example `glyph_run_colr_noto_250x70` differs from its uncached pair in
-1723 / 17500 pixels (max channel diff 151), `..._scaled_2x_500x140` in
-3305 / 70000 (max 100) and `..._transform_composition_210x410` in
-5759 / 86100 (max 255); the rotated scenes, whose transforms cannot be
+3737 / 17500 pixels (max channel diff 194), `..._scaled_2x_500x140` in
+8177 / 70000 (max 155) and `..._transform_composition_210x410` in
+14760 / 86100 (max 255); the rotated scenes, whose transforms cannot be
 atlas-cached (skew), differ in 0 pixels. Every scene is compared against the
 oracle for its own `atlas_cache` setting, and `tools/render_corpus.sh` checks
 that repeated oracle runs are byte-identical, so cache-on determinism is
 gated on both sides.
 
-The gate caught one geometry-relevant upstream subtlety now pinned by a unit
-test: traversal pushes the COLR clip box of *every* nested `PaintColrGlyph`,
-not only the root glyph's. Dropping the nested clip boxes made a backdrop
-cover the whole glyph area and left 580 differing pixels in the test-font
-scene; `colr.zig`'s composite-order test asserts the three clip boxes of
-glyph 156 (root, 166, 95) and the backdrop-then-source draw order.
+The gate caught two geometry-relevant upstream subtleties now pinned by unit
+tests. First, traversal pushes the COLR clip box of *every* nested
+`PaintColrGlyph`, not only the root glyph's: dropping the nested clip boxes
+made a backdrop cover the whole glyph area and left 580 differing pixels in
+the test-font scene; `colr.zig`'s composite-order test asserts the three clip
+boxes of glyph 156 (root, 166, 95) and the backdrop-then-source draw order.
+Second, `convert_stops` pads a first/last stop that is not already at 0.0/1.0
+to *exactly* those offsets before dropping the superfluous duplicate: after
+f32 traversal renormalization the Noto party-popper gradient's last offset is
+one ulp below 1.0 (`0.99999994`), so appending it unchanged left a near-one
+stop, which `encode_gradient` padded into a second near-empty range and a
+4096-entry LUT instead of upstream's 256, shifting interior gradient colors
+by one unit. The `convert_stops` test asserts the padded offsets and the
+single emitted range.
 
 ## Multithreaded dispatch
 

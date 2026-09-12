@@ -1286,10 +1286,14 @@ pub fn ColrPainter(comptime Sink: type) type {
             const last_stop = out.items[out.items.len - 1];
 
             if (first_stop.offset != 0.0) {
-                try out.insert(self.allocator, 0, first_stop);
+                var new_stop = first_stop;
+                new_stop.offset = 0.0;
+                try out.insert(self.allocator, 0, new_stop);
             }
             if (last_stop.offset != 1.0) {
-                try out.append(self.allocator, last_stop);
+                var new_stop = last_stop;
+                new_stop.offset = 1.0;
+                try out.append(self.allocator, new_stop);
             }
 
             while (out.items.len >= 2) {
@@ -1810,4 +1814,80 @@ test "composite traversal draws the backdrop before the source" {
     try testing.expectEqual(OrderRecorder.Event.fill_gradient, draws[1]);
     try testing.expectEqual(OrderRecorder.Event{ .clip_glyph = 161 }, draws[2]);
     try testing.expectEqual(OrderRecorder.Event{ .fill_solid = 13 }, draws[3]);
+}
+
+test "convert_stops pads offsets to exactly 0.0 and 1.0" {
+    const allocator = testing.allocator;
+    const blob = try test_fixture.notoColor();
+    const font = try @import("font.zig").Font.init(blob, 0);
+    const outlines = try font.outlines();
+    const face = try sfnt.Face.parse(blob, 0);
+    const collection = ColorGlyphCollection.init(face);
+    const color_glyph = collection.get(1) orelse return error.TestUnexpectedResult;
+    const cpal = if (face.table(sfnt.tag_cpal)) |data| cpal_mod.Cpal.parse(data) else null;
+
+    var cache = outline_cache.OutlineCache{};
+    defer cache.deinit(allocator);
+
+    var colr_glyph = glyph_mod.GlyphColr{
+        .color_glyph = color_glyph,
+        .cpal = cpal,
+        .outlines = &outlines,
+        .font_info = .{
+            .id = @intFromPtr(blob.ptr),
+            .index = 0,
+            .upem = @floatFromInt(font.unitsPerEm()),
+        },
+        .draw_transform = kurbo.Affine.IDENTITY,
+        .area = kurbo.Rect.new(0.0, 0.0, 10.0, 10.0),
+        .pix_width = 10,
+        .pix_height = 10,
+        .has_non_default_blend = false,
+    };
+
+    var recorder = atlas_commands.AtlasCommandRecorder.init(0, 16, 16);
+    defer recorder.deinit(allocator);
+
+    var painter = try ColrPainter(atlas_commands.AtlasCommandRecorder).init(
+        allocator,
+        &colr_glyph,
+        peniko.Color.BLACK,
+        &recorder,
+        &cache,
+    );
+    defer painter.deinit();
+
+    // `traverse` renormalizes the font's stop offsets in f32, and the last one
+    // can land one ulp below 1.0 (Noto glyph 13 after the 0.0235 first stop).
+    // `convert_stops` must pad to exactly [0.0, 1.0] like upstream: the padded
+    // stop replaces the near-one stop, so the encoded gradient keeps a single
+    // range and a 256-entry LUT instead of a 4096-entry one.
+    const near_one: f32 = 1.0 - std.math.floatEps(f32) / 2.0;
+    const stops = [_]ColorStop{
+        .{ .offset = 0.0, .palette_index = 11, .alpha = 1.0 },
+        .{ .offset = near_one, .palette_index = 6, .alpha = 1.0 },
+    };
+    try painter.fill(.{ .linear_gradient = .{
+        .p0 = PointF.new(0.0, 0.0),
+        .p1 = PointF.new(10.0, 0.0),
+        .color_stops = &stops,
+        .extend = .pad,
+    } });
+
+    var checked = false;
+    for (recorder.commands.items) |command| {
+        switch (command) {
+            .set_paint => |paint| switch (paint) {
+                .gradient => |gradient| {
+                    try testing.expectEqual(@as(usize, 2), gradient.stops.items.len);
+                    try testing.expectEqual(@as(f32, 0.0), gradient.stops.items[0].offset);
+                    try testing.expectEqual(@as(f32, 1.0), gradient.stops.items[1].offset);
+                    checked = true;
+                },
+                .solid => {},
+            },
+            else => {},
+        }
+    }
+    try testing.expect(checked);
 }
