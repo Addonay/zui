@@ -1680,14 +1680,18 @@ test "grow free list bucket" {
 test "atlas 10k operation trace matches the upstream oracle" {
     // The expected values below were produced by guillotiere 0.7.0 itself with
     // the generator this test mirrors: a 4096x4096 atlas, a fixed xorshift64*
-    // stream, 10_000 operations (`r % 3 == 0` deallocates a random live id,
-    // otherwise allocates a random 1..=1024 square), and an FNV-1a 64 hash
-    // over the event bytes (tag 0x01 = alloc with id/x/y/w/h little-endian,
-    // 0x02 = dealloc with id, 0x03 = miss). The `allocs`/`deallocs`/`misses`
-    // counters and the ten per-1000-op checkpoint hashes pin ids and offsets
-    // for the whole run; any placement divergence (or map-order divergence)
-    // changes them. This replaces the plan's `tools/oracle-rs` dump, which is
-    // out of scope for this task (tools must not be modified).
+    // stream (seed 0x9E3779B97F4A7C15, multiplier 0x2545F4914F6CDD1D), 10_000
+    // operations (`r % 3 == 0` deallocates a random live id, otherwise
+    // allocates a random 1..=1024 square), and an FNV-1a 64 hash over the
+    // event bytes (tag 0x01 = alloc with id/x/y/w/h little-endian, 0x02 =
+    // dealloc with id, 0x03 = miss). The Rust generator is a ~90-line binary
+    // that links the pinned registry crate as a path dependency
+    // (`cargo run --offline`); this test body is its exact Zig mirror. The
+    // `allocs`/`deallocs`/`misses` counters and the ten per-1000-op checkpoint
+    // hashes pin ids and offsets for the whole run; any placement divergence
+    // (or map-order divergence) changes them. This replaces the plan's
+    // `tools/oracle-rs` dump, which is out of scope for this task (tools must
+    // not be modified).
     const checkpoints = [10]u64{
         9888139109286242833,
         5490636622033091556,
