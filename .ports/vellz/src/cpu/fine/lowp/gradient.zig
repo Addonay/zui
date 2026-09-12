@@ -86,10 +86,12 @@ pub const GradientPainter = struct {
         self.t_idx += 16;
 
         const extended = applyExtend(pos, self.gradient.extend);
+        const scaled = extended * @as(F32x16, @splat(self.scale_factor));
+        const indices = @import("../image.zig").f32ToU32VecN(scaled);
 
         var out: [64]u8 = undefined;
         inline for (0..16) |pixel| {
-            const idx = gradient_mod.f32ToU32(extended[pixel] * self.scale_factor);
+            const idx = indices[pixel];
             // Upstream indexes `self.lut.lut()[idx as usize]` directly; an
             // out-of-range index is a slice panic there, reproduced here.
             if (idx >= self.lut.width()) {

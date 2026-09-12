@@ -16,7 +16,14 @@
 //!   high-precision painter (strict IEEE, unfused `mul_add`); only the texel
 //!   samples and interpolation products move to u8/u16.
 //! - `f32_to_u8` reproduces the baseline/x86 saturating low-byte conversion
-//!   from `common/util.zig`.
+//!   from `common/util.zig` (vectorized there, checked lane-for-lane against
+//!   the scalar reference).
+//! - `f32_to_u32` lane conversions (`f32ToU32Vec`) are vectorized as well,
+//!   removing the scalar lane loops that made the u8 bilinear painter slower
+//!   than the f32 painter at 64x64 (A/B in `docs/benchmarks.md`).
+//! - The four texel words are assembled into the `u8x16` with one bitcast on
+//!   little-endian targets (the port's documented native layout); other
+//!   targets keep the exact per-byte order.
 //! - The f32x4 position advances reuse [`image.ImagePainterData`] and the
 //!   shared [`image.extend`]/[`image.fractFloor`] helpers.
 //!
@@ -66,8 +73,21 @@ fn f32ToU8Wide(val: F32x4) U8x16 {
 
 /// Rust `f32 as u32` lane-wise (shared with the f32 image painter).
 inline fn f32ToU32Vec(val: F32x4) U32x4 {
-    var out: U32x4 = undefined;
-    inline for (0..4) |lane| out[lane] = image_mod.f32ToU32(val[lane]);
+    return image_mod.f32ToU32Vec(val);
+}
+
+/// Assemble 16 texel bytes (four RGBA words, one per tile row) into a
+/// `u8x16`. On little-endian targets this is a single bitcast of the word
+/// vector; other targets keep the exact per-byte order via the scalar loop.
+inline fn wordsToBytes(words: U32x4) U8x16 {
+    if (comptime @import("builtin").cpu.arch.endian() == .little) {
+        return @bitCast(words);
+    }
+    var out: U8x16 = undefined;
+    inline for (0..4) |lane| {
+        const bytes: [4]u8 = @bitCast(words[lane]);
+        inline for (0..4) |component| out[lane * 4 + component] = bytes[component];
+    }
     return out;
 }
 
@@ -76,14 +96,11 @@ inline fn f32ToU32Vec(val: F32x4) U32x4 {
 pub fn sampleU8(data: *const ImagePainterData, x_positions: F32x4, y_positions: F32x4) U8x16 {
     const idx = f32ToU32Vec(x_positions) +% (f32ToU32Vec(y_positions) *% data.width_u32);
 
-    var out: U8x16 = undefined;
+    var words: U32x4 = undefined;
     inline for (0..4) |lane| {
-        const rgba = data.pixmap.sampleIdx(idx[lane]).toU8Array();
-        inline for (0..4) |component| {
-            out[lane * 4 + component] = rgba[component];
-        }
+        words[lane] = data.pixmap.sampleIdx(idx[lane]).toU32();
     }
-    return out;
+    return wordsToBytes(words);
 }
 
 /// A bilinear image painter for the u8 pipeline (upstream

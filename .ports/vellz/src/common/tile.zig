@@ -16,14 +16,19 @@
 //! take an explicit allocator; `init`/`new` do not allocate, storage grows
 //! lazily in the `makeTiles*`/`reset` calls, and `deinit` releases it.
 //!
-//! The analytic-AA and MSAA implementations are scalar transcriptions of the
-//! upstream f32x4 code with identical operation order; per-lane arithmetic is
-//! element-wise, so results are bit-identical to the upstream scalar fallback.
+//! The analytic-AA and MSAA implementations transcribe the upstream f32x4
+//! code with identical operation order; per-lane arithmetic is element-wise,
+//! so results are bit-identical to the upstream scalar fallback. The
+//! fractional-coverage computation and the partial-winding accumulation run
+//! through `@Vector` when `Tiles.level` selects a vector backend and through
+//! the scalar fallback otherwise; both are bit-identical (tested).
 
 const std = @import("std");
 const simd = @import("../simd/root.zig");
 const flatten = @import("flatten.zig");
 const Line = flatten.Line;
+
+const F32x4 = simd.F32x4;
 
 /// T-op bit.
 pub const T: u32 = 0b00001;
@@ -402,7 +407,7 @@ pub const Tile = struct {
 pub const Tiles = struct {
     /// The emitted tiles; unsorted until `sortTiles` is called.
     tile_buf: std.ArrayList(Tile) = .empty,
-    /// The SIMD level; stored for API parity (single portable backend).
+    /// The SIMD level selecting the analytic-AA vector/scalar backends.
     level: simd.Level,
     /// Whether `tile_buf` has been sorted.
     sorted: bool = false,
@@ -559,7 +564,7 @@ pub const Tiles = struct {
                     const at_top_of_tile = line_top_y <= @as(f32, @floatFromInt(y_top_tiles));
                     if (at_top_of_tile) self.windings.coarse.items[y_top_tiles] += dir;
 
-                    const fractional_coverage = calcFractionalCoverage(y_top_tiles, line_top_y, line_bottom_y);
+                    const fractional_coverage = self.fractionalCoverage(y_top_tiles, line_top_y, line_bottom_y);
                     self.applyPartial(y_top_tiles, fractional_coverage, f_dir, if (at_top_of_tile) f_dir else 0.0);
                 }
 
@@ -582,7 +587,7 @@ pub const Tiles = struct {
                     self.windings.markRowActive(y_end_middle);
                     // Ends implicitly cross the top.
                     self.windings.coarse.items[y_end_middle] += dir;
-                    const fractional_coverage = calcFractionalCoverage(y_end_middle, line_top_y, line_bottom_y);
+                    const fractional_coverage = self.fractionalCoverage(y_end_middle, line_top_y, line_bottom_y);
                     // Subtract the inverse direction to avoid double counting
                     // with the coarse winding.
                     self.applyPartial(y_end_middle, fractional_coverage, f_dir, f_dir);
@@ -747,15 +752,43 @@ pub const Tiles = struct {
         return self.windings.culled;
     }
 
+    /// The 4-lane fractional coverage of a horizontal slice of a row,
+    /// dispatched per `self.level` (upstream `calc_fractional_coverage!`).
+    fn fractionalCoverage(
+        self: *const Tiles,
+        y_idx: u16,
+        segment_top_y: f32,
+        segment_bottom_y: f32,
+    ) [Tile.HEIGHT]f32 {
+        if (self.level.isFallback()) {
+            return calcFractionalCoverage(y_idx, segment_top_y, segment_bottom_y);
+        }
+        return calcFractionalCoverageVector(y_idx, segment_top_y, segment_bottom_y);
+    }
+
     /// Add `coverage * add` to a row's fractional winding, after optionally
     /// subtracting `subtract` from every lane (upstream `current -
     /// double_count`, then `mul_add(f_dir_v, ...)`).
+    ///
+    /// `fallback` runs the scalar lane loop; vector levels run the same
+    /// operation order as a single `f32x4` op.
     fn applyPartial(self: *Tiles, y_idx: u16, coverage: [Tile.HEIGHT]f32, add: f32, subtract: f32) void {
-        const current = self.windings.partial.items[y_idx];
-        var next: [Tile.HEIGHT]f32 = undefined;
-        inline for (0..Tile.HEIGHT) |k| {
-            next[k] = mulAdd(coverage[k], add, current[k] - subtract);
+        if (self.level.isFallback()) {
+            const current = self.windings.partial.items[y_idx];
+            var next: [Tile.HEIGHT]f32 = undefined;
+            inline for (0..Tile.HEIGHT) |k| {
+                next[k] = mulAdd(coverage[k], add, current[k] - subtract);
+            }
+            self.windings.partial.items[y_idx] = next;
+            return;
         }
+
+        const current: F32x4 = self.windings.partial.items[y_idx];
+        const next = simd.mulAddUnfused(
+            @as(F32x4, coverage),
+            @as(F32x4, @splat(add)),
+            current - @as(F32x4, @splat(subtract)),
+        );
         self.windings.partial.items[y_idx] = next;
     }
 
@@ -1033,7 +1066,7 @@ const AnalyticRowCtx = struct {
                 const crosses_top = (w_single & W) != 0;
                 if (crosses_top) self.tiles.windings.coarse.items[y_idx] += self.dir;
 
-                const fractional_coverage = calcFractionalCoverage(y_idx, row_top_y, row_bottom_y);
+                const fractional_coverage = self.tiles.fractionalCoverage(y_idx, row_top_y, row_bottom_y);
                 self.tiles.applyPartial(
                     y_idx,
                     fractional_coverage,
@@ -1056,7 +1089,7 @@ const AnalyticRowCtx = struct {
 
                 if (off_screen_top_y < off_screen_bottom_y) {
                     self.tiles.windings.markRowActive(y_idx);
-                    const fractional_coverage = calcFractionalCoverage(y_idx, off_screen_top_y, off_screen_bottom_y);
+                    const fractional_coverage = self.tiles.fractionalCoverage(y_idx, off_screen_top_y, off_screen_bottom_y);
                     self.tiles.applyPartial(y_idx, fractional_coverage, self.f_dir, 0.0);
                 }
             }
@@ -1272,6 +1305,28 @@ fn calcFractionalCoverage(y_idx: u16, segment_top_y: f32, segment_bottom_y: f32)
         out[i] = @max(@min(px_bottom, local_y_end) - @max(px_top, local_y_start), 0.0);
     }
     return out;
+}
+
+/// `@Vector` backend of [`calcFractionalCoverage`] (upstream `px_top`/
+/// `px_bottom` f32x4 computation). Same per-lane operation order as the
+/// scalar loop.
+fn calcFractionalCoverageVector(
+    y_idx: u16,
+    segment_top_y: f32,
+    segment_bottom_y: f32,
+) [Tile.HEIGHT]f32 {
+    const y_idx_f32: f32 = @floatFromInt(y_idx);
+    const tile_height_f32: f32 = @floatFromInt(Tile.HEIGHT);
+    const local_y_start = (segment_top_y - y_idx_f32) * tile_height_f32;
+    const local_y_end = (segment_bottom_y - y_idx_f32) * tile_height_f32;
+
+    const px_top: F32x4 = .{ 0.0, 1.0, 2.0, 3.0 };
+    const px_bottom = px_top + @as(F32x4, @splat(1.0));
+    const start_v: F32x4 = @splat(local_y_start);
+    const end_v: F32x4 = @splat(local_y_end);
+    const zero: F32x4 = @splat(0.0);
+
+    return @max(@min(px_bottom, end_v) - @max(px_top, start_v), zero);
 }
 
 /// Rust `bool as u32`.
@@ -2245,6 +2300,63 @@ test "infinite loop" {
     defer tiles.deinit(a);
     try tiles.makeTilesMsaa(a, &lines, 600, 600);
     _ = try tiles.makeTilesAnalyticAa(a, &lines, 600, 600);
+}
+
+test "analytic aa tiling is bit-identical across SIMD levels" {
+    const a = testing.allocator;
+
+    const levels = [_]simd.Level{
+        .baseline, .sse2, .sse4_2, .avx2, .avx512, .neon, .wasm_simd128,
+    };
+
+    var scalar = Tiles.init(a, .fallback, 128, 128);
+    defer scalar.deinit(a);
+    var vector = Tiles.init(a, .baseline, 128, 128);
+    defer vector.deinit(a);
+
+    var prng = std.Random.DefaultPrng.init(0x7113_c0de);
+    const random = prng.random();
+
+    var lines: [64]Line = undefined;
+    var iter: usize = 0;
+    while (iter < 128) : (iter += 1) {
+        const n = 1 + random.uintLessThan(usize, 64);
+        for (lines[0..n]) |*line| {
+            // Mix axis crossings, off-screen starts, and vertical lines.
+            const x0 = random.float(f32) * 400.0 - 100.0;
+            const y0 = random.float(f32) * 400.0 - 100.0;
+            const x1 = if (iter % 5 == 0) x0 else random.float(f32) * 400.0 - 100.0;
+            const y1 = random.float(f32) * 400.0 - 100.0;
+            line.* = mkLine(x0, y0, x1, y1);
+        }
+
+        const culled_reference = try scalar.makeTilesAnalyticAa(a, lines[0..n], 128, 128);
+        for (levels) |level| {
+            vector.level = level;
+            const culled = try vector.makeTilesAnalyticAa(a, lines[0..n], 128, 128);
+            try testing.expectEqual(culled_reference, culled);
+            try testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(scalar.tile_buf.items),
+                std.mem.sliceAsBytes(vector.tile_buf.items),
+            );
+            try testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(scalar.windings.partial.items),
+                std.mem.sliceAsBytes(vector.windings.partial.items),
+            );
+            try testing.expectEqualSlices(
+                i16,
+                scalar.windings.coarse.items,
+                vector.windings.coarse.items,
+            );
+            try testing.expectEqualSlices(
+                u32,
+                scalar.windings.active.items,
+                vector.windings.active.items,
+            );
+        }
+    }
 }
 
 // See https://github.com/linebender/vello/issues/1321.

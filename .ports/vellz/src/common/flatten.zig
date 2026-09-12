@@ -311,10 +311,6 @@ pub fn flattenPath(
     flatten_ctx: *FlattenCtx,
     cull_bbox: geometry.RectU16,
 ) !void {
-    // The level selects a backend upstream; the port has one portable
-    // backend (see the module docs).
-    _ = level;
-
     flatten_ctx.flattened_cubics.clearRetainingCapacity();
 
     // For the culling performed here to be correct, the top y coordinate of
@@ -417,7 +413,7 @@ pub fn flattenPath(
                     try callback.call(.{ .line_to = p3 });
                 } else {
                     const cubic = kurbo.CubicBez.new(p0, p1, p2, p3);
-                    const max = try flattenCubic(allocator, cubic, flatten_ctx);
+                    const max = try flattenCubic(allocator, level, cubic, flatten_ctx);
 
                     for (flatten_ctx.flattened_cubics.items[1..max]) |p| {
                         try callback.call(.{
@@ -682,11 +678,326 @@ fn outputLines(
     }
 }
 
+// ---------------------------------------------------------------------------
+// `@Vector` backend (upstream `flatten_simd.rs` f32x8 paths)
+// ---------------------------------------------------------------------------
+
+const F32x4 = simd.F32x4;
+const F32x8 = simd.F32x8;
+const I32x4 = simd.I32x4;
+const U32x4 = simd.U32x4;
+
+/// `f32x8::block_splat` of the `index`-th point of an interleaved
+/// `[x0, y0, x1, y1]` vector, i.e. `[x, y, x, y, x, y, x, y]` (upstream
+/// `split_single` followed by `block_splat`).
+inline fn pointSplatF32x4(v: F32x4, comptime index: usize) F32x8 {
+    const x = v[index * 2];
+    const y = v[index * 2 + 1];
+    return .{ x, y, x, y, x, y, x, y };
+}
+
+/// `pt_splat_simd`: an `(x, y)` pair repeated four times.
+inline fn pointSplat(p: Point32) F32x8 {
+    return .{ p.x, p.y, p.x, p.y, p.x, p.y, p.x, p.y };
+}
+
+inline fn splat8(value: f32) F32x8 {
+    return @splat(value);
+}
+
+/// SIMD version of [`approxParabolaIntegralF32`], generic over the vector
+/// width (upstream `approx_parabola_integral_simd` is generic over
+/// `SimdFloat`).
+inline fn approxParabolaIntegralSimd(x: anytype) @TypeOf(x) {
+    const V = @TypeOf(x);
+    const D: f32 = 0.67;
+    const D_POWI_4: f32 = 0.201_511_2;
+
+    const temp = @sqrt(@sqrt(simd.mulAddUnfused(
+        x * x,
+        @as(V, @splat(0.25)),
+        @as(V, @splat(D_POWI_4)),
+    )));
+    return x / (temp + @as(V, @splat(1.0 - D)));
+}
+
+/// SIMD version of [`approxParabolaInvIntegralF32`], generic over the vector
+/// width (upstream `approx_parabola_inv_integral_simd`).
+inline fn approxParabolaInvIntegralSimd(x: anytype) @TypeOf(x) {
+    const V = @TypeOf(x);
+    const B: f32 = 0.39;
+    const temp = @sqrt(simd.mulAddUnfused(
+        x * x,
+        @as(V, @splat(0.25)),
+        @as(V, @splat(B * B)),
+    ));
+    return x * (@as(V, @splat(1.0 - B)) + temp);
+}
+
+/// Upstream `is_finite_simd`: `|x|`'s bit pattern below infinity.
+inline fn isFiniteSimd(x: F32x4) simd.Mask32x4 {
+    const bits: U32x4 = @bitCast(@abs(x));
+    return bits < @as(U32x4, @splat(0x7f80_0000));
+}
+
+/// Load four interleaved `(x, y)` points into an `f32x8`.
+inline fn loadPoints(points: []const Point32) F32x8 {
+    std.debug.assert(points.len >= 4);
+    var out: F32x8 = undefined;
+    inline for (0..4) |k| {
+        out[2 * k] = points[k].x;
+        out[2 * k + 1] = points[k].y;
+    }
+    return out;
+}
+
+/// Store four interleaved `(x, y)` points from an `f32x8`.
+inline fn storePoints(dest: []Point32, v: F32x8) void {
+    std.debug.assert(dest.len >= 4);
+    inline for (0..4) |k| {
+        dest[k] = .{ .x = v[2 * k], .y = v[2 * k + 1] };
+    }
+}
+
+/// Upstream `eval_cubics_simd`: evaluate the cubic at four `t` values per
+/// iteration.
+///
+/// Lane `k` of the `f32x8` evaluates one coordinate of point `k`; the lane
+/// order `[0, 0, 2, 2, 1, 1, 3, 3]` and the `t` accumulation match upstream,
+/// so every lane performs the same operation sequence as the scalar
+/// transcription.
+fn evalCubicsVector(c: kurbo.CubicBez, n: usize, result: *FlattenCtx) void {
+    result.n_quads = n;
+    const dt: f32 = 0.5 / @as(f32, @floatFromInt(n));
+
+    const p0p1: F32x4 = .{
+        @floatCast(c.p0.x),
+        @floatCast(c.p0.y),
+        @floatCast(c.p1.x),
+        @floatCast(c.p1.y),
+    };
+    const p2p3: F32x4 = .{
+        @floatCast(c.p2.x),
+        @floatCast(c.p2.y),
+        @floatCast(c.p3.x),
+        @floatCast(c.p3.y),
+    };
+
+    const p0_128 = pointSplatF32x4(p0p1, 0);
+    const p1_128 = pointSplatF32x4(p0p1, 1);
+    const p2_128 = pointSplatF32x4(p2p3, 0);
+    const p3_128 = pointSplatF32x4(p2p3, 1);
+
+    // Horner coefficients, exactly as upstream `eval_cubics_simd`.
+    const coeff_a = simd.mulAddUnfused(p1_128 - p2_128, splat8(3.0), p3_128 - p0_128);
+    const coeff_b = simd.mulAddUnfused(p1_128, splat8(-2.0), p0_128 + p2_128) * splat8(3.0);
+    const coeff_c = (p1_128 - p0_128) * splat8(3.0);
+    const coeff_d = p0_128;
+
+    const iota: F32x8 = .{ 0.0, 0.0, 2.0, 2.0, 1.0, 1.0, 3.0, 3.0 };
+    var t = iota * splat8(dt);
+    const t_inc = splat8(4.0 * dt);
+
+    var i: usize = 0;
+    while (i < (n + 1) / 2) : (i += 1) {
+        const evaluated = simd.mulAddUnfused(
+            simd.mulAddUnfused(
+                simd.mulAddUnfused(coeff_a, t, coeff_b),
+                t,
+                coeff_c,
+            ),
+            t,
+            coeff_d,
+        );
+
+        const parts = simd.splitF32x8(evaluated);
+        // Low half -> even points 2i, 2i+1; high half -> odd points 2i, 2i+1.
+        result.even_pts[2 * i] = .{ .x = parts[0][0], .y = parts[0][1] };
+        result.even_pts[2 * i + 1] = .{ .x = parts[0][2], .y = parts[0][3] };
+        result.odd_pts[2 * i] = .{ .x = parts[1][0], .y = parts[1][1] };
+        result.odd_pts[2 * i + 1] = .{ .x = parts[1][2], .y = parts[1][3] };
+
+        t += t_inc;
+    }
+
+    // `p3_128.store_slice(&mut even_pts[n * 2..][..8])`: the endpoint fills
+    // points `n..n+4`.
+    const p3x: f32 = @floatCast(c.p3.x);
+    const p3y: f32 = @floatCast(c.p3.y);
+    inline for (0..4) |k| {
+        result.even_pts[n + k] = .{ .x = p3x, .y = p3y };
+    }
+}
+
+/// Upstream `estimate_subdiv_simd`: four quads per iteration.
+///
+/// The low four lanes carry the `d12`-derived values upstream binds to
+/// `x0`/`a0`/`u0`; the high four lanes carry the `d01`-derived
+/// `x2`/`a2`/`u2`. This is the same (deliberate) lane naming as the scalar
+/// transcription, which the upstream `unzip`/`combine` lane order produces.
+fn estimateSubdivVector(sqrt_tol: f32, ctx: *FlattenCtx) void {
+    const n = ctx.n_quads;
+
+    var i: usize = 0;
+    while (i < (n + 3) / 4) : (i += 1) {
+        const p0 = loadPoints(ctx.even_pts[4 * i ..][0..4]);
+        const p_half = loadPoints(ctx.odd_pts[4 * i ..][0..4]);
+        const p2 = loadPoints(ctx.even_pts[4 * i + 1 ..][0..4]);
+
+        const x = p0 * splat8(-0.5);
+        const x1 = simd.mulAddUnfused(p_half, splat8(2.0), x);
+        const p1 = simd.mulAddUnfused(p2, splat8(-0.5), x1);
+        storePoints(ctx.odd_pts[4 * i ..], p1);
+
+        const d01 = p1 - p0;
+        const d12 = p2 - p1;
+        const d01x = simd.unzipLowF32x8Wide(d01, d01);
+        const d01y = simd.unzipHighF32x8Wide(d01, d01);
+        const d12x = simd.unzipLowF32x8Wide(d12, d12);
+        const d12y = simd.unzipHighF32x8Wide(d12, d12);
+        const ddx = d01x - d12x;
+        const ddy = d01y - d12y;
+        const d02x = d01x + d12x;
+        const d02y = d01y + d12y;
+        // `(d02x * ddy) - (d02y * ddx)`, as `mul_add(-d02y, ddx)`.
+        const cross = simd.mulAddUnfused(ddx, -d02y, d02x * ddy);
+
+        const ddx_low = simd.splitF32x8(ddx)[0];
+        const ddy_low = simd.splitF32x8(ddy)[0];
+        const d12x_low = simd.splitF32x8(d12x)[0];
+        const d01x_low = simd.splitF32x8(d01x)[0];
+        const d12y_low = simd.splitF32x8(d12y)[0];
+        const d01y_low = simd.splitF32x8(d01y)[0];
+
+        const x0_x2_a = simd.combineF32x4(d12x_low, d01x_low) * ddx;
+        const x0_x2_num = simd.mulAddUnfused(
+            simd.combineF32x4(d12y_low, d01y_low),
+            ddy,
+            x0_x2_a,
+        );
+        const x0_x2 = x0_x2_num / cross;
+        const dd_hypot = @sqrt(simd.mulAddUnfused(ddy_low, ddy_low, ddx_low * ddx_low));
+
+        const x0_x2_parts = simd.splitF32x8(x0_x2);
+        const x0 = x0_x2_parts[0];
+        const x2 = x0_x2_parts[1];
+        const scale_denom = dd_hypot * (x2 - x0);
+        const cross_low = simd.splitF32x8(cross)[0];
+        const scale = @abs(cross_low / scale_denom);
+
+        const a0_a2 = approxParabolaIntegralSimd(x0_x2);
+        const a_parts = simd.splitF32x8(a0_a2);
+        const a0 = a_parts[0];
+        const a2 = a_parts[1];
+        const da = a2 - a0;
+        const da_abs = @abs(da);
+        const sqrt_scale = @sqrt(scale);
+
+        // `mask = (x0 | x2) >= 0` on the raw bit patterns (so `-0.0` counts
+        // as negative), exactly like the integer SIMD comparison upstream.
+        const bits = @as(I32x4, @bitCast(x0)) | @as(I32x4, @bitCast(x2));
+        const non_cusp = bits >= @as(I32x4, @splat(0));
+
+        const noncusp_val = da_abs * sqrt_scale;
+        const xmin = @as(F32x4, @splat(sqrt_tol)) / sqrt_scale;
+        const approxint = approxParabolaIntegralSimd(xmin);
+        const cusp_val = (@as(F32x4, @splat(sqrt_tol)) * da_abs) / approxint;
+        const val_raw = simd.select(F32x4, non_cusp, noncusp_val, cusp_val);
+        const val = simd.select(F32x4, isFiniteSimd(val_raw), val_raw, @as(F32x4, @splat(0.0)));
+
+        const u0_u2 = approxParabolaInvIntegralSimd(a0_a2);
+        const u_parts = simd.splitF32x8(u0_u2);
+        const u0_val = u_parts[0];
+        const u2_val = u_parts[1];
+        const uscale = @as(F32x4, @splat(1.0)) / (u2_val - u0_val);
+
+        ctx.a0[4 * i ..][0..4].* = a0;
+        ctx.da[4 * i ..][0..4].* = da;
+        ctx.u0[4 * i ..][0..4].* = u0_val;
+        ctx.uscale[4 * i ..][0..4].* = uscale;
+        ctx.val[4 * i ..][0..4].* = val;
+    }
+}
+
+/// Upstream `output_lines_simd`: emit `n_points` subdivision points of quad
+/// `i` into `flattened_cubics`.
+fn outputLinesVector(
+    ctx: *FlattenCtx,
+    i: usize,
+    x0: f32,
+    dx: f32,
+    n_points: usize,
+    start_idx: usize,
+) void {
+    const p0 = pointSplat(ctx.even_pts[i]);
+    const p1 = pointSplat(ctx.odd_pts[i]);
+    const p2 = pointSplat(ctx.even_pts[i + 1]);
+
+    // Lane order of the upstream IOTA2: [0, 0, 1, 1, 2, 2, 3, 3].
+    const iota2: F32x8 = .{ 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0 };
+    const x = simd.mulAddUnfused(iota2, splat8(dx), splat8(x0));
+    const a_start = simd.mulAddUnfused(splat8(ctx.da[i]), x, splat8(ctx.a0[i]));
+    const a_inc = splat8(4.0 * dx * ctx.da[i]);
+    const uscale = splat8(ctx.uscale[i]);
+    const u0_vec = splat8(ctx.u0[i]);
+
+    const coeff_a = simd.mulAddUnfused(p1, splat8(-2.0), p0) + p2;
+    const coeff_b = (p1 - p0) * splat8(2.0);
+    const coeff_c = p0;
+
+    var a = a_start;
+    var j: usize = 0;
+    while (j < (n_points + 3) / 4) : (j += 1) {
+        const u = approxParabolaInvIntegralSimd(a);
+        const t = (u - u0_vec) * uscale;
+        const p = simd.mulAddUnfused(
+            simd.mulAddUnfused(coeff_a, t, coeff_b),
+            t,
+            coeff_c,
+        );
+        storePoints(ctx.flattened_cubics.items[start_idx + j * 4 ..], p);
+        a += a_inc;
+    }
+}
+
 /// Flatten a cubic into `ctx.flattened_cubics`, returning the number of
 /// entries (including the start point) that are valid.
 ///
-/// Upstream `flatten_cubic_simd`.
+/// Upstream `flatten_cubic_simd`, dispatched per [`simd.Level`]: `fallback`
+/// runs the scalar transcription, every vector level the `@Vector` backend.
+/// Both produce bit-identical results (the differential test below asserts
+/// this for every level).
 fn flattenCubic(
+    allocator: std.mem.Allocator,
+    level: simd.Level,
+    c: kurbo.CubicBez,
+    ctx: *FlattenCtx,
+) !usize {
+    return simd.dispatch(CubicBackends, level, .{ allocator, c, ctx });
+}
+
+/// Per-level cubic flattening backends (`fearless_simd::dispatch!` shape).
+const CubicBackends = struct {
+    pub fn fallback(
+        allocator: std.mem.Allocator,
+        c: kurbo.CubicBez,
+        ctx: *FlattenCtx,
+    ) !usize {
+        return flattenCubicScalar(allocator, c, ctx);
+    }
+
+    pub fn vector(
+        allocator: std.mem.Allocator,
+        c: kurbo.CubicBez,
+        ctx: *FlattenCtx,
+    ) !usize {
+        return flattenCubicVector(allocator, c, ctx);
+    }
+};
+
+/// Scalar transcription of upstream `flatten_cubic_simd` (the `fallback`
+/// backend).
+fn flattenCubicScalar(
     allocator: std.mem.Allocator,
     c: kurbo.CubicBez,
     ctx: *FlattenCtx,
@@ -697,6 +1008,37 @@ fn flattenCubic(
     const sqrt_tol: f32 = @sqrt(tol);
     estimateSubdiv(sqrt_tol, ctx);
 
+    return flattenCubicTail(allocator, ctx, n_quads, sqrt_tol, outputLines);
+}
+
+/// `@Vector` backend of upstream `flatten_cubic_simd`: the same operation
+/// order per lane as [`flattenCubicScalar`], evaluated four points at a time
+/// with `f32x8`.
+fn flattenCubicVector(
+    allocator: std.mem.Allocator,
+    c: kurbo.CubicBez,
+    ctx: *FlattenCtx,
+) !usize {
+    const n_quads = estimateNumQuads(c, @floatCast(TOL));
+    evalCubicsVector(c, n_quads, ctx);
+    const tol: f32 = @as(f32, @floatCast(TOL)) * (1.0 - TO_QUAD_TOL);
+    const sqrt_tol: f32 = @sqrt(tol);
+    estimateSubdivVector(sqrt_tol, ctx);
+
+    return flattenCubicTail(allocator, ctx, n_quads, sqrt_tol, outputLinesVector);
+}
+
+/// The backend-independent scheduling tail of `flatten_cubic_simd`: sum the
+/// per-quad subdivision values (sequentially and in lane order, exactly like
+/// upstream's `iter().sum()`), size the output buffer, and emit the quads
+/// through `output`.
+fn flattenCubicTail(
+    allocator: std.mem.Allocator,
+    ctx: *FlattenCtx,
+    n_quads: usize,
+    sqrt_tol: f32,
+    comptime output: fn (*FlattenCtx, usize, f32, f32, usize, usize) void,
+) !usize {
     var sum: f32 = 0.0;
     for (ctx.val[0..n_quads]) |v| sum += v;
 
@@ -726,7 +1068,7 @@ fn flattenCubic(
         if (dn > 0) {
             const dx = step / val;
             const x0 = x0base * dx;
-            outputLines(ctx, i, x0, dx, dn, last_n);
+            output(ctx, i, x0, dx, dn, last_n);
         }
         x0base = this_n_next - this_n;
         last_n = this_n_next_idx;
@@ -1046,6 +1388,101 @@ test "fill reuses the context across calls" {
 
     try fill(a, .baseline, &curve, kurbo.Affine.IDENTITY, &line_buf, &ctx, bbox);
     try testing.expectEqual(first_len, line_buf.items.len);
+}
+
+test "vector cubic flattening is bit-identical to the scalar fallback" {
+    const testing = std.testing;
+    const a = testing.allocator;
+
+    const levels = [_]simd.Level{
+        .fallback, .baseline, .sse2, .sse4_2, .avx2, .avx512, .neon, .wasm_simd128,
+    };
+
+    var reference: std.ArrayList(Line) = .empty;
+    defer reference.deinit(a);
+    var candidate: std.ArrayList(Line) = .empty;
+    defer candidate.deinit(a);
+    var ctx = FlattenCtx.init();
+    defer ctx.deinit(a);
+
+    const bbox = geometry.RectU16.new(0, 0, 256, 256);
+    var prng = std.Random.DefaultPrng.init(0x5eed_5eed);
+    const random = prng.random();
+
+    var elements: [4]kurbo.PathEl = undefined;
+    var iter: usize = 0;
+    while (iter < 512) : (iter += 1) {
+        if (iter < 3) {
+            // Fixed shapes: a shallow curve (one quad), a deep curve (many
+            // quads), and a cubic with an off-screen endpoint (culling).
+            const fixed = [3][4]kurbo.Point{
+                .{
+                    kurbo.Point.new(0.0, 0.0),
+                    kurbo.Point.new(10.0, 1.0),
+                    kurbo.Point.new(20.0, 1.0),
+                    kurbo.Point.new(30.0, 0.0),
+                },
+                .{
+                    kurbo.Point.new(0.0, 0.0),
+                    kurbo.Point.new(10.0, 90.0),
+                    kurbo.Point.new(90.0, 90.0),
+                    kurbo.Point.new(100.0, 0.0),
+                },
+                .{
+                    kurbo.Point.new(-500.0, 20.0),
+                    kurbo.Point.new(-400.0, 600.0),
+                    kurbo.Point.new(400.0, -600.0),
+                    kurbo.Point.new(500.0, 30.0),
+                },
+            };
+            const pts = fixed[iter];
+            elements[0] = kurbo.PathEl.moveTo(pts[0]);
+            elements[1] = kurbo.PathEl.curveTo(pts[1], pts[2], pts[3]);
+            if (iter == 2) {
+                // A second subpath exercises context reuse within one call.
+                elements[2] = kurbo.PathEl.moveTo(kurbo.Point.new(150.0, 150.0));
+                elements[3] = kurbo.PathEl.curveTo(
+                    kurbo.Point.new(160.0, 10.0),
+                    kurbo.Point.new(200.0, 250.0),
+                    kurbo.Point.new(210.0, 160.0),
+                );
+            } else {
+                elements[2] = kurbo.PathEl.lineTo(kurbo.Point.new(0.0, 0.0));
+                elements[3] = kurbo.PathEl.closePath();
+            }
+        } else {
+            const x0 = random.float(f32) * 300.0 - 50.0;
+            const y0 = random.float(f32) * 300.0 - 50.0;
+            elements[0] = kurbo.PathEl.moveTo(kurbo.Point.new(x0, y0));
+            elements[1] = kurbo.PathEl.curveTo(
+                kurbo.Point.new(random.float(f32) * 400.0 - 100.0, random.float(f32) * 400.0 - 100.0),
+                kurbo.Point.new(random.float(f32) * 400.0 - 100.0, random.float(f32) * 400.0 - 100.0),
+                kurbo.Point.new(
+                    x0 + random.float(f32) * 300.0 - 150.0,
+                    y0 + random.float(f32) * 300.0 - 150.0,
+                ),
+            );
+            elements[2] = kurbo.PathEl.lineTo(kurbo.Point.new(x0, y0));
+            elements[3] = kurbo.PathEl.closePath();
+        }
+
+        const affine = if (iter % 2 == 0)
+            kurbo.Affine.IDENTITY
+        else
+            kurbo.Affine.scale(0.75).thenTranslate(kurbo.Vec2.new(11.25, -4.5));
+
+        for (levels, 0..) |level, li| {
+            const out = if (li == 0) &reference else &candidate;
+            try fill(a, level, &elements, affine, out, &ctx, bbox);
+            if (li != 0) {
+                try testing.expectEqualSlices(
+                    u8,
+                    std.mem.sliceAsBytes(reference.items),
+                    std.mem.sliceAsBytes(candidate.items),
+                );
+            }
+        }
+    }
 }
 
 test "stroke expands and flattens a line" {

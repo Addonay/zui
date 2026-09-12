@@ -18,10 +18,12 @@ diffs="out/diffs"
 
 tolerance=0
 jobs="$(nproc)"
+level=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --tolerance) tolerance="$2"; shift 2 ;;
         --jobs) jobs="$2"; shift 2 ;;
+        --level) level="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -41,7 +43,12 @@ run_one() {
         echo "SKIP     $name (no oracle fixture)"
         return 0
     fi
-    if ! "$cli" --scene "$scene" --out "$out/$name.rgba" >/dev/null 2>"$out/$name.stderr"; then
+    if [ -n "$level" ]; then
+        if ! "$cli" --scene "$scene" --out "$out/$name.rgba" --level "$level" >/dev/null 2>"$out/$name.stderr"; then
+            echo "ERROR    $name (cli failed; see $out/$name.stderr)"
+            return 1
+        fi
+    elif ! "$cli" --scene "$scene" --out "$out/$name.rgba" >/dev/null 2>"$out/$name.stderr"; then
         echo "ERROR    $name (cli failed; see $out/$name.stderr)"
         return 1
     fi

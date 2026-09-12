@@ -76,6 +76,9 @@ pub const RasterizerSettings = struct {
     ///
     /// See `RenderContext.renderWith` for the precise semantics.
     offset: Offset,
+    /// Optional per-stage timing sink (benchmarking only, `null` in normal
+    /// rendering). See [`StageTimings`].
+    timings: ?*StageTimings = null,
 
     /// The upstream default: speed mode, transparent clear, RGBA8, no offset.
     pub const default: RasterizerSettings = .{
@@ -84,6 +87,25 @@ pub const RasterizerSettings = struct {
         .pixel_format = .rgba8,
         .offset = .{ .x = 0, .y = 0 },
     };
+};
+
+/// Accumulated wall-clock nanoseconds per rasterization stage, written by the
+/// dispatcher during `rasterize` when [`RasterizerSettings.timings`] points at
+/// one.
+///
+/// `now_ns` is a caller-supplied monotonic clock so the library does not
+/// depend on a platform timer; `tools/bench.zig` passes one. The values are
+/// additive: the dispatcher adds each stage's elapsed time to the fields, so
+/// callers reset them between samples. For multi-threaded dispatch both values
+/// are wall-clock on the calling thread (`fine_ns` covers the parallel
+/// rasterization wait).
+pub const StageTimings = struct {
+    /// Nanoseconds spent bucketing the recorded commands into coarse rows.
+    bucket_ns: u64 = 0,
+    /// Nanoseconds spent in fine rasterization of all regions.
+    fine_ns: u64 = 0,
+    /// Monotonic clock in nanoseconds.
+    now_ns: *const fn () u64,
 };
 
 test "settings defaults match upstream" {

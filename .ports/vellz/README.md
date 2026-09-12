@@ -18,21 +18,22 @@ package (wgpu-native `v29.0.1.1`) rather than re-binding the C API locally.
 
 ## Status
 
-**Milestones 1 and 2 complete (G1 and G2 met 2026-09-12); the M4 u8 and
-multithreaded CPU pipelines have landed (G4 not yet claimed).** The CPU
-renderer produces premultiplied RGBA8 pixels through the full upstream
-pipeline (path encoding → flatten → tiles → sparse strips → coarse bucketing →
-fine rasterization) and every scene in the shared corpus — solid fills,
-strokes, gradients, images, layers, masks, filter layers, and blurred rounded
-rectangles, each also in its low-precision `*_speed` variant — is
+**Milestones 1, 2, and 4 complete (G1, G2, and G4 met 2026-09-12); the M4 u8,
+multithreaded, and SIMD CPU pipelines have landed.** The CPU renderer produces
+premultiplied RGBA8 pixels through the full upstream pipeline (path encoding →
+flatten → tiles → sparse strips → coarse bucketing → fine rasterization) and
+every scene in the shared corpus — solid fills, strokes, gradients, images,
+layers, masks, filter layers, and blurred rounded rectangles, each also in its
+low-precision `*_speed` variant — is
 **byte-exact against the pinned upstream oracle** (`tolerance=0`, all four
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 792/792 unit and integration tests (784 lib + 8 scene)
+zig build test     # 799/799 unit and integration tests (791 lib + 8 scene)
 zig build corpus   # 63/63 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo
+zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
 ```
 
 GPU (`-Dgpu=true`): `gpu-corpus` currently gates 9 root-pass scenes against the
@@ -63,16 +64,21 @@ placement trace. T3 wires the stack end to end: positioned `glyph_run` scenes
 (fill/stroke, transform absorption, skew, glyph transforms, gradient paint)
 render through `vellz.glifo` + `vellz.cpu` byte-exact against the pinned
 oracle with the glyph atlas cache on and off (15 new scenes; 63/63 corpus,
-tolerance 0). The GPU side has the wgpu-native device bootstrap plus the
-full host/shader layout contract, with an offscreen clear/readback smoke test
-passing on the llvmpipe adapter.
+tolerance 0). The GPU side has the wgpu-native device bootstrap, the full
+host/shader layout contract, a real offscreen root-strip renderer, and a
+9-scene `gpu-corpus` gate (6 byte-exact, 2 within the documented AA tolerance,
+plus typed device-loss/unsupported-capability errors) running on the llvmpipe
+software adapter.
 
 Not yet implemented (explicit typed errors, never placeholder pixels): hinted
 outlines (the interpreter), COLR/CPAL, glyph decoration and the Cozmic adapter
-(M3 remainder); the GPU pipelines, renderer, and G5 corpus (M5 remainder). G4
-still needs SIMD-level dispatch and methodology-complete speedup measurements;
-MT filter layers and u8 + MT return `error.Unsupported` (documented upstream
-limitations). See [`plan.md`](plan.md) for the ledgers and milestones.
+(M3 remainder); GPU layers/blends, gradients, images, filters, and the full G5
+corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
+SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage
+benchmarks in `docs/benchmarks.md` (u8-vs-f32 speedups 1.9–3.4× on the
+representative scenes). MT filter layers and u8 + MT return
+`error.Unsupported` (documented upstream limitations). See
+[`plan.md`](plan.md) for the ledgers and milestones.
 
 ## Layout
 
@@ -108,6 +114,7 @@ zig build corpus                # corpus gate: 48 scenes byte-exact vs pinned fi
 zig build probe                 # upstream probe fixture (tolerance-3 policy)
 zig build run-cpu-example       # writes cpu_example.ppm
 zig build vellz-cli             # corpus renderer CLI -> zig-out/bin
+zig build bench                 # per-stage CPU benchmark (docs/benchmarks.md)
 ```
 
 GPU backend (resolves the sibling `../wgpu` package and links wgpu-native):
