@@ -92,6 +92,25 @@ glyph_vectors=(
     "Roboto-Regular.ttf 100.0 0 1293 h"
     "Roboto-Regular.ttf 0.5 0 1293 h"
     "Roboto-Regular.ttf 2048.0 0 1293 h"
+    # G3f: variable-font outlines through `gvar` (unhinted and hinted), with
+    # normalized coordinates given as `[-1, 1]` values and converted with
+    # `F2Dot14::from_f32` on both sides. The last entry exercises the
+    # saturating out-of-range conversion.
+    "Inconsolata.ttf 16.0 0 200 n"
+    "Inconsolata.ttf 16.0 0 200 h"
+    "Inconsolata.ttf 16.0 0 961 n 1.0"
+    "Inconsolata.ttf 16.0 0 961 h 1.0"
+    "Inconsolata.ttf 16.0 0 961 n -1.0"
+    "Inconsolata.ttf 16.0 0 961 h -1.0"
+    "Inconsolata.ttf 12.0 0 500 n 0.5,-0.5"
+    "Inconsolata.ttf 12.0 0 500 h 0.5,-0.5"
+    "Inconsolata.ttf 23.5 0 300 n 1.0,-1.0"
+    "Inconsolata.ttf 23.5 0 300 h 1.0,-1.0"
+    "Inconsolata.ttf 7.0 0 200 n 0.3"
+    "Inconsolata.ttf 7.0 0 200 h 0.3"
+    "Inconsolata.ttf 100.0 0 200 n -0.75,0.25"
+    "Inconsolata.ttf 100.0 0 200 h -0.75,0.25"
+    "Inconsolata.ttf 16.0 0 50 n 3.0"
 )
 
 # font filename, first codepoint, last codepoint
@@ -106,6 +125,7 @@ font_id() {
         Roboto-Regular.ttf) echo 0 ;;
         NotoColorEmoji-Subset.ttf) echo 1 ;;
         NotoColorEmoji-CBTF-Subset.ttf) echo 2 ;;
+        Inconsolata.ttf) echo 3 ;;
         *) echo "unknown font $1" >&2; exit 2 ;;
     esac
 }
@@ -125,7 +145,7 @@ total_coordinates=0
 
 glyph_rows=""
 for vector in "${glyph_vectors[@]}"; do
-    read -r font size gid_start gid_end hint_flag <<<"$vector"
+    read -r font size gid_start gid_end hint_flag coords <<<"$vector"
     name="${font%.ttf}_s${size}_${gid_start}-${gid_end}"
     hint_arg=""
     manifest_hint="false"
@@ -134,12 +154,19 @@ for vector in "${glyph_vectors[@]}"; do
         hint_arg="--hint"
         manifest_hint="true"
     fi
+    coords_arg=()
+    coords_suffix=""
+    if [ -n "${coords:-}" ]; then
+        coords_arg=(--coords "$coords")
+        coords_suffix="_c$(printf '%s' "$coords" | tr ',.-' '___')"
+    fi
+    name="${name}${coords_suffix}"
     oracle_dump="$out/oracle_$name.txt"
     zig_dump="$out/zig_$name.txt"
     "$oracle" --dump-glyphs --font "$fonts_dir/$font" --size "$size" $hint_arg \
-        --gids "$gid_start-$gid_end" >"$oracle_dump"
+        "${coords_arg[@]}" --gids "$gid_start-$gid_end" >"$oracle_dump"
     "$cli" --dump-glyphs --font "$fonts_dir/$font" --size "$size" $hint_arg \
-        --gids "$gid_start-$gid_end" >"$zig_dump"
+        "${coords_arg[@]}" --gids "$gid_start-$gid_end" >"$zig_dump"
     count_elements="$(elements "$oracle_dump")"
     count_coordinates="$(coordinates "$oracle_dump")"
     total_elements=$((total_elements + count_elements))
@@ -156,7 +183,12 @@ for vector in "${glyph_vectors[@]}"; do
         hex="$(sha256sum "$oracle_dump" | awk '{print $1}')"
         bytes="$(printf '%s' "$hex" | sed 's/../0x&, /g')"
         size_bits="$(python3 -c 'import struct,sys; print("%08x" % struct.unpack("<I", struct.pack("<f", float(sys.argv[1])))[0])' "$size")"
-        glyph_rows+="    .{ .font = $(font_id "$font"), .size_bits = 0x$size_bits, .gid_start = $gid_start, .gid_end = $gid_end, .hint = $manifest_hint, .elements = $count_elements, .coordinates = $count_coordinates, .sha256 = .{ $bytes} },\n"
+        manifest_coords=""
+        if [ -n "${coords:-}" ]; then
+            coords_bits="$(awk '/^coords / { for (i = 3; i <= NF; i++) printf "%s, ", $i }' "$oracle_dump")"
+            manifest_coords=".coords = &.{ $coords_bits}, "
+        fi
+        glyph_rows+="    .{ .font = $(font_id "$font"), .size_bits = 0x$size_bits, .gid_start = $gid_start, .gid_end = $gid_end, .hint = $manifest_hint, $manifest_coords.elements = $count_elements, .coordinates = $count_coordinates, .sha256 = .{ $bytes} },\n"
     fi
 done
 
@@ -202,6 +234,7 @@ if [ "$update_manifest" -eq 1 ]; then
         echo "pub const font_roboto: u8 = 0;"
         echo "pub const font_noto: u8 = 1;"
         echo "pub const font_noto_cbtf: u8 = 2;"
+        echo "pub const font_inconsolata: u8 = 3;"
         echo ""
         echo "pub const GlyphVector = struct {"
         echo "    font: u8,"
@@ -209,6 +242,8 @@ if [ "$update_manifest" -eq 1 ]; then
         echo "    gid_start: u32,"
         echo "    gid_end: u32,"
         echo "    hint: bool,"
+        echo "    /// Normalized F2Dot14 coordinates; empty for static vectors."
+        echo "    coords: []const i16 = &.{},"
         echo "    elements: usize,"
         echo "    coordinates: usize,"
         echo "    sha256: [32]u8,"
