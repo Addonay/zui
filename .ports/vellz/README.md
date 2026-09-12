@@ -29,16 +29,18 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 799/799 unit and integration tests (791 lib + 8 scene)
+zig build test     # 815/815 unit and integration tests (807 lib + 8 scene)
 zig build corpus   # 63/63 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
 ```
 
-GPU (`-Dgpu=true`): `gpu-corpus` currently gates 9 root-pass scenes against the
-pinned CPU oracle under the documented tolerance registry (6 byte-exact, 2 at
-max-abs 1 with recorded AA reasons, plus typed error tests).
+GPU (`-Dgpu=true`): `gpu-corpus` gates 44 scenes against the pinned CPU oracle
+under the documented tolerance registry (27 byte-exact, the rest at max-abs 1–2
+with recorded AA/rounding reasons; masks, atlas-backed images, and multi-pass
+filter graphs remain typed `error.Unsupported`), plus typed
+device-loss/unsupported-capability error tests.
 
 Coverage: antialiased fills, translucent overlap, NonZero/EvenOdd, nested
 clips and isolated clip layers, transforms, round-capped strokes, degenerate
@@ -65,11 +67,11 @@ placement trace. T3 wires the stack end to end: positioned `glyph_run` scenes
 render through `vellz.glifo` + `vellz.cpu` byte-exact against the pinned
 oracle with the glyph atlas cache on and off (15 new scenes; 63/63 corpus,
 tolerance 0). The GPU side has the wgpu-native device bootstrap, the full
-host/shader layout contract, a real offscreen root-strip renderer, and a
-9-scene `gpu-corpus` gate (6 byte-exact, 2 within the documented AA tolerance,
-plus typed device-loss/unsupported-capability errors) running on the llvmpipe
-software adapter.
-
+host/shader layout contract, the schedule/layer executor, encoded paints
+(gradients and images), GPU filters, and a 44-scene `gpu-corpus` gate (27
+byte-exact, the rest within the documented per-scene tolerance registry, plus
+typed device-loss/unsupported-capability/missing-binding/feedback-loop errors)
+running on the llvmpipe software adapter.
 Not yet implemented (explicit typed errors, never placeholder pixels): hinted
 outlines (the interpreter), COLR/CPAL, glyph decoration and the Cozmic adapter
 (M3 remainder); GPU layers/blends, gradients, images, filters, and the full G5
