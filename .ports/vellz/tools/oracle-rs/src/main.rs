@@ -21,6 +21,10 @@ use serde::Deserialize;
 use skrifa::MetadataProvider as _;
 use skrifa::instance::Size as SkrifaSize;
 use skrifa::outline::pen::PathElement;
+use skrifa::outline::{
+    DrawSettings as SkrifaDrawSettings, Engine as SkrifaEngine, HintingInstance, HintingOptions,
+    SmoothMode as SkrifaSmoothMode, Target as SkrifaTarget,
+};
 use vello_cpu::color::{AlphaColor, Srgb};
 use vello_cpu::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_cpu::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke};
@@ -795,10 +799,12 @@ fn run() -> Result<(), String> {
 /// as its raw bit pattern in lowercase hex, so the Zig side can be compared
 /// byte-for-byte without any float formatting.
 ///
-/// `--dump-glyphs --font PATH [--index N] --size PPEM --gids 1,3,5-9`
-///   emits `skrifa`'s unhinted `PathStyle::FreeType` path elements plus the
-///   adjusted lsb/advance from the same draw. This is exactly the call
-///   `glifo`'s `OutlineCache` makes for an unhinted run.
+/// `--dump-glyphs --font PATH [--index N] [--hint] --size PPEM --gids 1,3,5-9`
+///   emits `skrifa`'s `PathStyle::FreeType` path elements plus the adjusted
+///   lsb/advance from the same draw. Without `--hint` this is exactly the call
+///   `glifo`'s `OutlineCache` makes for an unhinted run; with `--hint` it uses
+///   the same `HintingInstance`/`HintingOptions` glifo builds for a hinted
+///   run and adds a `hint 1` marker line.
 ///
 /// `--dump-cmap --font PATH [--index N] --codepoints 65,66,0x1F600`
 ///   emits the selected cmap subtable's mappings (skrifa's selection strategy,
@@ -815,6 +821,31 @@ fn dump_glyphs(args: &[String]) -> Result<(), String> {
     out.push_str("vellz-glyph-dump v1\n");
     out.push_str(&format!("face {}\n", parsed.index));
     out.push_str(&format!("size {:08x}\n", size.to_bits()));
+    if parsed.hint {
+        out.push_str("hint 1\n");
+    }
+    // The same configuration glifo 0.3.0 uses for hinted runs.
+    let hinting_options = HintingOptions {
+        engine: SkrifaEngine::AutoFallback,
+        target: SkrifaTarget::Smooth {
+            mode: SkrifaSmoothMode::Lcd,
+            symmetric_rendering: false,
+            preserve_linear_metrics: true,
+        },
+    };
+    let hinting_instance = if parsed.hint {
+        Some(
+            HintingInstance::new(
+                &outlines,
+                SkrifaSize::new(size),
+                skrifa::instance::LocationRef::default(),
+                hinting_options,
+            )
+            .map_err(|e| format!("configuring hinting at size {size}: {e}"))?,
+        )
+    } else {
+        None
+    };
     for gid in parsed.ids {
         let glyph = outlines
             .get(skrifa::GlyphId::new(gid))
@@ -826,8 +857,15 @@ fn dump_glyphs(args: &[String]) -> Result<(), String> {
             skrifa::outline::OutlineGlyphFormat::Varc => "varc",
         };
         let mut elements: Vec<PathElement> = Vec::new();
+        let settings = match &hinting_instance {
+            Some(instance) => SkrifaDrawSettings::hinted(instance, false),
+            None => SkrifaDrawSettings::unhinted(
+                SkrifaSize::new(size),
+                skrifa::instance::LocationRef::default(),
+            ),
+        };
         let metrics = glyph
-            .draw(SkrifaSize::new(size), &mut elements)
+            .draw(settings, &mut elements)
             .map_err(|e| format!("drawing glyph {gid}: {e}"))?;
         out.push_str(&format!(
             "gid {gid} format {format} elems {} lsb {} advance {}\n",
@@ -918,6 +956,7 @@ struct DumpArgs {
     index: u32,
     size: Option<f32>,
     ids: Vec<u32>,
+    hint: bool,
 }
 
 /// Parses the shared `--dump-glyphs`/`--dump-cmap` arguments.
@@ -926,6 +965,7 @@ fn parse_dump_args(args: &[String], want_size: bool, what: &str) -> Result<DumpA
     let mut index: u32 = 0;
     let mut size: Option<f32> = None;
     let mut ids: Vec<u32> = Vec::new();
+    let mut hint = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -951,6 +991,10 @@ fn parse_dump_args(args: &[String], want_size: bool, what: &str) -> Result<DumpA
                 );
                 i += 2;
             }
+            "--hint" => {
+                hint = true;
+                i += 1;
+            }
             "--gids" | "--codepoints" => {
                 let value = args.get(i + 1).ok_or("list argument needs a value")?;
                 ids.extend(parse_id_list(value, what)?);
@@ -968,6 +1012,7 @@ fn parse_dump_args(args: &[String], want_size: bool, what: &str) -> Result<DumpA
         index,
         size,
         ids,
+        hint,
     })
 }
 

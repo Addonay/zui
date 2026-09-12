@@ -37,6 +37,12 @@ pub const tag_maxp = Tag{ 'm', 'a', 'x', 'p' };
 pub const tag_cmap = Tag{ 'c', 'm', 'a', 'p' };
 pub const tag_loca = Tag{ 'l', 'o', 'c', 'a' };
 pub const tag_glyf = Tag{ 'g', 'l', 'y', 'f' };
+/// TrueType instruction tables (M3 hinting).
+pub const tag_fpgm = Tag{ 'f', 'p', 'g', 'm' };
+pub const tag_prep = Tag{ 'p', 'r', 'e', 'p' };
+pub const tag_cvt = Tag{ 'c', 'v', 't', ' ' };
+pub const tag_os2 = Tag{ 'O', 'S', '/', '2' };
+pub const tag_hdmx = Tag{ 'h', 'd', 'm', 'x' };
 /// Color/bitmap tables used to detect deferred glyph sources (T4/T3b).
 pub const tag_colr = Tag{ 'C', 'O', 'L', 'R' };
 pub const tag_cpal = Tag{ 'C', 'P', 'A', 'L' };

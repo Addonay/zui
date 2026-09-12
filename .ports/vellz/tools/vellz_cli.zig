@@ -39,6 +39,7 @@ pub fn main(init: std.process.Init) !void {
     var font_path: ?[]const u8 = null;
     var font_index: u32 = 0;
     var font_size: ?f32 = null;
+    var hint = false;
     var level_override: ?[]const u8 = null;
     var id_specs: std.ArrayList([]const u8) = .empty;
     defer id_specs.deinit(allocator);
@@ -61,6 +62,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--size")) {
             const value = args_iter.next() orelse return usage();
             font_size = std.fmt.parseFloat(f32, value) catch return usage();
+        } else if (std.mem.eql(u8, arg, "--hint")) {
+            hint = true;
         } else if (std.mem.eql(u8, arg, "--level")) {
             level_override = args_iter.next() orelse return usage();
         } else if (std.mem.eql(u8, arg, "--gids") or std.mem.eql(u8, arg, "--codepoints")) {
@@ -85,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
         );
         defer allocator.free(blob);
         if (dump_glyphs) {
-            return runDumpGlyphs(allocator, io, blob, font_index, font_size orelse return usage(), id_specs.items);
+            return runDumpGlyphs(allocator, io, blob, font_index, font_size orelse return usage(), hint, id_specs.items);
         }
         return runDumpCmap(allocator, io, blob, font_index, id_specs.items);
     }
@@ -111,7 +114,7 @@ fn usage() error{InvalidArguments} {
     std.debug.print(
         "usage: vellz-cli --scene SCENE.json --out OUT.rgba [--level fallback|native|avx2|...]\n" ++
             "       vellz-cli --probe [--out OUT.rgba]\n" ++
-            "       vellz-cli --dump-glyphs --font FONT [--index N] --size PPEM --gids 1,3,5-9\n" ++
+            "       vellz-cli --dump-glyphs --font FONT [--index N] [--hint] --size PPEM --gids 1,3,5-9\n" ++
             "       vellz-cli --dump-cmap --font FONT [--index N] --codepoints 65,0x1F600\n",
         .{},
     );
@@ -127,6 +130,7 @@ fn runDumpGlyphs(
     blob: []const u8,
     font_index: u32,
     size: f32,
+    hint: bool,
     id_specs: []const []const u8,
 ) !void {
     const glifo = vellz.glifo;
@@ -148,6 +152,7 @@ fn runDumpGlyphs(
         &outlines,
         font_index,
         size,
+        hint,
         gids.items,
     ) catch |err| {
         std.debug.print("vellz-cli: dumping glyphs: {s}\n", .{@errorName(err)});
