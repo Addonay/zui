@@ -3,6 +3,8 @@
 # the pinned upstream oracle (`tools/oracle-rs --dump-glyphs` /
 # `--dump-cmap`) byte for byte.
 #
+# Invoked directly by `zig build glyphs` (the file must stay executable).
+#
 # Usage:
 #   tools/compare_glyphs.sh [--update-manifest]
 #
@@ -33,11 +35,25 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# `cargo` is needed only to (re)build the oracle. rustup installs it under
+# ~/.cargo/bin, which may not be on PATH in build-runner environments.
+if ! command -v cargo >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/cargo" ]; then
+    PATH="$HOME/.cargo/bin:$PATH"
+fi
+
 if [ ! -d ".reference/vello" ]; then
     echo "error: .reference/vello missing; run tools/fetch-reference.sh" >&2
     exit 2
 fi
+# Rebuild when the binary is missing or predates the dump modes this gate
+# needs: a stale `vellz-oracle` otherwise fails with "unknown argument".
+needs_oracle_build=0
 if [ ! -x "$oracle" ]; then
+    needs_oracle_build=1
+elif "$oracle" --dump-glyphs 2>&1 | grep -q "unknown argument"; then
+    needs_oracle_build=1
+fi
+if [ "$needs_oracle_build" -eq 1 ]; then
     echo "building vellz-oracle..."
     (cd tools/oracle-rs && cargo build --release) || {
         echo "error: building tools/oracle-rs failed" >&2

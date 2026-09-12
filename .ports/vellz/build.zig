@@ -186,6 +186,9 @@ pub fn build(b: *std.Build) void {
     // `--update-manifest` refreshes tests/fixtures/glyphs/manifest.zig, which
     // `zig build test` checks without a Rust toolchain.
     const glyphs = b.addSystemCommand(&.{"tools/compare_glyphs.sh"});
+    // Track the script itself so edits invalidate cached runs; the oracle
+    // binary is rebuilt by the script when stale.
+    glyphs.addFileInput(b.path("tools/compare_glyphs.sh"));
     glyphs.step.dependOn(&b.addInstallArtifact(cli, .{}).step);
     const glyphs_step = b.step(
         "glyphs",
