@@ -10,8 +10,15 @@
 //! writes them to `--out`. The printed line matches `vellz-cli`'s metrics so
 //! `tools/gpu_corpus.sh` can compare both with `tools/compare_raw.py`.
 //!
-//! Unsupported scene features (gradients, images, layers, strokes beyond the
-//! ported subset) fail with a typed error; there is no CPU fallback.
+//! Images are registered in the shared image atlas cache (upstream
+//! `Renderer::upload_image`) and sampled through `ImageSource.opaque_id`;
+//! glyph runs draw through the GPU `DrawSink`/`GlyphRenderer` surface with the
+//! same atlas cache backing the glyph pages.
+//!
+//! Masks are applied through the local mask adapt (uploaded mask texture +
+//! dedicated multiply pass). Unsupported scene features (pixmap-only image
+//! sources, destructive blends, filter graphs without a GPU plan) fail with a
+//! typed error; there is no CPU fallback.
 
 const std = @import("std");
 const vellz = @import("vellz");
@@ -21,23 +28,25 @@ const scene_mod = @import("scene.zig");
 
 const backend = vellz.gpu.backend;
 const gpu_scene = vellz.gpu.scene;
+const resources_mod = vellz.gpu.resources;
+const text_mod = vellz.gpu.text;
 
 const Asset = struct {
-    id: u64,
+    id: common.paint.ImageId,
     path: []const u8,
     width: u16,
     height: u16,
-    texture: c.WGPUTexture,
-    view: c.WGPUTextureView,
     may_have_transparency: bool,
 };
 
 const kurbo = vellz.kurbo;
 const peniko = vellz.peniko;
 const common = vellz.common;
+const glifo = vellz.glifo;
 
-/// Device used by lazy asset uploads (set once the device is acquired).
-var current_device: ?*backend.Device = null;
+/// Renderer/resources used by lazy asset uploads (set before commands run).
+var current_renderer: ?*backend.renderer.Renderer = null;
+var current_resources: ?*resources_mod.Resources = null;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -90,7 +99,54 @@ pub fn main(init: std.process.Init) !void {
 
     var dev = try backend.Device.acquire(allocator, &adapter, "vellz-gpu-render");
     defer dev.deinit();
-    current_device = &dev;
+    const width: u32 = parsed_scene.width;
+    const height: u32 = parsed_scene.height;
+    if (width == 0 or height == 0) return error.InvalidSize;
+
+    const target_format = c.WGPUTextureFormat_RGBA8Unorm;
+
+    const texture = try backend.wgpu.createTexture2d(
+        &dev,
+        width,
+        height,
+        target_format,
+        c.WGPUTextureUsage_RenderAttachment | c.WGPUTextureUsage_CopySrc,
+        "vellz-gpu-target",
+    );
+    defer c.wgpuTextureRelease(texture);
+    const target_view = try backend.wgpu.createFullView(texture, target_format, "vellz-gpu-target-view");
+    defer c.wgpuTextureViewRelease(target_view);
+
+    var depth_texture: c.WGPUTexture = null;
+    var depth_view: ?c.WGPUTextureView = null;
+    defer if (depth_view) |view| c.wgpuTextureViewRelease(view);
+    defer if (depth_texture != null) c.wgpuTextureRelease(depth_texture);
+    if (use_depth) {
+        depth_texture = try backend.wgpu.createTexture2d(
+            &dev,
+            width,
+            height,
+            c.WGPUTextureFormat_Depth24Plus,
+            c.WGPUTextureUsage_RenderAttachment,
+            "vellz-gpu-depth",
+        );
+        depth_view = try backend.wgpu.createFullView(
+            depth_texture,
+            c.WGPUTextureFormat_Depth24Plus,
+            "vellz-gpu-depth-view",
+        );
+    }
+
+    // Persistent image/glyph resources. The atlas size is normalized against
+    // the device limit *before* any image or glyph allocation.
+    var resources = try resources_mod.Resources.init(allocator);
+    defer resources.deinit();
+
+    var renderer = try backend.renderer.Renderer.init(allocator, &dev, target_format, width, height);
+    defer renderer.deinit();
+    try renderer.configureResources(&resources);
+    current_renderer = &renderer;
+    current_resources = &resources;
 
     // Build the GPU scene from the corpus commands.
     var gpu = try gpu_scene.Scene.init(allocator, parsed_scene.width, parsed_scene.height);
@@ -101,12 +157,14 @@ pub fn main(init: std.process.Init) !void {
 
     var assets: std.ArrayList(Asset) = .empty;
     defer {
-        for (assets.items) |asset| {
-            c.wgpuTextureViewRelease(asset.view);
-            c.wgpuTextureRelease(asset.texture);
-            allocator.free(asset.path);
-        }
+        for (assets.items) |asset| allocator.free(asset.path);
         assets.deinit(allocator);
+    }
+    var font_blobs: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer {
+        var iterator = font_blobs.iterator();
+        while (iterator.next()) |entry| allocator.free(entry.value_ptr.*);
+        font_blobs.deinit(allocator);
     }
     const scene_dir = std.fs.path.dirname(scene_file) orelse ".";
 
@@ -153,76 +211,35 @@ pub fn main(init: std.process.Init) !void {
                 defer resetScratch(allocator, &scratch_path);
                 try gpu.pushClipLayer(scratch_path.elements.items);
             },
-            .push_layer => |spec| try pushLayerSpec(allocator, &gpu, &scratch_path, spec),
+            .push_layer => |spec| try pushLayerSpec(allocator, io, scene_dir, &gpu, &scratch_path, spec),
             .pop_layer => try gpu.popLayer(),
             .set_filter_effect => |filter_spec| gpu.setFilterEffect(try filterFromSpec(allocator, filter_spec)),
             .reset_filter_effect => gpu.resetFilterEffect(),
-            .glyph_run => {
-                std.debug.print(
-                    "vellz-gpu-render: scene command '{s}' is not supported by the GPU renderer\n",
-                    .{@tagName(command)},
-                );
-                return error.Unsupported;
-            },
+            .glyph_run => |spec| try renderGlyphRun(
+                allocator,
+                io,
+                scene_dir,
+                &gpu,
+                &resources,
+                &font_blobs,
+                spec,
+            ),
         }
     }
-
-    const width: u32 = parsed_scene.width;
-    const height: u32 = parsed_scene.height;
-    if (width == 0 or height == 0) return error.InvalidSize;
-
-    const target_format = c.WGPUTextureFormat_RGBA8Unorm;
-
-    const texture = try backend.wgpu.createTexture2d(
-        &dev,
-        width,
-        height,
-        target_format,
-        c.WGPUTextureUsage_RenderAttachment | c.WGPUTextureUsage_CopySrc,
-        "vellz-gpu-target",
-    );
-    defer c.wgpuTextureRelease(texture);
-    const target_view = try backend.wgpu.createFullView(texture, target_format, "vellz-gpu-target-view");
-    defer c.wgpuTextureViewRelease(target_view);
-
-    var depth_texture: c.WGPUTexture = null;
-    var depth_view: ?c.WGPUTextureView = null;
-    defer if (depth_view) |view| c.wgpuTextureViewRelease(view);
-    defer if (depth_texture != null) c.wgpuTextureRelease(depth_texture);
-    if (use_depth) {
-        depth_texture = try backend.wgpu.createTexture2d(
-            &dev,
-            width,
-            height,
-            c.WGPUTextureFormat_Depth24Plus,
-            c.WGPUTextureUsage_RenderAttachment,
-            "vellz-gpu-depth",
-        );
-        depth_view = try backend.wgpu.createFullView(
-            depth_texture,
-            c.WGPUTextureFormat_Depth24Plus,
-            "vellz-gpu-depth-view",
-        );
-    }
-
-    var renderer = try backend.renderer.Renderer.init(allocator, &dev, target_format, width, height);
-    defer renderer.deinit();
-
-    var binding_entries = try allocator.alloc(backend.renderer.TextureBindings.Entry, assets.items.len);
-    defer allocator.free(binding_entries);
-    for (assets.items, 0..) |asset, index| {
-        binding_entries[index] = .{
-            .id = asset.id,
-            .texture = .{ .view = asset.view, .texture = asset.texture },
-        };
-    }
-    const bindings = backend.renderer.TextureBindings{ .entries = binding_entries };
 
     const target_init: backend.renderer.TargetInit = switch (parsed_scene.target_init) {
         .clear => .{ .clear = peniko.color.Color.TRANSPARENT },
         .src_over => .src_over,
     };
-    try renderer.renderWithBindings(&gpu, target_view, depth_view, target_init, bindings, texture);
+    try renderer.renderWithResources(
+        &gpu,
+        target_view,
+        depth_view,
+        target_init,
+        .{},
+        texture,
+        &resources,
+    );
 
     const pixels = try backend.readback.readTexture(allocator, &dev, texture, width, height);
     defer allocator.free(pixels);
@@ -296,10 +313,12 @@ fn filterFromSpec(allocator: std.mem.Allocator, spec: scene_mod.FilterSpec) !com
 
 /// Map a layer spec onto the GPU scene's layer stack.
 ///
-/// Mask layers are unsupported by the GPU render pipeline and fail with a
-/// typed error (no approximation).
+/// Masks are loaded, nearest-resampled to the scene dimensions (exactly like
+/// `vellz-cli`), and applied by the GPU mask adapt.
 fn pushLayerSpec(
     allocator: std.mem.Allocator,
+    io: std.Io,
+    scene_dir: []const u8,
     gpu: *gpu_scene.Scene,
     scratch: *kurbo.BezPath,
     spec: scene_mod.LayerSpec,
@@ -312,12 +331,16 @@ fn pushLayerSpec(
         },
         .blend => |blend| try gpu.pushBlendLayer(blendFromSpec(blend)),
         .opacity => |opacity| try gpu.pushOpacityLayer(@floatCast(opacity)),
-        .mask => {
-            std.debug.print(
-                "vellz-gpu-render: mask layers are not supported by the GPU render pipeline\n",
-                .{},
+        .mask => |mask_spec| {
+            const mask = try loadMask(
+                allocator,
+                io,
+                scene_dir,
+                mask_spec,
+                gpu.sceneWidth(),
+                gpu.sceneHeight(),
             );
-            return error.Unsupported;
+            try gpu.pushMaskLayer(mask);
         },
         .filter => |filter_spec| {
             const filter = try filterFromSpec(allocator, filter_spec.filter);
@@ -333,15 +356,23 @@ fn pushLayerSpec(
             else
                 null;
             const opacity: ?f32 = if (filter_spec.opacity) |value| @floatCast(value) else null;
-            if (filter_spec.mask != null) {
-                std.debug.print(
-                    "vellz-gpu-render: mask layers are not supported by the GPU render pipeline\n",
-                    .{},
-                );
-                filter.deinit(allocator);
-                return error.Unsupported;
+            var mask: ?common.mask.Mask = null;
+            if (filter_spec.mask) |mask_spec| {
+                mask = loadMask(
+                    allocator,
+                    io,
+                    scene_dir,
+                    mask_spec,
+                    gpu.sceneWidth(),
+                    gpu.sceneHeight(),
+                ) catch |err| {
+                    filter.deinit(allocator);
+                    return err;
+                };
             }
-            try gpu.pushLayer(clip_elements, blend, opacity, null, filter);
+            // `pushLayer` takes ownership of both `filter` and `mask` on
+            // success and releases them itself on error.
+            try gpu.pushLayer(clip_elements, blend, opacity, mask, filter);
         },
     }
 }
@@ -397,12 +428,10 @@ fn applyPaint(
             gpu.setPaint(common.paint.PaintType.fromGradient(gradient));
         },
         .image => |spec_image| {
+            // Register the asset in the shared image atlas and reference it
+            // by `opaque_id`, like a caller using `upload_image`.
             const asset = try loadAsset(allocator, io, scene_dir, assets, spec_image);
-            const source = common.paint.ImageSource.initExternalTexture(
-                common.paint.TextureId.new(asset.id),
-                common.geometry.RectU16.new(0, 0, asset.width, asset.height),
-                asset.may_have_transparency,
-            ) catch |err| return err;
+            const source = common.paint.ImageSource.initOpaqueId(asset.id);
             const image = common.paint.Image{
                 .image = source,
                 .sampler = .{
@@ -417,7 +446,10 @@ fn applyPaint(
     }
 }
 
-/// Load (or reuse) a raw RGBA8 asset as a premultiplied `Rgba8Unorm` texture.
+/// Load (or reuse) a raw RGBA8 asset and upload it into the image atlas.
+///
+/// `Pixmap.fromParts` premultiplies straight-alpha bytes in place, so the
+/// pixmap bytes are written to the `Rgba8Unorm` atlas as-is.
 fn loadAsset(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -434,41 +466,85 @@ fn loadAsset(
         }
     }
 
-    const dev_handle = current_device orelse return error.DeviceLost;
-    // `Pixmap.fromParts` already premultiplies straight-alpha bytes in
-    // place, so the pixmap bytes can be uploaded as-is.
+    const renderer = current_renderer orelse return error.DeviceLost;
+    const resources = current_resources orelse return error.DeviceLost;
     var pixmap = try loadRawPixmap(allocator, io, scene_dir, spec);
     defer pixmap.deinit(allocator);
 
-    const texture = try backend.wgpu.createTexture2d(
-        dev_handle,
-        spec.width,
-        spec.height,
-        c.WGPUTextureFormat_RGBA8Unorm,
-        c.WGPUTextureUsage_TextureBinding | c.WGPUTextureUsage_CopyDst,
-        "vellz-image-asset",
-    );
-    errdefer c.wgpuTextureRelease(texture);
-    const view = try backend.wgpu.createFullView(
-        texture,
-        c.WGPUTextureFormat_RGBA8Unorm,
-        "vellz-image-asset-view",
-    );
-    errdefer c.wgpuTextureViewRelease(view);
-    try backend.wgpu.writeRgba8(dev_handle, texture, pixmap.dataAsU8Slice(), spec.width, spec.height);
+    const image_id = try renderer.uploadImage(resources, &pixmap);
 
     const path = try allocator.dupe(u8, spec.asset);
     errdefer allocator.free(path);
     try assets.append(allocator, .{
-        .id = @intCast(assets.items.len + 1),
+        .id = image_id,
         .path = path,
         .width = spec.width,
         .height = spec.height,
-        .texture = texture,
-        .view = view,
         .may_have_transparency = pixmap.mayHaveTransparency(),
     });
     return &assets.items[assets.items.len - 1];
+}
+
+/// Draw one positioned glyph run through the GPU glyph backend.
+///
+/// Deferred features (non-zero `embolden`, non-empty `normalized_coords`) are
+/// typed `error.Unsupported`, never silently dropped. `decoration` is drawn
+/// after the fill/stroke pass, matching the upstream decoration tests.
+fn renderGlyphRun(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scene_dir: []const u8,
+    scene: *gpu_scene.Scene,
+    resources: *resources_mod.Resources,
+    font_blobs: *std.StringHashMapUnmanaged([]const u8),
+    spec: scene_mod.GlyphRunSpec,
+) !void {
+    if (spec.embolden) |amount| {
+        if (amount[0] != 0.0 or amount[1] != 0.0) return error.Unsupported;
+    }
+    if (spec.normalized_coords) |coords| {
+        if (coords.len != 0) return error.Unsupported;
+    }
+
+    const blob = font_blobs.get(spec.font.asset) orelse blk: {
+        const path = try std.fs.path.join(allocator, &.{ scene_dir, spec.font.asset });
+        defer allocator.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
+        try font_blobs.put(allocator, spec.font.asset, bytes);
+        break :blk bytes;
+    };
+    const font_data = glifo.FontData.init(blob, spec.font.index);
+
+    const glyphs = try allocator.alloc(glifo.Glyph, spec.glyphs.len);
+    defer allocator.free(glyphs);
+    for (spec.glyphs, 0..) |glyph, i| {
+        glyphs[i] = .{ .id = glyph.id, .x = glyph.x, .y = glyph.y };
+    }
+
+    var builder = text_mod.glyphRun(scene, resources, font_data)
+        .fontSize(spec.font_size)
+        .hint(spec.hint)
+        .atlasCache(spec.atlas_cache);
+    if (spec.glyph_transform) |transform| {
+        builder = builder.glyphTransform(kurbo.Affine.new(transform));
+    }
+
+    switch (spec.style) {
+        .fill => try builder.fillGlyphs(allocator, glifo.iterate(glyphs)),
+        .stroke => try builder.strokeGlyphs(allocator, glifo.iterate(glyphs)),
+    }
+
+    if (spec.decoration) |decoration| {
+        try builder.renderDecoration(
+            allocator,
+            glifo.iterate(glyphs),
+            decoration.x_range,
+            decoration.baseline_y,
+            decoration.offset,
+            decoration.size,
+            decoration.buffer,
+        );
+    }
 }
 
 fn loadRawPixmap(
@@ -494,6 +570,62 @@ fn loadRawPixmap(
     };
     const metadata = vellz.common.pixmap.PixelMetadata.new(peniko_alpha, true);
     return vellz.common.pixmap.Pixmap.fromParts(allocator, bytes, spec.width, spec.height, metadata);
+}
+
+/// Load a mask asset and nearest-resample it to the scene dimensions, exactly
+/// like `tools/vellz_cli.zig` (the GPU scene drops mismatched masks).
+fn loadMask(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scene_dir: []const u8,
+    mask_spec: scene_mod.MaskSpec,
+    width: u16,
+    height: u16,
+) !common.mask.Mask {
+    var source = try loadRawPixmap(allocator, io, scene_dir, .{
+        .asset = mask_spec.asset,
+        .width = mask_spec.width,
+        .height = mask_spec.height,
+        .format = mask_spec.format,
+        .alpha_type = mask_spec.alpha_type,
+        .sampler = .{
+            .x_extend = .pad,
+            .y_extend = .pad,
+            .quality = .low,
+            .alpha = 1.0,
+        },
+    });
+    defer source.deinit(allocator);
+
+    var resampled = try resizeNearest(allocator, &source, width, height);
+    defer resampled.deinit(allocator);
+
+    return switch (mask_spec.kind) {
+        .alpha => try common.mask.Mask.newAlpha(allocator, &resampled),
+        .luminance => try common.mask.Mask.newLuminance(allocator, &resampled),
+    };
+}
+
+/// Nearest-neighbor resample (mirrors `tools/vellz_cli.zig`).
+fn resizeNearest(
+    allocator: std.mem.Allocator,
+    src: *const common.pixmap.Pixmap,
+    width: u16,
+    height: u16,
+) !common.pixmap.Pixmap {
+    var out = try common.pixmap.Pixmap.init(allocator, width, height);
+    errdefer out.deinit(allocator);
+
+    var y: u16 = 0;
+    while (y < height) : (y += 1) {
+        const sy: u16 = @intCast((@as(u32, y) * src.height) / height);
+        var x: u16 = 0;
+        while (x < width) : (x += 1) {
+            const sx: u16 = @intCast((@as(u32, x) * src.width) / width);
+            out.setPixel(x, y, src.sample(sx, sy));
+        }
+    }
+    return out;
 }
 
 fn parseSvg(

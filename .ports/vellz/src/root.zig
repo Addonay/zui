@@ -53,4 +53,7 @@ test {
     _ = @import("gpu/scene.zig");
     _ = @import("gpu/draw.zig");
     _ = @import("gpu/schedule/mod.zig");
+    _ = @import("gpu/resources.zig");
+    _ = @import("gpu/text.zig");
+    _ = @import("gpu/mask.zig");
 }

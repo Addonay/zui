@@ -133,6 +133,13 @@ pub const Mask = struct {
         return self.repr.get().height;
     }
 
+    /// Borrow the raw mask values (row-major, one byte per pixel).
+    ///
+    /// The returned slice is valid while the handle is alive and unmodified.
+    pub fn values(self: Mask) []const u8 {
+        return self.repr.get().data.items;
+    }
+
     /// Sample the value at a specific location.
     ///
     /// This function might panic or yield a wrong result if the location is

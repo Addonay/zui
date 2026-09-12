@@ -398,7 +398,12 @@ fn renderFromAtlas(
     tint: ?paint_mod.Tint,
 ) !void {
     const paint_transform = renderer.atlasPaintTransform(atlas_slot.x, atlas_slot.y);
-    const image_source = renderer.atlasImageSource(atlas_slot.page_index);
+    // Pass both identities: the GPU resolves the image-cache allocation
+    // (`image_id`), the CPU resolves its registered page (`page_index`).
+    const image_source = renderer.atlasImageSource(
+        atlas_slot.image_id.asU32(),
+        atlas_slot.page_index,
+    );
     const image = paint_mod.Image{
         .image = image_source,
         .sampler = .{

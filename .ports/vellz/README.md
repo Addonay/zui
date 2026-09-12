@@ -29,7 +29,7 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 928/928 unit and integration tests (911 lib + 8 scene
+zig build test     # 937/937 unit and integration tests (920 lib + 8 scene
                    #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
                    #   the .ports/cozmic sibling checkout is absent)
 zig build corpus   # 142/142 corpus scenes byte-exact vs the upstream oracle
@@ -38,11 +38,11 @@ zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo (glyf
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
 ```
 
-GPU (`-Dgpu=true`): `gpu-corpus` gates 44 scenes against the pinned CPU oracle
-under the documented tolerance registry (27 byte-exact, the rest at max-abs 1–2
-with recorded AA/rounding reasons; masks, atlas-backed images, and multi-pass
-filter graphs remain typed `error.Unsupported`), plus typed
-device-loss/unsupported-capability error tests.
+GPU (`-Dgpu=true`): `gpu-corpus` gates 75 scenes against the pinned CPU oracle
+under the documented tolerance registry (most byte-exact or max-abs 1, the rest
+at max-abs 2 with recorded AA/rounding reasons; multi-pass filter graphs remain
+typed `error.Unsupported`, and the mask adapt is documented in `tests/README.md`),
+plus typed device-loss/unsupported-capability error tests.
 
 Coverage: antialiased fills, translucent overlap, NonZero/EvenOdd, nested
 clips and isolated clip layers, transforms, round-capped strokes, degenerate
@@ -119,8 +119,10 @@ it renders byte-exact against the pinned oracle, atlas cache on and off
 (142/142 corpus, tolerance 0). The GPU side has the wgpu-native device
 bootstrap, the full host/shader layout
 contract, the schedule/layer executor, encoded paints (gradients and images),
-GPU filters, and a 44-scene `gpu-corpus` gate (27 byte-exact, the rest within
-the documented per-scene tolerance registry, plus typed
+the image atlas + GPU glyph text (`gpu/resources.zig`, `gpu/text.zig`), the
+documented mask adapt (`gpu/mask.zig` + `mask.wgsl`; upstream `vello_gpu`
+panics on mask layers), GPU filters, and a 75-scene `gpu-corpus` gate (the
+per-scene tolerance registry plus typed
 device-loss/unsupported-capability/missing-binding/feedback-loop errors)
 running on the llvmpipe software adapter.
 
@@ -129,8 +131,8 @@ Not yet implemented (explicit typed errors, never placeholder pixels): PNG
 on CFF2/variable outlines, COLRv1 `Var*` paint deltas at non-default
 coordinates, hinted advances from `hdmx` without backward compatibility, and
 synthetic embolden (all typed
-`error.Unsupported`); GPU masks, atlas-backed images, GPU text, and the full
-G5 corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
+`error.Unsupported`); GPU multi-pass filter graphs and the full G5 corpus (M5
+remainder). G4 is met: `zig build corpus` is byte-exact at every
 SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage
 benchmarks in `docs/benchmarks.md` (u8-vs-f32 speedups 1.9–3.4× on the
 representative scenes). MT filter layers and u8 + MT return

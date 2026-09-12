@@ -1,6 +1,7 @@
 //! Compiled WGSL shader sources from the pinned `vello_gpu_shaders` revision.
 //!
-//! These are minified/linked WGSL strings produced upstream by WESL + naga
+//! `mask.wgsl` is a local hand-written addition for the M5 mask adapt; the
+//! rest are minified/linked WGSL strings produced upstream by WESL + naga
 //! 29.0.3. They are checked in so a GPU build needs neither Cargo, WESL, nor
 //! naga. Regenerate with `tools/generate_shaders.sh`; see `manifest.json` for
 //! byte counts and SHA-256 hashes and `docs/shader-interface.md` for the
@@ -16,6 +17,8 @@ pub const COPY = @embedFile("copy.wgsl");
 pub const BLEND = @embedFile("blend.wgsl");
 /// `filter.wesl`: offset/flood/blur/drop-shadow executor.
 pub const FILTER = @embedFile("filter.wgsl");
+/// Hand-written mask multiply pass (M5 mask adapt; no upstream equivalent).
+pub const MASK = @embedFile("mask.wgsl");
 
 /// All shader roots by name, for enumeration and tests.
 pub const all = [_]struct { name: []const u8, source: []const u8 }{
@@ -24,13 +27,14 @@ pub const all = [_]struct { name: []const u8, source: []const u8 }{
     .{ .name = "copy", .source = COPY },
     .{ .name = "blend", .source = BLEND },
     .{ .name = "filter", .source = FILTER },
+    .{ .name = "mask", .source = MASK },
 };
 
 test "shader sources are non-empty and contain expected entry points" {
     const std = @import("std");
     for (all) |shader| {
         try std.testing.expect(shader.source.len > 0);
-        // All five roots share the vs_main/fs_main entry-point convention.
+        // Every root shares the vs_main/fs_main entry-point convention.
         try std.testing.expect(std.mem.indexOf(u8, shader.source, "vs_main") != null);
         try std.testing.expect(std.mem.indexOf(u8, shader.source, "fs_main") != null);
     }

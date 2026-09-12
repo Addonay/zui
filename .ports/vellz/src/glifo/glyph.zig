@@ -1774,8 +1774,13 @@ const RecordingRenderer = struct {
         return &self.paint;
     }
 
-    pub fn atlasImageSource(self: *const RecordingRenderer, page_index: u32) paint_mod.ImageSource {
+    pub fn atlasImageSource(
+        self: *const RecordingRenderer,
+        image_id: u32,
+        page_index: u32,
+    ) paint_mod.ImageSource {
         _ = self;
+        _ = image_id;
         return paint_mod.ImageSource.initOpaqueId(paint_mod.ImageId.new(page_index));
     }
 

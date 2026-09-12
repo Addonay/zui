@@ -18,20 +18,26 @@ const device = @import("device.zig");
 const wgpu_backend = @import("wgpu.zig");
 
 const blend_mod = @import("../blend.zig");
+const copy_mod = @import("../copy.zig");
 const draw_mod = @import("../draw.zig");
 const filter_mod = @import("../filter.zig");
 const gradient_cache = @import("../gradient_cache.zig");
+const mask_mod = @import("../mask.zig");
 const paint = @import("../paint.zig");
+const resources_mod = @import("../resources.zig");
 const schedule_mod = @import("../schedule/mod.zig");
 const scene_mod = @import("../scene.zig");
 const target = @import("../target.zig");
+const text_mod = @import("../text.zig");
 const util = @import("../util.zig");
 
+const common = @import("../../common/root.zig");
 const geometry = @import("../../common/geometry.zig");
+const glifo = @import("../../glifo/root.zig");
 const render_common = @import("../render/common.zig");
 const peniko = @import("../../peniko/root.zig");
 
-pub const Error = wgpu_backend.Error || error{
+pub const Error = wgpu_backend.Error || std.mem.Allocator.Error || error{
     /// The scene uses a feature this renderer does not implement.
     Unsupported,
     /// The target is larger than the device's resource texture size.
@@ -42,7 +48,57 @@ pub const Error = wgpu_backend.Error || error{
     TextureFeedbackLoop,
     /// The schedule needs more intermediate textures than the limit allows.
     LimitReached,
+    /// An `ImageSource.opaque_id` reference has no image-cache allocation.
+    MissingImage,
+    /// A glyph outline/COLR atlas replay failed (font or hinting error); the
+    /// underlying error name is printed when this is returned.
+    GlyphError,
 };
+
+/// Map the image-cache/atlas errors onto the renderer's error set.
+fn mapAtlasError(err: anyerror) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.NoSpaceAvailable,
+        error.AtlasLimitReached,
+        error.TextureTooLarge,
+        error.InvalidOptions,
+        => error.UnsupportedCapability,
+        error.AtlasNotFound,
+        error.InvalidAllocationId,
+        => error.Unsupported,
+        else => {
+            std.debug.print("vellz-gpu: image atlas error: {s}\n", .{@errorName(err)});
+            return error.Unsupported;
+        },
+    };
+}
+
+/// Map the erased error set of the glyph atlas replay (glifo draw errors plus
+/// renderer errors) onto the renderer's error set.
+fn mapReplayError(err: anyerror) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.MissingImage => error.MissingImage,
+        error.MissingTextureBinding => error.MissingTextureBinding,
+        error.TextureFeedbackLoop => error.TextureFeedbackLoop,
+        error.UnsupportedCapability => error.UnsupportedCapability,
+        error.Unsupported => error.Unsupported,
+        error.DeviceLost => error.DeviceLost,
+        error.NoSpaceAvailable,
+        error.AtlasLimitReached,
+        error.TextureTooLarge,
+        error.InvalidOptions,
+        => error.UnsupportedCapability,
+        error.AtlasNotFound,
+        error.InvalidAllocationId,
+        => error.Unsupported,
+        else => {
+            std.debug.print("vellz-gpu: glyph atlas replay failed: {s}\n", .{@errorName(err)});
+            return error.GlyphError;
+        },
+    };
+}
 
 /// How the root target is initialized before the strip passes.
 pub const TargetInit = union(enum) {
@@ -102,6 +158,77 @@ const Page = struct {
     fn deinit(self: *Page) void {
         c.wgpuTextureViewRelease(self.view);
         c.wgpuTextureRelease(self.texture);
+        self.* = undefined;
+    }
+};
+
+/// Persistent image-atlas textures (upstream `GpuResources::atlas_textures`).
+///
+/// Created lazily as the image cache grows new atlas pages. All textures share
+/// the renderer's resource dimension, so the layer `Config` buffer applies.
+const AtlasTextures = struct {
+    textures: std.ArrayList(c.WGPUTexture) = .empty,
+    views: std.ArrayList(c.WGPUTextureView) = .empty,
+    width: u32 = 0,
+    height: u32 = 0,
+
+    /// Create textures up to `required_count`, all `width` x `height`.
+    fn ensure(
+        self: *AtlasTextures,
+        allocator: std.mem.Allocator,
+        dev: *device.Device,
+        required_count: u32,
+        width: u32,
+        height: u32,
+    ) Error!void {
+        if (required_count == 0) return;
+        if (self.width == 0) {
+            self.width = width;
+            self.height = height;
+        } else if (self.width != width or self.height != height) {
+            return error.UnsupportedCapability;
+        }
+
+        try self.textures.ensureTotalCapacity(allocator, required_count);
+        try self.views.ensureTotalCapacity(allocator, required_count);
+        while (self.textures.items.len < required_count) {
+            const atlas_texture = try wgpu_backend.createTexture2d(
+                dev,
+                width,
+                height,
+                c.WGPUTextureFormat_RGBA8Unorm,
+                c.WGPUTextureUsage_TextureBinding |
+                    c.WGPUTextureUsage_CopyDst |
+                    c.WGPUTextureUsage_CopySrc |
+                    c.WGPUTextureUsage_RenderAttachment,
+                "vellz-atlas",
+            );
+            errdefer c.wgpuTextureRelease(atlas_texture);
+            const atlas_view = try wgpu_backend.createFullView(
+                atlas_texture,
+                c.WGPUTextureFormat_RGBA8Unorm,
+                "vellz-atlas-view",
+            );
+            self.textures.appendAssumeCapacity(atlas_texture);
+            self.views.appendAssumeCapacity(atlas_view);
+        }
+    }
+
+    fn texture(self: *const AtlasTextures, atlas_id: u32) ?c.WGPUTexture {
+        if (atlas_id >= self.textures.items.len) return null;
+        return self.textures.items[atlas_id];
+    }
+
+    fn view(self: *const AtlasTextures, atlas_id: u32) ?c.WGPUTextureView {
+        if (atlas_id >= self.views.items.len) return null;
+        return self.views.items[atlas_id];
+    }
+
+    fn deinit(self: *AtlasTextures, allocator: std.mem.Allocator) void {
+        for (self.views.items) |atlas_view| c.wgpuTextureViewRelease(atlas_view);
+        for (self.textures.items) |atlas_texture| c.wgpuTextureRelease(atlas_texture);
+        self.views.deinit(allocator);
+        self.textures.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -210,6 +337,14 @@ pub const Renderer = struct {
     encoded_paints_bind_group: c.WGPUBindGroup,
     /// Placeholder gradient bind group for unindexed paints.
     gradient_bind_group: c.WGPUBindGroup,
+    /// Lazily created image-atlas textures indexed by atlas id.
+    atlas_textures: AtlasTextures = .{},
+    /// Resources associated with this renderer for erased glyph uploads
+    /// (set by `configureResources`).
+    glyph_upload_resources: ?*resources_mod.Resources = null,
+    /// Zeroed staging buffer for atlas region clears (upstream
+    /// `atlas_clear_scratch`).
+    atlas_clear_scratch: std.ArrayList(u8) = .empty,
 
     depth_cleared_this_frame: bool,
 
@@ -258,6 +393,9 @@ pub const Renderer = struct {
             .encoded_paints_view = null,
             .encoded_paints_bind_group = null,
             .gradient_bind_group = null,
+            .atlas_textures = .{},
+            .glyph_upload_resources = null,
+            .atlas_clear_scratch = .empty,
             .depth_cleared_this_frame = false,
         };
 
@@ -353,6 +491,8 @@ pub const Renderer = struct {
 
     /// Release every owned handle.
     pub fn deinit(self: *Renderer) void {
+        self.atlas_clear_scratch.deinit(self.allocator);
+        self.atlas_textures.deinit(self.allocator);
         c.wgpuBindGroupRelease(self.gradient_bind_group);
         c.wgpuBindGroupRelease(self.encoded_paints_bind_group);
         c.wgpuTextureViewRelease(self.encoded_paints_view);
@@ -394,6 +534,62 @@ pub const Renderer = struct {
         bindings: TextureBindings,
         target_texture: ?c.WGPUTexture,
     ) Error!void {
+        return self.renderScene(
+            scene,
+            target_view,
+            depth_view,
+            target_init,
+            bindings,
+            target_texture,
+            null,
+            .user_surface,
+        );
+    }
+
+    /// Render `scene` with persistent resources: image-atlas textures are
+    /// uploaded and glyph atlas pages are replayed/uploaded/torn down around
+    /// the main pass (upstream `Renderer::render(scene, resources, ..)`).
+    /// External texture bindings still resolve through `bindings`.
+    pub fn renderWithResources(
+        self: *Renderer,
+        scene: *const scene_mod.Scene,
+        target_view: c.WGPUTextureView,
+        depth_view: ?c.WGPUTextureView,
+        target_init: TargetInit,
+        bindings: TextureBindings,
+        target_texture: ?c.WGPUTexture,
+        resources: *resources_mod.Resources,
+    ) Error!void {
+        try self.configureResources(resources);
+        try self.prepareResources(resources);
+        const result = self.renderScene(
+            scene,
+            target_view,
+            depth_view,
+            target_init,
+            bindings,
+            target_texture,
+            resources,
+            .user_surface,
+        );
+        // Frame-end maintenance runs even when the main pass failed, exactly
+        // like upstream's `let result = ..; after_render(..)?; result`.
+        try self.finishResources(resources);
+        return result;
+    }
+
+    /// Shared render pipeline: pack paints, schedule, and submit one frame.
+    fn renderScene(
+        self: *Renderer,
+        scene: *const scene_mod.Scene,
+        target_view: c.WGPUTextureView,
+        depth_view: ?c.WGPUTextureView,
+        target_init: TargetInit,
+        bindings: TextureBindings,
+        target_texture: ?c.WGPUTexture,
+        resources: ?*resources_mod.Resources,
+        root_target: target.RootTarget,
+    ) Error!void {
         if (self.dev.isLost()) return error.DeviceLost;
         if (self.target_width == 0 or self.target_height == 0) return error.TextureTooLarge;
         self.depth_cleared_this_frame = false;
@@ -405,6 +601,7 @@ pub const Renderer = struct {
             self.allocator,
             scene.encoded_paints.items,
             &ramps,
+            if (resources) |res| &res.image_cache else null,
         );
         defer prepared.deinit();
 
@@ -429,12 +626,13 @@ pub const Renderer = struct {
             );
         }
 
-        const resolver = paint.PaintResolver.new(scene.encoded_paints.items, prepared.offsets.items);
+        var resolver = paint.PaintResolver.new(scene.encoded_paints.items, prepared.offsets.items);
+        if (resources) |res| resolver = resolver.withImageCache(&res.image_cache);
         var plan = try schedule_mod.schedule(
             self.allocator,
             scene,
-            .user_surface,
-            depth_view != null,
+            root_target,
+            depth_view != null and root_target == .user_surface,
             resolver,
             geometry.SizeU16.new(@intCast(self.resource_dim)),
             null,
@@ -521,12 +719,18 @@ pub const Renderer = struct {
         for (plan.ops.items) |op| {
             switch (op) {
                 .draw => |draw_op| {
-                    const is_root = std.meta.activeTag(draw_op.target) == .root;
+                    const is_user_surface = switch (draw_op.target) {
+                        .root => |root| root == .user_surface,
+                        .layer => false,
+                    };
                     const view = switch (draw_op.target) {
                         .root => target_view,
                         .layer => |id| frame.pageView(id),
                     };
-                    const config_buffer = if (is_root) self.config_buffer else self.layer_config_buffer;
+                    const config_buffer = if (is_user_surface)
+                        self.config_buffer
+                    else
+                        self.layer_config_buffer;
                     const child_view: c.WGPUTextureView = if (draw_op.child) |id|
                         frame.pageView(id)
                     else
@@ -548,17 +752,17 @@ pub const Renderer = struct {
                     );
                     try frame.track(.{ .bind_group = strip_bind_group });
 
-                    const load_op: c.WGPULoadOp = if (is_root and !root_clear_consumed)
+                    const load_op: c.WGPULoadOp = if (is_user_surface and !root_clear_consumed)
                         root_load_op
                     else
                         c.WGPULoadOp_Load;
-                    const clear_value = if (is_root and !root_clear_consumed)
+                    const clear_value = if (is_user_surface and !root_clear_consumed)
                         root_clear_value
                     else
                         c.WGPUColor{ .r = 0, .g = 0, .b = 0, .a = 0 };
-                    if (is_root) root_clear_consumed = true;
+                    if (is_user_surface) root_clear_consumed = true;
 
-                    const use_depth = is_root and depth_view != null;
+                    const use_depth = is_user_surface and depth_view != null;
                     var alpha_runs: std.ArrayList(wgpu_backend.StripRun) = .empty;
                     defer alpha_runs.deinit(self.allocator);
                     try self.buildRuns(
@@ -576,7 +780,7 @@ pub const Renderer = struct {
                         .clear_value = clear_value,
                         .opaque_strips = &.{},
                         .alpha_strips = alpha_strips.items,
-                        .is_root = is_root,
+                        .is_root = is_user_surface,
                         .strip_bind_group = strip_bind_group,
                         .external_bind_group = try self.placeholderExternalBindGroup(&frame),
                         .alpha_external_runs = alpha_runs.items,
@@ -601,6 +805,9 @@ pub const Renderer = struct {
                 },
                 .clear => |clear_op| {
                     try self.executeClear(encoder, &frame, clear_op);
+                },
+                .mask => |mask_op| {
+                    try self.executeMask(encoder, &frame, mask_op);
                 },
             }
         }
@@ -799,6 +1006,115 @@ pub const Renderer = struct {
         }
     }
 
+    /// Execute a scheduled mask multiply (local M5 mask adapt): multiply the
+    /// layer region by the mask into the scratch texture, then copy the
+    /// result back into the layer.
+    fn executeMask(
+        self: *Renderer,
+        encoder: c.WGPUCommandEncoder,
+        frame: *Frame,
+        mask_op: schedule_mod.MaskOp,
+    ) Error!void {
+        const rect = mask_op.region.texture.rect;
+        if (rect.isEmpty()) return;
+        const mask = mask_op.mask;
+        const mask_width = mask.width();
+        const mask_height = mask.height();
+        if (mask_width == 0 or mask_height == 0) return;
+        const scratch = frame.scratch orelse return error.Unsupported;
+
+        const mask_view = try self.createMaskTexture(frame, mask);
+        const mask_bind_group = try wgpu_backend.createMaskBindGroup(
+            self.dev,
+            self.layouts.mask,
+            frame.pageView(mask_op.region.texture.target),
+            mask_view,
+        );
+        try frame.track(.{ .bind_group = mask_bind_group });
+
+        const texture_size = geometry.SizeU16.new(@intCast(self.resource_dim));
+        const instance = mask_mod.GpuMaskInstance.fromRegion(
+            mask_op.region,
+            .{ mask_width, mask_height },
+            texture_size,
+        );
+        try wgpu_backend.encodeMaskPass(
+            self.dev,
+            encoder,
+            self.pipelines.mask,
+            mask_bind_group,
+            &.{instance},
+            scratch.view,
+            "vellz-mask-pass",
+        );
+
+        // Copy the masked region back into the layer allocation.
+        const copy_instance = copy_mod.GpuCopyInstance.new(
+            .{ rect.x0, rect.y0 },
+            .{ rect.x0, rect.y0 },
+            .{ rect.width(), rect.height() },
+            .{ texture_size.width(), texture_size.height() },
+        );
+        const copy_bind_group = try wgpu_backend.createCopySourceBindGroup(
+            self.dev,
+            self.layouts.copy,
+            scratch.view,
+        );
+        try frame.track(.{ .bind_group = copy_bind_group });
+        try wgpu_backend.encodeCopyPass(
+            self.dev,
+            encoder,
+            self.pipelines.copy,
+            &.{copy_instance},
+            copy_bind_group,
+            frame.pageView(mask_op.region.texture.target),
+            "vellz-mask-copy-back",
+        );
+    }
+
+    /// Upload a mask into an `Rgba8Unorm` texture (the value is replicated in
+    /// every channel so any channel can be sampled).
+    fn createMaskTexture(
+        self: *Renderer,
+        frame: *Frame,
+        mask: *const common.mask.Mask,
+    ) Error!c.WGPUTextureView {
+        const width = mask.width();
+        const height = mask.height();
+        const texture = try wgpu_backend.createTexture2d(
+            self.dev,
+            width,
+            height,
+            c.WGPUTextureFormat_RGBA8Unorm,
+            c.WGPUTextureUsage_TextureBinding | c.WGPUTextureUsage_CopyDst,
+            "vellz-mask",
+        );
+        errdefer c.wgpuTextureRelease(texture);
+        const view = try wgpu_backend.createFullView(
+            texture,
+            c.WGPUTextureFormat_RGBA8Unorm,
+            "vellz-mask-view",
+        );
+        errdefer c.wgpuTextureViewRelease(view);
+
+        const pixel_count = @as(usize, width) * @as(usize, height);
+        const data = self.allocator.alloc(u8, pixel_count * 4) catch return error.OutOfMemory;
+        defer self.allocator.free(data);
+        const values = mask.values();
+        std.debug.assert(values.len == pixel_count);
+        for (values, 0..) |value, index| {
+            data[index * 4 + 0] = value;
+            data[index * 4 + 1] = value;
+            data[index * 4 + 2] = value;
+            data[index * 4 + 3] = value;
+        }
+        try wgpu_backend.writeRgba8(self.dev, texture, data, width, height);
+
+        try frame.track(.{ .texture = texture });
+        try frame.track(.{ .view = view });
+        return view;
+    }
+
     /// Clear one scheduled region back to transparent.
     fn executeClear(
         self: *Renderer,
@@ -841,7 +1157,22 @@ pub const Renderer = struct {
             for (run.bindings.texture_sources, 0..) |source, slot| {
                 const id = source orelse continue;
                 switch (id) {
-                    .atlas => return error.Unsupported,
+                    .atlas => |atlas_id| {
+                        const atlas_texture = self.atlas_textures.texture(atlas_id) orelse {
+                            std.debug.print(
+                                "vellz-gpu: no atlas texture for image atlas {d}\n",
+                                .{atlas_id},
+                            );
+                            return error.MissingImage;
+                        };
+                        if (target_texture != null and atlas_texture == target_texture.?) {
+                            // Sampling the atlas texture being rendered into
+                            // (e.g. an atlas page scene that references an
+                            // atlas image) is a usage conflict.
+                            return error.TextureFeedbackLoop;
+                        }
+                        views[slot] = self.atlas_textures.view(atlas_id).?;
+                    },
                     .external => |handle| {
                         const texture = bindings.get(handle) orelse {
                             std.debug.print(
@@ -869,6 +1200,228 @@ pub const Renderer = struct {
                 .bind_group = group,
             });
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistent resources (image atlas + glyph atlas)
+    // -----------------------------------------------------------------------
+
+    /// Normalize the resource atlas configuration against this renderer's
+    /// resource texture dimension. Must run before the caller allocates any
+    /// image or glyph slot (upstream `MemorySettings::normalize`).
+    pub fn configureResources(
+        self: *Renderer,
+        resources: *resources_mod.Resources,
+    ) Error!void {
+        resources.configureAtlas(@intCast(self.resource_dim)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnsupportedCapability,
+        };
+        self.glyph_upload_resources = resources;
+        resources.glyph_uploader = .{
+            .context = self,
+            .upload_fn = uploadGlyphPixmap,
+        };
+    }
+
+    /// Erased upload callback for `Resources.glyph_uploader`: uncached bitmap
+    /// glyphs hand the renderer a `Pixmap` image source.
+    fn uploadGlyphPixmap(
+        context: *anyopaque,
+        pixmap: *const common.pixmap.Pixmap,
+    ) anyerror!common.paint.ImageId {
+        const self: *Renderer = @ptrCast(@alignCast(context));
+        const resources = self.glyph_upload_resources orelse return error.DeviceLost;
+        return self.uploadImage(resources, pixmap);
+    }
+
+    /// Create atlas textures up to `atlas_id` if needed.
+    fn ensureAtlasTexture(self: *Renderer, atlas_id: u32) Error!void {
+        try self.atlas_textures.ensure(
+            self.allocator,
+            self.dev,
+            atlas_id + 1,
+            self.resource_dim,
+            self.resource_dim,
+        );
+    }
+
+    /// Frame-start resource work: replay pending glyph atlas commands into
+    /// atlas textures, upload queued bitmap glyph pixels, and (via the caller)
+    /// leave glyph caches for `finishResources` (upstream
+    /// `Resources::before_render`).
+    fn prepareResources(self: *Renderer, resources: *resources_mod.Resources) Error!void {
+        const glyph_resources = &(resources.glyph_resources orelse return);
+
+        const Replay = struct {
+            renderer: *Renderer,
+            resources: *resources_mod.Resources,
+
+            pub fn replay(context: *@This(), recorder: *glifo.AtlasCommandRecorder) anyerror!void {
+                const glyph = &context.resources.glyph_resources.?;
+                // Reset the page scene, then draw the recorded outline/COLR
+                // commands into it.
+                try glyph.glyph_renderer.reset();
+                var sink_state = text_mod.SinkState{};
+                var sink = text_mod.SceneSink{
+                    .scene = &glyph.glyph_renderer,
+                    .state = &sink_state,
+                    .resources = context.resources,
+                };
+                try glifo.renderer.replayAtlasCommands(
+                    context.resources.allocator,
+                    recorder,
+                    &sink,
+                );
+                if (sink_state.error_value) |err| return err;
+
+                // Render the page scene into the atlas texture and submit
+                // immediately so the content is committed before the main
+                // render samples it (upstream `render_to_atlas`).
+                try context.renderer.renderToAtlas(
+                    &glyph.glyph_renderer,
+                    recorder.page_index,
+                    context.resources,
+                );
+            }
+        };
+
+        var replay = Replay{ .renderer = self, .resources = resources };
+        glyph_resources.glyph_atlas.replayPendingAtlasCommands(
+            resources.allocator,
+            &replay,
+        ) catch |err| return mapReplayError(err);
+
+        // Bitmap glyphs are uploaded directly into their atlas regions
+        // (the page scenes never reference them).
+        for (glyph_resources.glyph_atlas.pendingUploads()) |upload| {
+            try self.writeToAtlas(
+                resources,
+                upload.image_id,
+                upload.pixmap.get(),
+                .{ upload.atlas_slot.x, upload.atlas_slot.y },
+            );
+        }
+        glyph_resources.glyph_atlas.clearPendingUploads(resources.allocator);
+    }
+
+    /// Frame-end resource work: maintain the caches and clear evicted atlas
+    /// regions (upstream `Resources::after_render`).
+    fn finishResources(self: *Renderer, resources: *resources_mod.Resources) Error!void {
+        resources.maintain() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedCapability => return error.UnsupportedCapability,
+            else => return mapAtlasError(err),
+        };
+        const glyph_resources = &(resources.glyph_resources orelse return);
+        for (glyph_resources.glyph_atlas.pendingClearRects()) |rect| {
+            try self.clearAtlasRegion(
+                rect.page_index,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+            );
+        }
+        glyph_resources.glyph_atlas.clearPendingClearRects();
+    }
+
+    /// Render a glyph page scene into its atlas texture (upstream
+    /// `Renderer::render_to_atlas`), submitting immediately.
+    fn renderToAtlas(
+        self: *Renderer,
+        scene: *const scene_mod.Scene,
+        atlas_id: u32,
+        resources: *resources_mod.Resources,
+    ) Error!void {
+        try self.ensureAtlasTexture(atlas_id);
+        const texture = self.atlas_textures.texture(atlas_id).?;
+        const view = self.atlas_textures.view(atlas_id).?;
+        try self.renderScene(
+            scene,
+            view,
+            null,
+            .src_over,
+            .{},
+            texture,
+            resources,
+            .atlas_layer,
+        );
+    }
+
+    /// Upload a pixmap into the image atlas and return its image id
+    /// (upstream `Renderer::upload_image`).
+    pub fn uploadImage(
+        self: *Renderer,
+        resources: *resources_mod.Resources,
+        pixmap: *const common.pixmap.Pixmap,
+    ) Error!common.paint.ImageId {
+        const allocator = resources.allocator;
+        const image_id = resources.image_cache.allocate(
+            allocator,
+            pixmap.width,
+            pixmap.height,
+            render_common.IMAGE_PADDING,
+        ) catch |err| return mapAtlasError(err);
+        errdefer _ = resources.image_cache.deallocate(allocator, image_id) catch {};
+        try self.writeToAtlas(resources, image_id, pixmap, null);
+        return image_id;
+    }
+
+    /// Write pixel data into an existing atlas allocation (upstream
+    /// `Renderer::write_to_atlas` with an optional offset override).
+    pub fn writeToAtlas(
+        self: *Renderer,
+        resources: *resources_mod.Resources,
+        image_id: common.paint.ImageId,
+        pixmap: *const common.pixmap.Pixmap,
+        offset_override: ?[2]u16,
+    ) Error!void {
+        const resource = resources.image_cache.get(image_id) orelse return error.MissingImage;
+        const atlas_id = resource.atlas_id.asU32();
+        try self.ensureAtlasTexture(atlas_id);
+        const texture = self.atlas_textures.texture(atlas_id).?;
+        const offset = offset_override orelse resource.offset;
+        if (@as(u32, offset[0]) + pixmap.width > self.resource_dim or
+            @as(u32, offset[1]) + pixmap.height > self.resource_dim)
+        {
+            return error.UnsupportedCapability;
+        }
+        try wgpu_backend.writeRgba8At(
+            self.dev,
+            texture,
+            pixmap.dataAsU8Slice(),
+            pixmap.width,
+            pixmap.height,
+            offset[0],
+            offset[1],
+        );
+    }
+
+    /// Zero a rectangular region of an atlas texture (upstream
+    /// `clear_atlas_region`).
+    fn clearAtlasRegion(
+        self: *Renderer,
+        atlas_id: u32,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) Error!void {
+        if (width == 0 or height == 0) return;
+        const texture = self.atlas_textures.texture(atlas_id) orelse return error.MissingImage;
+        const byte_count = @as(usize, width) * @as(usize, height) * 4;
+        try self.atlas_clear_scratch.resize(self.allocator, byte_count);
+        @memset(self.atlas_clear_scratch.items, 0);
+        try wgpu_backend.writeRgba8At(
+            self.dev,
+            texture,
+            self.atlas_clear_scratch.items,
+            width,
+            height,
+            x,
+            y,
+        );
     }
 
     /// Grow and upload the alpha texture for `alphas` (row-major 16-byte

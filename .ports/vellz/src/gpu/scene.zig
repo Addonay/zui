@@ -14,9 +14,10 @@
 //! - layers: clip, blend, opacity, and filter layers, plus the implicit
 //!   per-draw layer created by `setFilterEffect`
 //!
-//! Mask layers are rejected with `error.Unsupported` rather than falling back
-//! to an approximation: upstream `vello_gpu` panics on them for the same
-//! reason (there is no mask sampling path in the render shader).
+//! Mask layers are a documented local adapt: upstream `vello_gpu` has no mask
+//! sampling path and panics, so this port multiplies the rendered layer
+//! region by an uploaded mask texture in a dedicated pass before compositing
+//! (`gpu/mask.zig`, `shaders/mask.wgsl`, `backend/renderer.zig`).
 
 const std = @import("std");
 const simd = @import("../simd/root.zig");
@@ -433,10 +434,9 @@ pub const Scene = struct {
 
     /// Push a new layer with the given properties.
     ///
-    /// `filter` transfers ownership to the scene on success and is released on
-    /// error. `mask` is rejected with `error.Unsupported`; upstream
-    /// `vello_gpu` also has no mask-sampling path and panics for the same
-    /// input.
+    /// `filter` and `mask` transfer ownership to the scene on success and are
+    /// released on error. A mask whose dimensions do not match the scene is
+    /// silently dropped (upstream behavior; see `RenderContext::pushLayer`).
     pub fn pushLayer(
         self: *Scene,
         path: ?[]const kurbo.PathEl,
@@ -449,7 +449,16 @@ pub const Scene = struct {
         var filter_data: ?FilterData = if (filter) |owned| FilterData.new(owned, layer_transform) else null;
         errdefer if (filter_data) |*data| data.deinit(self.allocator);
 
-        if (mask != null) return error.Unsupported;
+        var effective_mask: ?Mask = mask;
+        if (effective_mask) |owned| {
+            if (owned.width() != self.width or owned.height() != self.height) {
+                // Upstream silently drops mismatched masks; release ours so it
+                // is not leaked.
+                owned.deinit(self.allocator);
+                effective_mask = null;
+            }
+        }
+        errdefer if (effective_mask) |owned| owned.deinit(self.allocator);
 
         const relative_root_transform = if (filter_data) |data| blk: {
             const shift = data.sourceShift();
@@ -492,11 +501,12 @@ pub const Scene = struct {
         try self.recorder.pushLayer(self.allocator, .{
             .blend_mode = blend_mode orelse peniko.BlendMode.default,
             .opacity = opacity orelse 1.0,
-            .mask = null,
+            .mask = effective_mask,
             .clip_path = clip_path,
         }, filter_data);
-        // Ownership of the filter graph transferred to the recorder.
+        // Ownership of the filter graph and mask transferred to the recorder.
         filter_data = null;
+        effective_mask = null;
     }
 
     /// Push a new clip layer.
@@ -521,12 +531,10 @@ pub const Scene = struct {
 
     /// Push a new mask layer.
     ///
-    /// Mask layers are not supported by the GPU render pipeline; this returns
-    /// `error.Unsupported` instead of approximating the mask.
+    /// The mask must match the scene dimensions; otherwise it is dropped
+    /// exactly like the CPU renderer (`RenderContext::pushLayer`).
     pub fn pushMaskLayer(self: *Scene, mask: Mask) Error!void {
-        _ = self;
-        _ = mask;
-        return error.Unsupported;
+        return self.pushLayer(null, null, null, mask, null);
     }
 
     /// Pop the last pushed layer.
@@ -972,14 +980,23 @@ test "opacity layer wraps draws in an implicit layer" {
     try testing.expectEqual(@as(f32, 0.5), props.opacity);
 }
 
-test "mask layer is typed unsupported" {
+test "mismatched mask layer is dropped and matching mask is recorded" {
     const allocator = testing.allocator;
     var scene = try Scene.init(allocator, 64, 64);
     defer scene.deinit();
 
-    var mask = try Mask.fromParts(allocator, &.{ 255, 0, 0, 255 }, 2, 2);
-    defer mask.deinit(allocator);
-    try testing.expectError(error.Unsupported, scene.pushMaskLayer(mask));
+    // Upstream drops masks that do not match the scene dimensions.
+    const small = try Mask.fromParts(allocator, &.{ 255, 0, 0, 255 }, 2, 2);
+    try scene.pushMaskLayer(small);
+    try testing.expect(scene.recorder.layers.items[0].props.mask == null);
+    try scene.popLayer();
+
+    const matching = try Mask.fromParts(allocator, &.{ 255, 128, 64, 0 }, 2, 2);
+    // Resize the scene to the mask dimensions so it is retained.
+    try scene.resetAndResize(2, 2);
+    try scene.pushMaskLayer(matching);
+    try testing.expect(scene.recorder.layers.items[0].props.mask != null);
+    try scene.popLayer();
 }
 
 test "reset clears draws and size" {

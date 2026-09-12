@@ -19,6 +19,9 @@ pub const paint = @import("paint.zig");
 pub const scene = @import("scene.zig");
 pub const draw = @import("draw.zig");
 pub const schedule = @import("schedule/mod.zig");
+pub const resources = @import("resources.zig");
+pub const text = @import("text.zig");
+pub const mask = @import("mask.zig");
 
 pub const Scene = scene.Scene;
 pub const RecordedDraw = scene.RecordedDraw;
@@ -45,4 +48,7 @@ test {
     _ = @import("scene.zig");
     _ = @import("draw.zig");
     _ = @import("schedule/mod.zig");
+    _ = @import("resources.zig");
+    _ = @import("text.zig");
+    _ = @import("mask.zig");
 }

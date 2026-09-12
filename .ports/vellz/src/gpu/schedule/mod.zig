@@ -79,6 +79,8 @@ pub const Error = std.mem.Allocator.Error || error{
     UnsupportedCapability,
     MissingTextureBinding,
     TextureFeedbackLoop,
+    /// An `ImageSource.opaque_id` paint has no allocation in the image cache.
+    MissingImage,
 };
 
 /// Counts of allocated or required intermediate textures.
@@ -159,12 +161,23 @@ pub const ClearOp = struct {
     rect: RectU16,
 };
 
+/// One scheduled mask multiply (local M5 mask adapt; upstream has no mask
+/// sampling path). The layer region is multiplied by `mask` into the shared
+/// scratch texture and copied back before the layer is composed.
+pub const MaskOp = struct {
+    /// The layer allocation multiplied by the mask.
+    region: LayerTextureRegion,
+    /// Borrowed mask data (owned by the recorded layer in the scene).
+    mask: *const common.mask.Mask,
+};
+
 /// One executable operation in dependency order.
 pub const Op = union(enum) {
     draw: DrawOp,
     filter: FilterOp,
     blend: BlendOp,
     clear: ClearOp,
+    mask: MaskOp,
 };
 
 /// A dependency-ordered rendering plan with its intermediate texture
@@ -334,6 +347,9 @@ const OpenLayer = struct {
     bbox: RectU16,
     /// Placement used when the completed layer is sampled by its parent.
     sample_placement: LayerSamplePlacement,
+    /// Borrowed mask applied after the layer's draws/filter, before
+    /// composition (local M5 mask adapt).
+    mask: ?*const common.mask.Mask = null,
     /// Lazily allocated target and its scheduling state.
     target: ?LayerTarget,
 };
@@ -545,6 +561,7 @@ const Scheduler = struct {
             .texture_parity = self.layerTextureParity(layer.depth),
             .bbox = bbox,
             .sample_placement = sample_placement,
+            .mask = if (layer.props.mask) |*m| m else null,
             .target = null,
         };
     }
@@ -586,6 +603,17 @@ const Scheduler = struct {
                 .gpu_filter = prepared.data,
             } });
             try self.releaseAllocation(temporary);
+        }
+
+        // Masks run after the layer's filter and before composition, exactly
+        // like `layerFill` applies opacity/mask when compositing (local M5
+        // mask adapt; upstream `vello_gpu` has no mask path).
+        if (layer.mask) |mask| {
+            self.atlases.requireScratchTexture();
+            try self.ops.append(self.allocator, .{ .mask = .{
+                .region = target.state.draw_state.target.layer,
+                .mask = mask,
+            } });
         }
 
         return .{
@@ -929,4 +957,47 @@ test "non-default blend requires the scratch texture" {
         if (std.meta.activeTag(op) == .blend) blend_count += 1;
     }
     try testing.expectEqual(@as(usize, 1), blend_count);
+}
+
+test "mask layer schedules a mask op and the scratch texture" {
+    const allocator = testing.allocator;
+    var scene = try scene_mod.Scene.init(allocator, 64, 64);
+    defer scene.deinit();
+
+    const mask_bytes = try allocator.alloc(u8, 64 * 64);
+    defer allocator.free(mask_bytes);
+    @memset(mask_bytes, 128);
+    const mask = try common.mask.Mask.fromParts(allocator, mask_bytes, 64, 64);
+    // Ownership transfers to the scene.
+    try scene.pushMaskLayer(mask);
+
+    scene.setPaint(common.paint.PaintType.fromAlphaColor(peniko.color.Color.fromRgb8(255, 0, 0)));
+    try scene.fillRect(&kurbo.Rect.new(8, 8, 56, 56));
+    try scene.popLayer();
+
+    var plan = try schedule(
+        allocator,
+        &scene,
+        .user_surface,
+        true,
+        PaintResolver.solid_only,
+        SizeU16.new(64),
+        null,
+    );
+    defer plan.deinit();
+
+    var mask_ops: usize = 0;
+    for (plan.ops.items) |op| {
+        if (std.meta.activeTag(op) == .mask) {
+            mask_ops += 1;
+            const mask_op = op.mask;
+            try testing.expectEqual(@as(u16, 128), mask_op.mask.values()[0]);
+            try testing.expectEqual(scene.recorder.layers.items[0].bbox, mask_op.region.layer_bbox);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), mask_ops);
+    // The mask pass stages its result in the shared scratch texture.
+    try testing.expect(plan.allocations.scratch);
+    // The mask must run before the layer's release clear.
+    try testing.expect(std.meta.activeTag(plan.ops.items[plan.ops.items.len - 1]) != .mask);
 }
