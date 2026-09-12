@@ -1264,9 +1264,14 @@ fn drawStripRuns(
         c.wgpuRenderPassEncoderDraw(pass, 4, @intCast(count), 0, first_instance);
         return;
     }
-    for (runs) |run| {
+    const total: u32 = @intCast(count);
+    for (runs, 0..) |run, index| {
+        // A run covers up to the start of the next run (or the end of the
+        // pass). `end` is informational only.
+        const end = if (index + 1 < runs.len) runs[index + 1].start else total;
+        if (end <= run.start) continue;
         c.wgpuRenderPassEncoderSetBindGroup(pass, 1, run.bind_group, 0, null);
-        c.wgpuRenderPassEncoderDraw(pass, 4, run.end - run.start, 0, first_instance + run.start);
+        c.wgpuRenderPassEncoderDraw(pass, 4, end - run.start, 0, first_instance + run.start);
     }
 }
 

@@ -20,6 +20,7 @@ const wgpu_backend = @import("wgpu.zig");
 const blend_mod = @import("../blend.zig");
 const draw_mod = @import("../draw.zig");
 const filter_mod = @import("../filter.zig");
+const gradient_cache = @import("../gradient_cache.zig");
 const paint = @import("../paint.zig");
 const schedule_mod = @import("../schedule/mod.zig");
 const scene_mod = @import("../scene.zig");
@@ -380,7 +381,7 @@ pub const Renderer = struct {
         depth_view: ?c.WGPUTextureView,
         target_init: TargetInit,
     ) Error!void {
-        return self.renderWithBindings(scene, target_view, depth_view, target_init, .{});
+        return self.renderWithBindings(scene, target_view, depth_view, target_init, .{}, null);
     }
 
     /// Render `scene` with explicit external texture bindings.
@@ -391,29 +392,54 @@ pub const Renderer = struct {
         depth_view: ?c.WGPUTextureView,
         target_init: TargetInit,
         bindings: TextureBindings,
+        target_texture: ?c.WGPUTexture,
     ) Error!void {
-        _ = bindings;
         if (self.dev.isLost()) return error.DeviceLost;
         if (self.target_width == 0 or self.target_height == 0) return error.TextureTooLarge;
         self.depth_cleared_this_frame = false;
 
-        if (scene.encoded_paints.items.len != 0) {
-            // Encoded paints (gradients/images/blurred rects) need the
-            // gradient and encoded-paints textures; not wired yet.
-            return error.Unsupported;
+        // Pack indexed paints and their gradient LUTs for this frame.
+        var ramps = gradient_cache.GradientRampCache.init(self.allocator);
+        defer ramps.deinit();
+        var prepared = try paint.prepareGpuEncodedPaints(
+            self.allocator,
+            scene.encoded_paints.items,
+            &ramps,
+        );
+        defer prepared.deinit();
+
+        var encoded_paints: ?EncodedPaintsTexture = null;
+        defer if (encoded_paints) |*data| data.deinit();
+        if (prepared.texels() > 0) {
+            encoded_paints = try EncodedPaintsTexture.create(
+                self.dev,
+                &self.layouts,
+                self.resource_dim,
+                prepared.data.items,
+            );
+        }
+        var gradient_texture: ?GradientTexture = null;
+        defer if (gradient_texture) |*data| data.deinit();
+        if (prepared.gradient_bytes.len > 0) {
+            gradient_texture = try GradientTexture.create(
+                self.dev,
+                &self.layouts,
+                self.resource_dim,
+                prepared.gradient_bytes,
+            );
         }
 
+        const resolver = paint.PaintResolver.new(scene.encoded_paints.items, prepared.offsets.items);
         var plan = try schedule_mod.schedule(
             self.allocator,
             scene,
             .user_surface,
             depth_view != null,
-            paint.PaintResolver.solid_only,
+            resolver,
             geometry.SizeU16.new(@intCast(self.resource_dim)),
             null,
         );
         defer plan.deinit();
-
         var frame = Frame.init(self.allocator);
         defer frame.deinit();
         try self.createPages(&frame, plan.allocations);
@@ -463,6 +489,15 @@ pub const Renderer = struct {
         // Root opaque strips are drawn first, front-to-back, with depth.
         if (plan.hasOpaqueStrips() and depth_view != null) {
             const no_child_group = try self.childBindGroup(&frame, null);
+            var opaque_runs: std.ArrayList(wgpu_backend.StripRun) = .empty;
+            defer opaque_runs.deinit(self.allocator);
+            try self.buildRuns(
+                &frame,
+                bindings,
+                target_texture,
+                plan.draw_buffers.opaque_draw.runs(),
+                &opaque_runs,
+            );
             try wgpu_backend.stripPass(self.dev, encoder, .{
                 .view = target_view,
                 .depth_view = depth_view,
@@ -474,8 +509,9 @@ pub const Renderer = struct {
                 .is_root = true,
                 .strip_bind_group = no_child_group,
                 .external_bind_group = try self.placeholderExternalBindGroup(&frame),
-                .encoded_paints_bind_group = self.encoded_paints_bind_group,
-                .gradient_bind_group = self.gradient_bind_group,
+                .opaque_external_runs = opaque_runs.items,
+                .encoded_paints_bind_group = if (encoded_paints) |data| data.bind_group else self.encoded_paints_bind_group,
+                .gradient_bind_group = if (gradient_texture) |data| data.bind_group else self.gradient_bind_group,
                 .pipelines = &self.pipelines,
             });
             root_clear_consumed = true;
@@ -523,6 +559,15 @@ pub const Renderer = struct {
                     if (is_root) root_clear_consumed = true;
 
                     const use_depth = is_root and depth_view != null;
+                    var alpha_runs: std.ArrayList(wgpu_backend.StripRun) = .empty;
+                    defer alpha_runs.deinit(self.allocator);
+                    try self.buildRuns(
+                        &frame,
+                        bindings,
+                        target_texture,
+                        draw_op.draw.external_texture_runs.items,
+                        &alpha_runs,
+                    );
                     try wgpu_backend.stripPass(self.dev, encoder, .{
                         .view = view,
                         .depth_view = if (use_depth) depth_view else null,
@@ -534,8 +579,9 @@ pub const Renderer = struct {
                         .is_root = is_root,
                         .strip_bind_group = strip_bind_group,
                         .external_bind_group = try self.placeholderExternalBindGroup(&frame),
-                        .encoded_paints_bind_group = self.encoded_paints_bind_group,
-                        .gradient_bind_group = self.gradient_bind_group,
+                        .alpha_external_runs = alpha_runs.items,
+                        .encoded_paints_bind_group = if (encoded_paints) |data| data.bind_group else self.encoded_paints_bind_group,
+                        .gradient_bind_group = if (gradient_texture) |data| data.bind_group else self.gradient_bind_group,
                         .pipelines = &self.pipelines,
                     });
                     if (use_depth) self.depth_cleared_this_frame = true;
@@ -777,6 +823,54 @@ pub const Renderer = struct {
         );
     }
 
+    /// Build per-run external-texture bind groups and strip ranges for one
+    /// pass. Runs reference four texture slots each; unbound slots use the
+    /// placeholder, unknown handles fail with `MissingTextureBinding`, and a
+    /// texture that is also the render target fails with
+    /// `TextureFeedbackLoop`.
+    fn buildRuns(
+        self: *Renderer,
+        frame: *Frame,
+        bindings: TextureBindings,
+        target_texture: ?c.WGPUTexture,
+        runs: []const draw_mod.ExternalTextureRun,
+        out: *std.ArrayList(wgpu_backend.StripRun),
+    ) Error!void {
+        for (runs) |run| {
+            var views: [draw_mod.EXTERNAL_TEXTURE_SLOT_COUNT]c.WGPUTextureView = @splat(self.placeholder_view);
+            for (run.bindings.texture_sources, 0..) |source, slot| {
+                const id = source orelse continue;
+                switch (id) {
+                    .atlas => return error.Unsupported,
+                    .external => |handle| {
+                        const texture = bindings.get(handle) orelse {
+                            std.debug.print(
+                                "vellz-gpu: no texture bound for image handle {d}\n",
+                                .{handle},
+                            );
+                            return error.MissingTextureBinding;
+                        };
+                        if (target_texture != null and texture.texture == target_texture.?) {
+                            return error.TextureFeedbackLoop;
+                        }
+                        views[slot] = texture.view;
+                    },
+                }
+            }
+            const group = try wgpu_backend.createExternalTextureBindGroup(
+                self.dev,
+                self.layouts.external_texture,
+                views,
+            );
+            try frame.track(.{ .bind_group = group });
+            try out.append(self.allocator, .{
+                .start = @intCast(run.strips_start),
+                .end = 0,
+                .bind_group = group,
+            });
+        }
+    }
+
     /// Grow and upload the alpha texture for `alphas` (row-major 16-byte
     /// blocks, matching `StripStorage.alphas`).
     fn prepareAlphas(self: *Renderer, alphas: []const u8) Error!void {
@@ -824,6 +918,101 @@ pub const Renderer = struct {
             width,
             self.alphas_height,
         );
+    }
+};
+
+/// The encoded-paints `Rgba32Uint` texture and its bind group for one frame.
+const EncodedPaintsTexture = struct {
+    texture: c.WGPUTexture,
+    view: c.WGPUTextureView,
+    bind_group: c.WGPUBindGroup,
+
+    fn create(
+        dev: *device.Device,
+        layouts: *const wgpu_backend.Layouts,
+        resource_dim: u32,
+        bytes: []const u8,
+    ) Error!EncodedPaintsTexture {
+        const texels: u32 = @intCast(bytes.len / 16);
+        const height = (texels + resource_dim - 1) / resource_dim;
+        if (height > resource_dim) return error.UnsupportedCapability;
+        const texture = try wgpu_backend.createRgba32UintTexture(dev, resource_dim, height, "vellz-encoded-paints");
+        errdefer c.wgpuTextureRelease(texture);
+        const view = try wgpu_backend.createFullView(
+            texture,
+            c.WGPUTextureFormat_RGBA32Uint,
+            "vellz-encoded-paints-view",
+        );
+        errdefer c.wgpuTextureViewRelease(view);
+
+        const total = @as(usize, resource_dim) * height * 16;
+        const padded = dev.allocator.alloc(u8, total) catch return error.OutOfMemory;
+        defer dev.allocator.free(padded);
+        @memset(padded, 0);
+        @memcpy(padded[0..bytes.len], bytes);
+        try wgpu_backend.writeRgba32Uint(dev, texture, padded, resource_dim, height);
+
+        const bind_group = try wgpu_backend.createEncodedPaintsBindGroup(dev, layouts.encoded_paints, view);
+        errdefer c.wgpuBindGroupRelease(bind_group);
+        return .{ .texture = texture, .view = view, .bind_group = bind_group };
+    }
+
+    fn deinit(self: *EncodedPaintsTexture) void {
+        c.wgpuBindGroupRelease(self.bind_group);
+        c.wgpuTextureViewRelease(self.view);
+        c.wgpuTextureRelease(self.texture);
+        self.* = undefined;
+    }
+};
+
+/// The packed gradient LUT `Rgba8Unorm` texture and its bind group.
+const GradientTexture = struct {
+    texture: c.WGPUTexture,
+    view: c.WGPUTextureView,
+    bind_group: c.WGPUBindGroup,
+
+    fn create(
+        dev: *device.Device,
+        layouts: *const wgpu_backend.Layouts,
+        resource_dim: u32,
+        bytes: []const u8,
+    ) Error!GradientTexture {
+        const bytes_per_row = @as(usize, resource_dim) * 4;
+        const height: u32 = @intCast((bytes.len + bytes_per_row - 1) / bytes_per_row);
+        if (height > resource_dim) return error.UnsupportedCapability;
+        const texture = try wgpu_backend.createTexture2d(
+            dev,
+            resource_dim,
+            height,
+            c.WGPUTextureFormat_RGBA8Unorm,
+            c.WGPUTextureUsage_TextureBinding | c.WGPUTextureUsage_CopyDst,
+            "vellz-gradient-lut",
+        );
+        errdefer c.wgpuTextureRelease(texture);
+        const view = try wgpu_backend.createFullView(
+            texture,
+            c.WGPUTextureFormat_RGBA8Unorm,
+            "vellz-gradient-lut-view",
+        );
+        errdefer c.wgpuTextureViewRelease(view);
+
+        const total = bytes_per_row * height;
+        const padded = dev.allocator.alloc(u8, total) catch return error.OutOfMemory;
+        defer dev.allocator.free(padded);
+        @memset(padded, 0);
+        @memcpy(padded[0..bytes.len], bytes);
+        try wgpu_backend.writeRgba8(dev, texture, padded, resource_dim, height);
+
+        const bind_group = try wgpu_backend.createGradientBindGroup(dev, layouts.gradient, view);
+        errdefer c.wgpuBindGroupRelease(bind_group);
+        return .{ .texture = texture, .view = view, .bind_group = bind_group };
+    }
+
+    fn deinit(self: *GradientTexture) void {
+        c.wgpuBindGroupRelease(self.bind_group);
+        c.wgpuTextureViewRelease(self.view);
+        c.wgpuTextureRelease(self.texture);
+        self.* = undefined;
     }
 };
 

@@ -49,6 +49,8 @@ test {
     _ = @import("gpu/target.zig");
     _ = @import("gpu/rect.zig");
     _ = @import("gpu/paint.zig");
+    _ = @import("gpu/gradient_cache.zig");
     _ = @import("gpu/scene.zig");
     _ = @import("gpu/draw.zig");
+    _ = @import("gpu/schedule/mod.zig");
 }
