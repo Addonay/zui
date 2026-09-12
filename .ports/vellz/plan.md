@@ -231,7 +231,7 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | Upstream module | Zig target | Status | Notes |
 | --- | --- | --- | --- |
 | `lib.rs`, `interface.rs` (Glyph, DrawSink, GlyphRenderer) | `glifo/root.zig`, `glifo/interface.zig` | port | comptime duck-typing contracts + `assert*` helpers; COLR/bitmap-specific methods deferred |
-| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | outline subset: run builder, transform absorption, prep cache, draw loop; hinting/embolden/coords/COLR/bitmap/decoration -> typed `error.Unsupported` |
+| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | outline subset: run builder, transform absorption, prep cache, draw loop, skip-ink `renderDecoration`; hinting/embolden/coords/COLR/bitmap -> typed `error.Unsupported` |
 | `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline fill/stroke, subpixel keys, command replay, raster metrics; COLR/bitmap paths deferred |
 | `colr.rs` (COLR/CPAL painting) | `glifo/colr.zig` | defer | M3 T4 |
 | `atlas/*` (cache, keys, regions, commands) | `glifo/atlas/*.zig` | port | cache/eviction, fixed-seed key hashing, recorder + replay; variable-font second-level map deferred with `gvar` |
@@ -454,6 +454,9 @@ of panics, thread ownership).
 
 ### Milestone 3 — Glyph rendering and Cozmic adapter
 
+- **Status (2026-09-12):** outline subset, atlas cache, decoration and the
+  Cozmic adapter are landed (T1–T3, T5); hinting (G3b), COLR (G3c) and
+  embolden/bitmap remain staged with typed `error.Unsupported`.
 - `glifo` port; stable font identity/face index/variation/glyph/size/placement
   contract; monochrome + COLR behavior; cache invalidation.
 - **Gate:** glyph corpus renders match upstream for the same font resources;
@@ -773,6 +776,28 @@ of panics, thread ownership).
   recorded in `tests/README.md`). Still `error.Unsupported`: layers
   (blend/opacity/filter/mask), gradients, images, filters, and GPU masks —
   schedule + encoded paints + `gradient_cache` are the next milestones.
+- 2026-09-12 (branch `vellz-cozmic`): **M3 T5 landed** (decoration + Cozmic
+  adapter). `glifo/glyph.zig` ports upstream `render_decoration`/
+  `decoration_spans` (`insert_and_merge_range`, `expand_rect_with_segment`,
+  the prep cache's `underline_exclusions` buffer) and exposes it through
+  `GlyphRunBuilder`/`GlyphRunRenderer`/`CpuGlyphRunBackend`; the oracle gains
+  `--dump-decoration` (skip-ink rectangles as f64 bit patterns through a
+  recording `DrawSink`) and renders `decoration` in `glyph_run` scenes. Six
+  new scenes mirror `vello_tests/tests/glyph.rs`'s decoration cases
+  (offset/size/no-descender/transformed) byte-exact with the atlas cache off
+  and on; unit tests compare skip-ink spans and merged exclusions against
+  oracle values. `src/cozmic_adapter.zig` (opt-in, never imported by the
+  core) maps caller-positioned glyphs 1:1 onto `glifo` runs, splits only on
+  font/size changes, never shapes/reorders, applies no `FLIP_Y`, and forwards
+  embolden to the core's typed `error.Unsupported`. The Cozmic bridge test
+  (`.ports/cozmic` imported only there) proves 1:1 mapping, counts resolver
+  calls (one per run), and renders byte-identical pixels to a direct
+  `glyph_run`; it skips explicitly when the sibling checkout is absent.
+  Corpus 69/69, tolerance 0. Known divergence: the baseline glyph scenes in
+  `tools/gen_glyph_scenes.py` were generated with advances decoded
+  little-endian (all glyphs at x = 0); decoding is fixed for the new
+  decoration scenes but the baseline scenes/fixtures were deliberately left
+  untouched and should be regenerated in a separate change.
 - 2026-09-12: **M3 T3 landed** (branch `vellz-glyph`). Glyph stack end to end:
   `glifo/atlas/*` (key/region/commands/cache with age-based eviction and
   page-indexed command recorders), `glifo/glyph.zig` (GlyphRun, builder,

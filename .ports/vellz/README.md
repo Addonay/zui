@@ -29,8 +29,10 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 815/815 unit and integration tests (807 lib + 8 scene)
-zig build corpus   # 63/63 corpus scenes byte-exact vs the upstream oracle
+zig build test     # 828/828 unit and integration tests (811 lib + 8 scene
+                   #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
+                   #   the .ports/cozmic sibling checkout is absent)
+zig build corpus   # 69/69 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
@@ -65,8 +67,16 @@ outlines, compared across 250,016 path elements / 685,392 coordinates and
 placement trace. T3 wires the stack end to end: positioned `glyph_run` scenes
 (fill/stroke, transform absorption, skew, glyph transforms, gradient paint)
 render through `vellz.glifo` + `vellz.cpu` byte-exact against the pinned
-oracle with the glyph atlas cache on and off (15 new scenes; 63/63 corpus,
-tolerance 0). The GPU side has the wgpu-native device bootstrap, the full
+oracle with the glyph atlas cache on and off. T5 adds the skip-ink decoration
+path (`renderDecoration`: underline/overline/strikethrough spans, buffer,
+transforms; 6 new scenes mirroring `vello_tests`' decoration cases and an
+oracle `--dump-decoration` span dump) and the opt-in Cozmic adapter
+(`vellz.cozmic_adapter`, never a dependency of the rendering core): it maps
+already-positioned glyphs 1:1 onto `glifo.GlyphRun` runs and is gated by a
+bridge test that renders byte-identical pixels to a direct `glyph_run`, with
+an explicit skip when `.ports/cozmic` is absent. The glyph corpus is now 21
+scenes; `zig build corpus` is 69/69, tolerance 0. The GPU side has the
+wgpu-native device bootstrap, the full
 host/shader layout contract, the schedule/layer executor, encoded paints
 (gradients and images), GPU filters, and a 44-scene `gpu-corpus` gate (27
 byte-exact, the rest within the documented per-scene tolerance registry, plus
@@ -74,8 +84,8 @@ typed device-loss/unsupported-capability/missing-binding/feedback-loop errors)
 running on the llvmpipe software adapter.
 
 Not yet implemented (explicit typed errors, never placeholder pixels): hinted
-outlines (the interpreter), COLR/CPAL, glyph decoration and the Cozmic adapter
-(M3 remainder); GPU layers/blends, gradients, images, filters, and the full G5
+outlines (the interpreter), COLR/CPAL and embedded bitmaps (M3 remainder);
+GPU layers/blends, gradients, images, filters, and the full G5
 corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
 SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage
 benchmarks in `docs/benchmarks.md` (u8-vs-f32 speedups 1.9–3.4× on the

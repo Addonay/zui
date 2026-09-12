@@ -281,11 +281,16 @@ pub fn RenderContext.glyphRun(self, resources, font) GlyphRunBuilder;
   of upstream's fixed-seed `foldhash`. Eviction/iteration order can differ;
   pixels cannot, because atlas slots are disjoint and sampled at integer
   offsets.
+- Decoration (`renderDecoration`) is ported: underline/overline/
+  strikethrough spans with skip-ink exclusions, using the prep cache's
+  `underline_exclusions` buffer. Upstream's lazy span iterator becomes one
+  pass over the merged exclusion list; rectangle values and order match the
+  pinned oracle (`--dump-decoration`).
 - Deferred with typed errors, never approximated: hinting interpreter/autohint
   (an eligible hinted run fails up front), `gvar`/`HVAR` coordinates, CFF/CFF2,
-  CBDT/CBLC/sbix bitmaps, COLR/CPAL and decoration. A font carrying a
-  COLR/CBDT/CBLC/sbix table rejects the whole run with `error.Unsupported`
-  instead of silently dropping the color/bitmap representation.
+  CBDT/CBLC/sbix bitmaps and COLR/CPAL. A font carrying a COLR/CBDT/CBLC/sbix
+  table rejects the whole run with `error.Unsupported` instead of silently
+  dropping the color/bitmap representation.
 
 ## Error policy
 
