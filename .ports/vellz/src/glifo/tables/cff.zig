@@ -297,13 +297,6 @@ pub fn readI32At(bytes: []const u8, pos: *usize) Error!i32 {
     return v;
 }
 
-pub fn readU32At(bytes: []const u8, pos: *usize) Error!u32 {
-    if (pos.* + 4 > bytes.len) return error.OutOfBounds;
-    const v = std.mem.readInt(u32, bytes[pos.*..][0..4], .big);
-    pos.* += 4;
-    return v;
-}
-
 // -------------------------------------------------------------------- numbers
 
 /// Unnamed constants from FreeType's `cff_parse_real`, mirrored by
@@ -1455,10 +1448,6 @@ pub const Charset = struct {
                 return error.OutOfBounds;
             },
         }
-    }
-
-    fn glyphOffset0(self: Charset, gid: u32) usize {
-        return self.offset + 1 + @as(usize, gid - 1) * 2;
     }
 
     fn rangeCount0(self: Charset) u32 {

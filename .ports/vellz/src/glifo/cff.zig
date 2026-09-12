@@ -1326,11 +1326,6 @@ fn transformHMetric(metric: Fixed, matrix: ?raw.FontMatrix, scale: ?Fixed) Fixed
     return Fixed.fromBits(shiftLeft16(value.bits));
 }
 
-/// `seac` needs a charset; the CFF2 deferral is documented in the module docs.
-pub fn seacSupported(outlines: *const Outlines) bool {
-    return outlines.version == 1 and !outlines.charset_invalid;
-}
-
 // --------------------------------------------------------------------- tests
 
 const testing = std.testing;
