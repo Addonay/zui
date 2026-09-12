@@ -231,21 +231,22 @@ pub const GlyphAtlas = struct {
 
     /// Replay all pending atlas command recorders (one per dirty page).
     ///
-    /// `f` receives each non-empty recorder by mutable reference. All pending
-    /// commands are cleared after replay, including when `f` returns an error;
-    /// only the first error is returned. Recorder allocations are kept for
-    /// reuse next frame.
+    /// `context` may be any value with a method
+    /// `fn replay(self, recorder: *AtlasCommandRecorder) !void`; it is called
+    /// for each non-empty recorder. All pending commands are cleared after
+    /// replay, including when `replay` returns an error; only the first error
+    /// is returned. Recorder allocations are kept for reuse next frame.
     pub fn replayPendingAtlasCommands(
         self: *GlyphAtlas,
         allocator: std.mem.Allocator,
-        f: anytype,
+        context: anytype,
     ) !void {
         var first_error: ?anyerror = null;
         for (self.pending_atlas_commands.items) |*slot| {
             if (slot.*) |*recorder| {
                 if (recorder.commands.items.len != 0) {
                     if (first_error == null) {
-                        f(recorder) catch |err| {
+                        context.replay(recorder) catch |err| {
                             first_error = err;
                         };
                     }

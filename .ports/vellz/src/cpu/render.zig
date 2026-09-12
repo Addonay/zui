@@ -59,6 +59,8 @@ const transforms_mod = @import("../common/transforms.zig");
 const common_util = @import("../common/util.zig");
 const settings_mod = @import("settings.zig");
 const dispatch_mod = @import("dispatch/mod.zig");
+const glyph_mod = @import("../glifo/root.zig");
+const text_mod = @import("text.zig");
 
 pub const RenderMode = settings_mod.RenderMode;
 pub const PixelFormat = settings_mod.PixelFormat;
@@ -135,6 +137,31 @@ pub const ImageRegistry = struct {
         self.next_id = 0;
     }
 
+    /// Register (or replace) the pixmap backing an atlas page.
+    ///
+    /// Atlas page ids live in the reserved range at and above
+    /// `ATLAS_IMAGE_ID_BASE`; replacing an existing page releases the previous
+    /// handle, mirroring upstream's `HashMap::insert`.
+    pub fn registerAtlasPage(
+        self: *ImageRegistry,
+        allocator: std.mem.Allocator,
+        page_index: u32,
+        pixmap: shared_mod.Shared(Pixmap),
+    ) std.mem.Allocator.Error!void {
+        const raw_id = ATLAS_IMAGE_ID_BASE + page_index;
+        if (self.images.getPtr(raw_id)) |existing| existing.release(allocator);
+        try self.images.put(allocator, raw_id, pixmap);
+    }
+
+    /// Release the atlas page registration for `page_index`.
+    pub fn destroyAtlasPage(
+        self: *ImageRegistry,
+        allocator: std.mem.Allocator,
+        page_index: u32,
+    ) bool {
+        return self.destroy(allocator, ImageId.new(ATLAS_IMAGE_ID_BASE + page_index));
+    }
+
     /// Release every image and the map storage.
     pub fn deinit(self: *ImageRegistry, allocator: std.mem.Allocator) void {
         self.clear(allocator);
@@ -145,11 +172,17 @@ pub const ImageRegistry = struct {
 /// Persistent resources required by the CPU renderer.
 ///
 /// Create one instance per renderer and reuse it across scenes. The image
-/// registry backs `ImageSource.opaque_id` resolution; glyph caches (M3) are
-/// added here without changing the public lifecycle.
+/// registry backs `ImageSource.opaque_id` resolution; the glyph caches
+/// (`glyph_prep_cache`, lazily created `glyph_resources`) are the M3 text
+/// path, with the frame protocol driven from `renderWith`.
 pub const Resources = struct {
     /// Registry for `ImageSource.opaque_id` paints.
     image_registry: ImageRegistry = .{},
+    /// Renderer-agnostic glyph caches (outline paths and skip-ink spans).
+    glyph_prep_cache: glyph_mod.GlyphPrepCache = .{},
+    /// Lazily initialized glyph atlas resources (atlas cache + page pixmaps +
+    /// the page-sized render context used to replay atlas commands).
+    glyph_resources: ?text_mod.GlyphAtlasResources = null,
 
     /// Create a new set of renderer resources.
     pub fn init() Resources {
@@ -158,6 +191,9 @@ pub const Resources = struct {
 
     /// Release owned resources.
     pub fn deinit(self: *Resources, allocator: std.mem.Allocator) void {
+        if (self.glyph_resources) |*glyph_resources| glyph_resources.deinit(allocator);
+        self.glyph_resources = null;
+        self.glyph_prep_cache.deinit(allocator);
         self.image_registry.deinit(allocator);
     }
 
@@ -419,6 +455,36 @@ pub const RenderContext = struct {
         return &self.state.paint;
     }
 
+    /// Get the current paint (upstream `current_paint`, used by the glyph
+    /// renderer contract).
+    pub fn currentPaint(self: *const RenderContext) *const PaintType {
+        return &self.state.paint;
+    }
+
+    /// Set the image tint applied by subsequent image draws (upstream
+    /// `set_tint`).
+    pub fn setTint(self: *RenderContext, tint: ?paint_mod.Tint) void {
+        self.state.tint = tint;
+    }
+
+    /// Save an owned copy of the current render state (upstream
+    /// `save_current_state`).
+    ///
+    /// The paint may own a gradient/image payload, so this is fallible; pair
+    /// with `restoreState`, which consumes the copy.
+    pub fn saveState(self: *RenderContext) !RenderState {
+        var copy = self.state;
+        copy.paint = try self.state.paint.clone(self.allocator);
+        return copy;
+    }
+
+    /// Restore a state previously returned by `saveState`, releasing the
+    /// currently held paint payload.
+    pub fn restoreState(self: *RenderContext, state: RenderState) void {
+        self.state.paint.deinit(self.allocator);
+        self.state = state;
+    }
+
     /// Set the current fill rule.
     pub fn setFillRule(self: *RenderContext, fill_rule: peniko.Fill) void {
         self.state.fill_rule = fill_rule;
@@ -436,6 +502,11 @@ pub const RenderContext = struct {
 
     /// Get the current stroke.
     pub fn stroke(self: *const RenderContext) *const kurbo.Stroke {
+        return &self.state.stroke;
+    }
+
+    /// Get the current stroke style mutably (upstream `stroke_mut`).
+    pub fn strokeMut(self: *RenderContext) *kurbo.Stroke {
         return &self.state.stroke;
     }
 
@@ -972,6 +1043,10 @@ pub const RenderContext = struct {
         // reported as a typed error here.
         if (self.dispatcher.hasLayers()) return error.UnclosedLayers;
 
+        // Glyph atlas synchronization happens before the target clear,
+        // exactly like upstream `resources.before_render(render_mode)`.
+        try text_mod.beforeRender(resources, self.allocator, settings.render_mode);
+
         var target = pixmap.asMut();
         const target_fully_covered = settings.offset.x == 0 and
             settings.offset.y == 0 and
@@ -1002,6 +1077,48 @@ pub const RenderContext = struct {
             self.encoded_paints.items,
             resources.imageResolver(),
         );
+        // Glyph atlas eviction runs after rasterization, exactly like
+        // upstream `resources.after_render()`.
+        try text_mod.afterRender(resources, self.allocator);
+    }
+
+    // ------------------------------------------------------------- glyphs
+
+    /// Creates a builder for drawing a run of glyphs that have the same
+    /// attributes (upstream `RenderContext::glyph_run`).
+    pub fn glyphRun(
+        self: *RenderContext,
+        resources: *Resources,
+        font: glyph_mod.FontData,
+    ) glyph_mod.GlyphRunBuilder(text_mod.CpuGlyphRunBackend) {
+        return glyph_mod.GlyphRunBuilder(text_mod.CpuGlyphRunBackend).new(
+            font,
+            self.state.transforms.sceneTransform(),
+            self.state.transforms.paintTransform(),
+            .{
+                .ctx = self,
+                .resources = resources,
+                .atlas_cache_enabled = false,
+            },
+        );
+    }
+
+    /// Resolve an atlas page index to its registered image id.
+    pub fn atlasImageSource(self: *const RenderContext, page_index: u32) paint_mod.ImageSource {
+        _ = self;
+        return paint_mod.ImageSource.initOpaqueId(
+            paint_mod.ImageId.new(ATLAS_IMAGE_ID_BASE + page_index),
+        );
+    }
+
+    /// Compute the paint transform that samples the atlas pixel at
+    /// `(x, y)` as the image origin.
+    pub fn atlasPaintTransform(self: *const RenderContext, x: u16, y: u16) kurbo.Affine {
+        _ = self;
+        return kurbo.Affine.translate(kurbo.Vec2.new(
+            -@as(f64, @floatFromInt(x)),
+            -@as(f64, @floatFromInt(y)),
+        ));
     }
 };
 
