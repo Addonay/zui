@@ -16,7 +16,14 @@
 //!   high-precision painter (strict IEEE, unfused `mul_add`); only the texel
 //!   samples and interpolation products move to u8/u16.
 //! - `f32_to_u8` reproduces the baseline/x86 saturating low-byte conversion
-//!   from `common/util.zig`.
+//!   from `common/util.zig` (vectorized there, checked lane-for-lane against
+//!   the scalar reference).
+//! - `f32_to_u32` lane conversions (`f32ToU32Vec`) are vectorized as well,
+//!   removing the scalar lane loops that made the u8 bilinear painter slower
+//!   than the f32 painter at 64x64 (A/B in `docs/benchmarks.md`).
+//! - The four texel words are assembled into the `u8x16` with one bitcast on
+//!   little-endian targets (the port's documented native layout); other
+//!   targets keep the exact per-byte order.
 //! - The f32x4 position advances reuse [`image.ImagePainterData`] and the
 //!   shared [`image.extend`]/[`image.fractFloor`] helpers.
 //!
