@@ -21,6 +21,9 @@ pub const kurbo = @import("kurbo/root.zig");
 pub const peniko = @import("peniko/root.zig");
 pub const simd = @import("simd/root.zig");
 
+/// Glyph outline loading for text rendering (M3 `glifo` port).
+pub const glifo = @import("glifo/root.zig");
+
 /// Shared core: geometry, paths, tiles, strips, paints, pixmaps.
 pub const common = @import("common/root.zig");
 

@@ -411,6 +411,7 @@ dependencies = [
  "fearless_simd",
  "serde",
  "serde_json",
+ "skrifa",
  "vello_cpu",
 ]
 

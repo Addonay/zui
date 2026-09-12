@@ -5,6 +5,11 @@
 //! The Zig implementation consumes the same scene files through
 //! `tools/vellz_cli`, so scene construction is shared rather than re-created.
 //!
+//! `--dump-glyphs` and `--dump-cmap` are the ground truth for the M3 `glifo`
+//! port: they emit the exact `skrifa 0.44.0` outline path elements (f32 bit
+//! patterns) and cmap mappings that `glifo 0.3.0` caches, so the Zig side can
+//! be byte-compared without rasterizing.
+//!
 //! This binary is development tooling. It is not distributed with the package.
 
 use std::path::{Path, PathBuf};
@@ -12,6 +17,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use serde::Deserialize;
+use skrifa::MetadataProvider as _;
+use skrifa::instance::Size as SkrifaSize;
+use skrifa::outline::pen::PathElement;
 use vello_cpu::color::{AlphaColor, Srgb};
 use vello_cpu::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_cpu::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke};
@@ -480,11 +488,18 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
+        Some("--dump-glyphs") => return dump_glyphs(&argv[1..]),
+        Some("--dump-cmap") => return dump_cmap(&argv[1..]),
+        _ => {}
+    }
+
     let mut scene_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
     let mut write_png = false;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = argv.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--scene" => scene_path = Some(args.next().ok_or("--scene needs a value")?.into()),
@@ -708,6 +723,220 @@ fn run() -> Result<(), String> {
         scene.width, scene.height
     );
     Ok(())
+}
+
+/// TrueType point/path dumps for the M3 `glifo` port.
+///
+/// The text format is versioned and canonical: one f32 per coordinate printed
+/// as its raw bit pattern in lowercase hex, so the Zig side can be compared
+/// byte-for-byte without any float formatting.
+///
+/// `--dump-glyphs --font PATH [--index N] --size PPEM --gids 1,3,5-9`
+///   emits `skrifa`'s unhinted `PathStyle::FreeType` path elements plus the
+///   adjusted lsb/advance from the same draw. This is exactly the call
+///   `glifo`'s `OutlineCache` makes for an unhinted run.
+///
+/// `--dump-cmap --font PATH [--index N] --codepoints 65,66,0x1F600`
+///   emits the selected cmap subtable's mappings (skrifa's selection strategy,
+///   preferring symbol then full-repertoire subtables).
+fn dump_glyphs(args: &[String]) -> Result<(), String> {
+    let parsed = parse_dump_args(args, true, "gid")?;
+    let size = parsed.size.ok_or("missing --size PPEM")?;
+    let data = std::fs::read(&parsed.font)
+        .map_err(|e| format!("reading {}: {e}", parsed.font.display()))?;
+    let font = skrifa::FontRef::from_index(&data, parsed.index)
+        .map_err(|e| format!("loading {}[{}]: {e}", parsed.font.display(), parsed.index))?;
+    let outlines = font.outline_glyphs();
+    let mut out = String::new();
+    out.push_str("vellz-glyph-dump v1\n");
+    out.push_str(&format!("face {}\n", parsed.index));
+    out.push_str(&format!("size {:08x}\n", size.to_bits()));
+    for gid in parsed.ids {
+        let glyph = outlines
+            .get(skrifa::GlyphId::new(gid))
+            .ok_or_else(|| format!("glyph {gid} is not present"))?;
+        let format = match glyph.format() {
+            skrifa::outline::OutlineGlyphFormat::Glyf => "glyf",
+            skrifa::outline::OutlineGlyphFormat::Cff => "cff",
+            skrifa::outline::OutlineGlyphFormat::Cff2 => "cff2",
+            skrifa::outline::OutlineGlyphFormat::Varc => "varc",
+        };
+        let mut elements: Vec<PathElement> = Vec::new();
+        let metrics = glyph
+            .draw(SkrifaSize::new(size), &mut elements)
+            .map_err(|e| format!("drawing glyph {gid}: {e}"))?;
+        out.push_str(&format!(
+            "gid {gid} format {format} elems {} lsb {} advance {}\n",
+            elements.len(),
+            format_opt_f32(metrics.lsb),
+            format_opt_f32(metrics.advance_width),
+        ));
+        for el in &elements {
+            match el {
+                PathElement::MoveTo { x, y } => {
+                    out.push_str(&format!("M {:08x} {:08x}\n", x.to_bits(), y.to_bits()));
+                }
+                PathElement::LineTo { x, y } => {
+                    out.push_str(&format!("L {:08x} {:08x}\n", x.to_bits(), y.to_bits()));
+                }
+                PathElement::QuadTo { cx0, cy0, x, y } => {
+                    out.push_str(&format!(
+                        "Q {:08x} {:08x} {:08x} {:08x}\n",
+                        cx0.to_bits(),
+                        cy0.to_bits(),
+                        x.to_bits(),
+                        y.to_bits(),
+                    ));
+                }
+                PathElement::CurveTo {
+                    cx0,
+                    cy0,
+                    cx1,
+                    cy1,
+                    x,
+                    y,
+                } => {
+                    out.push_str(&format!(
+                        "C {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n",
+                        cx0.to_bits(),
+                        cy0.to_bits(),
+                        cx1.to_bits(),
+                        cy1.to_bits(),
+                        x.to_bits(),
+                        y.to_bits(),
+                    ));
+                }
+                PathElement::Close => out.push_str("Z\n"),
+            }
+        }
+    }
+    out.push_str("end\n");
+    print!("{out}");
+    Ok(())
+}
+
+/// cmap dump companion to [`dump_glyphs`].
+fn dump_cmap(args: &[String]) -> Result<(), String> {
+    let parsed = parse_dump_args(args, false, "codepoint")?;
+    let data = std::fs::read(&parsed.font)
+        .map_err(|e| format!("reading {}: {e}", parsed.font.display()))?;
+    let font = skrifa::FontRef::from_index(&data, parsed.index)
+        .map_err(|e| format!("loading {}[{}]: {e}", parsed.font.display(), parsed.index))?;
+    let charmap = font.charmap();
+    let mut out = String::new();
+    out.push_str("vellz-cmap-dump v1\n");
+    out.push_str(&format!("face {}\n", parsed.index));
+    out.push_str(&format!(
+        "has_map {} is_symbol {}\n",
+        u8::from(charmap.has_map()),
+        u8::from(charmap.is_symbol()),
+    ));
+    for cp in parsed.ids {
+        match charmap.map(cp) {
+            Some(gid) => out.push_str(&format!("cp {cp} gid {}\n", gid.to_u32())),
+            None => out.push_str(&format!("cp {cp} gid none\n")),
+        }
+    }
+    out.push_str("end\n");
+    print!("{out}");
+    Ok(())
+}
+
+fn format_opt_f32(value: Option<f32>) -> String {
+    match value {
+        Some(value) => format!("{:08x}", value.to_bits()),
+        None => "none".to_string(),
+    }
+}
+
+struct DumpArgs {
+    font: PathBuf,
+    index: u32,
+    size: Option<f32>,
+    ids: Vec<u32>,
+}
+
+/// Parses the shared `--dump-glyphs`/`--dump-cmap` arguments.
+fn parse_dump_args(args: &[String], want_size: bool, what: &str) -> Result<DumpArgs, String> {
+    let mut font: Option<PathBuf> = None;
+    let mut index: u32 = 0;
+    let mut size: Option<f32> = None;
+    let mut ids: Vec<u32> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--font" => {
+                let value = args.get(i + 1).ok_or("--font needs a value")?;
+                font = Some(PathBuf::from(value));
+                i += 2;
+            }
+            "--index" => {
+                let value = args.get(i + 1).ok_or("--index needs a value")?;
+                index = value
+                    .parse()
+                    .map_err(|_| format!("--index must be an integer, got {value:?}"))?;
+                i += 2;
+            }
+            "--size" => {
+                let value = args.get(i + 1).ok_or("--size needs a value")?;
+                size = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--size must be a number, got {value:?}"))?,
+                );
+                i += 2;
+            }
+            "--gids" | "--codepoints" => {
+                let value = args.get(i + 1).ok_or("list argument needs a value")?;
+                ids.extend(parse_id_list(value, what)?);
+                i += 2;
+            }
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    let font = font.ok_or("missing --font PATH")?;
+    if want_size && size.is_none() {
+        return Err("missing --size PPEM".to_string());
+    }
+    Ok(DumpArgs {
+        font,
+        index,
+        size,
+        ids,
+    })
+}
+
+/// Parses `1,3,5-9` into `[1, 3, 5, 6, 7, 8, 9]`.
+fn parse_id_list(spec: &str, what: &str) -> Result<Vec<u32>, String> {
+    let mut ids = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            let start: u32 = parse_u32(start.trim())
+                .ok_or_else(|| format!("invalid {what} range start in {part:?}"))?;
+            let end: u32 = parse_u32(end.trim())
+                .ok_or_else(|| format!("invalid {what} range end in {part:?}"))?;
+            if end < start {
+                return Err(format!("invalid {what} range {part:?}"));
+            }
+            ids.extend(start..=end);
+        } else {
+            ids.push(parse_u32(part).ok_or_else(|| format!("invalid {what} {part:?}"))?);
+        }
+    }
+    Ok(ids)
+}
+
+/// Parses decimal or `0x`-prefixed hex.
+fn parse_u32(value: &str) -> Option<u32> {
+    match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => value.parse().ok(),
+    }
 }
 
 /// Builds the current paint from a `set_paint` payload.

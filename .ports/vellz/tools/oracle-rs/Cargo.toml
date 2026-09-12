@@ -9,6 +9,9 @@ description = "Renders the vellz scene corpus with the pinned upstream vello_cpu
 # Path dependency into the pinned checkout. This crate is tooling only and is
 # never part of the distributed vellz package.
 vello_cpu = { path = "../../.reference/vello/vello_cpu", features = ["f32_pipeline"] }
+# Pinned scaler used by `--dump-glyphs`/`--dump-cmap`. Same version and
+# `PathStyle::FreeType` default that `glifo`'s outline cache draws with.
+skrifa = { version = "0.44.0", default-features = false, features = ["std"] }
 # Enable the pure-scalar Fallback level so oracle output does not depend on the
 # host's SIMD feature set. The feature is additive; it only affects this tool.
 fearless_simd = { version = "0.7.0", default-features = false, features = ["force_support_fallback"] }

@@ -25,5 +25,13 @@ cp "$ref/vello_common/assets/probe.rgba" "$dest/probe.rgba"
 cp "$ref/vello_common/assets/probe.png" "$dest/probe.png"
 cp "$ref/assets/roboto/Roboto-Regular.ttf" "$dest/Roboto-Regular.ttf"
 cp "$ref/assets/roboto/LICENSE.txt" "$dest/Roboto-LICENSE.txt"
-sha256sum "$dest/probe.rgba" "$dest/probe.png"
+cp "$ref/assets/noto_color_emoji/NotoColorEmoji-Subset.ttf" "$dest/NotoColorEmoji-Subset.ttf"
+cp "$ref/assets/noto_color_emoji/NotoColorEmoji-CBTF-Subset.ttf" "$dest/NotoColorEmoji-CBTF-Subset.ttf"
+cp "$ref/assets/noto_color_emoji/LICENSE.txt" "$dest/NotoColorEmoji-LICENSE.txt"
+sha256sum \
+    "$dest/probe.rgba" \
+    "$dest/probe.png" \
+    "$dest/Roboto-Regular.ttf" \
+    "$dest/NotoColorEmoji-Subset.ttf" \
+    "$dest/NotoColorEmoji-CBTF-Subset.ttf"
 echo "ok: upstream fixtures imported from $VELLO_REV"

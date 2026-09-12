@@ -37,6 +37,38 @@ Rendering is deterministic by construction: `level` defaults to `fallback`
 (no runtime SIMD feature detection), `threads` to `0`, `mode` to `quality`
 (f32 pipeline), and `target_init` to a transparent clear.
 
+## Glyph and cmap dumps (M3 T2)
+
+`--dump-glyphs` and `--dump-cmap` are the ground truth for the Zig `glifo`
+port. They print canonical text to stdout; coordinates are f32 bit patterns in
+lowercase hex so the Zig side can be byte-compared without float formatting.
+`tools/compare_glyphs.sh` (or `zig build glyphs`) drives both implementations
+and diffs every vector.
+
+```sh
+# Unhinted FreeType path elements for glyphs 0..100 at 16 px.
+tools/oracle-rs/target/release/vellz-oracle \
+    --dump-glyphs --font tests/fixtures/upstream/Roboto-Regular.ttf \
+    --size 16.0 --gids 0-100
+
+# Selected cmap subtable (format 4 or 12) for ASCII plus an emoji.
+tools/oracle-rs/target/release/vellz-oracle \
+    --dump-cmap --font tests/fixtures/upstream/NotoColorEmoji-Subset.ttf \
+    --codepoints 65,0x1F389
+```
+
+`--gids`/`--codepoints` accept comma-separated decimal or `0x` hex values and
+inclusive `start-end` ranges, and may be repeated. `--font`, `--index`,
+`--size` and the id list are shared by both modes. The glyph dump draws with
+`skrifa`'s `DrawSettings::unhinted(Size::new(size), LocationRef::default())`
+and the default `PathStyle::FreeType`; that is exactly the call
+`glifo 0.3.0`'s `OutlineCache` makes for an unhinted run, and the dump also
+carries the resulting adjusted `lsb`/`advance`.
+
+Fixture hashes for the vectors gated by `zig build test` live in
+`tests/fixtures/glyphs/manifest.zig`; regenerate them with
+`tools/compare_glyphs.sh --update-manifest`.
+
 ## Scene format
 
 Version 1. All coordinates are f64 logical pixels; affine values are
