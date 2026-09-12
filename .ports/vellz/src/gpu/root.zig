@@ -12,6 +12,16 @@ pub const blend = @import("blend.zig");
 pub const filter = @import("filter.zig");
 pub const render = @import("render/common.zig");
 
+/// `vello_gpu` port, bottom-up (CPU-safe: these modules never import `wgpu`).
+pub const target = @import("target.zig");
+pub const rect = @import("rect.zig");
+pub const paint = @import("paint.zig");
+pub const scene = @import("scene.zig");
+pub const draw = @import("draw.zig");
+
+pub const Scene = scene.Scene;
+pub const RecordedDraw = scene.RecordedDraw;
+
 /// The wgpu-backed device/pipeline layer. Referenced only when the package is
 /// built with `-Dgpu=true`; the path must still exist in a CPU-only build
 /// because Zig resolves import paths even in untaken comptime branches.
@@ -28,4 +38,9 @@ test {
     _ = @import("blend.zig");
     _ = @import("filter.zig");
     _ = @import("render/common.zig");
+    _ = @import("target.zig");
+    _ = @import("rect.zig");
+    _ = @import("paint.zig");
+    _ = @import("scene.zig");
+    _ = @import("draw.zig");
 }

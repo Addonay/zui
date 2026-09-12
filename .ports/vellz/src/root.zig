@@ -46,4 +46,9 @@ test {
     _ = @import("gpu/blend.zig");
     _ = @import("gpu/filter.zig");
     _ = @import("gpu/render/common.zig");
+    _ = @import("gpu/target.zig");
+    _ = @import("gpu/rect.zig");
+    _ = @import("gpu/paint.zig");
+    _ = @import("gpu/scene.zig");
+    _ = @import("gpu/draw.zig");
 }
