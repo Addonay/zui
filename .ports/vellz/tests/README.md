@@ -179,6 +179,9 @@ fixture.
 | hinted glyph runs (scaled absorption, horizontal skew, glyph transform) | `glyph_run_scaled_hinted_*`, `glyph_run_skewed_hinted_*`, `glyph_run_glyph_transform_hinted_*` |
 | hinted transform composition rows (direct vs absorbed) | `glyph_run_transform_composition_hinted_*` |
 | hinted composite-heavy accented glyphs | `glyph_run_composite_hinted_300x70` |
+| autohinted glyph runs on instruction-less Noto Sans (fill, cache on/off) | `glyph_run_autohint_filled_*`, `glyph_run_autohint_filled_cache_*` |
+| autohinted glyph runs (small, skewed, scaled absorption, composite accented) | `glyph_run_autohint_{small,skewed,scaled,composite}_*` |
+| autohinted transform composition rows (direct vs absorbed) | `glyph_run_autohint_transform_composition_*` |
 | unhinted glyph runs (small, skewed, scaled, glyph transform) | `glyph_run_small_unhinted_*`, `glyph_run_skewed_unhinted_*`, `glyph_run_scaled_unhinted_*`, `glyph_run_glyph_transform_unhinted_*` |
 | unhinted glyph strokes | `glyph_run_stroked_unhinted_*`, `..._cache_*` |
 | transform composition rows (absorption, translate, rotate, skew, flips) | `glyph_run_transform_composition_unhinted_*` |
