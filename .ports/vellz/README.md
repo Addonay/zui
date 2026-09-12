@@ -29,10 +29,10 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 830/830 unit and integration tests (822 lib + 8 scene),
-                   #   plus opt-in Cozmic adapter/bridge tests that skip when
-                   #   the .ports/cozmic sibling checkout is absent
-zig build corpus   # 90/90 corpus scenes byte-exact vs the upstream oracle
+zig build test     # 844/844 unit and integration tests (827 lib + 8 scene
+                   #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
+                   #   the .ports/cozmic sibling checkout is absent)
+zig build corpus   # 96/96 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
