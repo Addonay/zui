@@ -36,14 +36,16 @@ pub const FontInfo = struct {
 };
 
 /// Synthetic embolden request. Matches `glifo`'s `FontEmbolden`: a dilation
-/// amount per axis plus the expansion controls used by `kurbo::expand_path`.
+/// amount per axis (`Diagonal2`, f64 like upstream) plus the expansion
+/// controls used by `kurbo::expand_path`. The amount is truncated to f32 only
+/// for the cache key, exactly like upstream's `f32_bits`.
 pub const FontEmbolden = struct {
-    amount: [2]f32 = .{ 0.0, 0.0 },
+    amount: [2]f64 = .{ 0.0, 0.0 },
     join: kurbo.Join = .miter,
     miter_limit: f64 = 4.0,
     tolerance: f64 = 0.1,
 
-    pub fn new(amount: [2]f32) FontEmbolden {
+    pub fn new(amount: [2]f64) FontEmbolden {
         return .{ .amount = amount };
     }
 
@@ -69,6 +71,17 @@ pub const FontEmbolden = struct {
         return self.amount[0] == 0.0 and self.amount[1] == 0.0;
     }
 };
+
+/// Upstream `join_bits` (defined per module there too): `Bevel => 0,
+/// Miter => 1, Round => 2`. `atlas/key.zig` carries the same mapping for the
+/// bitmap cache key.
+fn joinBits(join: kurbo.Join) u8 {
+    return switch (join) {
+        .bevel => 0,
+        .miter => 1,
+        .round => 2,
+    };
+}
 
 /// Cache key; field-for-field the upstream `OutlineKey` (u32 bit patterns for
 /// every float and the packed join discriminant).
@@ -171,9 +184,9 @@ pub const OutlineCache = struct {
             .font_index = font_info.index,
             .glyph_id = gid,
             .size_bits = @bitCast(size),
-            .embolden_x_bits = @bitCast(embolden.amount[0]),
-            .embolden_y_bits = @bitCast(embolden.amount[1]),
-            .embolden_join_bits = @backingInt(embolden.join),
+            .embolden_x_bits = @bitCast(@as(f32, @floatCast(embolden.amount[0]))),
+            .embolden_y_bits = @bitCast(@as(f32, @floatCast(embolden.amount[1]))),
+            .embolden_join_bits = joinBits(embolden.join),
             .embolden_miter_limit_bits = @bitCast(@as(f32, @floatCast(embolden.miter_limit))),
             .embolden_tolerance_bits = @bitCast(@as(f32, @floatCast(embolden.tolerance))),
             .hint = hint_instance != null,

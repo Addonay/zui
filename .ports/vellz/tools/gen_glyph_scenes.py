@@ -202,6 +202,7 @@ def glyph_run(
     atlas_cache=False,
     style="fill",
     glyph_transform=None,
+    embolden=None,
     font_rel=FONT_REL,
 ):
     command = {
@@ -215,6 +216,8 @@ def glyph_run(
     }
     if glyph_transform is not None:
         command["glyph_transform"] = glyph_transform
+    if embolden is not None:
+        command["embolden"] = embolden
     return command
 
 
@@ -237,12 +240,31 @@ def write(name, document):
     print(f"wrote {os.path.relpath(path, ROOT)}")
 
 
-def decorated_run(layout, text, size, *, offset, decor_size, buffer, cache, glyph_transform=None):
+def decorated_run(
+    layout,
+    text,
+    size,
+    *,
+    offset,
+    decor_size,
+    buffer,
+    cache,
+    glyph_transform=None,
+    hint=False,
+    embolden=None,
+):
     """A fill run plus a skip-ink decoration, matching upstream
-    `render_decorated_text` (with hinting forced off; see module docstring)."""
+    `render_decorated_text` (with hinting forced off unless requested)."""
     glyphs = layout.run(text, size)
     x_end = glyphs[-1]["x"] + size * 0.6 if glyphs else 0.0
-    command = glyph_run(glyphs, size, atlas_cache=cache, glyph_transform=glyph_transform)
+    command = glyph_run(
+        glyphs,
+        size,
+        hint=hint,
+        atlas_cache=cache,
+        glyph_transform=glyph_transform,
+        embolden=embolden,
+    )
     command["decoration"] = {
         "x_range": [0.0, round(x_end, 6)],
         "baseline_y": 0.0,
@@ -266,6 +288,7 @@ def fill_run(
     style="fill",
     glyph_transform=None,
     hint=False,
+    embolden=None,
 ):
     return [
         {"op": "set_paint", "rgba8": color},
@@ -277,6 +300,7 @@ def fill_run(
             atlas_cache=cache,
             style=style,
             glyph_transform=glyph_transform,
+            embolden=embolden,
         ),
     ]
 
@@ -481,6 +505,7 @@ def main():
             "HELLO",
             "Happy",
             "éàöüñç",
+            "this is regular and emboldened text",
         ]
     )
 
@@ -886,6 +911,9 @@ def main():
     # G3e bitmap scenes (M3 T5).
     write_bitmap_scenes()
 
+    # M3 embolden scenes (synthetic dilation via kurbo expand_path).
+    write_embolden_scenes(layout)
+
 
 # ------------------------------------------------------------ bitmap scenes (M3 T5)
 
@@ -1063,6 +1091,78 @@ def write_bitmap_scenes():
             scene(210, 410, commands),
         )
 
+
+
+def write_embolden_scenes(layout):
+    """M3 embolden scenes (upstream `glyphs_emboldened` plus extra coverage).
+
+    Amounts are positive (upstream's `expand_path` contract).
+    """
+    # vello_tests::glyphs_emboldened: two hinted runs, the second dilated with
+    # `FontEmbolden::new(Diagonal2::new(1.0, 1.0))`.
+    fs = 44.0
+    text = "this is regular and emboldened text"
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        commands = [
+            {"op": "set_paint", "rgba8": REBECCA_PURPLE_HALF},
+            {"op": "set_transform", "affine": translate(0.0, fs)},
+            glyph_run(layout.run(text, fs), fs, hint=True, atlas_cache=cache),
+            {"op": "set_transform", "affine": translate(0.0, fs + 58.0)},
+            glyph_run(
+                layout.run(text, fs),
+                fs,
+                hint=True,
+                atlas_cache=cache,
+                embolden=[1.0, 1.0],
+            ),
+        ]
+        write(f"glyph_run_emboldened{suffix}_760x140.json", scene(760, 140, commands))
+
+    # Unhinted runs cache at the font's upem (2048 here), so the amount is
+    # scaled up to a visible sub-pixel dilation at 50 px; anisotropic to
+    # exercise both axes of the expansion matrix.
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        write(
+            f"glyph_run_emboldened_unhinted{suffix}_300x70.json",
+            scene(
+                300,
+                70,
+                fill_run(
+                    layout,
+                    "Hello, world!",
+                    50.0,
+                    50.0,
+                    REBECCA_PURPLE_HALF,
+                    cache,
+                    embolden=[40.0, 20.0],
+                ),
+            ),
+        )
+
+    # Skip-ink extents include the dilation: the decoration geometry must match
+    # the oracle's `render_decoration` with the same `FontEmbolden` settings.
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        write(
+            f"glyph_run_embolden_decoration{suffix}_300x70.json",
+            scene(
+                300,
+                70,
+                decorated_run(
+                    layout,
+                    "Hello, world!",
+                    50.0,
+                    offset=3.0,
+                    decor_size=2.0,
+                    buffer=1.5,
+                    cache=cache,
+                    hint=True,
+                    embolden=[1.0, 1.0],
+                ),
+            ),
+        )
 
 
 if __name__ == "__main__":

@@ -98,8 +98,10 @@ pub const MAX_EXTREMA: usize = 4;
 ///
 /// Upstream this trait exists only for `no_std` + `libm`; Zig's builtins and
 /// `std.math` provide the same operations, so these are thin delegates. The
-/// special-cased `signum` and `rem_euclid` match the upstream implementations
-/// exactly.
+/// special-cased `signum`, `rem_euclid` and `hypot` match the upstream
+/// implementations exactly (`hypot` is a port of the glibc 2.39 algorithm
+/// that Rust's `f64::hypot` calls on this platform; `std.math.hypot` differs
+/// from libm by 1 ULP on ~0.7% of finite inputs and canonicalizes NaNs).
 pub const FloatFuncs = struct {
     pub inline fn abs(x: f64) f64 {
         return @abs(x);
@@ -134,7 +136,7 @@ pub const FloatFuncs = struct {
     }
 
     pub inline fn hypot(x: f64, y: f64) f64 {
-        return std.math.hypot(x, y);
+        return hypotLibm(x, y);
     }
 
     pub inline fn ln(x: f64) f64 {
@@ -212,6 +214,88 @@ pub const FloatFuncs = struct {
         return r;
     }
 };
+
+/// `hypot` as glibc 2.39 computes it (`sysdeps/ieee754/dbl-64/e_hypot.c`),
+/// which is what Rust's `f64::hypot` calls on this platform.
+///
+/// Ported because `std.math.hypot` is musl-shaped: it canonicalizes NaNs to
+/// `+NaN` and disagrees with glibc by 1 ULP on ~0.7% of finite inputs. The
+/// subnormal/extreme-scale branches and the Borges correction are preserved
+/// expression-for-expression; x86-64 glibc is built without FMA, so the
+/// non-`__FP_FAST_FMA` kernel is used.
+fn hypotLibm(x_in: f64, y_in: f64) f64 {
+    // `!(isfinite(x) && isfinite(y))`.
+    if (!(std.math.isFinite(x_in) and std.math.isFinite(y_in))) {
+        if ((std.math.isInf(x_in) or std.math.isInf(y_in)) and
+            !isSignalingNan(x_in) and !isSignalingNan(y_in))
+        {
+            return std.math.inf(f64);
+        }
+        // glibc: `return x + y` (preserves the operand NaN sign and payload).
+        return x_in + y_in;
+    }
+
+    const x = @abs(x_in);
+    const y = @abs(y_in);
+
+    var ax = @max(x, y);
+    const ay = @min(x, y);
+
+    // If ax is huge, scale both inputs down.
+    if (ax > hypot_large_val) {
+        if (ay <= ax * hypot_eps) {
+            return ax + ay;
+        }
+        return hypotKernel(ax * hypot_scale, ay * hypot_scale) / hypot_scale;
+    }
+
+    // If ay is tiny, scale both inputs up.
+    if (ay < hypot_tiny_val) {
+        if (ax >= ay / hypot_eps) {
+            return ax + ay;
+        }
+        ax = hypotKernel(ax / hypot_scale, ay / hypot_scale) * hypot_scale;
+        return ax;
+    }
+
+    // Common case: ax is not huge and ay is not tiny.
+    if (ay <= ax * hypot_eps) {
+        return ax + ay;
+    }
+    return hypotKernel(ax, ay);
+}
+
+const hypot_scale: f64 = 0x1p-600;
+const hypot_large_val: f64 = 0x1p+511;
+const hypot_tiny_val: f64 = 0x1p-459;
+const hypot_eps: f64 = 0x1p-54;
+
+/// glibc's `kernel` for the `__FP_FAST_FMA`-less build.
+fn hypotKernel(ax: f64, ay: f64) f64 {
+    var h = @sqrt(ax * ax + ay * ay);
+    var t1: f64 = undefined;
+    var t2: f64 = undefined;
+    if (h <= 2.0 * ay) {
+        const delta = h - ay;
+        t1 = ax * (2.0 * delta - ax);
+        t2 = (delta - 2.0 * (ax - ay)) * delta;
+    } else {
+        const delta = h - ax;
+        t1 = 2.0 * delta * (ax - 2.0 * ay);
+        t2 = (4.0 * delta - ay) * ay + delta * delta;
+    }
+    h -= (t1 + t2) / (2.0 * h);
+    return h;
+}
+
+/// A signaling NaN: exponent all ones, mantissa non-zero and the quiet bit
+/// clear (glibc `issignaling_inline`).
+fn isSignalingNan(x: f64) bool {
+    const bits: u64 = @bitCast(x);
+    const exponent: u64 = (bits >> 52) & 0x7FF;
+    const mantissa: u64 = bits & 0xF_FFFF_FFFF_FFFF;
+    return exponent == 0x7FF and mantissa != 0 and (mantissa & (1 << 51)) == 0;
+}
 
 /// Counterpart of upstream `FloatExt::expand` for `f64`.
 pub inline fn expand(x: f64) f64 {
@@ -1242,4 +1326,53 @@ test "rootsBetweenQuintic finds simple roots" {
     for (roots.slice(), 0..) |r, i| {
         try testing.expect(@abs(r - @as(f64, @floatFromInt(i + 1))) < 1e-9);
     }
+}
+
+test "FloatFuncs.hypot matches glibc (NaN, infinity, and 1-ULP vectors)" {
+    const testing = std.testing;
+    const bits = struct {
+        fn of(x: f64) u64 {
+            return @bitCast(x);
+        }
+    }.of;
+
+    // NaN propagation preserves the operand's sign and payload (`x + y`),
+    // unlike `std.math.hypot`, which canonicalizes to +NaN.
+    const neg_nan: f64 = @bitCast(@as(u64, 0xfff800000000abcd));
+    const pos_nan: f64 = @bitCast(@as(u64, 0x7ff8000000001234));
+    try testing.expectEqual(@as(u64, 0xfff800000000abcd), bits(FloatFuncs.hypot(neg_nan, 1.0)));
+    try testing.expectEqual(@as(u64, 0xfff800000000abcd), bits(FloatFuncs.hypot(1.0, neg_nan)));
+    try testing.expectEqual(@as(u64, 0x7ff8000000001234), bits(FloatFuncs.hypot(pos_nan, 1.0)));
+    try testing.expectEqual(@as(u64, 0xfff800000000abcd), bits(FloatFuncs.hypot(neg_nan, pos_nan)));
+    try testing.expectEqual(@as(u64, 0x7ff8000000001234), bits(FloatFuncs.hypot(pos_nan, neg_nan)));
+    // Infinities win over NaN.
+    try testing.expectEqual(
+        @as(u64, 0x7ff0000000000000),
+        bits(FloatFuncs.hypot(-std.math.inf(f64), pos_nan)),
+    );
+    try testing.expectEqual(@as(u64, 0x7ff0000000000000), bits(FloatFuncs.hypot(1.0, std.math.inf(f64))));
+
+    // Known glibc-2.39 outputs, one of them a case where `std.math.hypot`
+    // differs by 1 ULP.
+    try testing.expectEqual(@as(f64, 5.0), FloatFuncs.hypot(3.0, 4.0));
+    try testing.expectEqual(@as(f64, 0.0), FloatFuncs.hypot(0.0, -0.0));
+    try testing.expectEqual(
+        @as(u64, 0x049e1663312ab48f),
+        bits(FloatFuncs.hypot(
+            @bitCast(@as(u64, 0x849e146a9c405048)),
+            @bitCast(@as(u64, 0x8445c7a6d6b5c2e8)),
+        )),
+    );
+    try testing.expectEqual(
+        @as(u64, 0x0637b5c904893efe),
+        bits(FloatFuncs.hypot(
+            @bitCast(@as(u64, 0x830c5b6efa2ea82e)),
+            @bitCast(@as(u64, 0x8637b5c904893efe)),
+        )),
+    );
+    // Extreme scales exercise the SCALE/TINY_VAL/LARGE_VAL branches.
+    try testing.expectEqual(@as(f64, 0x1p600), FloatFuncs.hypot(0x1p600, 0.0));
+    try testing.expectEqual(@as(f64, 0x1p-600), FloatFuncs.hypot(0x1p-600, 0.0));
+    try testing.expectEqual(@as(f64, 0x1p1023), FloatFuncs.hypot(0x1p1023, 0.0));
+    try testing.expectEqual(@as(f64, 0x1p-1074), FloatFuncs.hypot(0x1p-1074, 0.0));
 }

@@ -30,8 +30,10 @@
 //!   (`sbix`/`CBDT`/`EBDT` strikes, PNG decode); `atlas` — `GlyphAtlas`/
 //!   `GlyphCacheKey`/`AtlasCommandRecorder`/`ImageCache`; `interface` — the
 //!   comptime `DrawSink`/`GlyphRenderer` duck-typing contracts.
-//! - `NormalizedCoord = i16` and `FontEmbolden` — carried in cache keys for
-//!   API parity; non-default values are rejected with `error.Unsupported`.
+//! - `NormalizedCoord = i16` — carried in cache keys for API parity;
+//!   non-empty variation coordinates are rejected with `error.Unsupported`.
+//!   `FontEmbolden` is fully ported: `OutlineCache.getOrInsert` dilates the
+//!   drawn (hinted or unhinted) outline with `kurbo.expand_path`.
 //! - `util` — the `glifo` float/affine predicates used by run preparation.
 //!
 //! # Fixed-point contract
@@ -43,14 +45,15 @@
 //! # Deferred with typed errors
 //!
 //! Autohinting (fonts without `fpgm`/`prep` bytecode), `gvar`/`HVAR`/`avar`
-//! variation deltas (any non-empty coords), CFF/CFF2 and synthetic embolden
-//! are all `error.Unsupported`; none are approximated. TrueType hinting
-//! (M3 G3b), decoration (T5) and COLRv0/COLRv1 (T4, including gradients,
-//! transforms, clip boxes and composite modes) are ported, and embedded
-//! bitmaps (`sbix`/`CBDT`/`EBDT`, T5) resolve through the upstream
-//! COLR > bitmap > outline cascade with PNG decoding; `Bgra`/`Mask` payloads
-//! and PNG features outside the decoder (16-bit, Adam7) fall through to the
-//! outline branch exactly like upstream's `.ok()` filter.
+//! variation deltas (any non-empty coords) and CFF/CFF2 are all
+//! `error.Unsupported`; none are approximated. TrueType hinting
+//! (M3 G3b), decoration (T5), synthetic embolden (`kurbo.expand_path`) and
+//! COLRv0/COLRv1 (T4, including gradients, transforms, clip boxes and
+//! composite modes) are ported, and embedded bitmaps
+//! (`sbix`/`CBDT`/`EBDT`, T5) resolve through the upstream
+//! COLR > bitmap > outline cascade with PNG decoding (indexed/grayscale/RGB/
+//! gray-alpha/RGBA at 1–16 bits, including Adam7); `Bgra`/`Mask` payloads
+//! fall through to the outline branch exactly like upstream's `.ok()` filter.
 //!
 //! # Oracle comparison
 //!

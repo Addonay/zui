@@ -231,10 +231,10 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | Upstream module | Zig target | Status | Notes |
 | --- | --- | --- | --- |
 | `lib.rs`, `interface.rs` (Glyph, DrawSink, GlyphRenderer) | `glifo/root.zig`, `glifo/interface.zig` | port | comptime duck-typing contracts + `assert*` helpers |
-| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, `HintCache` (16-entry LRU), COLR > bitmap > outline draw loop, COLR metrics, skip-ink `renderDecoration`, bitmap transform + decode; embolden/coords -> typed `error.Unsupported`; TrueType hinting ported (M3 G3b, `glifo/hint.zig`) |
+| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, `HintCache` (16-entry LRU), COLR > bitmap > outline draw loop, COLR metrics, skip-ink `renderDecoration`, bitmap transform + decode, synthetic embolden (`kurbo.expandPath`); coords -> typed `error.Unsupported`; TrueType hinting ported (M3 G3b, `glifo/hint.zig`) |
 | `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline/bitmap/COLR fill/stroke, subpixel keys, COLR command recording, command replay, raster metrics, pending bitmap uploads |
 | `colr.rs` (COLR/CPAL painting) + `skrifa/src/color/*` | `glifo/colr.zig`, `glifo/tables/{colr,cpal}.zig` | port | COLRv0/v1 paint graph, gradients, transforms, clip boxes, composite modes, palette/foreground colors (M3 T4) |
-| `skrifa/src/bitmap.rs` + `read-fonts` `sbix`/`CBDT`/`CBLC`/`EBDT`/`EBLC` | `glifo/tables/bitmap.zig`, `glifo/png.zig` | port | strike selection (sbix > CBDT > EBDT, nearest strike), CBLC/EBLC index subtable formats 1–5, CBDT/EBDT record decode (PNG/BGRA/mask), sbix glyph records, png 0.18-compatible decode; 16-bit/Adam7 -> typed `error.Unsupported` (M3 T5) |
+| `skrifa/src/bitmap.rs` + `read-fonts` `sbix`/`CBDT`/`CBLC`/`EBDT`/`EBLC` | `glifo/tables/bitmap.zig`, `glifo/png.zig` | port | strike selection (sbix > CBDT > EBDT, nearest strike), CBLC/EBLC index subtable formats 1–5, CBDT/EBDT record decode (PNG/BGRA/mask), sbix glyph records, png 0.18-compatible decode including 16-bit `STRIP_16` and sparse Adam7 (M3 T5) |
 | `atlas/*` (cache, keys, regions, commands) | `glifo/atlas/*.zig` | port | cache/eviction, fixed-seed key hashing, recorder + replay; variable-font second-level map deferred with `gvar` |
 | `util.rs` | `glifo/util.zig` | port | T2 |
 
@@ -456,9 +456,9 @@ of panics, thread ownership).
 ### Milestone 3 — Glyph rendering and Cozmic adapter
 
 - **Status (2026-09-12):** outline subset, atlas cache, COLR (G3c), hinting
-  (G3b), decoration and the Cozmic adapter (T5) and embedded bitmaps (G3e)
-  are landed (T1–T5); autohint, `gvar`/variation, CFF and embolden remain
-  staged with typed `error.Unsupported`.
+  (G3b), decoration and the Cozmic adapter (T5), embedded bitmaps (G3e) and
+  synthetic embolden are landed (T1–T5); autohint, `gvar`/variation and CFF
+  remain staged with typed `error.Unsupported`.
 - `glifo` port; stable font identity/face index/variation/glyph/size/placement
   contract; monochrome + COLR behavior; cache invalidation.
 - **Gate:** glyph corpus renders match upstream for the same font resources;
@@ -964,3 +964,44 @@ of panics, thread ownership).
   llvmpipe. `sbix`/`EBDT` have synthetic-font unit tests only (no pinned
   asset); PNG 16-bit/Adam7 is typed `error.Unsupported` and falls through to
   outlines.
+- 2026-09-12 (branch `vellz-embolden`): **M3 remainder closed — synthetic
+  embolden + PNG 16-bit/Adam7.** Ported kurbo `arc.rs` (`Arc`,
+  `to_cubic_beziers`, shared with `stroke.zig`) and `expand.rs` (`Diagonal2`,
+  `expand_path`/`expand_path_signed`, the `close_subpaths` area-sign probe,
+  Borges-style quadratic/cubic offset math) into `kurbo/arc.zig` and
+  `kurbo/expand.zig`; the ported upstream area/perimeter goldens and the
+  stroke suite confirm numerical order. `FontEmbolden` now flows from
+  `GlyphRunBuilder.fontEmbolden` through `prepareGlyphRun` into every outline
+  cache lookup, and `OutlineCache.getOrInsert` dilates the drawn (hinted or
+  unhinted) outline with `expand_path` before computing the cached bbox; the
+  outline/atlas keys already carried the amount/join/miter/tolerance bits, so
+  embolden variants cache separately, and decoration skip-ink uses the
+  dilated extents. The Cozmic adapter forwards and renders embolden; its
+  bridge test asserts byte-identical pixels against a direct emboldened
+  `glyph_run` and that dilation changes the ink. `FloatFuncs.hypot` was
+  replaced with a port of glibc 2.39's `e_hypot.c` (the function Rust's
+  `f64::hypot` calls here): `std.math.hypot` canonicalizes NaNs and differs
+  by 1 ULP on ~0.7% of finite inputs. `--dump-glyphs --embolden X,Y`
+  (oracle + CLI, f64 bit patterns) extends `tools/compare_glyphs.sh` and the
+  manifest with 4 embolden vectors (unhinted/hinted, isotropic/anisotropic,
+  gids 0-900): `zig build glyphs` = 24 glyph + 3 cmap vectors, 530,438
+  elements / 1,470,980 coordinates, tolerance 0. Six new scenes mirror
+  upstream `glyphs_emboldened` (760x140 hinted plain/emboldened pair), an
+  anisotropic unhinted run, and skip-ink decoration with dilation, cache
+  off/on: all byte-exact, `zig build corpus` = 114/114. Degenerate
+  zero-factor expansions produce NaN geometry upstream too; NaN sign/payload
+  is not stable across LLVM codegen, so the gate uses positive amounts
+  (upstream's documented `expand_path` contract) and rendering is unaffected
+  (both renderers ignore NaN path elements). PNG: `glifo/png.zig` decodes
+  16-bit payloads exactly like `normalize_to_color8() | ALPHA`
+  (`transform_row_strip16`, plus the `expand_trns_and_strip_line16` alpha
+  comparison on the raw 16-bit sample bytes) and Adam7 with the default
+  sparse deinterlacer (filter reset per pass, transform-then-scatter),
+  covered by unit tests against externally (Python zlib) encoded streams; the
+  pinned fonts only carry 8-bit non-interlaced PNGs, so no corpus scene gates
+  16-bit/Adam7 end to end. Evidence: `zig build test` = 895/895 (878 lib +
+  8 scene + 4 adapter + 5 Cozmic bridge), `zig build corpus` =
+  114/114 byte-exact at tolerance 0 in Debug/ReleaseSafe/ReleaseFast,
+  `zig build glyphs` pass, `zig build probe` byte-exact. Remaining typed
+  `error.Unsupported`: CFF/CFF2 outlines, variation coordinates,
+  autohinting, `Bgra`/`Mask` bitmap payloads.

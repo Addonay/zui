@@ -317,8 +317,12 @@ outlines). The oracle renders these scenes byte-identically with `hint(true)`
 `sbix` and `EBDT`/`EBLC` are ported at the table level (`tables/bitmap.zig`)
 and covered by synthetic-font unit tests (strike selection, glyph records,
 EBDT mask formats); the pinned checkout ships no `sbix`/`EBDT` asset, so no
-scene gates them end to end. `Bgra`/`Mask` payloads and PNG 16-bit/Adam7 fall
-through to the outline branch, matching upstream `glifo`'s `.ok()` filter.
+scene gates them end to end. `Bgra`/`Mask` payloads fall through to the
+outline branch, matching upstream `glifo`'s `.ok()` filter. PNG 16-bit and
+Adam7 payloads are decoded like `png 0.18` (`STRIP_16` high-byte strip and
+sparse Adam7 deinterleaving) and covered by unit tests against externally
+encoded streams; the pinned fonts only carry 8-bit non-interlaced PNGs, so no
+corpus scene gates those payloads end to end.
 
 Cache-on vs cache-off: the bitmap cache key carries the strike's own ppem
 (109) instead of the run size, and the decoded pixmap is queued as a

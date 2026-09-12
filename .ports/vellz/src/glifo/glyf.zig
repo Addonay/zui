@@ -24,9 +24,8 @@
 //! Deferred with typed errors: HarfBuzz path style (`error.Unsupported`),
 //! non-empty variation coordinates (`error.Unsupported`; `gvar`/`HVAR` deltas
 //! are not ported), CFF/bitmap faces (rejected by `font.Font.outlines`),
-//! autohinter-only fonts (`prefer_interpreter == false`), `hdmx` advances
-//! outside backward compatibility, and embolden (rejected by the outline
-//! cache).
+//! autohinter-only fonts (`prefer_interpreter == false`), and `hdmx` advances
+//! outside backward compatibility.
 
 const std = @import("std");
 

@@ -1898,7 +1898,7 @@ test "non-empty variation coordinates are rejected; embolden is prepared" {
     var with_embolden = base;
     with_embolden.font_embolden = FontEmbolden.new(.{ 1.0, 0.0 });
     const prepared = try prepareGlyphRun(with_embolden);
-    try testing.expectEqual([2]f32{ 1.0, 0.0 }, prepared.font_embolden.amount);
+    try testing.expectEqual([2]f64{ 1.0, 0.0 }, prepared.font_embolden.amount);
 }
 
 test "unhinted run absorbs uniform scale" {

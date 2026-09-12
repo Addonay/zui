@@ -29,10 +29,10 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 879/879 unit and integration tests (862 lib + 8 scene
+zig build test     # 895/895 unit and integration tests (878 lib + 8 scene
                    #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
                    #   the .ports/cozmic sibling checkout is absent)
-zig build corpus   # 108/108 corpus scenes byte-exact vs the upstream oracle
+zig build corpus   # 114/114 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo (hinted + unhinted)
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
@@ -89,10 +89,14 @@ COLR > bitmap > outline cascade with the pending-upload atlas path and a
 `png 0.18`-compatible decoder, plus a 5-scene G3e bitmap corpus (Noto CBTF
 colour emoji: fill, stroke, cache on/off, transform-composition rows). `sbix`
 and `EBDT`/`EBLC` are covered by synthetic-font unit tests (the pinned assets
-gate `CBDT`/`CBLC` end to end); PNG 16-bit/Adam7 payloads fall through to the
-outline branch. All of
+gate `CBDT`/`CBLC` end to end); PNG 16-bit and Adam7 payloads are decoded
+like `png 0.18` (`STRIP_16` high-byte strip, sparse deinterleaving) and
+unit-tested against synthetic streams because the pinned fonts only carry
+8-bit non-interlaced PNGs. Synthetic embolden (`FontEmbolden` +
+`kurbo.expandPath`) is ported end to end, including atlas/outline cache keys
+and decoration skip-ink extents. All of
 it renders byte-exact against the pinned oracle, atlas cache on and off
-(108/108 corpus, tolerance 0). The GPU side has the wgpu-native device
+(114/114 corpus, tolerance 0). The GPU side has the wgpu-native device
 bootstrap, the full host/shader layout
 contract, the schedule/layer executor, encoded paints (gradients and images),
 GPU filters, and a 44-scene `gpu-corpus` gate (27 byte-exact, the rest within

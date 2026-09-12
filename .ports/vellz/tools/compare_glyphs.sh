@@ -52,6 +52,9 @@ if [ ! -x "$oracle" ]; then
     needs_oracle_build=1
 elif "$oracle" --dump-glyphs 2>&1 | grep -q "unknown argument"; then
     needs_oracle_build=1
+elif "$oracle" --dump-glyphs --embolden 1,1 2>&1 | grep -q "unknown argument"; then
+    # Binary predates `--embolden`; the emboldened vectors would fail.
+    needs_oracle_build=1
 fi
 if [ "$needs_oracle_build" -eq 1 ]; then
     echo "building vellz-oracle..."
@@ -67,7 +70,8 @@ fi
 
 mkdir -p "$out" "$(dirname "$manifest")"
 
-# font filename, size in px, first gid, last gid, hint (n = unhinted, h = hinted)
+# font filename, size in px, first gid, last gid, hint (n = unhinted, h = hinted),
+# optional embolden "X,Y" (defaults to none)
 glyph_vectors=(
     "Roboto-Regular.ttf 12.0 0 1293"
     "Roboto-Regular.ttf 16.0 0 1293"
@@ -92,6 +96,16 @@ glyph_vectors=(
     "Roboto-Regular.ttf 100.0 0 1293 h"
     "Roboto-Regular.ttf 0.5 0 1293 h"
     "Roboto-Regular.ttf 2048.0 0 1293 h"
+    # M3 embolden: `kurbo::expand_path` applied to the drawn (hinted or
+    # unhinted) outline, matching `OutlineCache.getOrInsert`. Isotropic and
+    # anisotropic amounts, both hint modes. Amounts are positive (upstream's
+    # `expand_path` contract); a zero factor makes upstream produce NaN
+    # geometry, whose NaN sign/payload is not stable across LLVM codegen
+    # (rendering is unaffected because NaN path elements are ignored).
+    "Roboto-Regular.ttf 16.0 0 300 - 1.0,1.0"
+    "Roboto-Regular.ttf 16.0 0 300 h 1.0,1.0"
+    "Roboto-Regular.ttf 23.5 300 600 - 2.0,1.0"
+    "Roboto-Regular.ttf 12.0 600 900 h 0.5,1.5"
 )
 
 # font filename, first codepoint, last codepoint
@@ -125,7 +139,7 @@ total_coordinates=0
 
 glyph_rows=""
 for vector in "${glyph_vectors[@]}"; do
-    read -r font size gid_start gid_end hint_flag <<<"$vector"
+    read -r font size gid_start gid_end hint_flag embolden_spec <<<"$vector"
     name="${font%.ttf}_s${size}_${gid_start}-${gid_end}"
     hint_arg=""
     manifest_hint="false"
@@ -134,11 +148,22 @@ for vector in "${glyph_vectors[@]}"; do
         hint_arg="--hint"
         manifest_hint="true"
     fi
+    emb_arg=""
+    manifest_emb_x="0"
+    manifest_emb_y="0"
+    if [ -n "${embolden_spec:-}" ] && [ "$embolden_spec" != "-" ]; then
+        emb_arg="--embolden $embolden_spec"
+        emb_x="${embolden_spec%,*}"
+        emb_y="${embolden_spec#*,}"
+        manifest_emb_x="$(python3 -c 'import struct,sys; print("0x%016x" % struct.unpack("<Q", struct.pack("<d", float(sys.argv[1])))[0])' "$emb_x")"
+        manifest_emb_y="$(python3 -c 'import struct,sys; print("0x%016x" % struct.unpack("<Q", struct.pack("<d", float(sys.argv[1])))[0])' "$emb_y")"
+        name="${name}_emb${emb_x//./p}_${emb_y//./p}"
+    fi
     oracle_dump="$out/oracle_$name.txt"
     zig_dump="$out/zig_$name.txt"
-    "$oracle" --dump-glyphs --font "$fonts_dir/$font" --size "$size" $hint_arg \
+    "$oracle" --dump-glyphs --font "$fonts_dir/$font" --size "$size" $hint_arg $emb_arg \
         --gids "$gid_start-$gid_end" >"$oracle_dump"
-    "$cli" --dump-glyphs --font "$fonts_dir/$font" --size "$size" $hint_arg \
+    "$cli" --dump-glyphs --font "$fonts_dir/$font" --size "$size" $hint_arg $emb_arg \
         --gids "$gid_start-$gid_end" >"$zig_dump"
     count_elements="$(elements "$oracle_dump")"
     count_coordinates="$(coordinates "$oracle_dump")"
@@ -156,7 +181,7 @@ for vector in "${glyph_vectors[@]}"; do
         hex="$(sha256sum "$oracle_dump" | awk '{print $1}')"
         bytes="$(printf '%s' "$hex" | sed 's/../0x&, /g')"
         size_bits="$(python3 -c 'import struct,sys; print("%08x" % struct.unpack("<I", struct.pack("<f", float(sys.argv[1])))[0])' "$size")"
-        glyph_rows+="    .{ .font = $(font_id "$font"), .size_bits = 0x$size_bits, .gid_start = $gid_start, .gid_end = $gid_end, .hint = $manifest_hint, .elements = $count_elements, .coordinates = $count_coordinates, .sha256 = .{ $bytes} },\n"
+        glyph_rows+="    .{ .font = $(font_id "$font"), .size_bits = 0x$size_bits, .gid_start = $gid_start, .gid_end = $gid_end, .hint = $manifest_hint, .embolden_x_bits = $manifest_emb_x, .embolden_y_bits = $manifest_emb_y, .elements = $count_elements, .coordinates = $count_coordinates, .sha256 = .{ $bytes} },\n"
     fi
 done
 
@@ -209,6 +234,8 @@ if [ "$update_manifest" -eq 1 ]; then
         echo "    gid_start: u32,"
         echo "    gid_end: u32,"
         echo "    hint: bool,"
+        echo "    embolden_x_bits: u64,"
+        echo "    embolden_y_bits: u64,"
         echo "    elements: usize,"
         echo "    coordinates: usize,"
         echo "    sha256: [32]u8,"

@@ -199,7 +199,7 @@ const Recorder = struct {
     run_sizes: std.ArrayListUnmanaged(f32) = .empty,
     run_fonts: std.ArrayListUnmanaged(usize) = .empty,
     run_styles: std.ArrayListUnmanaged(Style) = .empty,
-    run_emboldens: std.ArrayListUnmanaged([2]f32) = .empty,
+    run_emboldens: std.ArrayListUnmanaged([2]f64) = .empty,
     resolve_calls: usize = 0,
     atlas_cache_calls: usize = 0,
     last_atlas_cache: bool = false,
@@ -408,7 +408,7 @@ test "adapter forwards non-default embolden verbatim" {
     });
     try testing.expectEqual(@as(usize, 1), recorder.glyphs.items.len);
     try testing.expectEqualDeep(
-        [2]f32{ 1.0, 0.0 },
+        [2]f64{ 1.0, 0.0 },
         recorder.run_emboldens.items[0],
     );
 }

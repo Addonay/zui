@@ -245,7 +245,7 @@ pub const GlyphRun = struct {
     transform: Affine, scene_paint_transform: Affine,
     glyph_transform: ?Affine, normalized_coords: []const NormalizedCoord, hint: bool,
 };
-pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun; // no hint cache; error.Unsupported: embolden/coords
+pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun; // no hint cache; error.Unsupported: variation coords
 pub fn prepareGlyphRunWithCache(run, hint_cache: ?*HintCache, allocator) Error!PreparedGlyphRun;
 pub fn GlyphRunBuilder(comptime Backend: type) type; // fontSize/fontEmbolden/glyphTransform/hint/
                                                      // normalizedCoords/atlasCache/fillGlyphs/strokeGlyphs
@@ -303,9 +303,15 @@ pub fn RenderContext.glyphRun(self, resources, font) GlyphRunBuilder;
   pinned oracle (`--dump-decoration`).
 - Embedded bitmaps (T5) are ported: `sbix`/`CBDT`/`EBDT` strike selection,
   `calculate_bitmap_transform`, direct pixmap sampling and the atlas upload
-  path. `Bgra`/`Mask` payloads and PNG features outside the decoder (16-bit,
-  Adam7) fall through to the outline branch, exactly like upstream's
-  `.ok()`-filtered `Pixmap::from_png`.
+  path. `Bgra`/`Mask` payloads fall through to the outline branch, exactly
+  like upstream's `.ok()`-filtered `Pixmap::from_png`. The PNG decoder
+  handles 16-bit payloads (`STRIP_16` high-byte strip) and Adam7
+  deinterlacing; the pinned fonts only carry 8-bit non-interlaced PNGs, so
+  those paths are unit-tested against synthetic streams, not corpus scenes.
+- Synthetic embolden is ported: `FontEmbolden` flows through run preparation
+  into every outline cache lookup, and `OutlineCache.getOrInsert` dilates the
+  drawn (hinted or unhinted) outline with `kurbo.expandPath` before computing
+  the cached bbox; keys and skip-ink extents include the embolden parameters.
 - Deferred with typed errors, never approximated: autohinting (a hinted run on
   a font without `fpgm`/`prep` fails up front), `hdmx` advances outside
   backward compatibility, `gvar`/`HVAR` coordinates, CFF/CFF2.

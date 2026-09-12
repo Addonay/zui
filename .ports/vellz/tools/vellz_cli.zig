@@ -40,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
     var font_index: u32 = 0;
     var font_size: ?f32 = null;
     var hint = false;
+    var embolden: ?[2]f64 = null;
     var level_override: ?[]const u8 = null;
     var id_specs: std.ArrayList([]const u8) = .empty;
     defer id_specs.deinit(allocator);
@@ -64,6 +65,13 @@ pub fn main(init: std.process.Init) !void {
             font_size = std.fmt.parseFloat(f32, value) catch return usage();
         } else if (std.mem.eql(u8, arg, "--hint")) {
             hint = true;
+        } else if (std.mem.eql(u8, arg, "--embolden")) {
+            const value = args_iter.next() orelse return usage();
+            const comma = std.mem.indexOfScalar(u8, value, ',') orelse return usage();
+            embolden = .{
+                std.fmt.parseFloat(f64, value[0..comma]) catch return usage(),
+                std.fmt.parseFloat(f64, value[comma + 1 ..]) catch return usage(),
+            };
         } else if (std.mem.eql(u8, arg, "--level")) {
             level_override = args_iter.next() orelse return usage();
         } else if (std.mem.eql(u8, arg, "--gids") or std.mem.eql(u8, arg, "--codepoints")) {
@@ -88,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
         );
         defer allocator.free(blob);
         if (dump_glyphs) {
-            return runDumpGlyphs(allocator, io, blob, font_index, font_size orelse return usage(), hint, id_specs.items);
+            return runDumpGlyphs(allocator, io, blob, font_index, font_size orelse return usage(), hint, embolden, id_specs.items);
         }
         return runDumpCmap(allocator, io, blob, font_index, id_specs.items);
     }
@@ -114,7 +122,7 @@ fn usage() error{InvalidArguments} {
     std.debug.print(
         "usage: vellz-cli --scene SCENE.json --out OUT.rgba [--level fallback|native|avx2|...]\n" ++
             "       vellz-cli --probe [--out OUT.rgba]\n" ++
-            "       vellz-cli --dump-glyphs --font FONT [--index N] [--hint] --size PPEM --gids 1,3,5-9\n" ++
+            "       vellz-cli --dump-glyphs --font FONT [--index N] [--hint] [--embolden X,Y] --size PPEM --gids 1,3,5-9\n" ++
             "       vellz-cli --dump-cmap --font FONT [--index N] --codepoints 65,0x1F600\n",
         .{},
     );
@@ -131,6 +139,7 @@ fn runDumpGlyphs(
     font_index: u32,
     size: f32,
     hint: bool,
+    embolden: ?[2]f64,
     id_specs: []const []const u8,
 ) !void {
     const glifo = vellz.glifo;
@@ -153,6 +162,7 @@ fn runDumpGlyphs(
         font_index,
         size,
         hint,
+        embolden,
         gids.items,
     ) catch |err| {
         std.debug.print("vellz-cli: dumping glyphs: {s}\n", .{@errorName(err)});
@@ -437,7 +447,10 @@ fn renderGlyphRun(
         .hint(spec.hint)
         .atlasCache(spec.atlas_cache);
     if (spec.embolden) |amount| {
-        builder = builder.fontEmbolden(glifo.FontEmbolden.new(amount));
+        builder = builder.fontEmbolden(glifo.FontEmbolden.new(.{
+            @as(f64, amount[0]),
+            @as(f64, amount[1]),
+        }));
     }
     if (spec.glyph_transform) |transform| {
         builder = builder.glyphTransform(kurbo.Affine.new(transform));

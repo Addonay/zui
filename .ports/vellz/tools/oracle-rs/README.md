@@ -74,7 +74,15 @@ inclusive `start-end` ranges, and may be repeated. `--font`, `--index`,
 with `skrifa`'s `DrawSettings::unhinted(Size::new(size), LocationRef::default())`
 and the default `PathStyle::FreeType`; that is exactly the call
 `glifo 0.3.0`'s `OutlineCache` makes for an unhinted run, and the dump also
-carries the resulting adjusted `lsb`/`advance`.
+carries the resulting adjusted `lsb`/`advance`. With `--hint` it uses the same
+`HintingInstance`/`HintingOptions` as a hinted run and adds a `hint 1` marker.
+
+`--embolden X,Y` adds synthetic embolden: the drawn outline is dilated with
+`kurbo::expand_path` (miter join, miter limit 4.0, tolerance 0.1) before the
+dump, exactly like `OutlineCacheSession::get_or_insert`, and the dump then
+emits an `embolden <x-f64-bits> <y-f64-bits>` marker and f64 bit patterns.
+Amounts should be positive (upstream's contract); a zero factor produces NaN
+geometry whose NaN sign/payload is not stable across LLVM codegen.
 
 Fixture hashes for the vectors gated by `zig build test` live in
 `tests/fixtures/glyphs/manifest.zig`; regenerate them with
@@ -260,13 +268,14 @@ positioned glyph list, so the oracle and vellz receive identical inputs.
 | --- | --- |
 | `font` | `asset` is relative to the scene file; `index` selects a TTC face |
 | `font_size` | pixels per em |
-| `hint` | default `true` (upstream); the M3 corpus uses `false` because the interpreter is not ported yet |
+| `hint` | default `true` (upstream); the ported TrueType interpreter runs hinted runs |
 | `glyph_transform` | optional affine applied per glyph (after positioning) |
 | `atlas_cache` | optional; toggles the glyph atlas path |
 | `style` | `fill` (default) or `stroke` (uses the current `set_stroke`) |
 | `glyphs` | `{id, x, y}` list; `id` is the font glyph id from `--dump-cmap` |
-| `embolden` / `normalized_coords` | parsed and rejected with an explicit error until ported (`error.Unsupported`) |
-| `decoration` | parsed and rejected with an explicit error until T5 |
+| `embolden` | optional `[x, y]`; synthetic dilation via `kurbo::expand_path` (positive amounts) |
+| `normalized_coords` | parsed and rejected with an explicit error until `gvar` is ported (`error.Unsupported`) |
+| `decoration` | skip-ink span computation (`render_decoration`), compare with `--dump-decoration` |
 
 The current scene transform and `set_paint_transform` are captured by
 `RenderContext::glyph_run` exactly as in `vello_cpu`, so the usual commands
