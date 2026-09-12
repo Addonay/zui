@@ -5,12 +5,19 @@
 //! and the oracle dump code stay format-agnostic (`glifo`'s
 //! `OutlineGlyphCollection`/`OutlineGlyphFormat` equivalent).
 //!
+//! adapt: upstream's `OutlineGlyphCollection` is a trait-object-like enum whose
+//! `get(gid)` returns `Option<OutlineGlyph>`; Zig has no trait objects, so the
+//! two concrete scalers are wrapped in a tagged union with the same method
+//! surface. `hasGlyph` is the format-neutral `get(gid).is_some()`; `getGlyph`
+//! (the `read-fonts` `Glyph` value used for `sbix` bearings) only exists for
+//! `glyf`, and CFF reports `error.Unsupported`.
+//!
 //! The wrapper keeps the `glyf`-specific surface (`getGlyph` for `sbix`
 //! y-bearings and COLR outline clips) but callers that need a format-neutral
 //! "has an outline" check use `hasGlyph`. CFF rows report
-//! `error.Unsupported` for `getGlyph`, because a `read-fonts` `Glyph` value
-//! only exists for `glyf`; CFF hinting is likewise `error.Unsupported`
-//! (see `cff.zig`).
+//! `error.Unsupported` for `getGlyph` and `createHintInstance`, because a
+//! `read-fonts` `Glyph` value only exists for `glyf` and CFF hinting is
+//! deferred (see `cff.zig`).
 
 const std = @import("std");
 

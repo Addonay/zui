@@ -51,9 +51,12 @@ pub const ItemVariationStore = struct {
             return error.InvalidVariationStoreIndex;
         }
         const entry = 8 + 4 * index;
+        // A truncated offsets array reads as empty (generated
+        // `read_array(..).ok().unwrap_or_default()`), so `get` returns None.
         const offset = sfnt.readU32(self.data, entry) orelse
             return error.InvalidVariationStoreIndex;
-        if (offset == 0 or offset > self.data.len) return error.InvalidVariationStoreIndex;
+        if (offset == 0) return error.InvalidVariationStoreIndex;
+        if (offset > self.data.len) return error.OutOfBounds;
         return ItemVariationData.parse(self.data[offset..]);
     }
 };

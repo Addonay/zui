@@ -147,10 +147,13 @@ pub const OutlineCache = struct {
 
     /// Looks up, or draws and stores, the outline for `gid`.
     ///
-    /// `hint_instance` runs the TrueType interpreter (configured for `size`)
-    /// and makes the cache key hint-distinct; `null` draws unhinted. Rejects
-    /// the remaining deferred inputs with `error.Unsupported`: non-empty
-    /// variation coordinates and non-default embolden.
+    /// `outlines` is the `glyf`/CFF dispatch union; `hint_instance` runs the
+    /// TrueType interpreter (configured for `size`) and makes the cache key
+    /// hint-distinct; `null` draws unhinted. CFF faces reject an enabled hint
+    /// instance with `error.Unsupported` and accept `null` (and an explicitly
+    /// disabled instance, matching upstream). Rejects the remaining deferred
+    /// inputs with `error.Unsupported`: non-empty variation coordinates on a
+    /// face that needs unported deltas and non-default embolden.
     pub fn getOrInsert(
         self: *OutlineCache,
         allocator: std.mem.Allocator,

@@ -28,6 +28,13 @@
 //! - `HVAR` advance/lsb deltas: non-empty normalized coordinates on a face
 //!   with `HVAR` are `error.Unsupported` (the outline blend itself is exact);
 //! - CFF2 `seac`: the format has no charset; `error.Unsupported`.
+//!
+//! adapt: `skrifa`'s sink chain uses trait objects and infallible
+//! `OutlinePen` callbacks; here the sinks are comptime-generic (one
+//! instantiation per pen type) and their methods return the pen's error union
+//! because Zig pens allocate (`pen.zig`). The evaluator state machine, stack
+//! semantics and operation order are transcribed verbatim from
+//! `read-fonts/src/ps/cs.rs`.
 
 const std = @import("std");
 

@@ -544,6 +544,11 @@ fn sbixGlyph(font: font_mod.Font, strike: SbixStrike, glyph_id: GlyphId) ?Bitmap
 
 /// `glyph_metrics(Size::unscaled()).bounds(gid)` y-min in font units, or 0
 /// when the face has no `glyf` outline for the glyph.
+///
+/// adapt: a CFF face reports `error.Unsupported` from `getGlyph` (the
+/// `read-fonts` `Glyph` value is `glyf`-only), so a hypothetical `sbix`+CFF
+/// face falls back to 0 instead of skrifa's CFF bbox; no pinned fixture
+/// combines the two.
 fn glyphYMin(font: font_mod.Font, glyph_id: GlyphId) f32 {
     const outlines = font.outlines() catch return 0.0;
     const glyph = outlines.getGlyph(glyph_id) catch return 0.0;
