@@ -116,10 +116,15 @@ def dump_advances(glyph_ids):
         if len(parts) < 8 or parts[0] != "gid":
             continue
         advance = parts[-1]
+        # `--dump-glyphs` prints the f32 bit pattern as a hexadecimal word in
+        # natural (big-endian) order, so decode it big-endian. Decoding
+        # little-endian yields ~1e-38 denormals and collapses every run to
+        # x = 0; the M3 baseline scenes were generated that way (see the T5
+        # report; regenerating them is a separate task).
         advances[int(parts[1])] = (
             0.0
             if advance == "none"
-            else struct.unpack("<f", bytes.fromhex(advance))[0]
+            else struct.unpack(">f", bytes.fromhex(advance))[0]
         )
     return advances
 
@@ -199,6 +204,25 @@ def write(name, document):
     print(f"wrote {os.path.relpath(path, ROOT)}")
 
 
+def decorated_run(layout, text, size, *, offset, decor_size, buffer, cache, glyph_transform=None):
+    """A fill run plus a skip-ink decoration, matching upstream
+    `render_decorated_text` (with hinting forced off; see module docstring)."""
+    glyphs = layout.run(text, size)
+    x_end = glyphs[-1]["x"] + size * 0.6 if glyphs else 0.0
+    command = glyph_run(glyphs, size, atlas_cache=cache, glyph_transform=glyph_transform)
+    command["decoration"] = {
+        "x_range": [0.0, round(x_end, 6)],
+        "baseline_y": 0.0,
+        "offset": offset,
+        "size": decor_size,
+        "buffer": buffer,
+    }
+    return [
+        {"op": "set_paint", "rgba8": REBECCA_PURPLE},
+        command,
+    ]
+
+
 def fill_run(layout, text, size, baseline, color, cache, style="fill", glyph_transform=None):
     return [
         {"op": "set_paint", "rgba8": color},
@@ -226,6 +250,9 @@ def main():
             "consectetur adipiscing elit.",
             "Sed ornare arcu lectus.",
             "Hello World",
+            "Happy joyful",
+            "HELLO",
+            "Happy",
         ]
     )
 
@@ -385,6 +412,97 @@ def main():
             f"glyph_run_transform_composition_unhinted{suffix}_300x420.json",
             scene(300, 420, commands),
         )
+
+    # glyphs_decoration_offset_values / _size_values / _no_descenders:
+    # mirrors `vello_tests/tests/glyph.rs` with hinting forced off. The oracle
+    # renders these scenes exactly as written (the decoration pass uses the
+    # same `hint` flag as the fill pass here).
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        commands = []
+        for i, offset in enumerate([-6.0, -2.0, 0.0, 8.0, 15.0]):
+            y = 30.0 + i * 32.0
+            commands.append({"op": "set_transform", "affine": translate(0.0, y)})
+            commands.extend(
+                decorated_run(
+                    layout,
+                    "Happy joyful",
+                    30.0,
+                    offset=offset,
+                    decor_size=1.5,
+                    buffer=1.5,
+                    cache=cache,
+                )
+            )
+        write(
+            f"glyph_run_decoration_offset_values{suffix}_300x180.json",
+            scene(300, 180, commands),
+        )
+
+    commands = []
+    for i, decor_size in enumerate([0.5, 1.0, 2.0, 4.0]):
+        y = 30.0 + i * 38.0
+        commands.append({"op": "set_transform", "affine": translate(0.0, y)})
+        commands.extend(
+            decorated_run(
+                layout,
+                "Happy joyful",
+                30.0,
+                offset=-2.0,
+                decor_size=decor_size,
+                buffer=1.5,
+                cache=False,
+            )
+        )
+    write("glyph_run_decoration_size_values_180x180.json", scene(180, 180, commands))
+
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        commands = [{"op": "set_transform", "affine": translate(0.0, 50.0)}]
+        commands.extend(
+            decorated_run(
+                layout,
+                "HELLO",
+                50.0,
+                offset=-2.0,
+                decor_size=2.0,
+                buffer=1.5,
+                cache=cache,
+            )
+        )
+        write(
+            f"glyph_run_decoration_no_descenders{suffix}_180x70.json",
+            scene(180, 70, commands),
+        )
+
+    # glyphs_decoration_transformed: run-level scale absorption, glyph-level
+    # scale, Y-flip and a rotated run. `buffer` doubles as the row advance.
+    rows = [
+        (scale(2.0), 12.0, None, 30.0),
+        ([1, 0, 0, 1, 0, 0], 10.0, scale(1.2), 40.0),
+        (mul([1, 0, 0, -1, 0, 0], translate(0.0, 20.0)), 20.0, None, 10.0),
+        (rotate(math.pi / 4.0), 12.0, None, 40.0),
+    ]
+    commands = []
+    y = 30.0
+    for run_transform, font_size, glyph_transform, buffer in rows:
+        commands.append(
+            {"op": "set_transform", "affine": mul(translate(16.0, y), run_transform)}
+        )
+        commands.extend(
+            decorated_run(
+                layout,
+                "Happy",
+                font_size,
+                offset=-1.0,
+                decor_size=1.0,
+                buffer=1.0,
+                cache=False,
+                glyph_transform=glyph_transform,
+            )
+        )
+        y += buffer
+    write("glyph_run_decoration_transformed_100x150.json", scene(100, 150, commands))
 
     # glyphs_with_gradient: complex paints are never atlas-cached and exercise
     # the relative paint transform on all four composition rows.

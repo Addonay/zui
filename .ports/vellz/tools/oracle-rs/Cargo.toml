@@ -9,6 +9,9 @@ description = "Renders the vellz scene corpus with the pinned upstream vello_cpu
 # Path dependency into the pinned checkout. This crate is tooling only and is
 # never part of the distributed vellz package.
 vello_cpu = { path = "../../.reference/vello/vello_cpu", features = ["f32_pipeline"] }
+# Direct dependency for `--dump-decoration`, which drives glifo's skip-ink
+# span computation through a recording `DrawSink`.
+glifo = { path = "../../.reference/vello/glifo" }
 # Pinned scaler used by `--dump-glyphs`/`--dump-cmap`. Same version and
 # `PathStyle::FreeType` default that `glifo`'s outline cache draws with.
 skrifa = { version = "0.44.0", default-features = false, features = ["std"] }

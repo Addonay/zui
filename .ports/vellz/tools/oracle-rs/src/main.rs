@@ -8,7 +8,9 @@
 //! `--dump-glyphs` and `--dump-cmap` are the ground truth for the M3 `glifo`
 //! port: they emit the exact `skrifa 0.44.0` outline path elements (f32 bit
 //! patterns) and cmap mappings that `glifo 0.3.0` caches, so the Zig side can
-//! be byte-compared without rasterizing.
+//! be byte-compared without rasterizing. `--dump-decoration` prints the
+//! skip-ink rectangles of a `glyph_run` scene's `decoration` (f64 bit
+//! patterns), the ground truth for the Zig decoration port.
 //!
 //! This binary is development tooling. It is not distributed with the package.
 
@@ -550,6 +552,7 @@ fn run() -> Result<(), String> {
     match argv.first().map(String::as_str) {
         Some("--dump-glyphs") => return dump_glyphs(&argv[1..]),
         Some("--dump-cmap") => return dump_cmap(&argv[1..]),
+        Some("--dump-decoration") => return dump_decoration(&argv[1..]),
         _ => {}
     }
 
@@ -1024,8 +1027,9 @@ fn build_paint(spec: &PaintSpec, scene_dir: &Path) -> Result<PaintType, String> 
 
 /// Draw one positioned glyph run through the pinned upstream `glifo` stack.
 ///
-/// Deferred features (`decoration`, `embolden`, `normalized_coords`) are hard
-/// errors so a scene can never silently drop them.
+/// Deferred features (`embolden`, `normalized_coords`) are hard errors so a
+/// scene can never silently drop them. `decoration` draws after the
+/// fill/stroke pass, like the upstream decoration tests.
 fn draw_glyph_run(
     ctx: &mut RenderContext,
     resources: &mut vello_cpu::Resources,
@@ -1033,9 +1037,6 @@ fn draw_glyph_run(
     spec: &GlyphRunSpec,
     font_cache: &mut HashMap<(PathBuf, u32), FontData>,
 ) -> Result<(), String> {
-    if spec.decoration.is_some() {
-        return Err("glyph_run decoration is not ported yet (T5)".into());
-    }
     if let Some(embolden) = spec.embolden
         && (embolden[0] != 0.0 || embolden[1] != 0.0)
     {
@@ -1068,9 +1069,176 @@ fn draw_glyph_run(
         .collect();
 
     match spec.style.as_deref() {
-        None | Some("fill") => builder.fill_glyphs(glyphs.into_iter()),
-        Some("stroke") => builder.stroke_glyphs(glyphs.into_iter()),
+        None | Some("fill") => builder.fill_glyphs(glyphs.clone().into_iter()),
+        Some("stroke") => builder.stroke_glyphs(glyphs.clone().into_iter()),
         Some(other) => return Err(format!("unknown glyph_run style {other:?}")),
+    }
+
+    if let Some(decoration) = &spec.decoration {
+        let mut deco_builder = ctx
+            .glyph_run(resources, &font)
+            .font_size(spec.font_size)
+            .hint(spec.hint)
+            .atlas_cache(spec.atlas_cache);
+        if let Some(transform) = spec.glyph_transform {
+            deco_builder = deco_builder.glyph_transform(parse_affine(transform));
+        }
+        deco_builder.render_decoration(
+            glyphs.into_iter(),
+            decoration.x_range[0]..=decoration.x_range[1],
+            decoration.baseline_y,
+            decoration.offset,
+            decoration.size,
+            decoration.buffer,
+        );
+    }
+    Ok(())
+}
+
+/// Recording `DrawSink` for `--dump-decoration`.
+struct DecorationDumpSink {
+    width: u16,
+    height: u16,
+    rects: Vec<Rect>,
+}
+
+impl glifo::DrawSink for DecorationDumpSink {
+    fn set_transform(&mut self, _t: Affine) {}
+    fn set_paint(&mut self, _paint: glifo::AtlasPaint) {}
+    fn set_paint_transform(&mut self, _t: Affine) {}
+    fn fill_path(&mut self, _path: &BezPath) {}
+    fn fill_rect(&mut self, rect: &Rect) {
+        self.rects.push(*rect);
+    }
+    fn push_clip_layer(&mut self, _clip: &BezPath) {}
+    fn push_blend_layer(&mut self, _blend_mode: BlendMode) {}
+    fn pop_layer(&mut self) {}
+    fn width(&self) -> u16 {
+        self.width
+    }
+    fn height(&self) -> u16 {
+        self.height
+    }
+}
+
+/// Backend that routes `render_decoration` into a [`DecorationDumpSink`],
+/// bypassing the pixel renderer.
+struct DecorationDumpBackend<'a> {
+    sink: &'a mut DecorationDumpSink,
+    prep: glifo::GlyphPrepCache,
+}
+
+impl<'a> glifo::GlyphRunBackend<'a> for DecorationDumpBackend<'a> {
+    fn atlas_cache(self, _enabled: bool) -> Self {
+        self
+    }
+
+    fn fill_glyphs<Glyphs>(self, _run: glifo::GlyphRun<'a>, _glyphs: Glyphs)
+    where
+        Glyphs: Iterator<Item = glifo::Glyph> + Clone,
+    {
+    }
+
+    fn stroke_glyphs<Glyphs>(self, _run: glifo::GlyphRun<'a>, _glyphs: Glyphs)
+    where
+        Glyphs: Iterator<Item = glifo::Glyph> + Clone,
+    {
+    }
+
+    fn render_decoration<Glyphs>(
+        mut self,
+        run: glifo::GlyphRun<'a>,
+        glyphs: Glyphs,
+        x_range: std::ops::RangeInclusive<f32>,
+        baseline_y: f32,
+        offset: f32,
+        size: f32,
+        buffer: f32,
+    ) where
+        Glyphs: Iterator<Item = glifo::Glyph> + Clone,
+    {
+        let sink = self.sink;
+        let mut renderer = run.build(glyphs, self.prep.as_mut(), glifo::AtlasCacher::Disabled);
+        renderer.render_decoration(x_range, baseline_y, offset, size, buffer, sink);
+    }
+}
+
+/// `--dump-decoration --scene PATH` prints, for every decorated `glyph_run`
+/// command, the skip-ink rectangles as f64 bit patterns. Shapes the Zig
+/// decoration tests can compare against without rasterizing.
+fn dump_decoration(args: &[String]) -> Result<(), String> {
+    let mut scene_path: Option<PathBuf> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--scene" => scene_path = Some(iter.next().ok_or("--scene needs a value")?.into()),
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    let scene_path = scene_path.ok_or("missing --scene PATH")?;
+    let scene_text = std::fs::read_to_string(&scene_path)
+        .map_err(|e| format!("reading {}: {e}", scene_path.display()))?;
+    let scene: Scene = serde_json::from_str(&scene_text)
+        .map_err(|e| format!("parsing {}: {e}", scene_path.display()))?;
+    let scene_dir = match scene_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+
+    let mut font_cache: HashMap<(PathBuf, u32), FontData> = HashMap::new();
+    for (command_index, command) in scene.commands.iter().enumerate() {
+        let Command::GlyphRun(spec) = command else {
+            continue;
+        };
+        let Some(decoration) = &spec.decoration else {
+            continue;
+        };
+        let font = load_font(scene_dir, &spec.font, &mut font_cache)?;
+        let glyphs: Vec<Glyph> = spec
+            .glyphs
+            .iter()
+            .map(|glyph| Glyph {
+                id: glyph.id,
+                x: glyph.x,
+                y: glyph.y,
+            })
+            .collect();
+
+        let mut sink = DecorationDumpSink {
+            width: scene.width,
+            height: scene.height,
+            rects: Vec::new(),
+        };
+        {
+            let backend = DecorationDumpBackend {
+                sink: &mut sink,
+                prep: glifo::GlyphPrepCache::default(),
+            };
+            let mut builder =
+                glifo::GlyphRunBuilder::new(font, Affine::IDENTITY, Affine::IDENTITY, backend)
+                    .font_size(spec.font_size)
+                    .hint(spec.hint);
+            if let Some(transform) = spec.glyph_transform {
+                builder = builder.glyph_transform(parse_affine(transform));
+            }
+            builder.render_decoration(
+                glyphs.into_iter(),
+                decoration.x_range[0]..=decoration.x_range[1],
+                decoration.baseline_y,
+                decoration.offset,
+                decoration.size,
+                decoration.buffer,
+            );
+        }
+        for rect in &sink.rects {
+            println!(
+                "command={command_index} x0={:016x} y0={:016x} x1={:016x} y1={:016x}",
+                rect.x0.to_bits(),
+                rect.y0.to_bits(),
+                rect.x1.to_bits(),
+                rect.y1.to_bits(),
+            );
+        }
     }
     Ok(())
 }

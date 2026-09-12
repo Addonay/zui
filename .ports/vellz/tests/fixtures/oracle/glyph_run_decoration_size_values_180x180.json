@@ -1,0 +1,13 @@
+{
+  "height": 180,
+  "level": "fallback",
+  "oracle": "vellz-oracle 0.1.0",
+  "output_fnv1a": "06088e377d3ce3be",
+  "pixel_format": "rgba8-premultiplied-srgb",
+  "render_mode": "quality",
+  "scene_fnv1a": "936b0ead2a12dc7f",
+  "threads": 0,
+  "vello_cpu": "0.2.0",
+  "vello_rev": "1e63b4a40ccb484f82e1d85b83df97ab95bcfbe7",
+  "width": 180
+}

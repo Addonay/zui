@@ -394,8 +394,9 @@ fn renderScene(
 
 /// Draw one positioned glyph run through `vellz.glifo`.
 ///
-/// Deferred features (`decoration`, non-zero `embolden`, non-empty
-/// `normalized_coords`) are typed `error.Unsupported`, never silently dropped.
+/// Deferred features (non-zero `embolden`, non-empty `normalized_coords`) are
+/// typed `error.Unsupported`, never silently dropped. `decoration` is drawn
+/// after the fill/stroke pass, matching the upstream decoration tests.
 fn renderGlyphRun(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -406,7 +407,6 @@ fn renderGlyphRun(
     spec: scene_mod.GlyphRunSpec,
 ) !void {
     const glifo = vellz.glifo;
-    if (spec.decoration != null) return error.Unsupported;
     if (spec.embolden) |amount| {
         if (amount[0] != 0.0 or amount[1] != 0.0) return error.Unsupported;
     }
@@ -440,6 +440,18 @@ fn renderGlyphRun(
     switch (spec.style) {
         .fill => try builder.fillGlyphs(allocator, glifo.iterate(glyphs)),
         .stroke => try builder.strokeGlyphs(allocator, glifo.iterate(glyphs)),
+    }
+
+    if (spec.decoration) |decoration| {
+        try builder.renderDecoration(
+            allocator,
+            glifo.iterate(glyphs),
+            decoration.x_range,
+            decoration.baseline_y,
+            decoration.offset,
+            decoration.size,
+            decoration.buffer,
+        );
     }
 }
 

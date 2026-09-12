@@ -316,13 +316,14 @@ pub const CpuGlyphRunBackend = struct {
         return result;
     }
 
-    fn renderGlyphs(
+    /// Build a run renderer, lazily creating atlas resources when caching is
+    /// enabled (upstream `CpuGlyphRunBackend::render_glyphs` prologue).
+    fn buildRunRenderer(
         self: CpuGlyphRunBackend,
         allocator: std.mem.Allocator,
         run: glifo.GlyphRun,
         glyphs: anytype,
-        style: glifo.glyph.Style,
-    ) !void {
+    ) !glifo.GlyphRunRenderer(@TypeOf(glyphs)) {
         var atlas_cacher: glifo.AtlasCacher = .disabled;
         if (self.atlas_cache_enabled) {
             try ensureGlyphResources(self.resources, allocator, self.ctx.renderSettings().level);
@@ -333,12 +334,22 @@ pub const CpuGlyphRunBackend = struct {
             } };
         }
 
-        var run_renderer = try glifo.buildRenderer(
+        return glifo.buildRenderer(
             run,
             glyphs,
             self.resources.glyph_prep_cache.asMut(),
             atlas_cacher,
         );
+    }
+
+    fn renderGlyphs(
+        self: CpuGlyphRunBackend,
+        allocator: std.mem.Allocator,
+        run: glifo.GlyphRun,
+        glyphs: anytype,
+        style: glifo.glyph.Style,
+    ) !void {
+        var run_renderer = try self.buildRunRenderer(allocator, run, glyphs);
 
         switch (style) {
             .fill => try run_renderer.fillGlyphs(allocator, self.ctx),
@@ -372,18 +383,29 @@ pub const CpuGlyphRunBackend = struct {
         try self.renderGlyphs(allocator, run, glyphs, .stroke);
     }
 
-    /// Render a decoration with skip-ink behavior. Deferred until T5.
+    /// Render a decoration (underline/overline/strikethrough) with skip-ink
+    /// behavior into the context, using the backend's run settings.
     pub fn renderDecoration(
         self: CpuGlyphRunBackend,
         allocator: std.mem.Allocator,
         run: glifo.GlyphRun,
         glyphs: anytype,
+        x_range: [2]f32,
+        baseline_y: f32,
+        offset: f32,
+        size: f32,
+        buffer: f32,
     ) !void {
-        _ = self;
-        _ = allocator;
-        _ = run;
-        _ = glyphs;
-        return error.Unsupported;
+        var run_renderer = try self.buildRunRenderer(allocator, run, glyphs);
+        try run_renderer.renderDecoration(
+            allocator,
+            x_range,
+            baseline_y,
+            offset,
+            size,
+            buffer,
+            self.ctx,
+        );
     }
 };
 
