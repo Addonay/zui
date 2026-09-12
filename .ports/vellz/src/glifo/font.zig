@@ -185,7 +185,7 @@ pub const Font = struct {
 test "f2dot14FromF32 matches F2Dot14::from_f32" {
     // Exact values and round-half-away-from-zero for positive/negative inputs.
     try std.testing.expectEqual(@as(i16, 0x4000), f2dot14FromF32(1.0));
-    try std.testing.expectEqual(@as(i16, 0xC000), f2dot14FromF32(-1.0));
+    try std.testing.expectEqual(@as(i16, -0x4000), f2dot14FromF32(-1.0));
     try std.testing.expectEqual(@as(i16, 0x2000), f2dot14FromF32(0.5));
     try std.testing.expectEqual(@as(i16, -0x2000), f2dot14FromF32(-0.5));
     try std.testing.expectEqual(@as(i16, 4915), f2dot14FromF32(0.3));

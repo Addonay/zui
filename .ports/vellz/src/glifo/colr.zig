@@ -23,10 +23,10 @@
 //!   (which upstream would abort on). The remaining stack entries are popped
 //!   afterwards, exactly like upstream.
 //! - `COLR` `Var*` deltas are resolved to zero: `glyph.zig` rejects
-//!   non-default effective coordinates on COLRv1 glyphs with
-//!   `error.Unsupported`, and COLRv0 has no variation data, so the paint
-//!   graph this module traverses is always the exact upstream default-
-//!   variation result.
+//!   non-default effective coordinates when the COLRv1 table carries a
+//!   variation store with `error.Unsupported`, and a table without one
+//!   yields zero deltas upstream for every coordinate, so the paint graph
+//!   this module traverses is always the exact upstream result.
 //! - Upstream derives `CachedOutline` for clip glyphs through an
 //!   `OutlineCacheSession`; this port passes the cache and allocator
 //!   explicitly.

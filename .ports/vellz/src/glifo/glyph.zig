@@ -1265,12 +1265,15 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
                 // ── COLR glyphs ───────────────────────────────────────────
                 if (prepared.color_glyphs.get(glyph.id)) |color_glyph| {
                     // `Var*` records in a COLRv1 paint graph are resolved
-                    // against the run's coordinates by `skrifa`. That
+                    // against the run's coordinates by `skrifa` when the COLR
+                    // table carries a variation store. That
                     // `ItemVariationStore` path is not ported, so non-default
-                    // coordinates on a v1 glyph are a typed error rather than
-                    // a default-variation approximation. COLRv0 has no
-                    // variation data and is an exact no-op (upstream too).
+                    // coordinates are a typed error rather than a
+                    // default-variation approximation. Without a store (or
+                    // for COLRv0) variation deltas are always zero and the
+                    // coordinates are an exact no-op, like upstream.
                     if (color_glyph.format() == .colr_v1 and
+                        color_glyph.colr.hasVarStore() and
                         glyf.effectiveCoords(prepared.normalized_coords).len != 0)
                     {
                         return error.Unsupported;
@@ -2135,9 +2138,30 @@ fn drawTestGlyphVariation(
     try run_renderer.fillGlyphs(allocator, renderer);
 }
 
-test "colr v1 glyphs reject non-default coordinates" {
+test "colr v1 variation stores reject non-default coordinates" {
     const allocator = testing.allocator;
-    const font = FontData.init(try test_fixture.colrTestGlyphs(), 0);
+    var blob = try allocator.dupe(u8, try test_fixture.colrTestGlyphs());
+    defer allocator.free(blob);
+    // The pinned COLRv1 test font carries no variation store (it is not a
+    // variable font), so point `itemVariationStoreOffset` (COLR v1 header
+    // bytes 30..34) at the header itself: present, never dereferenced by the
+    // gate. This is the only fixture path that reaches the typed error.
+    const face = try sfnt.Face.parse(blob, 0);
+    var i: usize = 0;
+    var colr_offset: usize = 0;
+    while (i < face.num_tables) : (i += 1) {
+        const record = face.recordAt(i) orelse break;
+        if (std.mem.eql(u8, &record.tag, &sfnt.tag_colr)) {
+            colr_offset = record.offset;
+            break;
+        }
+    }
+    try testing.expect(colr_offset != 0);
+    blob[colr_offset + 30] = 0;
+    blob[colr_offset + 31] = 0;
+    blob[colr_offset + 32] = 0;
+    blob[colr_offset + 33] = 34;
+    const font = FontData.init(blob, 0);
     // Glyph 8 is a COLRv1 paint-graph base glyph in the test font.
     const glyph = Glyph{ .id = 8 };
 
@@ -2150,7 +2174,7 @@ test "colr v1 glyphs reject non-default coordinates" {
     var image_cache = try atlas.ImageCache.initWithConfig(allocator, .{ .atlas_size = .{ 512, 512 } });
     defer image_cache.deinit(allocator);
 
-    // Default coordinates still draw (nothing to vary).
+    // Default coordinates still draw (nothing varies).
     try drawTestGlyphVariation(
         allocator,
         font,
@@ -2174,7 +2198,7 @@ test "colr v1 glyphs reject non-default coordinates" {
     ));
 }
 
-test "colr v0 glyphs treat coordinates as a no-op" {
+test "colr glyphs without a variation store treat coordinates as a no-op" {
     const allocator = testing.allocator;
     const font = FontData.init(try test_fixture.notoColor(), 0);
     const glyph = Glyph{ .id = 2 };
@@ -2188,8 +2212,9 @@ test "colr v0 glyphs treat coordinates as a no-op" {
     var image_cache = try atlas.ImageCache.initWithConfig(allocator, .{ .atlas_size = .{ 512, 512 } });
     defer image_cache.deinit(allocator);
 
-    // Noto's COLRv0 has no variation data and the font has no axes; the
-    // coordinate slice only selects the variable cache map.
+    // Noto's COLRv1 carries no variation store and the font has no
+    // variation tables, so the coordinate slice only selects the variable
+    // cache map.
     try drawTestGlyphVariation(
         allocator,
         font,

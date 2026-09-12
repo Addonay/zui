@@ -29,7 +29,7 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 885/885 unit and integration tests (868 lib + 8 scene
+zig build test     # 889/889 unit and integration tests (872 lib + 8 scene
                    #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
                    #   the .ports/cozmic sibling checkout is absent)
 zig build corpus   # 120/120 corpus scenes byte-exact vs the upstream oracle
@@ -63,8 +63,8 @@ bit-exact against upstream `skrifa`/`glifo` — sfnt/`head`/`maxp`/`hhea`/`hmtx`
 `loca`/`glyf`/`cmap` parsing with fixed-point 26.6 scaling, simple/composite
 outlines, `gvar`/`cvar` variation deltas with IUP and phantom points, and the
 TrueType hinting interpreter (`fpgm`/`prep`/`cvt`, phantom points,
-`HintingInstance`/`HintCache`, `GETVARIATION`), compared across 711,994 path
-elements and 2,004,430 coordinates (Roboto size sweeps, Noto, and the
+`HintingInstance`/`HintCache`, `GETVARIATION`), compared across 776,878 path
+elements and 2,181,546 coordinates (Roboto size sweeps, Noto, and the
 Inconsolata variable font at both axes, hinted and unhinted) plus 327,680 cmap
 mappings at tolerance 0 (`zig build glyphs`) — and the atlas stack
 (`guillotiere`, `multi_atlas`, `image_cache`) is ported with a Rust-golden
