@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "width": 300,
+  "height": 70,
+  "settings": {
+    "mode": "quality",
+    "threads": 0,
+    "level": "fallback"
+  },
+  "target_init": "clear",
+  "commands": [
+    {
+      "op": "set_paint",
+      "rgba8": [
+        102,
+        51,
+        153,
+        128
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        50.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/Roboto-Regular.ttf",
+        "index": 0
+      },
+      "font_size": 50.0,
+      "hint": true,
+      "atlas_cache": true,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 44,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 73,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 80,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 80,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 83,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 16,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 91,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 83,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 86,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 80,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 72,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 5,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    }
+  ]
+}

@@ -231,7 +231,7 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | Upstream module | Zig target | Status | Notes |
 | --- | --- | --- | --- |
 | `lib.rs`, `interface.rs` (Glyph, DrawSink, GlyphRenderer) | `glifo/root.zig`, `glifo/interface.zig` | port | comptime duck-typing contracts + `assert*` helpers |
-| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, COLR > bitmap > outline draw loop, COLR metrics; hinting/embolden/coords/bitmap/decoration -> typed `error.Unsupported` |
+| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, `HintCache` (16-entry LRU), COLR > bitmap > outline draw loop, COLR metrics; embolden/coords/bitmap/decoration -> typed `error.Unsupported`; TrueType hinting ported (M3 G3b, `glifo/hint.zig`) |
 | `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline/COLR fill/stroke, subpixel keys, COLR command recording, command replay, raster metrics; bitmap paths deferred |
 | `colr.rs` (COLR/CPAL painting) + `skrifa/src/color/*` | `glifo/colr.zig`, `glifo/tables/{colr,cpal}.zig` | port | COLRv0/v1 paint graph, gradients, transforms, clip boxes, composite modes, palette/foreground colors (M3 T4) |
 | `atlas/*` (cache, keys, regions, commands) | `glifo/atlas/*.zig` | port | cache/eviction, fixed-seed key hashing, recorder + replay; variable-font second-level map deferred with `gvar` |

@@ -146,8 +146,10 @@ pub const OutlineCache = struct {
 
     /// Looks up, or draws and stores, the outline for `gid`.
     ///
-    /// Rejects the deferred inputs with `error.Unsupported`: hinting,
-    /// non-empty variation coordinates, and non-default embolden.
+    /// `hint_instance` runs the TrueType interpreter (configured for `size`)
+    /// and makes the cache key hint-distinct; `null` draws unhinted. Rejects
+    /// the remaining deferred inputs with `error.Unsupported`: non-empty
+    /// variation coordinates and non-default embolden.
     pub fn getOrInsert(
         self: *OutlineCache,
         allocator: std.mem.Allocator,
@@ -157,9 +159,8 @@ pub const OutlineCache = struct {
         size: f32,
         embolden: FontEmbolden,
         coords: []const NormalizedCoord,
-        hint: bool,
+        hint_instance: ?*const glyf.HintInstance,
     ) glyf.DrawError!CachedOutline {
-        if (hint) return error.Unsupported;
         if (coords.len != 0) return error.Unsupported;
         if (!embolden.isDefault()) return error.Unsupported;
 
@@ -173,7 +174,7 @@ pub const OutlineCache = struct {
             .embolden_join_bits = @backingInt(embolden.join),
             .embolden_miter_limit_bits = @bitCast(@as(f32, @floatCast(embolden.miter_limit))),
             .embolden_tolerance_bits = @bitCast(@as(f32, @floatCast(embolden.tolerance))),
-            .hint = hint,
+            .hint = hint_instance != null,
         };
         if (self.static_map.getPtr(key)) |entry_ptr| {
             const entry = entry_ptr.*;
@@ -192,7 +193,10 @@ pub const OutlineCache = struct {
             allocator.destroy(path);
         }
         var path_pen = pen_mod.PathPen.init(allocator, path);
-        const metrics = try outlines.draw(allocator, gid, .{ .size = size }, &path_pen);
+        const metrics = try outlines.draw(allocator, gid, .{
+            .size = size,
+            .hint_instance = hint_instance,
+        }, &path_pen);
         _ = metrics;
         const bbox = path.boundingBox();
         const entry = try allocator.create(OutlineEntry);
@@ -299,7 +303,7 @@ test "outline cache reuses entries and survives repeated lookups" {
         16.0,
         .{},
         &.{},
-        false,
+        null,
     );
     const second = try cache.getOrInsert(
         std.testing.allocator,
@@ -309,7 +313,7 @@ test "outline cache reuses entries and survives repeated lookups" {
         16.0,
         .{},
         &.{},
-        false,
+        null,
     );
     try std.testing.expectEqual(@as(usize, 1), cache.cachedCount());
     try std.testing.expectEqual(first.path, second.path);
@@ -335,7 +339,7 @@ test "outline cache content matches a direct draw" {
         16.0,
         .{},
         &.{},
-        false,
+        null,
     );
     // f64 BezPath elements widen the exact f32 the pen emitted, so casting
     // back recovers the same bits.
@@ -388,7 +392,7 @@ test "outline cache evicts unused entries after max age" {
         16.0,
         .{},
         &.{},
-        false,
+        null,
     );
     try std.testing.expectEqual(@as(usize, 1), cache.cachedCount());
     // First maintain starts the serial clock; the entry is touched at serial
@@ -410,13 +414,26 @@ test "outline cache rejects unsupported inputs" {
     const outlines = try font.outlines();
     var cache = OutlineCache{};
     defer cache.deinit(std.testing.allocator);
-    try std.testing.expectError(
-        error.Unsupported,
-        cache.getOrInsert(std.testing.allocator, &outlines, 37, testFontInfo(), 16.0, .{}, &.{}, true),
+    var instance = try outlines.createHintInstance(
+        std.testing.allocator,
+        16.0,
+        glyf.glifo_hint_target,
     );
+    defer instance.deinit();
+    const hinted = try cache.getOrInsert(
+        std.testing.allocator,
+        &outlines,
+        37,
+        testFontInfo(),
+        16.0,
+        .{},
+        &.{},
+        &instance,
+    );
+    try std.testing.expect(hinted.path.elementsSlice().len > 0);
     try std.testing.expectError(
         error.Unsupported,
-        cache.getOrInsert(std.testing.allocator, &outlines, 37, testFontInfo(), 16.0, .{}, &.{0}, false),
+        cache.getOrInsert(std.testing.allocator, &outlines, 37, testFontInfo(), 16.0, .{}, &.{0}, null),
     );
     try std.testing.expectError(
         error.Unsupported,
@@ -428,7 +445,7 @@ test "outline cache rejects unsupported inputs" {
             16.0,
             FontEmbolden.new(.{ 0.5, 0.0 }),
             &.{},
-            false,
+            null,
         ),
     );
 }

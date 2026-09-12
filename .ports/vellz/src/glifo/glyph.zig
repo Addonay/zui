@@ -207,10 +207,114 @@ pub fn GlyphRunBuilder(comptime Backend: type) type {
     };
 }
 
+/// LRU cache for hinting instances, ported from `glifo`'s `HintCache`.
+///
+/// Regenerating hinting data is low to medium cost, so a 16-entry linear
+/// search cache is enough. Upstream's `get` returns `None` when an instance
+/// cannot be configured and then silently draws unhinted; this port reports
+/// the typed error instead, so a hinted run is never approximated.
+pub const HintCache = struct {
+    /// We keep this small to enable a simple LRU cache with a linear search.
+    pub const max_cached_hint_instances: usize = 16;
+
+    entries: std.ArrayList(HintEntry) = .empty,
+    serial: u64 = 0,
+
+    const HintEntry = struct {
+        font_id: u64,
+        font_index: u32,
+        size: f32,
+        instance: glyf.HintInstance,
+        serial: u64,
+    };
+
+    /// Release every cached instance and the entry list.
+    pub fn deinit(self: *HintCache, allocator: std.mem.Allocator) void {
+        self.clear(allocator);
+        self.entries.deinit(allocator);
+        self.* = .{};
+    }
+
+    /// Drop every cached instance.
+    pub fn clear(self: *HintCache, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        for (self.entries.items) |*entry| entry.instance.deinit();
+        self.entries.clearRetainingCapacity();
+        self.serial = 0;
+    }
+
+    /// Returns a hinting instance configured for `(font, size)`, reusing an
+    /// exact match or reconfiguring the least-recently-used entry when full.
+    pub fn get(
+        self: *HintCache,
+        allocator: std.mem.Allocator,
+        font_id: u64,
+        font_index: u32,
+        outlines: *const glyf.Outlines,
+        size: f32,
+    ) Error!*const glyf.HintInstance {
+        for (self.entries.items) |*entry| {
+            if (entry.font_id == font_id and
+                entry.font_index == font_index and
+                entry.size == size)
+            {
+                self.serial += 1;
+                entry.serial = self.serial;
+                return &entry.instance;
+            }
+        }
+        if (self.entries.items.len >= max_cached_hint_instances) {
+            // Evict the least recently used entry and reconfigure it.
+            var lru: usize = 0;
+            var lru_serial: u64 = std.math.maxInt(u64);
+            for (self.entries.items, 0..) |entry, ix| {
+                if (entry.serial < lru_serial) {
+                    lru_serial = entry.serial;
+                    lru = ix;
+                }
+            }
+            const entry = &self.entries.items[lru];
+            const sp = outlines.hintedScaleAndPpem(size);
+            entry.instance.reconfigure(
+                outlines.program,
+                sp.scale,
+                sp.ppem,
+                glyf.glifo_hint_target,
+                &.{},
+                size,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.HintError,
+            };
+            entry.font_id = font_id;
+            entry.font_index = font_index;
+            entry.size = size;
+            self.serial += 1;
+            entry.serial = self.serial;
+            return &entry.instance;
+        }
+        var instance = try outlines.createHintInstance(allocator, size, glyf.glifo_hint_target);
+        errdefer instance.deinit();
+        try self.entries.append(allocator, .{
+            .font_id = font_id,
+            .font_index = font_index,
+            .size = size,
+            .instance = instance,
+            .serial = 0,
+        });
+        self.serial += 1;
+        const entry = &self.entries.items[self.entries.items.len - 1];
+        entry.serial = self.serial;
+        return &entry.instance;
+    }
+};
+
 /// Caches used for preparing glyph drawing.
 pub const GlyphPrepCache = struct {
     /// Caches glyph outlines.
     outline_cache: outline_cache.OutlineCache = .{},
+    /// Caches hinting instances (upstream `HintCache`).
+    hint_cache: HintCache = .{},
     /// Horizontal spans excluded from "ink-skipping" underlines. Cached to
     /// reuse one allocation.
     underline_exclusions: std.ArrayListUnmanaged([2]f64) = .empty,
@@ -219,6 +323,7 @@ pub const GlyphPrepCache = struct {
     pub fn asMut(self: *GlyphPrepCache) GlyphPrepCacheMut {
         return .{
             .outline_cache = &self.outline_cache,
+            .hint_cache = &self.hint_cache,
             .underline_exclusions = &self.underline_exclusions,
         };
     }
@@ -226,6 +331,7 @@ pub const GlyphPrepCache = struct {
     /// Clear the glyph preparation caches.
     pub fn clear(self: *GlyphPrepCache, allocator: std.mem.Allocator) void {
         self.outline_cache.clear(allocator);
+        self.hint_cache.clear(allocator);
         self.underline_exclusions.clearRetainingCapacity();
     }
 
@@ -237,6 +343,7 @@ pub const GlyphPrepCache = struct {
     /// Release the cache storage.
     pub fn deinit(self: *GlyphPrepCache, allocator: std.mem.Allocator) void {
         self.outline_cache.deinit(allocator);
+        self.hint_cache.deinit(allocator);
         self.underline_exclusions.deinit(allocator);
         self.* = .{};
     }
@@ -246,6 +353,8 @@ pub const GlyphPrepCache = struct {
 pub const GlyphPrepCacheMut = struct {
     /// Caches glyph outlines.
     outline_cache: *outline_cache.OutlineCache,
+    /// Caches hinting instances.
+    hint_cache: *HintCache,
     /// Horizontal spans excluded from "ink-skipping" underlines.
     underline_exclusions: *std.ArrayListUnmanaged([2]f64),
 };
@@ -387,6 +496,9 @@ pub const PreparedGlyphRun = struct {
     scene_paint_transform: kurbo.Affine,
     /// Variation coordinates (always empty until `gvar` lands).
     normalized_coords: []const NormalizedCoord,
+    /// Hinting instance for this run; `null` when the run is unhinted (or the
+    /// effective transform is `Direct`, which never hints upstream).
+    hinting_instance: ?*const glyf.HintInstance = null,
 };
 
 /// The scale at which an outline is cached and the factor to the draw size.
@@ -417,13 +529,25 @@ pub const GlyphScaleProperties = struct {
 /// variation coordinates, synthetic embolden, and fonts whose glyphs would
 /// come from COLR/CPAL or bitmap tables.
 pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun {
+    // No hint cache: hinted-scale absorption is rejected with
+    // `error.Unsupported` (the allocator is never used).
+    return prepareGlyphRunWithCache(run, null, std.heap.page_allocator);
+}
+
+/// `prepareGlyphRun` with a hint cache for hinted-scale absorption.
+pub fn prepareGlyphRunWithCache(
+    run: GlyphRun,
+    hint_cache: ?*HintCache,
+    allocator: std.mem.Allocator,
+) Error!PreparedGlyphRun {
     if (run.normalized_coords.len != 0) return error.Unsupported;
     if (!run.font_embolden.isDefault()) return error.Unsupported;
 
     const full_transform = run.transform.compose(run.glyph_transform orelse kurbo.Affine.IDENTITY);
     const c = full_transform.asCoeffs();
     // `t_c` (the skew coefficient) is only needed for the hinted effective
-    // transform, which errors with `error.Unsupported` below.
+    // transform.
+    const t_c = c[2];
     const t_d = c[3];
     const t_e = c[4];
     const t_f = c[5];
@@ -448,22 +572,40 @@ pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun {
     else
         .direct;
 
-    // `AbsorbScaleHinted` requires a `HintingInstance`; deferred.
-    if (mode == .absorb_scale_hinted) return error.Unsupported;
-
-    const effective_transform: kurbo.Affine = switch (mode) {
+    var effective_transform: kurbo.Affine = undefined;
+    var draw_font_size: f32 = undefined;
+    var hinting_instance: ?*const glyf.HintInstance = null;
+    switch (mode) {
         // The scale is absorbed into the font size; remove it from the skew
         // coefficient as well so it is not applied twice.
-        .absorb_scale_unhinted => kurbo.Affine.new(.{ 1.0, 0.0, 0.0, 1.0, t_e, t_f }),
-        .direct => full_transform,
-        .absorb_scale_hinted => unreachable,
-    };
-
-    const draw_font_size: f32 = switch (mode) {
-        .absorb_scale_unhinted => run.font_size * @as(f32, @floatCast(t_d)),
-        .direct => run.font_size,
-        .absorb_scale_hinted => unreachable,
-    };
+        .absorb_scale_unhinted => {
+            effective_transform = kurbo.Affine.new(.{ 1.0, 0.0, 0.0, 1.0, t_e, t_f });
+            draw_font_size = run.font_size * @as(f32, @floatCast(t_d));
+        },
+        .direct => {
+            effective_transform = full_transform;
+            draw_font_size = run.font_size;
+        },
+        .absorb_scale_hinted => {
+            const vertical_font_size = run.font_size * @as(f32, @floatCast(t_d));
+            const cache = hint_cache orelse return error.Unsupported;
+            const hinted_font = try run.font.font();
+            const hinted_outlines = try hinted_font.outlines();
+            hinting_instance = try cache.get(
+                allocator,
+                @intFromPtr(run.font.blob.ptr),
+                run.font.index,
+                &hinted_outlines,
+                vertical_font_size,
+            );
+            // The scale has been absorbed into the font size, so remove it
+            // from the skew coefficient as well: otherwise the skew would be
+            // applied twice (once via the larger outline, once via the
+            // transform). The translation stays as-is.
+            effective_transform = kurbo.Affine.new(.{ 1.0, 0.0, t_c / t_d, 1.0, t_e, t_f });
+            draw_font_size = vertical_font_size;
+        },
+    }
 
     const font = try run.font.font();
     const upem: f32 = @floatFromInt(font.unitsPerEm());
@@ -504,6 +646,7 @@ pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun {
         },
         .scene_paint_transform = run.scene_paint_transform,
         .normalized_coords = run.normalized_coords,
+        .hinting_instance = hinting_instance,
     };
 }
 
@@ -520,12 +663,22 @@ fn util_isPositiveUniformScaleWithoutVerticalSkew(a: kurbo.Affine) bool {
 /// Calculate transform for outline glyphs.
 ///
 /// Applies the glyph position, the run's effective transform, and the font
-/// space to layout space Y flip. Upstream rounds the Y translation for hinted
-/// runs; hinted runs are `error.Unsupported` here, so no rounding occurs.
-pub fn calculateOutlineTransform(glyph: Glyph, draw_props: DrawProps) kurbo.Affine {
-    return draw_props
+/// space to layout space Y flip. For hinted runs the Y translation is snapped
+/// to the pixel grid (`calculate_outline_transform` upstream) so it does not
+/// interfere with the interpreter's grid fitting.
+pub fn calculateOutlineTransform(
+    glyph: Glyph,
+    draw_props: DrawProps,
+    hinted: bool,
+) kurbo.Affine {
+    var transform = draw_props
         .positionedTransform(glyph)
         .preScaleNonUniform(1.0, -1.0);
+    if (hinted) {
+        const c = transform.asCoeffs();
+        transform = kurbo.Affine.new(.{ c[0], c[1], c[2], c[3], c[4], @round(c[5]) });
+    }
+    return transform;
 }
 
 /// Helper struct containing computed COLR glyph metrics.
@@ -715,7 +868,7 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
             interface.assertGlyphRenderer(@TypeOf(renderer.*));
 
             const prepared = &self.prepared_run;
-            const hinted = false; // `hinting_instance.is_some()` upstream
+            const hinted = prepared.hinting_instance != null;
 
             const cache_config = self.atlas_cacher.config();
             const colr_bitmap_cache_enabled = if (cache_config) |config|
@@ -742,7 +895,7 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
                 // are pure arithmetic, so probe the cache before the
                 // expensive COLR lookup. On a miss both are reused by the
                 // outline branch below.
-                const outline_transform = calculateOutlineTransform(glyph, prepared.draw_props);
+                const outline_transform = calculateOutlineTransform(glyph, prepared.draw_props, hinted);
                 const outline_draw_transform = outline_transform.preScale(scale_props.draw_scale);
 
                 var outline_cache_key: ?atlas.GlyphCacheKey = null;
@@ -870,7 +1023,7 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
                     scale_props.cache_size,
                     prepared.font_embolden,
                     prepared.normalized_coords,
-                    hinted,
+                    prepared.hinting_instance,
                 );
 
                 const relative_paint_transform = outline_draw_transform
@@ -914,12 +1067,13 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
 /// `glyphs` is any iterator value with `next() ?Glyph`; `prep_cache` and
 /// `atlas_cacher` borrow their owners for the duration of the draw.
 pub fn buildRenderer(
+    allocator: std.mem.Allocator,
     run: GlyphRun,
     glyphs: anytype,
     prep_cache: GlyphPrepCacheMut,
     atlas_cacher: AtlasCacher,
 ) Error!GlyphRunRenderer(@TypeOf(glyphs)) {
-    const prepared_run = try prepareGlyphRun(run);
+    const prepared_run = try prepareGlyphRunWithCache(run, prep_cache.hint_cache, allocator);
     return .{
         .prepared_run = prepared_run,
         .outline_cache = prep_cache.outline_cache,
@@ -1092,7 +1246,7 @@ fn drawTestGlyph(
     else
         .disabled;
     const iterator = iterate(&.{glyph});
-    var run_renderer = try buildRenderer(run, iterator, prep_cache.asMut(), cacher);
+    var run_renderer = try buildRenderer(allocator, run, iterator, prep_cache.asMut(), cacher);
     switch (style) {
         .fill => try run_renderer.fillGlyphs(allocator, renderer),
         .stroke => try run_renderer.strokeGlyphs(allocator, renderer),
@@ -1280,4 +1434,48 @@ test "colr glyph is not cached when atlas cache is disabled" {
     try drawTestGlyph(allocator, font, glyph, false, .fill, &renderer, &prep_cache, &glyph_atlas, &image_cache);
     try testing.expectEqual(@as(usize, 0), glyph_atlas.len());
     try testing.expectEqual(@as(u64, 0), glyph_atlas.cacheMisses());
+}
+
+test "hint cache configures, reuses and reconfigures instances" {
+    const allocator = testing.allocator;
+    const font = FontData.init(try test_fixture.roboto(), 0);
+    const parsed = try font.font();
+    const outlines = try parsed.outlines();
+    const font_id = @intFromPtr(font.blob.ptr);
+
+    var cache = HintCache{};
+    defer cache.deinit(allocator);
+
+    const first = try cache.get(allocator, font_id, 0, &outlines, 16.0);
+    try testing.expect(first.isEnabled());
+    const second = try cache.get(allocator, font_id, 0, &outlines, 16.0);
+    try testing.expectEqual(first, second);
+    const other_size = try cache.get(allocator, font_id, 0, &outlines, 24.0);
+    try testing.expect(other_size != first);
+    try testing.expectEqual(@as(usize, 2), cache.entries.items.len);
+    try testing.expectEqual(@as(f32, 24.0), other_size.size);
+
+    cache.clear(allocator);
+    try testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+}
+
+test "hinted run preparation configures a hint instance" {
+    const allocator = testing.allocator;
+    const font = FontData.init(try test_fixture.roboto(), 0);
+    const run: GlyphRun = .{
+        .font = font,
+        .font_size = 16.0,
+        .transform = kurbo.Affine.IDENTITY,
+        .scene_paint_transform = kurbo.Affine.IDENTITY,
+        .hint = true,
+    };
+    // Without a cache the hinted-scale absorption stays a typed error.
+    try testing.expectError(error.Unsupported, prepareGlyphRun(run));
+
+    var cache = HintCache{};
+    defer cache.deinit(allocator);
+    const prepared = try prepareGlyphRunWithCache(run, &cache, allocator);
+    try testing.expect(prepared.hinting_instance != null);
+    try testing.expect(prepared.hinting_instance.?.isEnabled());
+    try testing.expectEqual(@as(usize, 1), cache.entries.items.len);
 }

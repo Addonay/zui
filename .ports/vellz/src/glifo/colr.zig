@@ -1093,7 +1093,7 @@ const GlyphInfoExtractor = struct {
             self.font_info.upem,
             FontEmbolden{},
             &.{},
-            false,
+            null,
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
@@ -1247,7 +1247,7 @@ pub fn ColrPainter(comptime Sink: type) type {
                 self.colr_glyph.font_info.upem,
                 FontEmbolden{},
                 &.{},
-                false,
+                null,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return null,

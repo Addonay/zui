@@ -334,6 +334,7 @@ pub const CpuGlyphRunBackend = struct {
         }
 
         var run_renderer = try glifo.buildRenderer(
+            allocator,
             run,
             glyphs,
             self.resources.glyph_prep_cache.asMut(),

@@ -164,6 +164,10 @@ fixture.
 | analytic blurred rounded rect | `blurred_rounded_rect_64` |
 | inverted (inset) blurred rounded rect | `blurred_rounded_rect_invert_64` |
 | unhinted glyph runs (fill, cache on/off) | `glyph_run_filled_unhinted_*`, `glyph_run_filled_unhinted_cache_*` |
+| hinted glyph runs through the TrueType interpreter (fill, cache on/off) | `glyph_run_filled_hinted_*`, `glyph_run_filled_hinted_cache_*` |
+| hinted glyph runs (scaled absorption, horizontal skew, glyph transform) | `glyph_run_scaled_hinted_*`, `glyph_run_skewed_hinted_*`, `glyph_run_glyph_transform_hinted_*` |
+| hinted transform composition rows (direct vs absorbed) | `glyph_run_transform_composition_hinted_*` |
+| hinted composite-heavy accented glyphs | `glyph_run_composite_hinted_300x70` |
 | unhinted glyph runs (small, skewed, scaled, glyph transform) | `glyph_run_small_unhinted_*`, `glyph_run_skewed_unhinted_*`, `glyph_run_scaled_unhinted_*`, `glyph_run_glyph_transform_unhinted_*` |
 | unhinted glyph strokes | `glyph_run_stroked_unhinted_*`, `..._cache_*` |
 | transform composition rows (absorption, translate, rotate, skew, flips) | `glyph_run_transform_composition_unhinted_*` |
@@ -180,8 +184,8 @@ They cover the u8-native gradient LUT and bilinear painters, the f32-painter
 `paintU8` conversion (nearest/bicubic images and undefined radial gradients),
 and the integer blend/composite/mask paths.
 
-All scenes above render byte-exact with `zig build corpus` (90/90,
-`tolerance=0`: 32 quality/f32 + 16 speed/u8 + 15 outline glyph + 27 COLR). The
+All scenes above render byte-exact with `zig build corpus` (97/97,
+`tolerance=0`: 32 quality/f32 + 16 speed/u8 + 22 outline glyph + 27 COLR). The
 f32 and u8 pipelines are not byte-equal to each other in general (integer
 `div_255` rounding vs f32); the corpus compares each pipeline against its own
 oracle output, never against the other pipeline.
@@ -198,9 +202,15 @@ above. Every case is committed twice, with `atlas_cache` off and
 on; both are byte-exact against the pinned oracle (`tolerance=0`), including
 the subpixel-bucket / atlas-page sampling path.
 
-Hinted scenes (upstream's default `hint(true)`) are absent on purpose: the
-hinting interpreter/autohinter is deferred with a typed `error.Unsupported`
-(see `docs/cpu-pipeline.md`). G3b (hinted) lands with that port.
+Hinted scenes (upstream's default `hint(true)`) run through the ported
+TrueType interpreter: `fpgm`/`prep` execute once per (font, size) in
+`HintInstance::reconfigure`, glyph programs run per glyph, and `HintCache`
+keeps 16 instances in an LRU. The scenes mirror the unhinted set where the
+transform is eligible for vertical hinting (positive uniform scale, or
+horizontal skew only); transform-composition rows that upstream leaves
+`Direct` (rotations, flips, vertical skew) render unhinted exactly like
+upstream. Fonts that would need the autohinter are a typed `error.Unsupported`
+rather than a silent unhinted fallback.
 
 ### COLR corpus (M3 T4 / G3c)
 
@@ -221,8 +231,8 @@ hinting interpreter/autohinter is deferred with a typed `error.Unsupported`
   scale, rotate, skew and their around-center variants) and all 28 composite
   modes, including layer isolation for non-default blending.
 
-Hinting is forced off (`hint(false)`) because the interpreter/autohinter is
-G3b; upstream already disables it for the Noto COLR scenes, and its test-font
+Hinting is forced off (`hint(false)`) for the COLR scenes: COLR glyphs are
+never hinted (upstream's Noto COLR scenes disable it too), and the test-font
 scene uses integer translations for which the hinted and unhinted COLR
 transforms agree.
 
@@ -264,5 +274,5 @@ committed scenes with `"threads": 4` and comparing against the same fixtures
 byte-for-byte. MT filter layers and u8 + MT return typed `error.Unsupported`
 (documented upstream limitations, never a silent fallback).
 
-Planned: hinted glyph outlines (G3b), bitmap (CBDT/CBLC/sbix) glyphs, glyph
-decoration (T5), mixed scripts, resource exhaustion, repeated resize.
+Planned: bitmap (CBDT/CBLC/sbix) glyphs, glyph decoration (T5), mixed
+scripts, resource exhaustion, repeated resize.
