@@ -1256,6 +1256,17 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
 
                 // ── COLR glyphs ───────────────────────────────────────────
                 if (prepared.color_glyphs.get(glyph.id)) |color_glyph| {
+                    // `Var*` records in a COLRv1 paint graph are resolved
+                    // against the run's coordinates by `skrifa`. That
+                    // `ItemVariationStore` path is not ported, so non-default
+                    // coordinates on a v1 glyph are a typed error rather than
+                    // a default-variation approximation. COLRv0 has no
+                    // variation data and is an exact no-op (upstream too).
+                    if (color_glyph.format() == .colr_v1 and
+                        glyf.effectiveCoords(prepared.normalized_coords).len != 0)
+                    {
+                        return error.Unsupported;
+                    }
                     const metrics = try calculateColrMetrics(
                         allocator,
                         prepared,
@@ -2086,6 +2097,104 @@ fn ensureColrCache() !void {
     try drawTestGlyph(allocator, font, glyph, true, .fill, &renderer, &prep_cache, &glyph_atlas, &image_cache);
     try testing.expectEqual(@as(usize, 1), glyph_atlas.len());
     try testing.expectEqual(@as(u64, 1), glyph_atlas.cacheHits());
+}
+
+fn drawTestGlyphVariation(
+    allocator: std.mem.Allocator,
+    font: FontData,
+    glyph: Glyph,
+    coords: []const NormalizedCoord,
+    renderer: *RecordingRenderer,
+    prep_cache: *GlyphPrepCache,
+    glyph_atlas: *atlas.GlyphAtlas,
+    image_cache: *atlas.ImageCache,
+) !void {
+    const transform = kurbo.Affine.translate(kurbo.Vec2.new(0.0, 20.0));
+    const run: GlyphRun = .{
+        .font = font,
+        .font_size = 20.0,
+        .transform = transform,
+        .scene_paint_transform = transform,
+        .hint = false,
+        .normalized_coords = coords,
+    };
+    const cacher: AtlasCacher = .{ .enabled = .{
+        .glyph_atlas = glyph_atlas,
+        .image_cache = image_cache,
+    } };
+    const iterator = iterate(&.{glyph});
+    var run_renderer = try buildRenderer(allocator, run, iterator, prep_cache.asMut(), cacher);
+    try run_renderer.fillGlyphs(allocator, renderer);
+}
+
+test "colr v1 glyphs reject non-default coordinates" {
+    const allocator = testing.allocator;
+    const font = FontData.init(try test_fixture.colrTestGlyphs(), 0);
+    // Glyph 8 is a COLRv1 paint-graph base glyph in the test font.
+    const glyph = Glyph{ .id = 8 };
+
+    var renderer = RecordingRenderer{};
+    defer renderer.deinit();
+    var prep_cache = GlyphPrepCache{};
+    defer prep_cache.deinit(allocator);
+    var glyph_atlas = atlas.GlyphAtlas.init();
+    defer glyph_atlas.deinit(allocator);
+    var image_cache = try atlas.ImageCache.initWithConfig(allocator, .{ .atlas_size = .{ 512, 512 } });
+    defer image_cache.deinit(allocator);
+
+    // Default coordinates still draw (nothing to vary).
+    try drawTestGlyphVariation(
+        allocator,
+        font,
+        glyph,
+        &.{},
+        &renderer,
+        &prep_cache,
+        &glyph_atlas,
+        &image_cache,
+    );
+    // Variable `Var*` deltas are not ported: reject instead of approximating.
+    try testing.expectError(error.Unsupported, drawTestGlyphVariation(
+        allocator,
+        font,
+        glyph,
+        &.{0x4000},
+        &renderer,
+        &prep_cache,
+        &glyph_atlas,
+        &image_cache,
+    ));
+}
+
+test "colr v0 glyphs treat coordinates as a no-op" {
+    const allocator = testing.allocator;
+    const font = FontData.init(try test_fixture.notoColor(), 0);
+    const glyph = Glyph{ .id = 2 };
+
+    var renderer = RecordingRenderer{};
+    defer renderer.deinit();
+    var prep_cache = GlyphPrepCache{};
+    defer prep_cache.deinit(allocator);
+    var glyph_atlas = atlas.GlyphAtlas.init();
+    defer glyph_atlas.deinit(allocator);
+    var image_cache = try atlas.ImageCache.initWithConfig(allocator, .{ .atlas_size = .{ 512, 512 } });
+    defer image_cache.deinit(allocator);
+
+    // Noto's COLRv0 has no variation data and the font has no axes; the
+    // coordinate slice only selects the variable cache map.
+    try drawTestGlyphVariation(
+        allocator,
+        font,
+        glyph,
+        &.{0x4000},
+        &renderer,
+        &prep_cache,
+        &glyph_atlas,
+        &image_cache,
+    );
+    try testing.expect(renderer.fill_rect_count > 0);
+    try testing.expectEqual(@as(usize, 1), glyph_atlas.len());
+    try testing.expectEqual(@as(usize, 1), glyph_atlas.variable_entries.count());
 }
 
 test "colr glyph is cached when atlas cache is enabled" {

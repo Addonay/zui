@@ -19,9 +19,10 @@
 //!   resolve to an empty slice (`ok().unwrap_or_default()`), while a malformed
 //!   *paint record* stops the traversal with `error.MalformedFont` (upstream
 //!   `PaintError`/`ReadError`, which `glifo`'s painter ignores).
-//! - Variation deltas are not applied. This is exact for the only supported
-//!   input: the run layer rejects non-empty `normalized_coords`, so `skrifa`
-//!   would return `FloatItemDelta::ZERO` for every `Var*` record. The
+//! - Variation deltas are not applied. The run layer rejects non-empty
+//!   `normalized_coords` for COLRv1 glyphs (`error.Unsupported` in
+//!   `glyph.zig`), so `skrifa`'s `FloatItemDelta::ZERO` is exact for every
+//!   reachable input; COLRv0 carries no variation data at all. The
 //!   `var_index_base` fields are parsed and ignored.
 
 const std = @import("std");

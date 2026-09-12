@@ -22,9 +22,11 @@
 //!   errors while propagating `error.OutOfMemory` and any other backend error
 //!   (which upstream would abort on). The remaining stack entries are popped
 //!   afterwards, exactly like upstream.
-//! - `COLR` `Var*` deltas are resolved against the run's normalized
-//!   coordinates; the paint graph is traversed with the same coordinate slice
-//!   with which the outline and hint paths were configured.
+//! - `COLR` `Var*` deltas are resolved to zero: `glyph.zig` rejects
+//!   non-default effective coordinates on COLRv1 glyphs with
+//!   `error.Unsupported`, and COLRv0 has no variation data, so the paint
+//!   graph this module traverses is always the exact upstream default-
+//!   variation result.
 //! - Upstream derives `CachedOutline` for clip glyphs through an
 //!   `OutlineCacheSession`; this port passes the cache and allocator
 //!   explicitly.
