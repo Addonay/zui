@@ -43,6 +43,8 @@ pub const tag_cpal = Tag{ 'C', 'P', 'A', 'L' };
 pub const tag_cbdt = Tag{ 'C', 'B', 'D', 'T' };
 pub const tag_cblc = Tag{ 'C', 'B', 'L', 'C' };
 pub const tag_sbix = Tag{ 's', 'b', 'i', 'x' };
+pub const tag_ebdt = Tag{ 'E', 'B', 'D', 'T' };
+pub const tag_eblc = Tag{ 'E', 'B', 'L', 'C' };
 pub const tag_cff = Tag{ 'C', 'F', 'F', ' ' };
 pub const tag_cff2 = Tag{ 'C', 'F', 'F', '2' };
 

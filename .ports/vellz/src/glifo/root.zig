@@ -72,6 +72,7 @@ pub const interface = @import("interface.zig");
 pub const glyph = @import("glyph.zig");
 pub const colr = @import("colr.zig");
 pub const renderer = @import("renderer.zig");
+pub const png = @import("png.zig");
 
 pub const FontData = font.FontData;
 pub const Font = font.Font;
@@ -145,4 +146,5 @@ test {
     _ = glyph;
     _ = colr;
     _ = renderer;
+    _ = png;
 }
