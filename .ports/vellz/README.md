@@ -29,11 +29,15 @@ rectangles, each also in its low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 729/729 unit and integration tests (722 lib + 7 scene)
-zig build corpus   # 48/48 corpus scenes byte-exact vs the upstream oracle
+zig build test     # 792/792 unit and integration tests (784 lib + 8 scene)
+zig build corpus   # 63/63 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo
 ```
+
+GPU (`-Dgpu=true`): `gpu-corpus` currently gates 9 root-pass scenes against the
+pinned CPU oracle under the documented tolerance registry (6 byte-exact, 2 at
+max-abs 1 with recorded AA reasons, plus typed error tests).
 
 Coverage: antialiased fills, translucent overlap, NonZero/EvenOdd, nested
 clips and isolated clip layers, transforms, round-capped strokes, degenerate

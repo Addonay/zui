@@ -123,6 +123,7 @@ pub fn main(init: std.process.Init) !void {
             .pop_layer,
             .set_filter_effect,
             .reset_filter_effect,
+            .glyph_run,
             => {
                 std.debug.print(
                     "vellz-gpu-render: scene command '{s}' is not supported by the root strip milestone\n",
