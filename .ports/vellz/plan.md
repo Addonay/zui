@@ -819,7 +819,7 @@ of panics, thread ownership).
   against the pinned oracle at `tolerance=0` -- including the
   transform-composition rows upstream marks `cpu_u8_tolerance = 3`, so no
   allowance is recorded -- with the atlas cache off and on; corpus 95/95,
-  `zig build test` = 845/845 (837 lib + 8 scene), `zig build glyphs` green.
+  `zig build test` = 847/847 (839 lib + 8 scene), `zig build glyphs` green.
 - 2026-09-12 (branch `vellz-simd`): **M4 remainder landed; G4 MET.** Added
   real SIMD backends behind the runtime `simd.Level` dispatch
   (`Level.detect`/`fromName`, `dispatch()` mirroring `fearless_simd::dispatch!`,

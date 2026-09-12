@@ -763,7 +763,7 @@ pub fn calculateBitmapTransform(
     font_size: f32,
     upem: f32,
     bitmap_glyph: *const bitmap_mod.BitmapGlyph,
-    bitmaps: *const bitmap_mod.Strikes,
+    bitmap_format: ?bitmap_mod.Format,
 ) kurbo.Affine {
     const x_scale_factor = font_size / bitmap_glyph.ppem_x;
     const y_scale_factor = font_size / bitmap_glyph.ppem_y;
@@ -772,7 +772,7 @@ pub fn calculateBitmapTransform(
     // CoreText appears to special-case Apple Color Emoji, adding a 100 font
     // unit vertical offset. We do the same, but only when the vertical offset
     // is 0 to avoid incorrect rendering if Apple ever encodes it directly.
-    const bearing_y = if (bitmap_glyph.bearing_y == 0.0 and bitmaps.format() == .sbix)
+    const bearing_y = if (bitmap_glyph.bearing_y == 0.0 and bitmap_format == .sbix)
         100.0
     else
         bitmap_glyph.bearing_y;
@@ -1003,7 +1003,7 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
                             prepared.draw_props.font_size,
                             prepared.font_info.upem,
                             &bitmap_glyph,
-                            &prepared.bitmap_strikes,
+                            prepared.bitmap_strikes.format(),
                         );
 
                         // Bitmaps are not hinted and have no sub-pixel offset
@@ -1608,4 +1608,97 @@ test "colr glyph is not cached when atlas cache is disabled" {
     try drawTestGlyph(allocator, font, glyph, false, .fill, &renderer, &prep_cache, &glyph_atlas, &image_cache);
     try testing.expectEqual(@as(usize, 0), glyph_atlas.len());
     try testing.expectEqual(@as(u64, 0), glyph_atlas.cacheMisses());
+}
+
+test "bitmap transform applies outer/inner bearings, scale and origin" {
+    const allocator = testing.allocator;
+    var pixmap = try pixmap_mod.Pixmap.init(allocator, 4, 2);
+    defer pixmap.deinit(allocator);
+
+    const draw_props: DrawProps = .{
+        .positioning_transform = kurbo.Affine.IDENTITY,
+        .effective_transform = kurbo.Affine.IDENTITY,
+        .font_size = 20.0,
+    };
+    const glyph = Glyph{ .id = 1, .x = 0.0, .y = 0.0 };
+    const base: bitmap_mod.BitmapGlyph = .{
+        .data = .{ .png = &.{} },
+        .bearing_x = 5.0,
+        .bearing_y = 25.0,
+        .inner_bearing_x = 1.0,
+        .inner_bearing_y = 3.0,
+        .ppem_x = 10.0,
+        .ppem_y = 10.0,
+        .advance = null,
+        .width = 4,
+        .height = 2,
+        .placement_origin = .top_left,
+    };
+
+    // font_size / ppem = 2 (scale), bearing_x/y in font units of 1/upem=0.02.
+    const top_left = calculateBitmapTransform(
+        glyph,
+        &pixmap,
+        draw_props,
+        20.0,
+        1000.0,
+        &base,
+        .cbdt,
+    );
+    // x' = -0.1 + 2*(x - 1); y' = 0.5 + 2*(y - 3).
+    try testing.expectEqual(@as(f64, 2.0), top_left.asCoeffs()[0]);
+    // Bearing offsets are computed in f32 and widened, so allow 1e-6.
+    try testing.expectApproxEqAbs(@as(f64, -2.1), top_left.asCoeffs()[4], 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, -5.5), top_left.asCoeffs()[5], 1e-6);
+
+    // Bottom-left origins shift down by the pixmap height (2 px * scale 2).
+    var bottom_left = base;
+    bottom_left.placement_origin = .bottom_left;
+    const shifted = calculateBitmapTransform(
+        glyph,
+        &pixmap,
+        draw_props,
+        20.0,
+        1000.0,
+        &bottom_left,
+        .cbdt,
+    );
+    try testing.expectApproxEqAbs(@as(f64, -9.5), shifted.asCoeffs()[5], 1e-6);
+
+    // `sbix` strikes with a zero outer bearing get CoreText's 100-unit offset.
+    var sbix = base;
+    sbix.bearing_y = 0.0;
+    const sbix_transform = calculateBitmapTransform(
+        glyph,
+        &pixmap,
+        draw_props,
+        20.0,
+        1000.0,
+        &sbix,
+        .sbix,
+    );
+    // y' = 2.0 + 2*(y - 3).
+    try testing.expectApproxEqAbs(@as(f64, -4.0), sbix_transform.asCoeffs()[5], 1e-6);
+    const cbdt_zero = calculateBitmapTransform(
+        glyph,
+        &pixmap,
+        draw_props,
+        20.0,
+        1000.0,
+        &sbix,
+        .cbdt,
+    );
+    try testing.expectApproxEqAbs(@as(f64, -6.0), cbdt_zero.asCoeffs()[5], 1e-6);
+
+    // Glyph positions feed `positionedTransform` in scaled device units.
+    const positioned = calculateBitmapTransform(
+        .{ .id = 1, .x = 3.0, .y = 0.0 },
+        &pixmap,
+        draw_props,
+        20.0,
+        1000.0,
+        &base,
+        .cbdt,
+    );
+    try testing.expectApproxEqAbs(@as(f64, 0.9), positioned.asCoeffs()[4], 1e-6);
 }

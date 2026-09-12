@@ -1114,3 +1114,147 @@ test "mask decode matches the skrifa vectors" {
     defer testing.allocator.free(allocated);
     try testing.expectEqualSlices(u8, &out_1, allocated);
 }
+
+/// One synthetic `CBLC` strike: ppem plus the inclusive glyph-id range the
+/// `BitmapSize` record advertises (the range drives per-strike availability).
+const TestStrike = struct {
+    ppem: u8,
+    start_gid: u16,
+    end_gid: u16,
+};
+
+/// Builds a minimal sfnt blob with `CBLC`/`CBDT` tables for `strikes` and
+/// `glyph_count` identical 13-byte format-18 records (8 big-metrics bytes,
+/// a 4-byte PNG length and one payload byte).
+///
+/// Index subtables all use format 2 (identical metrics, image format 18) so
+/// the nearest-strike fold can be exercised without a real colour bitmap font.
+fn buildSyntheticBitmapFont(
+    allocator: std.mem.Allocator,
+    strikes: []const TestStrike,
+    glyph_count: usize,
+) ![]u8 {
+    const image_size: u32 = 13;
+    const image_data_offset: u32 = 0;
+
+    // CBDT: one record per glyph.
+    const cbdt_len: usize = @as(usize, image_size) * glyph_count;
+    const cbdt = try allocator.alloc(u8, cbdt_len);
+    defer allocator.free(cbdt);
+    @memset(cbdt, 0);
+    for (0..glyph_count) |i| {
+        const record = cbdt[i * image_size ..][0..image_size];
+        record[0] = 32; // big metrics height
+        record[1] = 32; // big metrics width
+        record[2] = 1; // hori_bearing_x
+        record[3] = 30; // hori_bearing_y
+        record[4] = 32; // hori_advance
+        std.mem.writeInt(u32, record[8..12], 1, .big);
+        record[12] = 0xAB;
+    }
+
+    // CBLC: header, records, then one array record + format-2 subtable per
+    // strike.
+    const record_size = 48;
+    const array_size = 8;
+    const subtable_size = 20;
+    const per_strike = array_size + subtable_size;
+    const cblc_len = 8 + record_size * strikes.len + per_strike * strikes.len;
+    const cblc = try allocator.alloc(u8, cblc_len);
+    defer allocator.free(cblc);
+    @memset(cblc, 0);
+    std.mem.writeInt(u16, cblc[0..2], 3, .big);
+    std.mem.writeInt(u32, cblc[4..8], @intCast(strikes.len), .big);
+    for (strikes, 0..) |strike, i| {
+        const record = cblc[8 + i * record_size ..][0..record_size];
+        const list_offset: u32 = @intCast(8 + record_size * strikes.len + i * per_strike);
+        std.mem.writeInt(u32, record[0..4], list_offset, .big);
+        std.mem.writeInt(u32, record[4..8], array_size + subtable_size, .big);
+        std.mem.writeInt(u32, record[8..12], 1, .big);
+        std.mem.writeInt(u16, record[40..42], strike.start_gid, .big);
+        std.mem.writeInt(u16, record[42..44], strike.end_gid, .big);
+        record[44] = strike.ppem;
+        record[45] = strike.ppem;
+        record[46] = 32;
+        record[47] = 1;
+
+        const list = cblc[list_offset..];
+        std.mem.writeInt(u16, list[0..2], strike.start_gid, .big);
+        std.mem.writeInt(u16, list[2..4], strike.end_gid, .big);
+        std.mem.writeInt(u32, list[4..8], array_size, .big);
+        const subtable = list[array_size..];
+        std.mem.writeInt(u16, subtable[0..2], 2, .big);
+        std.mem.writeInt(u16, subtable[2..4], 18, .big);
+        std.mem.writeInt(u32, subtable[4..8], image_data_offset, .big);
+        std.mem.writeInt(u32, subtable[8..12], image_size, .big);
+        subtable[12] = 32; // big metrics height
+        subtable[13] = 32;
+        subtable[14] = 1;
+        subtable[15] = 30;
+        subtable[16] = 32;
+    }
+
+    // Assemble the sfnt directory + tables.
+    const header_size = 12 + 2 * 16;
+    const cblc_offset = header_size;
+    const cbdt_offset = cblc_offset + cblc_len;
+    const blob = try allocator.alloc(u8, cbdt_offset + cbdt_len);
+    @memset(blob, 0);
+    std.mem.writeInt(u32, blob[0..4], 0x00010000, .big);
+    std.mem.writeInt(u16, blob[4..6], 2, .big);
+    const record0 = blob[12..28];
+    @memcpy(record0[0..4], "CBLC");
+    std.mem.writeInt(u32, record0[8..12], @intCast(cblc_offset), .big);
+    std.mem.writeInt(u32, record0[12..16], @intCast(cblc_len), .big);
+    const record1 = blob[28..44];
+    @memcpy(record1[0..4], "CBDT");
+    std.mem.writeInt(u32, record1[8..12], @intCast(cbdt_offset), .big);
+    std.mem.writeInt(u32, record1[12..16], @intCast(cbdt_len), .big);
+    @memcpy(blob[cblc_offset .. cblc_offset + cblc_len], cblc);
+    @memcpy(blob[cbdt_offset .. cbdt_offset + cbdt_len], cbdt);
+    return blob;
+}
+
+test "nearest-strike selection mirrors skrifa for exact, larger and smaller" {
+    const allocator = testing.allocator;
+    const strikes_spec = [_]TestStrike{
+        .{ .ppem = 16, .start_gid = 1, .end_gid = 3 },
+        .{ .ppem = 64, .start_gid = 1, .end_gid = 3 },
+        .{ .ppem = 128, .start_gid = 1, .end_gid = 3 },
+    };
+    const blob = try buildSyntheticBitmapFont(allocator, &strikes_spec, 3);
+    defer allocator.free(blob);
+
+    const font = try font_mod.Font.init(blob, 0);
+    const strikes = Strikes.init(font);
+    try testing.expectEqual(Format.cbdt, strikes.format().?);
+    try testing.expectEqual(@as(usize, 3), strikes.len());
+    try testing.expectEqual(@as(f32, 16.0), strikes.get(0).?.ppem());
+    try testing.expectEqual(@as(f32, 64.0), strikes.get(1).?.ppem());
+    try testing.expectEqual(@as(f32, 128.0), strikes.get(2).?.ppem());
+
+    // Exact match, nearest larger, nearest smaller, unscaled (largest).
+    try testing.expectEqual(@as(f32, 16.0), strikes.glyphForSize(16.0, 2).?.ppem_x);
+    try testing.expectEqual(@as(f32, 64.0), strikes.glyphForSize(17.0, 2).?.ppem_x);
+    try testing.expectEqual(@as(f32, 64.0), strikes.glyphForSize(60.0, 2).?.ppem_x);
+    try testing.expectEqual(@as(f32, 128.0), strikes.glyphForSize(100.0, 2).?.ppem_x);
+    try testing.expectEqual(@as(f32, 128.0), strikes.glyphForSize(null, 2).?.ppem_x);
+
+    // Format-18 big metrics flow into the glyph record; `CBDT` is a colour
+    // table, and the synthetic records are `PNG` payloads.
+    const glyph = strikes.glyphForSize(16.0, 2).?;
+    try testing.expectEqual(@as(u32, 32), glyph.width);
+    try testing.expectEqual(@as(u32, 32), glyph.height);
+    try testing.expectEqual(@as(f32, 1.0), glyph.inner_bearing_x);
+    try testing.expectEqual(@as(f32, 30.0), glyph.inner_bearing_y);
+    try testing.expectEqual(@as(?f32, 32.0), glyph.advance);
+    try testing.expectEqual(Origin.top_left, glyph.placement_origin);
+    switch (glyph.data) {
+        .png => |data| try testing.expectEqualSlices(u8, &.{0xAB}, data),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // No EBLC/EBDT tables: the EBDT format yields no strikes.
+    try testing.expect(Strikes.withFormat(font, .ebdt) == null);
+    try testing.expect(Strikes.withFormat(font, .sbix) == null);
+}
