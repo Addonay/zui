@@ -13,15 +13,20 @@
 //! `F26Dot6::to_f32` converts to `f32`. A f32 reimplementation is not
 //! bit-identical; see `.ports/vellz/docs/glifo-m3-plan.md` §2.
 //!
-//! Ported scope (unhinted only): simple glyphs, composite glyphs with
-//! transforms and point matching, empty glyphs, phantom-point lsb/advance
-//! adjustment, and `PathStyle::FreeType`.
+//! Ported scope: simple glyphs, composite glyphs with transforms and point
+//! matching, empty glyphs, phantom-point lsb/advance adjustment,
+//! `PathStyle::FreeType`, and the embedded TrueType interpreter
+//! (`hint.zig`): hinted scaling (`computeHintedScale`, phantom rounding),
+//! `HintOutline` buffers, simple/composite glyf programs and the rounded
+//! hinted advance. Hinted outlines are bit-identical to skrifa; any
+//! interpreter failure is `error.HintError`, never a silent unhinted draw.
 //!
-//! Deferred with typed errors: hinting (`error.Unsupported`), HarfBuzz path
-//! style (`error.Unsupported`), non-empty variation coordinates
-//! (`error.Unsupported`; `gvar`/`HVAR` deltas are not ported), CFF/bitmap
-//! faces (rejected by `font.Font.outlines`), and embolden (rejected by the
-//! outline cache).
+//! Deferred with typed errors: HarfBuzz path style (`error.Unsupported`),
+//! non-empty variation coordinates (`error.Unsupported`; `gvar`/`HVAR` deltas
+//! are not ported), CFF/bitmap faces (rejected by `font.Font.outlines`),
+//! autohinter-only fonts (`prefer_interpreter == false`), `hdmx` advances
+//! outside backward compatibility, and embolden (rejected by the outline
+//! cache).
 
 const std = @import("std");
 

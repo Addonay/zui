@@ -41,13 +41,13 @@
 //!
 //! # Deferred with typed errors
 //!
-//! Hinting (`HintingInstance`, interpreter), autohinting, `gvar`/`HVAR`/`avar`
+//! Autohinting (fonts without `fpgm`/`prep` bytecode), `gvar`/`HVAR`/`avar`
 //! variation deltas (any non-empty coords), CFF/CFF2, CBDT/CBLC/sbix bitmaps,
 //! synthetic embolden and decoration are all `error.Unsupported`. None are
 //! approximated; fonts carrying bitmap tables reject the whole run instead of
-//! silently dropping a glyph that could fall back to a bitmap. COLRv0/COLRv1
-//! (T4) is ported, including gradients, transforms, clip boxes and composite
-//! modes.
+//! silently dropping a glyph that could fall back to a bitmap. TrueType
+//! hinting (M3 G3b) is ported with the interpreter; COLRv0/COLRv1 (T4) is
+//! ported, including gradients, transforms, clip boxes and composite modes.
 //!
 //! # Oracle comparison
 //!

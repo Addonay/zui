@@ -13,10 +13,15 @@
 //! - Iterators are plain values with a `next() ?Glyph` method and are not
 //!   required to be cloneable: the decoration path that needed cloning is
 //!   deferred.
-//! - Hinting (`HintingInstance`), synthetic embolden (`kurbo::expand_path`),
-//!   non-empty variation coordinates and bitmap glyphs (CBDT/CBLC/sbix) are
-//!   explicit `error.Unsupported`; a run whose transform would require
-//!   hinting is rejected up front instead of silently rendering unhinted.
+//! - TrueType hinting is ported (M3 G3b): `prepareGlyphRunWithCache` consults
+//!   the 16-entry LRU `HintCache` for eligible transforms, `HintingInstance`
+//!   runs `fpgm`/`prep` once per (font, size), and glyph outlines are drawn
+//!   through the interpreter keyed by the hint instance. Interpreter failures
+//!   are `error.HintError`; autohinter-only fonts are `error.Unsupported`
+//!   instead of silently rendering unhinted.
+//! - Synthetic embolden (`kurbo::expand_path`), non-empty variation
+//!   coordinates and bitmap glyphs (CBDT/CBLC/sbix) remain explicit
+//!   `error.Unsupported`.
 //! - A font carrying bitmap tables rejects the whole run: upstream resolves
 //!   glyphs through a COLR > bitmap > outline cascade, and a glyph without a
 //!   COLR entry could fall back to a bitmap that is not ported, so the

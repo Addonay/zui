@@ -248,8 +248,8 @@ pub fn normalize14(x: i32, y: i32) Point {
 fn dot14(ax: i32, ay: i32, bx: i32, by: i32) i32 {
     var v1: i64 = @as(i64, ax) * @as(i64, bx);
     const v2: i64 = @as(i64, ay) * @as(i64, by);
-    v1 += v2;
-    v1 += 0x2000 + (v1 >> 63);
+    v1 +%= v2;
+    v1 +%= 0x2000 + (v1 >> 63);
     return @truncate(v1 >> 14);
 }
 
@@ -579,25 +579,25 @@ pub const RoundState = struct {
     pub fn round(self: *const RoundState, distance: i32) i32 {
         const result: i32 = switch (self.mode) {
             .half_grid => if (distance >= 0)
-                @max(floor(distance) + 32, 0)
+                @max(floor(distance) +% 32, 0)
             else
-                @min(-(floor(-distance) + 32), 0),
+                @min(-%(floor(-%distance) +% 32), 0),
             .grid => if (distance >= 0)
                 @max(roundNearest(distance), 0)
             else
-                @min(-roundNearest(-distance), 0),
+                @min(-%roundNearest(-%distance), 0),
             .double_grid => if (distance >= 0)
                 @max(roundPad(distance, 32), 0)
             else
-                @min(-roundPad(-distance, 32), 0),
+                @min(-%roundPad(-%distance, 32), 0),
             .down_to_grid => if (distance >= 0)
                 @max(floor(distance), 0)
             else
-                @min(-floor(-distance), 0),
+                @min(-%floor(-%distance), 0),
             .up_to_grid => if (distance >= 0)
                 @max(ceil(distance), 0)
             else
-                @min(-ceil(-distance), 0),
+                @min(-%ceil(-%distance), 0),
             .super => if (distance >= 0) blk: {
                 const val = ((distance +% (self.threshold -% self.phase)) & -%self.period) +% self.phase;
                 break :blk if (val < 0) self.phase else val;
@@ -3365,4 +3365,219 @@ test "hint instance applies an empty fpgm and cvt program" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+/// Fixed-geometry engine for instruction tests, mirroring skrifa's
+/// `MockEngine` (32 unscaled points, 64 scaled points, one contour).
+const MockEngine = struct {
+    cvt_storage: [32]i32 = @splat(0),
+    value_stack: [32]i32 = @splat(0),
+    definitions: [8]Definition = @splat(.{}),
+    unscaled: [32]Point = @splat(.{}),
+    points: [64]Point = @splat(.{}),
+    point_flags: [32]u8 = @splat(0),
+    contours: [1]u16 = .{31},
+    twilight: [32]Point = @splat(.{}),
+    twilight_flags: [32]u8 = @splat(0),
+
+    fn engine(self: *MockEngine) Engine {
+        for (&self.unscaled, 0..) |*point, i| {
+            const x: i32 = 57 + @as(i32, @intCast(i)) * 2;
+            point.* = .{ .x = x, .y = -x * 3 };
+        }
+        const cvt = self.cvt_storage[0..16];
+        const storage = self.cvt_storage[16..32];
+        const functions = self.definitions[0..5];
+        const instructions = self.definitions[5..8];
+        return Engine.new(
+            ProgramState.new(&.{}, &.{}, &.{}, .font),
+            RetainedGraphicsState.new(0x10000, 16, Target.default),
+            .{
+                .functions = .{ .mut = functions },
+                .instructions = .{ .mut = instructions },
+            },
+            CowSlice.newMut(cvt),
+            CowSlice.newMut(storage),
+            ValueStack.init(&self.value_stack, false),
+            Zone{
+                .unscaled = &.{},
+                .original = self.twilight[0..16],
+                .points = self.twilight[16..32],
+                .flags = &self.twilight_flags,
+                .contours = &.{},
+            },
+            Zone{
+                .unscaled = &self.unscaled,
+                .original = self.points[0..32],
+                .points = self.points[32..64],
+                .flags = &self.point_flags,
+                .contours = &self.contours,
+            },
+            0,
+            &.{},
+            false,
+        );
+    }
+};
+
+test "svtca sets the coordinate axes" {
+    var mock = MockEngine{};
+    var engine = mock.engine();
+    // freedom and projection vector to y axis
+    try engine.opSvtca(0x00);
+    try std.testing.expectEqual(Point{ .x = 0, .y = 0x4000 }, engine.graphics.freedom_vector);
+    try std.testing.expectEqual(Point{ .x = 0, .y = 0x4000 }, engine.graphics.proj_vector);
+    // freedom and projection vector to x axis
+    try engine.opSvtca(0x01);
+    try std.testing.expectEqual(Point{ .x = 0x4000, .y = 0 }, engine.graphics.freedom_vector);
+    try std.testing.expectEqual(Point{ .x = 0x4000, .y = 0 }, engine.graphics.proj_vector);
+    // projection vector only
+    try engine.opSvtca(0x02);
+    try std.testing.expectEqual(Point{ .x = 0, .y = 0x4000 }, engine.graphics.proj_vector);
+    try engine.opSvtca(0x03);
+    try std.testing.expectEqual(Point{ .x = 0x4000, .y = 0 }, engine.graphics.proj_vector);
+    // freedom vector only
+    try engine.opSvtca(0x04);
+    try std.testing.expectEqual(Point{ .x = 0, .y = 0x4000 }, engine.graphics.freedom_vector);
+    try engine.opSvtca(0x05);
+    try std.testing.expectEqual(Point{ .x = 0x4000, .y = 0 }, engine.graphics.freedom_vector);
+}
+
+test "set/get vectors from the stack" {
+    var mock = MockEngine{};
+    var engine = mock.engine();
+    const x_axis = Point{ .x = 0x4000, .y = 0 };
+    const y_axis = Point{ .x = 0, .y = 0x4000 };
+    try engine.value_stack.push(x_axis.x);
+    try engine.value_stack.push(x_axis.y);
+    try engine.opSpvfs();
+    try std.testing.expectEqual(x_axis, engine.graphics.proj_vector);
+    try engine.opGpv();
+    const y = try engine.value_stack.pop();
+    const x = try engine.value_stack.pop();
+    try std.testing.expectEqual(x_axis, Point{ .x = x, .y = y });
+    try engine.value_stack.push(y_axis.x);
+    try engine.value_stack.push(y_axis.y);
+    try engine.opSfvfs();
+    try std.testing.expectEqual(y_axis, engine.graphics.freedom_vector);
+    try engine.opGfv();
+    const gy = try engine.value_stack.pop();
+    const gx = try engine.value_stack.pop();
+    try std.testing.expectEqual(y_axis, Point{ .x = gx, .y = gy });
+}
+
+test "zone iup shift and interpolate" {
+    var original = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 10 }, .{ .x = 20, .y = 20 } };
+    var points = [_]Point{ .{ .x = -5, .y = -20 }, .{ .x = 10, .y = 10 }, .{ .x = 20, .y = 20 } };
+    var flags = [_]u8{ marker_touched, 0, 0 };
+    var zone = Zone{
+        .unscaled = &.{},
+        .original = &original,
+        .points = &points,
+        .flags = &flags,
+        .contours = &.{3},
+    };
+    try zone.iup(.x);
+    try std.testing.expectEqualSlices(Point, &[_]Point{
+        .{ .x = -5, .y = -20 },
+        .{ .x = 5, .y = 10 },
+        .{ .x = 15, .y = 20 },
+    }, &points);
+    try zone.iup(.y);
+    try std.testing.expectEqualSlices(Point, &[_]Point{
+        .{ .x = -5, .y = -20 },
+        .{ .x = 5, .y = -10 },
+        .{ .x = 15, .y = 0 },
+    }, &points);
+}
+
+test "zone iup interpolation between two touched points" {
+    var original = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 10 }, .{ .x = 20, .y = 20 } };
+    var points = [_]Point{ .{ .x = -5, .y = -20 }, .{ .x = 10, .y = 10 }, .{ .x = 27, .y = 56 } };
+    var flags = [_]u8{ marker_touched, 0, marker_touched };
+    const unscaled = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 500, .y = 500 }, .{ .x = 1000, .y = 1000 } };
+    var zone = Zone{
+        .unscaled = &unscaled,
+        .original = &original,
+        .points = &points,
+        .flags = &flags,
+        .contours = &.{3},
+    };
+    try zone.iup(.x);
+    try std.testing.expectEqualSlices(Point, &[_]Point{
+        .{ .x = -5, .y = -20 },
+        .{ .x = 11, .y = 10 },
+        .{ .x = 27, .y = 56 },
+    }, &points);
+    try zone.iup(.y);
+    try std.testing.expectEqualSlices(Point, &[_]Point{
+        .{ .x = -5, .y = -20 },
+        .{ .x = 11, .y = 18 },
+        .{ .x = 27, .y = 56 },
+    }, &points);
+}
+
+test "unknown opcodes fail typed and IDEF overrides them" {
+    var mock = MockEngine{};
+    var engine = mock.engine();
+    // INS28 (0x28) is unused and undefined: typed UnhandledOpcode.
+    var glyph_code = [_]u8{0x28};
+    engine.program.bytecode[2] = &glyph_code;
+    engine.program.decoder = Decoder.init(&glyph_code, 0);
+    engine.program.initial = .glyph;
+    engine.program.current = .glyph;
+    try std.testing.expectError(error.UnhandledOpcode, engine.run());
+
+    // IDEF 0x28 (defined in the font program) adds 2 to the top stack value.
+    var mock2 = MockEngine{};
+    var engine2 = mock2.engine();
+    var font_code = [_]u8{ 0xB0, 0x28, 0x89, 0xB0, 2, 0x60, 0x2D };
+    engine2.program.bytecode[0] = &font_code;
+    engine2.program.decoder = Decoder.init(&font_code, 0);
+    engine2.program.initial = .font;
+    engine2.program.current = .font;
+    try engine2.runProgram(.font, false);
+    try engine2.value_stack.push(10);
+    var glyph_code2 = [_]u8{0x28};
+    engine2.program.bytecode[2] = &glyph_code2;
+    engine2.program.decoder = Decoder.init(&glyph_code2, 0);
+    engine2.program.initial = .glyph;
+    engine2.program.current = .glyph;
+    engine2.program.call_stack.clear();
+    try engine2.run();
+    try std.testing.expectEqual(@as(?i32, 12), engine2.value_stack.peek());
+}
+
+test "loop budget and call stack errors are typed" {
+    var mock = MockEngine{};
+    var engine = mock.engine();
+    try std.testing.expectError(error.CallStackUnderflow, engine.opEndf());
+
+    engine.loop_budget.limit = 2;
+    engine.value_stack.clear();
+    try engine.value_stack.push(-5);
+    try engine.opJmpr();
+    try engine.value_stack.push(-5);
+    try engine.opJmpr();
+    try engine.value_stack.push(-5);
+    try std.testing.expectError(error.ExceededExecutionBudget, engine.opJmpr());
+}
+
+test "getinfo and instctrl match upstream flags" {
+    var mock = MockEngine{};
+    var engine = mock.engine();
+    try engine.value_stack.push(1 << 0);
+    try engine.opGetinfo();
+    try std.testing.expectEqual(@as(?i32, 40), engine.value_stack.peek());
+    // Smooth target reports grayscale ClearType.
+    engine.graphics.target = .{ .smooth = .{ .mode = .normal } };
+    try engine.value_stack.push(1 << 12);
+    try engine.opGetinfo();
+    try std.testing.expectEqual(@as(?i32, 1 << 19), engine.value_stack.peek());
+    // INSTCTRL in the prep program disables hinting via selector 1.
+    engine.program.initial = .control_value;
+    try engine.value_stack.push(1);
+    try engine.value_stack.push(1);
+    try engine.opInstctrl();
+    try std.testing.expect((engine.graphics.instruct_control & 1) != 0);
 }

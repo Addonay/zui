@@ -15,8 +15,10 @@ cases (`glyphs_filled_unhinted`, `glyphs_skewed_unhinted`,
 `glyphs_stroked_unhinted`, `glyphs_small_unhinted`,
 `glyphs_transform_composition_rows_outline`, `glyphs_with_gradient`) plus the
 G3c COLR cases (`glyphs_colr_noto*`,
-`glyphs_transform_composition_rows_colr`, `glyphs_colr_test_glyphs`), with
-hinting forced off because the interpreter is not ported yet.
+`glyphs_transform_composition_rows_colr`, `glyphs_colr_test_glyphs`). The
+G3b hinted variants are generated from the same layouts with `hint=True`;
+rows whose combined transform is not eligible for vertical hinting render
+`Direct` exactly like upstream.
 """
 
 import json
@@ -218,13 +220,24 @@ def write(name, document):
     print(f"wrote {os.path.relpath(path, ROOT)}")
 
 
-def fill_run(layout, text, size, baseline, color, cache, style="fill", glyph_transform=None):
+def fill_run(
+    layout,
+    text,
+    size,
+    baseline,
+    color,
+    cache,
+    style="fill",
+    glyph_transform=None,
+    hint=False,
+):
     return [
         {"op": "set_paint", "rgba8": color},
         {"op": "set_transform", "affine": translate(0.0, baseline)},
         glyph_run(
             layout.run(text, size),
             size,
+            hint=hint,
             atlas_cache=cache,
             style=style,
             glyph_transform=glyph_transform,
@@ -428,6 +441,7 @@ def main():
             "consectetur adipiscing elit.",
             "Sed ornare arcu lectus.",
             "Hello World",
+            "éàöüñç",
         ]
     )
 
@@ -440,6 +454,26 @@ def main():
                 300,
                 70,
                 fill_run(layout, "Hello, world!", 50.0, 50.0, REBECCA_PURPLE_HALF, cache),
+            ),
+        )
+
+    # G3b: the same run through the TrueType interpreter.
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        write(
+            f"glyph_run_filled_hinted{suffix}_300x70.json",
+            scene(
+                300,
+                70,
+                fill_run(
+                    layout,
+                    "Hello, world!",
+                    50.0,
+                    50.0,
+                    REBECCA_PURPLE_HALF,
+                    cache,
+                    hint=True,
+                ),
             ),
         )
 
@@ -475,6 +509,25 @@ def main():
                 ),
             ),
         )
+
+    # G3b: horizontal skew is eligible for hinted absorption.
+    write(
+        "glyph_run_skewed_hinted_300x70.json",
+        scene(
+            300,
+            70,
+            fill_run(
+                layout,
+                "Hello, world!",
+                50.0,
+                50.0,
+                REBECCA_PURPLE_HALF,
+                False,
+                glyph_transform=slant,
+                hint=True,
+            ),
+        ),
+    )
 
     # glyphs_scaled_unhinted / glyphs_glyph_transform_unhinted: the run
     # transform carries `translate(0, size).then_scale(2)`; the uniform scale
@@ -512,6 +565,37 @@ def main():
                 ],
             ),
         )
+
+    # G3b: hinted equivalents (uniform scale absorbed into the font size).
+    write(
+        "glyph_run_scaled_hinted_150x125.json",
+        scene(
+            150,
+            125,
+            [
+                {"op": "set_paint", "rgba8": REBECCA_PURPLE_HALF},
+                {"op": "set_transform", "affine": scaled_transform},
+                glyph_run(two_lines, 25.0, hint=True),
+            ],
+        ),
+    )
+    write(
+        "glyph_run_glyph_transform_hinted_150x125.json",
+        scene(
+            150,
+            125,
+            [
+                {"op": "set_paint", "rgba8": REBECCA_PURPLE_HALF},
+                {"op": "set_transform", "affine": scaled_transform},
+                glyph_run(
+                    two_lines,
+                    25.0,
+                    hint=True,
+                    glyph_transform=translate(10.0, 10.0),
+                ),
+            ],
+        ),
+    )
 
     # glyphs_stroked_unhinted: outlines are never atlas-cached.
     for cache in (False, True):
@@ -587,6 +671,43 @@ def main():
             f"glyph_run_transform_composition_unhinted{suffix}_300x420.json",
             scene(300, 420, commands),
         )
+
+    # G3b: the same composition rows with hinting enabled. Rows whose full
+    # transform is not hint-eligible (rotations, flips, vertical skew) take
+    # the `Direct` path, exactly like upstream.
+    commands = [{"op": "set_paint", "rgba8": BLACK}]
+    y = 28.35
+    for run_transform, font_size, glyph_transform in rows:
+        commands.append(
+            {"op": "set_transform", "affine": mul(translate(16.0, y), run_transform)}
+        )
+        commands.append(
+            glyph_run(
+                layout.run("Hello, world!", font_size),
+                font_size,
+                hint=True,
+                glyph_transform=glyph_transform,
+            )
+        )
+        y += 30.0
+    write(
+        "glyph_run_transform_composition_hinted_300x420.json",
+        scene(300, 420, commands),
+    )
+
+    # G3b: composite-heavy hinted run (accented Latin glyphs are composites).
+    write(
+        "glyph_run_composite_hinted_300x70.json",
+        scene(
+            300,
+            70,
+            [
+                {"op": "set_paint", "rgba8": REBECCA_PURPLE_HALF},
+                {"op": "set_transform", "affine": translate(0.0, 50.0)},
+                glyph_run(layout.run("éàöüñç", 40.0), 40.0, hint=True),
+            ],
+        ),
+    )
 
     # glyphs_with_gradient: complex paints are never atlas-cached and exercise
     # the relative paint transform on all four composition rows.
