@@ -7,10 +7,11 @@
 //! outline pipeline needs (`head`, `maxp`, `hhea`, `hmtx`; `loca`/`glyf`/
 //! `cmap` are resolved on demand).
 //!
-//! Unsupported inputs are explicit: CFF/CFF2 outlines and variable-font
-//! instances fail with `error.Unsupported` instead of being approximated (see
-//! `.ports/vellz/docs/glifo-m3-plan.md` §2). Bitmap-only faces have no
-//! `outlines()` but expose their embedded strikes through `bitmapStrikes()`.
+//! Unsupported inputs are explicit: variable-font outline deltas
+//! (`gvar`/`HVAR`) and CFF hinting fail with `error.Unsupported` instead of
+//! being approximated; outlines themselves resolve for `glyf`, CFF and CFF2
+//! faces (`outlines.zig`). Bitmap-only faces have no `outlines()` but expose
+//! their embedded strikes through `bitmapStrikes()`.
 
 const std = @import("std");
 
@@ -22,6 +23,8 @@ const hmtx_mod = @import("tables/hmtx.zig");
 const cmap_mod = @import("tables/cmap.zig");
 const bitmap_mod = @import("tables/bitmap.zig");
 const glyf_mod = @import("glyf.zig");
+const cff_mod = @import("cff.zig");
+const outlines_mod = @import("outlines.zig");
 
 pub const Head = head_mod.Head;
 pub const Maxp = maxp_mod.Maxp;
@@ -116,18 +119,27 @@ pub const Font = struct {
         return 0;
     }
 
-    /// Builds the `glyf` outline scaler for this face.
+    /// Builds the outline scaler for this face: the CFF/CFF2 scaler when the
+    /// face carries those tables (CFF2 preferred, like `skrifa`), otherwise
+    /// the TrueType `glyf` scaler.
     ///
-    /// Fails with `error.Unsupported` for fonts without TrueType outlines
-    /// (CFF/CFF2, bitmap-only, or missing metrics tables).
-    pub fn outlines(self: Font) Error!glyf_mod.Outlines {
+    /// Fails with `error.Unsupported` for faces without any outline table
+    /// (bitmap-only) or missing metrics tables. Malformed CFF/CFF2 data
+    /// reports a typed parse error instead of being approximated.
+    pub fn outlines(self: Font) outlines_mod.DrawError!outlines_mod.Outlines {
         const head = self.head orelse return error.Unsupported;
         const maxp = self.maxp orelse return error.Unsupported;
         _ = self.hhea orelse return error.Unsupported;
         _ = self.hmtx orelse return error.Unsupported;
+        if (self.face.table(sfnt.tag_cff2)) |data| {
+            return .{ .cff = try cff_mod.Outlines.init(self, data) };
+        }
+        if (self.face.table(sfnt.tag_cff)) |data| {
+            return .{ .cff = try cff_mod.Outlines.init(self, data) };
+        }
         const loca_data = self.face.table(sfnt.tag_loca) orelse return error.Unsupported;
         const glyf_data = self.face.table(sfnt.tag_glyf) orelse return error.Unsupported;
-        return glyf_mod.Outlines.init(self, head, maxp, loca_data, glyf_data);
+        return .{ .glyf = glyf_mod.Outlines.init(self, head, maxp, loca_data, glyf_data) };
     }
 
     /// Embedded bitmap strikes (`sbix` > `CBDT` > `EBDT`), or an empty set.
@@ -146,13 +158,13 @@ test "Roboto face parses with the expected metrics" {
     _ = try font.outlines();
 }
 
-test "bitmap-only and CFF-only faces report Unsupported" {
+test "bitmap-only faces report Unsupported and CFF faces resolve" {
     const fixture = @import("test_fixture.zig");
     const bitmap_font = try Font.init(try fixture.notoCbtf(), 0);
     try std.testing.expectError(error.Unsupported, bitmap_font.outlines());
 
-    // A CFF face has no `glyf`/`loca`; Roboto with those records renamed away
-    // stands in for one.
+    // Roboto with its `glyf`/`loca` records renamed away has no outline table
+    // at all and is still rejected.
     var blob = try std.testing.allocator.dupe(u8, try fixture.roboto());
     defer std.testing.allocator.free(blob);
     const face = try sfnt.Face.parse(blob, 0);
@@ -166,4 +178,13 @@ test "bitmap-only and CFF-only faces report Unsupported" {
     }
     const cff_like = try Font.init(blob, 0);
     try std.testing.expectError(error.Unsupported, cff_like.outlines());
+
+    // Real CFF and CFF2 faces now resolve through the dispatch.
+    const cff_font = try Font.init(try fixture.sourceSerif(), 0);
+    const cff_outlines = try cff_font.outlines();
+    try std.testing.expect(cff_outlines.isCff());
+    const cff2_font = try Font.init(try fixture.sourceSerifVariable(), 0);
+    const cff2_outlines = try cff2_font.outlines();
+    try std.testing.expect(cff2_outlines.isCff());
+    try std.testing.expectEqual(@as(usize, 1464), cff2_outlines.glyphCount());
 }

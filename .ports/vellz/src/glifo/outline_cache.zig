@@ -22,6 +22,7 @@ const std = @import("std");
 const kurbo = @import("../kurbo/root.zig");
 const font_mod = @import("font.zig");
 const glyf = @import("glyf.zig");
+const outlines_mod = @import("outlines.zig");
 const pen_mod = @import("pen.zig");
 
 pub const GlyphId = font_mod.GlyphId;
@@ -153,14 +154,14 @@ pub const OutlineCache = struct {
     pub fn getOrInsert(
         self: *OutlineCache,
         allocator: std.mem.Allocator,
-        outlines: *const glyf.Outlines,
+        outlines: *const outlines_mod.Outlines,
         gid: GlyphId,
         font_info: FontInfo,
         size: f32,
         embolden: FontEmbolden,
         coords: []const NormalizedCoord,
         hint_instance: ?*const glyf.HintInstance,
-    ) glyf.DrawError!CachedOutline {
+    ) outlines_mod.DrawError!CachedOutline {
         if (coords.len != 0) return error.Unsupported;
         if (!embolden.isDefault()) return error.Unsupported;
 

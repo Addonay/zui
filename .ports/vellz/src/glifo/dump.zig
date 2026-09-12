@@ -11,9 +11,10 @@
 const std = @import("std");
 const font_mod = @import("font.zig");
 const glyf = @import("glyf.zig");
+const outlines_mod = @import("outlines.zig");
 const pen_mod = @import("pen.zig");
 
-pub const Error = glyf.DrawError || std.Io.Writer.Error;
+pub const Error = outlines_mod.DrawError || std.Io.Writer.Error;
 
 fn optF32Hex(value: ?f32, buf: *[8]u8) []const u8 {
     const bits = @as(u32, @bitCast(value orelse return "none"));
@@ -27,7 +28,7 @@ fn optF32Hex(value: ?f32, buf: *[8]u8) []const u8 {
 pub fn writeGlyphDump(
     writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
-    outlines: *const glyf.Outlines,
+    outlines: *const outlines_mod.Outlines,
     font_index: u32,
     size: f32,
     hint: bool,
@@ -54,8 +55,9 @@ pub fn writeGlyphDump(
         }, &pen);
         var lsb_buf: [8]u8 = undefined;
         var advance_buf: [8]u8 = undefined;
-        try writer.print("gid {d} format glyf elems {d} lsb {s} advance {s}\n", .{
+        try writer.print("gid {d} format {s} elems {d} lsb {s} advance {s}\n", .{
             gid,
+            outlines.formatName(),
             pen.elements.items.len,
             optF32Hex(metrics.lsb, &lsb_buf),
             optF32Hex(metrics.advance_width, &advance_buf),

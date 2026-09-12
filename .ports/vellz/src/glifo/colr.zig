@@ -40,6 +40,7 @@ const sfnt = @import("tables/sfnt.zig");
 const tables = @import("tables/colr.zig");
 const cpal_mod = @import("tables/cpal.zig");
 const glyf = @import("glyf.zig");
+const outlines_mod = @import("outlines.zig");
 const outline_cache = @import("outline_cache.zig");
 const util = @import("util.zig");
 const glyph_mod = @import("glyph.zig");
@@ -1010,7 +1011,7 @@ pub const ColrGlyphInfo = struct {
 pub fn getColrInfo(
     allocator: std.mem.Allocator,
     color_glyph: ColorGlyph,
-    outlines: *const glyf.Outlines,
+    outlines: *const outlines_mod.Outlines,
     outline_cache_ref: *outline_cache.OutlineCache,
     font_info: FontInfo,
 ) !ColrGlyphInfo {
@@ -1035,13 +1036,13 @@ const GlyphInfoExtractor = struct {
     clip_stack: std.ArrayListUnmanaged(kurbo.Rect) = .empty,
     coarse_bbox: ?kurbo.Rect = null,
     has_non_default_blend: bool = false,
-    outlines: *const glyf.Outlines,
+    outlines: *const outlines_mod.Outlines,
     outline_cache: *outline_cache.OutlineCache,
     font_info: FontInfo,
 
     fn init(
         allocator: std.mem.Allocator,
-        outlines: *const glyf.Outlines,
+        outlines: *const outlines_mod.Outlines,
         cache: *outline_cache.OutlineCache,
         font_info: FontInfo,
     ) !GlyphInfoExtractor {
@@ -1080,11 +1081,7 @@ const GlyphInfoExtractor = struct {
 
     fn getOutline(self: *GlyphInfoExtractor, glyph_id: u16) anyerror!?CachedOutline {
         const outlines = self.outlines;
-        const glyph = outlines.getGlyph(glyph_id) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        if (glyph == null) return null;
+        if (!outlines.hasGlyph(glyph_id)) return null;
         const outline = self.outline_cache.getOrInsert(
             self.allocator,
             outlines,

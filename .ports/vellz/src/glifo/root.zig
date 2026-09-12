@@ -66,6 +66,9 @@ const std = @import("std");
 pub const tables = @import("tables/root.zig");
 pub const font = @import("font.zig");
 pub const glyf = @import("glyf.zig");
+pub const cff = @import("cff.zig");
+pub const outlines = @import("outlines.zig");
+pub const fixed = @import("fixed.zig");
 pub const pen = @import("pen.zig");
 pub const outline_cache = @import("outline_cache.zig");
 pub const util = @import("util.zig");
@@ -83,12 +86,12 @@ pub const GlyphId = font.GlyphId;
 pub const NormalizedCoord = font.NormalizedCoord;
 pub const Charmap = font.Charmap;
 
-pub const Outlines = glyf.Outlines;
+pub const Outlines = outlines.Outlines;
 pub const Outline = glyf.Outline;
-pub const DrawSettings = glyf.DrawSettings;
-pub const DrawError = glyf.DrawError;
-pub const AdjustedMetrics = glyf.AdjustedMetrics;
-pub const PathStyle = glyf.PathStyle;
+pub const DrawSettings = outlines.DrawSettings;
+pub const DrawError = outlines.DrawError;
+pub const AdjustedMetrics = outlines.AdjustedMetrics;
+pub const PathStyle = outlines.PathStyle;
 pub const Scale26Dot6 = glyf.Scale26Dot6;
 
 pub const PathElement = pen.PathElement;
@@ -140,6 +143,9 @@ test {
     _ = tables;
     _ = font;
     _ = glyf;
+    _ = cff;
+    _ = outlines;
+    _ = fixed;
     _ = pen;
     _ = outline_cache;
     _ = util;

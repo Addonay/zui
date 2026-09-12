@@ -62,8 +62,10 @@ pub const FontEmbolden = outline_cache.FontEmbolden;
 pub const FontInfo = outline_cache.FontInfo;
 pub const FontData = font_mod.FontData;
 
+const outlines_mod = @import("outlines.zig");
+
 /// Errors from glyph run preparation and drawing.
-pub const Error = font_mod.Error || glyf.DrawError || error{
+pub const Error = font_mod.Error || outlines_mod.DrawError || error{
     /// A feature that is scoped but not ported yet: hinting, embolden,
     /// variation coordinates, and bitmap glyphs.
     Unsupported,
@@ -287,9 +289,10 @@ pub const HintCache = struct {
         allocator: std.mem.Allocator,
         font_id: u64,
         font_index: u32,
-        outlines: *const glyf.Outlines,
+        outlines: *const outlines_mod.Outlines,
         size: f32,
     ) Error!*const glyf.HintInstance {
+        if (!outlines.supportsHinting()) return error.Unsupported;
         for (self.entries.items) |*entry| {
             if (entry.font_id == font_id and
                 entry.font_index == font_index and
@@ -312,8 +315,9 @@ pub const HintCache = struct {
             }
             const entry = &self.entries.items[lru];
             const sp = outlines.hintedScaleAndPpem(size);
+            const program = outlines.hintProgram() orelse return error.Unsupported;
             entry.instance.reconfigure(
-                outlines.program,
+                program,
                 sp.scale,
                 sp.ppem,
                 glyf.glifo_hint_target,
@@ -446,7 +450,7 @@ pub const GlyphColr = struct {
     /// `BLACK`, matching upstream's `cpal().ok()?`).
     cpal: ?cpal_mod.Cpal,
     /// TrueType outlines used to resolve COLRv1 clip glyphs.
-    outlines: *const glyf.Outlines,
+    outlines: *const outlines_mod.Outlines,
     /// Basic metadata about the font.
     font_info: FontInfo,
     /// The transform to apply to the glyph.
@@ -528,7 +532,7 @@ pub const PreparedGlyphRun = struct {
     font_info: FontInfo,
     /// The parsed TrueType outlines (upstream `font_ref.outline_glyphs()`).
     /// Empty when the face has no `glyf` table (bitmap-only faces).
-    outlines: glyf.Outlines,
+    outlines: outlines_mod.Outlines,
     /// Whether `outlines` came from a real `glyf` table. Faces without `glyf`
     /// (bitmap-only, or CFF + bitmaps) have no ported outline source, so
     /// `false` skips the outline branch instead of parsing an empty `loca`
@@ -669,14 +673,14 @@ pub fn prepareGlyphRunWithCache(
     const face = font.face;
     const bitmap_strikes = font.bitmapStrikes();
 
-    // Faces without `glyf` outlines (bitmap-only, or CFF + bitmaps) keep an
-    // empty outline collection, like upstream's `outline_glyphs()`.
+    // Faces without `glyf`/CFF outlines (bitmap-only faces) keep an empty
+    // outline collection, like upstream's `outline_glyphs()`.
     var has_outlines = true;
     const outlines = font.outlines() catch |err| switch (err) {
         error.Unsupported => blk: {
             if (bitmap_strikes.isEmpty()) return error.Unsupported;
             has_outlines = false;
-            break :blk glyf.Outlines.empty(font);
+            break :blk outlines_mod.Outlines.empty(font);
         },
         else => return err,
     };
@@ -1093,11 +1097,7 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
             while (self.glyph_iterator.next()) |glyph| {
                 // Upstream `outlines.get()` returns `None` for glyph ids the
                 // font does not contain and skips them.
-                const raw_glyph = prepared.outlines.getGlyph(glyph.id) catch |err| switch (err) {
-                    error.OutOfBounds => continue,
-                    else => return err,
-                };
-                _ = raw_glyph;
+                if (!prepared.outlines.hasGlyph(glyph.id)) continue;
 
                 const cached = try self.outline_cache.getOrInsert(
                     allocator,
@@ -1416,13 +1416,9 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
                 if (!prepared.has_outlines) continue;
                 // The speculative check above already computed the transform
                 // and key; reuse them here.
-                const raw_glyph = prepared.outlines.getGlyph(glyph.id) catch |err| switch (err) {
-                    // Upstream `outlines.get()` returns `None` for
-                    // out-of-range glyph ids and skips them.
-                    error.OutOfBounds => continue,
-                    else => return err,
-                };
-                _ = raw_glyph;
+                // Upstream `outlines.get()` returns `None` for out-of-range
+                // glyph ids and skips them.
+                if (!prepared.outlines.hasGlyph(glyph.id)) continue;
 
                 const cached_outline = try self.outline_cache.getOrInsert(
                     allocator,

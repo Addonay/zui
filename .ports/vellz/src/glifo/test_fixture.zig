@@ -12,11 +12,15 @@ pub const roboto_path = "tests/fixtures/upstream/Roboto-Regular.ttf";
 pub const noto_color_path = "tests/fixtures/upstream/NotoColorEmoji-Subset.ttf";
 pub const noto_cbtf_path = "tests/fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf";
 pub const colr_test_glyphs_path = "tests/fixtures/upstream/test_glyphs-glyf_colr_1.ttf";
+pub const source_serif_path = "tests/fixtures/upstream/SourceSerif4-Regular.otf";
+pub const source_serif_variable_path = "tests/fixtures/upstream/SourceSerif4Variable-Roman.otf";
 
 var roboto_cache: ?[]const u8 = null;
 var noto_color_cache: ?[]const u8 = null;
 var noto_cbtf_cache: ?[]const u8 = null;
 var colr_test_glyphs_cache: ?[]const u8 = null;
+var source_serif_cache: ?[]const u8 = null;
+var source_serif_variable_cache: ?[]const u8 = null;
 
 fn load(path: []const u8) ![]const u8 {
     return std.Io.Dir.cwd().readFileAlloc(
@@ -47,9 +51,23 @@ pub fn colrTestGlyphs() ![]const u8 {
     return colr_test_glyphs_cache.?;
 }
 
+pub fn sourceSerif() ![]const u8 {
+    if (source_serif_cache == null) source_serif_cache = try load(source_serif_path);
+    return source_serif_cache.?;
+}
+
+pub fn sourceSerifVariable() ![]const u8 {
+    if (source_serif_variable_cache == null) {
+        source_serif_variable_cache = try load(source_serif_variable_path);
+    }
+    return source_serif_variable_cache.?;
+}
+
 test "fixtures are readable and non-empty" {
     try std.testing.expect((try roboto()).len > 100_000);
     try std.testing.expect((try notoColor()).len > 1_000);
     try std.testing.expect((try notoCbtf()).len > 1_000);
     try std.testing.expect((try colrTestGlyphs()).len > 10_000);
+    try std.testing.expect((try sourceSerif()).len > 100_000);
+    try std.testing.expect((try sourceSerifVariable()).len > 1_000_000);
 }
