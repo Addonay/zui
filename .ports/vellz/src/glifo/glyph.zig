@@ -21,9 +21,9 @@
 //!   COLR/CPAL is ported (T4) and embedded bitmaps (`sbix`/`CBDT`/`EBDT`) are
 //!   ported (T5); `Bgra`/`Mask` bitmap payloads and undecodable PNGs fall
 //!   through to the outline branch exactly like upstream's `.ok()`-filtered
-//!   `Pixmap::from_png`. Bitmap fonts without TrueType outlines use an empty
-//!   outline collection; outline fallbacks for those are skipped, matching
-//!   upstream's empty `OutlineGlyphCollection`.
+//!   `Pixmap::from_png`. Faces without TrueType outlines use an empty outline
+//!   collection, so outline fallbacks are skipped there (upstream would draw
+//!   CFF outlines; CFF is not ported).
 //! - Upstream's `OutlineCacheSession` is replaced by an explicit
 //!   `*OutlineCache` threaded through the draw loop and `renderer.fillGlyph`/
 //!   `strokeGlyph`.
@@ -393,10 +393,10 @@ pub const PreparedGlyphRun = struct {
     /// The parsed TrueType outlines (upstream `font_ref.outline_glyphs()`).
     /// Empty when the face has no `glyf` table (bitmap-only faces).
     outlines: glyf.Outlines,
-    /// Whether `outlines` came from a real `glyf` table. Upstream's
-    /// `OutlineGlyphCollection` is empty for bitmap-only faces and reports
-    /// `None` for every glyph; `false` preserves that by skipping the outline
-    /// branch instead of parsing an empty `loca`.
+    /// Whether `outlines` came from a real `glyf` table. Faces without `glyf`
+    /// (bitmap-only, or CFF + bitmaps) have no ported outline source, so
+    /// `false` skips the outline branch instead of parsing an empty `loca`
+    /// (upstream's CFF fallback is not ported).
     has_outlines: bool = true,
     /// The embedded bitmap strikes (upstream `font_ref.bitmap_strikes()`).
     bitmap_strikes: bitmap_mod.Strikes,

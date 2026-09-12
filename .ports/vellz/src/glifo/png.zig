@@ -150,7 +150,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) Error!Decoded {
     const row_bytes = (w * bits_per_pixel + 7) / 8;
     const expected_raw = std.math.mul(usize, row_bytes + 1, h) catch return error.InvalidData;
 
-    var raw = try inflate(allocator, idat.items);
+    var raw = try inflate(allocator, idat.items, expected_raw);
     defer allocator.free(raw);
     if (raw.len < expected_raw) return error.InvalidData;
 
@@ -181,10 +181,23 @@ fn bitsPerPixel(color_type: ColorType, bit_depth: u8) usize {
 }
 
 /// Inflate the concatenated `IDAT` payload (zlib stream) into `raw`.
-fn inflate(allocator: std.mem.Allocator, compressed: []const u8) Error![]u8 {
+///
+/// The decompressed size is capped at the row stream's exact size, so a
+/// malformed (or bomb) stream cannot allocate beyond the image it describes.
+fn inflate(
+    allocator: std.mem.Allocator,
+    compressed: []const u8,
+    expected_len: usize,
+) Error![]u8 {
     var input: std.Io.Reader = .fixed(compressed);
     var decompress = std.compress.flate.Decompress.init(&input, .zlib, &.{});
-    return decompress.reader.allocRemaining(allocator, .unlimited) catch |err| switch (err) {
+    return decompress.reader.allocRemaining(
+        allocator,
+        // One extra byte of headroom: `allocRemaining` reports `StreamTooLong`
+        // when the limit is *reached*, and a valid stream is exactly
+        // `expected_len` long.
+        .limited(expected_len + 1),
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidData,
     };
@@ -342,6 +355,19 @@ fn sampleAt(row: []const u8, x: usize, bit_depth: u8) u8 {
 // --------------------------------------------------------------------- tests
 const testing = std.testing;
 
+const png_oversized = [_]u8{
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02,
+    0x08, 0x03, 0x00, 0x00, 0x00, 0x48, 0x76, 0x8d, 0x51, 0x00, 0x00, 0x00,
+    0x09, 0x50, 0x4c, 0x54, 0x45, 0x0a, 0x14, 0x1e, 0x28, 0x32, 0x3c, 0x46,
+    0x50, 0x5a, 0x16, 0xac, 0x84, 0x74, 0x00, 0x00, 0x00, 0x03, 0x74, 0x52,
+    0x4e, 0x53, 0x00, 0x80, 0xff, 0xec, 0xf7, 0xb3, 0x18, 0x00, 0x00, 0x00,
+    0x1a, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x60, 0x60, 0x64, 0x62,
+    0x60, 0x60, 0x62, 0x62, 0x64, 0x70, 0x8d, 0x08, 0x09, 0x72, 0x54, 0x54,
+    0x54, 0x04, 0x00, 0x0a, 0x64, 0x01, 0xf0, 0x32, 0x5c, 0x16, 0x79, 0x00,
+    0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+};
+
 const indexed_png = [_]u8{
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
     0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02,
@@ -461,6 +487,10 @@ test "typed errors for unsupported and malformed PNGs" {
         error.Truncated,
         decode(testing.allocator, indexed_png[0..92]),
     );
+
+    // A stream that inflates beyond the image's row data is rejected by the
+    // decompression cap instead of being silently truncated.
+    try testing.expectError(error.InvalidData, decode(testing.allocator, &png_oversized));
 }
 
 test "decodes the CBDT fixture glyph PNGs" {
