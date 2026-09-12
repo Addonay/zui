@@ -14,13 +14,18 @@
 //!   coordinates are `error.Unsupported` in this port), so only the static
 //!   map exists. `GlyphCacheKey.var_coords` remains excluded from equality,
 //!   matching upstream.
-//! - `PendingBitmapUpload` is omitted until bitmap glyphs land.
+//! - `PendingBitmapUpload` is a borrowing queue (`pendingUploads` +
+//!   `clearPendingUploads`) instead of a draining iterator, because Zig's
+//!   `clearRetainingCapacity` poisons the backing storage in safe builds.
+//!   The backend copies each pixmap into its atlas page before clearing.
 //! - Deterministic hash map type: fixed-seed Wyhash (`key.KeyContext`).
 //!   Iteration/eviction order is not part of the pixel contract.
 
 const std = @import("std");
 const image_cache_mod = @import("../../common/image_cache.zig");
 const paint_mod = @import("../../common/paint.zig");
+const pixmap_mod = @import("../../common/pixmap.zig");
+const shared_mod = @import("../../common/shared.zig");
 const key_mod = @import("key.zig");
 const region = @import("region.zig");
 const commands = @import("commands.zig");
@@ -70,6 +75,20 @@ pub const GlyphCacheEntry = struct {
     serial: u64,
 };
 
+/// A bitmap glyph pixmap awaiting upload into an atlas page.
+///
+/// Accumulated during glyph encoding when a bitmap glyph is inserted into the
+/// cache. The backend must copy each pixmap into the atlas at the position
+/// indicated by `atlas_slot` before the render pass that samples the page.
+pub const PendingBitmapUpload = struct {
+    /// The image ID allocated in the shared `ImageCache`.
+    image_id: paint_mod.ImageId,
+    /// The bitmap pixel data to upload.
+    pixmap: shared_mod.Shared(pixmap_mod.Pixmap),
+    /// The atlas slot information for this glyph (includes dimensions).
+    atlas_slot: region.AtlasSlot,
+};
+
 const GlyphMap = std.HashMapUnmanaged(
     GlyphCacheKey,
     *GlyphCacheEntry,
@@ -93,6 +112,8 @@ pub const GlyphAtlas = struct {
     last_eviction_serial: u64 = 0,
     /// Total cached glyph count.
     entry_count: usize = 0,
+    /// Bitmap glyphs awaiting upload into their atlas pages.
+    pending_uploads: std.ArrayListUnmanaged(PendingBitmapUpload) = .empty,
     /// Atlas regions that must be cleared to transparent before reuse.
     pending_clear_rects: std.ArrayListUnmanaged(PendingClearRect) = .empty,
     /// Outline commands awaiting replay, indexed by atlas page.
@@ -116,6 +137,7 @@ pub const GlyphAtlas = struct {
     pub fn deinit(self: *GlyphAtlas, allocator: std.mem.Allocator) void {
         self.clear(allocator);
         self.static_entries.deinit(allocator);
+        self.pending_uploads.deinit(allocator);
         self.pending_clear_rects.deinit(allocator);
         self.pending_atlas_commands.deinit(allocator);
         self.* = undefined;
@@ -257,6 +279,40 @@ pub const GlyphAtlas = struct {
         if (first_error) |err| return err;
     }
 
+    /// Borrow the pending bitmap uploads.
+    ///
+    /// The returned slice stays valid until `clearPendingUploads`; the backend
+    /// copies every pixmap into its atlas page first.
+    pub fn pendingUploads(self: *const GlyphAtlas) []const PendingBitmapUpload {
+        return self.pending_uploads.items;
+    }
+
+    /// Queue a bitmap pixmap for later upload. Retains one reference to
+    /// `pixmap`; the reference is released by `clearPendingUploads`/`clear`/
+    /// `deinit`.
+    pub fn pushPendingUpload(
+        self: *GlyphAtlas,
+        allocator: std.mem.Allocator,
+        image_id: paint_mod.ImageId,
+        pixmap: shared_mod.Shared(pixmap_mod.Pixmap),
+        atlas_slot: region.AtlasSlot,
+    ) std.mem.Allocator.Error!void {
+        self.pending_uploads.append(allocator, .{
+            .image_id = image_id,
+            .pixmap = pixmap,
+            .atlas_slot = atlas_slot,
+        }) catch |err| {
+            pixmap.release(allocator);
+            return err;
+        };
+    }
+
+    /// Drop the pending bitmap uploads, keeping their allocation for reuse.
+    pub fn clearPendingUploads(self: *GlyphAtlas, allocator: std.mem.Allocator) void {
+        for (self.pending_uploads.items) |upload| upload.pixmap.release(allocator);
+        self.pending_uploads.clearRetainingCapacity();
+    }
+
     /// Borrow the pending clear rects.
     ///
     /// The returned slice stays valid until the next atlas mutation; consume
@@ -331,6 +387,7 @@ pub const GlyphAtlas = struct {
         var iterator = self.static_entries.iterator();
         while (iterator.next()) |map_entry| allocator.destroy(map_entry.value_ptr.*);
         self.static_entries.clearRetainingCapacity();
+        self.clearPendingUploads(allocator);
         self.pending_clear_rects.clearRetainingCapacity();
         for (self.pending_atlas_commands.items) |*slot| {
             if (slot.*) |*recorder| recorder.deinit(allocator);

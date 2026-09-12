@@ -15,7 +15,8 @@
 //!   allocator; upstream's `Vec::push`/`Arc::new` abort on failure.
 //! - `Arc::get_mut(..).expect(..)` becomes a `refCount() == 1` assertion,
 //!   because this port's `Shared(T)` has no fallible mutable accessor.
-//! - Bitmap glyph upload queuing is omitted until bitmap glyphs land.
+//! - Bitmap glyph uploads are copied into the page pixmaps at frame start,
+//!   before the pending outline/COLR commands are replayed.
 
 const std = @import("std");
 const cpu_render = @import("render.zig");
@@ -202,15 +203,32 @@ pub fn beforeRender(
     try prepareGlyphCache(resources, allocator, render_mode);
 }
 
-/// Rasterize pending outline/COLR glyphs into their atlas pages, then register
-/// the pages for image sampling. Bitmap upload draining is deferred with
-/// bitmap support.
+/// Rasterize pending outline/COLR glyphs into their atlas pages, upload
+/// pending bitmap glyphs, then register the pages for image sampling.
 fn syncGlyphCache(
     resources: *Resources,
     allocator: std.mem.Allocator,
     render_mode: RenderMode,
 ) !void {
     const glyph_resources = &(resources.glyph_resources orelse return);
+
+    // Upload all pending bitmap glyphs to the image atlas.
+    for (glyph_resources.glyph_atlas.pendingUploads()) |upload| {
+        const page_index: usize = upload.atlas_slot.page_index;
+        try ensurePage(allocator, glyph_resources, page_index);
+        const page = &glyph_resources.pixmaps.items[page_index];
+        // Upstream `Arc::get_mut`; the page is uniquely owned during sync.
+        std.debug.assert(page.refCount() == 1);
+        copyPixmapToAtlas(
+            upload.pixmap.get(),
+            page.get(),
+            upload.atlas_slot.x,
+            upload.atlas_slot.y,
+            upload.atlas_slot.width,
+            upload.atlas_slot.height,
+        );
+    }
+    glyph_resources.glyph_atlas.clearPendingUploads(allocator);
 
     const Replay = struct {
         glyph_resources: *GlyphAtlasResources,
@@ -296,6 +314,37 @@ fn clearPixmapRegion(pixmap: *Pixmap, rect: glifo.PendingClearRect) void {
     while (y < clear_height) : (y += 1) {
         const row_start = ((@as(usize, rect.y) + y) * stride + @as(usize, rect.x)) * 4;
         @memset(data[row_start .. row_start + clear_width * 4], 0);
+    }
+}
+
+/// Copy bitmap glyph pixels into a rectangular region of an atlas page.
+fn copyPixmapToAtlas(
+    src: *const Pixmap,
+    dst: *Pixmap,
+    dst_x: u16,
+    dst_y: u16,
+    width: u16,
+    height: u16,
+) void {
+    const copy_width: usize = width;
+    const copy_height: usize = height;
+    const src_stride: usize = src.width;
+    const dst_stride: usize = dst.width;
+
+    std.debug.assert(@as(usize, dst_x) + copy_width <= dst_stride);
+    std.debug.assert(@as(usize, dst_y) + copy_height <= dst.height);
+    std.debug.assert(copy_width <= src.width and copy_height <= src.height);
+
+    const src_data = src.dataAsU8Slice();
+    const dst_data = dst.dataAsU8SliceMut();
+
+    var y: usize = 0;
+    while (y < copy_height) : (y += 1) {
+        const src_row_start = y * src_stride * 4;
+        const src_row_end = src_row_start + copy_width * 4;
+        const dst_row_start = ((@as(usize, dst_y) + y) * dst_stride + @as(usize, dst_x)) * 4;
+        const dst_row_end = dst_row_start + copy_width * 4;
+        @memcpy(dst_data[dst_row_start..dst_row_end], src_data[src_row_start..src_row_end]);
     }
 }
 
@@ -480,6 +529,61 @@ test "render context glyph run with the atlas cache end to end" {
         if (byte != 0) nonzero += 1;
     }
     try testing.expect(nonzero > 0);
+}
+
+test "bitmap glyph upload reaches the atlas page" {
+    const allocator = testing.allocator;
+    const fixture = @import("../glifo/test_fixture.zig");
+    const font_data = glifo.FontData.init(try fixture.notoCbtf(), 0);
+
+    var ctx = try RenderContext.init(allocator, 250, 70, .{
+        .level = .baseline,
+        .num_threads = 0,
+    });
+    defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    try ensureGlyphResourcesWithSize(&resources, allocator, 256, 256, .baseline);
+    const glyph_resources = &resources.glyph_resources.?;
+
+    ctx.setPaint(peniko.Color.BLACK);
+    ctx.setTransform(kurbo.Affine.translate(kurbo.Vec2.new(0.0, 50.0)));
+    const glyphs = [_]glifo.Glyph{.{ .id = 2, .x = 0.0, .y = 0.0 }};
+    const builder = ctx.glyphRun(&resources, font_data)
+        .fontSize(50.0)
+        .hint(false)
+        .atlasCache(true);
+    try builder.fillGlyphs(allocator, glifo.iterate(&glyphs));
+
+    // The decoded pixmap is queued for upload into the atlas page.
+    try testing.expectEqual(@as(usize, 1), glyph_resources.glyph_atlas.pendingUploads().len);
+    try testing.expectEqual(@as(usize, 1), glyph_resources.glyph_atlas.len());
+
+    var pixmap = try Pixmap.init(allocator, 250, 70);
+    defer pixmap.deinit(allocator);
+    try ctx.renderWith(&pixmap, &resources, .{
+        .render_mode = .optimize_quality,
+        .target_init = .{ .clear = peniko.Color.TRANSPARENT },
+        .pixel_format = .rgba8,
+        .offset = .{ .x = 0, .y = 0 },
+    });
+
+    // Frame start copied the bitmap into the page and dropped the queue; the
+    // page keeps the premultiplied pixels for future frames.
+    try testing.expectEqual(@as(usize, 0), glyph_resources.glyph_atlas.pendingUploads().len);
+    try testing.expectEqual(@as(usize, 1), glyph_resources.pixmaps.items.len);
+    var page_nonzero: usize = 0;
+    for (glyph_resources.pixmaps.items[0].get().dataAsU8Slice()) |byte| {
+        if (byte != 0) page_nonzero += 1;
+    }
+    try testing.expect(page_nonzero > 0);
+
+    // The composite drawn into the target is opaque somewhere.
+    var target_nonzero: usize = 0;
+    for (pixmap.dataAsU8Slice()) |byte| {
+        if (byte != 0) target_nonzero += 1;
+    }
+    try testing.expect(target_nonzero > 0);
 }
 
 test "evicted region clearing zeroes atlas bytes" {

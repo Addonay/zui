@@ -11,7 +11,9 @@
 //! - Upstream's `OutlineCacheSession` becomes an explicit
 //!   `*outline_cache.OutlineCache` threaded into the COLR paths (COLRv1 clip
 //!   glyphs resolve through it).
-//! - Bitmap glyphs stay deferred (`error.Unsupported` at run preparation).
+//! - Bitmap glyphs render through the atlas cache with a deferred pixmap
+//!   upload (`GlyphAtlas.pushPendingUpload`); without the cache they are
+//!   sampled directly from the decoded `ImageSource.pixmap`.
 
 const std = @import("std");
 const kurbo = @import("../kurbo/root.zig");
@@ -35,6 +37,7 @@ const GlyphCacheKey = atlas.GlyphCacheKey;
 const RasterMetrics = atlas.RasterMetrics;
 const AtlasCacher = glyph.AtlasCacher;
 const GlyphOutline = glyph.GlyphOutline;
+const GlyphBitmap = glyph.GlyphBitmap;
 const GlyphColr = glyph.GlyphColr;
 const PreparedGlyph = glyph.PreparedGlyph;
 const OutlineCache = outline_cache.OutlineCache;
@@ -97,6 +100,27 @@ pub fn fillGlyph(
                     prepared.relative_paint_transform,
                 );
             },
+            .bitmap => |bitmap_glyph| {
+                if (prepared.cache_key) |key| {
+                    if (try insertAndRenderBitmap(
+                        allocator,
+                        renderer,
+                        &bitmap_glyph,
+                        prepared.outline_transform,
+                        key,
+                        e.glyph_atlas,
+                        e.image_cache,
+                    ) == .cached_and_rendered) {
+                        return;
+                    }
+                }
+                try renderUncachedBitmapGlyph(
+                    allocator,
+                    renderer,
+                    &bitmap_glyph,
+                    prepared.outline_transform,
+                );
+            },
             .colr => |colr_glyph| {
                 if (prepared.cache_key) |key| {
                     if (try insertAndRenderColr(
@@ -148,7 +172,13 @@ pub fn strokeGlyph(
                     prepared.outline_transform,
                     prepared.relative_paint_transform,
                 ),
-                .colr => try fillGlyph(allocator, renderer, prepared, atlas_cacher, outline_cache_ref),
+                .bitmap, .colr => try fillGlyph(
+                    allocator,
+                    renderer,
+                    prepared,
+                    atlas_cacher,
+                    outline_cache_ref,
+                ),
             }
             return;
         },
@@ -177,7 +207,13 @@ pub fn strokeGlyph(
                     prepared.relative_paint_transform,
                 );
             },
-            .colr => try fillGlyph(allocator, renderer, prepared, atlas_cacher, outline_cache_ref),
+            .bitmap, .colr => try fillGlyph(
+                allocator,
+                renderer,
+                prepared,
+                atlas_cacher,
+                outline_cache_ref,
+            ),
         },
     }
 }
@@ -195,6 +231,12 @@ fn fillUncached(
             &outline,
             prepared.outline_transform,
             prepared.relative_paint_transform,
+        ),
+        .bitmap => |bitmap_glyph| try renderUncachedBitmapGlyph(
+            allocator,
+            renderer,
+            &bitmap_glyph,
+            prepared.outline_transform,
         ),
         .colr => |colr_glyph| try renderUncachedColrGlyph(
             allocator,
@@ -233,6 +275,33 @@ fn strokeUncachedOutline(
     renderer.setTransform(outline_transform.preScale(outline.scale));
     renderer.setPaintTransform(paint_transform);
     try renderer.strokePath(allocator, outline.path.elementsSlice());
+}
+
+/// Draw a bitmap glyph directly into the renderer (no atlas).
+///
+/// The pixmap travels as an `ImageSource.pixmap` with the upstream sampler
+/// (`Pad`/`Pad`, quality from the transform, alpha 1).
+fn renderUncachedBitmapGlyph(
+    allocator: std.mem.Allocator,
+    renderer: anytype,
+    bitmap_glyph: *const GlyphBitmap,
+    outline_transform: Affine,
+) !void {
+    const image = paint_mod.Image{
+        .image = paint_mod.ImageSource.initPixmap(bitmap_glyph.pixmap.clone()),
+        .sampler = .{
+            .x_extend = .pad,
+            .y_extend = .pad,
+            .quality = qualityForScale(outline_transform),
+            .alpha = 1.0,
+        },
+    };
+
+    const state = try renderer.saveState();
+    defer renderer.restoreState(state);
+    renderer.setTransform(outline_transform);
+    renderer.setPaint(paint_mod.PaintType.fromImage(image));
+    try renderer.fillRect(allocator, bitmap_glyph.area);
 }
 
 /// Render an uncached COLR glyph directly into the renderer.
@@ -281,6 +350,8 @@ fn renderUncachedColrGlyph(
 pub const CachedGlyphType = union(enum) {
     /// An outline glyph cached in the atlas.
     outline,
+    /// A bitmap glyph cached in the atlas.
+    bitmap,
     /// A COLR glyph cached in the atlas. The area holds the fractional area
     /// dimensions to preserve sub-pixel accuracy when rendering.
     colr: Rect,
@@ -298,6 +369,9 @@ pub fn renderCachedGlyph(
         .outline => {
             const tint = contextColor(renderer.currentPaint());
             try renderOutlineGlyphFromAtlas(allocator, renderer, cached_slot, transform, tint);
+        },
+        .bitmap => {
+            try renderBitmapGlyphFromAtlas(allocator, renderer, cached_slot, transform);
         },
         .colr => |area| {
             try renderFromAtlas(
@@ -493,6 +567,53 @@ fn insertAndRenderColr(
     return .cached_and_rendered;
 }
 
+/// Insert a bitmap glyph into the atlas and render it from there.
+///
+/// Bitmap glyphs already have pixel data, so no draw commands are recorded;
+/// the pixels are queued for upload (`pushPendingUpload`) and copied into the
+/// page by the backend before the render pass resolves image references.
+fn insertAndRenderBitmap(
+    allocator: std.mem.Allocator,
+    renderer: anytype,
+    bitmap_glyph: *const GlyphBitmap,
+    transform: Affine,
+    cache_key: GlyphCacheKey,
+    glyph_atlas: *GlyphAtlas,
+    image_cache: *ImageCache,
+) !CacheResult {
+    if (!supportsAtlasCaching(&transform, .bitmap)) {
+        return .unsupported_transform;
+    }
+
+    const raster_metrics = RasterMetrics{
+        .width = bitmap_glyph.pixmap.get().width,
+        .height = bitmap_glyph.pixmap.get().height,
+        .bearing_x = 0,
+        .bearing_y = 0,
+    };
+
+    const insert_result = (try glyph_atlas.insert(allocator, image_cache, cache_key, raster_metrics)) orelse
+        return .atlas_full;
+
+    try glyph_atlas.pushPendingUpload(
+        allocator,
+        insert_result.slot.image_id,
+        bitmap_glyph.pixmap.clone(),
+        insert_result.slot,
+    );
+
+    try renderFromAtlas(
+        allocator,
+        renderer,
+        insert_result.slot,
+        transform,
+        bitmap_glyph.area,
+        qualityForScale(transform),
+        null,
+    );
+    return .cached_and_rendered;
+}
+
 /// Render an outline glyph from the atlas using bearing-based positioning.
 fn renderOutlineGlyphFromAtlas(
     allocator: std.mem.Allocator,
@@ -520,6 +641,30 @@ fn renderOutlineGlyphFromAtlas(
         area,
         .low,
         .{ .color = tint_color, .mode = .alpha_mask },
+    );
+}
+
+/// Render a bitmap glyph from the atlas cache.
+fn renderBitmapGlyphFromAtlas(
+    allocator: std.mem.Allocator,
+    renderer: anytype,
+    atlas_slot: AtlasSlot,
+    transform: Affine,
+) !void {
+    const area = Rect.new(
+        0.0,
+        0.0,
+        @as(f64, @floatFromInt(atlas_slot.width)),
+        @as(f64, @floatFromInt(atlas_slot.height)),
+    );
+    try renderFromAtlas(
+        allocator,
+        renderer,
+        atlas_slot,
+        transform,
+        area,
+        qualityForScale(transform),
+        null,
     );
 }
 
@@ -591,14 +736,20 @@ pub fn replayAtlasCommands(
 
 /// Returns `true` if the transform is safe for atlas-cached glyph rendering.
 ///
-/// Outlines and COLR glyphs expect the font-space y flip (negative d) and no
-/// non-unit scale/skew; bitmap glyphs are not ported.
+/// Outlines and COLR glyphs expect the font-space y flip (negative d) with
+/// unit scale and no skew. Bitmap glyphs have a fixed strike size and so
+/// commonly carry a non-unit scale; they may be scaled and translated but not
+/// skewed or mirrored (`glifo::renderer::supports_atlas_caching`).
 pub fn supportsAtlasCaching(transform: *const Affine, glyph_type: CachedGlyphType) bool {
-    _ = glyph_type;
     const c = transform.asCoeffs();
-    return !util.hasNonUnitSkewOrScale(transform.*) and
-        isSignPositive(c[0]) and
-        !isSignPositive(c[3]);
+    return switch (glyph_type) {
+        .outline, .colr => !util.hasNonUnitSkewOrScale(transform.*) and
+            isSignPositive(c[0]) and
+            !isSignPositive(c[3]),
+        .bitmap => !util.hasSkew(transform.*) and
+            isSignPositive(c[0]) and
+            isSignPositive(c[3]),
+    };
 }
 
 fn isSignPositive(value: f64) bool {
@@ -666,6 +817,18 @@ test "atlas caching support mirrors upstream predicates" {
         .{ .colr = Rect.ZERO },
     ));
     try testing.expect(!supportsAtlasCaching(&Affine.scale(2.0), .{ .colr = Rect.ZERO }));
+
+    // Bitmap glyphs may be translated and positively scaled (their strike size
+    // is fixed), but not skewed or mirrored.
+    try testing.expect(supportsAtlasCaching(&Affine.IDENTITY, .bitmap));
+    try testing.expect(supportsAtlasCaching(
+        &Affine.translate(Vec2.new(12.0, -3.5)),
+        .bitmap,
+    ));
+    try testing.expect(supportsAtlasCaching(&Affine.scaleNonUniform(2.0, 3.0), .bitmap));
+    try testing.expect(!supportsAtlasCaching(&Affine.scaleNonUniform(1.0, -1.0), .bitmap));
+    try testing.expect(!supportsAtlasCaching(&Affine.scaleNonUniform(-1.0, 1.0), .bitmap));
+    try testing.expect(!supportsAtlasCaching(&Affine.skew(0.2, 0.0), .bitmap));
 }
 
 test "quality selection" {

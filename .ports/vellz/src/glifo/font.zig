@@ -19,6 +19,7 @@ const maxp_mod = @import("tables/maxp.zig");
 const hhea_mod = @import("tables/hhea.zig");
 const hmtx_mod = @import("tables/hmtx.zig");
 const cmap_mod = @import("tables/cmap.zig");
+const bitmap_mod = @import("tables/bitmap.zig");
 const glyf_mod = @import("glyf.zig");
 
 pub const Head = head_mod.Head;
@@ -126,6 +127,11 @@ pub const Font = struct {
         const loca_data = self.face.table(sfnt.tag_loca) orelse return error.Unsupported;
         const glyf_data = self.face.table(sfnt.tag_glyf) orelse return error.Unsupported;
         return glyf_mod.Outlines.init(self, head, maxp, loca_data, glyf_data);
+    }
+
+    /// Embedded bitmap strikes (`sbix` > `CBDT` > `EBDT`), or an empty set.
+    pub fn bitmapStrikes(self: Font) bitmap_mod.Strikes {
+        return bitmap_mod.Strikes.init(self);
     }
 };
 
