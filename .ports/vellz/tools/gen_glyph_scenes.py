@@ -29,6 +29,16 @@ FONT_REL = "../fixtures/upstream/Roboto-Regular.ttf"
 FONT = os.path.join(ROOT, "tests", "fixtures", "upstream", "Roboto-Regular.ttf")
 UPEM = 2048.0
 
+# COLR fixtures (M3 T4 / G3c).
+NOTO_FONT_REL = "../fixtures/upstream/NotoColorEmoji-Subset.ttf"
+NOTO_FONT = os.path.join(ROOT, "tests", "fixtures", "upstream", "NotoColorEmoji-Subset.ttf")
+NOTO_UPEM = 1024.0
+COLR_TEST_FONT_REL = "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf"
+COLR_TEST_FONT = os.path.join(
+    ROOT, "tests", "fixtures", "upstream", "test_glyphs-glyf_colr_1.ttf"
+)
+COLR_TEST_UPEM = 1000.0
+
 # CSS palette values used by the upstream tests.
 REBECCA_PURPLE = [102, 51, 153, 255]
 REBECCA_PURPLE_HALF = [102, 51, 153, 128]
@@ -49,6 +59,10 @@ def translate(x, y):
 
 def scale(s):
     return [s, 0.0, 0.0, s, 0.0, 0.0]
+
+
+def scale_non_uniform(sx, sy):
+    return [sx, 0.0, 0.0, sy, 0.0, 0.0]
 
 
 def rotate(theta):
@@ -80,12 +94,12 @@ def run_cli(args):
     ).stdout
 
 
-def dump_cmap(codepoints):
+def dump_cmap(codepoints, font=FONT):
     text = run_cli(
         [
             "--dump-cmap",
             "--font",
-            FONT,
+            font,
             "--codepoints",
             ",".join(str(cp) for cp in sorted(set(codepoints))),
         ]
@@ -98,14 +112,14 @@ def dump_cmap(codepoints):
     return mapping
 
 
-def dump_advances(glyph_ids):
+def dump_advances(glyph_ids, font=FONT, size=2048):
     text = run_cli(
         [
             "--dump-glyphs",
             "--font",
-            FONT,
+            font,
             "--size",
-            "2048",
+            str(size),
             "--gids",
             ",".join(str(g) for g in sorted(set(glyph_ids))),
         ]
@@ -127,15 +141,17 @@ def dump_advances(glyph_ids):
 class Layout:
     """Explicitly positions glyphs using hmtx advances (no shaping/kerning)."""
 
-    def __init__(self):
+    def __init__(self, font=FONT, upem=UPEM):
+        self.font = font
+        self.upem = upem
         self.cmap = {}
         self.advances = {}
 
     def prepare(self, texts):
         codepoints = [ord(c) for text in texts for c in text if c != "\n"]
-        self.cmap = dump_cmap(codepoints)
+        self.cmap = dump_cmap(codepoints, self.font)
         ids = [self.cmap[cp] for cp in codepoints if self.cmap.get(cp) is not None]
-        self.advances = dump_advances(ids)
+        self.advances = dump_advances(ids, self.font, int(self.upem))
 
     def run(self, text, size, origin_x=0.0, origin_y=0.0):
         glyphs = []
@@ -150,7 +166,7 @@ class Layout:
             if gid is None:
                 raise SystemExit(f"glyph missing for {ch!r}")
             glyphs.append({"id": gid, "x": round(x, 6), "y": round(y, 6)})
-            x += self.advances[gid] * size / UPEM
+            x += self.advances[gid] * size / self.upem
         return glyphs
 
 
@@ -165,10 +181,11 @@ def glyph_run(
     atlas_cache=False,
     style="fill",
     glyph_transform=None,
+    font_rel=FONT_REL,
 ):
     command = {
         "op": "glyph_run",
-        "font": {"asset": FONT_REL, "index": 0},
+        "font": {"asset": font_rel, "index": 0},
         "font_size": font_size,
         "hint": hint,
         "atlas_cache": atlas_cache,
@@ -211,6 +228,189 @@ def fill_run(layout, text, size, baseline, color, cache, style="fill", glyph_tra
             glyph_transform=glyph_transform,
         ),
     ]
+
+
+# ---------------------------------------------------------------- COLR scenes
+
+
+def noto_colr_run(noto, size, cache, transform=None, style="fill", glyphs=None):
+    """One Noto COLR run, mirroring `render_colr_noto_with_transform`."""
+    commands = [{"op": "set_paint", "rgba8": BLACK}]
+    if transform is not None:
+        commands.append({"op": "set_transform", "affine": transform})
+    commands.append(
+        glyph_run(
+            noto.run("✅👀🎉🤠", size) if glyphs is None else glyphs,
+            size,
+            atlas_cache=cache,
+            style=style,
+            font_rel=NOTO_FONT_REL,
+        )
+    )
+    return commands
+
+
+def write_colr_scenes(noto):
+    """G3c scenes mirroring upstream `glyphs_colr_noto*`,
+    `glyphs_transform_composition_rows_colr` and `glyphs_colr_test_glyphs`.
+    Hinting is forced off (G3b is not ported); upstream already disables it for
+    the Noto COLR scenes.
+    """
+    fs = 50.0
+    cases = [
+        ("colr_noto", 250, 70, translate(0.0, fs)),
+        ("colr_noto_scaled_2x", 500, 140, mul(scale(2.0), translate(0.0, fs))),
+        ("colr_noto_scaled_half", 125, 35, mul(scale(0.5), translate(0.0, fs))),
+        (
+            "colr_noto_rotated",
+            350,
+            350,
+            mul(translate(175.0, 100.0), rotate(math.pi / 4.0)),
+        ),
+        (
+            "colr_noto_rotated_scaled",
+            600,
+            600,
+            mul(translate(300.0, 150.0), mul(rotate(math.pi / 4.0), scale(2.0))),
+        ),
+        (
+            "colr_noto_scaled_non_uniform",
+            250,
+            140,
+            mul(translate(0.0, fs), scale_non_uniform(1.0, 2.0)),
+        ),
+        (
+            "colr_noto_rotated_scaled_non_uniform",
+            300,
+            300,
+            mul(
+                translate(150.0, 150.0),
+                mul(rotate(math.pi / 4.0), scale_non_uniform(1.0, 2.0)),
+            ),
+        ),
+    ]
+    for base, width, height, transform in cases:
+        for cache in (False, True):
+            suffix = "_cache" if cache else ""
+            write(
+                f"glyph_run_{base}{suffix}_{width}x{height}.json",
+                scene(width, height, noto_colr_run(noto, fs, cache, transform)),
+            )
+        # Upstream's `glyphs_colr_noto_stroked` really renders a fill; exercise
+        # the stroke entry point as well (COLR strokes are always filled) so
+        # the delegation is gated too.
+        write(
+            f"glyph_run_{base}_stroked_250x70.json",
+            scene(250, 70, noto_colr_run(noto, fs, False, transform, style="stroke")),
+        )
+
+    # glyphs_colr_noto_overflow_centered: a single overflowed glyph.
+    check_gid = noto.cmap[ord("✅")]
+    centered = [{"id": check_gid, "x": -25.0, "y": 125.0}]
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        write(
+            f"glyph_run_colr_noto_overflow_centered{suffix}_100x100.json",
+            scene(100, 100, noto_colr_run(noto, 150.0, cache, glyphs=centered)),
+        )
+
+    # glyphs_transform_composition_rows_colr: the same 13 rows as the outline
+    # scene, with the Noto COLR glyphs.
+    reverse_x_shift = 100.0
+    rows = [
+        ([1, 0, 0, 1, 0, 0], 20.0, [1, 0, 0, 1, 0, 0]),
+        (scale(20.0), 1.0, [1, 0, 0, 1, 0, 0]),
+        ([1, 0, 0, 1, 0, 0], 10.0, scale(2.0)),
+        (scale(2.0), 5.0, scale(2.0)),
+        (translate(-4.0, 0.0), 20.0, translate(4.0, 0.0)),
+        (mul(translate(-4.0, 0.0), scale(4.0)), 5.0, translate(1.0, 0.0)),
+        (translate(-1.0, 0.0), 40.0, mul(scale(0.5), translate(2.0, 0.0))),
+        (
+            [1, 0, 0, 1, 0, 0],
+            20.0,
+            mul(translate(10.0, -10.0), mul(rotate(math.pi / 4.0), translate(-10.0, 10.0))),
+        ),
+        (
+            [1, 0, 0, 1, 0, 0],
+            20.0,
+            mul(translate(10.0, -10.0), mul(skew(0.35, 0.0), translate(-10.0, 10.0))),
+        ),
+        (
+            [1, 0, 0, 1, 0, 0],
+            20.0,
+            mul(translate(10.0, -10.0), mul(skew(0.0, 0.2), translate(-10.0, 10.0))),
+        ),
+        (mul([1, 0, 0, -1, 0, 0], translate(0.0, 20.0)), 20.0, [1, 0, 0, 1, 0, 0]),
+        (mul([-1, 0, 0, 1, 0, 0], translate(-reverse_x_shift, 0.0)), 20.0, [1, 0, 0, 1, 0, 0]),
+        (mul([-1, 0, 0, -1, 0, 0], translate(-reverse_x_shift, 20.0)), 20.0, [1, 0, 0, 1, 0, 0]),
+    ]
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        commands = [{"op": "set_paint", "rgba8": BLACK}]
+        y = 28.35
+        for run_transform, font_size, glyph_transform in rows:
+            commands.append(
+                {"op": "set_transform", "affine": mul(translate(16.0, y), run_transform)}
+            )
+            commands.append(
+                glyph_run(
+                    noto.run("✅👀🎉🤠", font_size),
+                    font_size,
+                    atlas_cache=cache,
+                    glyph_transform=glyph_transform,
+                    font_rel=NOTO_FONT_REL,
+                )
+            )
+            y += 30.0
+        write(
+            f"glyph_run_colr_transform_composition{suffix}_210x410.json",
+            scene(210, 410, commands),
+        )
+
+    # glyphs_colr_test_glyphs: every COLR glyph of the color-fonts test font in
+    # a 10-column grid, then blue/green foreground rows.
+    fs = 40.0
+    cols = 10.0
+    width = int(fs * cols)
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        commands = [{"op": "set_paint", "rgba8": BLACK}]
+        cur_x = 0.0
+        cur_y = fs
+
+        def emit(gid, x, y, commands=commands, cache=cache):
+            commands.append(
+                {"op": "set_transform", "affine": translate(x, y)}
+            )
+            commands.append(
+                glyph_run(
+                    [{"id": gid, "x": 0.0, "y": 0.0}],
+                    fs,
+                    atlas_cache=cache,
+                    font_rel=COLR_TEST_FONT_REL,
+                )
+            )
+
+        for gid in range(0, 222):
+            if 0 <= gid <= 7 or 161 <= gid <= 165 or 170 <= gid <= 176:
+                continue
+            if cur_x >= width:
+                cur_x = 0.0
+                cur_y += fs
+            emit(gid, cur_x, cur_y)
+            cur_x += fs
+        cur_y += fs
+        for color in (BLUE, GREEN):
+            cur_x = 0.0
+            cur_y += fs
+            commands.append({"op": "set_paint", "rgba8": color})
+            for gid in range(148, 154):
+                emit(gid, cur_x, cur_y)
+                cur_x += fs
+        write(
+            f"glyph_run_colr_test_glyphs{suffix}_400x960.json",
+            scene(400, 960, commands),
+        )
 
 
 def main():
@@ -424,6 +624,11 @@ def main():
         )
         baseline += 40.0
     write("glyph_run_gradient_unhinted_300x180.json", scene(300, 180, commands))
+
+    # G3c COLR scenes (Noto Color Emoji + the color-fonts test font).
+    noto = Layout(NOTO_FONT, NOTO_UPEM)
+    noto.prepare(["✅👀🎉🤠"])
+    write_colr_scenes(noto)
 
 
 if __name__ == "__main__":

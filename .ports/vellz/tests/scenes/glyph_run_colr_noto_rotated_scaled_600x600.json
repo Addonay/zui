@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "width": 600,
+  "height": 600,
+  "settings": {
+    "mode": "quality",
+    "threads": 0,
+    "level": "fallback"
+  },
+  "target_init": "clear",
+  "commands": [
+    {
+      "op": "set_paint",
+      "rgba8": [
+        0,
+        0,
+        0,
+        255
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.4142135623730951,
+        1.414213562373095,
+        -1.414213562373095,
+        1.4142135623730951,
+        300.0,
+        150.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 50.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 4,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 2,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 1,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 3,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    }
+  ]
+}

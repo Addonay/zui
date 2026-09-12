@@ -633,15 +633,22 @@ fn traverse(
             const base = colr.v1BaseGlyph(g.glyph_id) orelse return error.GlyphNotFound;
             try decycler.enter(base.abs);
             defer decycler.leave();
-            try traverse(
+            // `ColorGlyph::paint`'s nested-clipbox handling: every ColrGlyph
+            // pushes its own clip box (when present) around its subgraph.
+            const clip_box = colr.v1ClipBox(g.glyph_id);
+            if (clip_box) |cb| try painter.pushClipBox(cb);
+            const resolved = tables.resolvePaint(base) catch |err| return err;
+            const result = traverse(
                 allocator,
                 colr,
                 painter,
-                try tables.resolvePaint(base),
+                resolved,
                 decycler,
                 stops,
                 recurse_depth + 1,
             );
+            if (clip_box != null) try painter.popClip();
+            return result;
         },
         .transform,
         .translate,
@@ -1693,4 +1700,112 @@ test "color glyph collection prefers v1 and finds v0" {
     try testing.expectEqual(Format.colr_v0, v0.format());
     try testing.expect(v0.boundingBox() == null);
     try testing.expect(collection.get(7) == null);
+}
+
+/// Records the order and shape of painter callbacks (test helper).
+const OrderRecorder = struct {
+    const Event = union(enum) {
+        clip_glyph: u16,
+        clip_box,
+        fill_solid: u16,
+        fill_gradient,
+        push_layer: tables.CompositeMode,
+        pop_layer,
+    };
+
+    allocator: std.mem.Allocator,
+    events: std.ArrayListUnmanaged(Event) = .empty,
+
+    fn deinit(self: *OrderRecorder) void {
+        self.events.deinit(self.allocator);
+    }
+
+    fn append(self: *OrderRecorder, event: Event) !void {
+        try self.events.append(self.allocator, event);
+    }
+
+    pub fn fillGlyph(
+        self: *OrderRecorder,
+        glyph_id: u16,
+        brush_transform: ?tables.Affine2x3,
+        brush: Brush,
+    ) anyerror!void {
+        return traitFillGlyph(self, glyph_id, brush_transform, brush);
+    }
+
+    pub fn pushTransform(self: *OrderRecorder, transform: tables.Affine2x3) anyerror!void {
+        _ = self;
+        _ = transform;
+    }
+
+    pub fn popTransform(self: *OrderRecorder) void {
+        _ = self;
+    }
+
+    pub fn pushClipGlyph(self: *OrderRecorder, glyph_id: u16) anyerror!void {
+        try self.append(.{ .clip_glyph = glyph_id });
+    }
+
+    pub fn pushClipBox(self: *OrderRecorder, clip_box: tables.ClipBox) anyerror!void {
+        _ = clip_box;
+        try self.append(.clip_box);
+    }
+
+    pub fn popClip(self: *OrderRecorder) anyerror!void {
+        _ = self;
+    }
+
+    pub fn fill(self: *OrderRecorder, brush: Brush) anyerror!void {
+        switch (brush) {
+            .solid => |solid| try self.append(.{ .fill_solid = solid.palette_index }),
+            else => try self.append(.fill_gradient),
+        }
+    }
+
+    pub fn pushLayer(self: *OrderRecorder, mode: tables.CompositeMode) anyerror!void {
+        try self.append(.{ .push_layer = mode });
+    }
+
+    pub fn popLayer(self: *OrderRecorder) anyerror!void {
+        try self.append(.pop_layer);
+    }
+};
+
+test "composite traversal draws the backdrop before the source" {
+    const allocator = testing.allocator;
+    const blob = try test_fixture.colrTestGlyphs();
+    const font = try @import("font.zig").Font.init(blob, 0);
+    const collection = ColorGlyphCollection.init(font.face);
+    // Glyph 156 is `Composite(SrcOver) { backdrop: ColrGlyph(166), source:
+    // Glyph(161, solid) }`; the backdrop is a radial gradient clipped by
+    // glyph 2.
+    const color_glyph = collection.get(156) orelse return error.TestUnexpectedResult;
+
+    var recorder = OrderRecorder{ .allocator = allocator };
+    defer recorder.deinit();
+    var dynamic = Painter.init(&recorder);
+    try paintColorGlyph(allocator, &dynamic, color_glyph);
+
+    // The root glyph and both nested ColrGlyphs (166 -> 95) carry clip boxes;
+    // dropping the nested ones makes the backdrop cover the whole glyph area
+    // (regression: fixtures `glyph_run_colr_test_glyphs*`).
+    var clip_boxes: usize = 0;
+    var draws: [4]OrderRecorder.Event = undefined;
+    var draw_count: usize = 0;
+    for (recorder.events.items) |event| {
+        switch (event) {
+            .clip_box => clip_boxes += 1,
+            .push_layer, .pop_layer => {},
+            else => {
+                draws[draw_count] = event;
+                draw_count += 1;
+            },
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), clip_boxes);
+    try testing.expectEqual(@as(usize, 4), draw_count);
+    try testing.expectEqual(OrderRecorder.Event{ .clip_glyph = 2 }, draws[0]);
+    try testing.expectEqual(OrderRecorder.Event.fill_gradient, draws[1]);
+    try testing.expectEqual(OrderRecorder.Event{ .clip_glyph = 161 }, draws[2]);
+    try testing.expectEqual(OrderRecorder.Event{ .fill_solid = 13 }, draws[3]);
 }

@@ -1,0 +1,6246 @@
+{
+  "version": 1,
+  "width": 400,
+  "height": 960,
+  "settings": {
+    "mode": "quality",
+    "threads": 0,
+    "level": "fallback"
+  },
+  "target_init": "clear",
+  "commands": [
+    {
+      "op": "set_paint",
+      "rgba8": [
+        0,
+        0,
+        0,
+        255
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        40.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 8,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        40.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 9,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        40.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 10,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        40.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 11,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        40.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 12,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        40.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 13,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        40.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 14,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        40.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 15,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        40.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 16,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        40.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 17,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        80.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 18,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        80.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 19,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        80.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 20,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        80.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 21,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        80.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 22,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        80.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 23,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        80.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 24,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        80.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 25,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        80.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 26,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        80.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 27,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        120.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 28,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        120.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 29,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        120.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 30,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        120.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 31,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        120.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 32,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        120.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 33,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        120.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 34,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        120.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 35,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        120.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 36,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        120.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 37,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        160.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 38,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        160.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 39,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        160.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 40,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        160.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 41,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        160.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 42,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        160.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 43,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        160.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 44,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        160.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 45,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        160.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 46,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        160.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 47,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        200.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 48,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        200.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 49,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        200.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 50,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        200.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 51,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        200.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 52,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        200.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 53,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        200.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 54,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        200.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 55,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        200.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 56,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        200.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 57,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        240.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 58,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        240.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 59,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        240.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 60,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        240.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 61,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        240.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 62,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        240.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 63,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        240.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 64,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        240.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 65,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        240.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 66,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        240.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 67,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        280.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 68,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        280.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 69,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        280.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 70,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        280.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 71,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        280.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 72,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        280.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 73,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        280.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 74,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        280.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 75,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        280.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 76,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        280.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 77,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        320.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 78,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        320.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 79,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        320.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 80,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        320.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 81,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        320.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 82,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        320.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 83,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        320.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 84,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        320.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 85,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        320.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 86,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        320.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 87,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        360.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 88,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        360.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 89,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        360.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 90,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        360.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 91,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        360.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 92,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        360.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 93,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        360.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 94,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        360.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 95,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        360.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 96,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        360.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 97,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        400.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 98,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        400.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 99,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        400.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 100,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        400.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 101,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        400.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 102,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        400.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 103,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        400.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 104,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        400.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 105,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        400.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 106,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        400.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 107,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        440.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 108,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        440.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 109,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        440.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 110,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        440.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 111,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        440.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 112,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        440.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 113,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        440.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 114,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        440.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 115,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        440.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 116,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        440.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 117,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        480.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 118,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        480.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 119,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        480.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 120,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        480.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 121,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        480.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 122,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        480.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 123,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        480.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 124,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        480.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 125,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        480.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 126,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        480.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 127,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        520.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 128,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        520.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 129,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        520.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 130,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        520.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 131,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        520.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 132,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        520.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 133,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        520.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 134,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        520.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 135,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        520.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 136,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        520.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 137,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        560.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 138,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        560.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 139,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        560.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 140,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        560.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 141,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        560.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 142,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        560.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 143,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        560.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 144,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        560.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 145,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        560.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 146,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        560.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 147,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        600.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 148,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        600.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 149,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        600.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 150,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        600.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 151,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        600.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 152,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        600.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 153,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        600.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 154,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        600.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 155,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        600.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 156,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        600.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 157,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        640.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 158,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        640.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 159,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        640.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 160,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        640.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 166,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        640.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 167,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        640.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 168,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        640.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 169,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        640.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 177,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        640.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 178,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        640.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 179,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        680.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 180,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        680.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 181,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        680.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 182,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        680.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 183,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        680.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 184,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        680.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 185,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        680.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 186,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        680.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 187,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        680.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 188,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        680.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 189,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        720.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 190,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        720.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 191,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        720.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 192,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        720.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 193,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        720.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 194,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        720.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 195,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        720.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 196,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        720.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 197,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        720.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 198,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        720.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 199,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        760.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 200,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        760.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 201,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        760.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 202,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        760.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 203,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        760.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 204,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        760.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 205,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        760.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 206,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        760.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 207,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        760.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 208,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        760.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 209,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        800.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 210,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        800.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 211,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        800.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 212,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        800.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 213,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        800.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 214,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        800.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 215,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        240.0,
+        800.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 216,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        280.0,
+        800.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 217,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        320.0,
+        800.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 218,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        360.0,
+        800.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 219,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        840.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 220,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        840.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 221,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_paint",
+      "rgba8": [
+        0,
+        0,
+        255,
+        255
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        920.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 148,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        920.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 149,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        920.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 150,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        920.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 151,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        920.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 152,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        920.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 153,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_paint",
+      "rgba8": [
+        0,
+        128,
+        0,
+        255
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        960.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 148,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        40.0,
+        960.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 149,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        80.0,
+        960.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 150,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        120.0,
+        960.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 151,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        160.0,
+        960.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 152,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        200.0,
+        960.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/test_glyphs-glyf_colr_1.ttf",
+        "index": 0
+      },
+      "font_size": 40.0,
+      "hint": false,
+      "atlas_cache": false,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 153,
+          "x": 0.0,
+          "y": 0.0
+        }
+      ]
+    }
+  ]
+}
