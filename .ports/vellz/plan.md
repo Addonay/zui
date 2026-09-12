@@ -177,7 +177,8 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `blurred_rounded_rect.rs` | `common/blurred_rounded_rect.zig` | port | 1 test; encode + painter connected and oracle-verified (normal/inverted scenes) |
 | `image_cache.rs`, `multi_atlas.rs` (guillotiere) | `common/atlas.zig` | defer | M3 (glyph atlas), M2 (images) |
 | `target.rs` (`TargetInit`) | `common/target.zig` | port | 1 test; connected via `RasterizerSettings` |
-| `probe.rs`, `pico_svg.rs` | `common/probe.zig` | defer | oracle/dev only |
+| `probe.rs` | `common/probe.zig`, `cpu/probe.zig` | port (oracle/dev only) | Scene, grid layout, and upstream tolerance-3 comparison policy ported; embedded pinned `tests/fixtures/upstream/probe.rgba`; connected via `vellz.cpu.probe`/`vellz-cli --probe`; oracle-verified byte-exact (51×51, four channels, max diff 0) |
+| `pico_svg.rs` | — | defer | Dev-only SVG loader |
 
 ### `vello_cpu` → `src/cpu/`
 
@@ -378,6 +379,13 @@ of panics, thread ownership).
   metrics, and a diff image. Exact equality is required for the f32/scalar
   path and for oracle-verified fixtures unless a fixture documents a tolerance
   and the reason. A tolerance is never used to hide missing geometry.
+- **Upstream probe.** `tests/fixtures/upstream/probe.rgba` is the pinned
+  upstream probe reference (unpremultiplied RGBA8, 51×51). `common/probe.zig`
+  ports the scene and the upstream comparison policy (all four channels,
+  per-channel absolute tolerance 3, zero-alpha pixels equal); `zig build probe`
+  re-renders it and re-checks the written bytes independently through
+  `tools/compare_raw.py`. The f32/scalar path is byte-exact and both tools
+  report the measured maximum channel difference.
 - **Coverage areas.** winding rules and self-intersection; degenerate/extreme
   geometry; join/cap/dash strokes; tile seams; nested/intersecting clips;
   translucent overlap and layers; gradient stops/transforms; image sampling and
@@ -424,8 +432,10 @@ of panics, thread ownership).
   clip/opacity/blend), and analytic blurred rounded rectangles (normal and
   inverted). `zig build test` = 589/589. Verification commands:
   `zig build test`, `zig build corpus`.
-- Provenance: the imported upstream `probe.rgba` fixture is byte-exact
-  (tolerance policy 3; measured max channel difference 0).
+- Provenance: the ported upstream `vello_common::probe` scene
+  (`common/probe.zig`, `cpu/probe.zig`, `vellz-cli --probe`,
+  `zig build probe`) renders `probe.rgba` byte-exact (tolerance policy 3;
+  measured max channel difference 0).
 
 ### Milestone 3 — Glyph rendering and Cozmic adapter
 
@@ -535,4 +545,16 @@ of panics, thread ownership).
   integration branches pending merge into `main`: u8 `optimize_speed`
   rasterization (16 further scenes byte-exact) and multithreaded dispatch
   (byte-identical to single-threaded at 1–4 threads).
+- 2026-09-11 later (merged 2026-09-12): the upstream fixture import is
+  closed. The pinned `vello_common::probe` scene is ported
+  (`common/probe.zig`: 8 active elements, `Filter` disabled as upstream,
+  grid geometry and the tolerance-3 comparison policy transcribed) with the
+  pinned `probe.rgba` embedded and compared per channel; `cpu/probe.zig`
+  adds the exact reference render settings and the end-to-end oracle test;
+  `vellz-cli --probe` and `zig build probe` (`tools/check_probe.sh`,
+  re-checked with `tools/compare_raw.py`) run it outside `zig build test`.
+  Measured: 51×51, different pixels 0, max channel difference `[0,0,0,0]`
+  (byte-exact, fnv1a `52f1e5326a5c7fda`). One port defect found and fixed
+  during the port: the gradient element set its paint but initially omitted
+  the `fill_rect`, which is exactly what the probe is for.
 

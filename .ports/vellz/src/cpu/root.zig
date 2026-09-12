@@ -29,6 +29,7 @@ pub const coarse = @import("coarse/mod.zig");
 pub const single_threaded = @import("dispatch/single_threaded.zig");
 pub const fine = @import("fine/mod.zig");
 pub const render = @import("render.zig");
+pub const probe = @import("probe.zig");
 
 pub const Span = util.Span;
 pub const F32Kernel = fine.F32Kernel;
@@ -59,4 +60,5 @@ test {
     _ = @import("fine/mod.zig");
     _ = @import("fine/blurred_rect.zig");
     _ = @import("render.zig");
+    _ = @import("probe.zig");
 }

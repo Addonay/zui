@@ -48,6 +48,28 @@ reduction order) and must state:
 Tolerances never mask missing geometry: a scene whose feature is unimplemented
 must fail loudly or be absent from the corpus, not produce approximate output.
 
+## Upstream probe fixture
+
+`tests/fixtures/upstream/probe.rgba` is the pinned upstream probe reference
+(`vello_common/assets/probe.rgba`, 51×51 unpremultiplied RGBA8, imported
+byte-for-byte; see the fixture README). The scene is ported in
+`src/common/probe.zig` (8 active elements; upstream's `Filter` element is
+disabled) and rendered by `vellz.cpu.probe.renderProbePixmap` at the exact
+reference settings (`Level.fallback`, 0 threads, `RenderMode.optimize_quality`,
+`TargetInit.clear(css.WHITE)`).
+
+```sh
+zig build probe      # tools/check_probe.sh: render + compare
+```
+
+Policy: upstream's probe comparison uses a per-channel absolute tolerance of 3
+on all four channels (pixels where both alphas are zero compare equal). That
+tolerance is imported with the fixture and never used to hide missing
+geometry; the vellz f32/scalar path is byte-exact, and both the CLI and
+`tools/compare_raw.py` report the measured maximum channel difference. The
+same comparison also runs inside `zig build test` through the embedded
+fixture.
+
 ## Covered areas (current and planned)
 
 | Area | Scene |
@@ -76,6 +98,7 @@ must fail loudly or be absent from the corpus, not produce approximate output.
 | filter layer with clip + opacity + multiply | `filter_layer_clip_opacity_64` |
 | analytic blurred rounded rect | `blurred_rounded_rect_64` |
 | inverted (inset) blurred rounded rect | `blurred_rounded_rect_invert_64` |
+| upstream probe fixture | `tools/check_probe.sh` (`zig build probe`, embedded in `zig build test`) |
 
 All scenes above render byte-exact with `zig build corpus` (32/32,
 `tolerance=0`).

@@ -1,11 +1,20 @@
-//! vellz CLI: render a shared-corpus scene to raw premultiplied RGBA8.
+//! vellz CLI: render a shared-corpus scene to raw premultiplied RGBA8, or
+//! render the ported upstream probe scene and compare it against the pinned
+//! reference.
 //!
 //! Usage:
 //!   vellz-cli --scene tests/scenes/fill_rect_64.json --out out/fill_rect_64.rgba
+//!   vellz-cli --probe [--out out/probe.rgba]
 //!
-//! Outputs the same pixel format and metadata keys as `tools/oracle-rs`, so
-//! `tools/compare.py` can compare them directly. This tool is development
-//! tooling; it is not part of the distributed package.
+//! Scene output uses the same pixel format and metadata keys as
+//! `tools/oracle-rs`, so `tools/compare.py` can compare them directly.
+//! `--probe` renders `vellz.common.probe`'s scene at the upstream reference
+//! settings (`Level.fallback`, 0 threads, `RenderMode.optimize_quality`,
+//! `TargetInit.clear(css.WHITE)`), compares the un-premultiplied RGBA8 result
+//! against the embedded `tests/fixtures/upstream/probe.rgba` with upstream's
+//! probe policy (all four channels, per-channel absolute tolerance 3), prints
+//! the measured maximum channel difference, and exits non-zero on a mismatch.
+//! This tool is development tooling; it is not part of the distributed package.
 
 const std = @import("std");
 const vellz = @import("vellz");
@@ -24,15 +33,24 @@ pub fn main(init: std.process.Init) !void {
 
     var scene_path: ?[]const u8 = null;
     var out_path: ?[]const u8 = null;
+    var probe_mode = false;
     while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--scene")) {
             scene_path = args_iter.next() orelse return usage();
         } else if (std.mem.eql(u8, arg, "--out")) {
             out_path = args_iter.next() orelse return usage();
+        } else if (std.mem.eql(u8, arg, "--probe")) {
+            probe_mode = true;
         } else {
             return usage();
         }
     }
+
+    if (probe_mode) {
+        if (scene_path != null) return usage();
+        return runProbe(allocator, io, out_path);
+    }
+
     const scene_file = scene_path orelse return usage();
     const out_file = out_path orelse return usage();
 
@@ -52,10 +70,58 @@ pub fn main(init: std.process.Init) !void {
 
 fn usage() error{InvalidArguments} {
     std.debug.print(
-        "usage: vellz-cli --scene SCENE.json --out OUT.rgba\n",
+        "usage: vellz-cli --scene SCENE.json --out OUT.rgba\n" ++
+            "       vellz-cli --probe [--out OUT.rgba]\n",
         .{},
     );
     return error.InvalidArguments;
+}
+
+/// Render the probe scene, compare against the embedded pinned upstream
+/// reference, optionally write the un-premultiplied RGBA8 result, and report
+/// the exact metrics. Exits non-zero on a mismatch.
+fn runProbe(allocator: std.mem.Allocator, io: std.Io, out_path: ?[]const u8) !void {
+    const common_probe = vellz.common.probe;
+
+    var pixmap = try vellz.cpu.probe.renderProbePixmap(allocator);
+    defer pixmap.deinit(allocator);
+
+    const actual = try common_probe.ProbeImage.fromPixmap(allocator, &pixmap);
+    defer allocator.free(actual.data);
+
+    const comparison = common_probe.compareReference(actual);
+    const statistics = comparison.statistics;
+
+    if (out_path) |out_file| {
+        std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(out_file) orelse ".") catch {};
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_file, .data = actual.data });
+    }
+
+    std.debug.print(
+        "probe {d}x{d} bytes={d} fnv1a={x:0>16} different_pixels={d} " ++
+            "max_channel_diff=[{d},{d},{d},{d}] byte_exact={}\n",
+        .{
+            actual.width,
+            actual.height,
+            actual.data.len,
+            fnv1a(actual.data),
+            statistics.different_pixel_count,
+            statistics.max_channel_discrepancy[0],
+            statistics.max_channel_discrepancy[1],
+            statistics.max_channel_discrepancy[2],
+            statistics.max_channel_discrepancy[3],
+            comparison.byte_exact,
+        },
+    );
+
+    if (!comparison.passed()) {
+        for (common_probe.PROBE_ELEMENTS) |feature| {
+            if (statistics.differs(feature)) {
+                std.debug.print("probe: feature {s} differs\n", .{@tagName(feature)});
+            }
+        }
+        return error.ProbeMismatch;
+    }
 }
 
 fn renderScene(
