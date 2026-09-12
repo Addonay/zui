@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Offscreen GPU corpus gate (M5 T5).
 #
-# Renders the root-pass scene subset with the wgpu backend and compares the
+# Renders the gated scene subset (root/layer/gradient/image/filter/mask and
+# representative glyph runs) with the wgpu backend and compares the
 # premultiplied RGBA8 output against the pinned `vello_cpu` oracle using the
 # documented GPU tolerance.
 #
@@ -12,8 +13,8 @@
 # executable).
 #
 #   RENDERER is the built `vellz-gpu-render` executable (the Zig build passes
-#   it via `addArtifactArg`). When no scenes are given, the root-pass subset
-#   below runs.
+#   it via `addArtifactArg`). When no scenes are given, the gated subset below
+#   runs.
 #
 # Tolerance policy (docs/gpu-m5-plan.md §4): compare all four channels, start
 # at `--max-abs-diff 1 --max-diff-pixels 0`, and relax a scene only with a

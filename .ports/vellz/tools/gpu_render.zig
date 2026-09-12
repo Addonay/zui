@@ -15,8 +15,10 @@
 //! glyph runs draw through the GPU `DrawSink`/`GlyphRenderer` surface with the
 //! same atlas cache backing the glyph pages.
 //!
-//! Unsupported scene features (mask layers, pixmap-only image sources) fail
-//! with a typed error; there is no CPU fallback.
+//! Masks are applied through the local mask adapt (uploaded mask texture +
+//! dedicated multiply pass). Unsupported scene features (pixmap-only image
+//! sources, destructive blends, filter graphs without a GPU plan) fail with a
+//! typed error; there is no CPU fallback.
 
 const std = @import("std");
 const vellz = @import("vellz");
