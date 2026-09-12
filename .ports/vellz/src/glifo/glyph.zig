@@ -48,7 +48,7 @@ pub const FontData = font_mod.FontData;
 /// Errors from glyph run preparation and drawing.
 pub const Error = font_mod.Error || glyf.DrawError || error{
     /// A feature that is scoped but not ported yet: hinting, embolden,
-    /// variation coordinates, COLR/CPAL, bitmap glyphs, decoration.
+    /// variation coordinates, bitmap glyphs, decoration.
     Unsupported,
 };
 

@@ -8,12 +8,14 @@
 //! conversion), plus skrifa's `decycler.rs` cycle check.
 //!
 //! Port adaptations (see `.ports/vellz/docs/glifo-m3-plan.md` §3, T4):
-//! - `ColorPainter` becomes comptime duck typing: `traverse` is generic over
-//!   the painter type, exactly like the `DrawSink`/`GlyphRenderer` convention.
-//!   The `fill_glyph` default method from the Rust trait is the free function
-//!   `traitFillGlyph`; every painter exposes `fillGlyph` calling it, and
-//!   `CollectFillGlyphPainter` deliberately inherits it so nested `Glyph`
-//!   paints fall back to the unoptimized traversal (upstream semantics).
+//! - `ColorPainter` becomes the type-erased `Painter` vtable (`&mut dyn
+//!   ColorPainter` upstream). A comptime-generic painter would monomorphize
+//!   the nested `Glyph` optimization without bound, so traversal always goes
+//!   through the vtable. The `fill_glyph` default method from the Rust trait
+//!   is the free function `traitFillGlyph`; every painter exposes `fillGlyph`
+//!   calling it, and `CollectFillGlyphPainter` deliberately inherits it so
+//!   nested `Glyph` paints fall back to the unoptimized traversal (upstream
+//!   semantics).
 //! - Allocating sinks take the allocator and return `!void`; the traversal
 //!   therefore uses `anyerror` internally. Upstream `glifo` ignores paint
 //!   errors ("for now") and `paint()` here catches the `tables.colr` parse

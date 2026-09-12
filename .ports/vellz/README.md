@@ -63,13 +63,17 @@ placement trace. T3 wires the stack end to end: positioned `glyph_run` scenes
 (fill/stroke, transform absorption, skew, glyph transforms, gradient paint)
 render through `vellz.glifo` + `vellz.cpu` byte-exact against the pinned
 oracle with the glyph atlas cache on and off (15 new scenes; 63/63 corpus,
-tolerance 0). The GPU side has the wgpu-native device bootstrap plus the
+tolerance 0). T4 adds COLRv0/v1 + CPAL (paint graph traversal, linear/radial/
+sweep gradients, transforms, clip boxes, composite modes, palette and
+foreground colors) and its 27-scene G3c corpus; all render byte-exact against
+the pinned oracle, atlas cache on and off (90/90 corpus, tolerance 0). The GPU
+side has the wgpu-native device bootstrap plus the
 full host/shader layout contract, with an offscreen clear/readback smoke test
 passing on the llvmpipe adapter.
 
 Not yet implemented (explicit typed errors, never placeholder pixels): hinted
-outlines (the interpreter), COLR/CPAL, glyph decoration and the Cozmic adapter
-(M3 remainder); the GPU pipelines, renderer, and G5 corpus (M5 remainder). G4
+outlines (the interpreter), bitmap glyphs, glyph decoration and the Cozmic
+adapter (M3 remainder); the GPU pipelines, renderer, and G5 corpus (M5 remainder). G4
 still needs SIMD-level dispatch and methodology-complete speedup measurements;
 MT filter layers and u8 + MT return `error.Unsupported` (documented upstream
 limitations). See [`plan.md`](plan.md) for the ledgers and milestones.

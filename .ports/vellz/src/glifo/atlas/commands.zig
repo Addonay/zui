@@ -1,17 +1,19 @@
 //! Deferred atlas rendering commands.
 //!
-//! Port of `glifo/src/atlas/commands.rs`. During glyph encoding, outline (and,
-//! once ported, COLR) glyph draw commands are recorded into an
-//! `AtlasCommandRecorder` rather than being executed immediately. At render
-//! time the application drains the pending recorders (grouped by atlas page)
-//! and replays them into a single glyph renderer that is reset between pages.
+//! Port of `glifo/src/atlas/commands.rs`. During glyph encoding, outline and
+//! COLR glyph draw commands are recorded into an `AtlasCommandRecorder` rather
+//! than being executed immediately. At render time the application drains the
+//! pending recorders (grouped by atlas page) and replays them into a single
+//! glyph renderer that is reset between pages.
 //!
 //! Port adaptations (see `.ports/vellz/docs/glifo-m3-plan.md` §3):
 //! - `Arc<BezPath>` commands own a `kurbo.BezPath` directly; every command
 //!   that clones a path takes the allocator and can fail with
 //!   `error.OutOfMemory` (upstream's `Vec::push`/`Arc::new` abort).
-//! - `AtlasPaint::Gradient` is only representable once COLR lands and returns
-//!   `error.Unsupported` here instead of being silently stored.
+//! - `setPaintAtlas` moves a gradient's stop allocation into the recorded
+//!   command (freed by `clearCommands`/`deinit`, like an owned path); the
+//!   direct `RenderContext` sink path instead resolves paints through
+//!   `AtlasPaint.toPaintType`, which clones them.
 
 const std = @import("std");
 const kurbo = @import("../../kurbo/root.zig");
@@ -26,7 +28,7 @@ pub const AtlasPaint = union(enum) {
     gradient: peniko.Gradient,
 
     /// Convert to the renderer paint type. Gradients clone their stops, so the
-    /// conversion takes an allocator; gradients are deferred until COLR lands.
+    /// conversion takes an allocator; the caller keeps ownership of `self`.
     pub fn toPaintType(self: *const AtlasPaint, allocator: std.mem.Allocator) !paint_mod.PaintType {
         return switch (self.*) {
             .solid => |color| paint_mod.PaintType.fromAlphaColor(color),

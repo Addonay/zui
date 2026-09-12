@@ -13,7 +13,9 @@ Scene parameters mirror the pinned upstream `vello_tests/tests/glyph.rs`
 cases (`glyphs_filled_unhinted`, `glyphs_skewed_unhinted`,
 `glyphs_scaled_unhinted`, `glyphs_glyph_transform_unhinted`,
 `glyphs_stroked_unhinted`, `glyphs_small_unhinted`,
-`glyphs_transform_composition_rows_outline`, `glyphs_with_gradient`), with
+`glyphs_transform_composition_rows_outline`, `glyphs_with_gradient`) plus the
+G3c COLR cases (`glyphs_colr_noto*`,
+`glyphs_transform_composition_rows_colr`, `glyphs_colr_test_glyphs`), with
 hinting forced off because the interpreter is not ported yet.
 """
 
