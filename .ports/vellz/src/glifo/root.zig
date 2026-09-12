@@ -53,6 +53,7 @@ pub const glyf = @import("glyf.zig");
 pub const pen = @import("pen.zig");
 pub const outline_cache = @import("outline_cache.zig");
 pub const util = @import("util.zig");
+pub const dump = @import("dump.zig");
 
 pub const FontData = font.FontData;
 pub const Font = font.Font;
@@ -85,4 +86,5 @@ test {
     _ = pen;
     _ = outline_cache;
     _ = util;
+    _ = dump;
 }

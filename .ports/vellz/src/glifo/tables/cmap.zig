@@ -71,7 +71,7 @@ pub const Charmap = struct {
                 PlatformId.iso => .unicode_bmp,
                 else => .none,
             };
-            if (@intFromEnum(kind) > @intFromEnum(best_kind)) {
+            if (@backingInt(kind) > @backingInt(best_kind)) {
                 best_kind = kind;
                 best = subtable;
                 best_is_symbol = kind == .symbol;

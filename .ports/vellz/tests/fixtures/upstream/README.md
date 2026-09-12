@@ -10,13 +10,25 @@ regenerated so tests never need a Rust toolchain or Git LFS.
 | `probe.png` | `vello_common/assets/probe.png` | Same as above; preview only. |
 | `Roboto-Regular.ttf` | `assets/roboto/Roboto-Regular.ttf` | Apache-2.0; see `Roboto-LICENSE.txt`. Used for positioned-glyph tests in Milestone 3. |
 | `Roboto-LICENSE.txt` | `assets/roboto/LICENSE.txt` | Apache-2.0 notice. |
+| `NotoColorEmoji-Subset.ttf` | `assets/noto_color_emoji/NotoColorEmoji-Subset.ttf` | OFL-1.1; see `NotoColorEmoji-LICENSE.txt`. 44 glyphs, `glyf` + `COLR`/`CPAL`, cmap formats 4/12/14: the format 12 and variation-sequence fixture. |
+| `NotoColorEmoji-CBTF-Subset.ttf` | `assets/noto_color_emoji/NotoColorEmoji-CBTF-Subset.ttf` | OFL-1.1. Bitmap-only (`CBDT`/`CBLC`): the `error.Unsupported` fixture for non-`glyf` outlines. |
+| `NotoColorEmoji-LICENSE.txt` | `assets/noto_color_emoji/LICENSE.txt` | OFL-1.1 notice (covers both Noto files). |
 
 SHA-256:
 
 ```text
 88ff34af8db521e5e2520719706bc24388e7e976ac02dd818b867e0f6a8e0d13  probe.png
 01c87c436d7b3cfaa357dfaad9259f57b4fdcb27a62da9658afb10056ee54bea  probe.rgba
+319cff6e7a31f0f2a41c475dca42890aa5d19fe16017e2290f8c1d4e14f76481  Roboto-Regular.ttf
+467e3e7074b6cdf8bbb7795124eb88f87a08934f1446d5716795554cfb6e00cb  NotoColorEmoji-Subset.ttf
+b505bbd72ed997810e346931fa31f3bc59d1e131080182de959c4978ea20eb45  NotoColorEmoji-CBTF-Subset.ttf
 ```
+
+The SHA-256 values were computed from the pinned checkout with `sha256sum`
+(2026-09-12) and are re-printed by `tools/import_upstream_fixtures.sh`.
+`zig build test` reads the fonts directly; the M3 T2 oracle gate
+(`tools/compare_glyphs.sh`, `zig build glyphs`) hashes the canonical glyph
+dumps instead of the fonts, because the comparison is on f32 path data.
 
 The `probe.rgba` scene is defined in `vello_common/src/probe.rs` (upstream) and
 is ported in `src/common/probe.zig`; `vellz.cpu.probe.renderProbePixmap`

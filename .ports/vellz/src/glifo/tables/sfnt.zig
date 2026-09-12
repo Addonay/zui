@@ -169,3 +169,62 @@ test "table lookup tolerates a truncated directory" {
     std.mem.writeInt(u16, truncated[4..6], 17, .big);
     try std.testing.expect((try Face.parse(&truncated, 0)).table(tag_glyf) == null);
 }
+
+/// Builds a two-face TTC that shares one table directory and all tables, the
+/// layout `read-fonts` reads with `FontRef::from_index`.
+fn buildSharedTtc(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    const face = try Face.parse(data, 0);
+    const dir_size = 12 + 16 * @as(usize, face.num_tables);
+    const ttc_header_size = 12 + 4 * 2;
+    const face_offset = ttc_header_size;
+    const data_offset = face_offset + dir_size;
+    const ttc = try allocator.alloc(u8, data_offset + data.len);
+    @memset(ttc, 0);
+    @memcpy(ttc[0..4], "ttcf");
+    std.mem.writeInt(u32, ttc[4..8], 0x00010000, .big);
+    std.mem.writeInt(u32, ttc[8..12], 2, .big);
+    std.mem.writeInt(u32, ttc[12..16], face_offset, .big);
+    std.mem.writeInt(u32, ttc[16..20], face_offset, .big);
+    @memcpy(ttc[face_offset .. face_offset + dir_size], data[0..dir_size]);
+    var i: usize = 0;
+    while (i < face.num_tables) : (i += 1) {
+        const record = face_offset + 12 + 16 * i;
+        const table_offset = std.mem.readInt(u32, ttc[record + 8 ..][0..4], .big);
+        std.mem.writeInt(u32, ttc[record + 8 ..][0..4], table_offset + @as(u32, @intCast(data_offset)), .big);
+    }
+    @memcpy(ttc[data_offset..], data);
+    return ttc;
+}
+
+test "ttc faces share tables and outline identically" {
+    const std_testing = std.testing;
+    const fixture = @import("../test_fixture.zig");
+    const data = try fixture.roboto();
+    const ttc = try buildSharedTtc(std_testing.allocator, data);
+    defer std_testing.allocator.free(ttc);
+
+    const face0 = try Face.parse(ttc, 0);
+    const face1 = try Face.parse(ttc, 1);
+    try std_testing.expect(face0.in_ttc and face1.in_ttc);
+    try std_testing.expectEqual(face0.table(tag_glyf).?.ptr, face1.table(tag_glyf).?.ptr);
+    try std_testing.expectError(error.NoSuchFace, Face.parse(ttc, 2));
+
+    const font_mod = @import("../font.zig");
+    const pen_mod = @import("../pen.zig");
+    const font = try font_mod.Font.init(ttc, 1);
+    const outlines = try font.outlines();
+    var pen = pen_mod.PathElementPen.init(std_testing.allocator);
+    defer pen.deinit();
+    _ = try outlines.draw(std_testing.allocator, 37, .{ .size = 16.0 }, &pen);
+
+    const plain = try font_mod.Font.init(data, 0);
+    const plain_outlines = try plain.outlines();
+    var plain_pen = pen_mod.PathElementPen.init(std_testing.allocator);
+    defer plain_pen.deinit();
+    _ = try plain_outlines.draw(std_testing.allocator, 37, .{ .size = 16.0 }, &plain_pen);
+
+    try std_testing.expectEqual(plain_pen.elements.items.len, pen.elements.items.len);
+    for (plain_pen.elements.items, pen.elements.items) |expected, actual| {
+        try std_testing.expect(expected.eql(actual));
+    }
+}

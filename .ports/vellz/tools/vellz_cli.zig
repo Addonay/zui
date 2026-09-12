@@ -139,59 +139,17 @@ fn runDumpGlyphs(
 
     var stdout_buffer: [4096]u8 = undefined;
     var file_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    const writer = &file_writer.interface;
-    try writer.print("vellz-glyph-dump v1\n", .{});
-    try writer.print("face {d}\n", .{font_index});
-    try writer.print("size {x:0>8}\n", .{@as(u32, @bitCast(size))});
-
-    var pen = glifo.PathElementPen.init(allocator);
-    defer pen.deinit();
-    for (gids.items) |gid| {
-        pen.clearRetainingCapacity();
-        const metrics = outlines.draw(allocator, gid, .{ .size = size }, &pen) catch |err| {
-            std.debug.print("vellz-cli: drawing glyph {d}: {s}\n", .{ gid, @errorName(err) });
-            return err;
-        };
-        var lsb_buf: [8]u8 = undefined;
-        var advance_buf: [8]u8 = undefined;
-        try writer.print("gid {d} format glyf elems {d} lsb {s} advance {s}\n", .{
-            gid,
-            pen.elements.items.len,
-            optF32Hex(metrics.lsb, &lsb_buf),
-            optF32Hex(metrics.advance_width, &advance_buf),
-        });
-        for (pen.elements.items) |element| {
-            switch (element) {
-                .move_to => |p| try writer.print("M {x:0>8} {x:0>8}\n", .{
-                    @as(u32, @bitCast(p[0])),
-                    @as(u32, @bitCast(p[1])),
-                }),
-                .line_to => |p| try writer.print("L {x:0>8} {x:0>8}\n", .{
-                    @as(u32, @bitCast(p[0])),
-                    @as(u32, @bitCast(p[1])),
-                }),
-                .quad_to => |q| try writer.print("Q {x:0>8} {x:0>8} {x:0>8} {x:0>8}\n", .{
-                    @as(u32, @bitCast(q.c0[0])),
-                    @as(u32, @bitCast(q.c0[1])),
-                    @as(u32, @bitCast(q.p[0])),
-                    @as(u32, @bitCast(q.p[1])),
-                }),
-                .curve_to => |c| try writer.print(
-                    "C {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8}\n",
-                    .{
-                        @as(u32, @bitCast(c.c0[0])),
-                        @as(u32, @bitCast(c.c0[1])),
-                        @as(u32, @bitCast(c.c1[0])),
-                        @as(u32, @bitCast(c.c1[1])),
-                        @as(u32, @bitCast(c.p[0])),
-                        @as(u32, @bitCast(c.p[1])),
-                    },
-                ),
-                .close => try writer.print("Z\n", .{}),
-            }
-        }
-    }
-    try writer.print("end\n", .{});
+    glifo.dump.writeGlyphDump(
+        &file_writer.interface,
+        allocator,
+        &outlines,
+        font_index,
+        size,
+        gids.items,
+    ) catch |err| {
+        std.debug.print("vellz-cli: dumping glyphs: {s}\n", .{@errorName(err)});
+        return err;
+    };
     try file_writer.flush();
 }
 
@@ -206,7 +164,6 @@ fn runDumpCmap(
 ) !void {
     const glifo = vellz.glifo;
     const font = try glifo.Font.init(blob, font_index);
-    const charmap = font.charmap();
 
     var codepoints: std.ArrayList(u32) = .empty;
     defer codepoints.deinit(allocator);
@@ -214,21 +171,12 @@ fn runDumpCmap(
 
     var stdout_buffer: [4096]u8 = undefined;
     var file_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    const writer = &file_writer.interface;
-    try writer.print("vellz-cmap-dump v1\n", .{});
-    try writer.print("face {d}\n", .{font_index});
-    try writer.print("has_map {d} is_symbol {d}\n", .{
-        @intFromBool(charmap.hasMap()),
-        @intFromBool(charmap.isSymbol()),
-    });
-    for (codepoints.items) |codepoint| {
-        if (charmap.map(codepoint)) |gid| {
-            try writer.print("cp {d} gid {d}\n", .{ codepoint, gid });
-        } else {
-            try writer.print("cp {d} gid none\n", .{codepoint});
-        }
-    }
-    try writer.print("end\n", .{});
+    try glifo.dump.writeCmapDump(
+        &file_writer.interface,
+        font_index,
+        font.charmap(),
+        codepoints.items,
+    );
     try file_writer.flush();
 }
 
@@ -259,11 +207,6 @@ fn parseU32(text: []const u8) ?u32 {
         return std.fmt.parseInt(u32, text[2..], 16) catch null;
     }
     return std.fmt.parseInt(u32, text, 10) catch null;
-}
-
-fn optF32Hex(value: ?f32, buf: *[8]u8) []const u8 {
-    const bits = @as(u32, @bitCast(value orelse return "none"));
-    return std.fmt.bufPrint(buf, "{x:0>8}", .{bits}) catch unreachable;
 }
 
 /// Render the probe scene, compare against the embedded pinned upstream
