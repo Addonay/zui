@@ -29,9 +29,10 @@ rectangles, each also in its low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 638/638 unit and integration tests (631 lib + 7 scene)
+zig build test     # 729/729 unit and integration tests (722 lib + 7 scene)
 zig build corpus   # 48/48 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
+zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo
 ```
 
 Coverage: antialiased fills, translucent overlap, NonZero/EvenOdd, nested
@@ -48,8 +49,19 @@ bilinear images), and multithreaded f32 dispatch (1–255 threads, byte-identica
 to single-threaded). The imported upstream `probe.rgba` fixture is byte-exact
 (tolerance policy 3, measured difference 0).
 
+Progress toward M3 and M5 (both staged): the glyph outline engine is ported and
+bit-exact against upstream `skrifa`/`glifo` — sfnt/`head`/`maxp`/`hhea`/`hmtx`/
+`loca`/`glyf`/`cmap` parsing with fixed-point 26.6 scaling and simple/composite
+outlines, compared across 250,016 path elements / 685,392 coordinates and
+327,680 cmap mappings at tolerance 0 (`zig build glyphs`) — and the atlas stack
+(`guillotiere`, `multi_atlas`, `image_cache`) is ported with a Rust-golden
+placement trace. The GPU side has the wgpu-native device bootstrap plus the
+full host/shader layout contract, with an offscreen clear/readback smoke test
+passing on the llvmpipe adapter.
+
 Not yet implemented (explicit typed errors, never placeholder pixels): glyph
-rendering (M3) and the hybrid GPU backend (M5). G4 still needs SIMD-level
+run rendering/painting, COLR, and the Cozmic adapter (M3 remainder); the GPU
+pipelines, renderer, and G5 corpus (M5 remainder). G4 still needs SIMD-level
 dispatch and methodology-complete speedup measurements; MT filter layers and
 u8 + MT return `error.Unsupported` (documented upstream limitations). See
 [`plan.md`](plan.md) for the ledgers and milestones.
