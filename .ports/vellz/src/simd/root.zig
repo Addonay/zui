@@ -3,10 +3,17 @@
 //!
 //! Upstream algorithm code is generic over a `Simd` backend and dispatches at
 //! runtime over `Level`. The port keeps the same fixed vector widths and lane
-//! semantics; the `Level` here selects an implementation only for functions
-//! that genuinely differ per architecture (today: none). All helpers are
-//! `inline` and operate on `@Vector` values, so LLVM lowers them to the
-//! host's SIMD instructions when available and keeps IEEE semantics otherwise.
+//! semantics; [`Level`] is selected at runtime ([`Level.new`]/[`Level.detect`])
+//! and modules dispatch on it with [`dispatch`] (the Zig spelling of
+//! `fearless_simd::dispatch!`): the scalar `fallback` backend stays available
+//! for every operation, and vector backends are selected where the port
+//! implements them.
+//!
+//! Zig's `@Vector` operations are compiled for the target the binary was built
+//! for (the default `zig build` target is the native CPU), so `Level.detect`
+//! reports the highest level the *build target* supports; a `-Dcpu=baseline`
+//! build reports (and dispatches to) the baseline level. The level never
+//! enables instructions that the build target lacks.
 //!
 //! Porting rules:
 //! - Upstream `f32x16` etc. map to the aliases below.
@@ -18,12 +25,12 @@
 //!   are shared by scalar paths too.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Runtime-selected SIMD level, mirroring `fearless_simd::Level`.
 ///
-/// Vellz currently implements one portable backend; the variants exist so
-/// public settings and cache keys match upstream and so architecture-specific
-/// refinements can be added without changing callers.
+/// Every level has a working implementation (the portable `@Vector` backend);
+/// levels differ in which vector width/algorithms the port selects.
 pub const Level = enum {
     /// Pure scalar semantics. Always available in vellz (unlike upstream,
     /// where the variant may be compiled out on native SIMD targets).
@@ -37,21 +44,106 @@ pub const Level = enum {
     neon,
     wasm_simd128,
 
+    /// The detected level of the build target (`fearless_simd::Level::new`).
+    ///
+    /// This is a runtime value: it is computed from the build target's CPU
+    /// features, which Zig records at compile time, and callers may pass a
+    /// different level in [`RenderSettings`] to force a backend.
     pub fn new() Level {
-        return @This().baseline();
+        return detect();
     }
 
+    /// The detected level, or `null` when detection is unavailable (never in
+    /// this port; kept for the upstream API shape).
     pub fn tryDetect() ?Level {
-        return @This().baseline();
+        return detect();
+    }
+
+    /// Highest level supported by the binary's build target.
+    pub fn detect() Level {
+        return switch (builtin.cpu.arch) {
+            .x86_64, .x86 => blk: {
+                const has = std.Target.x86.featureSetHas;
+                if (has(builtin.cpu.features, .avx512f) and
+                    has(builtin.cpu.features, .avx512bw))
+                {
+                    break :blk .avx512;
+                }
+                if (has(builtin.cpu.features, .avx2)) break :blk .avx2;
+                if (has(builtin.cpu.features, .sse4_2)) break :blk .sse4_2;
+                if (has(builtin.cpu.features, .sse2)) break :blk .sse2;
+                break :blk .fallback;
+            },
+            .aarch64, .aarch64_be => blk: {
+                if (std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon)) {
+                    break :blk .neon;
+                }
+                break :blk .fallback;
+            },
+            .wasm32, .wasm64 => blk: {
+                if (std.Target.wasm.featureSetHas(builtin.cpu.features, .simd128)) {
+                    break :blk .wasm_simd128;
+                }
+                break :blk .fallback;
+            },
+            else => .fallback,
+        };
+    }
+
+    /// Parse a level name (`fallback`, `baseline`, `sse2`, ...), as used by
+    /// the CLI/bench `--level` options. `"native"` maps to [`detect`].
+    pub fn fromName(name: []const u8) ?Level {
+        if (std.mem.eql(u8, name, "native")) return detect();
+        inline for (@typeInfo(Level).@"enum".field_names) |field_name| {
+            if (std.mem.eql(u8, name, field_name)) {
+                return @field(Level, field_name);
+            }
+        }
+        return null;
     }
 
     pub fn isFallback(self: Level) bool {
         return self == .fallback;
     }
+
+    /// Whether this level selects the vector code paths (that is, anything
+    /// other than `fallback`).
+    pub fn isVector(self: Level) bool {
+        return self != .fallback;
+    }
 };
 
 /// Alias kept for ported call sites.
 pub const Simd = Level;
+
+/// Per-level dispatch, the Zig spelling of `fearless_simd::dispatch!`.
+///
+/// `spec` is a struct whose declarations implement one call signature for one
+/// or more levels, named exactly like the level (`fallback`, `sse2`, `avx2`,
+/// ...). `dispatch(spec, level, args)` calls the declaration for `level` when
+/// it exists, otherwise the shared `vector` declaration, otherwise
+/// `spec.fallback`; `spec` must always declare `fallback`.
+///
+/// The switch is runtime: each prong is a separate invocation of the selected
+/// declaration, so implementations can differ per level without a vtable.
+pub inline fn dispatch(
+    comptime spec: type,
+    level: Level,
+    args: anytype,
+) @TypeOf(@call(.auto, spec.fallback, args)) {
+    switch (level) {
+        inline else => |lv| {
+            const name = @tagName(lv);
+            const impl = comptime if (@hasDecl(spec, name))
+                @field(spec, name)
+            else if (@hasDecl(spec, "vector"))
+                spec.vector
+            else
+                spec.fallback;
+            return @call(.auto, impl, args);
+        },
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Vector types (fixed widths used by the upstream crates)
@@ -61,6 +153,7 @@ pub fn Vec(comptime n: usize, comptime T: type) type {
     return @Vector(n, T);
 }
 
+pub const F32x2 = Vec(2, f32);
 pub const F32x4 = Vec(4, f32);
 pub const F32x8 = Vec(8, f32);
 pub const F32x16 = Vec(16, f32);
@@ -104,19 +197,19 @@ pub inline fn splat(comptime V: type, value: Lane(V)) V {
 ///
 /// For 16-lane RGBA-block vectors (`[r,g,b,a, r,g,b,a, ...]`) this replaces
 /// each block with its alpha, which is what the highp kernel and the gradient
-/// LUT need. Upstream implements it with `zip_high`; the lane loop below is
-/// equivalent and exact.
+/// LUT need. Upstream implements it with `zip_high`; the shuffle below selects
+/// lane 3 of every block, which is the same permutation for all supported
+/// widths.
 pub inline fn splat4th(v: anytype) @TypeOf(v) {
     const V = @TypeOf(v);
     const n = comptime laneCount(V);
     comptime std.debug.assert(n % 4 == 0);
-    var out: V = undefined;
-    inline for (0..n / 4) |block| {
-        inline for (0..4) |lane| {
-            out[block * 4 + lane] = v[block * 4 + 3];
-        }
-    }
-    return out;
+    const mask = comptime blk: {
+        var m: [n]i32 = undefined;
+        for (&m, 0..) |*lane, i| lane.* = @intCast((i / 4) * 4 + 3);
+        break :blk m;
+    };
+    return @shuffle(Lane(V), v, undefined, mask);
 }
 
 pub inline fn fromSlice(comptime V: type, slice: []const Lane(V)) V {
@@ -149,17 +242,32 @@ pub inline fn blockSplat(a: F32x4, b: F32x4, c: F32x4, d: F32x4) F32x16 {
     return out;
 }
 
+/// `f32x8::block_splat`: repeat a four-lane block in both halves of an
+/// `f32x8` (upstream `combine_f32x4(block, block)`).
+pub inline fn blockSplatF32x4(block: F32x4) F32x8 {
+    return @shuffle(f32, block, undefined, [8]i32{ 0, 1, 2, 3, 0, 1, 2, 3 });
+}
+
 /// `element_wise_splat`: broadcast each lane of a four-lane vector to its own
 /// group of four lanes. Lane order matches upstream `combine_f32x8(
 /// combine_f32x4(splat(input[0]), splat(input[1])),
 /// combine_f32x4(splat(input[2]), splat(input[3])))`.
 pub inline fn elementWiseSplat(input: F32x4) F32x16 {
-    return blockSplat(
-        splat(F32x4, input[0]),
-        splat(F32x4, input[1]),
-        splat(F32x4, input[2]),
-        splat(F32x4, input[3]),
-    );
+    return @shuffle(f32, input, undefined, [16]i32{
+        0, 0, 0, 0,
+        1, 1, 1, 1,
+        2, 2, 2, 2,
+        3, 3, 3, 3,
+    });
+}
+
+/// `element_wise_splat` for a two-lane source, producing an `f32x8`; used by
+/// the flattening SIMD path (`f64x2` point pairs duplicated into four lanes).
+pub inline fn elementWiseSplatF32x2(input: F32x2) F32x8 {
+    return @shuffle(f32, input, undefined, [8]i32{
+        0, 0, 0, 0,
+        1, 1, 1, 1,
+    });
 }
 
 /// Alias of [`splat4th`] kept for the gradient/LUT call sites that already
@@ -271,12 +379,29 @@ pub inline fn unzipHighF32x8(a: F32x8, b: F32x8) F32x4 {
     return .{ a[1], a[3], b[1], b[3] };
 }
 
-pub inline fn zipLowF64x2(a: F64x2, b: F64x2) F64x4 {
-    return .{ a[0], a[1], b[0], b[1] };
+/// Full-width `unzip_low_f32x8`/`unzip_high_f32x8` (the upstream return type):
+/// extract the even-/odd-indexed lanes of both operands.
+///
+/// For `[a0..a7]` and `[b0..b7]` these return `[a0,a2,a4,a6,b0,b2,b4,b6]` and
+/// `[a1,a3,a5,a7,b1,b3,b5,b7]`; [`unzipLowF32x8`] is the first half of the
+/// former (upstream `unzip_low_f32x4` on the split halves).
+pub inline fn unzipLowF32x8Wide(a: F32x8, b: F32x8) F32x8 {
+    return .{ a[0], a[2], a[4], a[6], b[0], b[2], b[4], b[6] };
 }
 
-pub inline fn zipHighF64x2(a: F64x2, b: F64x2) F64x4 {
-    return .{ a[0], a[1], b[0], b[1] };
+pub inline fn unzipHighF32x8Wide(a: F32x8, b: F32x8) F32x8 {
+    return .{ a[1], a[3], a[5], a[7], b[1], b[3], b[5], b[7] };
+}
+
+/// Upstream `zip_low_f64x2`/`zip_high_f64x2` (SSE `unpacklo_pd`/`unpackhi_pd`):
+/// duplicate the low/high element of the two-lane inputs. Used by the
+/// flattening SIMD path to broadcast one `(x, y)` pair of an `f32x4`.
+pub inline fn zipLowF64x2(a: F64x2, b: F64x2) F64x2 {
+    return .{ a[0], b[0] };
+}
+
+pub inline fn zipHighF64x2(a: F64x2, b: F64x2) F64x2 {
+    return .{ a[1], b[1] };
 }
 
 pub inline fn combineU8x16(lo: U8x16, hi: U8x16) U8x32 {
@@ -380,4 +505,70 @@ test "select and comparisons" {
     const b: F32x4 = .{ 4, 3, 2, 1 };
     const m = simdGe(a, b);
     try std.testing.expectEqual(F32x4{ 4, 3, 3, 4 }, select(F32x4, m, a, b));
+}
+
+test "level detection and names" {
+    const detected = Level.detect();
+    // The test binary is built for the host (or a requested target), so
+    // detection must never report a level the build does not support and must
+    // never fail.
+    try std.testing.expect(detected == .fallback or detected.isVector());
+    try std.testing.expectEqual(detected, Level.new());
+    try std.testing.expectEqual(@as(?Level, detected), Level.tryDetect());
+
+    try std.testing.expectEqual(@as(?Level, .fallback), Level.fromName("fallback"));
+    try std.testing.expectEqual(@as(?Level, .avx2), Level.fromName("avx2"));
+    try std.testing.expectEqual(@as(?Level, detected), Level.fromName("native"));
+    try std.testing.expectEqual(@as(?Level, null), Level.fromName("quantum"));
+
+    try std.testing.expect(!Level.fallback.isVector());
+    try std.testing.expect(Level.baseline.isVector());
+    try std.testing.expect(Level.avx2.isVector());
+}
+
+test "dispatch selects per-level declarations with vector/fallback fallbacks" {
+    const Spec = struct {
+        pub fn fallback(x: i32) i32 {
+            return x + 1;
+        }
+        pub fn vector(x: i32) i32 {
+            return x + 100;
+        }
+        pub fn sse2(x: i32) i32 {
+            return x + 1000;
+        }
+    };
+
+    try std.testing.expectEqual(@as(i32, 6), dispatch(Spec, .fallback, .{5}));
+    try std.testing.expectEqual(@as(i32, 105), dispatch(Spec, .avx2, .{5}));
+    try std.testing.expectEqual(@as(i32, 105), dispatch(Spec, .avx512, .{5}));
+    try std.testing.expectEqual(@as(i32, 1005), dispatch(Spec, .sse2, .{5}));
+    try std.testing.expectEqual(@as(i32, 105), dispatch(Spec, .baseline, .{5}));
+
+    // A spec without a `vector` declaration falls back to `fallback` for
+    // levels it does not name.
+    const ScalarOnly = struct {
+        pub fn fallback(x: i32) i32 {
+            return x * 2;
+        }
+    };
+    try std.testing.expectEqual(@as(i32, 14), dispatch(ScalarOnly, .avx2, .{7}));
+}
+
+test "blockSplat and elementWiseSplat lane order" {
+    const block: F32x4 = .{ 1, 2, 3, 4 };
+    try std.testing.expectEqual(
+        F32x8{ 1, 2, 3, 4, 1, 2, 3, 4 },
+        blockSplatF32x4(block),
+    );
+    try std.testing.expectEqual(
+        F32x8{ 1, 1, 1, 1, 2, 2, 2, 2 },
+        elementWiseSplatF32x2(F32x2{ 1, 2 }),
+    );
+
+    const pair: F64x2 = .{ @bitCast(F32x2{ 1.5, 2.5 }), @bitCast(F32x2{ 3.5, 4.5 }) };
+    try std.testing.expectEqual(pair[0], zipLowF64x2(pair, pair)[0]);
+    try std.testing.expectEqual(pair[1], zipHighF64x2(pair, pair)[0]);
+    try std.testing.expectEqual(@as(F32x2, .{ 1.5, 2.5 }), @as(F32x2, @bitCast(zipLowF64x2(pair, pair)[0])));
+    try std.testing.expectEqual(@as(F32x2, .{ 3.5, 4.5 }), @as(F32x2, @bitCast(zipHighF64x2(pair, pair)[0])));
 }
