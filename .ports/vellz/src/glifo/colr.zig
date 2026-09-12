@@ -22,9 +22,9 @@
 //!   errors while propagating `error.OutOfMemory` and any other backend error
 //!   (which upstream would abort on). The remaining stack entries are popped
 //!   afterwards, exactly like upstream.
-//! - Variation coordinates are rejected at run preparation, so the traversal
-//!   is always invoked with empty coordinates: `skrifa` would resolve every
-//!   `Var*` delta to zero, which is what `tables/colr.zig` implements.
+//! - `COLR` `Var*` deltas are resolved against the run's normalized
+//!   coordinates; the paint graph is traversed with the same coordinate slice
+//!   with which the outline and hint paths were configured.
 //! - Upstream derives `CachedOutline` for clip glyphs through an
 //!   `OutlineCacheSession`; this port passes the cache and allocator
 //!   explicitly.

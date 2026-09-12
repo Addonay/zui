@@ -122,7 +122,7 @@ const DeltaRunType = enum(u8) {
     }
 
     fn width(self: DeltaRunType) usize {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -748,10 +748,8 @@ pub const ActiveTupleIter = struct {
     pub fn next(self: *ActiveTupleIter) ?Item {
         while (self.index < self.parent.tuple_count) {
             self.index += 1;
-            const header_start = self.header_pos;
             const header = self.readHeader() orelse return null;
             self.header_pos = header.next_pos;
-            _ = header_start;
             const data_start = self.data_offset;
             const data_end = std.math.add(usize, data_start, header.data_size) catch return null;
             self.data_offset = data_end;
@@ -945,6 +943,32 @@ pub const Cvar = struct {
 
 const testing = std.testing;
 
+test "cvar applies packed scalar deltas" {
+    // One tuple: embedded peak 1.0 on a single axis, dense I8 delta of 8.
+    const table = [_]u8{
+        0x00, 0x01, // tupleVariationCount = 1
+        0x00, 0x0A, // serializedDataOffset = 10
+        0x00, 0x02, // variationDataSize = 2
+        0x80, 0x00, // tupleIndex: embedded peak
+        0x40, 0x00, // peak = 1.0
+        0x00, 0x08, // one I8 delta: 8
+    };
+    const cvar = try Cvar.parse(&table);
+    var deltas = [_]i32{0};
+    try cvar.deltas(1, &.{0x4000}, deltas[0..]);
+    try testing.expectEqual(@as(i32, 8 << 16), deltas[0]);
+
+    // Outside the peak's extent the tuple is inactive.
+    deltas[0] = 0;
+    try cvar.deltas(1, &.{-0x4000}, deltas[0..]);
+    try testing.expectEqual(@as(i32, 0), deltas[0]);
+
+    // Positions past the output slice are ignored, not written.
+    var small = [_]i32{0};
+    try cvar.deltas(1, &.{0x4000}, small[0..0]);
+    try testing.expectEqual(@as(i32, 0), small[0]);
+}
+
 test "fixed point helpers match read-fonts" {
     try testing.expectEqual(@as(i32, 0x10000), fixedMul(0x10000, 0x10000));
     try testing.expectEqual(@as(i32, 0x8000), fixedMul(0x8000, 0x10000));
@@ -984,7 +1008,8 @@ test "zero-count packed points iterate densely" {
     try testing.expectEqual(@as(u16, 2), iter.next().?);
 }
 
-test "Inconsolata exposes the pinned gvar header" {    const fixture = @import("../test_fixture.zig");
+test "Inconsolata exposes the pinned gvar header" {
+    const fixture = @import("../test_fixture.zig");
     const font = try @import("../font.zig").Font.init(try fixture.inconsolata(), 0);
     const data = font.face.table(sfnt.Tag{ 'g', 'v', 'a', 'r' }).?;
     const gvar = try Gvar.parse(data);
@@ -1000,4 +1025,3 @@ test "Inconsolata exposes the pinned gvar header" {    const fixture = @import("
     try testing.expectEqual(@as(i16, 0x4000), tuples.get(2).?.get(0).?);
     try testing.expectEqual(@as(i16, 0), tuples.get(2).?.get(1).?);
 }
-

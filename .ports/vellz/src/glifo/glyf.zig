@@ -1345,7 +1345,8 @@ fn jigglerInterpolate(
     if (start > end) return;
     if (end >= points.len or end >= out.len) return error.OutOfBounds;
     try jigglerInterpolateCoord(.x, points, out, start, end, ref1_ix, ref2_ix);
-    try jigglerInterpolateCoord(.y, points, out, start, end, ref1_ix, ref2_ix);}
+    try jigglerInterpolateCoord(.y, points, out, start, end, ref1_ix, ref2_ix);
+}
 
 /// Coordinate axis for the IUP jiggler (`x`/`y` share one algorithm).
 const JigglerAxis = enum { x, y };

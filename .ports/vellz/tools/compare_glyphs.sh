@@ -111,6 +111,11 @@ glyph_vectors=(
     "Inconsolata.ttf 100.0 0 200 n -0.75,0.25"
     "Inconsolata.ttf 100.0 0 200 h -0.75,0.25"
     "Inconsolata.ttf 16.0 0 50 n 3.0"
+    # Extra coordinates beyond the axis count are ignored (LocationRef), and
+    # non-empty coordinates on a font without variation tables are a no-op.
+    "Inconsolata.ttf 16.0 0 100 n 0.5,-0.5,0.75"
+    "Roboto-Regular.ttf 16.0 0 1293 n 1.0,-1.0"
+    "Roboto-Regular.ttf 16.0 0 1293 h 1.0,-1.0"
 )
 
 # font filename, first codepoint, last codepoint

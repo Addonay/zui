@@ -8,9 +8,9 @@
 //!
 //! Port adaptations (see `.ports/vellz/docs/glifo-m3-plan.md` §3):
 //! - `AlphaColor<Srgb>` becomes `vellz.peniko.Color`; `SmallVec<[i16; 4]>`
-//!   becomes a borrowed `[]const NormalizedCoord` because non-empty variation
-//!   coordinates are `error.Unsupported` in this port (the key is only ever
-//!   built with an empty slice until `gvar` lands).
+//!   becomes a borrowed `[]const NormalizedCoord`. The key excludes the
+//!   coordinates from equality because `GlyphAtlas` holds upstream's
+//!   second-level map partitioned by them.
 //! - Upstream's manual `Hash`/`PartialEq` use a pre-packed premultiplied
 //!   RGBA8 `u32`; this port keeps the same field set with a fixed-seed Wyhash
 //!   context (upstream uses `foldhash` fixed seed 0). Iteration order is not
@@ -43,8 +43,8 @@ pub const SUBPIXEL_BITMAP: u8 = SUBPIXEL_BUCKETS + 1;
 ///
 /// `var_coords` is deliberately excluded from the hash/equality because the
 /// upstream `GlyphAtlas` uses a two-level map partitioned by variation
-/// coordinates. This port only supports empty coordinates (variation deltas
-/// are deferred), so the exclusion is currently unobservable.
+/// coordinates. Stored keys leave the slice empty; only the outer map key
+/// owns the coordinates.
 pub const GlyphCacheKey = struct {
     /// Unique identifier for the font blob.
     font_id: u64,

@@ -30,6 +30,8 @@ cp "$ref/assets/noto_color_emoji/NotoColorEmoji-CBTF-Subset.ttf" "$dest/NotoColo
 cp "$ref/assets/noto_color_emoji/LICENSE.txt" "$dest/NotoColorEmoji-LICENSE.txt"
 cp "$ref/assets/colr_test_glyphs/test_glyphs-glyf_colr_1.ttf" "$dest/test_glyphs-glyf_colr_1.ttf"
 cp "$ref/assets/colr_test_glyphs/LICENSE.txt" "$dest/colr_test_glyphs-LICENSE.txt"
+cp "$ref/assets/inconsolata/Inconsolata.ttf" "$dest/Inconsolata.ttf"
+cp "$ref/assets/inconsolata/LICENSE.txt" "$dest/Inconsolata-LICENSE.txt"
 sha256sum \
     "$dest/probe.rgba" \
     "$dest/probe.png" \
@@ -37,5 +39,7 @@ sha256sum \
     "$dest/NotoColorEmoji-Subset.ttf" \
     "$dest/NotoColorEmoji-CBTF-Subset.ttf" \
     "$dest/test_glyphs-glyf_colr_1.ttf" \
-    "$dest/colr_test_glyphs-LICENSE.txt"
+    "$dest/colr_test_glyphs-LICENSE.txt" \
+    "$dest/Inconsolata.ttf" \
+    "$dest/Inconsolata-LICENSE.txt"
 echo "ok: upstream fixtures imported from $VELLO_REV"

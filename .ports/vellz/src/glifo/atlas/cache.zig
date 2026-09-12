@@ -260,7 +260,12 @@ pub const GlyphAtlas = struct {
             _ = image_cache.deallocate(allocator, image_id) catch {};
             return err;
         };
-        target.map.put(allocator, key, entry) catch |err| {
+        // Stored keys never borrow the caller's coordinate slice: the outer
+        // map key owns the coordinates and the inner maps are reachable only
+        // through their outer key, so `var_coords` is excluded and left empty.
+        var stored_key = key;
+        stored_key.var_coords = &.{};
+        target.map.put(allocator, stored_key, entry) catch |err| {
             if (target.created) {
                 const removed = self.variable_entries.fetchRemove(.{ .coords = key.var_coords }).?;
                 removed.value.deinit(allocator);
@@ -422,6 +427,12 @@ pub const GlyphAtlas = struct {
     ) !void {
         var expired: std.ArrayListUnmanaged(GlyphCacheKey) = .empty;
         defer expired.deinit(allocator);
+        const ExpiredVarEntry = struct {
+            outer: VarKey,
+            inner: GlyphCacheKey,
+        };
+        var expired_var: std.ArrayListUnmanaged(ExpiredVarEntry) = .empty;
+        defer expired_var.deinit(allocator);
 
         var iterator = self.static_entries.iterator();
         while (iterator.next()) |map_entry| {
@@ -438,14 +449,16 @@ pub const GlyphAtlas = struct {
                 const entry = map_entry.value_ptr.*;
                 const age = self.serial -% entry.serial;
                 if (age > self.eviction_config.max_entry_age) {
-                    try expired.append(allocator, map_entry.key_ptr.*);
+                    try expired_var.append(allocator, .{
+                        .outer = outer.key_ptr.*,
+                        .inner = map_entry.key_ptr.*,
+                    });
                 }
             }
         }
 
         for (expired.items) |key| {
-            const map = self.mapForCoords(key.var_coords) orelse continue;
-            const entry = map.get(key) orelse continue;
+            const entry = self.static_entries.get(key) orelse continue;
             try self.pending_clear_rects.ensureUnusedCapacity(allocator, 1);
             _ = image_cache.deallocate(allocator, entry.atlas_slot.image_id) catch {
                 // Keep the entry cached when its atlas region cannot be
@@ -453,7 +466,18 @@ pub const GlyphAtlas = struct {
                 continue;
             };
             const slot = entry.atlas_slot;
-            _ = map.remove(key);
+            _ = self.static_entries.remove(key);
+            self.pending_clear_rects.appendAssumeCapacity(pushClearRectForSlot(slot));
+            allocator.destroy(entry);
+            self.entry_count -|= 1;
+        }
+        for (expired_var.items) |item| {
+            const map = self.variable_entries.getPtr(.{ .coords = item.outer.coords }) orelse continue;
+            const entry = map.*.get(item.inner) orelse continue;
+            try self.pending_clear_rects.ensureUnusedCapacity(allocator, 1);
+            _ = image_cache.deallocate(allocator, entry.atlas_slot.image_id) catch continue;
+            const slot = entry.atlas_slot;
+            _ = map.*.remove(item.inner);
             self.pending_clear_rects.appendAssumeCapacity(pushClearRectForSlot(slot));
             allocator.destroy(entry);
             self.entry_count -|= 1;
@@ -645,7 +669,8 @@ test "variable coordinates partition the atlas cache" {
     try testing.expectEqual(@as(usize, 3), atlas.pendingClearRects().len);
 }
 
-test "insert returns null when the atlas cannot fit the glyph" {    const allocator = testing.allocator;
+test "insert returns null when the atlas cannot fit the glyph" {
+    const allocator = testing.allocator;
     var cache = try testCache(allocator, .{ 16, 16 });
     defer cache.deinit(allocator);
     var atlas = GlyphAtlas.init();

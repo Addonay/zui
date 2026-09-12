@@ -15,6 +15,8 @@ regenerated so tests never need a Rust toolchain or Git LFS.
 | `NotoColorEmoji-LICENSE.txt` | `assets/noto_color_emoji/LICENSE.txt` | OFL-1.1 notice (covers both Noto files). |
 | `test_glyphs-glyf_colr_1.ttf` | `assets/colr_test_glyphs/test_glyphs-glyf_colr_1.ttf` | Apache-2.0; see `colr_test_glyphs-LICENSE.txt`. The upstream COLRv1 test font ("Font is taken from https://github.com/googlefonts/color-fonts"): COLRv0 glyphs 168..175 plus a COLRv1 paint graph exercising layers, solids, linear/radial/sweep gradients, glyph clips, all transform formats and all composite modes; also carries the CPAL fixture used by the COLR tests. Not a Git LFS object (`file` header, not a pointer). |
 | `colr_test_glyphs-LICENSE.txt` | `assets/colr_test_glyphs/LICENSE.txt` | Apache-2.0 notice. |
+| `Inconsolata.ttf` | `assets/inconsolata/Inconsolata.ttf` | OFL-1.1; see `Inconsolata-LICENSE.txt`. The variable-font fixture (M3 T6): `fvar` axes `wght` 200..900 (default 400) and `wdth` 50..200 (default 100), `gvar` with 962 glyphs and 8 shared tuples, `HVAR`, `avar`, and `fpgm`/`prep` bytecode so both the unhinted `gvar` path and the hinted path (interpreter + `GETVARIATION`) are gated. Not a Git LFS object. |
+| `Inconsolata-LICENSE.txt` | `assets/inconsolata/LICENSE.txt` | OFL-1.1 notice. |
 
 SHA-256:
 
@@ -26,6 +28,8 @@ SHA-256:
 b505bbd72ed997810e346931fa31f3bc59d1e131080182de959c4978ea20eb45  NotoColorEmoji-CBTF-Subset.ttf
 8aa611b1ca97044ac6f13dc982fde29256612f0a5acc6ef47ca541a7a5b99b28  test_glyphs-glyf_colr_1.ttf
 0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9  colr_test_glyphs-LICENSE.txt
+228b071e67b1bafa952149559505aaed0a20269f457e0a18a8d7739d031561dc  Inconsolata.ttf
+e564f06d018e7b95bc3594c96a17f1d41865af4038c375e7aa974dd69df38602  Inconsolata-LICENSE.txt
 ```
 
 The SHA-256 values were computed from the pinned checkout with `sha256sum`

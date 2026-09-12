@@ -42,9 +42,11 @@
 //!
 //! # Deferred with typed errors
 //!
-//! Autohinting (fonts without `fpgm`/`prep` bytecode), `gvar`/`HVAR`/`avar`
-//! variation deltas (any non-empty coords), CFF/CFF2 and synthetic embolden
-//! are all `error.Unsupported`; none are approximated. TrueType hinting
+//! Autohinting (fonts without `fpgm`/`prep` bytecode), CFF/CFF2 and synthetic
+//! embolden are `error.Unsupported`; none are approximated. `gvar`/`cvar`
+//! deltas and the variable-font cache maps are ported: user-space
+//! normalization (`fvar`/`avar`) stays caller-side exactly like
+//! `glifo`'s `normalizedCoords` API. TrueType hinting
 //! (M3 G3b), decoration (T5) and COLRv0/COLRv1 (T4, including gradients,
 //! transforms, clip boxes and composite modes) are ported, and embedded
 //! bitmaps (`sbix`/`CBDT`/`EBDT`, T5) resolve through the upstream

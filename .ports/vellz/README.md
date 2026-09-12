@@ -29,10 +29,10 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 879/879 unit and integration tests (862 lib + 8 scene
+zig build test     # 885/885 unit and integration tests (868 lib + 8 scene
                    #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
                    #   the .ports/cozmic sibling checkout is absent)
-zig build corpus   # 108/108 corpus scenes byte-exact vs the upstream oracle
+zig build corpus   # 120/120 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo (hinted + unhinted)
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
@@ -61,11 +61,12 @@ to single-threaded). The imported upstream `probe.rgba` fixture is byte-exact
 Progress toward M3 and M5 (both staged): the glyph outline engine is ported and
 bit-exact against upstream `skrifa`/`glifo` — sfnt/`head`/`maxp`/`hhea`/`hmtx`/
 `loca`/`glyf`/`cmap` parsing with fixed-point 26.6 scaling, simple/composite
-outlines and the TrueType hinting interpreter (`fpgm`/`prep`/`cvt`, phantom
-points, `HintingInstance`/`HintCache`), compared across 250,016 path elements /
-685,392 unhinted coordinates, 1,361,120 hinted coordinates (8 Roboto size
-sweeps × 1294 glyphs) and 327,680 cmap mappings at tolerance 0 (`zig build
-glyphs`) — and the atlas stack
+outlines, `gvar`/`cvar` variation deltas with IUP and phantom points, and the
+TrueType hinting interpreter (`fpgm`/`prep`/`cvt`, phantom points,
+`HintingInstance`/`HintCache`, `GETVARIATION`), compared across 711,994 path
+elements and 2,004,430 coordinates (Roboto size sweeps, Noto, and the
+Inconsolata variable font at both axes, hinted and unhinted) plus 327,680 cmap
+mappings at tolerance 0 (`zig build glyphs`) — and the atlas stack
 (`guillotiere`, `multi_atlas`, `image_cache`) is ported with a Rust-golden
 placement trace. T3 wires the stack end to end: positioned `glyph_run` scenes
 (fill/stroke, transform absorption, skew, glyph transforms, gradient paint)
@@ -90,9 +91,17 @@ COLR > bitmap > outline cascade with the pending-upload atlas path and a
 colour emoji: fill, stroke, cache on/off, transform-composition rows). `sbix`
 and `EBDT`/`EBLC` are covered by synthetic-font unit tests (the pinned assets
 gate `CBDT`/`CBLC` end to end); PNG 16-bit/Adam7 payloads fall through to the
-outline branch. All of
+outline branch. T6 closes the variable-font deferral: `gvar` deltas (simple,
+composite, empty glyphs, shared tuples, IUP and phantom points), `cvar` CVT
+deltas during hint-instance setup, second-level variable maps in the outline
+and glyph-atlas caches, and normalized coordinates through
+`GlyphRunBuilder.normalizedCoords` and the scene/oracle tooling. The pinned
+`Inconsolata.ttf` (OFL-1.1: `wght` + `wdth` axes, `gvar`/`HVAR`/`avar`, hinted
+bytecode) gates 15 dump vectors and a 12-scene `glyph_run_var_*` corpus
+(wght min/max, wdth, both axes, composites, stroke, hint and atlas-cache
+variants). All of
 it renders byte-exact against the pinned oracle, atlas cache on and off
-(108/108 corpus, tolerance 0). The GPU side has the wgpu-native device
+(120/120 corpus, tolerance 0). The GPU side has the wgpu-native device
 bootstrap, the full host/shader layout
 contract, the schedule/layer executor, encoded paints (gradients and images),
 GPU filters, and a 44-scene `gpu-corpus` gate (27 byte-exact, the rest within
@@ -101,9 +110,9 @@ device-loss/unsupported-capability/missing-binding/feedback-loop errors)
 running on the llvmpipe software adapter.
 
 Not yet implemented (explicit typed errors, never placeholder pixels): PNG
-16-bit/Adam7 decode, plus fonts that would need the autohinter or hinted
-advances from `hdmx` without backward compatibility (all typed
-`error.Unsupported`); GPU masks, atlas-backed images, GPU text, and the full
+16-bit/Adam7 decode, CFF/CFF2, synthetic embolden, plus fonts that would need
+the autohinter or hinted advances from `hdmx` without backward compatibility
+(all typed `error.Unsupported`); GPU masks, atlas-backed images, GPU text, and the full
 G5 corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
 SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage
 benchmarks in `docs/benchmarks.md` (u8-vs-f32 speedups 1.9–3.4× on the

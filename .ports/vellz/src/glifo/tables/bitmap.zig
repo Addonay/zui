@@ -19,8 +19,9 @@
 //!   renders (composites, bit-aligned 32bpp) are `null`.
 //! - `EBDT` is not a color table, so PNG image formats 17/18/19 are only read
 //!   from `CBDT`, matching `bitmap_data(.., is_color)`.
-//! - Variation metrics (`HVAR`/`gvar`) are not applied; the glyph run layer
-//!   rejects non-empty normalized coordinates before any bitmap lookup.
+//! - Variation coordinates are irrelevant to fixed bitmap strikes; the glyph
+//!   run layer routes bitmap cache keys through the static map exactly like
+//!   upstream (`var_coords: SmallVec::new()`).
 
 const std = @import("std");
 

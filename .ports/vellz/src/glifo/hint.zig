@@ -745,11 +745,11 @@ pub const GraphicsState = struct {
     }
 
     pub fn zone(self: *GraphicsState, pointer: ZonePointer) *Zone {
-        return &self.zones[@intFromEnum(pointer)];
+        return &self.zones[@backingInt(pointer)];
     }
 
     pub fn zoneConst(self: *const GraphicsState, pointer: ZonePointer) *const Zone {
-        return &self.zones[@intFromEnum(pointer)];
+        return &self.zones[@backingInt(pointer)];
     }
 
     pub fn zp0Mut(self: *GraphicsState) *Zone {
@@ -1154,7 +1154,7 @@ pub const Definition = struct {
             .start = @intCast(start),
             .end = @intCast(end),
             .key = key,
-            .program = @intFromEnum(program),
+            .program = @backingInt(program),
             .is_active = 1,
         };
     }
@@ -1289,21 +1289,21 @@ pub const ProgramState = struct {
             .bytecode = bytecode,
             .initial = initial_program,
             .current = initial_program,
-            .decoder = Decoder.init(bytecode[@intFromEnum(initial_program)], 0),
+            .decoder = Decoder.init(bytecode[@backingInt(initial_program)], 0),
         };
     }
 
     pub fn reset(self: *ProgramState, program: Program) void {
         self.initial = program;
         self.current = program;
-        self.decoder = Decoder.init(self.bytecode[@intFromEnum(program)], 0);
+        self.decoder = Decoder.init(self.bytecode[@backingInt(program)], 0);
         self.call_stack.clear();
     }
 
     pub fn enter(self: *ProgramState, definition: Definition, count: u32) HintError!void {
         const program = definition.programId();
         const pc = definition.codeStart();
-        const bytecode = self.bytecode[@intFromEnum(program)];
+        const bytecode = self.bytecode[@backingInt(program)];
         try self.call_stack.push(.{
             .caller_program = self.current,
             .return_pc = self.decoder.pc,
@@ -1322,7 +1322,7 @@ pub const ProgramState = struct {
             try self.call_stack.push(record);
         } else {
             self.current = record.caller_program;
-            self.decoder.bytecode = self.bytecode[@intFromEnum(record.caller_program)];
+            self.decoder.bytecode = self.bytecode[@backingInt(record.caller_program)];
             self.decoder.pc = record.return_pc;
         }
     }

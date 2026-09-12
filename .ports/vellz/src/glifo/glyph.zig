@@ -29,8 +29,10 @@
 //! - Decoration (`renderDecoration`) is ported: the upstream `Vec` of merged
 //!   exclusion spans lives on `GlyphPrepCache` and the Rust iterator/closure
 //!   pair becomes one pass over that list.
-//! - Synthetic embolden (`kurbo::expand_path`) and non-empty variation
-//!   coordinates remain explicit `error.Unsupported`.
+//! - Variation coordinates are ported: they are forwarded to `skrifa`-style
+//!   `gvar` deltas, hint-instance setup (`cvar`) and the second-level outline
+//!   and atlas cache maps. Synthetic embolden (`kurbo::expand_path`) remains
+//!   an explicit `error.Unsupported`.
 //! - Upstream's `OutlineCacheSession` is replaced by an explicit
 //!   `*OutlineCache` threaded through the draw loop and `renderer.fillGlyph`/
 //!   `strokeGlyph`.
@@ -558,7 +560,8 @@ pub const PreparedGlyphRun = struct {
     draw_props: DrawProps,
     /// The original transform for the paint in scene space.
     scene_paint_transform: kurbo.Affine,
-    /// Variation coordinates (always empty until `gvar` lands).
+    /// Normalized variation coordinates (`i16` F2Dot14 bits), borrowed from
+    /// the caller like upstream's `GlyphRun<'a>`.
     normalized_coords: []const NormalizedCoord,
     /// Hinting instance for this run; `null` when the run is unhinted (or the
     /// effective transform is `Direct`, which never hints upstream).

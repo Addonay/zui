@@ -7,10 +7,12 @@
 //! outline pipeline needs (`head`, `maxp`, `hhea`, `hmtx`; `loca`/`glyf`/
 //! `cmap` are resolved on demand).
 //!
-//! Unsupported inputs are explicit: CFF/CFF2 outlines and variable-font
-//! instances fail with `error.Unsupported` instead of being approximated (see
-//! `.ports/vellz/docs/glifo-m3-plan.md` §2). Bitmap-only faces have no
-//! `outlines()` but expose their embedded strikes through `bitmapStrikes()`.
+//! Unsupported inputs are explicit: CFF/CFF2 outlines fail with
+//! `error.Unsupported` instead of being approximated (see
+//! `.ports/vellz/docs/glifo-m3-plan.md` §2); `gvar`/`cvar`/`HVAR` are exposed
+//! through `gvar()`, `cvar()` and `hasHvar()` for the outline pipeline.
+//! Bitmap-only faces have no `outlines()` but expose their embedded strikes
+//! through `bitmapStrikes()`.
 
 const std = @import("std");
 
@@ -179,6 +181,20 @@ pub const Font = struct {
         return data.len >= 20;
     }
 };
+
+test "f2dot14FromF32 matches F2Dot14::from_f32" {
+    // Exact values and round-half-away-from-zero for positive/negative inputs.
+    try std.testing.expectEqual(@as(i16, 0x4000), f2dot14FromF32(1.0));
+    try std.testing.expectEqual(@as(i16, 0xC000), f2dot14FromF32(-1.0));
+    try std.testing.expectEqual(@as(i16, 0x2000), f2dot14FromF32(0.5));
+    try std.testing.expectEqual(@as(i16, -0x2000), f2dot14FromF32(-0.5));
+    try std.testing.expectEqual(@as(i16, 4915), f2dot14FromF32(0.3));
+    try std.testing.expectEqual(@as(i16, -4915), f2dot14FromF32(-0.3));
+    // Rust's `f32 as i16` saturates out-of-range values.
+    try std.testing.expectEqual(std.math.maxInt(i16), f2dot14FromF32(3.0));
+    try std.testing.expectEqual(std.math.minInt(i16), f2dot14FromF32(-3.0));
+    try std.testing.expectEqual(@as(i16, 0), f2dot14FromF32(std.math.nan(f32)));
+}
 
 test "Roboto face parses with the expected metrics" {
     const fixture = @import("test_fixture.zig");
