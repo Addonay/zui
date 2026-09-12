@@ -404,6 +404,12 @@ of panics, thread ownership).
   execution, readback, presentation. Record hardware/adapter, build mode,
   feature flags, memory, workload. Hardware vs software adapters are reported
   explicitly. Readback cost is included or excluded symmetrically and noted.
+  For the CPU pipeline this is implemented by `zig build bench`
+  (`tools/bench.zig`, wrapper `tools/bench.sh`): per-stage wall times
+  (construction / preprocessing / coarse bucketing / fine rasterization /
+  render / total) through `RasterizerSettings.timings`, with output hashes to
+  prove level agreement. Recorded numbers and the full methodology note live
+  in `docs/benchmarks.md`.
 
 ## 13. Milestones and executable gates
 
@@ -455,10 +461,9 @@ of panics, thread ownership).
 
 ### Milestone 4 — CPU optimization
 
-- **Status (2026-09-12):** the u8 low-precision pipeline and multithreaded
-  f32 dispatch are landed on `main` and oracle/differential-verified (G4 is
-  not claimed yet: SIMD-level dispatch and methodology-complete timings are
-  still open).
+- **Status (2026-09-12):** complete. u8 low-precision pipeline, multithreaded
+  f32 dispatch, SIMD-level dispatch, and methodology-complete per-stage timings
+  are landed and oracle/differential-verified.
 - u8 low-precision pipeline ported and connected behind
   `RenderMode.optimize_speed` (`cpu/fine/lowp/*`, dispatcher kernel selection).
 - Multi-threaded f32 dispatch ported: `dispatch/mod.zig` `Dispatcher` vtable +
@@ -476,16 +481,55 @@ of panics, thread ownership).
 - **MT equivalence:** the single- vs multi-threaded f32 output is asserted
   byte-identical on a layered differential scene in `cpu/render.zig`; the
   corpus itself runs with the committed scenes' `threads` setting (0).
-- **Rough timings** (ReleaseFast CLI, 200 runs each, includes ~2.4 ms process
-  startup; not a methodology-complete G4 record): `fill_wave_seams_128`
-  3.6 -> 2.0 ms, `fill_tile_grid_128` 4.4 -> 1.9 ms, `gradient_repeat_128`
-  5.0 -> 3.5 ms; but `image_bilinear_64` 3.4 -> 4.8 ms slower in u8, because
-  the ported u8 painters run scalar lane loops while the f32 painters
-  vectorize through `@Vector`.
-- **Remaining:** SIMD-level dispatch (the port currently pins fallback
-  semantics in `src/simd`), MT filters, u8 + MT, per-stage measured speedups.
-  Gate G4 is not claimed until scalar/portable/SIMD agreement and timings are
-  recorded.
+- **SIMD-level dispatch** (`src/simd/root.zig`): `Level.detect()` reports the
+  build target's level (SSE2/SSE4.2/AVX2/AVX-512 on x86-64, Neon on aarch64),
+  `Level.fromName` parses level names for the CLI/bench, and `dispatch()`
+  mirrors `fearless_simd::dispatch!` (per-level declaration, shared `vector`,
+  `fallback`). Vector backends landed where upstream has them:
+  - `common/flatten.zig`: f32x8 `eval_cubics`/`estimate_subdiv`/
+    `output_lines` (upstream `flatten_simd.rs`); scalar fallback retained.
+  - `common/tile.zig`: f32x4 fractional coverage and partial-winding
+    accumulation for analytic AA.
+  - `src/simd/root.zig`: `splat4th`/`elementWiseSplat`/`blockSplat` as
+    `@shuffle` permutes, full-width `unzip_low/high_f32x8`, upstream-correct
+    `zip_low/high_f64x2`.
+  - u8 fine hot loops: `common/util.f32ToU8` and `cpu/fine/image.f32ToU32Vec`
+    are `@Vector` lane conversions (scalar references kept in tests,
+    lane-for-lane exact including NaN and range boundaries); `lowp/image.zig`
+    assembles texel words with one bitcast; `lowp/gradient.zig` converts LUT
+    indices as `f32x16`.
+- **Exactness (G4 agreement):** `zig build corpus` is 48/48 byte-exact
+  (`tolerance=0`, four channels) at `--level fallback`, `sse2`, `sse4_2`,
+  `avx2`, and `avx512`. Differential unit tests assert scalar-vs-vector
+  bit-equality for flatten cubic subdivision (512 fixed/random cubics × 8
+  levels) and analytic-AA tiling (128 randomized line sets × 7 levels), and
+  the vector conversions against their scalar references.
+- **Per-stage timings:** `tools/bench.zig` + `tools/bench.sh` +
+  `zig build bench` measure scene construction, preprocessing, coarse
+  bucketing, fine rasterization, render and total separately (the last two
+  through `RasterizerSettings.timings`), for quality/speed and for each
+  requested level. Results and methodology: `docs/benchmarks.md`
+  (ReleaseFast, single-thread, min of 100, 4-vCPU `icelake_server`):
+  - u8 speed vs f32 quality total: `fill_wave_seams_128` 2.58x,
+    `fill_tile_grid_128` 3.38x, `image_bilinear_64` 1.93x,
+    `gradient_repeat_128` 2.42x.
+  - The plan's `image_bilinear_64` u8 regression is fixed: 102 -> 41 µs fine
+    (min), now 1.93x faster than the f32 painter instead of 1.15x slower
+    (A/B in `docs/benchmarks.md`; the scalar lane loops were the bottleneck).
+  - `fallback` vs `native` is 0.98-1.01x at every stage on this build: the
+    native target lets LLVM auto-vectorize the scalar transcriptions with the
+    same instructions, so the explicit vector paths are the guarantee and the
+    exactness surface rather than an end-to-end win at these scene sizes.
+  - MT (`threads=4`, quality) is recorded but not faster at these sizes
+    (worker synchronization dominates); u8 + MT and MT filters stay
+    `error.Unsupported`.
+- **Gate `G4`: MET 2026-09-12.** Scalar/portable/SIMD outputs agree exactly
+  (corpus 48/48 at five levels; unit differentials) and per-stage measured
+  speedups are recorded in `docs/benchmarks.md`. Verification commands:
+  `zig build test`, `zig build corpus`, `./tools/compare_corpus.sh --level
+  native`, `tools/bench.sh`, in Debug/ReleaseSafe/ReleaseFast.
+- **Remaining (outside G4):** MT filter layers and u8 + MT (upstream
+  limitations), u8/f32 filter performance.
 
 ### Milestone 5 — Hybrid GPU implementation
 
@@ -697,3 +741,26 @@ of panics, thread ownership).
   `zig build corpus` = 48/48 byte-exact in Debug/ReleaseSafe/ReleaseFast,
   `zig build probe` byte-exact, `zig build glyphs` pass, and
   `zig build -Dgpu=true check` + `run-gpu-smoke` green on llvmpipe.
+- 2026-09-12 (branch `vellz-simd`): **M4 remainder landed; G4 MET.** Added
+  real SIMD backends behind the runtime `simd.Level` dispatch
+  (`Level.detect`/`fromName`, `dispatch()` mirroring `fearless_simd::dispatch!`,
+  `fallback` always available): f32x8 cubic flattening in `common/flatten.zig`,
+  f32x4 analytic-AA fractional coverage/partial winding in `common/tile.zig`,
+  `@shuffle` versions of `splat4th`/`elementWiseSplat`/`blockSplat` plus
+  wide `unzip_low/high_f32x8` and corrected `zip_*_f64x2` in `src/simd`, and
+  vectorized u8 conversion/sampling (`common/util.f32ToU8`,
+  `cpu/fine/image.f32ToU32Vec`, lowp image texel assembly, lowp gradient LUT
+  indices). Differential tests assert scalar-vs-vector bit equality (flatten:
+  512 cubics × 8 levels; tile: 128 random line sets × 7 levels; conversions:
+  random bit patterns + NaN/range boundaries). `zig build corpus` is 48/48
+  byte-exact at `--level fallback|sse2|sse4_2|avx2|avx512`. Added the
+  methodology-complete benchmark harness (`zig build bench`, `tools/bench.sh`,
+  `RasterizerSettings.timings` for bucket/fine stages) and
+  `docs/benchmarks.md`: ReleaseFast min-of-100 on a 4-vCPU `icelake_server`
+  records u8-vs-f32 total speedups of 2.58x (`fill_wave_seams_128`), 3.38x
+  (`fill_tile_grid_128`), 1.93x (`image_bilinear_64`), 2.42x
+  (`gradient_repeat_128`), fixing the `image_bilinear_64` u8 regression
+  (102 → 41 µs fine, A/B in the doc). `fallback` vs `native` is 0.98-1.01x at
+  every stage because the native build lets LLVM auto-vectorize the scalar
+  transcriptions; that is recorded honestly rather than claimed as a win.
+  `vellz-cli`/`tools/compare_corpus.sh` gained `--level` for per-level gates.
