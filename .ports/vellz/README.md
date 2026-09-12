@@ -72,6 +72,7 @@ host/shader layout contract, the schedule/layer executor, encoded paints
 byte-exact, the rest within the documented per-scene tolerance registry, plus
 typed device-loss/unsupported-capability/missing-binding/feedback-loop errors)
 running on the llvmpipe software adapter.
+
 Not yet implemented (explicit typed errors, never placeholder pixels): hinted
 outlines (the interpreter), COLR/CPAL, glyph decoration and the Cozmic adapter
 (M3 remainder); GPU layers/blends, gradients, images, filters, and the full G5
