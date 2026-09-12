@@ -175,7 +175,9 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `record.rs` (layers/commands) | `common/record.zig` | port | 18 tests (11 upstream), transactional OOM-safe pushes |
 | `filter_effects.rs` + `filter/mod.rs` | `common/filter_effects.zig`, `common/filter.zig` | port | connected; `PreparedFilter` payloads (flood, gaussian blur, offset, drop shadow) oracle-verified; 22+ tests |
 | `blurred_rounded_rect.rs` | `common/blurred_rounded_rect.zig` | port | 1 test; encode + painter connected and oracle-verified (normal/inverted scenes) |
-| `image_cache.rs`, `multi_atlas.rs` (guillotiere) | `common/atlas.zig` | defer | M3 (glyph atlas), M2 (images) |
+| `guillotiere-0.7.0/src/allocator.rs` + `lib.rs` | `common/guillotiere.zig` | port | 13 tests (9 upstream + a 10k-op Rust-golden trace proving identical ids/rectangles + `rearrange`/`reset`/`initFromAllocator`); `AtlasAllocator`, `SimpleAtlasAllocator`, `AllocId` |
+| `multi_atlas.rs` | `common/multi_atlas.zig` | port | 13 tests; typed error set in place of payload errors (`spaceDiagnostics` exposes the diagnostics); deterministic atlas order |
+| `image_cache.rs` | `common/image_cache.zig` | port | 10 tests (9 upstream + id/placement determinism); LIFO slot reuse, `ImageId`/offsets deterministic |
 | `target.rs` (`TargetInit`) | `common/target.zig` | port | 1 test; connected via `RasterizerSettings` |
 | `probe.rs` | `common/probe.zig`, `cpu/probe.zig` | port (oracle/dev only) | Scene, grid layout, and upstream tolerance-3 comparison policy ported; embedded pinned `tests/fixtures/upstream/probe.rgba`; connected via `vellz.cpu.probe`/`vellz-cli --probe`; oracle-verified byte-exact (51×51, four channels, max diff 0) |
 | `pico_svg.rs` | — | defer | Dev-only SVG loader |
