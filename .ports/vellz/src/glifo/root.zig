@@ -66,6 +66,7 @@ pub const dump = @import("dump.zig");
 pub const atlas = @import("atlas/root.zig");
 pub const interface = @import("interface.zig");
 pub const glyph = @import("glyph.zig");
+pub const colr = @import("colr.zig");
 pub const renderer = @import("renderer.zig");
 
 pub const FontData = font.FontData;
@@ -103,6 +104,8 @@ pub const GlyphScaleProperties = glyph.GlyphScaleProperties;
 pub const DrawProps = glyph.DrawProps;
 pub const PreparedGlyph = glyph.PreparedGlyph;
 pub const GlyphOutline = glyph.GlyphOutline;
+pub const GlyphColr = glyph.GlyphColr;
+pub const GlyphType = glyph.GlyphType;
 pub const GlyphSliceIterator = glyph.GlyphSliceIterator;
 pub const iterate = glyph.iterate;
 pub const prepareGlyphRun = glyph.prepareGlyphRun;
@@ -136,5 +139,6 @@ test {
     _ = atlas;
     _ = interface;
     _ = glyph;
+    _ = colr;
     _ = renderer;
 }

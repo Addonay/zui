@@ -65,10 +65,14 @@ pub const AtlasCommand = union(enum) {
     /// Pop the most recent clip path.
     pop_clip_path,
 
-    /// Release any owned path.
+    /// Release any owned path or gradient stops.
     pub fn deinit(self: *AtlasCommand, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .fill_path, .push_clip_layer, .push_clip_path => |*path| path.deinit(allocator),
+            .set_paint => |*paint| switch (paint.*) {
+                .gradient => |*gradient| gradient.deinit(),
+                .solid => {},
+            },
             else => {},
         }
     }
@@ -127,13 +131,11 @@ pub const AtlasCommandRecorder = struct {
         try self.append(allocator, .{ .set_transform = t });
     }
 
-    pub fn setPaint(self: *AtlasCommandRecorder, allocator: std.mem.Allocator, paint: AtlasPaint) !void {
-        // The solid color is a plain value; no owned payload is cloned.
-        switch (paint) {
-            .solid => try self.append(allocator, .{ .set_paint = paint }),
-            // Deferred until COLR lands: never silently drop the gradient.
-            .gradient => return error.Unsupported,
-        }
+    /// Append a paint command. A gradient's stop allocation is moved into the
+    /// command (and freed by `deinit`/`clearCommands`); the direct-render
+    /// sink path resolves paints through `AtlasPaint.toPaintType` instead.
+    pub fn setPaintAtlas(self: *AtlasCommandRecorder, allocator: std.mem.Allocator, paint: AtlasPaint) !void {
+        try self.append(allocator, .{ .set_paint = paint });
     }
 
     pub fn setPaintTransform(self: *AtlasCommandRecorder, allocator: std.mem.Allocator, t: kurbo.Affine) !void {
@@ -206,7 +208,7 @@ test "recorder clones paths and frees them on clear" {
     var recorder = AtlasCommandRecorder.init(2, 64, 64);
     defer recorder.deinit(allocator);
     try recorder.setTransform(allocator, kurbo.Affine.IDENTITY);
-    try recorder.setPaint(allocator, .{ .solid = peniko.Color.BLACK });
+    try recorder.setPaintAtlas(allocator, .{ .solid = peniko.Color.BLACK });
     try recorder.fillPath(allocator, &path);
     try recorder.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 4.0, 4.0));
     try recorder.pushClipPath(allocator, &path);
@@ -219,12 +221,35 @@ test "recorder clones paths and frees them on clear" {
     try testing.expectEqual(@as(usize, 0), recorder.commands.items.len);
 }
 
-test "gradient paint is a typed unsupported error" {
+test "gradient paints are recorded and freed with the command" {
     const allocator = testing.allocator;
     var recorder = AtlasCommandRecorder.init(0, 64, 64);
     defer recorder.deinit(allocator);
-    try testing.expectError(
-        error.Unsupported,
-        recorder.setPaint(allocator, .{ .gradient = .{} }),
-    );
+
+    const stops = [_]peniko.ColorStop{
+        .{ .offset = 0.0, .color = peniko.Color.fromRgba8(255, 0, 0, 255) },
+        .{ .offset = 1.0, .color = peniko.Color.fromRgba8(0, 0, 255, 255) },
+    };
+    const gradient = try (peniko.Gradient{
+        .kind = .{ .linear = .{ .start = kurbo.Point.new(0.0, 0.0), .end = kurbo.Point.new(1.0, 0.0) } },
+    }).withStops(allocator, &stops);
+
+    try recorder.setPaintAtlas(allocator, .{ .gradient = gradient });
+    try testing.expectEqual(@as(usize, 1), recorder.commands.items.len);
+
+    // Replay resolves the gradient into a PaintType for the target sink.
+    const resolved = try recorder.commands.items[0].set_paint.toPaintType(allocator);
+    switch (resolved) {
+        .gradient => |owned| {
+            var g = owned;
+            defer g.deinit();
+            try testing.expectEqual(@as(usize, 2), g.stops.items.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // `clearCommands` releases the recorded gradient; the testing allocator
+    // fails the test if the stops leak.
+    recorder.clearCommands(allocator);
+    try testing.expectEqual(@as(usize, 0), recorder.commands.items.len);
 }

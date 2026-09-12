@@ -139,16 +139,16 @@ pub const ColorStops = struct {
 
     /// Stop offset in 0..1 (`F2Dot14`), variation deltas not applied.
     pub fn offset(self: ColorStops, i: usize) f32 {
-        return f2dot14ToF32(sfnt.readI16(self.data, i * self.stride).?);
+        return f2dot14ToF32(sfnt.readI16(self.data, i * @as(usize, self.stride)).?);
     }
 
     pub fn paletteIndex(self: ColorStops, i: usize) u16 {
-        return sfnt.readU16(self.data, i * self.stride + 2).?;
+        return sfnt.readU16(self.data, i * @as(usize, self.stride) + 2).?;
     }
 
     /// Stop alpha in 0..1 (`F2Dot14`), variation deltas not applied.
     pub fn alpha(self: ColorStops, i: usize) f32 {
-        return f2dot14ToF32(sfnt.readI16(self.data, i * self.stride + 4).?);
+        return f2dot14ToF32(sfnt.readI16(self.data, i * @as(usize, self.stride) + 4).?);
     }
 };
 

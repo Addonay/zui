@@ -1,17 +1,17 @@
 //! Shared glyph rendering logic for rendering backends.
 //!
-//! Port of `glifo/src/renderer.rs` (outline subset). Fills and strokes
-//! prepared glyphs, using the glyph atlas when possible and falling back to
-//! direct rendering otherwise, and replays recorded atlas commands into a
-//! `DrawSink`.
+//! Port of `glifo/src/renderer.rs`. Fills and strokes prepared glyphs (outline
+//! or COLR), using the glyph atlas when possible and falling back to direct
+//! rendering otherwise, and replays recorded atlas commands into a `DrawSink`.
 //!
 //! Port adaptations (see `.ports/vellz/docs/glifo-m3-plan.md` §3):
 //! - Backends are comptime duck typed (`renderer: anytype`); `interface.zig`
 //!   compiles the documented method set.
 //! - Allocating draw calls take the allocator and return `!void`.
-//! - Bitmap and COLR atlas paths are deferred (typed `error.Unsupported` in
-//!   `glyph.zig`/`fillGlyph`), so `CachedGlyphType` currently has only the
-//!   outline variant.
+//! - Upstream's `OutlineCacheSession` becomes an explicit
+//!   `*outline_cache.OutlineCache` threaded into the COLR paths (COLRv1 clip
+//!   glyphs resolve through it).
+//! - Bitmap glyphs stay deferred (`error.Unsupported` at run preparation).
 
 const std = @import("std");
 const kurbo = @import("../kurbo/root.zig");
@@ -19,12 +19,15 @@ const peniko = @import("../peniko/root.zig");
 const paint_mod = @import("../common/paint.zig");
 const util = @import("util.zig");
 const glyph = @import("glyph.zig");
+const colr = @import("colr.zig");
+const outline_cache = @import("outline_cache.zig");
 const atlas = @import("atlas/root.zig");
 const interface = @import("interface.zig");
 
 const Affine = kurbo.Affine;
 const BezPath = kurbo.BezPath;
 const Rect = kurbo.Rect;
+const Vec2 = kurbo.Vec2;
 const AtlasSlot = atlas.AtlasSlot;
 const GlyphAtlas = atlas.GlyphAtlas;
 const ImageCache = atlas.ImageCache;
@@ -32,7 +35,9 @@ const GlyphCacheKey = atlas.GlyphCacheKey;
 const RasterMetrics = atlas.RasterMetrics;
 const AtlasCacher = glyph.AtlasCacher;
 const GlyphOutline = glyph.GlyphOutline;
+const GlyphColr = glyph.GlyphColr;
 const PreparedGlyph = glyph.PreparedGlyph;
+const OutlineCache = outline_cache.OutlineCache;
 
 /// Outcome of a cache-first render attempt.
 const CacheResult = enum {
@@ -61,98 +66,224 @@ pub fn fillGlyph(
     renderer: anytype,
     prepared: *const PreparedGlyph,
     atlas_cacher: *AtlasCacher,
+    outline_cache_ref: *OutlineCache,
 ) !void {
     interface.assertGlyphRenderer(@TypeOf(renderer.*));
 
     switch (atlas_cacher.*) {
-        .disabled => {
-            try fillUncachedOutline(allocator, renderer, prepared);
-        },
-        .enabled => |*e| {
-            if (prepared.cache_key) |key| {
-                const tint_color = contextColor(renderer.currentPaint());
-                if (try insertAndRenderOutline(
+        .disabled => return fillUncached(allocator, renderer, prepared, outline_cache_ref),
+        .enabled => |*e| switch (prepared.glyph_type) {
+            .outline => |outline| {
+                if (prepared.cache_key) |key| {
+                    const tint_color = contextColor(renderer.currentPaint());
+                    if (try insertAndRenderOutline(
+                        allocator,
+                        renderer,
+                        &outline,
+                        prepared.outline_transform,
+                        key,
+                        e.glyph_atlas,
+                        e.image_cache,
+                        tint_color,
+                    ) == .cached_and_rendered) {
+                        return;
+                    }
+                }
+                try fillUncachedOutline(
                     allocator,
                     renderer,
-                    &prepared.outline,
+                    &outline,
                     prepared.outline_transform,
-                    key,
-                    e.glyph_atlas,
-                    e.image_cache,
-                    tint_color,
-                ) == .cached_and_rendered) {
-                    return;
+                    prepared.relative_paint_transform,
+                );
+            },
+            .colr => |colr_glyph| {
+                if (prepared.cache_key) |key| {
+                    if (try insertAndRenderColr(
+                        allocator,
+                        renderer,
+                        &colr_glyph,
+                        prepared.outline_transform,
+                        key,
+                        e.glyph_atlas,
+                        e.image_cache,
+                        outline_cache_ref,
+                    ) == .cached_and_rendered) {
+                        return;
+                    }
                 }
-            }
-            try fillUncachedOutline(allocator, renderer, prepared);
+                try renderUncachedColrGlyph(
+                    allocator,
+                    renderer,
+                    &colr_glyph,
+                    prepared.outline_transform,
+                    contextColor(renderer.currentPaint()),
+                    outline_cache_ref,
+                );
+            },
         },
     }
 }
 
 /// Stroke a prepared glyph, using the glyph atlas when possible and falling
 /// back to direct rendering otherwise. Stroked outlines are never cached
-/// (upstream: cache keys do not carry stroke parameters).
+/// (upstream: cache keys do not carry stroke parameters); COLR/bitmap glyphs
+/// are always filled.
 pub fn strokeGlyph(
     allocator: std.mem.Allocator,
     renderer: anytype,
     prepared: *const PreparedGlyph,
     atlas_cacher: *AtlasCacher,
+    outline_cache_ref: *OutlineCache,
 ) !void {
     interface.assertGlyphRenderer(@TypeOf(renderer.*));
 
     switch (atlas_cacher.*) {
         .disabled => {
-            try strokeUncachedOutline(allocator, renderer, prepared);
-        },
-        .enabled => |*e| {
-            if (prepared.cache_key) |key| {
-                const tint_color = contextColor(renderer.currentPaint());
-                if (try insertAndRenderOutline(
+            switch (prepared.glyph_type) {
+                .outline => |outline| try strokeUncachedOutline(
                     allocator,
                     renderer,
-                    &prepared.outline,
+                    &outline,
                     prepared.outline_transform,
-                    key,
-                    e.glyph_atlas,
-                    e.image_cache,
-                    tint_color,
-                ) == .cached_and_rendered) {
-                    return;
-                }
+                    prepared.relative_paint_transform,
+                ),
+                .colr => try fillGlyph(allocator, renderer, prepared, atlas_cacher, outline_cache_ref),
             }
-            try strokeUncachedOutline(allocator, renderer, prepared);
+            return;
         },
+        .enabled => |*e| switch (prepared.glyph_type) {
+            .outline => |outline| {
+                if (prepared.cache_key) |key| {
+                    const tint_color = contextColor(renderer.currentPaint());
+                    if (try insertAndRenderOutline(
+                        allocator,
+                        renderer,
+                        &outline,
+                        prepared.outline_transform,
+                        key,
+                        e.glyph_atlas,
+                        e.image_cache,
+                        tint_color,
+                    ) == .cached_and_rendered) {
+                        return;
+                    }
+                }
+                try strokeUncachedOutline(
+                    allocator,
+                    renderer,
+                    &outline,
+                    prepared.outline_transform,
+                    prepared.relative_paint_transform,
+                );
+            },
+            .colr => try fillGlyph(allocator, renderer, prepared, atlas_cacher, outline_cache_ref),
+        },
+    }
+}
+
+fn fillUncached(
+    allocator: std.mem.Allocator,
+    renderer: anytype,
+    prepared: *const PreparedGlyph,
+    outline_cache_ref: *OutlineCache,
+) !void {
+    switch (prepared.glyph_type) {
+        .outline => |outline| try fillUncachedOutline(
+            allocator,
+            renderer,
+            &outline,
+            prepared.outline_transform,
+            prepared.relative_paint_transform,
+        ),
+        .colr => |colr_glyph| try renderUncachedColrGlyph(
+            allocator,
+            renderer,
+            &colr_glyph,
+            prepared.outline_transform,
+            contextColor(renderer.currentPaint()),
+            outline_cache_ref,
+        ),
     }
 }
 
 fn fillUncachedOutline(
     allocator: std.mem.Allocator,
     renderer: anytype,
-    prepared: *const PreparedGlyph,
+    outline: *const GlyphOutline,
+    outline_transform: Affine,
+    paint_transform: Affine,
 ) !void {
     const state = try renderer.saveState();
     defer renderer.restoreState(state);
-    renderer.setTransform(prepared.outline_transform.preScale(prepared.outline.scale));
-    renderer.setPaintTransform(prepared.relative_paint_transform);
-    try renderer.fillPath(allocator, prepared.outline.path.elementsSlice());
+    renderer.setTransform(outline_transform.preScale(outline.scale));
+    renderer.setPaintTransform(paint_transform);
+    try renderer.fillPath(allocator, outline.path.elementsSlice());
 }
 
 fn strokeUncachedOutline(
     allocator: std.mem.Allocator,
     renderer: anytype,
-    prepared: *const PreparedGlyph,
+    outline: *const GlyphOutline,
+    outline_transform: Affine,
+    paint_transform: Affine,
 ) !void {
     const state = try renderer.saveState();
     defer renderer.restoreState(state);
-    renderer.setTransform(prepared.outline_transform.preScale(prepared.outline.scale));
-    renderer.setPaintTransform(prepared.relative_paint_transform);
-    try renderer.strokePath(allocator, prepared.outline.path.elementsSlice());
+    renderer.setTransform(outline_transform.preScale(outline.scale));
+    renderer.setPaintTransform(paint_transform);
+    try renderer.strokePath(allocator, outline.path.elementsSlice());
+}
+
+/// Render an uncached COLR glyph directly into the renderer.
+///
+/// Two reasons for the clip wrapper, as upstream: a layer isolates blend modes
+/// inside the glyph from already-drawn content, and clipping bounds the
+/// blending cost.
+fn renderUncachedColrGlyph(
+    allocator: std.mem.Allocator,
+    renderer: anytype,
+    colr_glyph: *const GlyphColr,
+    outline_transform: Affine,
+    context_color: peniko.Color,
+    outline_cache_ref: *OutlineCache,
+) !void {
+    const state = try renderer.saveState();
+    defer renderer.restoreState(state);
+    renderer.setTransform(outline_transform);
+
+    var clip_path = try colr_glyph.area.toPath(0.1, allocator);
+    defer clip_path.deinit(allocator);
+    if (colr_glyph.has_non_default_blend) {
+        try renderer.pushClipLayer(allocator, clip_path.elementsSlice());
+    } else {
+        try renderer.pushClipPath(allocator, clip_path.elementsSlice());
+    }
+
+    var painter = try colr.ColrPainter(@TypeOf(renderer.*)).init(
+        allocator,
+        colr_glyph,
+        context_color,
+        renderer,
+        outline_cache_ref,
+    );
+    defer painter.deinit();
+    try painter.paint();
+
+    if (colr_glyph.has_non_default_blend) {
+        renderer.popLayer();
+    } else {
+        renderer.popClipPath();
+    }
 }
 
 /// Type hint for cached glyph rendering.
-pub const CachedGlyphType = enum {
+pub const CachedGlyphType = union(enum) {
     /// An outline glyph cached in the atlas.
     outline,
+    /// A COLR glyph cached in the atlas. The area holds the fractional area
+    /// dimensions to preserve sub-pixel accuracy when rendering.
+    colr: Rect,
 };
 
 /// Render a cached glyph from the atlas.
@@ -167,6 +298,17 @@ pub fn renderCachedGlyph(
         .outline => {
             const tint = contextColor(renderer.currentPaint());
             try renderOutlineGlyphFromAtlas(allocator, renderer, cached_slot, transform, tint);
+        },
+        .colr => |area| {
+            try renderFromAtlas(
+                allocator,
+                renderer,
+                cached_slot,
+                transform,
+                area,
+                qualityForSkew(transform),
+                null,
+            );
         },
     }
 }
@@ -215,7 +357,7 @@ fn renderOutlineToAtlas(
 ) !void {
     const outline_transform = Affine
         .scaleNonUniform(scale, -scale)
-        .thenTranslate(kurbo.Vec2.new(
+        .thenTranslate(Vec2.new(
             @as(f64, @floatFromInt(atlas_slot.x)) -
                 @as(f64, @floatFromInt(raster_metrics.bearing_x)) +
                 @as(f64, subpixel_offset),
@@ -223,7 +365,7 @@ fn renderOutlineToAtlas(
                 @as(f64, @floatFromInt(raster_metrics.bearing_y)),
         ));
     try recorder.setTransform(allocator, outline_transform);
-    try recorder.setPaint(allocator, .{ .solid = peniko.Color.BLACK });
+    try recorder.setPaintAtlas(allocator, .{ .solid = peniko.Color.BLACK });
     try recorder.fillPath(allocator, path);
 }
 
@@ -263,6 +405,94 @@ fn insertAndRenderOutline(
     return .cached_and_rendered;
 }
 
+/// Record COLR glyph draw commands into the atlas command recorder.
+fn renderColrToAtlas(
+    allocator: std.mem.Allocator,
+    colr_glyph: *const GlyphColr,
+    context_color: peniko.Color,
+    recorder: *atlas.AtlasCommandRecorder,
+    atlas_slot: AtlasSlot,
+    outline_cache_ref: *OutlineCache,
+) !void {
+    try recorder.setTransform(allocator, Affine.translate(Vec2.new(
+        @as(f64, @floatFromInt(atlas_slot.x)),
+        @as(f64, @floatFromInt(atlas_slot.y)),
+    )));
+
+    var clip_path = try colr_glyph.area.toPath(0.1, allocator);
+    defer clip_path.deinit(allocator);
+    if (colr_glyph.has_non_default_blend) {
+        try recorder.pushClipLayer(allocator, &clip_path);
+    } else {
+        try recorder.pushClipPath(allocator, &clip_path);
+    }
+
+    var painter = try colr.ColrPainter(atlas.AtlasCommandRecorder).init(
+        allocator,
+        colr_glyph,
+        context_color,
+        recorder,
+        outline_cache_ref,
+    );
+    defer painter.deinit();
+    try painter.paint();
+
+    if (colr_glyph.has_non_default_blend) {
+        try recorder.popLayer(allocator);
+    } else {
+        try recorder.popClipPath(allocator);
+    }
+}
+
+/// Insert a COLR glyph into the atlas and render it from there.
+fn insertAndRenderColr(
+    allocator: std.mem.Allocator,
+    renderer: anytype,
+    colr_glyph: *const GlyphColr,
+    outline_transform: Affine,
+    cache_key: GlyphCacheKey,
+    glyph_atlas: *GlyphAtlas,
+    image_cache: *ImageCache,
+    outline_cache_ref: *OutlineCache,
+) !CacheResult {
+    if (!supportsAtlasCaching(&outline_transform, .{ .colr = Rect.ZERO })) {
+        return .unsupported_transform;
+    }
+
+    const raster_metrics = RasterMetrics{
+        .width = colr_glyph.pix_width,
+        .height = colr_glyph.pix_height,
+        .bearing_x = 0,
+        .bearing_y = 0,
+    };
+
+    const area = colr_glyph.area;
+    const context_color = cache_key.context_color;
+
+    const insert_result = (try glyph_atlas.insert(allocator, image_cache, cache_key, raster_metrics)) orelse
+        return .atlas_full;
+
+    try renderColrToAtlas(
+        allocator,
+        colr_glyph,
+        context_color,
+        insert_result.recorder,
+        insert_result.slot,
+        outline_cache_ref,
+    );
+
+    try renderFromAtlas(
+        allocator,
+        renderer,
+        insert_result.slot,
+        outline_transform,
+        area,
+        qualityForSkew(outline_transform),
+        null,
+    );
+    return .cached_and_rendered;
+}
+
 /// Render an outline glyph from the atlas using bearing-based positioning.
 fn renderOutlineGlyphFromAtlas(
     allocator: std.mem.Allocator,
@@ -272,7 +502,7 @@ fn renderOutlineGlyphFromAtlas(
     tint_color: peniko.Color,
 ) !void {
     const c = outline_transform.asCoeffs();
-    const rect_transform = Affine.translate(kurbo.Vec2.new(
+    const rect_transform = Affine.translate(Vec2.new(
         @floor(c[4]) + @as(f64, @floatFromInt(atlas_slot.bearing_x)),
         @floor(c[5]) + @as(f64, @floatFromInt(atlas_slot.bearing_y)),
     ));
@@ -360,10 +590,11 @@ pub fn replayAtlasCommands(
 }
 
 /// Returns `true` if the transform is safe for atlas-cached glyph rendering.
+///
+/// Outlines and COLR glyphs expect the font-space y flip (negative d) and no
+/// non-unit scale/skew; bitmap glyphs are not ported.
 pub fn supportsAtlasCaching(transform: *const Affine, glyph_type: CachedGlyphType) bool {
     _ = glyph_type;
-    // Upstream supports y-mirroring for outlines (the flip is expected) but
-    // not x-mirroring.
     const c = transform.asCoeffs();
     return !util.hasNonUnitSkewOrScale(transform.*) and
         isSignPositive(c[0]) and
@@ -429,6 +660,12 @@ test "atlas caching support mirrors upstream predicates" {
         &Affine.scaleNonUniform(1.0, 1.0),
         .outline,
     ));
+    // COLR glyphs use the same predicate as outlines.
+    try testing.expect(supportsAtlasCaching(
+        &Affine.scaleNonUniform(1.0, -1.0),
+        .{ .colr = Rect.ZERO },
+    ));
+    try testing.expect(!supportsAtlasCaching(&Affine.scale(2.0), .{ .colr = Rect.ZERO }));
 }
 
 test "quality selection" {
