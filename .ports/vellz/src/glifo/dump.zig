@@ -145,6 +145,8 @@ fn fontBlob(font_id: u8) ![]const u8 {
         manifest.font_roboto => try fixture.roboto(),
         manifest.font_noto => try fixture.notoColor(),
         manifest.font_noto_cbtf => try fixture.notoCbtf(),
+        manifest.font_source_serif => try fixture.sourceSerif(),
+        manifest.font_source_serif_variable => try fixture.sourceSerifVariable(),
         else => error.TestUnexpectedResult,
     };
 }
