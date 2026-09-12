@@ -21,7 +21,7 @@ Pinned upstream: `1e63b4a40ccb484f82e1d85b83df97ab95bcfbe7` (`v0.10.0-51-g1e63b4
 | 13 | `vello_gpu/src/{text,resources}.rs` | — | `src/gpu/text.zig` | M5, not M3 |
 | 14 | `glifo/src/lib.rs` re-exports | 66 | `src/glifo/root.zig`, `src/root.zig` | all |
 
-Staged-only inventory (see §5 remainder): `skrifa/outline/glyf/hint/*` (30 files, each <500; interpreter), `outline/hint.rs` 647, `outline/autohint/*` (16 files, ~2.5k), `cff/mod.rs` 1,011 + `cff/hint.rs`, `glyf/deltas.rs` (~400), `bitmap.rs`, `png` decode.
+Staged-only inventory (see §5 remainder): `skrifa/outline/glyf/hint/*` (30 files, each <500; interpreter), `outline/hint.rs` 647, `outline/autohint/*` (16 files, ~2.5k), `cff/hint.rs` 1,505 — the CFF scaler and charstring evaluator themselves landed in the M3 CFF branch (`src/glifo/cff.zig`); the hinter is still deferred. `glyf/deltas.rs` (~400), `bitmap.rs`, `png` decode.
 
 ## 2. Font loading decision (standalone, byte-exact)
 
@@ -36,7 +36,7 @@ Staged-only inventory (see §5 remainder): `skrifa/outline/glyf/hint/*` (30 file
 | `gvar`/`HVAR`/`avar`, `LocationRef`/`NormalizedCoord` | **contract only, outline deltas defer** | API and cache keys carry `i16` coords; non-default coords on a variable font → `error.Unsupported` until ported |
 | TrueType interpreter (`fpgm`/`prep`/`cvt`, phantom points), `HintingInstance`/`HintingOptions(Engine::AutoFallback, Target::Smooth{Lcd, symmetric_rendering:false, preserve_linear_metrics:true})` | **port** (staged, after tasks 1–5) | upstream default `hint(true)`; Roboto prefers interpreter, so hinted fixtures need it |
 | autohinter | **defer** | only selected for instruction-less fonts, none in the M3 fixture set → explicit error |
-| CFF/CFF2 | **defer** | Roboto/Noto/`test_glyphs-glyf_colr_1` are all `glyf` |
+| CFF/CFF2 | **port** (M3 CFF) | Source Serif 4 OTF + variable CFF2 OTF (OFL-1.1) added as fixtures; Type2 charstring evaluator, DICT/INDEX/charset/FDSelect parsing and CFF2 blend/variation-store scalars are ported bit-exactly (`src/glifo/cff.zig`, `src/glifo/tables/cff.zig`, `src/glifo/tables/variations.zig`). CFF hinting (`skrifa/cff/hint.rs`) and `HVAR` advance deltas stay typed `error.Unsupported`, never approximated |
 | COLRv0/v1 + CPAL, `ColorPainter` traversal, brushes, composite modes | **port** | required by the milestone; glifo never hints COLR |
 | CBDT/CBLC/sbix + PNG bitmap glyphs | **port** (T5) | `sbix`/`CBDT`/`EBDT` strike selection + decode, `png 0.18`-compatible decoder; 16-bit/Adam7 -> `error.Unsupported` |
 | `FontEmbolden`/`kurbo::expand_path`/`Diagonal2` | **defer** | kurbo `expand` not ported; non-zero amount → `error.Unsupported` |
@@ -93,7 +93,36 @@ Staged gates: **G3a** unhinted outline corpus (Roboto `glyphs_{filled,small,skew
 
 **T5 — Cozmic adapter + decoration.** Files: `src/cozmic_adapter.zig`, `src/glifo/glyph.rs→.zig` decoration, `src/kurbo/bezpath.zig` (`PathSeg.transform`), `tests/cozmic_adapter_test.zig`, `build.zig` (opt-in test). Deps: T3 (outline fill/stroke), optionally T4. Acceptance: positioned-glyph mapping is 1:1 (ids/positions, no shaping calls, asserted by a counter/probe); `renderDecoration` skip-ink spans match upstream on crafted glyphs; adapter test skips explicitly when `.ports/cozmic` is absent; `zig build test`.
 
-M3 remainder after these five: autohint, `gvar`/variation, CFF, embolden — each explicit `error.Unsupported`. (TrueType hinting, bitmap/PNG, decoration and the Cozmic adapter landed in T5; see `plan.md`'s ledger.)
+M3 remainder after these five: autohint, `gvar`/variation, CFF hinting and `HVAR` deltas, embolden — each explicit `error.Unsupported`. (TrueType hinting, bitmap/PNG, decoration and the Cozmic adapter landed in T5; the unhinted CFF/CFF2 scaler, blend support and its fixtures landed on branch `vellz-cff`; see `plan.md`'s ledger.)
+
+### M3 CFF closure (branch `vellz-cff`)
+
+Files: `src/glifo/cff.zig` (scaler + Type2 evaluator + sinks),
+`src/glifo/tables/cff.zig` (INDEX/DICT/charset/FDSelect/Stack/BlendState),
+`src/glifo/tables/variations.zig` (item variation store + region scalars),
+`src/glifo/fixed.zig` (16.16/2.14 primitives), `src/glifo/outlines.zig`
+(glyf/CFF dispatch union), plus the `glyf`→`Outlines` call-site migration
+(`font.zig`, `glyph.zig`, `outline_cache.zig`, `colr.zig`, `dump.zig`).
+
+Ported bit-exactly: CFF (version 1) and CFF2 headers/INDEXes, top/private/font
+DICTs (binary-coded decimals, delta prefix sums, `blend`/`vsindex`), charsets
+(format 0/1/2 + ISOAdobe/Expert/ExpertSubset), FDSelect (0/3/4), the full Type2
+path operator set including flex and `seac`, `FontMatrix` normalization and
+combination, `TransformSink`/`NopFilterSink`, width fallbacks
+(`defaultWidthX`/`nominalWidthX` → `hmtx`) and `transform_h_metric`.
+
+Still typed `error.Unsupported` (never approximated): CFF hinting
+(`skrifa/cff/hint.rs`; an enabled `HintInstance` on a CFF face), `HVAR`
+advance/lsb deltas (non-empty coordinates on a face with `HVAR`), and CFF2
+`seac` (the format has no charset). An explicitly disabled hint instance still
+draws unhinted and rounds the advance, matching upstream.
+
+Fixtures: `SourceSerif4-Regular.otf` (1464 glyphs, CFF1) and
+`SourceSerif4Variable-Roman.otf` (CFF2, 6 FDArray subfonts, 34k `blend`
+operators), imported from the Adobe Fonts `release` commit
+`5f220b17d27ed64873f22cde0dd593685387bd19` under OFL-1.1. Gates: 9 glyph dump
+vectors (29 total, 866,901 elements / 2,500,272 coordinates), 2 cmap vectors
+and 10 `glyph_run` scenes, all byte-exact at tolerance 0.
 
 ## Evidence inspected
 `plan.md` §2/§5/§9/§10/§11/§13; `README.md`; `docs/port-contracts.md`; `docs/cpu-pipeline.md`; `tests/README.md`; `tests/fixtures/upstream/README.md`; `build.zig`, `build.zig.zon`, `src/root.zig`, `src/cpu/render.zig`, `src/common/render_state.zig`, `src/common/paint.zig`, relevant `src/kurbo` APIs; `tools/{scene.zig,vellz_cli.zig,oracle-rs/src/main.rs,import_upstream_fixtures.sh}`. Upstream: all `glifo/src/*`, `vello_cpu/src/{text,text_debug,render}.rs` text paths, `vello_common/src/{multi_atlas,image_cache}.rs`, `vello_tests/tests/{glyph,util,renderer}.rs`, `vello_dev_macros/src/{test,lib}.rs`, fixture READMEs, plus registry copies of `skrifa 0.44.0`, `read-fonts 0.41.0`, `guillotiere 0.7.0`. Cozmic: `src/layout.zig`, `glyph_cache.zig`, `shape_hb.zig`, `render.zig`; ZUI `README.md` font/atlas notes and `src/fonts/{atlas,shaper}.zig`.
@@ -106,10 +135,10 @@ Port the atlas stack first, then a fixed-point-exact `glyf` outline subset with 
 - Unhinted glyf must use 26.6 `Fixed` scaling; f32 shortcuts silently break byte-exactness.
 - Hash-map iteration differences vs `foldhash` fixed-state change eviction/packing order (argued pixel-invisible; needs confirmation).
 - COLR exactness across composition layers/gradients is the least certain; upstream itself allows 55 pixels.
-- Deferrals (CFF, embolden, variation, autohint, PNG 16-bit/Adam7) shrink coverage vs upstream test names.
+- Deferrals (CFF hinting, `HVAR` deltas, embolden, autohint, PNG 16-bit/Adam7) shrink coverage vs upstream test names.
 
 ## Open questions
 1. Is G3 (unhinted + COLR + adapter) acceptable, or is hinted-Roboto parity required before declaring M3?
-2. Approve deferring synthetic embolden, CFF/CFF2, CBDT/PNG, and variable-font outlines with typed errors?
+2. Approve deferring synthetic embolden, CFF hinting/`HVAR`, CBDT/PNG, and variable-font outlines with typed errors?
 3. Confirm hash-map/Pixmap-page ownership divergences are acceptable as documented non-pixel divergences.
 4. Who captures and commits the missing Roboto/Noto/colr SHA-256 values (needs write access to `tests/fixtures/upstream/` + the import script)?

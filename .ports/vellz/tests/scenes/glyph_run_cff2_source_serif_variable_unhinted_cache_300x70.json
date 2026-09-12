@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "width": 300,
+  "height": 70,
+  "settings": {
+    "mode": "quality",
+    "threads": 0,
+    "level": "fallback"
+  },
+  "target_init": "clear",
+  "commands": [
+    {
+      "op": "set_paint",
+      "rgba8": [
+        102,
+        51,
+        153,
+        128
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        50.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/SourceSerif4Variable-Roman.otf",
+        "index": 0
+      },
+      "font_size": 50.0,
+      "hint": false,
+      "atlas_cache": true,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 9,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 32,
+          "x": 39.4,
+          "y": 0.0
+        },
+        {
+          "id": 39,
+          "x": 64.9,
+          "y": 0.0
+        },
+        {
+          "id": 39,
+          "x": 79.8,
+          "y": 0.0
+        },
+        {
+          "id": 42,
+          "x": 94.7,
+          "y": 0.0
+        },
+        {
+          "id": 480,
+          "x": 122.15,
+          "y": 0.0
+        },
+        {
+          "id": 1,
+          "x": 137.15,
+          "y": 0.0
+        },
+        {
+          "id": 50,
+          "x": 148.8,
+          "y": 0.0
+        },
+        {
+          "id": 42,
+          "x": 187.0,
+          "y": 0.0
+        },
+        {
+          "id": 45,
+          "x": 214.45,
+          "y": 0.0
+        },
+        {
+          "id": 39,
+          "x": 235.6,
+          "y": 0.0
+        },
+        {
+          "id": 31,
+          "x": 250.5,
+          "y": 0.0
+        },
+        {
+          "id": 484,
+          "x": 278.85,
+          "y": 0.0
+        }
+      ]
+    }
+  ]
+}

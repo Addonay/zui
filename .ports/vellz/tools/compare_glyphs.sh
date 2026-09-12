@@ -92,6 +92,17 @@ glyph_vectors=(
     "Roboto-Regular.ttf 100.0 0 1293 h"
     "Roboto-Regular.ttf 0.5 0 1293 h"
     "Roboto-Regular.ttf 2048.0 0 1293 h"
+    # CFF/CFF2: Source Serif 4 (OFL-1.1). Unhinted only; CFF hinting is a
+    # typed error in the port (see src/glifo/cff.zig).
+    "SourceSerif4-Regular.otf 0.5 0 1463"
+    "SourceSerif4-Regular.otf 12.0 0 1463"
+    "SourceSerif4-Regular.otf 16.0 0 1463"
+    "SourceSerif4-Regular.otf 100.0 0 1463"
+    "SourceSerif4-Regular.otf 2048.0 0 1463"
+    "SourceSerif4Variable-Roman.otf 0.5 0 1463"
+    "SourceSerif4Variable-Roman.otf 12.0 0 1463"
+    "SourceSerif4Variable-Roman.otf 16.0 0 1463"
+    "SourceSerif4Variable-Roman.otf 100.0 0 1463"
 )
 
 # font filename, first codepoint, last codepoint
@@ -99,6 +110,8 @@ cmap_vectors=(
     "Roboto-Regular.ttf 0 65535"
     "NotoColorEmoji-Subset.ttf 0 131071"
     "NotoColorEmoji-CBTF-Subset.ttf 0 131071"
+    "SourceSerif4-Regular.otf 0 65535"
+    "SourceSerif4Variable-Roman.otf 0 65535"
 )
 
 font_id() {
@@ -106,6 +119,8 @@ font_id() {
         Roboto-Regular.ttf) echo 0 ;;
         NotoColorEmoji-Subset.ttf) echo 1 ;;
         NotoColorEmoji-CBTF-Subset.ttf) echo 2 ;;
+        SourceSerif4-Regular.otf) echo 3 ;;
+        SourceSerif4Variable-Roman.otf) echo 4 ;;
         *) echo "unknown font $1" >&2; exit 2 ;;
     esac
 }
@@ -126,7 +141,7 @@ total_coordinates=0
 glyph_rows=""
 for vector in "${glyph_vectors[@]}"; do
     read -r font size gid_start gid_end hint_flag <<<"$vector"
-    name="${font%.ttf}_s${size}_${gid_start}-${gid_end}"
+    name="${font%.*}_s${size}_${gid_start}-${gid_end}"
     hint_arg=""
     manifest_hint="false"
     if [ "$hint_flag" = "h" ]; then
@@ -163,7 +178,7 @@ done
 cmap_rows=""
 for vector in "${cmap_vectors[@]}"; do
     read -r font cp_start cp_end <<<"$vector"
-    name="${font%.ttf}_cp${cp_start}-${cp_end}"
+    name="${font%.*}_cp${cp_start}-${cp_end}"
     oracle_dump="$out/oracle_$name.txt"
     zig_dump="$out/zig_$name.txt"
     "$oracle" --dump-cmap --font "$fonts_dir/$font" \
@@ -202,6 +217,8 @@ if [ "$update_manifest" -eq 1 ]; then
         echo "pub const font_roboto: u8 = 0;"
         echo "pub const font_noto: u8 = 1;"
         echo "pub const font_noto_cbtf: u8 = 2;"
+        echo "pub const font_source_serif: u8 = 3;"
+        echo "pub const font_source_serif_variable: u8 = 4;"
         echo ""
         echo "pub const GlyphVector = struct {"
         echo "    font: u8,"

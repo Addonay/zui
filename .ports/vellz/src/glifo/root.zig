@@ -12,9 +12,10 @@
 //! - `FontData { blob, index }` / `Font` — face selection (sfnt + TTC),
 //!   `head`/`maxp`/`hhea`/`hmtx` metrics, `cmap` formats 4 + 12, and
 //!   `outlines()` for the TrueType scaler.
-//! - `Outlines` — unhinted `glyf` outlines: `outline(gid)` for point/contour
-//!   totals, `draw(allocator, gid, settings, pen)` for scaling + path
-//!   emission with `DrawSettings{ size, coords, path_style }` and
+//! - `Outlines` — unhinted outlines for `glyf`, CFF and CFF2 faces:
+//!   `outline(gid)` for point/contour totals (glyf), `draw(allocator, gid,
+//!   settings, pen)` for scaling + path emission with
+//!   `DrawSettings{ size, coords, path_style }` and
 //!   `AdjustedMetrics{ has_overlaps, lsb, advance_width }`.
 //! - `pen.PathElementPen` — records raw f32 `PathElement`s (the oracle dump
 //!   sink); `pen.PathPen` — records into a `vellz.kurbo.BezPath`.
@@ -43,14 +44,16 @@
 //! # Deferred with typed errors
 //!
 //! Autohinting (fonts without `fpgm`/`prep` bytecode), `gvar`/`HVAR`/`avar`
-//! variation deltas (any non-empty coords), CFF/CFF2 and synthetic embolden
-//! are all `error.Unsupported`; none are approximated. TrueType hinting
+//! variation deltas (non-empty coords on a face with `HVAR`/variable `glyf`),
+//! CFF hinting (`skrifa/cff/hint.rs`), CFF2 `seac` and synthetic embolden are
+//! all `error.Unsupported`; none are approximated. TrueType hinting
 //! (M3 G3b), decoration (T5) and COLRv0/COLRv1 (T4, including gradients,
-//! transforms, clip boxes and composite modes) are ported, and embedded
-//! bitmaps (`sbix`/`CBDT`/`EBDT`, T5) resolve through the upstream
-//! COLR > bitmap > outline cascade with PNG decoding; `Bgra`/`Mask` payloads
-//! and PNG features outside the decoder (16-bit, Adam7) fall through to the
-//! outline branch exactly like upstream's `.ok()` filter.
+//! transforms, clip boxes and composite modes) are ported, the unhinted
+//! CFF/CFF2 scaler (M3 CFF, including CFF2 blend/variation-store scalars) is
+//! ported, and embedded bitmaps (`sbix`/`CBDT`/`EBDT`, T5) resolve through the
+//! upstream COLR > bitmap > outline cascade with PNG decoding; `Bgra`/`Mask`
+//! payloads and PNG features outside the decoder (16-bit, Adam7) fall through
+//! to the outline branch exactly like upstream's `.ok()` filter.
 //!
 //! # Oracle comparison
 //!
@@ -66,6 +69,9 @@ const std = @import("std");
 pub const tables = @import("tables/root.zig");
 pub const font = @import("font.zig");
 pub const glyf = @import("glyf.zig");
+pub const cff = @import("cff.zig");
+pub const outlines = @import("outlines.zig");
+pub const fixed = @import("fixed.zig");
 pub const pen = @import("pen.zig");
 pub const outline_cache = @import("outline_cache.zig");
 pub const util = @import("util.zig");
@@ -83,12 +89,12 @@ pub const GlyphId = font.GlyphId;
 pub const NormalizedCoord = font.NormalizedCoord;
 pub const Charmap = font.Charmap;
 
-pub const Outlines = glyf.Outlines;
+pub const Outlines = outlines.Outlines;
 pub const Outline = glyf.Outline;
-pub const DrawSettings = glyf.DrawSettings;
-pub const DrawError = glyf.DrawError;
-pub const AdjustedMetrics = glyf.AdjustedMetrics;
-pub const PathStyle = glyf.PathStyle;
+pub const DrawSettings = outlines.DrawSettings;
+pub const DrawError = outlines.DrawError;
+pub const AdjustedMetrics = outlines.AdjustedMetrics;
+pub const PathStyle = outlines.PathStyle;
 pub const Scale26Dot6 = glyf.Scale26Dot6;
 
 pub const PathElement = pen.PathElement;
@@ -140,6 +146,9 @@ test {
     _ = tables;
     _ = font;
     _ = glyf;
+    _ = cff;
+    _ = outlines;
+    _ = fixed;
     _ = pen;
     _ = outline_cache;
     _ = util;

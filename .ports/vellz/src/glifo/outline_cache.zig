@@ -22,6 +22,7 @@ const std = @import("std");
 const kurbo = @import("../kurbo/root.zig");
 const font_mod = @import("font.zig");
 const glyf = @import("glyf.zig");
+const outlines_mod = @import("outlines.zig");
 const pen_mod = @import("pen.zig");
 
 pub const GlyphId = font_mod.GlyphId;
@@ -146,21 +147,24 @@ pub const OutlineCache = struct {
 
     /// Looks up, or draws and stores, the outline for `gid`.
     ///
-    /// `hint_instance` runs the TrueType interpreter (configured for `size`)
-    /// and makes the cache key hint-distinct; `null` draws unhinted. Rejects
-    /// the remaining deferred inputs with `error.Unsupported`: non-empty
-    /// variation coordinates and non-default embolden.
+    /// `outlines` is the `glyf`/CFF dispatch union; `hint_instance` runs the
+    /// TrueType interpreter (configured for `size`) and makes the cache key
+    /// hint-distinct; `null` draws unhinted. CFF faces reject an enabled hint
+    /// instance with `error.Unsupported` and accept `null` (and an explicitly
+    /// disabled instance, matching upstream). Rejects the remaining deferred
+    /// inputs with `error.Unsupported`: non-empty variation coordinates on a
+    /// face that needs unported deltas and non-default embolden.
     pub fn getOrInsert(
         self: *OutlineCache,
         allocator: std.mem.Allocator,
-        outlines: *const glyf.Outlines,
+        outlines: *const outlines_mod.Outlines,
         gid: GlyphId,
         font_info: FontInfo,
         size: f32,
         embolden: FontEmbolden,
         coords: []const NormalizedCoord,
         hint_instance: ?*const glyf.HintInstance,
-    ) glyf.DrawError!CachedOutline {
+    ) outlines_mod.DrawError!CachedOutline {
         if (coords.len != 0) return error.Unsupported;
         if (!embolden.isDefault()) return error.Unsupported;
 
