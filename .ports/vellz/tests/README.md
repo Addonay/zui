@@ -68,12 +68,17 @@ must fail loudly or be absent from the corpus, not produce approximate output.
 | blend layer (multiply) | `layer_blend_multiply_64` |
 | nested opacity layers | `layer_opacity_64` |
 | alpha / luminance masks | `mask_alpha_64`, `mask_luminance_64` |
+| flood / offset filters | `filter_flood_64`, `filter_offset_64` |
+| gaussian blur | `filter_gaussian_blur_64` |
+| drop shadow (composited and shadow-only) | `filter_drop_shadow_64`, `filter_drop_shadow_only_64` |
+| filter layer with clip | `filter_layer_clip_64` |
+| filter layer with opacity | `filter_layer_opacity_64` |
+| filter layer with clip + opacity + multiply | `filter_layer_clip_opacity_64` |
+| analytic blurred rounded rect | `blurred_rounded_rect_64` |
+| inverted (inset) blurred rounded rect | `blurred_rounded_rect_invert_64` |
 
-All scenes above render byte-exact with `zig build corpus` (22/22,
-`tolerance=0`). Filter layers and blurred rounded rectangles are the remaining
-M2 features; their scenes will be added here together with oracle support, and
-until then the renderer fails those commands loudly instead of approximating
-their output.
+All scenes above render byte-exact with `zig build corpus` (32/32,
+`tolerance=0`).
 
-Planned: filters, positioned glyphs, mixed scripts, resource exhaustion,
+Planned: positioned glyphs, mixed scripts, resource exhaustion,
 repeated resize.

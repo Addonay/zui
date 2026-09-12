@@ -10,10 +10,10 @@
 //!   `u8_pipeline` feature picks the u8 kernel for `RenderMode.optimize_speed`;
 //!   that kernel is M4, so the speed mode returns `error.Unsupported` instead
 //!   of silently rendering with different precision.
-//! - `rasterizeFilterLayers` returns an empty `FilterContext` (M2). Filter
-//!   layers cannot be recorded through this dispatcher either:
-//!   `pushLayer` rejects a non-null `filter_data` with `error.Unsupported`, so
-//!   the bucketer never sees a filter node.
+//! - Filter layers are supported: `rasterizeFilterLayers` renders every
+//!   recorded filter layer in reverse dependency order into its placement
+//!   pixmap and applies the filter, then the root pass composites the
+//!   resulting pixmaps through `filter_paints`.
 //! - Multi-threaded dispatch is M4; there is no vtable yet and this type is
 //!   used directly by `cpu/render.zig`.
 //!
@@ -60,6 +60,7 @@ const Mask = mask_mod.Mask;
 const Node = record.Node;
 const Paint = paint_mod.Paint;
 const PathDataRef = strip_storage.PathDataRef;
+const Pixmap = pixmap_mod.Pixmap;
 const PixmapMut = pixmap_mod.PixmapMut;
 const PremulColor = paint_mod.PremulColor;
 const RecordedFill = cpu_record.RecordedFill;
@@ -302,9 +303,11 @@ pub const SingleThreadedDispatcher = struct {
 
     /// Push a layer (upstream `push_layer`).
     ///
-    /// M1 rejects filter layers (`filter_data != null`) with
-    /// `error.Unsupported`; regular layers record their clip path strips and
-    /// hand the layer properties to the recorder.
+    /// A non-null `filter_data` first pushes a root viewport covering the
+    /// filter's source padding (dependency order matters: filter layers are
+    /// rasterized before the layers that composite them). `filter_data` is
+    /// consumed by this call: on success ownership transfers to the recorder,
+    /// on failure it is released here.
     ///
     /// `mask` is consumed by this call: on success ownership transfers to the
     /// recorder, on failure it is released here (like upstream's `Drop` on
@@ -319,14 +322,24 @@ pub const SingleThreadedDispatcher = struct {
         opacity: f32,
         aliasing_threshold: ?u8,
         mask: ?Mask,
-        filter_data: ?*const filter_data_mod.FilterData,
+        filter_data: ?filter_data_mod.FilterData,
     ) !void {
-        // `mask` was transferred into this call; release it on every error
-        // path until the recorder takes ownership.
+        // `mask` and `filter_data` were transferred into this call; release
+        // them on every error path until the recorder takes ownership.
         var pending_mask = mask;
         errdefer if (pending_mask) |owned| owned.deinit(allocator);
+        var pending_filter = filter_data;
+        errdefer if (pending_filter) |*owned| owned.deinit(allocator);
 
-        if (filter_data != null) return error.Unsupported;
+        var viewport_pushed = false;
+        errdefer if (viewport_pushed) {
+            self.viewport.popRootViewport(allocator) catch {};
+        };
+
+        if (pending_filter) |*data| {
+            try self.viewport.pushRootViewport(allocator, data);
+            viewport_pushed = true;
+        }
 
         var clip: ?LayerClip = null;
         if (clip_path) |path| {
@@ -380,23 +393,24 @@ pub const SingleThreadedDispatcher = struct {
             .mask = pending_mask,
             .clip_path = clip,
         };
+        var recorder_filter = pending_filter;
         pending_mask = null;
-        self.recorder.pushLayer(allocator, props, null) catch |err| {
-            // The recorder did not take ownership; release the mask here.
+        pending_filter = null;
+        self.recorder.pushLayer(allocator, props, recorder_filter) catch |err| {
+            // The recorder did not take ownership; release both handles here.
             if (props.mask) |owned| owned.deinit(allocator);
+            if (recorder_filter) |*owned| owned.deinit(allocator);
             return err;
         };
+        recorder_filter = null;
     }
 
     /// Pop the last-pushed layer (upstream `pop_layer`).
     pub fn popLayer(self: *SingleThreadedDispatcher, allocator: std.mem.Allocator) !void {
-        _ = allocator; // M2: `.filter` pops the root viewport.
         const popped = try self.recorder.popLayer();
         switch (popped) {
             .regular => {},
-            // Filter layers are rejected in `pushLayer`, so a recorded filter
-            // layer can only appear through a direct recorder use.
-            .filter => return error.Unsupported,
+            .filter => try self.viewport.popRootViewport(allocator),
         }
     }
 
@@ -480,7 +494,9 @@ pub const SingleThreadedDispatcher = struct {
         encoded_paints: []encode_mod.EncodedPaint,
         image_resolver: paint_mod.ImageResolver,
     ) !void {
-        const filter_ctx = self.rasterizeFilterLayers();
+        var filter_ctx = try self.rasterizeFilterLayers(allocator, encoded_paints, image_resolver);
+        defer filter_ctx.deinit(allocator);
+
         const target_init = settings.target_init.map(PremulColor.fromAlphaColor);
         const params = FineRenderParams{
             .scene_size = .{ scene_width, scene_height },
@@ -501,14 +517,72 @@ pub const SingleThreadedDispatcher = struct {
         );
     }
 
-    /// Rasterize every recorded filter layer (M2).
+    /// Rasterize every recorded filter layer (upstream `rasterize_filter_layers`).
     ///
-    /// M1 never records a filter layer (see `pushLayer`), so this returns an
-    /// empty context. The M2 port iterates `recorder.filter_layers` in reverse,
-    /// renders each layer into its placement pixmap, applies the filter, and
-    /// stores the result with `FilterContext.setLayer`.
-    fn rasterizeFilterLayers(self: *const SingleThreadedDispatcher) FilterContext {
-        return FilterContext.init(self.recorder.layers.items.len);
+    /// Filter layers are recorded on "push", so nested filter layers get added
+    /// after their parents and subsequent sibling filter layers are added after
+    /// the layer they are composited into. Iterating in reverse order therefore
+    /// guarantees all dependencies have been rendered before they are invoked.
+    fn rasterizeFilterLayers(
+        self: *SingleThreadedDispatcher,
+        allocator: std.mem.Allocator,
+        encoded_paints: []encode_mod.EncodedPaint,
+        image_resolver: paint_mod.ImageResolver,
+    ) !FilterContext {
+        // TODO (upstream): reuse pixmaps across frames.
+        var filter_ctx = try FilterContext.init(allocator, self.recorder.layers.items.len);
+        errdefer filter_ctx.deinit(allocator);
+
+        var i = self.recorder.filter_layers.items.len;
+        while (i > 0) {
+            i -= 1;
+            const id = self.recorder.filter_layers.items[i];
+            const layer = &self.recorder.layers.items[id];
+            const filter_kind = switch (layer.kind) {
+                .filter => |*kind| kind,
+                .regular => unreachable, // `filter_layers` only holds filter layers
+            };
+
+            const pixmap_bbox = filter_kind.placement.pixmap_bbox;
+            if (pixmap_bbox.isEmpty()) continue;
+
+            const width = pixmap_bbox.width();
+            const height = pixmap_bbox.height();
+            var pixmap = try Pixmap.init(allocator, width, height);
+            errdefer pixmap.deinit(allocator);
+
+            var pixmap_mut = pixmap.asMut();
+            const params = FineRenderParams{
+                .scene_size = .{ width, height },
+                .target_offset = .{ 0, 0 },
+            };
+
+            try self.bucketAndRasterize(
+                allocator,
+                layer.nodes.items,
+                pixmap_bbox,
+                &filter_ctx,
+                &pixmap_mut,
+                params,
+                .{ .clear = PremulColor.fromAlphaColor(peniko.Color.TRANSPARENT) },
+                false,
+                encoded_paints,
+                image_resolver,
+            );
+
+            try filter_mod.filterHighp(
+                allocator,
+                &filter_kind.filter_data.filter,
+                &pixmap,
+                filter_ctx.scratchBuffer(),
+                filter_kind.filter_data.transform,
+            );
+
+            // Ownership of `pixmap` moves into the context.
+            try filter_ctx.setLayer(allocator, id, pixmap);
+        }
+
+        return filter_ctx;
     }
 
     fn bucketAndRasterize(
@@ -536,13 +610,13 @@ pub const SingleThreadedDispatcher = struct {
         );
 
         const alpha_buffers = [_][]const u8{self.strip_storage.alphas.items};
-        // Filter layers are still deferred, so no encoded filter paints exist
-        // yet; upstream reads them from the bucketer.
-        const no_filter_paints = [_]encode_mod.EncodedPaint{};
+        // Filter paints are generated by bucketing (see
+        // `CommandBucketer.generateFilterLayerFill`) and continue the index
+        // space after the scene's encoded paints.
         const resources = FineResources{
             .alpha_buffers = &alpha_buffers,
             .encoded_paints = encoded_paints,
-            .filter_paints = &no_filter_paints,
+            .filter_paints = self.bucketer.filter_paints.items,
             .image_resolver = image_resolver,
         };
 
@@ -637,7 +711,7 @@ test "buffers cleared on reset" {
     try testing.expect(!dispatcher.viewport.hasRootViewports());
 }
 
-test "fill rect fast records strips and rejects filter layers" {
+test "fill rect fast records strips and filter layers" {
     const allocator = testing.allocator;
     var dispatcher = try SingleThreadedDispatcher.init(allocator, 16, 8, .baseline);
     defer dispatcher.deinit(allocator);
@@ -652,32 +726,35 @@ test "fill rect fast records strips and rejects filter layers" {
     try testing.expectEqual(@as(usize, 1), dispatcher.recorder.draws.items.len);
     try testing.expect(dispatcher.strip_storage.strips.items.len >= 2);
 
-    // A filter layer is rejected before any recorder state changes.
-    var filter = try @import("../../common/filter_effects.zig").Filter.fromPrimitive(
+    // A filter layer is recorded and pushes a root viewport.
+    const filter = try @import("../../common/filter_effects.zig").Filter.fromPrimitive(
         allocator,
         .{ .gaussian_blur = .{ .std_deviation = 1.0, .edge_mode = .none } },
     );
     defer filter.deinit(allocator);
-    var filter_data = @import("../../common/filter.zig").FilterData.new(
+
+    const filter_data = @import("../../common/filter.zig").FilterData.new(
         filter.clone(),
         kurbo.Affine.IDENTITY,
     );
-    defer filter_data.deinit(allocator);
-
-    try testing.expectError(
-        error.Unsupported,
-        dispatcher.pushLayer(
-            allocator,
-            null,
-            Fill.non_zero,
-            kurbo.Affine.IDENTITY,
-            BlendMode.default,
-            1.0,
-            null,
-            null,
-            &filter_data,
-        ),
+    // `pushLayer` consumes `filter_data`; the recorder owns it afterwards.
+    try dispatcher.pushLayer(
+        allocator,
+        null,
+        Fill.non_zero,
+        kurbo.Affine.IDENTITY,
+        BlendMode.default,
+        1.0,
+        null,
+        null,
+        filter_data,
     );
+    try testing.expect(dispatcher.hasLayers());
+    try testing.expectEqual(@as(usize, 1), dispatcher.recorder.layers.items.len);
+    try testing.expectEqual(@as(usize, 1), dispatcher.recorder.filter_layers.items.len);
+    try testing.expect(dispatcher.viewport.hasRootViewports());
+
+    try dispatcher.popLayer(allocator);
     try testing.expect(!dispatcher.hasLayers());
-    try testing.expectEqual(@as(usize, 0), dispatcher.recorder.layers.items.len);
+    try testing.expect(!dispatcher.viewport.hasRootViewports());
 }

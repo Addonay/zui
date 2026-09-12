@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "quality", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "rgba8": [245, 245, 245, 255] },
+    { "op": "fill_rect", "rect": [0, 0, 64, 64] },
+    { "op": "push_layer", "kind": "filter",
+      "filter": { "kind": "offset", "dx": 10.0, "dy": 0.0 },
+      "clip": "M32 6 L58 32 L32 58 L6 32 Z" },
+    { "op": "set_paint", "rgba8": [220, 40, 40, 255] },
+    { "op": "fill_rect", "rect": [20, 20, 40, 40] },
+    { "op": "pop_layer" }
+  ]
+}

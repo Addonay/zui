@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "quality", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "rgba8": [245, 245, 245, 255] },
+    { "op": "fill_rect", "rect": [0, 0, 64, 64] },
+    { "op": "set_filter_effect", "filter": { "kind": "drop_shadow", "dx": 6.0, "dy": 6.0, "std_deviation": 2.0, "rgba8": [20, 30, 90, 200], "edge_mode": "duplicate" } },
+    { "op": "set_paint", "rgba8": [230, 60, 40, 255] },
+    { "op": "fill_rect", "rect": [18, 18, 38, 38] },
+    { "op": "reset_filter_effect" }
+  ]
+}

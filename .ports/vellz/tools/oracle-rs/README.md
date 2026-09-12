@@ -74,7 +74,9 @@ Commands:
 | `fill_path` / `stroke_path` | `path`: SVG path data | kurbo `BezPath::from_svg` |
 | `push_clip_path` / `pop_clip_path` | `path` | non-isolated clipping |
 | `push_clip_layer` / `pop_layer` | `path` | isolated clipping layer (alias for `push_layer` `kind:clip`) |
-| `push_layer` / `pop_layer` | `kind`: `clip` \| `blend` \| `opacity` \| `mask` | isolated layer; see below |
+| `push_layer` / `pop_layer` | `kind`: `clip` \| `blend` \| `opacity` \| `mask` \| `filter` | isolated layer; see below |
+| `set_filter_effect` | `filter` | wraps each subsequent draw in a filter layer |
+| `reset_filter_effect` | | clears the paint-level filter |
 | `reset` | | upstream `RenderContext::reset` |
 
 ### Paints
@@ -146,6 +148,36 @@ kept as an alias for `kind:clip`. Mask layers use the asset's alpha
 nearest-neighbor resampled to the render target size because `vello_cpu`
 ignores masks of a different size (see `tests/scenes/assets/README.md`).
 
-Filter layers and glyph runs remain planned; they are added when the
-corresponding vellz feature is ported, and the same file is consumed by both
-implementations.
+### Filters
+
+Upstream (`vello_cpu`) supports single-primitive filter graphs only; a
+multi-primitive graph panics, so the scene format expresses only one primitive
+per filter. `edge_mode` is `duplicate`, `wrap`, `mirror` or `none` (default).
+
+```json
+{ "op": "set_filter_effect", "filter": { "kind": "flood", "rgba8": [30, 140, 220, 180] } }
+{ "op": "reset_filter_effect" }
+{ "op": "set_filter_effect", "filter": { "kind": "offset", "dx": 8.5, "dy": -4.0 } }
+{ "op": "set_filter_effect", "filter": { "kind": "gaussian_blur", "std_deviation": 3.0, "edge_mode": "duplicate" } }
+{ "op": "set_filter_effect", "filter": { "kind": "drop_shadow", "dx": 6, "dy": 6, "std_deviation": 2, "rgba8": [20, 30, 90, 200], "edge_mode": "duplicate" } }
+{ "op": "set_filter_effect", "filter": { "kind": "drop_shadow_only", "dx": 6, "dy": 6, "std_deviation": 2, "rgba8": [20, 30, 90, 200], "edge_mode": "duplicate" } }
+```
+
+`set_filter_effect` applies the filter to the next drawn elements (each draw
+becomes its own filter layer); use `push_layer kind:filter` to apply one filter
+to multiple draws. A filter layer accepts an optional `clip` (SVG path data),
+`opacity` (f32), `blend` (`{mix, compose}`) and `mask` next to its required
+`filter`:
+
+```json
+{ "op": "push_layer", "kind": "filter",
+  "filter": { "kind": "gaussian_blur", "std_deviation": 2.0, "edge_mode": "duplicate" },
+  "clip": "M32 6 L58 32 L32 58 L6 32 Z",
+  "opacity": 0.5,
+  "blend": { "mix": "multiply", "compose": "src_over" } }
+{ "op": "pop_layer" }
+```
+
+Blurred rounded rectangles and glyph runs remain planned; they are added when
+the corresponding vellz feature is ported, and the same file is consumed by
+both implementations.

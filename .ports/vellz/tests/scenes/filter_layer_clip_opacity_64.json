@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "quality", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "rgba8": [245, 245, 245, 255] },
+    { "op": "fill_rect", "rect": [0, 0, 64, 64] },
+    { "op": "push_layer", "kind": "filter",
+      "filter": { "kind": "flood", "rgba8": [30, 140, 220, 200] },
+      "clip": "M8 8 L56 8 L56 56 L8 56 Z",
+      "opacity": 0.75,
+      "blend": { "mix": "multiply", "compose": "src_over" } },
+    { "op": "set_paint", "rgba8": [255, 255, 255, 255] },
+    { "op": "fill_rect", "rect": [0, 0, 64, 64] },
+    { "op": "pop_layer" }
+  ]
+}

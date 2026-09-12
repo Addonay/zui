@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "quality", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "rgba8": [245, 245, 245, 255] },
+    { "op": "fill_rect", "rect": [0, 0, 64, 64] },
+    { "op": "set_filter_effect", "filter": { "kind": "offset", "dx": 8.5, "dy": -4.0 } },
+    { "op": "set_paint", "rgba8": [220, 40, 40, 255] },
+    { "op": "fill_rect", "rect": [20, 20, 40, 40] },
+    { "op": "reset_filter_effect" }
+  ]
+}

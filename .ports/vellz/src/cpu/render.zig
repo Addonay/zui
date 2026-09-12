@@ -10,10 +10,13 @@
 //! - **Solid, gradient and image paints.** `setPaint` accepts a
 //!   `peniko.Color` or a `common.paint.PaintType`; gradients and images are
 //!   encoded into `encoded_paints` at draw time (M2) and rasterized by the
-//!   fine painters. Blurred rounded rects remain `error.Unsupported`.
-//! - **Regular layers only.** `pushClipLayer`/`pushBlendLayer`/
-//!   `pushOpacityLayer`/`pushLayer` support clip/opacity/blend layers;
-//!   `pushLayer` rejects a non-null filter with `error.Unsupported`.
+//!   fine painters. `fillBlurredRoundedRect` encodes an analytic blurred
+//!   rounded rectangle paint.
+//! - **Layers**: `pushClipLayer`/`pushBlendLayer`/`pushOpacityLayer`/
+//!   `pushLayer` support clip/opacity/blend layers, and `pushLayer` accepts a
+//!   filter. A `setFilterEffect` filter wraps each subsequent draw in a
+//!   recorded filter layer (upstream `with_optional_filter`); the filter
+//!   itself stays set until `resetFilterEffect`.
 //! - **Path-level masks** (`set_mask`/`reset_mask` upstream) are M2, matching
 //!   their `RecordedFill.mask` seam in `cpu/record.zig`.
 //! - Multi-threaded rendering is M4; `RenderSettings.num_threads` is ignored
@@ -38,7 +41,9 @@
 const std = @import("std");
 const kurbo = @import("../kurbo/root.zig");
 const peniko = @import("../peniko/root.zig");
+const blurred_rounded_rect_mod = @import("../common/blurred_rounded_rect.zig");
 const encode_mod = @import("../common/encode.zig");
+const filter_data_mod = @import("../common/filter.zig");
 const filter_effects = @import("../common/filter_effects.zig");
 const mask_mod = @import("../common/mask.zig");
 const paint_mod = @import("../common/paint.zig");
@@ -211,10 +216,12 @@ pub const RenderContext = struct {
     root_transforms: RootTransforms,
     /// Optional threshold for aliasing.
     aliasing_threshold: ?u8,
-    /// The current paint-level filter effect (M2; draws fail while set).
+    /// The current paint-level filter effect.
     ///
-    /// Owned handle: the context releases it on `deinit`,
-    /// `resetFilterEffect`, or replacement by `setFilterEffect`.
+    /// While set, every draw operation records its own filter layer with a
+    /// clone of this filter (upstream `with_optional_filter`). Owned handle:
+    /// the context releases it on `deinit`, `resetFilterEffect`, or
+    /// replacement by `setFilterEffect`.
     filter: ?Filter,
     /// The path-level mask applied to subsequent draws (upstream `mask`).
     /// Owned; `Mask` is reference-counted so `setMask`/`resetMask` are cheap.
@@ -451,9 +458,9 @@ pub const RenderContext = struct {
 
     /// Apply a filter to the current paint (affects the next drawn elements).
     ///
-    /// M2: while a filter is set, every draw fails with `error.Unsupported`
-    /// (upstream wraps the draw in a filter layer). The context takes
-    /// ownership of `filter`.
+    /// This sets a filter that will be applied to the next drawn element; to
+    /// apply a filter to multiple elements, use `pushLayer` (or
+    /// `pushFilterLayer`). The context takes ownership of `filter`.
     pub fn setFilterEffect(self: *RenderContext, filter: Filter) void {
         if (self.filter) |old| old.deinit(self.allocator);
         self.filter = filter;
@@ -465,10 +472,10 @@ pub const RenderContext = struct {
         self.filter = null;
     }
 
-    // ------------------------------------------------------- drawing ops
-
-    fn rejectFilter(self: *const RenderContext) !void {
-        if (self.filter != null) return error.Unsupported;
+    /// Push a filter layer that affects all subsequent drawing operations
+    /// (upstream `push_filter_layer`).
+    pub fn pushFilterLayer(self: *RenderContext, allocator: std.mem.Allocator, filter: Filter) !void {
+        try self.pushLayer(allocator, null, null, null, null, filter);
     }
 
     /// Encode the current paint into `encoded_paints` (upstream
@@ -519,13 +526,29 @@ pub const RenderContext = struct {
         try self.temp_path.appendSlice(allocator, &elements);
     }
 
+    // ------------------------------------------------------- drawing ops
+
     /// Fill a path.
     pub fn fillPath(
         self: *RenderContext,
         allocator: std.mem.Allocator,
         path: []const kurbo.PathEl,
     ) !void {
-        try self.rejectFilter();
+        if (self.filter) |filter| {
+            try self.pushLayer(allocator, null, null, null, null, filter.clone());
+            errdefer self.popLayer();
+            try self.fillPathInner(allocator, path);
+            self.popLayer();
+        } else {
+            try self.fillPathInner(allocator, path);
+        }
+    }
+
+    fn fillPathInner(
+        self: *RenderContext,
+        allocator: std.mem.Allocator,
+        path: []const kurbo.PathEl,
+    ) !void {
         const encoded_paint = try self.encodeCurrentPaint();
         const path_transform = self.root_transforms.effectivePathTransform(self.state.transforms);
         try self.dispatcher.fillPath(
@@ -546,7 +569,21 @@ pub const RenderContext = struct {
         allocator: std.mem.Allocator,
         path: []const kurbo.PathEl,
     ) !void {
-        try self.rejectFilter();
+        if (self.filter) |filter| {
+            try self.pushLayer(allocator, null, null, null, null, filter.clone());
+            errdefer self.popLayer();
+            try self.strokePathInner(allocator, path);
+            self.popLayer();
+        } else {
+            try self.strokePathInner(allocator, path);
+        }
+    }
+
+    fn strokePathInner(
+        self: *RenderContext,
+        allocator: std.mem.Allocator,
+        path: []const kurbo.PathEl,
+    ) !void {
         const encoded_paint = try self.encodeCurrentPaint();
         const path_transform = self.root_transforms.effectivePathTransform(self.state.transforms);
         try self.dispatcher.strokePath(
@@ -567,7 +604,21 @@ pub const RenderContext = struct {
         allocator: std.mem.Allocator,
         rect: kurbo.Rect,
     ) !void {
-        try self.rejectFilter();
+        if (self.filter) |filter| {
+            try self.pushLayer(allocator, null, null, null, null, filter.clone());
+            errdefer self.popLayer();
+            try self.fillRectInner(allocator, rect);
+            self.popLayer();
+        } else {
+            try self.fillRectInner(allocator, rect);
+        }
+    }
+
+    fn fillRectInner(
+        self: *RenderContext,
+        allocator: std.mem.Allocator,
+        rect: kurbo.Rect,
+    ) !void {
         const encoded_paint = try self.encodeCurrentPaint();
         const path_transform = self.root_transforms.effectivePathTransform(self.state.transforms);
 
@@ -606,7 +657,21 @@ pub const RenderContext = struct {
         allocator: std.mem.Allocator,
         rect: kurbo.Rect,
     ) !void {
-        try self.rejectFilter();
+        if (self.filter) |filter| {
+            try self.pushLayer(allocator, null, null, null, null, filter.clone());
+            errdefer self.popLayer();
+            try self.strokeRectInner(allocator, rect);
+            self.popLayer();
+        } else {
+            try self.strokeRectInner(allocator, rect);
+        }
+    }
+
+    fn strokeRectInner(
+        self: *RenderContext,
+        allocator: std.mem.Allocator,
+        rect: kurbo.Rect,
+    ) !void {
         try self.rectToTempPath(allocator, rect);
         const encoded_paint = try self.encodeCurrentPaint();
         const path_transform = self.root_transforms.effectivePathTransform(self.state.transforms);
@@ -614,6 +679,64 @@ pub const RenderContext = struct {
             allocator,
             self.temp_path.items,
             &self.state.stroke,
+            path_transform,
+            encoded_paint,
+            self.state.blend_mode,
+            self.aliasing_threshold,
+            self.currentMask(),
+        );
+    }
+
+    /// Fill a blurred rounded rectangle (upstream `fill_blurred_rounded_rect`).
+    ///
+    /// When `invert` is `true`, the inverse (`1 - alpha`) of the blur coverage
+    /// is painted: the paint is fully opaque outside the blurred rectangle and
+    /// fades to transparent inside it (inset box shadows). Only a solid paint
+    /// is used; image/gradient paints fall back to black, like upstream.
+    pub fn fillBlurredRoundedRect(
+        self: *RenderContext,
+        allocator: std.mem.Allocator,
+        rect: kurbo.Rect,
+        radius: f32,
+        std_dev: f32,
+        invert: bool,
+    ) !void {
+        const abs_rect = rect.abs();
+        const color = switch (self.state.paint) {
+            .solid => |solid| solid,
+            // Fallback to black when attempting to blur a rectangle with an
+            // image/gradient paint.
+            else => peniko.Color.BLACK,
+        };
+
+        const blurred_rect = blurred_rounded_rect_mod.BlurredRoundedRectangle{
+            .rect = abs_rect,
+            .color = color,
+            .radius = radius,
+            .std_dev = std_dev,
+            .invert = invert,
+        };
+
+        // The impulse response of a Gaussian filter is infinite; for
+        // performance, cut it off at 2.5 sigma.
+        const kernel_size: f64 = 2.5 * @as(f64, std_dev);
+        const inflated_rect = abs_rect.inflate(kernel_size, kernel_size);
+        const path_transform = self.root_transforms.effectivePathTransform(self.state.transforms);
+        const paint_transform = self.root_transforms.effectivePaintTransform(self.state.transforms);
+
+        try self.rectToTempPath(allocator, inflated_rect);
+
+        const encoded_paint = try encode_mod.encodeBlurredRoundedRectangle(
+            &blurred_rect,
+            self.allocator,
+            &self.encoded_paints,
+            paint_transform,
+            null,
+        );
+        try self.dispatcher.fillPath(
+            allocator,
+            self.temp_path.items,
+            .non_zero,
             path_transform,
             encoded_paint,
             self.state.blend_mode,
@@ -653,11 +776,11 @@ pub const RenderContext = struct {
     ///
     /// `mask`, when provided, must have the same dimensions as the render
     /// context; otherwise it is ignored (and released), matching upstream.
-    /// `mask` is consumed whenever `filter` is null: on success ownership
-    /// transfers to the recorder, on failure it is released here, so do not
-    /// release it again. A non-null `filter` is M2 and makes this method fail
-    /// with `error.Unsupported` before touching `mask`; ownership of both
-    /// `mask` and `filter` then stays with the caller.
+    /// `mask` and `filter` are consumed: on success ownership transfers to the
+    /// recorder, on failure both are released here, so do not release them
+    /// again. A non-null `filter` pushes a filter layer, which shifts the
+    /// recorded contents by the filter's source shift and stores a
+    /// `FilterData` for later rasterization.
     pub fn pushLayer(
         self: *RenderContext,
         allocator: std.mem.Allocator,
@@ -667,16 +790,34 @@ pub const RenderContext = struct {
         mask: ?Mask,
         filter: ?Filter,
     ) !void {
-        if (filter != null) return error.Unsupported;
-
         const blend = blend_mode orelse peniko.BlendMode.default;
         const alpha = std.math.clamp(opacity orelse 1.0, 0.0, 1.0);
         const layer_transform = self.root_transforms.effectivePathTransform(self.state.transforms);
 
-        // The relative root transform is only non-identity for filter layers
-        // (which are rejected above), but the push/pop bracket is always kept
-        // so layer nesting matches upstream.
-        self.root_transforms.pushRoot(allocator, kurbo.Affine.IDENTITY) catch |err| {
+        // `FilterData::new` takes ownership of the filter handle.
+        var pending_filter = filter;
+        errdefer if (pending_filter) |f| f.deinit(allocator);
+        var filter_data: ?filter_data_mod.FilterData = null;
+        if (pending_filter) |f| {
+            pending_filter = null;
+            filter_data = filter_data_mod.FilterData.new(f, layer_transform);
+        }
+        errdefer if (filter_data) |*data| data.deinit(allocator);
+
+        // The relative root transform is identity except for filter layers:
+        // their contents are shifted by the source shift so that negative
+        // scene coordinates do not need to be rendered, and
+        // `FilterLayerPlacement` undoes the shift when the layer is
+        // composited back into the parent.
+        const relative_transform: kurbo.Affine = if (filter_data) |data| blk: {
+            const shift = data.sourceShift();
+            break :blk kurbo.Affine.translate(kurbo.Vec2.new(
+                @floatFromInt(shift[0]),
+                @floatFromInt(shift[1]),
+            ));
+        } else kurbo.Affine.IDENTITY;
+
+        self.root_transforms.pushRoot(allocator, relative_transform) catch |err| {
             // The caller transferred `mask` into this call; release it.
             if (mask) |m| m.deinit(allocator);
             return err;
@@ -694,6 +835,10 @@ pub const RenderContext = struct {
             }
         }
 
+        // The dispatcher takes ownership of `filter_data` on success; it
+        // releases it (together with `effective_mask`) on failure.
+        const filter_arg = filter_data;
+        filter_data = null;
         try self.dispatcher.pushLayer(
             allocator,
             clip_path,
@@ -703,7 +848,7 @@ pub const RenderContext = struct {
             alpha,
             self.aliasing_threshold,
             effective_mask,
-            null,
+            filter_arg,
         );
     }
 
@@ -1308,34 +1453,206 @@ test "reset keeps aliasing threshold and filter state" {
     const allocator = testing.allocator;
     var ctx = try RenderContext.init(allocator, 2, 2, RenderSettings.default);
     defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    var pixmap = try Pixmap.init(allocator, 2, 2);
+    defer pixmap.deinit(allocator);
 
     ctx.setAliasingThreshold(128);
     ctx.setFilterEffect(try filter_effects.Filter.fromPrimitive(allocator, .{
-        .gaussian_blur = .{ .std_deviation = 1.0, .edge_mode = .none },
+        .flood = .{ .color = peniko.palette.css.RED },
     }));
 
     ctx.reset();
     try testing.expectEqual(@as(?u8, 128), ctx.aliasingThreshold());
     try testing.expect(ctx.filter != null);
 
-    // While the filter is set, every draw fails explicitly (M2); the filter
-    // itself survives the reset (upstream behavior).
-    try testing.expectError(
-        error.Unsupported,
-        ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 2.0, 2.0)),
-    );
+    // The filter survives the reset (upstream behavior) and wraps subsequent
+    // draws in filter layers: the flood filter replaces the layer contents
+    // with red before compositing.
+    ctx.setPaint(palette.BLUE);
+    try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 2.0, 2.0));
     ctx.resetFilterEffect();
     try testing.expect(ctx.filter == null);
 
     // The recorded scene is cleared, so the context is reusable.
-    var resources = Resources.init();
-    defer resources.deinit(allocator);
-    var pixmap = try Pixmap.init(allocator, 2, 2);
-    defer pixmap.deinit(allocator);
-    ctx.setPaint(palette.RED);
-    try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 2.0, 2.0));
+    ctx.flush();
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
     try expectPixel(&pixmap, 0, 0, premulU8(palette.RED));
+}
+
+// ---------------------------------------------------------------------------
+// Filter end-to-end tests
+// ---------------------------------------------------------------------------
+
+test "set filter effect wraps a draw in a flood filter layer" {
+    const allocator = testing.allocator;
+    var ctx = try RenderContext.init(allocator, 4, 4, RenderSettings.default);
+    defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    var pixmap = try Pixmap.init(allocator, 4, 4);
+    defer pixmap.deinit(allocator);
+
+    ctx.setPaint(palette.BLUE);
+    ctx.setFilterEffect(try filter_effects.Filter.fromPrimitive(allocator, .{
+        .flood = .{ .color = peniko.palette.css.GREEN },
+    }));
+    try ctx.fillRect(allocator, kurbo.Rect.new(1.0, 1.0, 3.0, 3.0));
+    ctx.resetFilterEffect();
+    ctx.flush();
+    try ctx.renderWith(&pixmap, &resources, qualitySettings());
+
+    // Filter layers are tile-aligned: the drawn rect's strips span the whole
+    // 4x4 tile, so the flood-filled pixmap covers the full layer area.
+    const green = premulU8(palette.GREEN);
+    for (0..4) |y| {
+        for (0..4) |x| {
+            try expectPixel(&pixmap, @intCast(x), @intCast(y), green);
+        }
+    }
+}
+
+test "set filter effect wraps a draw in an offset filter layer" {
+    const allocator = testing.allocator;
+    var ctx = try RenderContext.init(allocator, 4, 4, RenderSettings.default);
+    defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    var pixmap = try Pixmap.init(allocator, 4, 4);
+    defer pixmap.deinit(allocator);
+
+    ctx.setPaint(palette.RED);
+    ctx.setFilterEffect(try filter_effects.Filter.fromPrimitive(allocator, .{
+        .offset = .{ .dx = 1.0, .dy = 1.0 },
+    }));
+    try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 2.0, 2.0));
+    ctx.resetFilterEffect();
+    ctx.flush();
+    try ctx.renderWith(&pixmap, &resources, qualitySettings());
+
+    // The red square moved from (0,0)-(2,2) to (1,1)-(3,3).
+    const red = premulU8(palette.RED);
+    const transparent = transparentPixel();
+    for (0..4) |y| {
+        for (0..4) |x| {
+            const inside = x >= 1 and x < 3 and y >= 1 and y < 3;
+            try expectPixel(&pixmap, @intCast(x), @intCast(y), if (inside) red else transparent);
+        }
+    }
+}
+
+test "gaussian blur filter spreads an opaque rect" {
+    const allocator = testing.allocator;
+    var ctx = try RenderContext.init(allocator, 16, 16, RenderSettings.default);
+    defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    var pixmap = try Pixmap.init(allocator, 16, 16);
+    defer pixmap.deinit(allocator);
+
+    ctx.setPaint(palette.RED);
+    ctx.setFilterEffect(try filter_effects.Filter.fromPrimitive(allocator, .{
+        .gaussian_blur = .{ .std_deviation = 2.0, .edge_mode = .duplicate },
+    }));
+    try ctx.fillRect(allocator, kurbo.Rect.new(4.0, 4.0, 12.0, 12.0));
+    ctx.resetFilterEffect();
+    ctx.flush();
+    try ctx.renderWith(&pixmap, &resources, qualitySettings());
+
+    // Center retains full coverage, edges are partially covered, and the
+    // blur bleeds outside the source rectangle.
+    try testing.expect(pixmap.sample(8, 8).a > 200);
+    try testing.expect(pixmap.sample(8, 3).a > 0);
+    try testing.expect(pixmap.sample(8, 0).a < pixmap.sample(8, 3).a);
+    try testing.expect(pixmap.sample(0, 0).a < pixmap.sample(8, 3).a);
+}
+
+test "drop shadow filter composites the shadow and original" {
+    const allocator = testing.allocator;
+    var ctx = try RenderContext.init(allocator, 8, 8, RenderSettings.default);
+    defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    var pixmap = try Pixmap.init(allocator, 8, 8);
+    defer pixmap.deinit(allocator);
+
+    ctx.setPaint(palette.RED);
+    ctx.setFilterEffect(try filter_effects.Filter.fromPrimitive(allocator, .{
+        .drop_shadow = .{
+            .dx = 2.0,
+            .dy = 2.0,
+            .std_deviation = 0.0,
+            .color = peniko.palette.css.BLUE,
+            .edge_mode = .none,
+        },
+    }));
+    try ctx.fillRect(allocator, kurbo.Rect.new(1.0, 1.0, 3.0, 3.0));
+    ctx.resetFilterEffect();
+    ctx.flush();
+    try ctx.renderWith(&pixmap, &resources, qualitySettings());
+
+    // The original red is composited over the blue shadow at its position...
+    try expectPixel(&pixmap, 1, 1, premulU8(palette.RED));
+    // ...and the shadow shows through at the offset position.
+    try expectPixel(&pixmap, 3, 3, premulU8(palette.BLUE));
+    try expectPixel(&pixmap, 0, 0, transparentPixel());
+}
+
+test "push layer accepts a filter with opacity and clip" {
+    const allocator = testing.allocator;
+    var ctx = try RenderContext.init(allocator, 8, 8, RenderSettings.default);
+    defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    var pixmap = try Pixmap.init(allocator, 8, 8);
+    defer pixmap.deinit(allocator);
+
+    const filter = try filter_effects.Filter.fromPrimitive(allocator, .{
+        .flood = .{ .color = peniko.palette.css.GREEN },
+    });
+    const clip = rectElements(kurbo.Rect.new(0.0, 0.0, 4.0, 8.0));
+    try ctx.pushLayer(allocator, &clip, null, 0.5, null, filter);
+    ctx.setPaint(palette.RED);
+    try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 8.0, 8.0));
+    ctx.popLayer();
+    ctx.flush();
+    try ctx.renderWith(&pixmap, &resources, qualitySettings());
+
+    // The flood filter fills the layer with the CSS `green` flood color
+    // (#008000), the clip keeps the left half, and the 0.5 opacity scales the
+    // composited result.
+    const expected = peniko.PremulRgba8{ .r = 0, .g = 64, .b = 0, .a = 128 };
+    try expectPixel(&pixmap, 1, 1, expected);
+    try expectPixel(&pixmap, 6, 1, transparentPixel());
+}
+
+test "multi primitive filter graphs fail with a typed error" {
+    const allocator = testing.allocator;
+    var ctx = try RenderContext.init(allocator, 4, 4, RenderSettings.default);
+    defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    var pixmap = try Pixmap.init(allocator, 4, 4);
+    defer pixmap.deinit(allocator);
+
+    const filter = try filter_effects.Filter.fromPrimitive(allocator, .{
+        .flood = .{ .color = peniko.palette.css.RED },
+    });
+    defer filter.deinit(allocator);
+    _ = try filter.graph.get().add(allocator, .{
+        .gaussian_blur = .{ .std_deviation = 1.0, .edge_mode = .none },
+    }, null);
+
+    ctx.setPaint(palette.BLUE);
+    ctx.setFilterEffect(filter.clone());
+    try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 4.0, 4.0));
+    ctx.resetFilterEffect();
+    ctx.flush();
+    try testing.expectError(
+        error.Unsupported,
+        ctx.renderWith(&pixmap, &resources, qualitySettings()),
+    );
 }
 
 test "reset and resize update the scene size" {

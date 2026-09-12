@@ -52,9 +52,9 @@
 //!    when there is none) and clamped to 1, and `ImageQuality.medium` is
 //!    downgraded to `.low` for integer-only translations.
 //! 7. **Blurred rounded rectangles**: `EncodedBlurredRoundedRectangle` is
-//!    declared with upstream's fields but its encoder returns
-//!    `error.Unsupported`; the algorithm belongs to the filters/BRR work
-//!    (M2-later) and no field is faked.
+//!    declared with upstream's fields and encoded by
+//!    `encodeBlurredRoundedRectangle` (the `EncodeExt` implementation);
+//!    the fine-side painter lives in `cpu/fine/blurred_rect.zig`.
 //! 8. `EncodedPaint.mayHaveTransparency` and the `Paint`-level query are
 //!    ported; the transparent-source path works for images whose pixels are
 //!    resolved later through `NoOpImageResolver`, because the flag comes from
@@ -691,23 +691,86 @@ pub const EncodedBlurredRoundedRectangle = struct {
 };
 
 /// Upstream `EncodeExt for BlurredRoundedRectangle`.
-///
-/// Deferred to the filters/BRR work (M2-later). The upstream implementation
-/// computes exponent/scale/min-edge fields from `compute_erf7` and the blur
-/// std-dev; this port refuses to guess any of them and fails explicitly.
 pub fn encodeBlurredRoundedRectangle(
-    rect: *const BlurredRoundedRectangle,
+    blurred: *const BlurredRoundedRectangle,
     allocator: std.mem.Allocator,
     paints: *std.ArrayList(EncodedPaint),
-    transform: Affine,
+    transform_in: Affine,
     tint: ?Tint,
 ) Error!Paint {
-    _ = rect;
-    _ = allocator;
-    _ = paints;
-    _ = transform;
+    // Upstream ignores the tint for blurred rounded rectangles.
     _ = tint;
-    return error.Unsupported;
+
+    const rect = blk: {
+        // Ensure the rectangle has positive width/height.
+        var rect = blurred.rect;
+        if (rect.x0 > rect.x1) std.mem.swap(f64, &rect.x0, &rect.x1);
+        if (rect.y0 > rect.y1) std.mem.swap(f64, &rect.y0, &rect.y1);
+        break :blk rect;
+    };
+
+    const transform = Affine.translate(Vec2.new(-rect.x0, -rect.y0))
+        .compose(transform_in.inverse());
+    const advances = xYAdvances(transform);
+
+    const width: f32 = @floatCast(rect.width());
+    const height: f32 = @floatCast(rect.height());
+    const radius = @min(blurred.radius, 0.5 * @min(width, height));
+
+    // To avoid a divide by 0; potentially should be a bigger number for
+    // antialiasing.
+    const std_dev = @max(blurred.std_dev, 1e-6);
+
+    const min_edge = @min(width, height);
+    const rmax = 0.5 * min_edge;
+    const r0 = @min(hypotF32(radius, std_dev * 1.15), rmax);
+    const r1 = @min(hypotF32(radius, std_dev * 2.0), rmax);
+
+    const exponent = 2.0 * r1 / r0;
+
+    const std_dev_inv = 1.0 / std_dev;
+
+    // Pull in the long end (make less eccentric).
+    const delta = 1.25 * std_dev *
+        (@exp(-squareF32(0.5 * std_dev_inv * width)) -
+            @exp(-squareF32(0.5 * std_dev_inv * height)));
+    const w = width + @min(delta, 0.0);
+    const h = height - @max(delta, 0.0);
+
+    const recip_exponent = 1.0 / exponent;
+    const scale = 0.5 * math.computeErf7(std_dev_inv * 0.5 * (@max(w, h) - 0.5 * radius));
+
+    const encoded = EncodedBlurredRoundedRectangle{
+        .exponent = exponent,
+        .recip_exponent = recip_exponent,
+        .width = width,
+        .height = height,
+        .scale = scale,
+        .r1 = r1,
+        .std_dev_inv = std_dev_inv,
+        .min_edge = min_edge,
+        .invert = blurred.invert,
+        .color = PremulColor.fromAlphaColor(blurred.color),
+        .w = w,
+        .h = h,
+        .transform = transform,
+        .x_advance = advances.x_advance,
+        .y_advance = advances.y_advance,
+    };
+
+    const idx = paints.items.len;
+    const indexed = try IndexedPaint.new(idx);
+    try paints.append(allocator, .{ .blurred_rounded_rect = encoded });
+    return .{ .indexed = indexed };
+}
+
+/// `x.hypot(y)` for f32.
+fn hypotF32(x: f32, y: f32) f32 {
+    return std.math.hypot(x, y);
+}
+
+fn squareF32(x: f32) f32 {
+    return x * x;
 }
 
 // ---------------------------------------------------------------------------
@@ -2167,10 +2230,10 @@ test "image source resolved through a no-op resolver keeps its transparency hint
     try testing.expect(paints.items[1].image.may_have_transparency);
 }
 
-test "blurred rounded rectangle encoder is unsupported" {
+test "blurred rounded rectangle encoder produces a paint" {
     const allocator = testing.allocator;
     var paints: std.ArrayList(EncodedPaint) = .empty;
-    defer paints.deinit(allocator);
+    defer drainPaints(&paints, allocator);
 
     const rect = BlurredRoundedRectangle{
         .rect = kurbo.Rect.new(0.0, 0.0, 10.0, 10.0),
@@ -2179,11 +2242,39 @@ test "blurred rounded rectangle encoder is unsupported" {
         .std_dev = 1.0,
         .invert = false,
     };
-    try testing.expectError(
-        error.Unsupported,
-        encodeInto(rect, allocator, &paints, Affine.IDENTITY, null),
-    );
-    try testing.expectEqual(@as(usize, 0), paints.items.len);
+    _ = try encodeInto(rect, allocator, &paints, Affine.IDENTITY, null);
+
+    try testing.expectEqual(@as(usize, 1), paints.items.len);
+    try testing.expectEqual(std.meta.Tag(EncodedPaint).blurred_rounded_rect, std.meta.activeTag(paints.items[0]));
+    const encoded = paints.items[0].blurred_rounded_rect;
+    try testing.expectEqual(@as(f32, 10.0), encoded.width);
+    try testing.expectEqual(@as(f32, 10.0), encoded.height);
+    try testing.expectEqual(@as(f32, 10.0), encoded.min_edge);
+    try testing.expect(@abs(encoded.r1 - 2.8284271) < 1e-5);
+    try testing.expect(encoded.exponent > 0.0);
+    try testing.expect(@abs(encoded.recip_exponent * encoded.exponent - 1.0) < 1e-5);
+    try testing.expect(!encoded.invert);
+}
+
+test "blurred rounded rectangle encoder mirrors negative rects and reports transparency" {
+    const allocator = testing.allocator;
+    var paints: std.ArrayList(EncodedPaint) = .empty;
+    defer drainPaints(&paints, allocator);
+
+    // A reversed rectangle is normalized before encoding.
+    const rect = BlurredRoundedRectangle{
+        .rect = kurbo.Rect.new(10.0, 10.0, 0.0, 0.0),
+        .color = peniko.palette.css.RED,
+        .radius = 2.0,
+        .std_dev = 1.0,
+        .invert = true,
+    };
+    const paint = try encodeInto(rect, allocator, &paints, Affine.IDENTITY, null);
+    const encoded = paints.items[0].blurred_rounded_rect;
+    try testing.expectEqual(@as(f32, 10.0), encoded.width);
+    try testing.expect(encoded.invert);
+    try testing.expect(paints.items[0].mayHaveTransparency());
+    try testing.expectEqual(@as(usize, 0), paint.indexed.index());
 }
 
 test "encodeInto dispatches by value and by pointer" {

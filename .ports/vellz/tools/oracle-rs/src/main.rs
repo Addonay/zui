@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use vello_cpu::color::{AlphaColor, Srgb};
+use vello_cpu::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_cpu::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke};
 use vello_cpu::peniko::{
     BlendMode, ColorStop, ColorStops, Compose, Extend, Fill, Gradient, ImageAlphaType,
@@ -106,6 +107,14 @@ enum Command {
     StrokeRect {
         rect: [f64; 4],
     },
+    /// Analytic blurred rounded rectangle (inset shadow when `invert`).
+    FillBlurredRoundedRect {
+        rect: [f64; 4],
+        radius: f32,
+        std_dev: f32,
+        #[serde(default)]
+        invert: bool,
+    },
     FillPath {
         path: String,
     },
@@ -122,6 +131,10 @@ enum Command {
     /// Generic layer: clip, blend, opacity or mask.
     PushLayer(LayerSpec),
     PopLayer,
+    /// Set a paint-level filter; wraps each subsequent draw in a filter layer.
+    SetFilterEffect { filter: FilterSpec },
+    /// Clear the paint-level filter.
+    ResetFilterEffect,
     Reset,
 }
 
@@ -206,6 +219,72 @@ enum LayerSpec {
     Blend { blend: BlendSpec },
     Opacity { opacity: f32 },
     Mask { mask: MaskSpec },
+    Filter {
+        filter: FilterSpec,
+        #[serde(default)]
+        clip: Option<String>,
+        #[serde(default)]
+        blend: Option<BlendSpec>,
+        #[serde(default)]
+        opacity: Option<f32>,
+        #[serde(default)]
+        mask: Option<MaskSpec>,
+    },
+}
+
+/// A single-primitive filter (upstream supports no other graphs yet).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum FilterSpec {
+    Flood {
+        rgba8: [u8; 4],
+    },
+    GaussianBlur {
+        std_deviation: f32,
+        #[serde(default)]
+        edge_mode: EdgeModeSpec,
+    },
+    Offset {
+        dx: f32,
+        dy: f32,
+    },
+    DropShadow {
+        dx: f32,
+        dy: f32,
+        std_deviation: f32,
+        rgba8: [u8; 4],
+        #[serde(default)]
+        edge_mode: EdgeModeSpec,
+    },
+    DropShadowOnly {
+        dx: f32,
+        dy: f32,
+        std_deviation: f32,
+        rgba8: [u8; 4],
+        #[serde(default)]
+        edge_mode: EdgeModeSpec,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EdgeModeSpec {
+    Duplicate,
+    Wrap,
+    Mirror,
+    #[default]
+    None,
+}
+
+impl From<EdgeModeSpec> for EdgeMode {
+    fn from(spec: EdgeModeSpec) -> Self {
+        match spec {
+            EdgeModeSpec::Duplicate => Self::Duplicate,
+            EdgeModeSpec::Wrap => Self::Wrap,
+            EdgeModeSpec::Mirror => Self::Mirror,
+            EdgeModeSpec::None => Self::None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -507,6 +586,19 @@ fn run() -> Result<(), String> {
             Command::StrokeRect { rect } => {
                 ctx.stroke_rect(&Rect::new(rect[0], rect[1], rect[2], rect[3]));
             }
+            Command::FillBlurredRoundedRect {
+                rect,
+                radius,
+                std_dev,
+                invert,
+            } => {
+                ctx.fill_blurred_rounded_rect(
+                    &Rect::new(rect[0], rect[1], rect[2], rect[3]),
+                    *radius,
+                    *std_dev,
+                    *invert,
+                );
+            }
             Command::FillPath { path } => ctx.fill_path(&parse_path(path)),
             Command::StrokePath { path } => ctx.stroke_path(&parse_path(path)),
             Command::PushClipPath { path } => ctx.push_clip_path(&parse_path(path)),
@@ -534,8 +626,34 @@ fn run() -> Result<(), String> {
                     let mask = load_mask(mask, scene_dir, scene.width, scene.height)?;
                     ctx.push_layer(None, None, None, Some(mask), None);
                 }
+                LayerSpec::Filter {
+                    filter,
+                    clip,
+                    blend,
+                    opacity,
+                    mask,
+                } => {
+                    let clip_path = clip.as_deref().map(parse_path);
+                    let blend = blend.as_ref().map(|blend| BlendMode {
+                        mix: blend.mix.into(),
+                        compose: blend.compose.into(),
+                    });
+                    let mask = mask
+                        .as_ref()
+                        .map(|mask| load_mask(mask, scene_dir, scene.width, scene.height))
+                        .transpose()?;
+                    ctx.push_layer(
+                        clip_path.as_ref(),
+                        blend,
+                        *opacity,
+                        mask,
+                        Some(build_filter(filter)),
+                    );
+                }
             },
             Command::PopLayer => ctx.pop_layer(),
+            Command::SetFilterEffect { filter } => ctx.set_filter_effect(build_filter(filter)),
+            Command::ResetFilterEffect => ctx.reset_filter_effect(),
             Command::Reset => ctx.reset(),
         }
     }
@@ -609,6 +727,55 @@ fn build_paint(spec: &PaintSpec, scene_dir: &Path) -> Result<PaintType, String> 
     }
     let image = spec.image.as_ref().expect("checked above");
     Ok(load_image(image, scene_dir)?.into())
+}
+
+/// Builds a single-primitive filter from a scene spec.
+fn build_filter(spec: &FilterSpec) -> Filter {
+    fn color(rgba8: &[u8; 4]) -> AlphaColor<Srgb> {
+        AlphaColor::<Srgb>::from_rgba8(rgba8[0], rgba8[1], rgba8[2], rgba8[3])
+    }
+
+    let primitive = match spec {
+        FilterSpec::Flood { rgba8 } => FilterPrimitive::Flood { color: color(rgba8) },
+        FilterSpec::GaussianBlur {
+            std_deviation,
+            edge_mode,
+        } => FilterPrimitive::GaussianBlur {
+            std_deviation: *std_deviation,
+            edge_mode: (*edge_mode).into(),
+        },
+        FilterSpec::Offset { dx, dy } => FilterPrimitive::Offset {
+            dx: *dx,
+            dy: *dy,
+        },
+        FilterSpec::DropShadow {
+            dx,
+            dy,
+            std_deviation,
+            rgba8,
+            edge_mode,
+        } => FilterPrimitive::DropShadow {
+            dx: *dx,
+            dy: *dy,
+            std_deviation: *std_deviation,
+            color: color(rgba8),
+            edge_mode: (*edge_mode).into(),
+        },
+        FilterSpec::DropShadowOnly {
+            dx,
+            dy,
+            std_deviation,
+            rgba8,
+            edge_mode,
+        } => FilterPrimitive::DropShadowOnly {
+            dx: *dx,
+            dy: *dy,
+            std_deviation: *std_deviation,
+            color: color(rgba8),
+            edge_mode: (*edge_mode).into(),
+        },
+    };
+    Filter::from_primitive(primitive)
 }
 
 fn build_gradient(spec: &GradientSpec) -> Result<Gradient, String> {

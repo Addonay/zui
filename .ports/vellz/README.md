@@ -18,30 +18,34 @@ package (wgpu-native `v29.0.1.1`) rather than re-binding the C API locally.
 
 ## Status
 
-**Milestone 1 complete (G1 met 2026-09-11); Milestone 2 CPU features
-oracle-verified.** The CPU renderer produces premultiplied RGBA8 pixels through
-the full upstream pipeline (path encoding → flatten → tiles → sparse strips →
-coarse bucketing → f32 fine rasterization) and every scene in the shared
-corpus — solid fills, strokes, gradients, images, layers, and masks — is
-**byte-exact against the pinned upstream oracle** (`tolerance=0`, all four
-channels) in Debug, ReleaseSafe, and ReleaseFast:
+**Milestones 1 and 2 complete (G1 and G2 met 2026-09-12).** The CPU renderer
+produces premultiplied RGBA8 pixels through the full upstream pipeline (path
+encoding → flatten → tiles → sparse strips → coarse bucketing → fine
+rasterization) and every scene in the shared corpus — solid fills, strokes,
+gradients, images, layers, masks, filter layers, and blurred rounded
+rectangles — is **byte-exact against the pinned upstream oracle**
+(`tolerance=0`, all four channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 547/547 unit and integration tests
-zig build corpus   # 22/22 corpus scenes byte-exact vs the upstream oracle
+zig build test     # 589/589 unit and integration tests
+zig build corpus   # 32/32 corpus scenes byte-exact vs the upstream oracle
 ```
 
 Coverage: antialiased fills, translucent overlap, NonZero/EvenOdd, nested
 clips and isolated clip layers, transforms, round-capped strokes, degenerate
 and empty scenes, tile seams, wide curvature at 128×128, linear/radial/sweep
 gradients with LUT/repeat extend, nearest/bilinear image sampling with
-reflect, opacity and multiply-blend layers, and alpha/luminance masks.
+reflect, opacity and multiply-blend layers, alpha/luminance masks, filter
+layers (flood, offset, gaussian blur, drop shadow and shadow-only, composed
+with clip/opacity/blend), and analytic blurred rounded rectangles (normal and
+inverted). The imported upstream `probe.rgba` fixture is also byte-exact
+(tolerance policy 3, measured difference 0).
 
-Not yet implemented (explicit errors, never placeholder pixels): filter
-layers (gaussian blur, drop shadow, flood, offset), blurred rounded
-rectangles, and u8-speed rasterization on the CPU; multithreading; glyph
-rendering; the GPU backend. See [`plan.md`](plan.md) for the ledgers and
-milestones.
+Not yet on `main` (verified on integration branches, pending merge):
+u8-speed rasterization (`optimize_speed`, 16 extra corpus scenes) and
+multithreaded dispatch (byte-identical at 1–4 threads). Still to implement:
+glyph rendering and the GPU backend. See [`plan.md`](plan.md) for the ledgers
+and milestones.
 
 ## Layout
 

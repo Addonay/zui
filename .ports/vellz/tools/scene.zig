@@ -32,6 +32,45 @@ pub const ImageFormat = enum { rgba8, bgra8 };
 pub const ImageAlphaType = enum { alpha, premultiplied };
 pub const MaskKind = enum { alpha, luminance };
 
+/// Filter edge handling for out-of-bounds sampling.
+pub const EdgeMode = enum { duplicate, wrap, mirror, none };
+
+pub const DropShadowSpec = struct {
+    dx: f64,
+    dy: f64,
+    std_deviation: f64,
+    rgba8: [4]u8,
+    edge_mode: EdgeMode,
+};
+
+/// One variant of [`FilterSpec`]; exactly one key is present in the JSON.
+///
+/// `vello_common`/`vello_cpu` currently support single-primitive filter graphs
+/// only; a scene that needs a compound effect uses `drop_shadow` /
+/// `drop_shadow_only`.
+pub const FilterSpec = union(enum) {
+    flood: [4]u8,
+    gaussian_blur: struct {
+        std_deviation: f64,
+        edge_mode: EdgeMode,
+    },
+    offset: struct {
+        dx: f64,
+        dy: f64,
+    },
+    drop_shadow: DropShadowSpec,
+    drop_shadow_only: DropShadowSpec,
+};
+
+/// A `push_layer` with a filter plus the optional regular layer properties.
+pub const FilterLayerSpec = struct {
+    filter: FilterSpec,
+    clip: ?[]const u8 = null,
+    blend: ?BlendSpec = null,
+    opacity: ?f64 = null,
+    mask: ?MaskSpec = null,
+};
+
 /// peniko's `Mix` compositing functions.
 pub const Mix = enum {
     normal,
@@ -143,6 +182,7 @@ pub const LayerSpec = union(enum) {
     blend: BlendSpec,
     opacity: f64,
     mask: MaskSpec,
+    filter: FilterLayerSpec,
 };
 
 pub const StrokeSpec = struct {
@@ -153,6 +193,13 @@ pub const StrokeSpec = struct {
     miter_limit: ?f64 = null,
     dash: ?[]const f64 = null,
     dash_offset: f64 = 0,
+};
+
+pub const BlurredRoundedRectSpec = struct {
+    rect: [4]f64,
+    radius: f64,
+    std_dev: f64,
+    invert: bool = false,
 };
 
 pub const Command = union(enum) {
@@ -166,6 +213,7 @@ pub const Command = union(enum) {
     set_aliasing_threshold: ?u8,
     fill_rect: [4]f64,
     stroke_rect: [4]f64,
+    fill_blurred_rounded_rect: BlurredRoundedRectSpec,
     fill_path: []const u8,
     stroke_path: []const u8,
     push_clip_path: []const u8,
@@ -173,6 +221,8 @@ pub const Command = union(enum) {
     push_clip_layer: []const u8,
     push_layer: LayerSpec,
     pop_layer,
+    set_filter_effect: FilterSpec,
+    reset_filter_effect,
     reset,
 };
 
@@ -311,6 +361,17 @@ fn parseCommand(alloc: std.mem.Allocator, value: std.json.Value) ParseError!Comm
     }
     if (std.mem.eql(u8, op, "fill_rect")) return .{ .fill_rect = try rectField(obj) };
     if (std.mem.eql(u8, op, "stroke_rect")) return .{ .stroke_rect = try rectField(obj) };
+    if (std.mem.eql(u8, op, "fill_blurred_rounded_rect")) {
+        return .{ .fill_blurred_rounded_rect = .{
+            .rect = try rectField(obj),
+            .radius = try floatField(obj, "radius"),
+            .std_dev = try floatField(obj, "std_dev"),
+            .invert = if (obj.get("invert")) |invert_value| switch (invert_value) {
+                .bool => |b| b,
+                else => return error.InvalidScene,
+            } else false,
+        } };
+    }
     if (std.mem.eql(u8, op, "fill_path")) return .{ .fill_path = try pathField(alloc, obj) };
     if (std.mem.eql(u8, op, "stroke_path")) return .{ .stroke_path = try pathField(alloc, obj) };
     if (std.mem.eql(u8, op, "push_clip_path")) return .{ .push_clip_path = try pathField(alloc, obj) };
@@ -318,6 +379,10 @@ fn parseCommand(alloc: std.mem.Allocator, value: std.json.Value) ParseError!Comm
     if (std.mem.eql(u8, op, "push_clip_layer")) return .{ .push_clip_layer = try pathField(alloc, obj) };
     if (std.mem.eql(u8, op, "push_layer")) return .{ .push_layer = try parseLayer(alloc, obj) };
     if (std.mem.eql(u8, op, "pop_layer")) return .pop_layer;
+    if (std.mem.eql(u8, op, "set_filter_effect")) {
+        return .{ .set_filter_effect = try parseFilter(obj.get("filter") orelse return error.InvalidScene) };
+    }
+    if (std.mem.eql(u8, op, "reset_filter_effect")) return .reset_filter_effect;
     if (std.mem.eql(u8, op, "reset")) return .reset;
     return error.InvalidScene;
 }
@@ -436,6 +501,71 @@ fn parseLayer(alloc: std.mem.Allocator, obj: std.json.ObjectMap) ParseError!Laye
     if (std.mem.eql(u8, kind, "mask")) {
         const mask_obj = try objectOf(obj.get("mask") orelse return error.InvalidScene);
         return .{ .mask = try parseMask(alloc, mask_obj) };
+    }
+    if (std.mem.eql(u8, kind, "filter")) {
+        var spec: FilterLayerSpec = .{
+            .filter = try parseFilter(obj.get("filter") orelse return error.InvalidScene),
+        };
+        if (obj.get("clip")) |v| {
+            const s = stringOf(v) orelse return error.InvalidScene;
+            spec.clip = alloc.dupe(u8, s) catch return error.OutOfMemory;
+        }
+        if (obj.get("blend")) |v| {
+            const blend_obj = try objectOf(v);
+            spec.blend = .{
+                .mix = try enumField(Mix, blend_obj, "mix"),
+                .compose = try enumField(Compose, blend_obj, "compose"),
+            };
+        }
+        if (obj.get("opacity")) |v| {
+            spec.opacity = switch (v) {
+                .float => |f| f,
+                .integer => |i| @floatFromInt(i),
+                else => return error.InvalidScene,
+            };
+        }
+        if (obj.get("mask")) |v| {
+            const mask_obj = try objectOf(v);
+            spec.mask = try parseMask(alloc, mask_obj);
+        }
+        return .{ .filter = spec };
+    }
+    return error.InvalidScene;
+}
+
+/// Parses a filter primitive. Exactly one of the `kind` variants is expected.
+fn parseFilter(value: std.json.Value) ParseError!FilterSpec {
+    const obj = try objectOf(value);
+    const kind = stringOf(obj.get("kind") orelse return error.InvalidScene) orelse
+        return error.InvalidScene;
+
+    if (std.mem.eql(u8, kind, "flood")) {
+        return .{ .flood = try rgba8Field(obj) };
+    }
+    if (std.mem.eql(u8, kind, "gaussian_blur")) {
+        return .{ .gaussian_blur = .{
+            .std_deviation = try floatField(obj, "std_deviation"),
+            .edge_mode = try enumField(EdgeMode, obj, "edge_mode"),
+        } };
+    }
+    if (std.mem.eql(u8, kind, "offset")) {
+        return .{ .offset = .{
+            .dx = try floatField(obj, "dx"),
+            .dy = try floatField(obj, "dy"),
+        } };
+    }
+    if (std.mem.eql(u8, kind, "drop_shadow") or std.mem.eql(u8, kind, "drop_shadow_only")) {
+        const shadow = DropShadowSpec{
+            .dx = try floatField(obj, "dx"),
+            .dy = try floatField(obj, "dy"),
+            .std_deviation = try floatField(obj, "std_deviation"),
+            .rgba8 = try rgba8Field(obj),
+            .edge_mode = try enumField(EdgeMode, obj, "edge_mode"),
+        };
+        return if (std.mem.eql(u8, kind, "drop_shadow"))
+            .{ .drop_shadow = shadow }
+        else
+            .{ .drop_shadow_only = shadow };
     }
     return error.InvalidScene;
 }
@@ -628,7 +758,7 @@ test "parse every corpus scene" {
         try std_testing.expect(parsed.scene.height > 0);
         count += 1;
     }
-    try std_testing.expect(count >= 22);
+    try std_testing.expect(count >= 30);
 }
 
 test "commands parse with expected variants" {
@@ -827,6 +957,59 @@ test "milestone 2 layer and mask scenes parse with expected kinds" {
     }
 }
 
+test "milestone 2 filter scenes parse with expected kinds" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    {
+        var parsed = try parseSceneFile(alloc, io, "filter_flood_64.json");
+        defer parsed.deinit();
+        const spec = parsed.scene.commands[2].set_filter_effect;
+        try std.testing.expectEqual([4]u8{ 30, 140, 220, 180 }, spec.flood);
+        try std.testing.expectEqual(@as(usize, 6), parsed.scene.commands.len);
+        try std.testing.expectEqual(std.meta.Tag(Command).reset_filter_effect, std.meta.activeTag(parsed.scene.commands[5]));
+    }
+    {
+        var parsed = try parseSceneFile(alloc, io, "filter_offset_64.json");
+        defer parsed.deinit();
+        const spec = parsed.scene.commands[2].set_filter_effect.offset;
+        try std.testing.expectEqual(@as(f64, 8.5), spec.dx);
+        try std.testing.expectEqual(@as(f64, -4.0), spec.dy);
+    }
+    {
+        var parsed = try parseSceneFile(alloc, io, "filter_gaussian_blur_64.json");
+        defer parsed.deinit();
+        const spec = parsed.scene.commands[2].set_filter_effect.gaussian_blur;
+        try std.testing.expectEqual(@as(f64, 3.0), spec.std_deviation);
+        try std.testing.expectEqual(EdgeMode.duplicate, spec.edge_mode);
+    }
+    {
+        var parsed = try parseSceneFile(alloc, io, "filter_drop_shadow_64.json");
+        defer parsed.deinit();
+        const spec = parsed.scene.commands[2].set_filter_effect.drop_shadow;
+        try std.testing.expectEqual(@as(f64, 6.0), spec.dx);
+        try std.testing.expectEqual(@as(f64, 2.0), spec.std_deviation);
+        try std.testing.expectEqual([4]u8{ 20, 30, 90, 200 }, spec.rgba8);
+        try std.testing.expectEqual(EdgeMode.duplicate, spec.edge_mode);
+    }
+    {
+        var parsed = try parseSceneFile(alloc, io, "filter_drop_shadow_only_64.json");
+        defer parsed.deinit();
+        const spec = parsed.scene.commands[2].set_filter_effect.drop_shadow_only;
+        try std.testing.expectEqual([4]u8{ 20, 30, 90, 200 }, spec.rgba8);
+    }
+    {
+        var parsed = try parseSceneFile(alloc, io, "filter_layer_clip_opacity_64.json");
+        defer parsed.deinit();
+        const spec = parsed.scene.commands[2].push_layer.filter;
+        try std.testing.expectEqual([4]u8{ 30, 140, 220, 200 }, spec.filter.flood);
+        try std.testing.expectEqual(@as(f64, 0.75), spec.opacity.?);
+        try std.testing.expectEqual(Mix.multiply, spec.blend.?.mix);
+        try std.testing.expectEqual(Compose.src_over, spec.blend.?.compose);
+        try std.testing.expect(spec.clip != null);
+    }
+}
+
 test "invalid scenes are rejected" {
     try std.testing.expectError(error.InvalidScene, parse(std.testing.allocator, "{}"));
     try std.testing.expectError(
@@ -874,11 +1057,20 @@ test "invalid scenes are rejected" {
             "{\"version\":1,\"width\":1,\"height\":1,\"commands\":[{\"op\":\"set_paint\",\"image\":{\"asset\":\"a.rgba\",\"width\":1,\"height\":1,\"format\":\"rgba8\",\"alpha_type\":\"alpha\",\"sampler\":{\"x_extend\":\"pad\",\"y_extend\":\"pad\",\"quality\":\"ultra\",\"alpha\":1.0}}}]}",
         ),
     );
+    // A filter layer without a `filter` payload is rejected.
     try std.testing.expectError(
         error.InvalidScene,
         parse(
             std.testing.allocator,
             "{\"version\":1,\"width\":1,\"height\":1,\"commands\":[{\"op\":\"push_layer\",\"kind\":\"filter\"}]}",
+        ),
+    );
+    // Unknown filter kinds are rejected.
+    try std.testing.expectError(
+        error.InvalidScene,
+        parse(
+            std.testing.allocator,
+            "{\"version\":1,\"width\":1,\"height\":1,\"commands\":[{\"op\":\"set_filter_effect\",\"filter\":{\"kind\":\"convolve\"}}]}",
         ),
     );
     try std.testing.expectError(

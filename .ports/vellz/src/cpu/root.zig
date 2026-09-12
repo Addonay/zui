@@ -9,10 +9,12 @@
 //!   `RenderSettings`, `RasterizerSettings`, `TargetInit`); a leaf module so
 //!   the dispatcher can name them without an import cycle
 //! - `coarse/`         <- `coarse/` (`cmd`, `depth`, `bucketer`)
-//! - `filter.zig`      <- `filter/context.rs` (M1 empty-context seam)
+//! - `filter.zig`      <- `filter/` (`context.rs`, `flood.rs`,
+//!   `gaussian_blur.rs`, `drop_shadow.rs`, `offset.rs`, `shift.rs`, and the
+//!   `FilterEffect` dispatch)
 //! - `dispatch/single_threaded.zig` <- `dispatch/single_threaded.rs`
 //! - `fine/`           <- `fine/` (`Fine(K)`, `rasterizeRegion`,
-//!   `highp.F32Kernel`)
+//!   `highp.F32Kernel`, `common/rounded_blurred_rect.rs`)
 //! - `render.zig`      <- `render.rs` (`RenderContext`, `Resources`, and the
 //!   re-exported settings types)
 
@@ -55,5 +57,6 @@ test {
     _ = @import("coarse/depth.zig");
     _ = @import("dispatch/single_threaded.zig");
     _ = @import("fine/mod.zig");
+    _ = @import("fine/blurred_rect.zig");
     _ = @import("render.zig");
 }

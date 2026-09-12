@@ -125,6 +125,13 @@ fn renderScene(
             .set_aliasing_threshold => |threshold| ctx.setAliasingThreshold(threshold),
             .fill_rect => |r| try ctx.fillRect(allocator, kurbo.Rect.new(r[0], r[1], r[2], r[3])),
             .stroke_rect => |r| try ctx.strokeRect(allocator, kurbo.Rect.new(r[0], r[1], r[2], r[3])),
+            .fill_blurred_rounded_rect => |spec| try ctx.fillBlurredRoundedRect(
+                allocator,
+                kurbo.Rect.new(spec.rect[0], spec.rect[1], spec.rect[2], spec.rect[3]),
+                @floatCast(spec.radius),
+                @floatCast(spec.std_dev),
+                spec.invert,
+            ),
             .fill_path => |svg| try fillPath(&ctx, allocator, &scratch_path, svg),
             .stroke_path => |svg| try strokePath(&ctx, allocator, &scratch_path, svg),
             .push_clip_path => |svg| try clipPath(&ctx, allocator, &scratch_path, svg),
@@ -132,6 +139,11 @@ fn renderScene(
             .push_clip_layer => |svg| try clipLayer(&ctx, allocator, &scratch_path, svg),
             .push_layer => |spec| try pushLayerSpec(&ctx, allocator, io, scene_dir, &scratch_path, spec),
             .pop_layer => ctx.popLayer(),
+            .set_filter_effect => |spec| {
+                const filter = try buildFilter(allocator, spec);
+                ctx.setFilterEffect(filter);
+            },
+            .reset_filter_effect => ctx.resetFilterEffect(),
             .reset => ctx.reset(),
         }
     }
@@ -307,31 +319,123 @@ fn pushLayerSpec(
         },
         .opacity => |opacity| try ctx.pushOpacityLayer(@floatCast(opacity)),
         .mask => |mask_spec| {
-            var source = try loadRawPixmap(
+            const mask = try loadMask(
                 allocator,
                 io,
                 scene_dir,
-                mask_spec.asset,
-                mask_spec.width,
-                mask_spec.height,
-                mask_spec.format,
-                mask_spec.alpha_type,
+                mask_spec,
+                ctx.width(),
+                ctx.height(),
             );
-            defer source.deinit(allocator);
-
-            // `vello_cpu` ignores masks whose size differs from the context,
-            // so bring assets to the scene size with the oracle's exact
-            // nearest-neighbor rule.
-            var resampled = try resizeNearest(allocator, &source, ctx.width(), ctx.height());
-            defer resampled.deinit(allocator);
-
-            const mask = switch (mask_spec.kind) {
-                .alpha => try vellz.common.mask.Mask.newAlpha(allocator, &resampled),
-                .luminance => try vellz.common.mask.Mask.newLuminance(allocator, &resampled),
-            };
             try ctx.pushMaskLayer(allocator, mask);
         },
+        .filter => |filter_spec| {
+            const filter = try buildFilter(allocator, filter_spec.filter);
+
+            var clip_elements: ?[]const kurbo.PathEl = null;
+            if (filter_spec.clip) |svg| {
+                scratch.* = kurbo.bezpath.fromSvg(allocator, svg) catch return error.InvalidPath;
+                clip_elements = scratch.elements.items;
+            }
+            defer {
+                if (filter_spec.clip != null) {
+                    scratch.deinit(allocator);
+                    scratch.* = kurbo.BezPath.init();
+                }
+            }
+
+            const blend: ?peniko.BlendMode = if (filter_spec.blend) |blend| .{
+                .mix = std.meta.stringToEnum(peniko.Mix, @tagName(blend.mix)).?,
+                .compose = std.meta.stringToEnum(peniko.Compose, @tagName(blend.compose)).?,
+            } else null;
+            const opacity: ?f32 = if (filter_spec.opacity) |value| @floatCast(value) else null;
+            const mask: ?vellz.common.mask.Mask = if (filter_spec.mask) |mask_spec|
+                try loadMask(allocator, io, scene_dir, mask_spec, ctx.width(), ctx.height())
+            else
+                null;
+
+            try ctx.pushLayer(allocator, clip_elements, blend, opacity, mask, filter);
+        },
     }
+}
+
+/// Loads a mask asset and resamples it to the scene size.
+///
+/// `vello_cpu` ignores masks whose size differs from the context, so assets
+/// are brought to the scene size with the oracle's exact nearest-neighbor
+/// rule.
+fn loadMask(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scene_dir: []const u8,
+    mask_spec: scene_mod.MaskSpec,
+    width: u16,
+    height: u16,
+) !vellz.common.mask.Mask {
+    var source = try loadRawPixmap(
+        allocator,
+        io,
+        scene_dir,
+        mask_spec.asset,
+        mask_spec.width,
+        mask_spec.height,
+        mask_spec.format,
+        mask_spec.alpha_type,
+    );
+    defer source.deinit(allocator);
+
+    var resampled = try resizeNearest(allocator, &source, width, height);
+    defer resampled.deinit(allocator);
+
+    return switch (mask_spec.kind) {
+        .alpha => try vellz.common.mask.Mask.newAlpha(allocator, &resampled),
+        .luminance => try vellz.common.mask.Mask.newLuminance(allocator, &resampled),
+    };
+}
+
+/// Builds a single-primitive filter from a scene spec.
+fn buildFilter(
+    allocator: std.mem.Allocator,
+    spec: scene_mod.FilterSpec,
+) !vellz.common.filter_effects.Filter {
+    const fe = vellz.common.filter_effects;
+    const toColor = struct {
+        fn call(rgba: [4]u8) peniko.Color {
+            return peniko.color.Color.fromRgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
+        }
+    }.call;
+    const toEdgeMode = struct {
+        fn call(mode: scene_mod.EdgeMode) fe.EdgeMode {
+            return std.meta.stringToEnum(fe.EdgeMode, @tagName(mode)).?;
+        }
+    }.call;
+
+    const primitive: fe.FilterPrimitive = switch (spec) {
+        .flood => |rgba| .{ .flood = .{ .color = toColor(rgba) } },
+        .gaussian_blur => |blur| .{ .gaussian_blur = .{
+            .std_deviation = @floatCast(blur.std_deviation),
+            .edge_mode = toEdgeMode(blur.edge_mode),
+        } },
+        .offset => |offset| .{ .offset = .{
+            .dx = @floatCast(offset.dx),
+            .dy = @floatCast(offset.dy),
+        } },
+        .drop_shadow => |shadow| .{ .drop_shadow = .{
+            .dx = @floatCast(shadow.dx),
+            .dy = @floatCast(shadow.dy),
+            .std_deviation = @floatCast(shadow.std_deviation),
+            .color = toColor(shadow.rgba8),
+            .edge_mode = toEdgeMode(shadow.edge_mode),
+        } },
+        .drop_shadow_only => |shadow| .{ .drop_shadow_only = .{
+            .dx = @floatCast(shadow.dx),
+            .dy = @floatCast(shadow.dy),
+            .std_deviation = @floatCast(shadow.std_deviation),
+            .color = toColor(shadow.rgba8),
+            .edge_mode = toEdgeMode(shadow.edge_mode),
+        } },
+    };
+    return fe.Filter.fromPrimitive(allocator, primitive);
 }
 
 fn loadRawPixmap(

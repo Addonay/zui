@@ -173,8 +173,8 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `pixmap.rs` (`Pixmap`, `PixmapMut`, premultiply) | `common/pixmap.zig` | port | connected (CPU targets, image assets); RGBA8 premultiplied sRGB |
 | `mask.rs` | `common/mask.zig` | port | Shared(MaskRepr); 6 tests |
 | `record.rs` (layers/commands) | `common/record.zig` | port | 18 tests (11 upstream), transactional OOM-safe pushes |
-| `filter_effects.rs` + `filter/mod.rs` | `common/filter_effects.zig`, `common/filter.zig` | port (data model) | declaration + expansion math; algorithms deferred to M2 (`PreparedFilter.new` -> `error.Unsupported`); 22 tests |
-| `blurred_rounded_rect.rs` | `common/blurred_rounded_rect.zig` | port (data model) | 1 test; encode deferred to the filter work |
+| `filter_effects.rs` + `filter/mod.rs` | `common/filter_effects.zig`, `common/filter.zig` | port | connected; `PreparedFilter` payloads (flood, gaussian blur, offset, drop shadow) oracle-verified; 22+ tests |
+| `blurred_rounded_rect.rs` | `common/blurred_rounded_rect.zig` | port | 1 test; encode + painter connected and oracle-verified (normal/inverted scenes) |
 | `image_cache.rs`, `multi_atlas.rs` (guillotiere) | `common/atlas.zig` | defer | M3 (glyph atlas), M2 (images) |
 | `target.rs` (`TargetInit`) | `common/target.zig` | port | 1 test; connected via `RasterizerSettings` |
 | `probe.rs`, `pico_svg.rs` | `common/probe.zig` | defer | oracle/dev only |
@@ -195,10 +195,10 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `fine/lowp/*` (u8 kernel) | `cpu/fine/lowp.zig` | defer | M4 speed path |
 | `fine/common/gradient/*` | `cpu/fine/gradient.zig` | port | connected; oracle-verified (linear/radial/sweep/repeat scenes byte-exact) |
 | `fine/common/image.rs` | `cpu/fine/image.zig` | port | connected; oracle-verified (nearest/bilinear scenes byte-exact) |
-| `fine/common/rounded_blurred_rect.rs` | `cpu/fine/blurred_rect.zig` | defer | M2 filter work |
 | `dispatch/single_threaded.rs` | `cpu/dispatch/single_threaded.zig` | port | connected; f32 kernel; u8 kernel explicit `error.Unsupported` (M4) |
 | `dispatch/multi_threaded*.rs` | `cpu/dispatch/multi_threaded.zig` | defer | M4 |
-| `filter/*` | `cpu/filter/*.zig` | defer | M2; upstream limitations recorded |
+| `filter/*` | `cpu/filter/*.zig` | port | connected; oracle-verified (8 filter scenes byte-exact); highp uses upstream's lowp blur/drop-shadow internals; multi-primitive graphs -> `error.Unsupported` |
+| `fine/common/rounded_blurred_rect.rs` | `cpu/fine/blurred_rect.zig` | port | connected; oracle-verified (normal + inverted scenes byte-exact) |
 | `text.rs`, `text_debug.rs` | `cpu/text.zig` | defer | M3 |
 | `util.rs` (`Span`, `div255`, `Premultiply`) | `cpu/util.zig` | port | 6 tests |
 
@@ -416,14 +416,16 @@ of panics, thread ownership).
 
 - Strokes, gradients, images, layers/blending, masks, supported filters,
   upstream fixtures imported with provenance.
-- **Landed and oracle-verified:** strokes, linear/radial/sweep/repeat
-  gradients, nearest/bilinear images, nested opacity and multiply-blend
-  layers, alpha/luminance masks. `zig build corpus` = 22/22 scenes byte-exact
-  (`tolerance=0`, four channels); `zig build test` = 547/547.
-- **Remaining:** filter layers (gaussian blur, drop shadow, flood, offset),
-  blurred rounded rectangles, and the matching scene/oracle support.
-- **Gate:** corpus scenes for each feature pass; error paths and teardown
-  covered by tests (`G2`).
+- **Gate `G2`: MET 2026-09-12.** All 32 corpus scenes are byte-exact
+  (`tolerance=0`, four channels) in Debug, ReleaseSafe, and ReleaseFast: the
+  M1 set plus linear/radial/sweep/repeat gradients, nearest/bilinear images,
+  opacity/multiply layers, alpha/luminance masks, filter layers (flood,
+  offset, gaussian blur, drop shadow and drop-shadow-only, composed with
+  clip/opacity/blend), and analytic blurred rounded rectangles (normal and
+  inverted). `zig build test` = 589/589. Verification commands:
+  `zig build test`, `zig build corpus`.
+- Provenance: the imported upstream `probe.rgba` fixture is byte-exact
+  (tolerance policy 3; measured max channel difference 0).
 
 ### Milestone 3 — Glyph rendering and Cozmic adapter
 
@@ -519,4 +521,18 @@ of panics, thread ownership).
   to the M1 set; `zig build test` 547/547. Remaining for G2: filter layers
   (gaussian blur, drop shadow, flood, offset), blurred rounded rectangles,
   upstream fixture import.
+- 2026-09-12: **M2 complete (G2 met).** Filter layers landed end to end:
+  `vello_common` filter payloads (`PreparedFilter` for flood, gaussian blur,
+  offset, drop shadow/drop-shadow-only), `vello_cpu` algorithms and
+  `FilterContext`/scratch, the bucketer's filter-layer branch and
+  `generate_filter_layer_fill`, dispatcher-side filter-layer rasterization,
+  paint-level `setFilterEffect` layering, and analytic blurred rounded
+  rectangles (`common/pixmap`-level encode + `cpu/fine/blurred_rect.zig`).
+  Ten new scenes (8 filter, 2 blurred rounded rect) were added with
+  deterministically regenerated pinned-oracle fixtures; `zig build corpus` =
+  32/32 byte-exact in Debug/ReleaseSafe/ReleaseFast, `zig build test` =
+  589/589. The upstream `probe.rgba` fixture is byte-exact. Verified on
+  integration branches pending merge into `main`: u8 `optimize_speed`
+  rasterization (16 further scenes byte-exact) and multithreaded dispatch
+  (byte-identical to single-threaded at 1–4 threads).
 

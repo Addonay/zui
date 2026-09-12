@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render the shared corpus with vellz and compare against the pinned oracle
-# fixtures. Gates G1 (foundation) and the landed M2 CPU features; M2 filter
-# scenes are absent until filters land.
+# fixtures. Gates G1 (foundation) and G2 (M2 CPU features, including filter
+# layers and blurred rounded rectangles).
 #
 # Usage:
 #   tools/compare_corpus.sh [--tolerance N] [--jobs N]

@@ -7,26 +7,20 @@
 //!
 //! Scope of this port: solid and indexed (gradient/image) paints, regular
 //! layers (clip/opacity/blend), coarse depth culling of opaque fills, alpha
-//! segments from `fill_gap` handling, viewport origins, and clip bounding
-//! boxes. Deferred features fail with `error.Unsupported` instead of emitting
-//! placeholder pixels:
-//!
-//! - **Filter layers**: `bucketCommands` rejects a recorded
-//!   `RecordedLayerKind.filter` node outright. `FilterContext` (see
-//!   `cpu/filter.zig`) stays empty until M2 filter rasterization lands.
-//! - **Indexed paints** are supported: `generateFill` consults the scene's
-//!   `encoded_paints` through `encode.paintMayHaveTransparency` exactly like
-//!   upstream, so a gradient/image fill disables depth culling when it may be
-//!   translucent.
+//! segments from `fill_gap` handling, viewport origins, clip bounding boxes,
+//! and filter layers. Filter layers are composited by emitting a
+//! `filter_paints` entry (an `EncodedPaint::Image` referencing the rendered
+//! filter pixmap) plus paint-fill commands; the pixmaps themselves are
+//! produced by `cpu/dispatch/single_threaded.zig`.
 //!
 //! Ownership/allocator note (following the repository convention): the
 //! bucketer owns `row_states`, `clip_bboxes`, `active_layers`,
-//! `paint_fill_attrs`, `layer_fill_attrs`, and the row/occupied-row pools. It
-//! takes an explicit allocator on every operation that can grow a buffer
-//! (`init`/`reset`/`bucketCommands`), and `deinit` releases everything.
-//! Masks are borrowed (`?*const Mask`) exactly like `cpu/record.zig` and
-//! `cpu/coarse/cmd.zig`: the recorded layer graph and the mask owner must
-//! outlive bucketing and rasterization.
+//! `paint_fill_attrs`, `layer_fill_attrs`, `filter_paints`, and the
+//! row/occupied-row pools. It takes an explicit allocator on every operation
+//! that can grow a buffer (`init`/`reset`/`bucketCommands`) and `deinit`
+//! releases everything. Masks are borrowed (`?*const Mask`) exactly like
+//! `cpu/record.zig` and `cpu/coarse/cmd.zig`; `filter_paints` entries own a
+//! shared `Pixmap` handle each (upstream stores an `Arc<Pixmap>`).
 //!
 //! Error policy: allocation failure propagates as `error.OutOfMemory` and
 //! leaves the bucketer in a defined state (partial rows are valid; `reset`
@@ -39,9 +33,12 @@ const record = @import("../../common/record.zig");
 const cpu_record = @import("../record.zig");
 const geometry = @import("../../common/geometry.zig");
 const common_util = @import("../../common/util.zig");
+const common_filter = @import("../../common/filter.zig");
+const kurbo = @import("../../kurbo/root.zig");
 const mask_mod = @import("../../common/mask.zig");
 const paint_mod = @import("../../common/paint.zig");
 const encode_mod = @import("../../common/encode.zig");
+const shared_mod = @import("../../common/shared.zig");
 const strip_mod = @import("../../common/strip.zig");
 const peniko = @import("../../peniko/root.zig");
 const cmd = @import("cmd.zig");
@@ -57,6 +54,7 @@ pub const LayerFillAttrs = cmd.LayerFillAttrs;
 
 const BlendMode = peniko.BlendMode;
 const FilterContext = filter_mod.FilterContext;
+const FilterLayerPlacement = common_filter.FilterLayerPlacement;
 const LayerClip = record.LayerClip;
 const LayerFill = cmd.LayerFill;
 const LayerProps = record.LayerProps;
@@ -64,9 +62,11 @@ const Mask = mask_mod.Mask;
 const Node = record.Node;
 const Paint = paint_mod.Paint;
 const PaintFill = cmd.PaintFill;
+const Pixmap = @import("../../common/pixmap.zig").Pixmap;
 const RecordedFill = cpu_record.RecordedFill;
 const RecordedLayer = record.RecordedLayer;
 const RectU16 = geometry.RectU16;
+const Shared = shared_mod.Shared;
 const Strip = strip_mod.Strip;
 const StripAlphaFillSegment = strip_mod.StripAlphaFillSegment;
 const StripFillSegment = strip_mod.StripFillSegment;
@@ -77,8 +77,8 @@ const TILE_WIDTH: u16 = util_cpu.TILE_WIDTH;
 const TILE_HEIGHT: u16 = util_cpu.TILE_HEIGHT;
 
 /// Errors from bucketing: allocation failure plus the explicitly deferred
-/// features (filter layers).
-pub const Error = std.mem.Allocator.Error || error{Unsupported};
+/// features and the paint-index overflow that upstream panics on.
+pub const Error = std.mem.Allocator.Error || error{ Unsupported, TooManyPaints };
 
 fn isDefaultBlendMode(blend_mode: BlendMode) bool {
     return blend_mode.mix == .normal and blend_mode.compose == .src_over;
@@ -262,6 +262,9 @@ pub const CommandBucketer = struct {
     paint_fill_attrs: std.ArrayList(PaintFillAttrs),
     /// Attributes referenced by layer fill commands.
     layer_fill_attrs: std.ArrayList(LayerFillAttrs),
+    /// Encoded paints generated for filter layers (upstream
+    /// `filter_paints`); each entry owns its shared pixmap handle.
+    filter_paints: std.ArrayList(encode_mod.EncodedPaint),
     /// Currently active layers, to enable lazy layer pushing.
     active_layers: std.ArrayList(ActiveLayer),
     /// A pool for the `occupied_rows` vectors that are handed back when a
@@ -316,6 +319,7 @@ pub const CommandBucketer = struct {
             .row_states = row_states,
             .paint_fill_attrs = .empty,
             .layer_fill_attrs = .empty,
+            .filter_paints = .empty,
             .active_layers = .empty,
             .occupied_rows_pool = common_util.VecPool(usize).init(true),
             .occupied_rows_bool_scratch = occupied_rows_bool_scratch,
@@ -330,6 +334,8 @@ pub const CommandBucketer = struct {
         self.clip_bboxes.deinit(allocator);
         self.paint_fill_attrs.deinit(allocator);
         self.layer_fill_attrs.deinit(allocator);
+        for (self.filter_paints.items) |*paint| paint.deinit(allocator);
+        self.filter_paints.deinit(allocator);
         for (self.active_layers.items) |*layer| layer.occupied_rows.deinit(allocator);
         self.active_layers.deinit(allocator);
         for (self.occupied_rows_pool.entries.items) |*occupied| occupied.deinit(allocator);
@@ -369,6 +375,8 @@ pub const CommandBucketer = struct {
 
         self.paint_fill_attrs.clearRetainingCapacity();
         self.layer_fill_attrs.clearRetainingCapacity();
+        for (self.filter_paints.items) |*paint| paint.deinit(allocator);
+        self.filter_paints.clearRetainingCapacity();
         for (self.active_layers.items) |*layer| {
             self.recycleOccupiedRows(allocator, layer.occupied_rows);
         }
@@ -423,9 +431,10 @@ pub const CommandBucketer = struct {
     /// `bucket_commands`).
     ///
     /// Nodes are processed in order; a node's draws are bucketed before its
-    /// optional layer is pushed and recursed into. `filter_ctx` is part of the
-    /// upstream signature and is kept as the M2 seam; M1 rejects filter layers
-    /// before consulting it.
+    /// optional layer is pushed and recursed into. Filter layers are
+    /// composited through `filter_ctx`, which must already contain the
+    /// rasterized pixmaps of every dependent filter layer (the dispatcher
+    /// renders them in reverse dependency order first).
     pub fn bucketCommands(
         self: *CommandBucketer,
         allocator: std.mem.Allocator,
@@ -480,7 +489,34 @@ pub const CommandBucketer = struct {
                         );
                         try self.popLayer(allocator, strips);
                     },
-                    .filter => return error.Unsupported,
+                    .filter => |*filter_kind| {
+                        const props = &layer.props;
+                        const needs_layer = !isDefaultBlendMode(props.blend_mode) or
+                            props.opacity != 1.0 or
+                            props.mask != null or
+                            props.clip_path != null;
+
+                        if (needs_layer) {
+                            try self.pushLayer(allocator, props);
+                        }
+
+                        // Note: at this point, all dependent filter layers have
+                        // already been rasterized, so the lookup should never
+                        // fail (`filterLayer` returns null only for layers that
+                        // were skipped because their placement was empty).
+                        if (filter_ctx.filterLayer(layer_id)) |pixmap| {
+                            try self.generateFilterLayerFill(
+                                allocator,
+                                pixmap,
+                                filter_kind.placement,
+                                encoded_paints.len,
+                            );
+                        }
+
+                        if (needs_layer) {
+                            try self.popLayer(allocator, strips);
+                        }
+                    },
                 }
             }
         }
@@ -626,6 +662,97 @@ pub const CommandBucketer = struct {
             }
 
             self.recycleOccupiedRows(allocator, occupied_rows);
+        }
+    }
+
+    /// Generate the fill commands that composite a rendered filter layer
+    /// (upstream `generate_filter_layer_fill`).
+    ///
+    /// Takes ownership of `pixmap`: the new `filter_paints` entry holds the
+    /// handle on success, and it is released on early return or failure.
+    pub fn generateFilterLayerFill(
+        self: *CommandBucketer,
+        allocator: std.mem.Allocator,
+        pixmap: Shared(Pixmap),
+        placement: FilterLayerPlacement,
+        static_paint_count: usize,
+    ) Error!void {
+        const origin = self.viewportOrigin();
+        const dest_bbox = placement.dest_bbox;
+        const src_sample_shift = placement.srcOrigin();
+
+        // Here, we want to determine the absolute transform that needs to be
+        // applied to the filter image for it to be placed correctly: it starts
+        // at the top-left of `dest_bbox`, with a correction so we sample from
+        // the right location of the filter pixmap (`FilterLayerPlacement.new`
+        // explains what this offset represents).
+        const src_offset = [2]i32{
+            @as(i32, src_sample_shift[0]) - @as(i32, dest_bbox.x0),
+            @as(i32, src_sample_shift[1]) - @as(i32, dest_bbox.y0),
+        };
+
+        // Regardless of the viewport origin, rendering always shifts the local
+        // origin to (0, 0); the paint's own `origin` handles the shift, so the
+        // scene-space `dest_bbox` is converted to viewport-local coordinates.
+        const local_dest_bbox = dest_bbox.relativeToOrigin(origin);
+        const clip_bbox = self.clip_bboxes.items[self.clip_bboxes.items.len - 1];
+        // Only the parts of the filter layer inside the clip bounding box need
+        // to be composited.
+        const clipped_dest_bbox = local_dest_bbox.intersect(clip_bbox);
+        if (clipped_dest_bbox.isEmpty()) {
+            pixmap.release(allocator);
+            return;
+        }
+
+        const draw_id = self.nextDrawId();
+        const span = bboxSpan(clipped_dest_bbox);
+        const paint_idx = static_paint_count + self.filter_paints.items.len;
+        const indexed = paint_mod.IndexedPaint.new(paint_idx) catch |err| {
+            pixmap.release(allocator);
+            return err;
+        };
+
+        // Reserve both lists before taking ownership of `pixmap` in the paint.
+        try self.paint_fill_attrs.ensureUnusedCapacity(allocator, 1);
+        try self.filter_paints.ensureUnusedCapacity(allocator, 1);
+
+        const attrs_idx: u32 = @intCast(self.paint_fill_attrs.items.len);
+        self.filter_paints.appendAssumeCapacity(.{ .image = .{
+            .source = .{ .pixmap = pixmap },
+            .sampler = .{
+                .x_extend = .pad,
+                .y_extend = .pad,
+                .quality = .low,
+                .alpha = 1.0,
+            },
+            .may_have_transparency = true,
+            .transform = kurbo.Affine.translate(kurbo.Vec2.new(
+                @floatFromInt(src_offset[0]),
+                @floatFromInt(src_offset[1]),
+            )),
+            .x_advance = kurbo.Vec2.new(1.0, 0.0),
+            .y_advance = kurbo.Vec2.new(0.0, 1.0),
+            .tint = null,
+        } });
+
+        self.paint_fill_attrs.appendAssumeCapacity(.{
+            .paint = .{ .indexed = indexed },
+            .blend_mode = BlendMode.default,
+            .mask = null,
+            .draw_id = draw_id,
+            .thread_idx = 0,
+            .origin = origin,
+        });
+
+        const row_start = @as(usize, clipped_dest_bbox.y0 / TILE_HEIGHT);
+        const row_end = @as(usize, divCeilU16(clipped_dest_bbox.y1, TILE_HEIGHT));
+        for (row_start..row_end) |row_idx| {
+            try self.pushFill(
+                allocator,
+                .{ .row_idx = row_idx, .span = span },
+                attrs_idx,
+                null,
+            );
         }
     }
 
@@ -883,7 +1010,6 @@ const PushFillCtx = struct {
 
 const testing = std.testing;
 const palette = peniko.palette.css;
-const kurbo = @import("../../kurbo/root.zig");
 
 fn fillAttrs(paint: Paint) PaintFillAttrs {
     return .{

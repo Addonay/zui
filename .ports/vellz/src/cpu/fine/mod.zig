@@ -17,11 +17,11 @@
 //! the root is a blend target, the background is isolated into the parent
 //! buffer so blend modes cannot destructively touch it.
 //!
-//! `indexed_fill` (gradients and images) is implemented in M2 via
-//! `gradient.zig` and `image.zig`; the painters are f32-only until the u8
-//! kernel lands in M4. Still deferred (explicit `error.Unsupported`, never
-//! placeholder pixels): blurred rounded rects, external textures, and filter
-//! paints (`filter_paints` is carried but always empty for now).
+//! `indexed_fill` (gradients, images, blurred rounded rectangles and filter
+//! paints) is implemented in M2 via `gradient.zig`, `image.zig`, and
+//! `blurred_rect.zig`; the painters are f32-only until the u8 kernel lands in
+//! M4. Still deferred (explicit `error.Unsupported`, never placeholder
+//! pixels): external textures.
 //!
 //! Kernel (`K`) surface required at instantiation time
 //! (`ComptimeKernel` documents it; only `highp.F32Kernel` is instantiated in
@@ -69,6 +69,7 @@ const region_mod = @import("../region.zig");
 const coarse = @import("../coarse/mod.zig");
 const gradient_mod = @import("gradient.zig");
 const image_mod = @import("image.zig");
+const blurred_rect_mod = @import("blurred_rect.zig");
 
 const Span = util.Span;
 const Region = region_mod.Region;
@@ -107,11 +108,10 @@ pub const TILE_HEIGHT_COMPONENTS: usize = @as(usize, TILE_HEIGHT) * COLOR_COMPON
 
 /// Errors produced by fine rasterization.
 ///
-/// `Unsupported` is returned for the still-deferred paint kinds (blurred
-/// rounded rects, external textures, filters); `OutOfMemory` replaces
-/// upstream's abort-on-allocation-failure. Upstream panics for a missing
-/// registered image or an out-of-range paint index; this port reports
-/// `MissingImage`/`InvalidPaintIndex` instead.
+/// `Unsupported` is returned for the still-deferred paint kinds (external
+/// textures); `OutOfMemory` replaces upstream's abort-on-allocation-failure.
+/// Upstream panics for a missing registered image or an out-of-range paint
+/// index; this port reports `MissingImage`/`InvalidPaintIndex` instead.
 pub const Error = error{ Unsupported, OutOfMemory, MissingImage, InvalidPaintIndex };
 
 /// Returns whether a blend mode is the upstream default (normal + src-over).
@@ -787,8 +787,24 @@ pub fn Fine(comptime K: type) type {
                         &painter,
                     );
                 },
-                // Blurred rounded rects belong to the filter/BRR work.
-                .blurred_rounded_rect => return error.Unsupported,
+                // Blurred rounded rectangles compute their coverage
+                // analytically (upstream `fill_complex_paint!(true, ...)`:
+                // always the transparent compositing path, no tint).
+                .blurred_rounded_rect => |*rect| {
+                    var painter = blurred_rect_mod.BlurredRoundedRectFiller.init(
+                        rect,
+                        sampler_x,
+                        sampler_y,
+                    );
+                    self.applyComplexPaint(
+                        span,
+                        attrs,
+                        alphas,
+                        true,
+                        null,
+                        &painter,
+                    );
+                },
             }
         }
 
