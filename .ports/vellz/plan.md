@@ -756,5 +756,6 @@ of panics, thread ownership).
   (`backend=vulkan type=cpu execution=software-adapter`): `zig build test`
   = 774/774 (767 unit + 7 scene), `zig build corpus` 48/48 byte-exact,
   `zig build -Dgpu=true test` = 787/787, `run-gpu-smoke`,
-  `run-gpu-errors`, and `gpu-corpus` all green; per-scene metrics are in
+  `run-gpu-errors` (now also covering `MissingTextureBinding` and
+  `TextureFeedbackLoop`), and `gpu-corpus` all green; per-scene metrics are in
   `tests/README.md`'s tolerance registry.
