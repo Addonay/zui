@@ -34,6 +34,13 @@ pub fn main(init: std.process.Init) !void {
     var scene_path: ?[]const u8 = null;
     var out_path: ?[]const u8 = null;
     var probe_mode = false;
+    var dump_glyphs = false;
+    var dump_cmap = false;
+    var font_path: ?[]const u8 = null;
+    var font_index: u32 = 0;
+    var font_size: ?f32 = null;
+    var id_specs: std.ArrayList([]const u8) = .empty;
+    defer id_specs.deinit(allocator);
     while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--scene")) {
             scene_path = args_iter.next() orelse return usage();
@@ -41,6 +48,20 @@ pub fn main(init: std.process.Init) !void {
             out_path = args_iter.next() orelse return usage();
         } else if (std.mem.eql(u8, arg, "--probe")) {
             probe_mode = true;
+        } else if (std.mem.eql(u8, arg, "--dump-glyphs")) {
+            dump_glyphs = true;
+        } else if (std.mem.eql(u8, arg, "--dump-cmap")) {
+            dump_cmap = true;
+        } else if (std.mem.eql(u8, arg, "--font")) {
+            font_path = args_iter.next() orelse return usage();
+        } else if (std.mem.eql(u8, arg, "--index")) {
+            const value = args_iter.next() orelse return usage();
+            font_index = std.fmt.parseInt(u32, value, 10) catch return usage();
+        } else if (std.mem.eql(u8, arg, "--size")) {
+            const value = args_iter.next() orelse return usage();
+            font_size = std.fmt.parseFloat(f32, value) catch return usage();
+        } else if (std.mem.eql(u8, arg, "--gids") or std.mem.eql(u8, arg, "--codepoints")) {
+            try id_specs.append(allocator, args_iter.next() orelse return usage());
         } else {
             return usage();
         }
@@ -49,6 +70,21 @@ pub fn main(init: std.process.Init) !void {
     if (probe_mode) {
         if (scene_path != null) return usage();
         return runProbe(allocator, io, out_path);
+    }
+    if (dump_glyphs or dump_cmap) {
+        if (scene_path != null or out_path != null) return usage();
+        const font_file = font_path orelse return usage();
+        const blob = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            font_file,
+            allocator,
+            .unlimited,
+        );
+        defer allocator.free(blob);
+        if (dump_glyphs) {
+            return runDumpGlyphs(allocator, io, blob, font_index, font_size orelse return usage(), id_specs.items);
+        }
+        return runDumpCmap(allocator, io, blob, font_index, id_specs.items);
     }
 
     const scene_file = scene_path orelse return usage();
@@ -71,10 +107,163 @@ pub fn main(init: std.process.Init) !void {
 fn usage() error{InvalidArguments} {
     std.debug.print(
         "usage: vellz-cli --scene SCENE.json --out OUT.rgba\n" ++
-            "       vellz-cli --probe [--out OUT.rgba]\n",
+            "       vellz-cli --probe [--out OUT.rgba]\n" ++
+            "       vellz-cli --dump-glyphs --font FONT [--index N] --size PPEM --gids 1,3,5-9\n" ++
+            "       vellz-cli --dump-cmap --font FONT [--index N] --codepoints 65,0x1F600\n",
         .{},
     );
     return error.InvalidArguments;
+}
+
+/// Prints the Zig `glifo` path elements for `--gids` in the same canonical
+/// text format as `tools/oracle-rs --dump-glyphs`, so the two can be
+/// byte-compared. This is the M3 T2 bit-exactness gate.
+fn runDumpGlyphs(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    blob: []const u8,
+    font_index: u32,
+    size: f32,
+    id_specs: []const []const u8,
+) !void {
+    const glifo = vellz.glifo;
+    const font = try glifo.Font.init(blob, font_index);
+    const outlines = font.outlines() catch |err| {
+        std.debug.print("vellz-cli: outlines unavailable: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    var gids: std.ArrayList(u32) = .empty;
+    defer gids.deinit(allocator);
+    for (id_specs) |spec| try parseIdList(allocator, &gids, spec);
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var file_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    const writer = &file_writer.interface;
+    try writer.print("vellz-glyph-dump v1\n", .{});
+    try writer.print("face {d}\n", .{font_index});
+    try writer.print("size {x:0>8}\n", .{@as(u32, @bitCast(size))});
+
+    var pen = glifo.PathElementPen.init(allocator);
+    defer pen.deinit();
+    for (gids.items) |gid| {
+        pen.clearRetainingCapacity();
+        const metrics = outlines.draw(allocator, gid, .{ .size = size }, &pen) catch |err| {
+            std.debug.print("vellz-cli: drawing glyph {d}: {s}\n", .{ gid, @errorName(err) });
+            return err;
+        };
+        var lsb_buf: [8]u8 = undefined;
+        var advance_buf: [8]u8 = undefined;
+        try writer.print("gid {d} format glyf elems {d} lsb {s} advance {s}\n", .{
+            gid,
+            pen.elements.items.len,
+            optF32Hex(metrics.lsb, &lsb_buf),
+            optF32Hex(metrics.advance_width, &advance_buf),
+        });
+        for (pen.elements.items) |element| {
+            switch (element) {
+                .move_to => |p| try writer.print("M {x:0>8} {x:0>8}\n", .{
+                    @as(u32, @bitCast(p[0])),
+                    @as(u32, @bitCast(p[1])),
+                }),
+                .line_to => |p| try writer.print("L {x:0>8} {x:0>8}\n", .{
+                    @as(u32, @bitCast(p[0])),
+                    @as(u32, @bitCast(p[1])),
+                }),
+                .quad_to => |q| try writer.print("Q {x:0>8} {x:0>8} {x:0>8} {x:0>8}\n", .{
+                    @as(u32, @bitCast(q.c0[0])),
+                    @as(u32, @bitCast(q.c0[1])),
+                    @as(u32, @bitCast(q.p[0])),
+                    @as(u32, @bitCast(q.p[1])),
+                }),
+                .curve_to => |c| try writer.print(
+                    "C {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8}\n",
+                    .{
+                        @as(u32, @bitCast(c.c0[0])),
+                        @as(u32, @bitCast(c.c0[1])),
+                        @as(u32, @bitCast(c.c1[0])),
+                        @as(u32, @bitCast(c.c1[1])),
+                        @as(u32, @bitCast(c.p[0])),
+                        @as(u32, @bitCast(c.p[1])),
+                    },
+                ),
+                .close => try writer.print("Z\n", .{}),
+            }
+        }
+    }
+    try writer.print("end\n", .{});
+    try file_writer.flush();
+}
+
+/// cmap companion to `--dump-glyphs`; same format as the oracle's
+/// `--dump-cmap`.
+fn runDumpCmap(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    blob: []const u8,
+    font_index: u32,
+    id_specs: []const []const u8,
+) !void {
+    const glifo = vellz.glifo;
+    const font = try glifo.Font.init(blob, font_index);
+    const charmap = font.charmap();
+
+    var codepoints: std.ArrayList(u32) = .empty;
+    defer codepoints.deinit(allocator);
+    for (id_specs) |spec| try parseIdList(allocator, &codepoints, spec);
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var file_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    const writer = &file_writer.interface;
+    try writer.print("vellz-cmap-dump v1\n", .{});
+    try writer.print("face {d}\n", .{font_index});
+    try writer.print("has_map {d} is_symbol {d}\n", .{
+        @intFromBool(charmap.hasMap()),
+        @intFromBool(charmap.isSymbol()),
+    });
+    for (codepoints.items) |codepoint| {
+        if (charmap.map(codepoint)) |gid| {
+            try writer.print("cp {d} gid {d}\n", .{ codepoint, gid });
+        } else {
+            try writer.print("cp {d} gid none\n", .{codepoint});
+        }
+    }
+    try writer.print("end\n", .{});
+    try file_writer.flush();
+}
+
+/// Parses `1,3,5-9` with decimal or `0x` hex values into `ids`.
+fn parseIdList(
+    allocator: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    spec: []const u8,
+) !void {
+    var parts = std.mem.splitScalar(u8, spec, ',');
+    while (parts.next()) |raw_part| {
+        const part = std.mem.trim(u8, raw_part, " \t");
+        if (part.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, part, '-')) |dash| {
+            const start = parseU32(part[0..dash]) orelse return error.InvalidArguments;
+            const end = parseU32(part[dash + 1 ..]) orelse return error.InvalidArguments;
+            if (end < start) return error.InvalidArguments;
+            var id = start;
+            while (id <= end) : (id += 1) try ids.append(allocator, id);
+        } else {
+            try ids.append(allocator, parseU32(part) orelse return error.InvalidArguments);
+        }
+    }
+}
+
+fn parseU32(text: []const u8) ?u32 {
+    if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) {
+        return std.fmt.parseInt(u32, text[2..], 16) catch null;
+    }
+    return std.fmt.parseInt(u32, text, 10) catch null;
+}
+
+fn optF32Hex(value: ?f32, buf: *[8]u8) []const u8 {
+    const bits = @as(u32, @bitCast(value orelse return "none"));
+    return std.fmt.bufPrint(buf, "{x:0>8}", .{bits}) catch unreachable;
 }
 
 /// Render the probe scene, compare against the embedded pinned upstream
