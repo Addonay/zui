@@ -29,10 +29,10 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 879/879 unit and integration tests (862 lib + 8 scene
+zig build test     # 900/900 unit and integration tests (883 lib + 8 scene
                    #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
                    #   the .ports/cozmic sibling checkout is absent)
-zig build corpus   # 108/108 corpus scenes byte-exact vs the upstream oracle
+zig build corpus   # 120/120 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo (hinted + unhinted)
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
@@ -92,7 +92,7 @@ and `EBDT`/`EBLC` are covered by synthetic-font unit tests (the pinned assets
 gate `CBDT`/`CBLC` end to end); PNG 16-bit/Adam7 payloads fall through to the
 outline branch. All of
 it renders byte-exact against the pinned oracle, atlas cache on and off
-(108/108 corpus, tolerance 0). The GPU side has the wgpu-native device
+(120/120 corpus, tolerance 0). The GPU side has the wgpu-native device
 bootstrap, the full host/shader layout
 contract, the schedule/layer executor, encoded paints (gradients and images),
 GPU filters, and a 44-scene `gpu-corpus` gate (27 byte-exact, the rest within
@@ -142,7 +142,7 @@ CPU-only, no GPU dependency:
 ```sh
 zig build test                  # unit + integration tests
 zig build check                 # compile without running
-zig build corpus                # corpus gate: 108 scenes byte-exact vs pinned fixtures
+zig build corpus                # corpus gate: 120 scenes byte-exact vs pinned fixtures
 zig build probe                 # upstream probe fixture (tolerance-3 policy)
 zig build run-cpu-example       # writes cpu_example.ppm
 zig build vellz-cli             # corpus renderer CLI -> zig-out/bin

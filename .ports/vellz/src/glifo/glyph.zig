@@ -14,11 +14,12 @@
 //!   required to be cloneable: the decoration pass drains the run's iterator
 //!   once instead of cloning it.
 //! - TrueType hinting is ported (M3 G3b): `prepareGlyphRunWithCache` consults
-//!   the 16-entry LRU `HintCache` for eligible transforms, `HintingInstance`
-//!   runs `fpgm`/`prep` once per (font, size), and glyph outlines are drawn
-//!   through the interpreter keyed by the hint instance. Interpreter failures
-//!   are `error.HintError`; autohinter-only fonts are `error.Unsupported`
-//!   instead of silently rendering unhinted.
+//!   the 16-entry LRU `HintCache` for eligible transforms,
+//!   `hinting.HintingInstance` runs `fpgm`/`prep` once per (font, size), and
+//!   glyph outlines are drawn through the interpreter keyed by the hint
+//!   instance. `Engine::AutoFallback` selects the autohinter for
+//!   instruction-less fonts; interpreter failures are `error.HintError`, and
+//!   neither engine ever silently renders unhinted.
 //! - Glyphs resolve through the upstream COLR > bitmap > outline cascade:
 //!   COLR/CPAL is ported (T4) and embedded bitmaps (`sbix`/`CBDT`/`EBDT`) are
 //!   ported (T5); `Bgra`/`Mask` bitmap payloads and undecodable PNGs fall

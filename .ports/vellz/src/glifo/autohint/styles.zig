@@ -327,3 +327,20 @@ test "glyph style flags" {
     try std.testing.expectEqual(@as(u16, style.latn), other.styleIndex().?);
     try std.testing.expect(other.bits & GlyphStyle.from_gsub_output == 0);
 }
+
+test "Noto Sans style map assigns Latin styles and digits" {
+    const fixture = @import("../test_fixture.zig");
+    const font_mod = @import("../font.zig");
+    const font = try font_mod.Font.init(try fixture.notoSans(), 0);
+    var shaper = shaper_mod.Shaper.init(font, .best_effort);
+    var map = try GlyphStyleMap.init(std.testing.allocator, font.numGlyphs(), &shaper);
+    defer map.deinit(std.testing.allocator);
+    // 'A' (gid 36) and '1' (gid 20) are cmap-mapped Latin; the GSUB feature
+    // styles (c2sc/smcp/...) must not leak onto them.
+    const a = map.styleFor(36).?;
+    try std.testing.expectEqual(@as(u16, style.latn), a.styleIndex().?);
+    try std.testing.expect(!a.isDigit());
+    const one = map.styleFor(20).?;
+    try std.testing.expectEqual(@as(u16, style.latn), one.styleIndex().?);
+    try std.testing.expect(one.isDigit());
+}

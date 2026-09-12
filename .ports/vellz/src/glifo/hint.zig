@@ -10,7 +10,9 @@
 //! The caller (the glyf scaler) supplies the font program tables through
 //! [`ProgramData`] and the per-glyph buffers through [`HintOutline`].
 //!
-//! Deferred with typed errors, never approximated: autohinting, CFF hinting
+//! The engine selection (`Engine::AutoFallback`) lives in `hinting.zig`:
+//! fonts without `fpgm`/`prep` bytecode use `autohint/` instead of this
+//! interpreter. Deferred with typed errors, never approximated: CFF hinting
 //! and variation deltas (`cvar`/`gvar`). Unhandled opcodes raise
 //! `error.UnhandledOpcode` (or dispatch to user `IDEF`s, matching upstream).
 

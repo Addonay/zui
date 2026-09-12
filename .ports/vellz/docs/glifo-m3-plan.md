@@ -21,7 +21,7 @@ Pinned upstream: `1e63b4a40ccb484f82e1d85b83df97ab95bcfbe7` (`v0.10.0-51-g1e63b4
 | 13 | `vello_gpu/src/{text,resources}.rs` | — | `src/gpu/text.zig` | M5, not M3 |
 | 14 | `glifo/src/lib.rs` re-exports | 66 | `src/glifo/root.zig`, `src/root.zig` | all |
 
-Staged-only inventory (see §5 remainder): `skrifa/outline/glyf/hint/*` (30 files, each <500; interpreter), `outline/hint.rs` 647, `outline/autohint/*` (16 files, ~2.5k), `cff/mod.rs` 1,011 + `cff/hint.rs`, `glyf/deltas.rs` (~400), `bitmap.rs`, `png` decode.
+Staged-only inventory (see §5 remainder): `cff/mod.rs` 1,011 + `cff/hint.rs`, `glyf/deltas.rs` (~400). The interpreter (`outline/glyf/hint/*` + `outline/hint.rs`), the autohinter (`outline/autohint/*`, incl. the BestEffort GSUB shaper subset) and `bitmap.rs`/PNG decode have since landed as M3 G3b/G3e.
 
 ## 2. Font loading decision (standalone, byte-exact)
 
@@ -35,7 +35,7 @@ Staged-only inventory (see §5 remainder): `skrifa/outline/glyf/hint/*` (30 file
 | `loca`/`glyf` outlines, simple + composite | **port** FreeType-style | default `PathStyle::FreeType`; `HarfBuzz` variant → `error.Unsupported`. Critical: unhinted FreeType scaling runs through `Fixed`/`F26Dot6` (`Scale26Dot6`) and converts to f32 at the end — an f32 reimplementation will not be bit-exact |
 | `gvar`/`HVAR`/`avar`, `LocationRef`/`NormalizedCoord` | **contract only, outline deltas defer** | API and cache keys carry `i16` coords; non-default coords on a variable font → `error.Unsupported` until ported |
 | TrueType interpreter (`fpgm`/`prep`/`cvt`, phantom points), `HintingInstance`/`HintingOptions(Engine::AutoFallback, Target::Smooth{Lcd, symmetric_rendering:false, preserve_linear_metrics:true})` | **port** (staged, after tasks 1–5) | upstream default `hint(true)`; Roboto prefers interpreter, so hinted fixtures need it |
-| autohinter | **defer** | only selected for instruction-less fonts, none in the M3 fixture set → explicit error |
+| autohinter (`outline/autohint/*`) | **port** (G3b autohint) | selected by `Engine::AutoFallback` for instruction-less fonts; ported with the BestEffort GSUB shaper subset, `styles_data.zig` transcribed from skrifa's generated tables. Fixture: the Noto project's unhinted `NotoSans-Regular.ttf`; 3884 glyphs × 6 sizes (0.5–2048 ppem) and 8 hinted `--dump-glyphs` vectors are byte-exact |
 | CFF/CFF2 | **defer** | Roboto/Noto/`test_glyphs-glyf_colr_1` are all `glyf` |
 | COLRv0/v1 + CPAL, `ColorPainter` traversal, brushes, composite modes | **port** | required by the milestone; glifo never hints COLR |
 | CBDT/CBLC/sbix + PNG bitmap glyphs | **port** (T5) | `sbix`/`CBDT`/`EBDT` strike selection + decode, `png 0.18`-compatible decoder; 16-bit/Adam7 -> `error.Unsupported` |
@@ -93,7 +93,7 @@ Staged gates: **G3a** unhinted outline corpus (Roboto `glyphs_{filled,small,skew
 
 **T5 — Cozmic adapter + decoration.** Files: `src/cozmic_adapter.zig`, `src/glifo/glyph.rs→.zig` decoration, `src/kurbo/bezpath.zig` (`PathSeg.transform`), `tests/cozmic_adapter_test.zig`, `build.zig` (opt-in test). Deps: T3 (outline fill/stroke), optionally T4. Acceptance: positioned-glyph mapping is 1:1 (ids/positions, no shaping calls, asserted by a counter/probe); `renderDecoration` skip-ink spans match upstream on crafted glyphs; adapter test skips explicitly when `.ports/cozmic` is absent; `zig build test`.
 
-M3 remainder after these five: autohint, `gvar`/variation, CFF, embolden — each explicit `error.Unsupported`. (TrueType hinting, bitmap/PNG, decoration and the Cozmic adapter landed in T5; see `plan.md`'s ledger.)
+M3 remainder after these five: `gvar`/variation, CFF, embolden — each explicit `error.Unsupported`. (TrueType hinting, the autohinter, bitmap/PNG, decoration and the Cozmic adapter landed in T5/G3b; see `plan.md`'s ledger.)
 
 ## Evidence inspected
 `plan.md` §2/§5/§9/§10/§11/§13; `README.md`; `docs/port-contracts.md`; `docs/cpu-pipeline.md`; `tests/README.md`; `tests/fixtures/upstream/README.md`; `build.zig`, `build.zig.zon`, `src/root.zig`, `src/cpu/render.zig`, `src/common/render_state.zig`, `src/common/paint.zig`, relevant `src/kurbo` APIs; `tools/{scene.zig,vellz_cli.zig,oracle-rs/src/main.rs,import_upstream_fixtures.sh}`. Upstream: all `glifo/src/*`, `vello_cpu/src/{text,text_debug,render}.rs` text paths, `vello_common/src/{multi_atlas,image_cache}.rs`, `vello_tests/tests/{glyph,util,renderer}.rs`, `vello_dev_macros/src/{test,lib}.rs`, fixture READMEs, plus registry copies of `skrifa 0.44.0`, `read-fonts 0.41.0`, `guillotiere 0.7.0`. Cozmic: `src/layout.zig`, `glyph_cache.zig`, `shape_hb.zig`, `render.zig`; ZUI `README.md` font/atlas notes and `src/fonts/{atlas,shaper}.zig`.

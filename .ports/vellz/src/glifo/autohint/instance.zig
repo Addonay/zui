@@ -178,3 +178,50 @@ pub const Instance = struct {
         };
     }
 };
+
+test "autohint draws a Latin glyph deterministically" {
+    const fixture = @import("../test_fixture.zig");
+    const pen_mod = @import("../pen.zig");
+    const font = try glyf.Font.init(try fixture.notoSans(), 0);
+    const outlines = try font.outlines();
+    var instance = try Instance.init(
+        std.testing.allocator,
+        &outlines,
+        glyf.glifo_hint_target,
+        &.{},
+    );
+    defer instance.deinit();
+
+    var pen = pen_mod.PathElementPen.init(std.testing.allocator);
+    defer pen.deinit();
+    const adjusted = try instance.draw(
+        std.testing.allocator,
+        36,
+        16.0,
+        &.{},
+        .freetype,
+        &pen,
+    );
+    try std.testing.expectEqual(@as(f32, 10.0), adjusted.advance_width.?);
+    try std.testing.expect(adjusted.lsb == null);
+    try std.testing.expect(!adjusted.has_overlaps);
+    try std.testing.expect(pen.elements.items.len > 0);
+
+    var pen2 = pen_mod.PathElementPen.init(std.testing.allocator);
+    defer pen2.deinit();
+    _ = try instance.draw(std.testing.allocator, 36, 16.0, &.{}, .freetype, &pen2);
+    try std.testing.expectEqual(pen.elements.items.len, pen2.elements.items.len);
+    for (pen.elements.items, pen2.elements.items) |a, b| {
+        try std.testing.expect(std.meta.eql(a, b));
+    }
+}
+
+test "autohint rejects deferred inputs" {
+    const fixture = @import("../test_fixture.zig");
+    const font = try glyf.Font.init(try fixture.notoSans(), 0);
+    const outlines = try font.outlines();
+    try std.testing.expectError(
+        error.Unsupported,
+        Instance.init(std.testing.allocator, &outlines, glyf.glifo_hint_target, &.{0}),
+    );
+}

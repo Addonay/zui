@@ -24,9 +24,11 @@
 //! Deferred with typed errors: HarfBuzz path style (`error.Unsupported`),
 //! non-empty variation coordinates (`error.Unsupported`; `gvar`/`HVAR` deltas
 //! are not ported), CFF/bitmap faces (rejected by `font.Font.outlines`),
-//! autohinter-only fonts (`prefer_interpreter == false`), `hdmx` advances
-//! outside backward compatibility, and embolden (rejected by the outline
-//! cache).
+//! `hdmx` advances outside backward compatibility, and embolden (rejected by
+//! the outline cache). Instruction-less fonts (`prefer_interpreter == false`)
+//! are drawn by the autohinter through `hinting.zig`; `draw` itself still
+//! rejects an interpreter instance for them, so a hinted draw can never
+//! silently fall back to unhinted output.
 
 const std = @import("std");
 
@@ -248,8 +250,8 @@ pub const Outlines = struct {
     /// `head` bit 3 unset: fractional ppem is rounded before hinting.
     fractional_size_hinting: bool = true,
     /// True when the font carries bytecode (`fpgm`/`prep`/maxp instructions).
-    /// `Engine::AutoFallback` selects the interpreter only for these fonts;
-    /// everything else would need the deferred autohinter.
+    /// `Engine::AutoFallback` (`hinting.zig`) selects the interpreter only
+    /// for these fonts and the autohinter otherwise.
     prefer_interpreter: bool = false,
     /// The font carries `hdmx` width records; hinted advances would need them
     /// (not ported), so hinting such fonts is a typed error.
@@ -453,8 +455,10 @@ pub const Outlines = struct {
         if (settings.hint_instance) |instance| {
             if (instance.isEnabled()) {
                 if (!self.prefer_interpreter) {
-                    // `Engine::AutoFallback` would choose the (deferred)
-                    // autohinter; never silently draw unhinted.
+                    // `Engine::AutoFallback` chooses the autohinter for this
+                    // font (`hinting.zig`); an interpreter instance here
+                    // would be a configuration bug, never a silent unhinted
+                    // draw.
                     return error.Unsupported;
                 }
                 // `hdmx` advances are only consulted when backward

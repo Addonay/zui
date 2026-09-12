@@ -197,8 +197,8 @@ They cover the u8-native gradient LUT and bilinear painters, the f32-painter
 `paintU8` conversion (nearest/bicubic images and undefined radial gradients),
 and the integer blend/composite/mask paths.
 
-All scenes above render byte-exact with `zig build corpus` (108/108,
-`tolerance=0`: 32 quality/f32 + 16 speed/u8 + 22 outline glyph +
+All scenes above render byte-exact with `zig build corpus` (120/120,
+`tolerance=0`: 32 quality/f32 + 16 speed/u8 + 34 outline glyph +
 6 decoration + 27 COLR + 5 bitmap). The
 f32 and u8 pipelines are not byte-equal to each other in general (integer
 `div_255` rounding vs f32); the corpus compares each pipeline against its own
@@ -224,8 +224,12 @@ keeps 16 instances in an LRU. The scenes mirror the unhinted set where the
 transform is eligible for vertical hinting (positive uniform scale, or
 horizontal skew only); transform-composition rows that upstream leaves
 `Direct` (rotations, flips, vertical skew) render unhinted exactly like
-upstream. Fonts that would need the autohinter are a typed `error.Unsupported`
-rather than a silent unhinted fallback.
+upstream. The instruction-less Noto Sans scenes (`glyph_run_autohint_*`) take
+`Engine::AutoFallback` to the ported autohinter instead: styles are derived
+per glyph (cmap + GSUB coverage), per-style metrics are computed lazily, and
+the JIT pipeline grid-fits the outline; the vectors are byte-exact against
+pinned skrifa at tolerance 0, cache on and off. A hinted draw never silently
+falls back to unhinted output.
 
 ### COLR corpus (M3 T4 / G3c)
 

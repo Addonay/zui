@@ -30,6 +30,10 @@
 //!   (`sbix`/`CBDT`/`EBDT` strikes, PNG decode); `atlas` — `GlyphAtlas`/
 //!   `GlyphCacheKey`/`AtlasCommandRecorder`/`ImageCache`; `interface` — the
 //!   comptime `DrawSink`/`GlyphRenderer` duck-typing contracts.
+//! - `hinting`/`autohint` — `Engine::AutoFallback`: `HintingInstance` is
+//!   either the TrueType interpreter (`hint.zig`) or the automatic hinter
+//!   (`autohint/`: script/style tables, widths/blues, segments/edges, JIT
+//!   grid-fitting and the BestEffort GSUB shaper subset).
 //! - `NormalizedCoord = i16` and `FontEmbolden` — carried in cache keys for
 //!   API parity; non-default values are rejected with `error.Unsupported`.
 //! - `util` — the `glifo` float/affine predicates used by run preparation.
@@ -42,15 +46,16 @@
 //!
 //! # Deferred with typed errors
 //!
-//! Autohinting (fonts without `fpgm`/`prep` bytecode), `gvar`/`HVAR`/`avar`
-//! variation deltas (any non-empty coords), CFF/CFF2 and synthetic embolden
-//! are all `error.Unsupported`; none are approximated. TrueType hinting
-//! (M3 G3b), decoration (T5) and COLRv0/COLRv1 (T4, including gradients,
-//! transforms, clip boxes and composite modes) are ported, and embedded
-//! bitmaps (`sbix`/`CBDT`/`EBDT`, T5) resolve through the upstream
-//! COLR > bitmap > outline cascade with PNG decoding; `Bgra`/`Mask` payloads
-//! and PNG features outside the decoder (16-bit, Adam7) fall through to the
-//! outline branch exactly like upstream's `.ok()` filter.
+//! `gvar`/`HVAR`/`avar` variation deltas (any non-empty coords), CFF/CFF2 and
+//! synthetic embolden are `error.Unsupported`; none are approximated.
+//! TrueType hinting (M3 G3b) and the `Engine::AutoFallback` autohinter
+//! (`autohint/`) are ported, decoration (T5) and COLRv0/COLRv1 (T4,
+//! including gradients, transforms, clip boxes and composite modes) are
+//! ported, and embedded bitmaps (`sbix`/`CBDT`/`EBDT`, T5) resolve through
+//! the upstream COLR > bitmap > outline cascade with PNG decoding;
+//! `Bgra`/`Mask` payloads and PNG features outside the decoder (16-bit,
+//! Adam7) fall through to the outline branch exactly like upstream's `.ok()`
+//! filter.
 //!
 //! # Oracle comparison
 //!
