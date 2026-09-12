@@ -540,7 +540,12 @@ of panics, thread ownership).
   all four channels byte-for-byte; upstream MT tests (`allocations`, reset /
   drop with pending tasks, empty frame after reset, clip before draw) are
   ported. `zig build test` = 563/563 (557 unit + 6 scene), `zig build corpus`
-  = 22/22 byte-exact (corpus stays `threads: 0`, single-threaded). Remaining
+  = 22/22 byte-exact (corpus stays `threads: 0`, single-threaded). Extra MT
+  evidence: rewriting every corpus scene to `"threads": 4` and rendering it
+  with the CLI matches the pinned oracle fixtures byte-for-byte in Debug,
+  ReleaseSafe, and ReleaseFast (22/22 each; e.g. `sed 's/"threads": 0/"threads":
+  4/' tests/scenes/x.json > out/mt/x.json && zig-out/bin/vellz-cli --scene
+  out/mt/x.json --out out/mt/x.rgba`, then `tools/compare_raw.py`). Remaining
   for G4: the u8 lowp kernel (`optimize_speed` still `error.Unsupported`),
   native SIMD levels, MT filters, and measured speedups.
 
