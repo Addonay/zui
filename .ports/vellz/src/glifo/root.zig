@@ -54,6 +54,10 @@ pub const pen = @import("pen.zig");
 pub const outline_cache = @import("outline_cache.zig");
 pub const util = @import("util.zig");
 pub const dump = @import("dump.zig");
+pub const atlas = @import("atlas/root.zig");
+pub const interface = @import("interface.zig");
+pub const glyph = @import("glyph.zig");
+pub const renderer = @import("renderer.zig");
 
 pub const FontData = font.FontData;
 pub const Font = font.Font;
@@ -79,6 +83,39 @@ pub const CachedOutline = outline_cache.CachedOutline;
 pub const FontInfo = outline_cache.FontInfo;
 pub const FontEmbolden = outline_cache.FontEmbolden;
 
+pub const Glyph = glyph.Glyph;
+pub const GlyphRun = glyph.GlyphRun;
+pub const GlyphRunBuilder = glyph.GlyphRunBuilder;
+pub const GlyphRunRenderer = glyph.GlyphRunRenderer;
+pub const GlyphPrepCache = glyph.GlyphPrepCache;
+pub const GlyphPrepCacheMut = glyph.GlyphPrepCacheMut;
+pub const AtlasCacher = glyph.AtlasCacher;
+pub const GlyphScaleProperties = glyph.GlyphScaleProperties;
+pub const DrawProps = glyph.DrawProps;
+pub const PreparedGlyph = glyph.PreparedGlyph;
+pub const GlyphOutline = glyph.GlyphOutline;
+pub const GlyphSliceIterator = glyph.GlyphSliceIterator;
+pub const iterate = glyph.iterate;
+pub const prepareGlyphRun = glyph.prepareGlyphRun;
+pub const buildRenderer = glyph.buildRenderer;
+
+pub const AtlasSlot = atlas.AtlasSlot;
+pub const RasterMetrics = atlas.RasterMetrics;
+pub const GlyphCacheKey = atlas.GlyphCacheKey;
+pub const GlyphAtlas = atlas.GlyphAtlas;
+pub const GlyphCacheConfig = atlas.GlyphCacheConfig;
+pub const ImageCache = atlas.ImageCache;
+pub const AtlasConfig = atlas.AtlasConfig;
+pub const GLYPH_PADDING = atlas.GLYPH_PADDING;
+pub const AtlasCommand = atlas.AtlasCommand;
+pub const AtlasCommandRecorder = atlas.AtlasCommandRecorder;
+pub const AtlasPaint = atlas.AtlasPaint;
+pub const PendingClearRect = atlas.PendingClearRect;
+pub const SUBPIXEL_BUCKETS = atlas.SUBPIXEL_BUCKETS;
+
+pub const DrawSink = interface;
+pub const GlyphRenderer = interface;
+
 test {
     _ = tables;
     _ = font;
@@ -87,4 +124,8 @@ test {
     _ = outline_cache;
     _ = util;
     _ = dump;
+    _ = atlas;
+    _ = interface;
+    _ = glyph;
+    _ = renderer;
 }
