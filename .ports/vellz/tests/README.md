@@ -279,6 +279,17 @@ is recorded. The scenes are generated with exact f32 advances from the
 oracle's `--dump-advances` mode (`tools/gen_glyph_scenes.py`), because
 `--dump-glyphs` needs outlines that a bitmap-only face does not have.
 
+Hinting is forced off (`hint(false)`): the port's hinted transform-absorption
+path is G3b. The oracle renders these scenes byte-identically with
+`hint(true)` (checked by re-rendering with the flag flipped), because bitmap
+pixels are fixed strikes and never hint.
+
+`sbix` and `EBDT`/`EBLC` are ported at the table level (`tables/bitmap.zig`)
+and covered by synthetic-font unit tests (strike selection, glyph records,
+EBDT mask formats); the pinned checkout ships no `sbix`/`EBDT` asset, so no
+scene gates them end to end. `Bgra`/`Mask` payloads and PNG 16-bit/Adam7 fall
+through to the outline branch, matching upstream `glifo`'s `.ok()` filter.
+
 Cache-on vs cache-off: the bitmap cache key carries the strike's own ppem
 (109) instead of the run size, and the decoded pixmap is queued as a
 `PendingBitmapUpload` that `cpu/text.zig` copies into the atlas page at frame
