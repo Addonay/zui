@@ -1691,6 +1691,14 @@ test "vertex attribute layouts match the shader contract" {
     const filter = filterInstanceAttributes();
     try std.testing.expectEqual(@as(usize, 9), filter.len);
     try std.testing.expectEqual(@sizeOf(filter_mod.FilterInstanceData), 36);
+
+    const mask = maskAttributes();
+    try std.testing.expectEqual(@as(usize, 6), mask.len);
+    for (mask, 0..) |attribute, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i * 4)), attribute.offset);
+        try std.testing.expectEqual(@as(u32, @intCast(c.WGPUVertexFormat_Uint32)), @as(u32, @intCast(attribute.format)));
+    }
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(mask_mod.GpuMaskInstance));
 }
 
 test "config buffer contents match the strip contract" {

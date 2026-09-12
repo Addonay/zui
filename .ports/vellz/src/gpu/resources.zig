@@ -249,9 +249,10 @@ test "configure atlas is rejected after allocations" {
     try testing.expectEqual([2]u16{ 64, 64 }, resources.atlasConfig().atlas_size);
 }
 
-test "empty atlas size is rejected" {
+test "empty atlas size is rejected at construction" {
     const allocator = testing.allocator;
-    var resources = try Resources.initWithConfig(allocator, .{ .atlas_size = .{ 0, 0 } });
-    defer resources.deinit();
-    try testing.expectError(error.UnsupportedCapability, resources.configureAtlas(64));
+    try testing.expectError(
+        error.InvalidOptions,
+        Resources.initWithConfig(allocator, .{ .atlas_size = .{ 0, 0 } }),
+    );
 }
