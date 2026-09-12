@@ -44,6 +44,18 @@ COLR_TEST_FONT = os.path.join(
 )
 COLR_TEST_UPEM = 1000.0
 
+# CFF fixtures (M3 CFF): Source Serif 4, OFL-1.1 (Adobe release commit
+# 5f220b17d27ed64873f22cde0dd593685387bd19).
+SOURCE_SERIF_FONT_REL = "../fixtures/upstream/SourceSerif4-Regular.otf"
+SOURCE_SERIF_FONT = os.path.join(
+    ROOT, "tests", "fixtures", "upstream", "SourceSerif4-Regular.otf"
+)
+SOURCE_SERIF_VF_FONT_REL = "../fixtures/upstream/SourceSerif4Variable-Roman.otf"
+SOURCE_SERIF_VF_FONT = os.path.join(
+    ROOT, "tests", "fixtures", "upstream", "SourceSerif4Variable-Roman.otf"
+)
+SOURCE_SERIF_UPEM = 1000.0
+
 # CSS palette values used by the upstream tests.
 REBECCA_PURPLE = [102, 51, 153, 255]
 REBECCA_PURPLE_HALF = [102, 51, 153, 128]
@@ -266,6 +278,7 @@ def fill_run(
     style="fill",
     glyph_transform=None,
     hint=False,
+    font_rel=FONT_REL,
 ):
     return [
         {"op": "set_paint", "rgba8": color},
@@ -277,6 +290,7 @@ def fill_run(
             atlas_cache=cache,
             style=style,
             glyph_transform=glyph_transform,
+            font_rel=font_rel,
         ),
     ]
 
@@ -883,8 +897,126 @@ def main():
     noto.prepare(["✅👀🎉🤠"])
     write_colr_scenes(noto)
 
+    # CFF/CFF2 scenes (M3 CFF): Source Serif 4 static and variable faces.
+    write_cff_scenes()
+
     # G3e bitmap scenes (M3 T5).
     write_bitmap_scenes()
+
+
+# ---------------------------------------------------------------- CFF scenes
+
+
+def write_cff_scenes():
+    """CFF (static) and CFF2 (variable) runs with the Source Serif 4 faces.
+
+    CFF hinting is a typed error in the port, so every scene keeps `hint`
+    false; the outlines are cubic and exercise a different scaler than the
+    `glyf` scenes.
+    """
+    texts = ["Hello, world!", "CFF outlines: éàöüñç"]
+    cff = Layout(SOURCE_SERIF_FONT, SOURCE_SERIF_UPEM)
+    cff.prepare(texts)
+    cff2 = Layout(SOURCE_SERIF_VF_FONT, SOURCE_SERIF_UPEM)
+    cff2.prepare(texts)
+
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        write(
+            f"glyph_run_cff_source_serif_unhinted{suffix}_300x70.json",
+            scene(
+                300,
+                70,
+                fill_run(
+                    cff,
+                    "Hello, world!",
+                    50.0,
+                    50.0,
+                    REBECCA_PURPLE_HALF,
+                    cache,
+                    font_rel=SOURCE_SERIF_FONT_REL,
+                ),
+            ),
+        )
+        write(
+            f"glyph_run_cff2_source_serif_variable_unhinted{suffix}_300x70.json",
+            scene(
+                300,
+                70,
+                fill_run(
+                    cff2,
+                    "Hello, world!",
+                    50.0,
+                    50.0,
+                    REBECCA_PURPLE_HALF,
+                    cache,
+                    font_rel=SOURCE_SERIF_VF_FONT_REL,
+                ),
+            ),
+        )
+        # Stroking CFF outlines exercises the cubic path in the stroker.
+        write(
+            f"glyph_run_cff_source_serif_stroked_unhinted{suffix}_300x70.json",
+            scene(
+                300,
+                70,
+                [
+                    {"op": "set_paint", "rgba8": REBECCA_PURPLE_HALF},
+                    {"op": "set_stroke", "width": 1.0},
+                    {"op": "set_transform", "affine": translate(0.0, 50.0)},
+                    glyph_run(
+                        cff.run("Hello, world!", 50.0),
+                        50.0,
+                        atlas_cache=cache,
+                        style="stroke",
+                        font_rel=SOURCE_SERIF_FONT_REL,
+                    ),
+                ],
+            ),
+        )
+        # The uniform run scale is absorbed into the draw font size.
+        scaled_transform = mul(scale(2.0), translate(0.0, 25.0))
+        write(
+            f"glyph_run_cff_source_serif_scaled_unhinted{suffix}_150x125.json",
+            scene(
+                150,
+                125,
+                [
+                    {"op": "set_paint", "rgba8": REBECCA_PURPLE_HALF},
+                    {"op": "set_transform", "affine": scaled_transform},
+                    glyph_run(
+                        cff.run("Hello,\nworld!", 25.0),
+                        25.0,
+                        atlas_cache=cache,
+                        font_rel=SOURCE_SERIF_FONT_REL,
+                    ),
+                ],
+            ),
+        )
+        # CFF2 with a rotated run transform (direct mode).
+        write(
+            f"glyph_run_cff2_source_serif_variable_rotated_unhinted{suffix}_220x220.json",
+            scene(
+                220,
+                220,
+                [
+                    {"op": "set_paint", "rgba8": REBECCA_PURPLE_HALF},
+                    {
+                        "op": "set_transform",
+                        "affine": mul(
+                            translate(110.0, 110.0),
+                            mul(rotate(math.pi / 8.0), translate(-90.0, -10.0)),
+                        ),
+                    },
+                    glyph_run(
+                        cff2.run("CFF outlines: éàöüñç", 24.0),
+                        24.0,
+                        atlas_cache=cache,
+                        font_rel=SOURCE_SERIF_VF_FONT_REL,
+                    ),
+                ],
+            ),
+        )
 
 
 # ------------------------------------------------------------ bitmap scenes (M3 T5)
