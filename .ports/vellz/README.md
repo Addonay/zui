@@ -66,22 +66,27 @@ placement trace. T3 wires the stack end to end: positioned `glyph_run` scenes
 (fill/stroke, transform absorption, skew, glyph transforms, gradient paint)
 render through `vellz.glifo` + `vellz.cpu` byte-exact against the pinned
 oracle with the glyph atlas cache on and off (15 new scenes; 63/63 corpus,
-tolerance 0). The GPU side has the wgpu-native device bootstrap, the full
-host/shader layout contract, the schedule/layer executor, encoded paints
-(gradients and images), GPU filters, and a 44-scene `gpu-corpus` gate (27
-byte-exact, the rest within the documented per-scene tolerance registry, plus
-typed device-loss/unsupported-capability/missing-binding/feedback-loop errors)
+tolerance 0). T4 adds COLRv0/v1 + CPAL (paint-graph traversal, linear/radial/
+sweep gradients, transforms, clip boxes, composite modes, palette and
+foreground colors) and its 27-scene G3c corpus; all render byte-exact against
+the pinned oracle, atlas cache on and off (90/90 corpus, tolerance 0). The GPU
+side has the wgpu-native device bootstrap, the full host/shader layout
+contract, the schedule/layer executor, encoded paints (gradients and images),
+GPU filters, and a 44-scene `gpu-corpus` gate (27 byte-exact, the rest within
+the documented per-scene tolerance registry, plus typed
+device-loss/unsupported-capability/missing-binding/feedback-loop errors)
 running on the llvmpipe software adapter.
 
 Not yet implemented (explicit typed errors, never placeholder pixels): hinted
-outlines (the interpreter), COLR/CPAL, glyph decoration and the Cozmic adapter
-(M3 remainder); GPU layers/blends, gradients, images, filters, and the full G5
-corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
+outlines (the interpreter), bitmap glyphs, glyph decoration and the Cozmic
+adapter (M3 remainder); GPU masks, atlas-backed images, GPU text, and the full
+G5 corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
 SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage
 benchmarks in `docs/benchmarks.md` (u8-vs-f32 speedups 1.9–3.4× on the
 representative scenes). MT filter layers and u8 + MT return
 `error.Unsupported` (documented upstream limitations). See
 [`plan.md`](plan.md) for the ledgers and milestones.
+
 
 ## Layout
 

@@ -168,6 +168,8 @@ fixture.
 | unhinted glyph strokes | `glyph_run_stroked_unhinted_*`, `..._cache_*` |
 | transform composition rows (absorption, translate, rotate, skew, flips) | `glyph_run_transform_composition_unhinted_*` |
 | glyph run with gradient paint + paint transforms | `glyph_run_gradient_unhinted_300x180` |
+| COLRv1 Noto color emoji: identity, scale, rotate, non-uniform, overflow, stroke, composition rows | `glyph_run_colr_noto_*`, `glyph_run_colr_transform_composition_*` |
+| COLRv0/v1 color-fonts test glyph grid: all gradients, transform formats, composite modes, foreground colors | `glyph_run_colr_test_glyphs_*` |
 | upstream probe fixture | `tools/check_probe.sh` (`zig build probe`, embedded in `zig build test`) |
 
 The `*_speed` variants of the scenes above (16 scenes) are identical except for
@@ -178,11 +180,11 @@ They cover the u8-native gradient LUT and bilinear painters, the f32-painter
 `paintU8` conversion (nearest/bicubic images and undefined radial gradients),
 and the integer blend/composite/mask paths.
 
-All scenes above render byte-exact with `zig build corpus` (63/63,
-`tolerance=0`: 32 quality/f32 + 16 speed/u8 + 15 glyph). The f32 and u8
-pipelines are not byte-equal to each other in general (integer `div_255`
-rounding vs f32); the corpus compares each pipeline against its own oracle
-output, never against the other pipeline.
+All scenes above render byte-exact with `zig build corpus` (90/90,
+`tolerance=0`: 32 quality/f32 + 16 speed/u8 + 15 outline glyph + 27 COLR). The
+f32 and u8 pipelines are not byte-equal to each other in general (integer
+`div_255` rounding vs f32); the corpus compares each pipeline against its own
+oracle output, never against the other pipeline.
 
 ### Glyph corpus (M3 T3)
 
@@ -196,12 +198,59 @@ above. Every case is committed twice, with `atlas_cache` off and
 on; both are byte-exact against the pinned oracle (`tolerance=0`), including
 the subpixel-bucket / atlas-page sampling path.
 
-Hinted scenes (upstream's default `hint(true)`) and COLR scenes are absent on
-purpose: the hinting interpreter and COLR/CPAL are deferred with typed
-`error.Unsupported` (see `docs/cpu-pipeline.md`). Upstream allows a 55-pixel
-tolerance for one COLR test glyph; because COLR is not in this corpus, no
-tolerance is claimed or used. G3b (hinted) and G3c (COLR) land with their
-respective ports.
+Hinted scenes (upstream's default `hint(true)`) are absent on purpose: the
+hinting interpreter/autohinter is deferred with a typed `error.Unsupported`
+(see `docs/cpu-pipeline.md`). G3b (hinted) lands with that port.
+
+### COLR corpus (M3 T4 / G3c)
+
+`tests/scenes/glyph_run_colr_*` cover the COLR/CPAL pipeline on two fonts:
+
+- `NotoColorEmoji-Subset.ttf` (COLRv1 layers, solid fills, linear/radial
+  gradients, glyph clips and transforms) mirrors upstream `glyphs_colr_noto*`
+  and `glyphs_transform_composition_rows_colr` -- identity, scale 2x/0.5,
+  rotated, rotated+scaled, non-uniform, rotated+non-uniform, overflow-centered
+  and the 13 transform-composition rows -- each committed with `atlas_cache`
+  off and on. Upstream's "stroked" case actually renders a fill; the corpus
+  commits that fill *and* a real `style: "stroke"` run, gating the COLR
+  stroke-to-fill delegation.
+- `test_glyphs-glyf_colr_1.ttf` mirrors `glyphs_colr_test_glyphs`: every COLR
+  glyph in a 10-column grid plus the blue/green foreground-color rows,
+  covering COLRv0 layers, all gradient types (linear/radial/sweep), every
+  transform format (transform, translate, scale, scale-around-center, uniform
+  scale, rotate, skew and their around-center variants) and all 28 composite
+  modes, including layer isolation for non-default blending.
+
+Hinting is forced off (`hint(false)`) because the interpreter/autohinter is
+G3b; upstream already disables it for the Noto COLR scenes, and its test-font
+scene uses integer translations for which the hinted and unhinted COLR
+transforms agree.
+
+Every COLR scene is byte-exact against the pinned oracle at `tolerance=0`
+(`--max-abs-diff 0 --max-diff-pixels 0`) with the atlas cache off and on. The
+test-font scene measures **0 differing pixels / 384000**; upstream's own test
+macro allows a 55-pixel CPU/GPU gap, which vellz closes exactly. Cache-on
+determinism holds: the `_cache` scenes render identical bytes to the uncached
+scenes and to repeated runs.
+
+Cache-on vs cache-off: upstream's own note that "the cached versions of COLR
+glyphs seem to have a slight shift" is observable in the oracle fixtures. The
+`_cache` scenes reproduce that shift byte-for-byte instead of diverging, for
+example `glyph_run_colr_noto_250x70` differs from its uncached pair in
+1723 / 17500 pixels (max channel diff 151), `..._scaled_2x_500x140` in
+3305 / 70000 (max 100) and `..._transform_composition_210x410` in
+5759 / 86100 (max 255); the rotated scenes, whose transforms cannot be
+atlas-cached (skew), differ in 0 pixels. Every scene is compared against the
+oracle for its own `atlas_cache` setting, and `tools/render_corpus.sh` checks
+that repeated oracle runs are byte-identical, so cache-on determinism is
+gated on both sides.
+
+The gate caught one geometry-relevant upstream subtlety now pinned by a unit
+test: traversal pushes the COLR clip box of *every* nested `PaintColrGlyph`,
+not only the root glyph's. Dropping the nested clip boxes made a backdrop
+cover the whole glyph area and left 580 differing pixels in the test-font
+scene; `colr.zig`'s composite-order test asserts the three clip boxes of
+glyph 156 (root, 166, 95) and the backdrop-then-source draw order.
 
 ## Multithreaded dispatch
 
@@ -215,5 +264,5 @@ committed scenes with `"threads": 4` and comparing against the same fixtures
 byte-for-byte. MT filter layers and u8 + MT return typed `error.Unsupported`
 (documented upstream limitations, never a silent fallback).
 
-Planned: hinted glyph outlines (G3b), COLR/CPAL (G3c), glyph decoration,
-mixed scripts, resource exhaustion, repeated resize.
+Planned: hinted glyph outlines (G3b), bitmap (CBDT/CBLC/sbix) glyphs, glyph
+decoration (T5), mixed scripts, resource exhaustion, repeated resize.

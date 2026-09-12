@@ -1,8 +1,8 @@
 //! `vellz.glifo` — glyph outline loading and run rendering for text.
 //!
 //! Port of `glifo 0.3.0` (`font.zig`, `glyf.zig`, `outline_cache.zig`,
-//! `util.zig`, `glyph.zig`, `renderer.zig` and `atlas/*`), staged per
-//! `.ports/vellz/docs/glifo-m3-plan.md` tasks T2/T3. The module is
+//! `util.zig`, `glyph.zig`, `renderer.zig`, `colr.zig` and `atlas/*`), staged
+//! per `.ports/vellz/docs/glifo-m3-plan.md` tasks T2/T3/T4. The module is
 //! self-contained: it borrows a font blob, parses the small sfnt subset, and
 //! produces `vellz.kurbo` path elements that are **bit-identical** to the
 //! pinned upstream `PathStyle::FreeType` output.
@@ -23,8 +23,10 @@
 //!   upstream's `maintain()`/`clear()` eviction policy.
 //! - `glyph` — `Glyph`, `GlyphRun`, `GlyphRunBuilder`, `GlyphRunRenderer`,
 //!   `GlyphPrepCache`, transform absorption (`prepareGlyphRun`) and the
-//!   outline draw loop; `renderer` — atlas-first fill/stroke, cached glyph
-//!   sampling and command replay; `atlas` — `GlyphAtlas`/`GlyphCacheKey`/
+//!   COLR > bitmap > outline draw loop; `colr` — the COLRv0/COLRv1 paint graph
+//!   traversal (`skrifa` color subset) and `ColrPainter`; `renderer` —
+//!   atlas-first fill/stroke, cached glyph sampling, COLR atlas recording and
+//!   command replay; `atlas` — `GlyphAtlas`/`GlyphCacheKey`/
 //!   `AtlasCommandRecorder`/`ImageCache`; `interface` — the comptime
 //!   `DrawSink`/`GlyphRenderer` duck-typing contracts.
 //! - `NormalizedCoord = i16` and `FontEmbolden` — carried in cache keys for
@@ -41,9 +43,11 @@
 //!
 //! Hinting (`HintingInstance`, interpreter), autohinting, `gvar`/`HVAR`/`avar`
 //! variation deltas (any non-empty coords), CFF/CFF2, CBDT/CBLC/sbix bitmaps,
-//! COLR/CPAL, synthetic embolden and decoration are all `error.Unsupported`.
-//! None are approximated; fonts carrying COLR/bitmap tables reject the whole
-//! run instead of silently dropping glyphs.
+//! synthetic embolden and decoration are all `error.Unsupported`. None are
+//! approximated; fonts carrying bitmap tables reject the whole run instead of
+//! silently dropping a glyph that could fall back to a bitmap. COLRv0/COLRv1
+//! (T4) is ported, including gradients, transforms, clip boxes and composite
+//! modes.
 //!
 //! # Oracle comparison
 //!
@@ -66,6 +70,7 @@ pub const dump = @import("dump.zig");
 pub const atlas = @import("atlas/root.zig");
 pub const interface = @import("interface.zig");
 pub const glyph = @import("glyph.zig");
+pub const colr = @import("colr.zig");
 pub const renderer = @import("renderer.zig");
 
 pub const FontData = font.FontData;
@@ -103,6 +108,8 @@ pub const GlyphScaleProperties = glyph.GlyphScaleProperties;
 pub const DrawProps = glyph.DrawProps;
 pub const PreparedGlyph = glyph.PreparedGlyph;
 pub const GlyphOutline = glyph.GlyphOutline;
+pub const GlyphColr = glyph.GlyphColr;
+pub const GlyphType = glyph.GlyphType;
 pub const GlyphSliceIterator = glyph.GlyphSliceIterator;
 pub const iterate = glyph.iterate;
 pub const prepareGlyphRun = glyph.prepareGlyphRun;
@@ -136,5 +143,6 @@ test {
     _ = atlas;
     _ = interface;
     _ = glyph;
+    _ = colr;
     _ = renderer;
 }

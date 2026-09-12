@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "width": 100,
+  "height": 100,
+  "settings": {
+    "mode": "quality",
+    "threads": 0,
+    "level": "fallback"
+  },
+  "target_init": "clear",
+  "commands": [
+    {
+      "op": "set_paint",
+      "rgba8": [
+        0,
+        0,
+        0,
+        255
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/NotoColorEmoji-Subset.ttf",
+        "index": 0
+      },
+      "font_size": 150.0,
+      "hint": false,
+      "atlas_cache": true,
+      "style": "fill",
+      "glyphs": [
+        {
+          "id": 4,
+          "x": -25.0,
+          "y": 125.0
+        }
+      ]
+    }
+  ]
+}

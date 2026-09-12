@@ -281,11 +281,17 @@ pub fn RenderContext.glyphRun(self, resources, font) GlyphRunBuilder;
   of upstream's fixed-seed `foldhash`. Eviction/iteration order can differ;
   pixels cannot, because atlas slots are disjoint and sampled at integer
   offsets.
+- COLRv0/v1 + CPAL (T4) is ported: the paint graph is traversed in font units
+  (`glifo/src/colr.rs` plus the `skrifa` color subset in `glifo/colr.zig`) and
+  drawn through the same `DrawSink` surface, directly or into the glyph atlas.
+  Palette-indexed and foreground colors, gradients, transforms, clip boxes and
+  composite modes match upstream; `AtlasPaint::Gradient` is recorded with owned
+  stops that replay/clear frees.
 - Deferred with typed errors, never approximated: hinting interpreter/autohint
   (an eligible hinted run fails up front), `gvar`/`HVAR` coordinates, CFF/CFF2,
-  CBDT/CBLC/sbix bitmaps, COLR/CPAL and decoration. A font carrying a
-  COLR/CBDT/CBLC/sbix table rejects the whole run with `error.Unsupported`
-  instead of silently dropping the color/bitmap representation.
+  CBDT/CBLC/sbix bitmaps and decoration. A font carrying a bitmap table
+  rejects the whole run with `error.Unsupported` instead of silently dropping a
+  glyph that could fall back to a bitmap.
 
 ## Error policy
 

@@ -12,6 +12,8 @@ pub const hmtx = @import("hmtx.zig");
 pub const loca = @import("loca.zig");
 pub const glyf = @import("glyf.zig");
 pub const cmap = @import("cmap.zig");
+pub const colr = @import("colr.zig");
+pub const cpal = @import("cpal.zig");
 
 pub const Head = head.Head;
 pub const Maxp = maxp.Maxp;
@@ -19,6 +21,8 @@ pub const Hhea = hhea.Hhea;
 pub const Hmtx = hmtx.Hmtx;
 pub const Loca = loca.Loca;
 pub const Charmap = cmap.Charmap;
+pub const Colr = colr.Colr;
+pub const Cpal = cpal.Cpal;
 
 test {
     _ = sfnt;
@@ -29,4 +33,6 @@ test {
     _ = loca;
     _ = glyf;
     _ = cmap;
+    _ = colr;
+    _ = cpal;
 }

@@ -230,10 +230,10 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 
 | Upstream module | Zig target | Status | Notes |
 | --- | --- | --- | --- |
-| `lib.rs`, `interface.rs` (Glyph, DrawSink, GlyphRenderer) | `glifo/root.zig`, `glifo/interface.zig` | port | comptime duck-typing contracts + `assert*` helpers; COLR/bitmap-specific methods deferred |
-| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | outline subset: run builder, transform absorption, prep cache, draw loop; hinting/embolden/coords/COLR/bitmap/decoration -> typed `error.Unsupported` |
-| `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline fill/stroke, subpixel keys, command replay, raster metrics; COLR/bitmap paths deferred |
-| `colr.rs` (COLR/CPAL painting) | `glifo/colr.zig` | defer | M3 T4 |
+| `lib.rs`, `interface.rs` (Glyph, DrawSink, GlyphRenderer) | `glifo/root.zig`, `glifo/interface.zig` | port | comptime duck-typing contracts + `assert*` helpers |
+| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, COLR > bitmap > outline draw loop, COLR metrics; hinting/embolden/coords/bitmap/decoration -> typed `error.Unsupported` |
+| `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline/COLR fill/stroke, subpixel keys, COLR command recording, command replay, raster metrics; bitmap paths deferred |
+| `colr.rs` (COLR/CPAL painting) + `skrifa/src/color/*` | `glifo/colr.zig`, `glifo/tables/{colr,cpal}.zig` | port | COLRv0/v1 paint graph, gradients, transforms, clip boxes, composite modes, palette/foreground colors (M3 T4) |
 | `atlas/*` (cache, keys, regions, commands) | `glifo/atlas/*.zig` | port | cache/eviction, fixed-seed key hashing, recorder + replay; variable-font second-level map deferred with `gvar` |
 | `util.rs` | `glifo/util.zig` | port | T2 |
 
@@ -790,10 +790,12 @@ of panics, thread ownership).
   atlas cache toggle) and `tools/gen_glyph_scenes.py` generates 15 G3a scenes
   mirroring `vello_tests/tests/glyph.rs`. Gate: all 15 scenes byte-exact
   against the pinned oracle with the atlas cache off and on (`tolerance=0`);
-  corpus 63/63. Hinting, embolden, variation, COLR/bitmap and decoration
-  remain typed `error.Unsupported`. `zig build test` = 756/756
-  (748 lib + 8 scene), also green in ReleaseSafe; `zig build corpus` =
-  63/63 byte-exact in Debug/ReleaseSafe/ReleaseFast.
+  corpus 63/63. Hinting, embolden, variation, bitmap and decoration remain
+  typed `error.Unsupported`. T4 ports COLRv0/v1 + CPAL with 27 new G3c scenes
+  (Noto Color Emoji + the color-fonts test font: gradients, transforms, clip
+  boxes, all composite modes, cache on/off), all byte-exact at
+  `--max-abs-diff 0 --max-diff-pixels 0`; corpus 90/90, `zig build test` =
+  799/799 (791 lib + 8 scene), also green in ReleaseSafe.
 - 2026-09-12 (branch `vellz-simd`): **M4 remainder landed; G4 MET.** Added
   real SIMD backends behind the runtime `simd.Level` dispatch
   (`Level.detect`/`fromName`, `dispatch()` mirroring `fearless_simd::dispatch!`,
