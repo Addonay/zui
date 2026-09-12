@@ -212,9 +212,9 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | --- | --- | --- | --- |
 | `render/common.rs` (Config, GpuStrip, clear/encoded paint structs, packing) | `gpu/render/common.zig` | port | 8 layout/packing tests run in the default `zig build test`; comptime `@sizeOf`/`@offsetOf` asserts match `docs/shader-interface.md` §4 |
 | `render/wgpu/mod.rs` (device bootstrap/readback/clear subset) | `gpu/backend/{device,wgpu,readback}.zig` | partial | T1: instance/adapter/device/queue, error scopes, uncaptured/device-lost capture, limits, adapter-info printing, texture readback; `run-gpu-smoke` passes offscreen on lavapipe (all handles released, zero validation errors) |
-| `render/wgpu/mod.rs` (Programs, pipelines, resources, root passes) | `gpu/backend/{wgpu,renderer}.zig` | conn | T3/T4 + schedule: shader modules from checked-in WGSL, bind-group layouts for render groups 0–3 + filter/blend/copy, four 24-B strip pipelines, layer/root/atlas clear, copy/blend/filter passes, per-target `Config` uniforms, `Rgba32Uint` uploads (256-B rows), encoded-paints/gradient/filter-data textures, external-texture runs, and a schedule executor over per-frame texture pages. Evidence: `-Dgpu=true test` 787/787, `gpu-corpus` 44/44 gated scenes |
-| `draw.rs`, `scene.rs` | `gpu/draw.zig`, `gpu/scene.zig` | port | solid + indexed paints (gradients, images, blurred rounded rects) via `common.encode`, layers (clip/blend/opacity/filter) and implicit per-draw filter/blend layers, clips, transforms, tints, fast-rect CPU-bbox emulation; mask layers typed `error.Unsupported` (upstream GPU has no mask path) |
-| `schedule/*` | `gpu/schedule/{allocate,mod}.zig` | port (adapted) | M5 T5: guillotiere atlas pages with filter padding, lazy bottom-up layer allocation and release clears, scratch-texture accounting, blend/filter/clear ops in dependency order. The round/stage batching is unnecessary here because each op opens its own render pass; documented in the module header |
+| `render/wgpu/mod.rs` (Programs, pipelines, resources, root passes) | `gpu/backend/{wgpu,renderer}.zig` | port | shader modules from checked-in WGSL (+ the local `mask.wgsl`), bind-group layouts for render groups 0–3 + filter/blend/copy/mask, four 24-B strip pipelines, layer/root/atlas clear, copy/blend/filter/mask passes, per-target `Config` uniforms, `Rgba32Uint` uploads (256-B rows), encoded-paints/gradient/filter-data textures, external-texture runs, persistent image-atlas textures with `render_to_atlas` glyph-page replay, and a schedule executor over per-frame texture pages. Evidence: `-Dgpu=true` tests green, `gpu-corpus` 75/75 gated scenes |
+| `draw.rs`, `scene.rs` | `gpu/draw.zig`, `gpu/scene.zig` | port | solid + indexed paints (gradients, images, blurred rounded rects) via `common.encode`, layers (clip/blend/opacity/filter/mask) and implicit per-draw filter/blend layers, clips, transforms, tints, fast-rect CPU-bbox emulation. Mask layers are the documented local adapt (`gpu/mask.zig` + a dedicated multiply pass); upstream `vello_gpu` panics on them |
+| `schedule/*` | `gpu/schedule/{allocate,mod}.zig` | port (adapted) | M5 T5: guillotiere atlas pages with filter padding, lazy bottom-up layer allocation and release clears, scratch-texture accounting, blend/filter/mask/clear ops in dependency order. The round/stage batching is unnecessary here because each op opens its own render pass; documented in the module header |
 | `target.rs` | `gpu/target.zig` | port | Root/layer targets, parity, blend/filter bindings, texture regions (T4) |
 | `util.rs` | `gpu/util.zig` | port | packing helpers + `Ranges`/`RangedSlice` (T4) |
 | `copy.rs` | `gpu/copy.zig` | port | `GpuCopyInstance` (16 B) + packing test |
@@ -222,7 +222,7 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `filter.rs` | `gpu/filter.zig` | port | 48-byte blocks, `FilterInstanceData` (36 B), `PreparedFilter` → Gpu* conversions, `FilterContext` (offsets + serialization), `FilterPassPlan` blur/shadow step sequences |
 | `paint.rs`, `rect.rs` | `gpu/paint.zig`, `gpu/rect.zig` | port | solid + indexed paint packing, external-image texture sources, `prepare_gpu_encoded_paints` (offsets + `Rgba32Uint` data), full `split_rect` |
 | `gradient_cache.rs` | `gpu/gradient_cache.zig` | port (adapted) | packed RGBA8 gradient LUTs deduplicated by `GradientCacheKey`; per-render cache, no LRU eviction (documented) |
-| `resources.rs`, `text.rs` | `gpu/resources.zig`, `gpu/text.zig` | defer | image atlas uploads (`ImageSource.opaque_id`) and text; typed `error.Unsupported` today |
+| `resources.rs`, `text.rs` | `gpu/resources.zig`, `gpu/text.zig` | port | persistent `Resources` (image atlas cache + `GlyphPrepCache` + lazy page-sized glyph `Scene`), `ImageSource.opaque_id` resolution with atlas upload, `SceneSink` (`DrawSink`/`GlyphRenderer`) and `HybridGlyphRunBackend`; pixmap image sources (uncached bitmap glyphs) are uploaded through an erased uploader instead of upstream's panic |
 | `render/webgl/*` | — | unsup | WebGL out of scope |
 | WGSL shaders | `gpu/shaders/generated.zig` | port | checked-in compiled WGSL; all five modules create successfully on lavapipe; clear + render drive the smoke and root corpus |
 
@@ -359,7 +359,7 @@ Recorded from the pinned READMEs/source; each entry states impact and handling.
 | --- | --- |
 | `vello_cpu`: complex filter graphs panic; filters unsupported in multithreaded mode | typed `error.Unsupported`; no silent skip |
 | `vello_cpu`: glyph caching marked experimental | port the cache behind the explicit contract; keep uncached path correct first |
-| `vello_gpu`: mask layers, complex filter graphs, some non-isolated blends panic | typed errors; document unsupported cases in the feature matrix |
+| `vello_gpu`: mask layers, complex filter graphs, some non-isolated blends panic | masks implemented as a documented adapt (independent multiply pass + `mask.wgsl`); the rest are typed errors documented in the feature matrix |
 | `vello_gpu`: some failures panic (no `Result`) | Zig API returns errors; panic only on programmer misuse |
 | Rust wgpu badge says 29.0.1 while Cargo.lock uses 29.0.3 | record actual lock version 29.0.3; wgpu-native core matches 29.0.3 |
 | `vello_toy debug` default `--stages` contains invalid `ti` | pass stages explicitly in oracle scripts |
@@ -993,3 +993,26 @@ of panics, thread ownership).
   stroked/scaled/skewed/decoration scenes, 2 for COLR Noto scenes, and 2 for
   the bitmap scenes (non-cache bitmap now renders through an automatic atlas
   upload).
+- 2026-09-12: **M5 masks + GPU corpus extension landed** (branch `vellz-gpures`,
+  second checkpoint). Upstream `vello_gpu` panics on mask layers, so masks are
+  a documented adapt: `Scene.pushLayer`/`pushMaskLayer` retain scene-sized
+  masks (mismatched ones are dropped exactly like the CPU renderer),
+  `gpu/schedule` plans a `MaskOp` after the layer's draws/filter and requires
+  the scratch texture, and `backend/renderer.zig::executeMask` uploads the mask
+  into an `Rgba8Unorm` texture, multiplies the layer allocation into the
+  scratch texture with the new hand-written `shaders/mask.wgsl` (`textureLoad`
+  nearest, scene-coordinate sampling, out-of-mask transparent), and copies the
+  result back with the existing copy pass before composition. `gpu/mask.zig`
+  holds the 24-byte instance with comptime layout asserts. `tools/gpu_render.zig`
+  loads masks through the same nearest resample as `vellz-cli` (also for filter
+  layers). `tools/gpu_corpus.sh` grows from 44 to **75 gated scenes**: the three
+  mask scenes, 28 representative glyph scenes (filled/hinted/stroked/scaled/
+  skewed/transform/decoration/composite/gradient/COLR Noto/bitmap, atlas cache
+  on/off), plus the existing 44. Measured on llvmpipe: masks max-abs 1
+  (`mask_alpha_64_speed` max 2), outline/hinted/stroked/decoration glyphs
+  max-abs 1, COLR Noto and uncached bitmap max-abs 2; the two
+  `glyph_run_colr_test_glyphs_*` scenes stay ungated with recorded metrics
+  (max-abs 5 at 2362/2347 px) and `image_bicubic_64_speed` remains ungated
+  (max-abs 9). Evidence: `zig build test` green (879/879 across the four
+  steps), 108/108 CPU corpus byte-exact, `zig build -Dgpu=true check` green,
+  `gpu-corpus` 75/75 on llvmpipe.

@@ -195,3 +195,27 @@ by the library (`Features::empty()`, only `max_texture_dimension_2d` is read).
 6. `textureLoad` vs sampling semantics: alphas/paints/filter data use
    `textureLoad` (no filtering); only the filter input sampler and gradient
    texture filter.
+
+## 8. Local mask pass (M5 adapt)
+
+Upstream `vello_gpu` has no mask sampling path (mask layers panic), so this
+port adds one local shader, `src/gpu/shaders/mask.wgsl`: the layer allocation
+is multiplied by an uploaded mask texture into the shared scratch texture and
+copied back with the existing copy pipeline before the layer is composited
+(`backend/renderer.zig::executeMask`). The bound WGSL is checked in and
+embedded like the pinned modules.
+
+- Bind group 0: binding 0 = layer source texture (`UnfilterableFloat`),
+  binding 1 = mask texture (`UnfilterableFloat`, the mask byte replicated in
+  every channel). No uniform; the target size travels per instance.
+- Vertex layout: 24-byte stride, six `Uint32` instance attributes at shader
+  locations 0–5 (`GpuMaskInstance`): `geometry_origin`, `geometry_size`,
+  `source_origin`, `scene_origin`, `mask_size`, `texture_size` (all packed
+  `u16` pairs, x in the low 16 bits).
+- Pipeline: `TriangleStrip`, `Rgba8Unorm` target, no blend, no depth.
+- Sampling: `textureLoad` (nearest) for both source and mask; the mask sample
+  coordinate is `scene_origin + local` (scene pixel coordinates, exactly like
+  the CPU `SampledMaskIter`), and out-of-mask samples are transparent black.
+- Ordering: mask runs after the layer's draws and filter, before composition
+  and the layer's release clear; `src/gpu/schedule/mod.zig` emits the mask op
+  and requires the scratch texture.

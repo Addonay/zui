@@ -209,7 +209,7 @@ pub fn main(init: std.process.Init) !void {
                 defer resetScratch(allocator, &scratch_path);
                 try gpu.pushClipLayer(scratch_path.elements.items);
             },
-            .push_layer => |spec| try pushLayerSpec(allocator, &gpu, &scratch_path, spec),
+            .push_layer => |spec| try pushLayerSpec(allocator, io, scene_dir, &gpu, &scratch_path, spec),
             .pop_layer => try gpu.popLayer(),
             .set_filter_effect => |filter_spec| gpu.setFilterEffect(try filterFromSpec(allocator, filter_spec)),
             .reset_filter_effect => gpu.resetFilterEffect(),
@@ -311,10 +311,12 @@ fn filterFromSpec(allocator: std.mem.Allocator, spec: scene_mod.FilterSpec) !com
 
 /// Map a layer spec onto the GPU scene's layer stack.
 ///
-/// Mask layers are unsupported by the GPU render pipeline and fail with a
-/// typed error (no approximation).
+/// Masks are loaded, nearest-resampled to the scene dimensions (exactly like
+/// `vellz-cli`), and applied by the GPU mask adapt.
 fn pushLayerSpec(
     allocator: std.mem.Allocator,
+    io: std.Io,
+    scene_dir: []const u8,
     gpu: *gpu_scene.Scene,
     scratch: *kurbo.BezPath,
     spec: scene_mod.LayerSpec,
@@ -327,12 +329,16 @@ fn pushLayerSpec(
         },
         .blend => |blend| try gpu.pushBlendLayer(blendFromSpec(blend)),
         .opacity => |opacity| try gpu.pushOpacityLayer(@floatCast(opacity)),
-        .mask => {
-            std.debug.print(
-                "vellz-gpu-render: mask layers are not supported by the GPU render pipeline\n",
-                .{},
+        .mask => |mask_spec| {
+            const mask = try loadMask(
+                allocator,
+                io,
+                scene_dir,
+                mask_spec,
+                gpu.sceneWidth(),
+                gpu.sceneHeight(),
             );
-            return error.Unsupported;
+            try gpu.pushMaskLayer(mask);
         },
         .filter => |filter_spec| {
             const filter = try filterFromSpec(allocator, filter_spec.filter);
@@ -348,15 +354,23 @@ fn pushLayerSpec(
             else
                 null;
             const opacity: ?f32 = if (filter_spec.opacity) |value| @floatCast(value) else null;
-            if (filter_spec.mask != null) {
-                std.debug.print(
-                    "vellz-gpu-render: mask layers are not supported by the GPU render pipeline\n",
-                    .{},
-                );
-                filter.deinit(allocator);
-                return error.Unsupported;
+            var mask: ?common.mask.Mask = null;
+            if (filter_spec.mask) |mask_spec| {
+                mask = loadMask(
+                    allocator,
+                    io,
+                    scene_dir,
+                    mask_spec,
+                    gpu.sceneWidth(),
+                    gpu.sceneHeight(),
+                ) catch |err| {
+                    filter.deinit(allocator);
+                    return err;
+                };
             }
-            try gpu.pushLayer(clip_elements, blend, opacity, null, filter);
+            // `pushLayer` takes ownership of both `filter` and `mask` on
+            // success and releases them itself on error.
+            try gpu.pushLayer(clip_elements, blend, opacity, mask, filter);
         },
     }
 }
@@ -554,6 +568,62 @@ fn loadRawPixmap(
     };
     const metadata = vellz.common.pixmap.PixelMetadata.new(peniko_alpha, true);
     return vellz.common.pixmap.Pixmap.fromParts(allocator, bytes, spec.width, spec.height, metadata);
+}
+
+/// Load a mask asset and nearest-resample it to the scene dimensions, exactly
+/// like `tools/vellz_cli.zig` (the GPU scene drops mismatched masks).
+fn loadMask(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scene_dir: []const u8,
+    mask_spec: scene_mod.MaskSpec,
+    width: u16,
+    height: u16,
+) !common.mask.Mask {
+    var source = try loadRawPixmap(allocator, io, scene_dir, .{
+        .asset = mask_spec.asset,
+        .width = mask_spec.width,
+        .height = mask_spec.height,
+        .format = mask_spec.format,
+        .alpha_type = mask_spec.alpha_type,
+        .sampler = .{
+            .x_extend = .pad,
+            .y_extend = .pad,
+            .quality = .low,
+            .alpha = 1.0,
+        },
+    });
+    defer source.deinit(allocator);
+
+    var resampled = try resizeNearest(allocator, &source, width, height);
+    defer resampled.deinit(allocator);
+
+    return switch (mask_spec.kind) {
+        .alpha => try common.mask.Mask.newAlpha(allocator, &resampled),
+        .luminance => try common.mask.Mask.newLuminance(allocator, &resampled),
+    };
+}
+
+/// Nearest-neighbor resample (mirrors `tools/vellz_cli.zig`).
+fn resizeNearest(
+    allocator: std.mem.Allocator,
+    src: *const common.pixmap.Pixmap,
+    width: u16,
+    height: u16,
+) !common.pixmap.Pixmap {
+    var out = try common.pixmap.Pixmap.init(allocator, width, height);
+    errdefer out.deinit(allocator);
+
+    var y: u16 = 0;
+    while (y < height) : (y += 1) {
+        const sy: u16 = @intCast((@as(u32, y) * src.height) / height);
+        var x: u16 = 0;
+        while (x < width) : (x += 1) {
+            const sx: u16 = @intCast((@as(u32, x) * src.width) / width);
+            out.setPixel(x, y, src.sample(sx, sy));
+        }
+    }
+    return out;
 }
 
 fn parseSvg(

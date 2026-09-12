@@ -18,9 +18,11 @@ const device = @import("device.zig");
 const wgpu_backend = @import("wgpu.zig");
 
 const blend_mod = @import("../blend.zig");
+const copy_mod = @import("../copy.zig");
 const draw_mod = @import("../draw.zig");
 const filter_mod = @import("../filter.zig");
 const gradient_cache = @import("../gradient_cache.zig");
+const mask_mod = @import("../mask.zig");
 const paint = @import("../paint.zig");
 const resources_mod = @import("../resources.zig");
 const schedule_mod = @import("../schedule/mod.zig");
@@ -804,6 +806,9 @@ pub const Renderer = struct {
                 .clear => |clear_op| {
                     try self.executeClear(encoder, &frame, clear_op);
                 },
+                .mask => |mask_op| {
+                    try self.executeMask(encoder, &frame, mask_op);
+                },
             }
         }
 
@@ -999,6 +1004,115 @@ pub const Renderer = struct {
                 "vellz-filter-pass",
             );
         }
+    }
+
+    /// Execute a scheduled mask multiply (local M5 mask adapt): multiply the
+    /// layer region by the mask into the scratch texture, then copy the
+    /// result back into the layer.
+    fn executeMask(
+        self: *Renderer,
+        encoder: c.WGPUCommandEncoder,
+        frame: *Frame,
+        mask_op: schedule_mod.MaskOp,
+    ) Error!void {
+        const rect = mask_op.region.texture.rect;
+        if (rect.isEmpty()) return;
+        const mask = mask_op.mask;
+        const mask_width = mask.width();
+        const mask_height = mask.height();
+        if (mask_width == 0 or mask_height == 0) return;
+        const scratch = frame.scratch orelse return error.Unsupported;
+
+        const mask_view = try self.createMaskTexture(frame, mask);
+        const mask_bind_group = try wgpu_backend.createMaskBindGroup(
+            self.dev,
+            self.layouts.mask,
+            frame.pageView(mask_op.region.texture.target),
+            mask_view,
+        );
+        try frame.track(.{ .bind_group = mask_bind_group });
+
+        const texture_size = geometry.SizeU16.new(@intCast(self.resource_dim));
+        const instance = mask_mod.GpuMaskInstance.fromRegion(
+            mask_op.region,
+            .{ mask_width, mask_height },
+            texture_size,
+        );
+        try wgpu_backend.encodeMaskPass(
+            self.dev,
+            encoder,
+            self.pipelines.mask,
+            mask_bind_group,
+            &.{instance},
+            scratch.view,
+            "vellz-mask-pass",
+        );
+
+        // Copy the masked region back into the layer allocation.
+        const copy_instance = copy_mod.GpuCopyInstance.new(
+            .{ rect.x0, rect.y0 },
+            .{ rect.x0, rect.y0 },
+            .{ rect.width(), rect.height() },
+            .{ texture_size.width(), texture_size.height() },
+        );
+        const copy_bind_group = try wgpu_backend.createCopySourceBindGroup(
+            self.dev,
+            self.layouts.copy,
+            scratch.view,
+        );
+        try frame.track(.{ .bind_group = copy_bind_group });
+        try wgpu_backend.encodeCopyPass(
+            self.dev,
+            encoder,
+            self.pipelines.copy,
+            &.{copy_instance},
+            copy_bind_group,
+            frame.pageView(mask_op.region.texture.target),
+            "vellz-mask-copy-back",
+        );
+    }
+
+    /// Upload a mask into an `Rgba8Unorm` texture (the value is replicated in
+    /// every channel so any channel can be sampled).
+    fn createMaskTexture(
+        self: *Renderer,
+        frame: *Frame,
+        mask: *const common.mask.Mask,
+    ) Error!c.WGPUTextureView {
+        const width = mask.width();
+        const height = mask.height();
+        const texture = try wgpu_backend.createTexture2d(
+            self.dev,
+            width,
+            height,
+            c.WGPUTextureFormat_RGBA8Unorm,
+            c.WGPUTextureUsage_TextureBinding | c.WGPUTextureUsage_CopyDst,
+            "vellz-mask",
+        );
+        errdefer c.wgpuTextureRelease(texture);
+        const view = try wgpu_backend.createFullView(
+            texture,
+            c.WGPUTextureFormat_RGBA8Unorm,
+            "vellz-mask-view",
+        );
+        errdefer c.wgpuTextureViewRelease(view);
+
+        const pixel_count = @as(usize, width) * @as(usize, height);
+        const data = self.allocator.alloc(u8, pixel_count * 4) catch return error.OutOfMemory;
+        defer self.allocator.free(data);
+        const values = mask.values();
+        std.debug.assert(values.len == pixel_count);
+        for (values, 0..) |value, index| {
+            data[index * 4 + 0] = value;
+            data[index * 4 + 1] = value;
+            data[index * 4 + 2] = value;
+            data[index * 4 + 3] = value;
+        }
+        try wgpu_backend.writeRgba8(self.dev, texture, data, width, height);
+
+        try frame.track(.{ .texture = texture });
+        try frame.track(.{ .view = view });
+        return view;
     }
 
     /// Clear one scheduled region back to transparent.

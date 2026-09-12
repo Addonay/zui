@@ -25,6 +25,7 @@ const device = @import("device.zig");
 const shaders = @import("../shaders/generated.zig");
 const common = @import("../render/common.zig");
 const filter_mod = @import("../filter.zig");
+const mask_mod = @import("../mask.zig");
 const common_util = @import("../../common/util.zig");
 
 pub const Error = device.Error || error{
@@ -156,6 +157,9 @@ pub const Layouts = struct {
     blend: c.WGPUBindGroupLayout,
     /// Copy group 0: unfilterable source.
     copy: c.WGPUBindGroupLayout,
+    /// Mask group 0: unfilterable source + unfilterable mask texture
+    /// (local M5 mask adapt; `mask.wgsl`).
+    mask: c.WGPUBindGroupLayout,
 
     /// Create every layout, releasing on failure.
     pub fn create(dev: *device.Device) Error!Layouts {
@@ -198,6 +202,10 @@ pub const Layouts = struct {
         const copy_entries = [_]c.WGPUBindGroupLayoutEntry{
             textureLayoutEntry(0, c.WGPUShaderStage_Fragment, c.WGPUTextureSampleType_UnfilterableFloat),
         };
+        const mask_entries = [_]c.WGPUBindGroupLayoutEntry{
+            textureLayoutEntry(0, c.WGPUShaderStage_Fragment, c.WGPUTextureSampleType_UnfilterableFloat),
+            textureLayoutEntry(1, c.WGPUShaderStage_Fragment, c.WGPUTextureSampleType_UnfilterableFloat),
+        };
 
         var layouts: Layouts = undefined;
         layouts.strip = try createBindGroupLayout(dev, "vellz-strip-layout", &strip_entries);
@@ -217,11 +225,14 @@ pub const Layouts = struct {
         layouts.blend = try createBindGroupLayout(dev, "vellz-blend-layout", &blend_entries);
         errdefer c.wgpuBindGroupLayoutRelease(layouts.blend);
         layouts.copy = try createBindGroupLayout(dev, "vellz-copy-layout", &copy_entries);
+        errdefer c.wgpuBindGroupLayoutRelease(layouts.copy);
+        layouts.mask = try createBindGroupLayout(dev, "vellz-mask-layout", &mask_entries);
         return layouts;
     }
 
     /// Release every layout.
     pub fn deinit(self: *Layouts) void {
+        c.wgpuBindGroupLayoutRelease(self.mask);
         c.wgpuBindGroupLayoutRelease(self.copy);
         c.wgpuBindGroupLayoutRelease(self.blend);
         c.wgpuBindGroupLayoutRelease(self.filter_original);
@@ -242,6 +253,8 @@ pub const ShaderModules = struct {
     copy: c.WGPUShaderModule,
     blend: c.WGPUShaderModule,
     filter: c.WGPUShaderModule,
+    /// Local M5 mask multiply shader (`mask.wgsl`).
+    mask: c.WGPUShaderModule,
 
     /// Create every module.
     pub fn create(dev: *device.Device) Error!ShaderModules {
@@ -255,11 +268,14 @@ pub const ShaderModules = struct {
         modules.blend = try createShaderModule(dev, shaders.BLEND, "vellz-blend-shader");
         errdefer c.wgpuShaderModuleRelease(modules.blend);
         modules.filter = try createShaderModule(dev, shaders.FILTER, "vellz-filter-shader");
+        errdefer c.wgpuShaderModuleRelease(modules.filter);
+        modules.mask = try createShaderModule(dev, shaders.MASK, "vellz-mask-shader");
         return modules;
     }
 
     /// Release every module.
     pub fn deinit(self: *ShaderModules) void {
+        c.wgpuShaderModuleRelease(self.mask);
         c.wgpuShaderModuleRelease(self.filter);
         c.wgpuShaderModuleRelease(self.blend);
         c.wgpuShaderModuleRelease(self.copy);
@@ -312,6 +328,8 @@ pub const Pipelines = struct {
     blend: c.WGPURenderPipeline,
     /// Filter pipeline.
     filter: c.WGPURenderPipeline,
+    /// Mask multiply pipeline (`Rgba8Unorm` scratch target).
+    mask: c.WGPURenderPipeline,
 
     /// Create every pipeline. `format` is the caller's target format; the
     /// intermediate/atlas pipelines are fixed to `Rgba8Unorm` per the shader
@@ -351,6 +369,10 @@ pub const Pipelines = struct {
         var copy_groups = [_]c.WGPUBindGroupLayout{layouts.copy};
         const copy_pipeline_layout = try createPipelineLayout(dev, "vellz-copy-pipeline-layout", &copy_groups);
         defer c.wgpuPipelineLayoutRelease(copy_pipeline_layout);
+
+        var mask_groups = [_]c.WGPUBindGroupLayout{layouts.mask};
+        const mask_pipeline_layout = try createPipelineLayout(dev, "vellz-mask-pipeline-layout", &mask_groups);
+        defer c.wgpuPipelineLayoutRelease(mask_pipeline_layout);
 
         const blend_state = premultipliedAlphaBlend();
 
@@ -475,12 +497,28 @@ pub const Pipelines = struct {
             &filter_vertex,
             "vellz-filter",
         );
+        errdefer c.wgpuRenderPipelineRelease(pipelines.filter);
+
+        const mask_attributes = maskAttributes();
+        var mask_vertex = c.wgpu_zig_init_WGPUVertexBufferLayout();
+        mask_vertex.arrayStride = @sizeOf(mask_mod.GpuMaskInstance);
+        mask_vertex.stepMode = c.WGPUVertexStepMode_Instance;
+        mask_vertex.attributeCount = mask_attributes.len;
+        mask_vertex.attributes = &mask_attributes;
+        pipelines.mask = try createTextureOpPipeline(
+            dev,
+            mask_pipeline_layout,
+            modules.mask,
+            &mask_vertex,
+            "vellz-mask",
+        );
 
         return pipelines;
     }
 
     /// Release every pipeline.
     pub fn deinit(self: *Pipelines) void {
+        c.wgpuRenderPipelineRelease(self.mask);
         c.wgpuRenderPipelineRelease(self.filter);
         c.wgpuRenderPipelineRelease(self.blend);
         c.wgpuRenderPipelineRelease(self.copy);
@@ -551,6 +589,17 @@ fn blendAttributes() [8]c.WGPUVertexAttribute {
         .{ .format = c.WGPUVertexFormat_Uint32, .offset = 20, .shaderLocation = 5 },
         .{ .format = c.WGPUVertexFormat_Uint32, .offset = 24, .shaderLocation = 6 },
         .{ .format = c.WGPUVertexFormat_Uint32, .offset = 28, .shaderLocation = 7 },
+    };
+}
+
+fn maskAttributes() [6]c.WGPUVertexAttribute {
+    return .{
+        .{ .format = c.WGPUVertexFormat_Uint32, .offset = 0, .shaderLocation = 0 },
+        .{ .format = c.WGPUVertexFormat_Uint32, .offset = 4, .shaderLocation = 1 },
+        .{ .format = c.WGPUVertexFormat_Uint32, .offset = 8, .shaderLocation = 2 },
+        .{ .format = c.WGPUVertexFormat_Uint32, .offset = 12, .shaderLocation = 3 },
+        .{ .format = c.WGPUVertexFormat_Uint32, .offset = 16, .shaderLocation = 4 },
+        .{ .format = c.WGPUVertexFormat_Uint32, .offset = 20, .shaderLocation = 5 },
     };
 }
 
@@ -1371,6 +1420,20 @@ pub fn createCopySourceBindGroup(
     return createBindGroup(dev, layout, "vellz-copy-source-bind-group", &entries);
 }
 
+/// Mask group 0: the layer source texture and the uploaded mask texture.
+pub fn createMaskBindGroup(
+    dev: *device.Device,
+    layout: c.WGPUBindGroupLayout,
+    source_view: c.WGPUTextureView,
+    mask_view: c.WGPUTextureView,
+) Error!c.WGPUBindGroup {
+    const entries = [_]c.WGPUBindGroupEntry{
+        textureBindEntry(0, source_view),
+        textureBindEntry(1, mask_view),
+    };
+    return createBindGroup(dev, layout, "vellz-mask-bind-group", &entries);
+}
+
 /// Blend group 0: the two bound layer pages plus the alpha texture.
 pub fn createBlendBindGroup(
     dev: *device.Device,
@@ -1474,6 +1537,43 @@ pub fn encodeCopyPass(
     defer c.wgpuRenderPassEncoderRelease(pass);
     c.wgpuRenderPassEncoderSetPipeline(pass, pipeline);
     c.wgpuRenderPassEncoderSetBindGroup(pass, 0, source_bind_group, 0, null);
+    c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, buffer, 0, c.WGPU_WHOLE_SIZE);
+    c.wgpuRenderPassEncoderDraw(pass, 4, @intCast(instances.len), 0, 0);
+    c.wgpuRenderPassEncoderEnd(pass);
+}
+
+/// Encode the mask multiply pass into `scratch_view` (local M5 mask adapt).
+pub fn encodeMaskPass(
+    dev: *device.Device,
+    encoder: c.WGPUCommandEncoder,
+    pipeline: c.WGPURenderPipeline,
+    mask_bind_group: c.WGPUBindGroup,
+    instances: []const mask_mod.GpuMaskInstance,
+    scratch_view: c.WGPUTextureView,
+    label: []const u8,
+) Error!void {
+    if (instances.len == 0) return;
+    if (dev.isLost()) return error.DeviceLost;
+
+    const buffer = try createTextureOpInstanceBuffer(dev, std.mem.sliceAsBytes(instances), "vellz-mask-instances");
+    defer c.wgpuBufferRelease(buffer);
+
+    var attachment = c.wgpu_zig_init_WGPURenderPassColorAttachment();
+    attachment.view = scratch_view;
+    attachment.depthSlice = c.WGPU_DEPTH_SLICE_UNDEFINED;
+    attachment.loadOp = c.WGPULoadOp_Load;
+    attachment.storeOp = c.WGPUStoreOp_Store;
+
+    var desc = c.wgpu_zig_init_WGPURenderPassDescriptor();
+    desc.label = wgpu.stringView(label);
+    desc.colorAttachmentCount = 1;
+    desc.colorAttachments = &attachment;
+    const pass = c.wgpuCommandEncoderBeginRenderPass(encoder, &desc) orelse {
+        return error.RenderPassFailed;
+    };
+    defer c.wgpuRenderPassEncoderRelease(pass);
+    c.wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+    c.wgpuRenderPassEncoderSetBindGroup(pass, 0, mask_bind_group, 0, null);
     c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, buffer, 0, c.WGPU_WHOLE_SIZE);
     c.wgpuRenderPassEncoderDraw(pass, 4, @intCast(instances.len), 0, 0);
     c.wgpuRenderPassEncoderEnd(pass);

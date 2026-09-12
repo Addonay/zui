@@ -71,6 +71,37 @@ SCENES=(
     fill_overlap_alpha_64_speed
     fill_rect_64_speed
     stroke_basic_64_speed
+    mask_alpha_64
+    mask_alpha_64_speed
+    mask_luminance_64
+    glyph_run_filled_unhinted_300x70
+    glyph_run_filled_unhinted_cache_300x70
+    glyph_run_filled_hinted_300x70
+    glyph_run_filled_hinted_cache_300x70
+    glyph_run_stroked_unhinted_300x70
+    glyph_run_small_unhinted_64x16
+    glyph_run_small_unhinted_cache_64x16
+    glyph_run_scaled_unhinted_150x125
+    glyph_run_scaled_unhinted_cache_150x125
+    glyph_run_scaled_hinted_150x125
+    glyph_run_skewed_unhinted_300x70
+    glyph_run_glyph_transform_unhinted_150x125
+    glyph_run_glyph_transform_unhinted_cache_150x125
+    glyph_run_glyph_transform_hinted_150x125
+    glyph_run_colr_noto_250x70
+    glyph_run_colr_noto_cache_250x70
+    glyph_run_colr_noto_scaled_half_125x35
+    glyph_run_colr_noto_rotated_350x350
+    glyph_run_bitmap_noto_250x70
+    glyph_run_bitmap_noto_cache_250x70
+    glyph_run_decoration_no_descenders_180x70
+    glyph_run_decoration_no_descenders_cache_180x70
+    glyph_run_decoration_transformed_100x150
+    glyph_run_decoration_offset_values_300x180
+    glyph_run_composite_hinted_300x70
+    glyph_run_gradient_unhinted_300x180
+    glyph_run_transform_composition_unhinted_300x420
+    glyph_run_transform_composition_unhinted_cache_300x420
 )
 
 usage() {
@@ -149,6 +180,38 @@ for scene in "${SCENES[@]}"; do
         # Analytic blurred rounded rect vs the CPU pixmap integration.
         blurred_rounded_rect_64) max_abs=2; max_pixels=2032; reason="(analytic blur coverage: 2032 px, max 2)" ;;
         blurred_rounded_rect_invert_64) max_abs=2; max_pixels=2380; reason="(analytic blur coverage: 2380 px, max 2)" ;;
+        # Mask adapt: GPU f32 multiply vs the CPU oracle's kernel (u8 div255
+        # for the speed oracle; f32 for the regular scenes). Bounds are the
+        # measured worst case; only the speed scene has channel diffs at 2.
+        mask_alpha_64) max_abs=1; max_pixels=1984; reason="(f32 mask multiply vs CPU f32 kernel: 1984 px at 1)" ;;
+        mask_alpha_64_speed) max_abs=2; max_pixels=2304; reason="(f32 mask multiply vs u8 div255 oracle: 2304 px, max 2)" ;;
+        mask_luminance_64) max_abs=1; max_pixels=1216; reason="(f32 mask multiply vs CPU f32 kernel: 1216 px at 1)" ;;
+        # GPU glyph strips vs the CPU oracle's glyph rasterization: the CPU
+        # fixture is a hardened pixel path, the GPU uses analytic strip AA,
+        # so edge coverage can differ by one channel step.
+        glyph_run_filled_unhinted_300x70) max_pixels=493; reason="(strip AA vs CPU glyph coverage: 493 px at 1)" ;;
+        glyph_run_filled_unhinted_cache_300x70) max_pixels=467; reason="(atlas glyph sampling: 467 px at 1)" ;;
+        glyph_run_filled_hinted_300x70) max_pixels=476; reason="(hinted outlines: 476 px at 1)" ;;
+        glyph_run_filled_hinted_cache_300x70) max_pixels=530; reason="(hinted atlas glyph sampling: 530 px at 1)" ;;
+        glyph_run_stroked_unhinted_300x70) max_pixels=789; reason="(stroked outlines: 789 px at 1)" ;;
+        glyph_run_scaled_unhinted_150x125) max_pixels=447; reason="(scaled outlines: 447 px at 1)" ;;
+        glyph_run_scaled_unhinted_cache_150x125) max_pixels=477; reason="(scaled atlas sampling: 477 px at 1)" ;;
+        glyph_run_scaled_hinted_150x125) max_pixels=418; reason="(scaled hinted outlines: 418 px at 1)" ;;
+        glyph_run_skewed_unhinted_300x70) max_pixels=495; reason="(skewed outlines: 495 px at 1)" ;;
+        glyph_run_glyph_transform_unhinted_150x125) max_pixels=440; reason="(per-glyph transform: 440 px at 1)" ;;
+        glyph_run_glyph_transform_unhinted_cache_150x125) max_pixels=464; reason="(per-glyph transform atlas sampling: 464 px at 1)" ;;
+        glyph_run_glyph_transform_hinted_150x125) max_pixels=407; reason="(hinted per-glyph transform: 407 px at 1)" ;;
+        glyph_run_colr_noto_250x70) max_abs=2; max_pixels=1048; reason="(COLR color/gradient rounding: 1048 px, max 2)" ;;
+        glyph_run_colr_noto_cache_250x70) max_abs=2; max_pixels=1112; reason="(COLR atlas sampling rounding: 1112 px, max 2)" ;;
+        glyph_run_colr_noto_scaled_half_125x35) max_abs=2; max_pixels=501; reason="(scaled COLR rounding: 501 px, max 2)" ;;
+        glyph_run_colr_noto_rotated_350x350) max_abs=2; max_pixels=940; reason="(rotated COLR rounding: 940 px, max 2)" ;;
+        glyph_run_bitmap_noto_250x70) max_abs=2; max_pixels=10; reason="(bitmap pixmap sampling vs uploaded atlas: 10 px, max 2)" ;;
+        glyph_run_bitmap_noto_cache_250x70) max_pixels=3; reason="(bitmap atlas sampling: 3 px at 1)" ;;
+        glyph_run_decoration_transformed_100x150) max_pixels=5; reason="(transformed decoration: 5 px at 1)" ;;
+        glyph_run_decoration_offset_values_300x180) max_pixels=431; reason="(decoration offset spans: 431 px at 1)" ;;
+        glyph_run_composite_hinted_300x70) max_pixels=223; reason="(hinted composite glyphs: 223 px at 1)" ;;
+        glyph_run_gradient_unhinted_300x180) max_pixels=437; reason="(glyph gradient paint rounding: 437 px at 1)" ;;
+        glyph_run_transform_composition_unhinted_cache_300x420) max_pixels=2; reason="(transform composition atlas sampling: 2 px at 1)" ;;
         *) ;;
     esac
 

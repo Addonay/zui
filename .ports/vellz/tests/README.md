@@ -75,13 +75,10 @@ only with a written reason. Always run on the same adapter class and record
 the adapter line printed by the renderer (`execution=software-adapter` for
 lavapipe/llvmpipe).
 
-**44 of the 48 committed scenes are gated.** The four excluded scenes are:
-`mask_alpha_64`, `mask_alpha_64_speed`, and `mask_luminance_64` (mask layers
-return typed `error.Unsupported`; upstream `vello_gpu` has no mask sampling
-path at all), and `image_bicubic_64_speed` (the u8 `OptimizeSpeed` oracle's
-bicubic filter differs from the GPU's f32 implementation by up to 9 channel
-steps at 487 pixels, which is not a defensible hybrid tolerance). Scenes
-whose commands are unimplemented fail loudly; they are never approximated.
+**75 of the 108 committed scenes are gated.** The ungated scenes are two
+COLR test-glyph grids, one speed image scene, and the glyph variants that are
+duplicates of the gated families (see the end of this section). Scenes whose
+commands are unimplemented fail loudly; they are never approximated.
 
 | Scene | max abs diff | differing pixels | Reason |
 | --- | --- | --- | --- |
@@ -103,7 +100,7 @@ whose commands are unimplemented fail loudly; they are never approximated.
 | `gradient_radial_undefined_64_speed` | 0 | 0 | byte-exact |
 | `gradient_repeat_128` | 1 | 27 / 16384 | repeat-extend LUT index rounding |
 | `gradient_repeat_128_speed` | 1 | 122 / 16384 | repeat-extend LUT index rounding (u8 oracle) |
-| `image_nearest_64`, `image_bilinear_64`, `image_nearest_64_speed` | 0 | 0 | byte-exact |
+| `image_nearest_64`, `image_bilinear_64`, `image_nearest_64_speed` | 0 | 0 | byte-exact; images are now uploaded to the image atlas and sampled through `ImageSource.opaque_id` |
 | `image_bilinear_64_speed` | 1 | 455 / 4096 | u8 bilinear oracle vs GPU bilinear |
 | `image_bilinear_skew_64_speed` | 2 | 643 / 4096 | u8 bilinear oracle vs f32 GPU skew sampling |
 | `blurred_rounded_rect_64` | 2 | 2032 / 4096 | analytic GPU blur coverage vs CPU pixmap integration (16 channel diffs at 2) |
@@ -111,16 +108,48 @@ whose commands are unimplemented fail loudly; they are never approximated.
 | `fill_overlap_alpha_64_speed` | 1 | 64 / 4096 | u8-pipeline oracle vs f32 GPU compositing |
 | `fill_rect_64_speed` | 1 | 119 / 4096 | u8-pipeline oracle vs f32 GPU edge coverage |
 | `stroke_basic_64_speed` | 1 | 98 / 4096 | u8-pipeline oracle vs f32 GPU stroke AA |
+| `mask_alpha_64`, `mask_luminance_64` | 1 | 1984 / 4096, 1216 / 4096 | f32 mask multiply vs the CPU f32 kernel (one channel step) |
+| `mask_alpha_64_speed` | 2 | 2304 / 4096 | f32 mask multiply vs the u8 `div255` oracle (64 channel diffs at 2, rest at 1) |
+| `glyph_run_small_unhinted_64x16`, `..._cache_64x16`, `glyph_run_decoration_no_descenders_180x70` (+cache), `glyph_run_transform_composition_unhinted_300x420` | 0 | 0 | byte-exact |
+| `glyph_run_filled_unhinted_300x70` (+cache), `glyph_run_filled_hinted_300x70` (+cache) | 1 | 493, 467, 476, 530 / 21000 | GPU strip AA vs CPU glyph coverage; atlas cache on/off |
+| `glyph_run_stroked_unhinted_300x70` | 1 | 789 / 21000 | stroked outline AA |
+| `glyph_run_scaled_unhinted_150x125` (+cache), `glyph_run_scaled_hinted_150x125` | 1 | 447, 477, 418 / 18750 | scaled/hinted outline AA |
+| `glyph_run_skewed_unhinted_300x70`, `glyph_run_glyph_transform_unhinted_150x125` (+cache), `glyph_run_glyph_transform_hinted_150x125` | 1 | 495, 440, 464, 407 / 21000, 18750 | skewed/per-glyph-transform outline AA |
+| `glyph_run_decoration_transformed_100x150`, `glyph_run_decoration_offset_values_300x180` | 1 | 5 / 15000, 431 / 54000 | decoration spans and skip-ink AA |
+| `glyph_run_composite_hinted_300x70` | 1 | 223 / 21000 | accented composite outlines |
+| `glyph_run_gradient_unhinted_300x180` | 1 | 437 / 54000 | glyph gradient paint rounding |
+| `glyph_run_transform_composition_unhinted_cache_300x420` | 1 | 2 / 126000 | absorbed transform rows through the atlas |
+| `glyph_run_colr_noto_250x70` (+cache), `glyph_run_colr_noto_scaled_half_125x35`, `glyph_run_colr_noto_rotated_350x350` | 2 | 1048, 1112 / 17500, 501 / 4375, 940 / 122500 | COLR gradient/color rounding on the GPU f32 path |
+| `glyph_run_bitmap_noto_250x70` | 2 | 10 / 17500 | uncached bitmap glyphs are uploaded into the image atlas (local adapt; upstream panics on pixmap sources) |
+| `glyph_run_bitmap_noto_cache_250x70` | 1 | 3 / 17500 | bitmap atlas sampling |
 
 Measured on the container's **llvmpipe software Vulkan** adapter
 (`backend=vulkan type=cpu execution=software-adapter`, Mesa 25.2.8, LLVM
 20.1.2). Every bound above is the measured worst case; no scene is allowed to
 regress past its recorded count.
 
-Ungated, with recorded metrics: `image_bicubic_64_speed` (max-abs 9,
-487 / 4096 pixels) is the u8 pipeline's bicubic filter vs the GPU's f32
-bicubic. Mask layers return typed `error.Unsupported` from `Scene` and never
-produce approximate output.
+Ungated, with recorded metrics:
+
+- `image_bicubic_64_speed` (max-abs 9, 487 / 4096 pixels): the u8 pipeline's
+  bicubic filter vs the GPU's f32 bicubic.
+- `glyph_run_colr_test_glyphs_400x960` and its `_cache` variant (max-abs 5,
+  2362 / 384000 and 2347 / 384000 pixels): the color-fonts test grid exercises
+  every COLR gradient/transform/composite mode at once; the GPU f32 COLR path
+  rounds a few stops one more step away from the CPU oracle than the Noto
+  scenes above. Not defensible as a hybrid bound, so it stays a recorded
+  metric rather than an approximate gate.
+- The remaining glyph scenes are variants of the gated families (alternate
+  hinting/cache symmetry, stroke/scale/skew and hinted composition rows); the
+  gate keeps one representative per family to bound llvmpipe CI time.
+
+The mask rows are the documented local adapt: upstream `vello_gpu` has no
+mask sampling path and panics, so `gpu/schedule` plans a mask op that
+multiplies the layer allocation by the uploaded mask texture and copies the
+result back before composition (`src/gpu/mask.zig`, `shaders/mask.wgsl`).
+The bounds above are the measured llvmpipe difference between the GPU f32
+multiply and the CPU oracle (f32 for the quality scenes, `div_255` for
+`_speed`); every difference is a single channel step except the 64 channel
+diffs at 2 recorded for `mask_alpha_64_speed`.
 
 ## Upstream probe fixture
 
