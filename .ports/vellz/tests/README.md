@@ -179,6 +179,9 @@ fixture.
 | hinted glyph runs (scaled absorption, horizontal skew, glyph transform) | `glyph_run_scaled_hinted_*`, `glyph_run_skewed_hinted_*`, `glyph_run_glyph_transform_hinted_*` |
 | hinted transform composition rows (direct vs absorbed) | `glyph_run_transform_composition_hinted_*` |
 | hinted composite-heavy accented glyphs | `glyph_run_composite_hinted_300x70` |
+| autohinted glyph runs on instruction-less Noto Sans (fill, cache on/off) | `glyph_run_autohint_filled_*`, `glyph_run_autohint_filled_cache_*` |
+| autohinted glyph runs (small, skewed, scaled absorption, composite accented) | `glyph_run_autohint_{small,skewed,scaled,composite}_*` |
+| autohinted transform composition rows (direct vs absorbed) | `glyph_run_autohint_transform_composition_*` |
 | unhinted glyph runs (small, skewed, scaled, glyph transform) | `glyph_run_small_unhinted_*`, `glyph_run_skewed_unhinted_*`, `glyph_run_scaled_unhinted_*`, `glyph_run_glyph_transform_unhinted_*` |
 | unhinted glyph strokes | `glyph_run_stroked_unhinted_*`, `..._cache_*` |
 | transform composition rows (absorption, translate, rotate, skew, flips) | `glyph_run_transform_composition_unhinted_*` |
@@ -200,8 +203,8 @@ They cover the u8-native gradient LUT and bilinear painters, the f32-painter
 `paintU8` conversion (nearest/bicubic images and undefined radial gradients),
 and the integer blend/composite/mask paths.
 
-All scenes above render byte-exact with `zig build corpus` (130/130,
-`tolerance=0`: 32 quality/f32 + 16 speed/u8 + 22 outline glyph +
+All scenes above render byte-exact with `zig build corpus` (142/142,
+`tolerance=0`: 32 quality/f32 + 16 speed/u8 + 34 outline glyph +
 6 decoration + 27 COLR + 5 bitmap + 10 CFF/CFF2 + 12 variable). The
 f32 and u8 pipelines are not byte-equal to each other in general (integer
 `div_255` rounding vs f32); the corpus compares each pipeline against its own
@@ -227,8 +230,12 @@ keeps 16 instances in an LRU. The scenes mirror the unhinted set where the
 transform is eligible for vertical hinting (positive uniform scale, or
 horizontal skew only); transform-composition rows that upstream leaves
 `Direct` (rotations, flips, vertical skew) render unhinted exactly like
-upstream. Fonts that would need the autohinter are a typed `error.Unsupported`
-rather than a silent unhinted fallback.
+upstream. The instruction-less Noto Sans scenes (`glyph_run_autohint_*`) take
+`Engine::AutoFallback` to the ported autohinter instead: styles are derived
+per glyph (cmap + GSUB coverage), per-style metrics are computed lazily, and
+the JIT pipeline grid-fits the outline; the vectors are byte-exact against
+pinned skrifa at tolerance 0, cache on and off. A hinted draw never silently
+falls back to unhinted output.
 
 ### COLR corpus (M3 T4 / G3c)
 
@@ -352,8 +359,8 @@ coordinates and CFF2 `seac`. The same fixtures also back the dump gate:
 `tools/compare_glyphs.sh` compares every glyph of both faces at several sizes
 (9 vectors) through the oracle's `--dump-glyphs` path.
 
-The dump gate covers 48 glyph vectors / 5 cmap vectors in total (1,193,920 path
-elements, 3,456,940 f32 coordinates, 458,752 cmap mappings) with per-vector
+The dump gate covers 60 glyph vectors / 5 cmap vectors in total (2,335,632 path
+elements, 6,812,052 f32 coordinates, 458,752 cmap mappings) with per-vector
 SHA-256s in `tests/fixtures/glyphs/manifest.zig`, checked by `zig build test`
 without a Rust toolchain; `zig build glyphs` re-runs the live comparison.
 
@@ -378,7 +385,31 @@ header carries a variation store).
 
 The same vectors gate the dump: 18 `Inconsolata.ttf` and variable-Roboto
 entries (hinted/unhinted, in-range and saturating out-of-range coordinates)
-are part of the 48-vector union manifest.
+are part of the 60-vector union manifest.
+
+## Autohint corpus (M3 G3b autohint)
+
+`tests/scenes/glyph_run_autohint_*` gate the `Engine::AutoFallback`
+autohinter (`src/glifo/autohint/**`, selected by `hinting.zig` when the face
+has no `fpgm`/`prep` bytecode and `maxp.maxSizeOfInstructions == 0`) on the
+imported instruction-less Noto fixtures (OFL-1.1, notofonts *unhinted* build
+tree): `NotoSans-Regular.ttf`, `NotoSansMono-Regular.ttf` (fixed-width
+advance paths) and `NotoSansDevanagari-Regular.ttf` (Indic script group).
+
+Twelve scenes: fill, small, skewed, scaled absorption, composite-heavy and
+transform-composition rows, each with cache off and on where the scene has a
+`_cache` twin. Styles are derived per glyph (cmap + BestEffort GSUB
+coverage), per-style metrics are computed lazily, and the JIT pipeline
+grid-fits the outline; `HintCache` swaps engines when the same cache entry is
+reconfigured for a different face. All scenes are byte-exact against the
+pinned skrifa oracle at `tolerance=0`, cache on and off; a hinted draw never
+silently falls back to unhinted output.
+
+The same faces gate 14 dump vectors (`NotoSans-Regular` at eight sizes,
+plus NotoSansMono and NotoSansDevanagari at two sizes each, all `--hint`) as
+part of the 60-vector union manifest. The autohinter parses no variation
+deltas, so non-empty coordinates on the autohint path are a typed
+`error.Unsupported` (the interpreter path handles them).
 
 ## Multithreaded dispatch
 

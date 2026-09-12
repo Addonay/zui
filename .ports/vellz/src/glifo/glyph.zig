@@ -14,11 +14,12 @@
 //!   required to be cloneable: the decoration pass drains the run's iterator
 //!   once instead of cloning it.
 //! - TrueType hinting is ported (M3 G3b): `prepareGlyphRunWithCache` consults
-//!   the 16-entry LRU `HintCache` for eligible transforms, `HintingInstance`
-//!   runs `fpgm`/`prep` once per (font, size), and glyph outlines are drawn
-//!   through the interpreter keyed by the hint instance. Interpreter failures
-//!   are `error.HintError`; autohinter-only fonts are `error.Unsupported`
-//!   instead of silently rendering unhinted.
+//!   the 16-entry LRU `HintCache` for eligible transforms,
+//!   `hinting.HintingInstance` runs `fpgm`/`prep` once per (font, size), and
+//!   glyph outlines are drawn through the interpreter keyed by the hint
+//!   instance. `Engine::AutoFallback` selects the autohinter for
+//!   instruction-less fonts; interpreter failures are `error.HintError`, and
+//!   neither engine ever silently renders unhinted.
 //! - Glyphs resolve through the upstream COLR > bitmap > outline cascade:
 //!   COLR/CPAL is ported (T4) and embedded bitmaps (`sbix`/`CBDT`/`EBDT`) are
 //!   ported (T5); `Bgra`/`Mask` bitmap payloads and undecodable PNGs fall
@@ -49,6 +50,7 @@ const bitmap_mod = @import("tables/bitmap.zig");
 const cpal_mod = @import("tables/cpal.zig");
 const font_mod = @import("font.zig");
 const glyf = @import("glyf.zig");
+const hinting = @import("hinting.zig");
 const colr = @import("colr.zig");
 const png_mod = @import("png.zig");
 const outline_cache = @import("outline_cache.zig");
@@ -270,7 +272,7 @@ pub const HintCache = struct {
         font_id: u64,
         font_index: u32,
         size: f32,
-        instance: glyf.HintInstance,
+        instance: hinting.HintingInstance,
         serial: u64,
     };
 
@@ -300,7 +302,7 @@ pub const HintCache = struct {
         outlines: *const outlines_mod.Outlines,
         size: f32,
         coords: []const i16,
-    ) Error!*const glyf.HintInstance {
+    ) Error!*hinting.HintingInstance {
         if (!outlines.supportsHinting()) return error.Unsupported;
         for (self.entries.items) |*entry| {
             if (entry.font_id == font_id and
@@ -324,19 +326,14 @@ pub const HintCache = struct {
                 }
             }
             const entry = &self.entries.items[lru];
-            const sp = outlines.hintedScaleAndPpem(size);
-            const program = outlines.hintProgram() orelse return error.Unsupported;
-            entry.instance.reconfigure(
-                program,
-                sp.scale,
-                sp.ppem,
-                glyf.glifo_hint_target,
-                coords,
+            try hinting.reconfigure(
+                &entry.instance,
+                allocator,
+                outlines,
                 size,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.HintError,
-            };
+                coords,
+                glyf.glifo_hint_target,
+            );
             entry.font_id = font_id;
             entry.font_index = font_index;
             entry.size = size;
@@ -344,12 +341,7 @@ pub const HintCache = struct {
             entry.serial = self.serial;
             return &entry.instance;
         }
-        var instance = try outlines.createHintInstance(
-            allocator,
-            size,
-            coords,
-            glyf.glifo_hint_target,
-        );
+        var instance = try hinting.create(allocator, outlines, size, coords, glyf.glifo_hint_target);
         errdefer instance.deinit();
         try self.entries.append(allocator, .{
             .font_id = font_id,
@@ -574,7 +566,7 @@ pub const PreparedGlyphRun = struct {
     normalized_coords: []const NormalizedCoord,
     /// Hinting instance for this run; `null` when the run is unhinted (or the
     /// effective transform is `Direct`, which never hints upstream).
-    hinting_instance: ?*const glyf.HintInstance = null,
+    hinting_instance: ?*hinting.HintingInstance = null,
 };
 
 /// The scale at which an outline is cached and the factor to the draw size.
@@ -652,7 +644,7 @@ pub fn prepareGlyphRunWithCache(
 
     var effective_transform: kurbo.Affine = undefined;
     var draw_font_size: f32 = undefined;
-    var hinting_instance: ?*const glyf.HintInstance = null;
+    var hinting_instance: ?*hinting.HintingInstance = null;
     switch (mode) {
         // The scale is absorbed into the font size; remove it from the skew
         // coefficient as well so it is not applied twice.

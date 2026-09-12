@@ -13,9 +13,11 @@
 //! consumer inside the interpreter); the `GETVARIATION` opcode reads the
 //! normalized coordinates passed by the scaler.
 //!
-//! Deferred with typed errors, never approximated: autohinting and CFF
-//! hinting. Unhandled opcodes raise `error.UnhandledOpcode` (or dispatch to
-//! user `IDEF`s, matching upstream).
+//! The engine selection (`Engine::AutoFallback`) lives in `hinting.zig`:
+//! fonts without `fpgm`/`prep` bytecode use `autohint/` instead of this
+//! interpreter. Deferred with typed errors, never approximated: CFF hinting.
+//! Unhandled opcodes raise `error.UnhandledOpcode` (or dispatch to user
+//! `IDEF`s, matching upstream).
 
 const std = @import("std");
 

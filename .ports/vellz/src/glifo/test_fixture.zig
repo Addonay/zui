@@ -15,6 +15,9 @@ pub const colr_test_glyphs_path = "tests/fixtures/upstream/test_glyphs-glyf_colr
 pub const source_serif_path = "tests/fixtures/upstream/SourceSerif4-Regular.otf";
 pub const source_serif_variable_path = "tests/fixtures/upstream/SourceSerif4Variable-Roman.otf";
 pub const inconsolata_path = "tests/fixtures/upstream/Inconsolata.ttf";
+pub const noto_sans_path = "tests/fixtures/upstream/NotoSans-Regular.ttf";
+pub const noto_sans_mono_path = "tests/fixtures/upstream/NotoSansMono-Regular.ttf";
+pub const noto_sans_devanagari_path = "tests/fixtures/upstream/NotoSansDevanagari-Regular.ttf";
 
 var roboto_cache: ?[]const u8 = null;
 var noto_color_cache: ?[]const u8 = null;
@@ -23,6 +26,9 @@ var colr_test_glyphs_cache: ?[]const u8 = null;
 var source_serif_cache: ?[]const u8 = null;
 var source_serif_variable_cache: ?[]const u8 = null;
 var inconsolata_cache: ?[]const u8 = null;
+var noto_sans_cache: ?[]const u8 = null;
+var noto_sans_mono_cache: ?[]const u8 = null;
+var noto_sans_devanagari_cache: ?[]const u8 = null;
 
 fn load(path: []const u8) ![]const u8 {
     return std.Io.Dir.cwd().readFileAlloc(
@@ -70,6 +76,21 @@ pub fn inconsolata() ![]const u8 {
     return inconsolata_cache.?;
 }
 
+pub fn notoSans() ![]const u8 {
+    if (noto_sans_cache == null) noto_sans_cache = try load(noto_sans_path);
+    return noto_sans_cache.?;
+}
+
+pub fn notoSansMono() ![]const u8 {
+    if (noto_sans_mono_cache == null) noto_sans_mono_cache = try load(noto_sans_mono_path);
+    return noto_sans_mono_cache.?;
+}
+
+pub fn notoSansDevanagari() ![]const u8 {
+    if (noto_sans_devanagari_cache == null) noto_sans_devanagari_cache = try load(noto_sans_devanagari_path);
+    return noto_sans_devanagari_cache.?;
+}
+
 test "fixtures are readable and non-empty" {
     try std.testing.expect((try roboto()).len > 100_000);
     try std.testing.expect((try notoColor()).len > 1_000);
@@ -78,4 +99,7 @@ test "fixtures are readable and non-empty" {
     try std.testing.expect((try sourceSerif()).len > 100_000);
     try std.testing.expect((try sourceSerifVariable()).len > 1_000_000);
     try std.testing.expect((try inconsolata()).len > 100_000);
+    try std.testing.expect((try notoSans()).len > 100_000);
+    try std.testing.expect((try notoSansMono()).len > 100_000);
+    try std.testing.expect((try notoSansDevanagari()).len > 100_000);
 }

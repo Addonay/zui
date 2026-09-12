@@ -456,10 +456,11 @@ of panics, thread ownership).
 ### Milestone 3 — Glyph rendering and Cozmic adapter
 
 - **Status (2026-09-12):** outline subset, atlas cache, COLR (G3c), hinting
-  (G3b), decoration and the Cozmic adapter (T5), embedded bitmaps (G3e), the
-  unhinted CFF/CFF2 scaler and `gvar`/`cvar` variation (G3f, T6) are landed
-  (T1–T6 + `vellz-cff`); autohint, CFF hinting/`HVAR` deltas and synthetic
-  embolden remain staged with typed `error.Unsupported`.
+  (G3b) and the `Engine::AutoFallback` autohinter, decoration and the Cozmic
+  adapter (T5), embedded bitmaps (G3e), the unhinted CFF/CFF2 scaler and
+  `gvar`/`cvar` variation (G3f, T6) are landed
+  (T1–T6 + `vellz-cff` + `vellz-autohint`); CFF hinting/`HVAR` deltas and
+  synthetic embolden remain staged with typed `error.Unsupported`.
 - `glifo` port; stable font identity/face index/variation/glyph/size/placement
   contract; monochrome + COLR behavior; cache invalidation.
 - **Gate:** glyph corpus renders match upstream for the same font resources;

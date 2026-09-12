@@ -290,12 +290,16 @@ pub fn RenderContext.glyphRun(self, resources, font) GlyphRunBuilder;
   composite modes match upstream; `AtlasPaint::Gradient` is recorded with owned
   stops that replay/clear frees.
 - TrueType hinting (M3 G3b) is ported: `HintCache` is a 16-entry LRU of
-  `HintInstance`s keyed by (font id/index, size) which run `fpgm`/`prep` on
-  configure; eligible runs (positive uniform scale or horizontal skew only)
-  absorb the scale, get a `HintingInstance`, round the glyph Y translation and
-  draw through `OutlineCache::getOrInsert(.., hint_instance)`. Hinting is
-  never silently dropped: an interpreter failure is `error.HintError`, and a
-  font that would select the autohinter is `error.Unsupported`.
+  engine-neutral `hinting.HintingInstance`s keyed by (font id/index, size)
+  which run `fpgm`/`prep` on configure; eligible runs (positive uniform scale
+  or horizontal skew only) absorb the scale, get a `HintingInstance`, round
+  the glyph Y translation and draw through
+  `OutlineCache::getOrInsert(.., hint_instance)`. `Engine::AutoFallback`
+  selects the interpreter when `fpgm`/`prep`/`maxp` instructions are present
+  and the ported autohinter (`autohint/`, with the BestEffort GSUB shaper
+  subset) otherwise. Hinting is never silently dropped: an interpreter
+  failure is `error.HintError`, and neither engine falls back to unhinted
+  output.
 - Decoration (`renderDecoration`) is ported: underline/overline/
   strikethrough spans with skip-ink exclusions, using the prep cache's
   `underline_exclusions` buffer. Upstream's lazy span iterator becomes one
@@ -306,11 +310,11 @@ pub fn RenderContext.glyphRun(self, resources, font) GlyphRunBuilder;
   path. `Bgra`/`Mask` payloads and PNG features outside the decoder (16-bit,
   Adam7) fall through to the outline branch, exactly like upstream's
   `.ok()`-filtered `Pixmap::from_png`.
-- Deferred with typed errors, never approximated: autohinting (a hinted run on
-  a font without `fpgm`/`prep` fails up front), `hdmx` advances outside
-  backward compatibility, `gvar`/`HVAR` coordinates, CFF hinting and CFF2
-  `seac` (unhinted CFF/CFF2 outlines, including CFF2 blend scalars, are
-  ported).
+- Deferred with typed errors, never approximated: CFF hinting, CFF2 `seac`,
+  `HVAR` advance deltas on CFF2/variable outlines, `hdmx` advances outside
+  backward compatibility, and synthetic embolden (unhinted CFF/CFF2 outlines
+  including CFF2 blend scalars, `gvar`/`cvar` deltas and the
+  `Engine::AutoFallback` autohinter are ported).
 
 ## Error policy
 

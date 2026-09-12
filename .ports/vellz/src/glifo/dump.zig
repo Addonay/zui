@@ -12,6 +12,7 @@ const std = @import("std");
 const font_mod = @import("font.zig");
 const glyf = @import("glyf.zig");
 const outlines_mod = @import("outlines.zig");
+const hinting = @import("hinting.zig");
 const pen_mod = @import("pen.zig");
 
 pub const Error = outlines_mod.DrawError || std.Io.Writer.Error;
@@ -48,11 +49,12 @@ pub fn writeGlyphDump(
         try writer.print("\n", .{});
     }
 
-    var instance: ?glyf.HintInstance = null;
+    var instance: ?hinting.HintingInstance = null;
     defer if (instance) |*inst| inst.deinit();
     if (hint) {
-        instance = try outlines.createHintInstance(
+        instance = try hinting.create(
             allocator,
+            outlines,
             size,
             coords,
             glyf.glifo_hint_target,
@@ -63,10 +65,23 @@ pub fn writeGlyphDump(
     defer pen.deinit();
     for (gids) |gid| {
         pen.clearRetainingCapacity();
-        const metrics = try outlines.draw(allocator, gid, .{
+        const metrics = if (instance) |*inst| switch (inst.kind) {
+            .interpreter => |*interpreter| try outlines.draw(allocator, gid, .{
+                .size = size,
+                .coords = coords,
+                .hint_instance = interpreter,
+            }, &pen),
+            .auto => |*auto| try auto.draw(
+                allocator,
+                gid,
+                size,
+                coords,
+                .freetype,
+                &pen,
+            ),
+        } else try outlines.draw(allocator, gid, .{
             .size = size,
             .coords = coords,
-            .hint_instance = if (instance) |*inst| inst else null,
         }, &pen);
         var lsb_buf: [8]u8 = undefined;
         var advance_buf: [8]u8 = undefined;
@@ -163,6 +178,9 @@ fn fontBlob(font_id: u8) ![]const u8 {
         manifest.font_source_serif => try fixture.sourceSerif(),
         manifest.font_source_serif_variable => try fixture.sourceSerifVariable(),
         manifest.font_inconsolata => try fixture.inconsolata(),
+        manifest.font_notosans => try fixture.notoSans(),
+        manifest.font_notosans_mono => try fixture.notoSansMono(),
+        manifest.font_notosans_devanagari => try fixture.notoSansDevanagari(),
         else => error.TestUnexpectedResult,
     };
 }

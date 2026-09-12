@@ -58,6 +58,8 @@ pub const tag_gvar = Tag{ 'g', 'v', 'a', 'r' };
 pub const tag_cvar = Tag{ 'c', 'v', 'a', 'r' };
 pub const tag_hvar = Tag{ 'H', 'V', 'A', 'R' };
 pub const tag_fvar = Tag{ 'f', 'v', 'a', 'r' };
+pub const tag_gsub = Tag{ 'G', 'S', 'U', 'B' };
+pub const tag_post = Tag{ 'p', 'o', 's', 't' };
 
 pub const sfnt_version_true: u32 = 0x00010000;
 pub const sfnt_version_otto: u32 = 0x4F54544F; // "OTTO"

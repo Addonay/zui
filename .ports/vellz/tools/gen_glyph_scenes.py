@@ -56,6 +56,14 @@ SOURCE_SERIF_VF_FONT = os.path.join(
 )
 SOURCE_SERIF_UPEM = 1000.0
 
+# Autohint fixture (M3 G3b): instruction-less Noto Sans takes
+# `Engine::AutoFallback` to the autohinter.
+NOTO_SANS_FONT_REL = "../fixtures/upstream/NotoSans-Regular.ttf"
+NOTO_SANS_FONT = os.path.join(
+    ROOT, "tests", "fixtures", "upstream", "NotoSans-Regular.ttf"
+)
+NOTO_SANS_UPEM = 1000.0
+
 # CSS palette values used by the upstream tests.
 REBECCA_PURPLE = [102, 51, 153, 255]
 REBECCA_PURPLE_HALF = [102, 51, 153, 128]
@@ -852,6 +860,139 @@ def main():
             ],
         ),
     )
+
+    # G3b autohint: the instruction-less Noto Sans fixture, hinted through
+    # the automatic hinter. Every scene is generated for the cache-off and
+    # cache-on paths and gated byte-exactly against the pinned oracle.
+    noto_sans = Layout(NOTO_SANS_FONT, NOTO_SANS_UPEM)
+    noto_sans.prepare(
+        [
+            "Hello, world!",
+            "Hello,\nworld!",
+            "HELLO",
+            "éàöüñç",
+        ]
+    )
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        write(
+            f"glyph_run_autohint_filled{suffix}_300x70.json",
+            scene(
+                300,
+                70,
+                fill_run(
+                    noto_sans,
+                    "Hello, world!",
+                    50.0,
+                    50.0,
+                    REBECCA_PURPLE_HALF,
+                    cache,
+                    hint=True,
+                    font_rel=NOTO_SANS_FONT_REL,
+                ),
+            ),
+        )
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        write(
+            f"glyph_run_autohint_small{suffix}_64x16.json",
+            scene(
+                64,
+                16,
+                fill_run(
+                    noto_sans,
+                    "Hello, world!",
+                    10.0,
+                    10.0,
+                    REBECCA_PURPLE,
+                    cache,
+                    hint=True,
+                    font_rel=NOTO_SANS_FONT_REL,
+                ),
+            ),
+        )
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        write(
+            f"glyph_run_autohint_skewed{suffix}_300x70.json",
+            scene(
+                300,
+                70,
+                fill_run(
+                    noto_sans,
+                    "Hello, world!",
+                    50.0,
+                    50.0,
+                    REBECCA_PURPLE_HALF,
+                    cache,
+                    glyph_transform=slant,
+                    hint=True,
+                    font_rel=NOTO_SANS_FONT_REL,
+                ),
+            ),
+        )
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        write(
+            f"glyph_run_autohint_scaled{suffix}_150x125.json",
+            scene(
+                150,
+                125,
+                [
+                    {"op": "set_paint", "rgba8": REBECCA_PURPLE_HALF},
+                    {"op": "set_transform", "affine": scaled_transform},
+                    glyph_run(
+                        noto_sans.run("Hello,\nworld!", 25.0),
+                        25.0,
+                        atlas_cache=cache,
+                        hint=True,
+                        font_rel=NOTO_SANS_FONT_REL,
+                    ),
+                ],
+            ),
+        )
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        write(
+            f"glyph_run_autohint_composite{suffix}_300x70.json",
+            scene(
+                300,
+                70,
+                fill_run(
+                    noto_sans,
+                    "éàöüñç",
+                    40.0,
+                    50.0,
+                    REBECCA_PURPLE_HALF,
+                    cache,
+                    hint=True,
+                    font_rel=NOTO_SANS_FONT_REL,
+                ),
+            ),
+        )
+    for cache in (False, True):
+        suffix = "_cache" if cache else ""
+        commands = [{"op": "set_paint", "rgba8": BLACK}]
+        y = 28.35
+        for run_transform, font_size, glyph_transform in rows:
+            commands.append(
+                {"op": "set_transform", "affine": mul(translate(16.0, y), run_transform)}
+            )
+            commands.append(
+                glyph_run(
+                    noto_sans.run("Hello, world!", font_size),
+                    font_size,
+                    hint=True,
+                    atlas_cache=cache,
+                    glyph_transform=glyph_transform,
+                    font_rel=NOTO_SANS_FONT_REL,
+                )
+            )
+            y += 30.0
+        write(
+            f"glyph_run_autohint_transform_composition{suffix}_300x420.json",
+            scene(300, 420, commands),
+        )
 
     # glyphs_with_gradient: complex paints are never atlas-cached and exercise
     # the relative paint transform on all four composition rows.

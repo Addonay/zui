@@ -21,7 +21,7 @@ Pinned upstream: `1e63b4a40ccb484f82e1d85b83df97ab95bcfbe7` (`v0.10.0-51-g1e63b4
 | 13 | `vello_gpu/src/{text,resources}.rs` | — | `src/gpu/text.zig` | M5, not M3 |
 | 14 | `glifo/src/lib.rs` re-exports | 66 | `src/glifo/root.zig`, `src/root.zig` | all |
 
-Staged-only inventory (see §5 remainder): `skrifa/outline/glyf/hint/*` (30 files, each <500; interpreter), `outline/hint.rs` 647, `outline/autohint/*` (16 files, ~2.5k), `cff/hint.rs` 1,505 — the CFF scaler and charstring evaluator themselves landed in the M3 CFF branch (`src/glifo/cff.zig`); the hinter is still deferred. `glyf/deltas.rs` (~400), `bitmap.rs`, `png` decode.
+Staged-only inventory (see §5 remainder): `cff/hint.rs` 1,505 — the CFF scaler and charstring evaluator themselves landed in the M3 CFF branch (`src/glifo/cff.zig`); the hinter is still deferred. The interpreter (`outline/glyf/hint/*` + `outline/hint.rs`), the autohinter (`outline/autohint/*`, incl. the BestEffort GSUB shaper subset), `glyf/deltas.rs` (`gvar`/`cvar`, T6) and `bitmap.rs`/PNG decode have since landed as M3 G3b/G3e/T6.
 
 ## 2. Font loading decision (standalone, byte-exact)
 
@@ -35,7 +35,7 @@ Staged-only inventory (see §5 remainder): `skrifa/outline/glyf/hint/*` (30 file
 | `loca`/`glyf` outlines, simple + composite | **port** FreeType-style | default `PathStyle::FreeType`; `HarfBuzz` variant → `error.Unsupported`. Critical: unhinted FreeType scaling runs through `Fixed`/`F26Dot6` (`Scale26Dot6`) and converts to f32 at the end — an f32 reimplementation will not be bit-exact |
 | `gvar`/`cvar`, `HVAR` presence, `LocationRef`/`NormalizedCoord` | **port** (T6) | API and cache keys carry `i16` coords; `gvar`/`cvar` deltas, IUP, phantom points and hint `GETVARIATION` are bit-exact against the pinned oracle. `HVAR`/`VVAR`/`MVAR` *values* are not needed: the `glyf` scaler derives lsb/advance from the gvar phantom points, and HVAR only selects FreeType's rounding for them. `fvar`/`avar` user-space normalization stays caller-side, matching `glifo`'s `normalizedCoords` contract; `cmap` format 14 variation sequences remain deferred |
 | TrueType interpreter (`fpgm`/`prep`/`cvt`, phantom points), `HintingInstance`/`HintingOptions(Engine::AutoFallback, Target::Smooth{Lcd, symmetric_rendering:false, preserve_linear_metrics:true})` | **port** (staged, after tasks 1–5) | upstream default `hint(true)`; Roboto prefers interpreter, so hinted fixtures need it |
-| autohinter | **defer** | only selected for instruction-less fonts, none in the M3 fixture set → explicit error |
+| autohinter (`outline/autohint/*`) | **port** (G3b autohint) | selected by `Engine::AutoFallback` for instruction-less fonts; ported with the BestEffort GSUB shaper subset, `styles_data.zig` transcribed from skrifa's generated tables. Fixture: the Noto project's unhinted `NotoSans-Regular.ttf`; 3884 glyphs × 6 sizes (0.5–2048 ppem) and 8 hinted `--dump-glyphs` vectors are byte-exact |
 | CFF/CFF2 | **port** (M3 CFF) | Source Serif 4 OTF + variable CFF2 OTF (OFL-1.1) added as fixtures; Type2 charstring evaluator, DICT/INDEX/charset/FDSelect parsing and CFF2 blend/variation-store scalars are ported bit-exactly (`src/glifo/cff.zig`, `src/glifo/tables/cff.zig`, `src/glifo/tables/variations.zig`). CFF hinting (`skrifa/cff/hint.rs`) and `HVAR` advance deltas stay typed `error.Unsupported`, never approximated |
 | COLRv0/v1 + CPAL, `ColorPainter` traversal, brushes, composite modes | **port** | required by the milestone; glifo never hints COLR |
 | CBDT/CBLC/sbix + PNG bitmap glyphs | **port** (T5) | `sbix`/`CBDT`/`EBDT` strike selection + decode, `png 0.18`-compatible decoder; 16-bit/Adam7 -> `error.Unsupported` |
@@ -93,7 +93,7 @@ Staged gates: **G3a** unhinted outline corpus (Roboto `glyphs_{filled,small,skew
 
 **T5 — Cozmic adapter + decoration.** Files: `src/cozmic_adapter.zig`, `src/glifo/glyph.rs→.zig` decoration, `src/kurbo/bezpath.zig` (`PathSeg.transform`), `tests/cozmic_adapter_test.zig`, `build.zig` (opt-in test). Deps: T3 (outline fill/stroke), optionally T4. Acceptance: positioned-glyph mapping is 1:1 (ids/positions, no shaping calls, asserted by a counter/probe); `renderDecoration` skip-ink spans match upstream on crafted glyphs; adapter test skips explicitly when `.ports/cozmic` is absent; `zig build test`.
 
-M3 remainder after these five: autohint, CFF hinting and `HVAR` deltas, embolden — each explicit `error.Unsupported`. (TrueType hinting, bitmap/PNG, decoration, the Cozmic adapter and `gvar`/`cvar` variation deltas landed in T5/T6; the unhinted CFF/CFF2 scaler, blend support and its fixtures landed on branch `vellz-cff`; see `plan.md`'s ledger.)
+M3 remainder after these five: CFF hinting and `HVAR` deltas, embolden — each explicit `error.Unsupported`. (TrueType hinting, the `Engine::AutoFallback` autohinter, bitmap/PNG, decoration, the Cozmic adapter and `gvar`/`cvar` variation deltas landed in T5/T6/G3b; the unhinted CFF/CFF2 scaler, blend support and its fixtures landed on branch `vellz-cff`; see `plan.md`'s ledger.)
 
 ### M3 CFF closure (branch `vellz-cff`)
 
@@ -121,7 +121,7 @@ Fixtures: `SourceSerif4-Regular.otf` (1464 glyphs, CFF1) and
 `SourceSerif4Variable-Roman.otf` (CFF2, 6 FDArray subfonts, 34k `blend`
 operators), imported from the Adobe Fonts `release` commit
 `5f220b17d27ed64873f22cde0dd593685387bd19` under OFL-1.1. Gates: 9 glyph dump
-vectors (part of the 48-vector union gate, 1,193,920 elements / 3,456,940
+vectors (part of the 60-vector union gate, 2,335,632 elements / 6,812,052
 coordinates), 2 cmap vectors and 10 `glyph_run` scenes, all byte-exact at
 tolerance 0.
 
@@ -136,7 +136,7 @@ Port the atlas stack first, then a fixed-point-exact `glyf` outline subset with 
 - Unhinted glyf must use 26.6 `Fixed` scaling; f32 shortcuts silently break byte-exactness.
 - Hash-map iteration differences vs `foldhash` fixed-state change eviction/packing order (argued pixel-invisible; needs confirmation).
 - COLR exactness across composition layers/gradients is the least certain; upstream itself allows 55 pixels.
-- Deferrals (CFF hinting/`HVAR`, embolden, autohint, PNG 16-bit/Adam7) shrink coverage vs upstream test names.
+- Deferrals (CFF hinting/`HVAR`, embolden, PNG 16-bit/Adam7) shrink coverage vs upstream test names.
 
 ## Open questions
 1. Is G3 (unhinted + COLR + adapter) acceptable, or is hinted-Roboto parity required before declaring M3?

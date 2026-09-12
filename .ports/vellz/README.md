@@ -29,12 +29,12 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 906/906 unit and integration tests (889 lib + 8 scene
+zig build test     # 928/928 unit and integration tests (911 lib + 8 scene
                    #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
                    #   the .ports/cozmic sibling checkout is absent)
-zig build corpus   # 130/130 corpus scenes byte-exact vs the upstream oracle
+zig build corpus   # 142/142 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
-zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo (glyf, CFF, CFF2, gvar/cvar)
+zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo (glyf, CFF, CFF2, gvar/cvar, autohint)
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
 ```
 
@@ -67,9 +67,12 @@ TrueType hinting interpreter (`fpgm`/`prep`/`cvt`, phantom points,
 scaler (`cff.zig`: Type2 charstrings, flex, `seac`, CFF2 `blend`/`vsindex`;
 `tables/cff.zig` + `tables/variations.zig`: INDEX/DICT/charset/FDSelect and
 item variation store scalars) behind a format-neutral `glyf`/CFF dispatch
-(`outlines.zig`) — compared across 48 glyph vectors (1,193,920 path elements /
-3,456,940 f32 coordinates; Roboto size sweeps hinted and unhinted, Noto,
-Source Serif CFF/CFF2 and the Inconsolata variable font at both axes) and
+(`outlines.zig`), and the `Engine::AutoFallback` autohinter (`autohint/`, the
+ported generated style tables; instruction-less Noto Sans/Mono/Devanagari) —
+compared across 60 glyph vectors (2,335,632 path elements / 6,812,052 f32
+coordinates; Roboto size sweeps hinted and unhinted, Noto and colour Noto,
+Source Serif CFF/CFF2, the Inconsolata variable font at both axes, and the
+autohinted Noto Sans/Mono/Devanagari) and
 5 cmap vectors (458,752 mappings) at tolerance 0 (`zig build glyphs`) — and
 the atlas stack
 (`guillotiere`, `multi_atlas`, `image_cache`) is ported with a Rust-golden
@@ -104,9 +107,16 @@ and glyph-atlas caches, and normalized coordinates through
 `Inconsolata.ttf` (OFL-1.1: `wght` + `wdth` axes, `gvar`/`HVAR`/`avar`, hinted
 bytecode) gates 15 dump vectors and a 12-scene `glyph_run_var_*` corpus
 (wght min/max, wdth, both axes, composites, stroke, hint and atlas-cache
-variants). All of
+variants). G3b-autohint ports `Engine::AutoFallback` (`hinting.zig` selects
+the interpreter or `autohint/`): the deprecated-shaper-equivalent generated
+style tables, blue zones, edge hinting, Latin/monospace/Indic script groups,
+and the `HintCache` engine swap. The pinned instruction-less
+`NotoSans-Regular`/`NotoSansMono`/`NotoSansDevanagari` (OFL-1.1, unhinted
+build tree) gate 12 `glyph_run_autohint_*` scenes (fill, small, skew, scale
+absorption, composites, transform-composition rows, cache on/off) and 14 dump
+vectors, all byte-exact at tolerance 0. All of
 it renders byte-exact against the pinned oracle, atlas cache on and off
-(130/130 corpus, tolerance 0). The GPU side has the wgpu-native device
+(142/142 corpus, tolerance 0). The GPU side has the wgpu-native device
 bootstrap, the full host/shader layout
 contract, the schedule/layer executor, encoded paints (gradients and images),
 GPU filters, and a 44-scene `gpu-corpus` gate (27 byte-exact, the rest within
@@ -116,10 +126,10 @@ running on the llvmpipe software adapter.
 
 Not yet implemented (explicit typed errors, never placeholder pixels): PNG
 16-bit/Adam7 decode, CFF hinting (`skrifa/cff/hint.rs`), `HVAR` advance deltas
-on CFF2/variable outlines, synthetic embolden, plus fonts that would need the
-autohinter or hinted advances from `hdmx` without backward compatibility (all
-typed `error.Unsupported`); GPU masks, atlas-backed images, GPU text, and the
-full
+on CFF2/variable outlines, COLRv1 `Var*` paint deltas at non-default
+coordinates, hinted advances from `hdmx` without backward compatibility, and
+synthetic embolden (all typed
+`error.Unsupported`); GPU masks, atlas-backed images, GPU text, and the full
 G5 corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
 SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage
 benchmarks in `docs/benchmarks.md` (u8-vs-f32 speedups 1.9–3.4× on the
@@ -158,7 +168,7 @@ CPU-only, no GPU dependency:
 ```sh
 zig build test                  # unit + integration tests
 zig build check                 # compile without running
-zig build corpus                # corpus gate: 130 scenes byte-exact vs pinned fixtures
+zig build corpus                # corpus gate: 142 scenes byte-exact vs pinned fixtures
 zig build probe                 # upstream probe fixture (tolerance-3 policy)
 zig build run-cpu-example       # writes cpu_example.ppm
 zig build vellz-cli             # corpus renderer CLI -> zig-out/bin

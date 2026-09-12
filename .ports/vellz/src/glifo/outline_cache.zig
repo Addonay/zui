@@ -27,6 +27,7 @@ const kurbo = @import("../kurbo/root.zig");
 const font_mod = @import("font.zig");
 const glyf = @import("glyf.zig");
 const outlines_mod = @import("outlines.zig");
+const hinting = @import("hinting.zig");
 const pen_mod = @import("pen.zig");
 
 pub const GlyphId = font_mod.GlyphId;
@@ -180,13 +181,14 @@ pub const OutlineCache = struct {
     /// Looks up, or draws and stores, the outline for `gid`.
     ///
     /// `outlines` is the `glyf`/CFF dispatch union; `hint_instance` runs the
-    /// TrueType interpreter (configured for `size`) and makes the cache key
-    /// hint-distinct; `null` draws unhinted. CFF faces reject an enabled hint
-    /// instance with `error.Unsupported` and accept `null` (and an explicitly
-    /// disabled instance, matching upstream). Non-empty `coords` select the
-    /// second-level variable map (a no-op on a font without variation tables);
-    /// faces that need unported deltas reject them in `outlines.draw`. A
-    /// non-default embolden is still `error.Unsupported`.
+    /// configured hinting engine (interpreter or autohinter) and makes the
+    /// cache key hint-distinct; `null` draws unhinted. CFF faces reject an
+    /// enabled hint instance with `error.Unsupported` and accept `null` (and
+    /// an explicitly disabled instance, matching upstream). Non-empty `coords`
+    /// select the second-level variable map (a no-op on a font without
+    /// variation tables); faces that need unported deltas reject them in
+    /// `outlines.draw`. A non-default embolden is still
+    /// `error.Unsupported`.
     pub fn getOrInsert(
         self: *OutlineCache,
         allocator: std.mem.Allocator,
@@ -196,7 +198,7 @@ pub const OutlineCache = struct {
         size: f32,
         embolden: FontEmbolden,
         coords: []const NormalizedCoord,
-        hint_instance: ?*const glyf.HintInstance,
+        hint_instance: ?*hinting.HintingInstance,
     ) outlines_mod.DrawError!CachedOutline {
         if (!embolden.isDefault()) return error.Unsupported;
 
@@ -255,7 +257,7 @@ pub const OutlineCache = struct {
         gid: GlyphId,
         size: f32,
         coords: []const NormalizedCoord,
-        hint_instance: ?*const glyf.HintInstance,
+        hint_instance: ?*hinting.HintingInstance,
     ) outlines_mod.DrawError!CachedOutline {
         if (map.getPtr(key)) |entry_ptr| {
             const entry = entry_ptr.*;
@@ -274,10 +276,23 @@ pub const OutlineCache = struct {
             allocator.destroy(path);
         }
         var path_pen = pen_mod.PathPen.init(allocator, path);
-        const metrics = try outlines.draw(allocator, gid, .{
+        const metrics = if (hint_instance) |instance| switch (instance.kind) {
+            .interpreter => |*interpreter| try outlines.draw(allocator, gid, .{
+                .size = size,
+                .coords = coords,
+                .hint_instance = interpreter,
+            }, &path_pen),
+            .auto => |*auto| try auto.draw(
+                allocator,
+                gid,
+                size,
+                coords,
+                .freetype,
+                &path_pen,
+            ),
+        } else try outlines.draw(allocator, gid, .{
             .size = size,
             .coords = coords,
-            .hint_instance = hint_instance,
         }, &path_pen);
         _ = metrics;
         const bbox = path.boundingBox();
@@ -622,8 +637,9 @@ test "outline cache rejects unsupported inputs" {
     const outlines = try font.outlines();
     var cache = OutlineCache{};
     defer cache.deinit(std.testing.allocator);
-    var instance = try outlines.createHintInstance(
+    var instance = try hinting.create(
         std.testing.allocator,
+        &outlines,
         16.0,
         &.{},
         glyf.glifo_hint_target,

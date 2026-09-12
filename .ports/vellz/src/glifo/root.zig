@@ -31,6 +31,10 @@
 //!   (`sbix`/`CBDT`/`EBDT` strikes, PNG decode); `atlas` — `GlyphAtlas`/
 //!   `GlyphCacheKey`/`AtlasCommandRecorder`/`ImageCache`; `interface` — the
 //!   comptime `DrawSink`/`GlyphRenderer` duck-typing contracts.
+//! - `hinting`/`autohint` — `Engine::AutoFallback`: `HintingInstance` is
+//!   either the TrueType interpreter (`hint.zig`) or the automatic hinter
+//!   (`autohint/`: script/style tables, widths/blues, segments/edges, JIT
+//!   grid-fitting and the BestEffort GSUB shaper subset).
 //! - `NormalizedCoord = i16` and `FontEmbolden` — carried in cache keys for
 //!   API parity; non-default values are rejected with `error.Unsupported`.
 //! - `util` — the `glifo` float/affine predicates used by run preparation.
@@ -43,15 +47,18 @@
 //!
 //! # Deferred with typed errors
 //!
-//! Autohinting (fonts without `fpgm`/`prep` bytecode), COLRv1 `Var*` deltas
-//! (non-default coordinates on a v1 paint graph), CFF hinting
-//! (`skrifa/cff/hint.rs`), CFF2 `seac` and synthetic embolden are all
+//! COLRv1 `Var*` deltas (non-default coordinates on a v1 paint graph), CFF
+//! hinting (`skrifa/cff/hint.rs`), CFF2 `seac` and synthetic embolden are all
 //! `error.Unsupported`; none are approximated. `gvar`/`cvar` deltas and the
 //! variable-font cache maps are ported: user-space normalization
 //! (`fvar`/`avar`) stays caller-side exactly like `glifo`'s `normalizedCoords`
-//! API. TrueType hinting
-//! (M3 G3b), decoration (T5) and COLRv0/COLRv1 (T4, including gradients,
-//! transforms, clip boxes and composite modes) are ported, the unhinted
+//! API (non-empty coordinates on the autohinter path are a typed error, since
+//! the port does not thread varied outlines through `autohint/`). TrueType
+//! hinting
+//! (M3 G3b) and the `Engine::AutoFallback` autohinter (`autohint/`,
+//! instruction-less TrueType fonts), decoration (T5) and COLRv0/COLRv1 (T4,
+//! including gradients, transforms, clip boxes and composite modes) are
+//! ported, the unhinted
 //! CFF/CFF2 scaler (M3 CFF, including CFF2 blend/variation-store scalars) is
 //! ported, and embedded bitmaps (`sbix`/`CBDT`/`EBDT`, T5) resolve through the
 //! upstream COLR > bitmap > outline cascade with PNG decoding; `Bgra`/`Mask`
@@ -75,6 +82,8 @@ pub const glyf = @import("glyf.zig");
 pub const cff = @import("cff.zig");
 pub const outlines = @import("outlines.zig");
 pub const fixed = @import("fixed.zig");
+pub const autohint = @import("autohint/root.zig");
+pub const hinting = @import("hinting.zig");
 pub const pen = @import("pen.zig");
 pub const outline_cache = @import("outline_cache.zig");
 pub const util = @import("util.zig");

@@ -33,9 +33,14 @@
 //! to the plain scaler, and truncated tuple headers end iteration.
 //!
 //! Deferred with typed errors: HarfBuzz path style (`error.Unsupported`),
-//! CFF/bitmap faces (rejected by `font.Font.outlines`), autohinter-only fonts
-//! (`prefer_interpreter == false`), `hdmx` advances outside backward
-//! compatibility, and embolden (rejected by the outline cache).
+//! CFF/bitmap faces (rejected by `font.Font.outlines`; CFF hinting is
+//! `error.Unsupported`), `hdmx` advances outside backward compatibility, and
+//! embolden (rejected by the outline cache). Variation coordinates are
+//! handled here (`gvar`/`cvar` deltas). Instruction-less fonts
+//! (`prefer_interpreter == false`) are drawn by the autohinter through
+//! `hinting.zig`; `draw` itself still
+//! rejects an interpreter instance for them, so a hinted draw can never
+//! silently fall back to unhinted output.
 
 const std = @import("std");
 
@@ -292,8 +297,8 @@ pub const Outlines = struct {
     /// `head` bit 3 unset: fractional ppem is rounded before hinting.
     fractional_size_hinting: bool = true,
     /// True when the font carries bytecode (`fpgm`/`prep`/maxp instructions).
-    /// `Engine::AutoFallback` selects the interpreter only for these fonts;
-    /// everything else would need the deferred autohinter.
+    /// `Engine::AutoFallback` (`hinting.zig`) selects the interpreter only
+    /// for these fonts and the autohinter otherwise.
     prefer_interpreter: bool = false,
     /// The font carries `hdmx` width records; hinted advances would need them
     /// (not ported), so hinting such fonts is a typed error.
@@ -508,8 +513,10 @@ pub const Outlines = struct {
         if (settings.hint_instance) |instance| {
             if (instance.isEnabled()) {
                 if (!self.prefer_interpreter) {
-                    // `Engine::AutoFallback` would choose the (deferred)
-                    // autohinter; never silently draw unhinted.
+                    // `Engine::AutoFallback` chooses the autohinter for this
+                    // font (`hinting.zig`); an interpreter instance here
+                    // would be a configuration bug, never a silent unhinted
+                    // draw.
                     return error.Unsupported;
                 }
                 // `hdmx` advances are only consulted when backward
@@ -570,6 +577,56 @@ pub const Outlines = struct {
             .advance_width = f26ToF32(final_advance),
         };
     }
+
+    /// `OutlineGlyph::draw_unscaled` for `glyf`: runs the unhinted FreeType
+    /// scaler with no ppem and pushes raw font-unit points into `sink`.
+    ///
+    /// `sink` is duck-typed and must provide `tryReserve(usize) DrawError!void`
+    /// and `push(UnscaledSinkPoint) DrawError!void`. Returns the adjusted
+    /// advance width in font units (`>> 6`), like upstream.
+    pub fn drawUnscaled(
+        self: *const Outlines,
+        allocator: std.mem.Allocator,
+        gid: GlyphId,
+        sink: anytype,
+    ) DrawError!i32 {
+        const info = try self.outline(gid);
+        if (info.points > max_points) return error.TooManyPoints;
+        var scaler = try Scaler.init(allocator, self, &info, null, &.{}, null, false);
+        defer scaler.deinit();
+        try scaler.load(info.glyph, gid, 0);
+        try sink.tryReserve(scaler.point_count);
+        var contour_start: usize = 0;
+        for (scaler.contours.items) |contour_end_raw| {
+            const contour_end: usize = contour_end_raw;
+            if (contour_end >= contour_start) {
+                var ix = contour_start;
+                while (ix <= contour_end) : (ix += 1) {
+                    const point = scaler.scaled.items[ix];
+                    try sink.push(.{
+                        .x = @truncate(point.x >> 6),
+                        .y = @truncate(point.y >> 6),
+                        .flags = scaler.flags.items[ix] & raw.flag_on_curve_point,
+                        .is_contour_start = ix == contour_start,
+                    });
+                }
+            }
+            contour_start = contour_end + 1;
+        }
+        const advance = scaler.phantom[1].x -% scaler.phantom[0].x;
+        return advance >> 6;
+    }
+};
+
+/// One raw unscaled outline point for the autohinter (`UnscaledPoint`).
+pub const UnscaledSinkPoint = struct {
+    /// Font-unit coordinate (`F26Dot6` bits >> 6, truncated to `i16`).
+    x: i16,
+    y: i16,
+    /// On-curve/cubic flags with markers removed.
+    flags: u8,
+    /// True for the first point of a contour.
+    is_contour_start: bool,
 };
 
 /// State for one outline load. Mirrors `skrifa`'s `FreeTypeScaler`.
@@ -1501,28 +1558,28 @@ fn readPointsFast(
 
 // ------------------------------------------------------------ path conversion
 
-const ContourPoint = struct {
+pub const PathContourPoint = struct {
     x: i32,
     y: i32,
     flags: u8,
 
-    fn isOnCurve(self: ContourPoint) bool {
+    fn isOnCurve(self: PathContourPoint) bool {
         return (self.flags & raw.flag_on_curve_point) != 0;
     }
 
-    fn isOffCurveQuad(self: ContourPoint) bool {
+    fn isOffCurveQuad(self: PathContourPoint) bool {
         return (self.flags & (raw.flag_on_curve_point | raw.flag_cubic)) == 0;
     }
 
-    fn isOffCurveCubic(self: ContourPoint) bool {
+    fn isOffCurveCubic(self: PathContourPoint) bool {
         return (self.flags & raw.flag_cubic) != 0;
     }
 
-    fn toF32(self: ContourPoint) [2]f32 {
+    fn toF32(self: PathContourPoint) [2]f32 {
         return .{ f26ToF32(self.x), f26ToF32(self.y) };
     }
 
-    fn midpoint(self: ContourPoint, other: ContourPoint) ContourPoint {
+    fn midpoint(self: PathContourPoint, other: PathContourPoint) PathContourPoint {
         return .{
             .x = f26Midpoint(self.x, other.x),
             .y = f26Midpoint(self.y, other.y),
@@ -1551,28 +1608,53 @@ fn contourToPath(
         // Upstream only supports FreeType in this pipeline; HarfBuzz is
         // rejected in `draw` before reaching here.
         if (style != .freetype) return error.Unsupported;
-        try contourToPathFreetype(
-            points[start_ix .. end_ix + 1],
-            flags[start_ix .. end_ix + 1],
-            pen,
-        );
+        try contourToPathFreetype(PathPointView(Point26){
+            .points = points[start_ix .. end_ix + 1],
+            .flags = flags[start_ix .. end_ix + 1],
+        }, pen);
     }
 }
 
-fn contourPoint(points: []const Point26, flags: []const u8, ix: usize) ContourPoint {
-    return .{ .x = points[ix].x, .y = points[ix].y, .flags = flags[ix] };
+/// A read-only view over contour points in either of the two forms the
+/// scaler produces: parallel 26.6 `Point26`/flag slices, or the packed
+/// `PathContourPoint` array the autohinter keeps.
+fn PathPointView(comptime T: type) type {
+    return struct {
+        points: []const T,
+        flags: ?[]const u8 = null,
+
+        fn len(self: @This()) usize {
+            return self.points.len;
+        }
+
+        fn get(self: @This(), ix: usize) PathContourPoint {
+            if (comptime T == PathContourPoint) {
+                return self.points[ix];
+            } else {
+                const f = self.flags.?;
+                return .{ .x = self.points[ix].x, .y = self.points[ix].y, .flags = f[ix] };
+            }
+        }
+    };
 }
 
-fn contourToPathFreetype(
-    points: []const Point26,
-    flags: []const u8,
+/// Runs the FreeType path conversion over raw packed contour points. Used by
+/// the autohinter, which keeps its own point representation.
+pub fn contourPointsToPath(
+    points: []const PathContourPoint,
+    style: PathStyle,
     pen: anytype,
 ) DrawError!void {
-    const n = points.len;
-    const first = contourPoint(points, flags, 0);
-    const last = contourPoint(points, flags, n - 1);
+    if (style != .freetype) return error.Unsupported;
+    try contourToPathFreetype(PathPointView(PathContourPoint){ .points = points }, pen);
+}
 
-    var start_point: ContourPoint = undefined;
+fn contourToPathFreetype(points: anytype, pen: anytype) DrawError!void {
+    const n = points.len();
+    const first = points.get(0);
+    const last = points.get(n - 1);
+
+    var start_point: PathContourPoint = undefined;
     var omit_last = false;
     var start_ix: usize = 0;
     if (first.isOffCurveQuad()) {
@@ -1597,12 +1679,12 @@ fn contourToPathFreetype(
         const end_ix = n - 1;
         var ix = start_ix;
         while (ix < end_ix) : (ix += 1) {
-            try state.emit(ix, contourPoint(points, flags, ix), pen);
+            try state.emit(ix, points.get(ix), pen);
         }
     } else {
         var ix = start_ix;
         while (ix < n) : (ix += 1) {
-            try state.emit(ix, contourPoint(points, flags, ix), pen);
+            try state.emit(ix, points.get(ix), pen);
         }
     }
     try state.finish(0, start_point, pen);
@@ -1610,11 +1692,11 @@ fn contourToPathFreetype(
 
 const PendingState = union(enum) {
     empty,
-    pending_quad: ContourPoint,
-    pending_cubic: ContourPoint,
-    two_pending_cubics: struct { c0: ContourPoint, c1: ContourPoint },
+    pending_quad: PathContourPoint,
+    pending_cubic: PathContourPoint,
+    two_pending_cubics: struct { c0: PathContourPoint, c1: PathContourPoint },
 
-    fn emit(self: *PendingState, ix: usize, point: ContourPoint, pen: anytype) DrawError!void {
+    fn emit(self: *PendingState, ix: usize, point: PathContourPoint, pen: anytype) DrawError!void {
         _ = ix;
         switch (self.*) {
             .empty => {
@@ -1669,7 +1751,7 @@ const PendingState = union(enum) {
         }
     }
 
-    fn finish(self: *PendingState, start_ix: usize, start_point: ContourPoint, pen: anytype) DrawError!void {
+    fn finish(self: *PendingState, start_ix: usize, start_point: PathContourPoint, pen: anytype) DrawError!void {
         switch (self.*) {
             .empty => {},
             else => {

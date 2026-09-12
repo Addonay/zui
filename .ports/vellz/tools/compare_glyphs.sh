@@ -128,6 +128,24 @@ glyph_vectors=(
     "Inconsolata.ttf 16.0 0 100 n 0.5,-0.5,0.75"
     "Roboto-Regular.ttf 16.0 0 1293 n 1.0,-1.0"
     "Roboto-Regular.ttf 16.0 0 1293 h 1.0,-1.0"
+    # G3b autohint: the instruction-less OFL Noto Sans fixture takes
+    # `Engine::AutoFallback` to the autohinter (fpgm/prep empty and
+    # maxp.maxSizeOfInstructions == 0).
+    "NotoSans-Regular.ttf 12.0 0 3883 h"
+    "NotoSans-Regular.ttf 16.0 0 3883 h"
+    "NotoSans-Regular.ttf 23.5 0 3883 h"
+    "NotoSans-Regular.ttf 7.0 0 3883 h"
+    "NotoSans-Regular.ttf 14.5 0 3883 h"
+    "NotoSans-Regular.ttf 100.0 0 3883 h"
+    "NotoSans-Regular.ttf 0.5 0 3883 h"
+    "NotoSans-Regular.ttf 2048.0 0 3883 h"
+    # G3b autohint coverage: monospace digits exercise the fixed-width /
+    # same-width digit advance path, and Devanagari exercises the Indic
+    # script group.
+    "NotoSansMono-Regular.ttf 16.0 0 3919 h"
+    "NotoSansMono-Regular.ttf 7.0 0 3919 h"
+    "NotoSansDevanagari-Regular.ttf 16.0 0 844 h"
+    "NotoSansDevanagari-Regular.ttf 7.0 0 844 h"
 )
 
 # font filename, first codepoint, last codepoint
@@ -147,6 +165,9 @@ font_id() {
         SourceSerif4-Regular.otf) echo 3 ;;
         SourceSerif4Variable-Roman.otf) echo 4 ;;
         Inconsolata.ttf) echo 5 ;;
+        NotoSans-Regular.ttf) echo 6 ;;
+        NotoSansMono-Regular.ttf) echo 7 ;;
+        NotoSansDevanagari-Regular.ttf) echo 8 ;;
         *) echo "unknown font $1" >&2; exit 2 ;;
     esac
 }
@@ -258,6 +279,9 @@ if [ "$update_manifest" -eq 1 ]; then
         echo "pub const font_source_serif: u8 = 3;"
         echo "pub const font_source_serif_variable: u8 = 4;"
         echo "pub const font_inconsolata: u8 = 5;"
+        echo "pub const font_notosans: u8 = 6;"
+        echo "pub const font_notosans_mono: u8 = 7;"
+        echo "pub const font_notosans_devanagari: u8 = 8;"
         echo ""
         echo "pub const GlyphVector = struct {"
         echo "    font: u8,"
