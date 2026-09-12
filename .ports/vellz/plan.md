@@ -191,12 +191,12 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `coarse/cmd.rs` | `cpu/coarse/cmd.zig` | port | 4 tests |
 | `coarse/depth.rs` | `cpu/coarse/depth.zig` | port | 10 tests, 128-px buckets |
 | `coarse/bucketer.rs` | `cpu/coarse/bucketer.zig` | port | full `bucketCommands` (fills, layers, depth, alpha segments) |
-| `fine/mod.rs` (`Fine`, `rasterize_region`, traits) | `cpu/fine/mod.zig` | port | connected; error-returning per port policy |
+| `fine/mod.rs` (`Fine`, `rasterize_region`, traits) | `cpu/fine/mod.zig` | port | connected; error-returning per port policy; painter selection dispatches on `K.Numeric` |
 | `fine/highp/*` (f32 kernel) | `cpu/fine/highp/mod.zig`, `blend.zig`, `compose.zig` | port | connected; 16 mix + 14 compose modes |
-| `fine/lowp/*` (u8 kernel) | `cpu/fine/lowp.zig` | defer | M4 speed path |
+| `fine/lowp/*` (u8 kernel) | `cpu/fine/lowp/mod.zig`, `blend.zig`, `compose.zig`, `gradient.zig`, `image.zig` | port + conn + ver | connected via `optimize_speed`; scalar u8 fast paths + f32 fallback for the remaining mix modes; oracle-verified (16 speed scenes byte-exact vs pinned oracle) |
 | `fine/common/gradient/*` | `cpu/fine/gradient.zig` | port | connected; oracle-verified (linear/radial/sweep/repeat scenes byte-exact) |
 | `fine/common/image.rs` | `cpu/fine/image.zig` | port | connected; oracle-verified (nearest/bilinear scenes byte-exact) |
-| `dispatch/single_threaded.rs` | `cpu/dispatch/single_threaded.zig` | port | connected; f32 kernel; u8 kernel explicit `error.Unsupported` (M4) |
+| `dispatch/single_threaded.rs` | `cpu/dispatch/single_threaded.zig` | port | connected; comptime kernel selection (`optimize_speed` -> u8, `optimize_quality` -> f32), mirroring upstream with both pipelines enabled |
 | `dispatch/multi_threaded*.rs` | `cpu/dispatch/multi_threaded.zig` | defer | M4 |
 | `filter/*` | `cpu/filter/*.zig` | port | connected; oracle-verified (8 filter scenes byte-exact); highp uses upstream's lowp blur/drop-shadow internals; multi-primitive graphs -> `error.Unsupported` |
 | `fine/common/rounded_blurred_rect.rs` | `cpu/fine/blurred_rect.zig` | port | connected; oracle-verified (normal + inverted scenes byte-exact) |
@@ -447,9 +447,24 @@ of panics, thread ownership).
 
 ### Milestone 4 — CPU optimization
 
-- SIMD dispatch and multithreading ported, scalar reference retained.
-- **Gate:** scalar/portable/SIMD results agree exactly on the corpus; measured
-  speedups recorded with methodology (`G4`).
+- u8 low-precision pipeline ported and connected behind
+  `RenderMode.optimize_speed` (`cpu/fine/lowp/*`, dispatcher kernel selection).
+- **u8 oracle gate:** 16 `*_speed` corpus scenes byte-exact (`tolerance=0`,
+  four channels) against the pinned oracle rendered with
+  `RenderMode::OptimizeSpeed`; they cover the u8-native gradient LUT and
+  bilinear painters, the f32 painter `paintU8` conversion (nearest/bicubic
+  images, undefined radial gradients), and the integer blend/composite/mask
+  paths. The original 22 quality scenes stay byte-exact.
+- **Rough timings** (ReleaseFast CLI, 200 runs each, includes ~2.4 ms process
+  startup; not a methodology-complete G4 record): `fill_wave_seams_128`
+  3.6 -> 2.0 ms, `fill_tile_grid_128` 4.4 -> 1.9 ms, `gradient_repeat_128`
+  5.0 -> 3.5 ms; but `image_bilinear_64` 3.4 -> 4.8 ms slower in u8, because
+  the ported u8 painters run scalar lane loops while the f32 painters
+  vectorize through `@Vector`.
+- **Remaining:** SIMD-level dispatch (the port currently pins fallback
+  semantics in `src/simd`), multithreading, per-stage measured speedups. Gate
+  G4 is not claimed until scalar/portable/SIMD agreement and timings are
+  recorded.
 
 ### Milestone 5 — Hybrid GPU implementation
 
@@ -557,4 +572,22 @@ of panics, thread ownership).
   (byte-exact, fnv1a `52f1e5326a5c7fda`). One port defect found and fixed
   during the port: the gradient element set its paint but initially omitted
   the `fill_rect`, which is exactly what the probe is for.
+- 2026-09-11 later (merged 2026-09-12): M4 u8 speed path landed. Ported
+  upstream `fine/lowp/{mod,blend,compose,gradient,image}.rs` into
+  `cpu/fine/lowp/{mod,blend,compose,gradient,image}.zig` (u8/u16 integer
+  compositing and blend fast paths with the f32 fallback for the remaining
+  mix modes; u8 LUT gradient painter; u8-native bilinear image painters;
+  the f32 painters gained `paintU8` conversion for the paths upstream keeps
+  on f32, and `cpu/fine/blurred_rect.zig` gained the matching `paintU8` so
+  the u8 kernel can use the M2 blurred-rect painter too).
+  `cpu/fine/mod.zig` `indexedFill`/`applyComplexPaint` select painters by
+  `K.Numeric`, and `dispatch/single_threaded.zig` routes
+  `RenderMode.optimize_speed` to `U8Kernel` with comptime dispatch (no
+  runtime vtable), mirroring upstream when both pipeline features are on;
+  filter layers rasterize their contents with the selected kernel, as
+  upstream's `rasterize_filter_layers` does. Oracle evidence: 16 new
+  `*_speed` scenes render byte-exact vs the pinned oracle at
+  `OptimizeSpeed` (`tolerance=0`, four channels); quality scenes stay
+  byte-exact. Remaining: SIMD-level dispatch, multithreading, more measured
+  speedups, glyphs on the u8 path.
 

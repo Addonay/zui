@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "speed", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "gradient": {
+        "kind": { "radial": {
+          "start_center": [20, 32], "start_radius": 5,
+          "end_center": [28, 32], "end_radius": 5
+        } },
+        "stops": [
+          { "offset": 0.0, "rgba8": [255, 220, 80, 200] },
+          { "offset": 1.0, "rgba8": [180, 20, 90, 255] }
+        ],
+        "extend": "pad"
+    } },
+    { "op": "fill_rect", "rect": [4, 4, 60, 60] }
+  ]
+}

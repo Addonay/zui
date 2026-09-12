@@ -928,10 +928,10 @@ pub const RenderContext = struct {
     /// settings.
     ///
     /// Note: the default rasterizer mode is `optimize_speed`, which selects
-    /// the u8 pipeline upstream. That pipeline is M4 in this port, so `render`
-    /// currently returns `error.Unsupported`; pass
+    /// the u8 pipeline (upstream parity). Pass
     /// `RasterizerSettings{ .render_mode = .optimize_quality }` to
-    /// `renderWith` for M1 rendering.
+    /// `renderWith` for the f32 pipeline; the two pipelines are not
+    /// byte-equal in general (see `tests/README.md`).
     pub fn render(
         self: *RenderContext,
         pixmap: *Pixmap,
@@ -1018,7 +1018,8 @@ fn transparentPixel() peniko.PremulRgba8 {
     return peniko.PremulRgba8.fromU32(0);
 }
 
-/// The M4 u8 pipeline is not ported yet, so tests render with the f32 kernel.
+/// Quality-mode settings for tests that pin f32 bytes (the corpus gate also
+/// runs in this mode).
 fn qualitySettings() RasterizerSettings {
     return .{
         .render_mode = .optimize_quality,
@@ -1431,22 +1432,49 @@ test "render fails with unclosed layers" {
     try ctx.renderWith(&pixmap, &resources, qualitySettings());
 }
 
-test "default render mode defers to the M4 u8 pipeline" {
+test "default render mode uses the u8 pipeline and matches f32 on opaque fills" {
     const allocator = testing.allocator;
-    var ctx = try RenderContext.init(allocator, 1, 1, RenderSettings.default);
-    defer ctx.deinit(allocator);
+
+    const renderMode = struct {
+        fn call(
+            mode: RenderMode,
+            allocator_: std.mem.Allocator,
+            pixmap: *Pixmap,
+            resources: *Resources,
+        ) !void {
+            var ctx = try RenderContext.init(allocator_, 4, 4, RenderSettings.default);
+            defer ctx.deinit(allocator_);
+
+            ctx.setPaint(palette.RED);
+            try ctx.fillRect(allocator_, kurbo.Rect.new(0.0, 0.0, 4.0, 4.0));
+            ctx.flush();
+            if (mode == .optimize_speed) {
+                // `render` uses `RasterizerSettings.default`.
+                try ctx.render(pixmap, resources);
+            } else {
+                try ctx.renderWith(pixmap, resources, qualitySettings());
+            }
+        }
+    }.call;
+
     var resources = Resources.init();
     defer resources.deinit(allocator);
-    var pixmap = try Pixmap.init(allocator, 1, 1);
-    defer pixmap.deinit(allocator);
 
-    ctx.setPaint(palette.RED);
-    try ctx.fillRect(allocator, kurbo.Rect.new(0.0, 0.0, 1.0, 1.0));
-    ctx.flush();
+    var speed_pixmap = try Pixmap.init(allocator, 4, 4);
+    defer speed_pixmap.deinit(allocator);
+    var quality_pixmap = try Pixmap.init(allocator, 4, 4);
+    defer quality_pixmap.deinit(allocator);
 
-    // `render` uses `RasterizerSettings.default` (optimize_speed -> u8
-    // kernel), which is M4; the error must be explicit.
-    try testing.expectError(error.Unsupported, ctx.render(&pixmap, &resources));
+    try renderMode(.optimize_speed, allocator, &speed_pixmap, &resources);
+    try renderMode(.optimize_quality, allocator, &quality_pixmap, &resources);
+
+    // Opaque fills are exact in both pipelines.
+    try testing.expectEqualSlices(
+        u8,
+        quality_pixmap.dataAsU8Slice(),
+        speed_pixmap.dataAsU8Slice(),
+    );
+    try expectPixel(&speed_pixmap, 0, 0, premulU8(palette.RED));
 }
 
 test "reset keeps aliasing threshold and filter state" {

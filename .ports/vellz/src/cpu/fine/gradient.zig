@@ -29,12 +29,14 @@
 
 const std = @import("std");
 const simd = @import("../../simd/root.zig");
+const common_util = @import("../../common/util.zig");
 const encode = @import("../../common/encode.zig");
 const kurbo = @import("../../kurbo/root.zig");
 const peniko = @import("../../peniko/root.zig");
 
 const F32x4 = simd.F32x4;
 const F32x8 = simd.F32x8;
+const F32x16 = simd.F32x16;
 const U32x8 = simd.Vec(8, u32);
 const Point = kurbo.Point;
 const Extend = peniko.Extend;
@@ -286,6 +288,59 @@ pub const GradientPainter = struct {
         }
     }
 
+    /// Paint one row as u8 bytes, processing complete 32-byte (8-pixel)
+    /// chunks only.
+    ///
+    /// This is the `U8Kernel::apply_painter` path for gradients with
+    /// undefined positions (upstream keeps `gradient_painter_with_undefined`
+    /// on the f32 painter and converts through `u8x16::from_f32`). The two
+    /// passes mirror [`GradientPainter.paint`].
+    pub fn paintU8(self: *GradientPainter, dest: []u8) void {
+        const masked_pass = self.has_undefined;
+
+        self.paintU8Pass(dest);
+
+        if (masked_pass) {
+            self.t_idx = 0;
+            self.maskedU8Pass(dest);
+        }
+    }
+
+    /// First u8 pass: sample the f32 LUT and convert each component.
+    fn paintU8Pass(self: *GradientPainter, dest: []u8) void {
+        const max_index: u32 = @intCast(self.lut.width() - 1);
+        const max_index_v: U32x8 = @splat(max_index);
+
+        var i: usize = 0;
+        while (i + 32 <= dest.len) : (i += 32) {
+            const indices = self.nextIndices();
+            const clamped = @min(indices, max_index_v);
+            inline for (0..8) |pixel| {
+                const rgba = self.lut.get(@intCast(clamped[pixel]));
+                inline for (0..4) |component| {
+                    dest[i + 4 * pixel + component] = lutComponentToU8(rgba[component]);
+                }
+            }
+        }
+    }
+
+    /// Second u8 pass: zero every pixel whose raw index is the invalid
+    /// sentinel.
+    fn maskedU8Pass(self: *GradientPainter, dest: []u8) void {
+        const sentinel: U32x8 = @splat(GRADIENT_INVALID_POS);
+
+        var i: usize = 0;
+        while (i + 32 <= dest.len) : (i += 32) {
+            const indices = self.nextIndices();
+            const invalid = indices == sentinel;
+            inline for (0..8) |pixel| {
+                if (invalid[pixel]) {
+                    @memset(dest[i + 4 * pixel ..][0..4], 0);
+                }
+            }
+        }
+    }
+
     /// First pass: sample the LUT for every complete 8-pixel chunk.
     fn paintPass(self: *GradientPainter, dest: []f32) void {
         const max_index: u32 = @intCast(self.lut.width() - 1);
@@ -375,12 +430,22 @@ fn applyExtend(val: F32x8, extend: Extend) F32x8 {
 /// Rust's `value as u32` for f32: truncate toward zero and saturate; NaN maps
 /// to zero and values at or above the saturating bound map to `u32::MAX`
 /// (which is also [`GRADIENT_INVALID_POS`], like upstream).
-fn f32ToU32(value: f32) u32 {
+///
+/// Public because the low-precision painter in `lowp/gradient.zig` shares the
+/// same saturating conversion (upstream `to_int::<u32x16>`).
+pub fn f32ToU32(value: f32) u32 {
     if (std.math.isNan(value)) return 0;
     if (value <= 0.0) return 0;
     // The f32 literal rounds to 2^32, matching Rust's saturating cast bound.
     if (value >= 4294967295.0) return GRADIENT_INVALID_POS;
     return @intFromFloat(value);
+}
+
+/// Convert one f32 LUT component to u8 via `u8x16::from_f32`
+/// (`f32_to_u8(v * 255.0 + 0.5)`, unfused multiply-add).
+fn lutComponentToU8(value: f32) u8 {
+    const scaled: F32x16 = @splat(value * 255.0 + 0.5);
+    return common_util.f32ToU8(scaled)[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +632,57 @@ test "painter samples a two-color lut and leaves partial groups alone" {
     }
     for (dest[32..]) |value| {
         try testing.expectEqual(@as(f32, 42.0), value);
+    }
+}
+
+test "u8 painting zeroes undefined positions when has_undefined" {
+    const allocator = testing.allocator;
+    var paints: std.ArrayList(encode.EncodedPaint) = .empty;
+    defer releasePaints(allocator, &paints);
+
+    const stops = [_]peniko.ColorStop{
+        peniko.ColorStop.init(0.0, peniko.palette.css.RED),
+        peniko.ColorStop.init(1.0, peniko.palette.css.BLUE),
+    };
+    // Equal radii with distinct centers encode as a `strip`, which can yield
+    // undefined positions (`has_undefined = true`).
+    const gradient = try encodeTestGradient(
+        allocator,
+        &paints,
+        .{ .radial = peniko.RadialGradientPosition.newTwoPoint(
+            Point.new(0.0, 0.0),
+            1.0,
+            Point.new(2.0, 0.0),
+            1.0,
+        ) },
+        &stops,
+        .pad,
+    );
+    try testing.expect(gradient.has_undefined);
+
+    const lut = try gradient.f32Lut(allocator);
+    const first = lut.get(0);
+    var first_u8: [4]u8 = undefined;
+    inline for (0..4) |component| {
+        const scaled: F32x16 = @splat(first[component] * 255.0 + 0.5);
+        first_u8[component] = common_util.f32ToU8(scaled)[0];
+    }
+
+    // First pixel column is undefined (NaN) and must be zeroed; the second
+    // samples index 0.
+    const t_vals = [_]f32{
+        std.math.nan(f32), std.math.nan(f32), std.math.nan(f32), std.math.nan(f32),
+        0.0,               0.0,               0.0,               0.0,
+    };
+    var painter = try GradientPainter.init(gradient, allocator, &t_vals);
+    var dest: [32]u8 = @splat(42);
+    painter.paintU8(&dest);
+
+    for (dest[0..16]) |value| {
+        try testing.expectEqual(@as(u8, 0), value);
+    }
+    for (0..4) |pixel| {
+        try testing.expectEqualSlices(u8, &first_u8, dest[16 + 4 * pixel ..][0..4]);
     }
 }
 

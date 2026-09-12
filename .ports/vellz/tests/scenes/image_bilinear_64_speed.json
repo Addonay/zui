@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "speed", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "image": {
+        "asset": "assets/checker16.rgba",
+        "width": 16,
+        "height": 16,
+        "format": "rgba8",
+        "alpha_type": "alpha",
+        "sampler": { "x_extend": "reflect", "y_extend": "reflect", "quality": "medium", "alpha": 1.0 }
+    } },
+    { "op": "set_paint_transform", "affine": [3, 0, 0, 3, 0, 0] },
+    { "op": "fill_rect", "rect": [0, 0, 64, 64] }
+  ]
+}

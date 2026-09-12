@@ -24,10 +24,10 @@ pub const PixelFormat = enum {
 /// Whether to prioritize speed or quality when rendering.
 ///
 /// Upstream selects the u8 pipeline for `optimize_speed` and the f32 pipeline
-/// for `optimize_quality` when both cargo features are enabled. The port has
-/// only the f32 kernel until M4; see `SingleThreadedDispatcher.rasterize`.
+/// for `optimize_quality` when both cargo features are enabled; this port
+/// mirrors that selection in `SingleThreadedDispatcher.rasterize`.
 pub const RenderMode = enum {
-    /// Prefer speed (u8 pipeline upstream; M4 in this port).
+    /// Prefer speed (u8 pipeline).
     optimize_speed,
     /// Prefer quality (f32 pipeline).
     optimize_quality,

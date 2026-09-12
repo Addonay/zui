@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "width": 64,
+  "height": 64,
+  "settings": { "mode": "speed", "level": "fallback", "threads": 0 },
+  "commands": [
+    { "op": "set_paint", "rgba8": [255, 0, 0, 128] },
+    { "op": "fill_rect", "rect": [8, 8, 40, 40] },
+    { "op": "set_paint", "rgba8": [0, 128, 255, 128] },
+    { "op": "fill_rect", "rect": [24, 24, 56, 56] }
+  ]
+}

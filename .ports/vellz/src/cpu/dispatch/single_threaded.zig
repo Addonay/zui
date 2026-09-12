@@ -1,15 +1,17 @@
 //! Port of vello_cpu src/dispatch/single_threaded.rs (Apache-2.0 OR MIT).
 //!
 //! The single-threaded dispatcher records fill commands from a path/stroke/rect
-//! API into a `CommandRecorder`, then buckets and rasterizes them with the f32
-//! fine kernel.
+//! API into a `CommandRecorder`, then buckets and rasterizes them with the fine
+//! kernel selected by `RasterizerSettings.render_mode`: the u8 kernel
+//! (`U8Kernel`) for `optimize_speed` and the f32 kernel (`F32Kernel`) for
+//! `optimize_quality`, mirroring upstream with both pipeline features enabled.
 //!
-//! M1 scope and deferrals:
+//! Scope and deferrals:
 //!
-//! - `rasterize` only selects the f32 kernel (`F32Kernel`). Upstream with the
-//!   `u8_pipeline` feature picks the u8 kernel for `RenderMode.optimize_speed`;
-//!   that kernel is M4, so the speed mode returns `error.Unsupported` instead
-//!   of silently rendering with different precision.
+//! - `rasterize` selects the fine kernel from `RasterizerSettings.render_mode`:
+//!   the u8 kernel (`U8Kernel`) for `optimize_speed` and the f32 kernel
+//!   (`F32Kernel`) for `optimize_quality`, mirroring upstream with both
+//!   pipeline features enabled.
 //! - Filter layers are supported: `rasterizeFilterLayers` renders every
 //!   recorded filter layer in reverse dependency order into its placement
 //!   pixmap and applies the filter, then the root pass composites the
@@ -50,6 +52,7 @@ const CommandBucketer = coarse.CommandBucketer;
 const CommandRecorder = record.CommandRecorder(cpu_record.RecordedFill);
 const DepthBuffer = coarse.DepthBuffer;
 const F32Kernel = fine_mod.F32Kernel;
+const U8Kernel = fine_mod.U8Kernel;
 const Fill = peniko.Fill;
 const FilterContext = filter_mod.FilterContext;
 const Fine = fine_mod.Fine;
@@ -456,7 +459,9 @@ pub const SingleThreadedDispatcher = struct {
     ///
     /// `encoded_paints` are the scene's encoded gradient/image paints (owned
     /// by the caller); `image_resolver` resolves `ImageSource.opaque_id`
-    /// paints.
+    /// paints. With both pipelines available (as here), upstream selects the
+    /// u8 kernel for speed and the f32 kernel for quality; that selection is
+    /// preserved instead of falling back silently.
     pub fn rasterize(
         self: *SingleThreadedDispatcher,
         allocator: std.mem.Allocator,
@@ -468,7 +473,8 @@ pub const SingleThreadedDispatcher = struct {
         image_resolver: paint_mod.ImageResolver,
     ) !void {
         switch (settings.render_mode) {
-            .optimize_quality => try self.rasterizeF32(
+            .optimize_quality => try self.rasterizeWith(
+                F32Kernel,
                 allocator,
                 target,
                 scene_width,
@@ -477,15 +483,26 @@ pub const SingleThreadedDispatcher = struct {
                 encoded_paints,
                 image_resolver,
             ),
-            // The u8 pipeline is M4. Never fall back silently to f32.
-            .optimize_speed => return error.Unsupported,
+            .optimize_speed => try self.rasterizeWith(
+                U8Kernel,
+                allocator,
+                target,
+                scene_width,
+                scene_height,
+                settings,
+                encoded_paints,
+                image_resolver,
+            ),
         }
     }
 
-    /// Rasterize using the f32 precision pipeline (upstream `rasterize_f32`
-    /// with only the `f32_pipeline` feature enabled).
-    fn rasterizeF32(
+    /// Rasterize with a specific fine kernel (upstream `rasterize_with`).
+    ///
+    /// The kernel is a comptime parameter, so operators dispatch statically
+    /// and no runtime vtable exists between the dispatcher and the kernel.
+    fn rasterizeWith(
         self: *SingleThreadedDispatcher,
+        comptime K: type,
         allocator: std.mem.Allocator,
         target: *PixmapMut,
         scene_width: u16,
@@ -494,7 +511,12 @@ pub const SingleThreadedDispatcher = struct {
         encoded_paints: []encode_mod.EncodedPaint,
         image_resolver: paint_mod.ImageResolver,
     ) !void {
-        var filter_ctx = try self.rasterizeFilterLayers(allocator, encoded_paints, image_resolver);
+        var filter_ctx = try self.rasterizeFilterLayers(
+            K,
+            allocator,
+            encoded_paints,
+            image_resolver,
+        );
         defer filter_ctx.deinit(allocator);
 
         const target_init = settings.target_init.map(PremulColor.fromAlphaColor);
@@ -504,6 +526,7 @@ pub const SingleThreadedDispatcher = struct {
         };
 
         try self.bucketAndRasterize(
+            K,
             allocator,
             self.recorder.nodes.items,
             RectU16.new(0, 0, scene_width, scene_height),
@@ -525,6 +548,7 @@ pub const SingleThreadedDispatcher = struct {
     /// guarantees all dependencies have been rendered before they are invoked.
     fn rasterizeFilterLayers(
         self: *SingleThreadedDispatcher,
+        comptime K: type,
         allocator: std.mem.Allocator,
         encoded_paints: []encode_mod.EncodedPaint,
         image_resolver: paint_mod.ImageResolver,
@@ -558,6 +582,7 @@ pub const SingleThreadedDispatcher = struct {
             };
 
             try self.bucketAndRasterize(
+                K,
                 allocator,
                 layer.nodes.items,
                 pixmap_bbox,
@@ -587,6 +612,7 @@ pub const SingleThreadedDispatcher = struct {
 
     fn bucketAndRasterize(
         self: *SingleThreadedDispatcher,
+        comptime K: type,
         allocator: std.mem.Allocator,
         cmds: []const Node,
         viewport: RectU16,
@@ -629,13 +655,13 @@ pub const SingleThreadedDispatcher = struct {
         );
         defer regions.deinit(allocator);
 
-        var fine = try Fine(F32Kernel).init(self.level, allocator, self.bucketer.width);
+        var fine = try Fine(K).init(self.level, allocator, self.bucketer.width);
         defer fine.deinit();
         var depth_buffer = try DepthBuffer.init(allocator, self.bucketer.width);
         defer depth_buffer.deinit(allocator);
 
         const Ctx = struct {
-            fine: *Fine(F32Kernel),
+            fine: *Fine(K),
             depth_buffer: *DepthBuffer,
             bucketer: *const CommandBucketer,
             resources: FineResources,
@@ -646,7 +672,7 @@ pub const SingleThreadedDispatcher = struct {
             pub fn call(ctx: *@This(), region: *Region) void {
                 if (ctx.err != null) return;
                 fine_mod.rasterizeRegion(
-                    F32Kernel,
+                    K,
                     ctx.fine,
                     ctx.depth_buffer,
                     region,

@@ -14,7 +14,7 @@
 //!   `FilterEffect` dispatch)
 //! - `dispatch/single_threaded.zig` <- `dispatch/single_threaded.rs`
 //! - `fine/`           <- `fine/` (`Fine(K)`, `rasterizeRegion`,
-//!   `highp.F32Kernel`, `common/rounded_blurred_rect.rs`)
+//!   `highp.F32Kernel`, `lowp.U8Kernel`, `common/rounded_blurred_rect.rs`)
 //! - `render.zig`      <- `render.rs` (`RenderContext`, `Resources`, and the
 //!   re-exported settings types)
 
@@ -33,6 +33,7 @@ pub const probe = @import("probe.zig");
 
 pub const Span = util.Span;
 pub const F32Kernel = fine.F32Kernel;
+pub const U8Kernel = fine.U8Kernel;
 pub const FilterContext = filter.FilterContext;
 
 pub const RenderContext = render.RenderContext;
@@ -59,6 +60,12 @@ test {
     _ = @import("dispatch/single_threaded.zig");
     _ = @import("fine/mod.zig");
     _ = @import("fine/blurred_rect.zig");
+    _ = @import("fine/highp/mod.zig");
+    _ = @import("fine/lowp/mod.zig");
+    _ = @import("fine/lowp/blend.zig");
+    _ = @import("fine/lowp/compose.zig");
+    _ = @import("fine/lowp/gradient.zig");
+    _ = @import("fine/lowp/image.zig");
     _ = @import("render.zig");
     _ = @import("probe.zig");
 }

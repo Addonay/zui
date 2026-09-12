@@ -5,9 +5,9 @@
 //! <https://git.sr.ht/~raph/blurrr/tree/master/src/distfield.rs>.
 //!
 //! The upstream filler is a `Painter` over 8-lane `f32x8` vectors; this port
-//! keeps the same lane layout and operation order and exposes `paint` with the
-//! same contract as the other M2 painters (`gradient.zig`, `image.zig`):
-//! only complete 8-pixel (32-f32) chunks are written, trailing pixels keep
+//! keeps the same lane layout and operation order and exposes `paint`/`paintU8`
+//! with the same contract as the other M2 painters (`gradient.zig`,
+//! `image.zig`): only complete chunks are written, trailing pixels keep
 //! whatever the caller initialized the buffer with.
 //!
 //! Ownership/allocator note: the filler borrows the encoded rectangle for the
@@ -18,6 +18,7 @@ const simd = @import("../../simd/root.zig");
 const kurbo = @import("../../kurbo/root.zig");
 const encode = @import("../../common/encode.zig");
 const math = @import("../../common/math.zig");
+const common_util = @import("../../common/util.zig");
 
 const Point = kurbo.Point;
 const Vec2 = kurbo.Vec2;
@@ -68,17 +69,37 @@ pub const BlurredRoundedRectFiller = struct {
     pub fn paint(self: *BlurredRoundedRectFiller, dest: []f32) void {
         var i: usize = 0;
         while (i + 32 <= dest.len) : (i += 32) {
-            var coverage = self.alpha_calculator.next();
-            if (self.invert) {
-                coverage = @as(F32x8, @splat(1.0)) - coverage;
-            }
-
-            const r = self.r * coverage;
-            const g = self.g * coverage;
-            const b = self.b * coverage;
-            const a = self.a * coverage;
+            const result = self.nextResult();
 
             inline for (0..8) |lane| {
+                dest[i + 4 * lane] = result.r[lane];
+                dest[i + 4 * lane + 1] = result.g[lane];
+                dest[i + 4 * lane + 2] = result.b[lane];
+                dest[i + 4 * lane + 3] = result.a[lane];
+            }
+        }
+    }
+
+    /// Paint one span as u8 bytes, processing complete 16-pixel (64-byte)
+    /// chunks only.
+    ///
+    /// This is upstream's `Painter::paint_u8` for
+    /// `BlurredRoundedRectFiller`: two f32x8 results per chunk, converted
+    /// through `u8x16::from_f32` (`f32_to_u8(v * 255 + 0.5)`, saturating).
+    /// The f32 kernel never calls it; the u8 kernel's `apply_painter` does
+    /// (upstream implements both methods on the same filler).
+    pub fn paintU8(self: *BlurredRoundedRectFiller, dest: []u8) void {
+        var i: usize = 0;
+        while (i + 64 <= dest.len) : (i += 64) {
+            const first = self.nextResult();
+            const second = self.nextResult();
+
+            const r = columnToU8(simd.combineF32x8(first.r, second.r));
+            const g = columnToU8(simd.combineF32x8(first.g, second.g));
+            const b = columnToU8(simd.combineF32x8(first.b, second.b));
+            const a = columnToU8(simd.combineF32x8(first.a, second.a));
+
+            inline for (0..16) |lane| {
                 dest[i + 4 * lane] = r[lane];
                 dest[i + 4 * lane + 1] = g[lane];
                 dest[i + 4 * lane + 2] = b[lane];
@@ -86,7 +107,38 @@ pub const BlurredRoundedRectFiller = struct {
             }
         }
     }
+
+    /// One alpha-calculator step with the invert fold applied (upstream
+    /// `Iterator::next`).
+    fn nextResult(self: *BlurredRoundedRectFiller) struct {
+        r: F32x8,
+        g: F32x8,
+        b: F32x8,
+        a: F32x8,
+    } {
+        var coverage = self.alpha_calculator.next();
+        if (self.invert) {
+            coverage = @as(F32x8, @splat(1.0)) - coverage;
+        }
+
+        return .{
+            .r = self.r * coverage,
+            .g = self.g * coverage,
+            .b = self.b * coverage,
+            .a = self.a * coverage,
+        };
+    }
 };
+
+/// Convert one normalized f32 pixel column to bytes (upstream
+/// `u8x16::from_f32`).
+fn columnToU8(column: simd.F32x16) simd.U8x16 {
+    return common_util.f32ToU8(simd.mulAddUnfused(
+        column,
+        @as(simd.F32x16, @splat(255.0)),
+        @as(simd.F32x16, @splat(0.5)),
+    ));
+}
 
 /// Blur-coverage iterator (upstream `AlphaCalculator`).
 const AlphaCalculator = struct {
