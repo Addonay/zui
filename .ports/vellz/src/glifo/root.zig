@@ -43,10 +43,13 @@
 //!
 //! # Deferred with typed errors
 //!
-//! Autohinting (fonts without `fpgm`/`prep` bytecode), `gvar`/`HVAR`/`avar`
-//! variation deltas (non-empty coords on a face with `HVAR`/variable `glyf`),
-//! CFF hinting (`skrifa/cff/hint.rs`), CFF2 `seac` and synthetic embolden are
-//! all `error.Unsupported`; none are approximated. TrueType hinting
+//! Autohinting (fonts without `fpgm`/`prep` bytecode), COLRv1 `Var*` deltas
+//! (non-default coordinates on a v1 paint graph), CFF hinting
+//! (`skrifa/cff/hint.rs`), CFF2 `seac` and synthetic embolden are all
+//! `error.Unsupported`; none are approximated. `gvar`/`cvar` deltas and the
+//! variable-font cache maps are ported: user-space normalization
+//! (`fvar`/`avar`) stays caller-side exactly like `glifo`'s `normalizedCoords`
+//! API. TrueType hinting
 //! (M3 G3b), decoration (T5) and COLRv0/COLRv1 (T4, including gradients,
 //! transforms, clip boxes and composite modes) are ported, the unhinted
 //! CFF/CFF2 scaler (M3 CFF, including CFF2 blend/variation-store scalars) is
@@ -87,6 +90,9 @@ pub const FontData = font.FontData;
 pub const Font = font.Font;
 pub const GlyphId = font.GlyphId;
 pub const NormalizedCoord = font.NormalizedCoord;
+/// `F2Dot14::from_f32` (round half away from zero, saturating): the same
+/// conversion the oracle applies to `--coords` values.
+pub const f2dot14FromF32 = font.f2dot14FromF32;
 pub const Charmap = font.Charmap;
 
 pub const Outlines = outlines.Outlines;

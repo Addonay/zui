@@ -28,6 +28,7 @@ const raw = @import("tables/glyf.zig");
 
 pub const Font = font_mod.Font;
 pub const GlyphId = font_mod.GlyphId;
+pub const NormalizedCoord = font_mod.NormalizedCoord;
 pub const HintInstance = glyf.HintInstance;
 pub const HintProgram = glyf.HintProgram;
 pub const AdjustedMetrics = glyf.AdjustedMetrics;
@@ -152,10 +153,11 @@ pub const Outlines = union(enum) {
         self: *const Outlines,
         allocator: std.mem.Allocator,
         size: f32,
+        coords: []const NormalizedCoord,
         target: glyf.HintTarget,
     ) DrawError!HintInstance {
         return switch (self.*) {
-            .glyf => |*g| g.createHintInstance(allocator, size, target),
+            .glyf => |*g| g.createHintInstance(allocator, size, coords, target),
             .cff => error.Unsupported,
         };
     }
@@ -197,6 +199,7 @@ test "cff dispatch reports glyph coverage" {
     try testing.expectError(error.Unsupported, outlines.createHintInstance(
         testing.allocator,
         16.0,
+        &.{},
         glyf.glifo_hint_target,
     ));
 }

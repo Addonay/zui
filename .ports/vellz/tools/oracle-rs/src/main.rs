@@ -198,8 +198,10 @@ struct GlyphRunSpec {
     glyph_transform: Option<[f64; 6]>,
     #[serde(default)]
     embolden: Option<[f32; 2]>,
+    /// Normalized variation coordinates in `[-1, 1]`; converted with
+    /// `F2Dot14::from_f32`, the same conversion the CLI applies.
     #[serde(default)]
-    normalized_coords: Option<Vec<i16>>,
+    normalized_coords: Option<Vec<f32>>,
     #[serde(default)]
     atlas_cache: bool,
     /// "fill" (default) or "stroke".
@@ -821,12 +823,27 @@ fn dump_glyphs(args: &[String]) -> Result<(), String> {
     let font = skrifa::FontRef::from_index(&data, parsed.index)
         .map_err(|e| format!("loading {}[{}]: {e}", parsed.font.display(), parsed.index))?;
     let outlines = font.outline_glyphs();
+    // `--coords` values are normalized user-facing coordinates; convert them
+    // with `F2Dot14::from_f32` exactly like the Zig CLI does.
+    let normalized: Vec<skrifa::instance::NormalizedCoord> = parsed
+        .coords
+        .iter()
+        .map(|coord| skrifa::instance::NormalizedCoord::from_f32(*coord))
+        .collect();
+    let location = skrifa::instance::LocationRef::new(&normalized);
     let mut out = String::new();
     out.push_str("vellz-glyph-dump v1\n");
     out.push_str(&format!("face {}\n", parsed.index));
     out.push_str(&format!("size {:08x}\n", size.to_bits()));
     if parsed.hint {
         out.push_str("hint 1\n");
+    }
+    if !normalized.is_empty() {
+        out.push_str(&format!("coords {}", normalized.len()));
+        for coord in &normalized {
+            out.push_str(&format!(" {}", coord.to_bits()));
+        }
+        out.push('\n');
     }
     // The same configuration glifo 0.3.0 uses for hinted runs.
     let hinting_options = HintingOptions {
@@ -839,13 +856,8 @@ fn dump_glyphs(args: &[String]) -> Result<(), String> {
     };
     let hinting_instance = if parsed.hint {
         Some(
-            HintingInstance::new(
-                &outlines,
-                SkrifaSize::new(size),
-                skrifa::instance::LocationRef::default(),
-                hinting_options,
-            )
-            .map_err(|e| format!("configuring hinting at size {size}: {e}"))?,
+            HintingInstance::new(&outlines, SkrifaSize::new(size), location, hinting_options)
+                .map_err(|e| format!("configuring hinting at size {size}: {e}"))?,
         )
     } else {
         None
@@ -863,10 +875,7 @@ fn dump_glyphs(args: &[String]) -> Result<(), String> {
         let mut elements: Vec<PathElement> = Vec::new();
         let settings = match &hinting_instance {
             Some(instance) => SkrifaDrawSettings::hinted(instance, false),
-            None => SkrifaDrawSettings::unhinted(
-                SkrifaSize::new(size),
-                skrifa::instance::LocationRef::default(),
-            ),
+            None => SkrifaDrawSettings::unhinted(SkrifaSize::new(size), location),
         };
         let metrics = glyph
             .draw(settings, &mut elements)
@@ -991,6 +1000,9 @@ struct DumpArgs {
     size: Option<f32>,
     ids: Vec<u32>,
     hint: bool,
+    /// Normalized coordinates as supplied on the command line (before
+    /// `F2Dot14` conversion).
+    coords: Vec<f32>,
 }
 
 /// Parses the shared `--dump-glyphs`/`--dump-cmap` arguments.
@@ -1000,6 +1012,7 @@ fn parse_dump_args(args: &[String], want_size: bool, what: &str) -> Result<DumpA
     let mut size: Option<f32> = None;
     let mut ids: Vec<u32> = Vec::new();
     let mut hint = false;
+    let mut coords: Vec<f32> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -1025,6 +1038,22 @@ fn parse_dump_args(args: &[String], want_size: bool, what: &str) -> Result<DumpA
                 );
                 i += 2;
             }
+            "--coords" => {
+                let value = args.get(i + 1).ok_or("--coords needs a value")?;
+                if !value.trim().is_empty() {
+                    for part in value.split(',') {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            continue;
+                        }
+                        coords.push(
+                            part.parse()
+                                .map_err(|_| format!("--coords values must be numbers, got {part:?}"))?,
+                        );
+                    }
+                }
+                i += 2;
+            }
             "--hint" => {
                 hint = true;
                 i += 1;
@@ -1047,6 +1076,7 @@ fn parse_dump_args(args: &[String], want_size: bool, what: &str) -> Result<DumpA
         size,
         ids,
         hint,
+        coords,
     })
 }
 
@@ -1103,9 +1133,10 @@ fn build_paint(spec: &PaintSpec, scene_dir: &Path) -> Result<PaintType, String> 
 
 /// Draw one positioned glyph run through the pinned upstream `glifo` stack.
 ///
-/// Deferred features (`embolden`, `normalized_coords`) are hard errors so a
-/// scene can never silently drop them. `decoration` draws after the
-/// fill/stroke pass, like the upstream decoration tests.
+/// Deferred features (`embolden`) are hard errors so a scene can never
+/// silently drop them. `normalized_coords` are converted with
+/// `F2Dot14::from_f32` before being handed to the builder. `decoration` draws
+/// after the fill/stroke pass, like the upstream decoration tests.
 fn draw_glyph_run(
     ctx: &mut RenderContext,
     resources: &mut vello_cpu::Resources,
@@ -1118,18 +1149,24 @@ fn draw_glyph_run(
     {
         return Err("glyph_run embolden is not ported yet (error.Unsupported)".into());
     }
-    if let Some(coords) = &spec.normalized_coords
-        && !coords.is_empty()
-    {
-        return Err("glyph_run normalized_coords are not supported (gvar deferred)".into());
-    }
 
     let font = load_font(scene_dir, &spec.font, font_cache)?;
+    // glifo's public `NormalizedCoord` is the `i16` bit pattern of F2Dot14.
+    let coords: Vec<i16> = spec
+        .normalized_coords
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|coord| skrifa::instance::NormalizedCoord::from_f32(*coord).to_bits())
+        .collect();
     let mut builder = ctx
         .glyph_run(resources, &font)
         .font_size(spec.font_size)
         .hint(spec.hint)
         .atlas_cache(spec.atlas_cache);
+    if !coords.is_empty() {
+        builder = builder.normalized_coords(&coords);
+    }
     if let Some(transform) = spec.glyph_transform {
         builder = builder.glyph_transform(parse_affine(transform));
     }
@@ -1156,6 +1193,9 @@ fn draw_glyph_run(
             .font_size(spec.font_size)
             .hint(spec.hint)
             .atlas_cache(spec.atlas_cache);
+        if !coords.is_empty() {
+            deco_builder = deco_builder.normalized_coords(&coords);
+        }
         if let Some(transform) = spec.glyph_transform {
             deco_builder = deco_builder.glyph_transform(parse_affine(transform));
         }
@@ -1290,10 +1330,20 @@ fn dump_decoration(args: &[String]) -> Result<(), String> {
                 sink: &mut sink,
                 prep: glifo::GlyphPrepCache::default(),
             };
+            let coords: Vec<i16> = spec
+                .normalized_coords
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|coord| skrifa::instance::NormalizedCoord::from_f32(*coord).to_bits())
+                .collect();
             let mut builder =
                 glifo::GlyphRunBuilder::new(font, Affine::IDENTITY, Affine::IDENTITY, backend)
                     .font_size(spec.font_size)
                     .hint(spec.hint);
+            if !coords.is_empty() {
+                builder = builder.normalized_coords(&coords);
+            }
             if let Some(transform) = spec.glyph_transform {
                 builder = builder.glyph_transform(parse_affine(transform));
             }

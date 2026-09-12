@@ -10,10 +10,10 @@
 //!   for map/vector storage and for the `ImageCache` calls.
 //! - `insert` distinguishes `error.OutOfMemory` from "atlas full" (`null`);
 //!   upstream's `.ok()?` collapses both.
-//! - Variable-font entries are not implemented (non-empty variation
-//!   coordinates are `error.Unsupported` in this port), so only the static
-//!   map exists. `GlyphCacheKey.var_coords` remains excluded from equality,
-//!   matching upstream.
+//! - Variable-font entries use upstream's two-level map, partitioned by the
+//!   raw `GlyphCacheKey.var_coords` slice (which stays excluded from key
+//!   equality). The outer key owns a copy of the coordinates; lookups are
+//!   allocation-free borrowed-content lookups.
 //! - `PendingBitmapUpload` is a borrowing queue (`pendingUploads` +
 //!   `clearPendingUploads`) instead of a draining iterator, because Zig's
 //!   `clearRetainingCapacity` poisons the backing storage in safe builds.
@@ -96,6 +96,30 @@ const GlyphMap = std.HashMapUnmanaged(
     std.hash_map.default_max_load_percentage,
 );
 
+/// Owned variation-coordinate key for the second-level atlas map.
+pub const VarKey = struct {
+    coords: []const key_mod.NormalizedCoord,
+};
+
+const VarContext = struct {
+    pub fn hash(_: VarContext, key: VarKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.sliceAsBytes(key.coords));
+        return h.final();
+    }
+
+    pub fn eql(_: VarContext, a: VarKey, b: VarKey) bool {
+        return std.mem.eql(key_mod.NormalizedCoord, a.coords, b.coords);
+    }
+};
+
+const VariableMap = std.HashMapUnmanaged(
+    VarKey,
+    *GlyphMap,
+    VarContext,
+    std.hash_map.default_max_load_percentage,
+);
+
 /// Core glyph atlas cache data shared by all renderer backends.
 ///
 /// Contains the cache entries, age tracking, and pending queues. Does **not**
@@ -106,6 +130,10 @@ pub const GlyphAtlas = struct {
     eviction_config: GlyphCacheConfig = .{},
     /// Entries for non-variable fonts.
     static_entries: GlyphMap = .empty,
+    /// Entries for variable fonts, partitioned by the variation coordinates
+    /// (upstream's `variable_entries`). The inner keys exclude `var_coords`
+    /// from equality, exactly like upstream.
+    variable_entries: VariableMap = .empty,
     /// Current frame serial for age tracking.
     serial: u64 = 0,
     /// Serial of the last eviction pass.
@@ -137,15 +165,46 @@ pub const GlyphAtlas = struct {
     pub fn deinit(self: *GlyphAtlas, allocator: std.mem.Allocator) void {
         self.clear(allocator);
         self.static_entries.deinit(allocator);
+        self.variable_entries.deinit(allocator);
         self.pending_uploads.deinit(allocator);
         self.pending_clear_rects.deinit(allocator);
         self.pending_atlas_commands.deinit(allocator);
         self.* = undefined;
     }
 
+    /// The map that holds `coords`: the static map for an empty slice,
+    /// otherwise the second-level variable map (upstream's two-level layout).
+    fn mapForCoords(self: *GlyphAtlas, coords: []const key_mod.NormalizedCoord) ?*GlyphMap {
+        if (coords.len == 0) return &self.static_entries;
+        const ptr = self.variable_entries.getPtr(.{ .coords = coords }) orelse return null;
+        return ptr.*;
+    }
+
+    fn mapForInsert(
+        self: *GlyphAtlas,
+        allocator: std.mem.Allocator,
+        coords: []const key_mod.NormalizedCoord,
+    ) std.mem.Allocator.Error!struct { map: *GlyphMap, created: bool } {
+        if (coords.len == 0) return .{ .map = &self.static_entries, .created = false };
+        if (self.variable_entries.getPtr(.{ .coords = coords })) |existing| {
+            return .{ .map = existing.*, .created = false };
+        }
+        const owned = try allocator.dupe(key_mod.NormalizedCoord, coords);
+        errdefer allocator.free(owned);
+        const map = try allocator.create(GlyphMap);
+        map.* = .empty;
+        errdefer allocator.destroy(map);
+        try self.variable_entries.put(allocator, .{ .coords = owned }, map);
+        return .{ .map = map, .created = true };
+    }
+
     /// Look up a cached glyph, updating its age serial.
     pub fn get(self: *GlyphAtlas, key: GlyphCacheKey) ?region.AtlasSlot {
-        const entry = self.static_entries.get(key) orelse {
+        const map = self.mapForCoords(key.var_coords) orelse {
+            self.cache_misses += 1;
+            return null;
+        };
+        const entry = map.get(key) orelse {
             self.cache_misses += 1;
             return null;
         };
@@ -197,7 +256,22 @@ pub const GlyphAtlas = struct {
         errdefer allocator.destroy(entry);
         entry.* = .{ .atlas_slot = atlas_slot, .serial = self.serial };
 
-        self.static_entries.put(allocator, key, entry) catch |err| {
+        const target = self.mapForInsert(allocator, key.var_coords) catch |err| {
+            _ = image_cache.deallocate(allocator, image_id) catch {};
+            return err;
+        };
+        // Stored keys never borrow the caller's coordinate slice: the outer
+        // map key owns the coordinates and the inner maps are reachable only
+        // through their outer key, so `var_coords` is excluded and left empty.
+        var stored_key = key;
+        stored_key.var_coords = &.{};
+        target.map.put(allocator, stored_key, entry) catch |err| {
+            if (target.created) {
+                const removed = self.variable_entries.fetchRemove(.{ .coords = key.var_coords }).?;
+                removed.value.deinit(allocator);
+                allocator.destroy(removed.value);
+                allocator.free(removed.key.coords);
+            }
             _ = image_cache.deallocate(allocator, image_id) catch {};
             return err;
         };
@@ -353,6 +427,12 @@ pub const GlyphAtlas = struct {
     ) !void {
         var expired: std.ArrayListUnmanaged(GlyphCacheKey) = .empty;
         defer expired.deinit(allocator);
+        const ExpiredVarEntry = struct {
+            outer: VarKey,
+            inner: GlyphCacheKey,
+        };
+        var expired_var: std.ArrayListUnmanaged(ExpiredVarEntry) = .empty;
+        defer expired_var.deinit(allocator);
 
         var iterator = self.static_entries.iterator();
         while (iterator.next()) |map_entry| {
@@ -360,6 +440,20 @@ pub const GlyphAtlas = struct {
             const age = self.serial -% entry.serial;
             if (age > self.eviction_config.max_entry_age) {
                 try expired.append(allocator, map_entry.key_ptr.*);
+            }
+        }
+        var outer_iterator = self.variable_entries.iterator();
+        while (outer_iterator.next()) |outer| {
+            var inner_iterator = outer.value_ptr.*.iterator();
+            while (inner_iterator.next()) |map_entry| {
+                const entry = map_entry.value_ptr.*;
+                const age = self.serial -% entry.serial;
+                if (age > self.eviction_config.max_entry_age) {
+                    try expired_var.append(allocator, .{
+                        .outer = outer.key_ptr.*,
+                        .inner = map_entry.key_ptr.*,
+                    });
+                }
             }
         }
 
@@ -377,6 +471,34 @@ pub const GlyphAtlas = struct {
             allocator.destroy(entry);
             self.entry_count -|= 1;
         }
+        for (expired_var.items) |item| {
+            const map = self.variable_entries.getPtr(.{ .coords = item.outer.coords }) orelse continue;
+            const entry = map.*.get(item.inner) orelse continue;
+            try self.pending_clear_rects.ensureUnusedCapacity(allocator, 1);
+            _ = image_cache.deallocate(allocator, entry.atlas_slot.image_id) catch continue;
+            const slot = entry.atlas_slot;
+            _ = map.*.remove(item.inner);
+            self.pending_clear_rects.appendAssumeCapacity(pushClearRectForSlot(slot));
+            allocator.destroy(entry);
+            self.entry_count -|= 1;
+        }
+
+        // Drop second-level maps that became empty, releasing their owned
+        // coordinate keys.
+        var empty_keys: std.ArrayListUnmanaged(VarKey) = .empty;
+        defer empty_keys.deinit(allocator);
+        var prune_iterator = self.variable_entries.iterator();
+        while (prune_iterator.next()) |outer| {
+            if (outer.value_ptr.*.count() == 0) {
+                try empty_keys.append(allocator, outer.key_ptr.*);
+            }
+        }
+        for (empty_keys.items) |var_key| {
+            const removed = self.variable_entries.fetchRemove(var_key).?;
+            removed.value.deinit(allocator);
+            allocator.destroy(removed.value);
+            allocator.free(removed.key.coords);
+        }
     }
 
     /// Clear all cache entries, pending work queues and statistics.
@@ -387,6 +509,16 @@ pub const GlyphAtlas = struct {
         var iterator = self.static_entries.iterator();
         while (iterator.next()) |map_entry| allocator.destroy(map_entry.value_ptr.*);
         self.static_entries.clearRetainingCapacity();
+        var outer_iterator = self.variable_entries.iterator();
+        while (outer_iterator.next()) |outer| {
+            const map = outer.value_ptr.*;
+            var inner_iterator = map.iterator();
+            while (inner_iterator.next()) |map_entry| allocator.destroy(map_entry.value_ptr.*);
+            map.deinit(allocator);
+            allocator.destroy(map);
+            allocator.free(outer.key_ptr.coords);
+        }
+        self.variable_entries.clearRetainingCapacity();
         self.clearPendingUploads(allocator);
         self.pending_clear_rects.clearRetainingCapacity();
         for (self.pending_atlas_commands.items) |*slot| {
@@ -460,6 +592,21 @@ fn testKey(glyph_id: u32) GlyphCacheKey {
     );
 }
 
+fn testVarKey(glyph_id: u32, coords: []const i16) GlyphCacheKey {
+    return key_mod.newKey(
+        1,
+        0,
+        glyph_id,
+        16.0,
+        false,
+        0.0,
+        peniko.Color.BLACK,
+        key_mod.packColor(peniko.Color.BLACK),
+        @import("../outline_cache.zig").FontEmbolden{},
+        coords,
+    );
+}
+
 fn testCache(allocator: std.mem.Allocator, atlas_size: [2]u16) !image_cache_mod.ImageCache {
     return image_cache_mod.ImageCache.initWithConfig(allocator, .{ .atlas_size = atlas_size });
 }
@@ -492,6 +639,34 @@ test "insert allocates a padded slot and get hits it" {
 
     try testing.expect(atlas.get(testKey(43)) == null);
     try testing.expectEqual(@as(u64, 1), atlas.cacheMisses());
+}
+
+test "variable coordinates partition the atlas cache" {
+    const allocator = testing.allocator;
+    var cache = try testCache(allocator, .{ 256, 256 });
+    defer cache.deinit(allocator);
+    var atlas = GlyphAtlas.init();
+    defer atlas.deinit(allocator);
+
+    const coords_a = [_]i16{ 0x4000, 0 };
+    const coords_b = [_]i16{ -0x4000, 0x2000 };
+    const static_result = (try atlas.insert(allocator, &cache, testKey(7), testMetrics(4, 4))).?;
+    const a_result = (try atlas.insert(allocator, &cache, testVarKey(7, &coords_a), testMetrics(4, 4))).?;
+    const b_result = (try atlas.insert(allocator, &cache, testVarKey(7, &coords_b), testMetrics(4, 4))).?;
+    try testing.expectEqual(@as(usize, 3), atlas.len());
+    try testing.expectEqual(@as(usize, 2), atlas.variable_entries.count());
+
+    try testing.expectEqual(static_result.slot.image_id.asU32(), atlas.get(testKey(7)).?.image_id.asU32());
+    try testing.expectEqual(a_result.slot.image_id.asU32(), atlas.get(testVarKey(7, &coords_a)).?.image_id.asU32());
+    try testing.expectEqual(b_result.slot.image_id.asU32(), atlas.get(testVarKey(7, &coords_b)).?.image_id.asU32());
+    try testing.expect(atlas.get(testVarKey(7, &.{0})) == null);
+
+    // Eviction frees the nested maps and their owned coordinate keys.
+    var i: u32 = 0;
+    while (i < 130) : (i += 1) try atlas.maintain(allocator, &cache);
+    try testing.expectEqual(@as(usize, 0), atlas.len());
+    try testing.expectEqual(@as(usize, 0), atlas.variable_entries.count());
+    try testing.expectEqual(@as(usize, 3), atlas.pendingClearRects().len);
 }
 
 test "insert returns null when the atlas cannot fit the glyph" {

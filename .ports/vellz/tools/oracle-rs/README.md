@@ -51,6 +51,13 @@ tools/oracle-rs/target/release/vellz-oracle \
     --dump-glyphs --font tests/fixtures/upstream/Roboto-Regular.ttf \
     --size 16.0 --gids 0-100
 
+# Variable-font outlines: normalized coords are converted with
+# `F2Dot14::from_f32` and echoed in the dump as `coords <n> <bits...>`.
+# `--hint` configures the interpreter at the same location.
+tools/oracle-rs/target/release/vellz-oracle \
+    --dump-glyphs --font tests/fixtures/upstream/Inconsolata.ttf \
+    --size 16.0 --coords 1.0,-1.0 --hint --gids 0-200
+
 # Selected cmap subtable (format 4 or 12) for ASCII plus an emoji.
 tools/oracle-rs/target/release/vellz-oracle \
     --dump-cmap --font tests/fixtures/upstream/NotoColorEmoji-Subset.ttf \
@@ -260,13 +267,14 @@ positioned glyph list, so the oracle and vellz receive identical inputs.
 | --- | --- |
 | `font` | `asset` is relative to the scene file; `index` selects a TTC face |
 | `font_size` | pixels per em |
-| `hint` | default `true` (upstream); the M3 corpus uses `false` because the interpreter is not ported yet |
+| `hint` | default `true` (upstream); the interpreter is ported (M3 G3b) |
 | `glyph_transform` | optional affine applied per glyph (after positioning) |
 | `atlas_cache` | optional; toggles the glyph atlas path |
 | `style` | `fill` (default) or `stroke` (uses the current `set_stroke`) |
 | `glyphs` | `{id, x, y}` list; `id` is the font glyph id from `--dump-cmap` |
-| `embolden` / `normalized_coords` | parsed and rejected with an explicit error until ported (`error.Unsupported`) |
-| `decoration` | parsed and rejected with an explicit error until T5 |
+| `embolden` | parsed and rejected with an explicit error until ported (`error.Unsupported`) |
+| `normalized_coords` | optional normalized `[-1, 1]` values, converted with `F2Dot14::from_f32` and forwarded to `glifo`'s `normalized_coords` |
+| `decoration` | optional skip-ink decoration drawn after the fill/stroke pass (T5) |
 
 The current scene transform and `set_paint_transform` are captured by
 `RenderContext::glyph_run` exactly as in `vello_cpu`, so the usual commands

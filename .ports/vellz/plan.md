@@ -231,11 +231,11 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | Upstream module | Zig target | Status | Notes |
 | --- | --- | --- | --- |
 | `lib.rs`, `interface.rs` (Glyph, DrawSink, GlyphRenderer) | `glifo/root.zig`, `glifo/interface.zig` | port | comptime duck-typing contracts + `assert*` helpers |
-| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, `HintCache` (16-entry LRU), COLR > bitmap > outline draw loop, COLR metrics, skip-ink `renderDecoration`, bitmap transform + decode; embolden/coords -> typed `error.Unsupported`; TrueType hinting ported (M3 G3b, `glifo/hint.zig`) |
+| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, `HintCache` (16-entry LRU, coordinate-keyed), COLR > bitmap > outline draw loop, COLR metrics, skip-ink `renderDecoration`, bitmap transform + decode; variable coordinates forwarded to `gvar`/`cvar` and the second-level cache maps (M3 T6); embolden -> typed `error.Unsupported`; TrueType hinting ported (M3 G3b, `glifo/hint.zig`) |
 | `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline/bitmap/COLR fill/stroke, subpixel keys, COLR command recording, command replay, raster metrics, pending bitmap uploads |
 | `colr.rs` (COLR/CPAL painting) + `skrifa/src/color/*` | `glifo/colr.zig`, `glifo/tables/{colr,cpal}.zig` | port | COLRv0/v1 paint graph, gradients, transforms, clip boxes, composite modes, palette/foreground colors (M3 T4) |
 | `skrifa/src/bitmap.rs` + `read-fonts` `sbix`/`CBDT`/`CBLC`/`EBDT`/`EBLC` | `glifo/tables/bitmap.zig`, `glifo/png.zig` | port | strike selection (sbix > CBDT > EBDT, nearest strike), CBLC/EBLC index subtable formats 1–5, CBDT/EBDT record decode (PNG/BGRA/mask), sbix glyph records, png 0.18-compatible decode; 16-bit/Adam7 -> typed `error.Unsupported` (M3 T5) |
-| `atlas/*` (cache, keys, regions, commands) | `glifo/atlas/*.zig` | port | cache/eviction, fixed-seed key hashing, recorder + replay; variable-font second-level map deferred with `gvar` |
+| `atlas/*` (cache, keys, regions, commands) | `glifo/atlas/*.zig` | port | cache/eviction, fixed-seed key hashing, recorder + replay, variable-font second-level map keyed by owned coordinates (M3 T6) |
 | `util.rs` | `glifo/util.zig` | port | T2 |
 
 ### Ported dependency sources (`kurbo`, `color`, `peniko`)
@@ -456,10 +456,10 @@ of panics, thread ownership).
 ### Milestone 3 — Glyph rendering and Cozmic adapter
 
 - **Status (2026-09-12):** outline subset, atlas cache, COLR (G3c), hinting
-  (G3b), decoration and the Cozmic adapter (T5), embedded bitmaps (G3e) and
-  the unhinted CFF/CFF2 scaler are landed (T1–T5 + `vellz-cff`); autohint,
-  `gvar`/variation, CFF hinting/`HVAR` deltas and embolden remain
-  staged with typed `error.Unsupported`.
+  (G3b), decoration and the Cozmic adapter (T5), embedded bitmaps (G3e), the
+  unhinted CFF/CFF2 scaler and `gvar`/`cvar` variation (G3f, T6) are landed
+  (T1–T6 + `vellz-cff`); autohint, CFF hinting/`HVAR` deltas and synthetic
+  embolden remain staged with typed `error.Unsupported`.
 - `glifo` port; stable font identity/face index/variation/glyph/size/placement
   contract; monochrome + COLR behavior; cache invalidation.
 - **Gate:** glyph corpus renders match upstream for the same font resources;

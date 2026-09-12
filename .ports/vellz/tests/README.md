@@ -189,6 +189,7 @@ fixture.
 | embedded bitmap transform composition rows (absorption, translate, rotate, skew, flips) | `glyph_run_bitmap_transform_composition_*` |
 | CFF (Source Serif 4 OTF): fill, stroke, scale absorption, cache on/off | `glyph_run_cff_source_serif_*` |
 | CFF2 variable (Source Serif 4 VF OTF): fill, rotated direct mode, cache on/off | `glyph_run_cff2_source_serif_variable_*` |
+| variable fonts (`gvar`/`cvar`: wght/wdth min/max/both, composites, stroke, hint + cache on/off) | `glyph_run_var_*` |
 | upstream probe fixture | `tools/check_probe.sh` (`zig build probe`, embedded in `zig build test`) |
 
 The `*_speed` variants of the scenes above (16 scenes) are identical except for
@@ -199,9 +200,9 @@ They cover the u8-native gradient LUT and bilinear painters, the f32-painter
 `paintU8` conversion (nearest/bicubic images and undefined radial gradients),
 and the integer blend/composite/mask paths.
 
-All scenes above render byte-exact with `zig build corpus` (118/118,
+All scenes above render byte-exact with `zig build corpus` (130/130,
 `tolerance=0`: 32 quality/f32 + 16 speed/u8 + 22 outline glyph +
-6 decoration + 27 COLR + 5 bitmap + 10 CFF/CFF2). The
+6 decoration + 27 COLR + 5 bitmap + 10 CFF/CFF2 + 12 variable). The
 f32 and u8 pipelines are not byte-equal to each other in general (integer
 `div_255` rounding vs f32); the corpus compares each pipeline against its own
 oracle output, never against the other pipeline.
@@ -351,10 +352,33 @@ coordinates and CFF2 `seac`. The same fixtures also back the dump gate:
 `tools/compare_glyphs.sh` compares every glyph of both faces at several sizes
 (9 vectors) through the oracle's `--dump-glyphs` path.
 
-The dump gate covers 29 glyph vectors / 5 cmap vectors in total (866,901 path
-elements, 2,500,272 f32 coordinates, 458,752 cmap mappings) with per-vector
+The dump gate covers 48 glyph vectors / 5 cmap vectors in total (1,193,920 path
+elements, 3,456,940 f32 coordinates, 458,752 cmap mappings) with per-vector
 SHA-256s in `tests/fixtures/glyphs/manifest.zig`, checked by `zig build test`
 without a Rust toolchain; `zig build glyphs` re-runs the live comparison.
+
+## Variable-font corpus (M3 T6 / G3f)
+
+`tests/scenes/glyph_run_var_*` gate `gvar`/`cvar` variation deltas on the
+imported `Inconsolata.ttf` (OFL-1.1; `wght` and `wdth` axes, `gvar` with 962
+glyphs and 8 shared tuples, `HVAR`/`avar`, hinted bytecode). Twelve scenes:
+wght min/max, wdth max, both axes, a composite-heavy run and a stroked run,
+each committed unhinted and (where hint-eligible) hinted, plus atlas-cache
+variants. Scene coordinates are `i16` F2Dot14 values passed through
+`glyph_run.normalized_coords`, the CLI/oracle `--coords` flags and
+`GlyphRunBuilder.normalizedCoords`; the oracle converts `[-1, 1]` floats with
+`F2Dot14::from_f32` on both sides. `HVAR` advance *values* are not applied:
+like `glifo`, the `glyf` scaler derives lsb/advance from the gvar phantom
+points. `cvar` deltas reconfigure the CVT before `fpgm`/`prep`. All scenes are
+byte-exact at `tolerance=0` with the atlas cache on and off; the cache keys
+carry the coordinates through both the second-level outline map and the
+`HintCache` LRU. COLRv1 `Var*` paint deltas remain a typed
+`error.Unsupported` (`glyph.zig` rejects non-default coordinates when the v1
+header carries a variation store).
+
+The same vectors gate the dump: 18 `Inconsolata.ttf` and variable-Roboto
+entries (hinted/unhinted, in-range and saturating out-of-range coordinates)
+are part of the 48-vector union manifest.
 
 ## Multithreaded dispatch
 

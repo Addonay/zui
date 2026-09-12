@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "width": 150,
+  "height": 80,
+  "settings": {
+    "mode": "quality",
+    "threads": 0,
+    "level": "fallback"
+  },
+  "target_init": "clear",
+  "commands": [
+    {
+      "op": "set_paint",
+      "rgba8": [
+        102,
+        51,
+        153,
+        255
+      ]
+    },
+    {
+      "op": "set_transform",
+      "affine": [
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        50.0
+      ]
+    },
+    {
+      "op": "glyph_run",
+      "font": {
+        "asset": "../fixtures/upstream/Inconsolata.ttf",
+        "index": 0
+      },
+      "font_size": 50.0,
+      "hint": true,
+      "atlas_cache": false,
+      "style": "fill",
+      "normalized_coords": [
+        1.0,
+        -1.0
+      ],
+      "glyphs": [
+        {
+          "id": 447,
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "id": 301,
+          "x": 25.0,
+          "y": 0.0
+        },
+        {
+          "id": 308,
+          "x": 50.0,
+          "y": 0.0
+        },
+        {
+          "id": 415,
+          "x": 75.0,
+          "y": 0.0
+        }
+      ]
+    }
+  ]
+}

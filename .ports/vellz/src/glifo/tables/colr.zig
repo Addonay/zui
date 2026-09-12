@@ -19,10 +19,11 @@
 //!   resolve to an empty slice (`ok().unwrap_or_default()`), while a malformed
 //!   *paint record* stops the traversal with `error.MalformedFont` (upstream
 //!   `PaintError`/`ReadError`, which `glifo`'s painter ignores).
-//! - Variation deltas are not applied. This is exact for the only supported
-//!   input: the run layer rejects non-empty `normalized_coords`, so `skrifa`
-//!   would return `FloatItemDelta::ZERO` for every `Var*` record. The
-//!   `var_index_base` fields are parsed and ignored.
+//! - Variation deltas are not applied: `hasVarStore()` reports whether the
+//!   v1 header carries an `itemVariationStore`/`varIndexMap`, and `glyph.zig`
+//!   rejects non-default coordinates when it does (`error.Unsupported`), so
+//!   `skrifa`'s `FloatItemDelta::ZERO` is exact for every reachable input.
+//!   The `var_index_base` fields are parsed and ignored.
 
 const std = @import("std");
 const sfnt = @import("sfnt.zig");
@@ -275,6 +276,16 @@ pub const Colr = struct {
 
     fn isV1(self: Colr) bool {
         return self.version() >= 1;
+    }
+
+    /// True when the COLRv1 header carries a `varIndexMap` or
+    /// `itemVariationStore` offset: the only case where `Var*` paint records
+    /// can contribute non-zero variation deltas.
+    pub fn hasVarStore(self: Colr) bool {
+        if (!self.isV1()) return false;
+        const var_index_map = sfnt.readU32(self.data, 26) orelse return false;
+        const item_variation_store = sfnt.readU32(self.data, 30) orelse return false;
+        return var_index_map != 0 or item_variation_store != 0;
     }
 
     /// Record array at `offset_field` with `count` records of `stride` bytes,

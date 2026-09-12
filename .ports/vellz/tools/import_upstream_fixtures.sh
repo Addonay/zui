@@ -44,6 +44,10 @@ curl -fsSL "$source_serif_base/OTF/SourceSerif4-Regular.otf" -o "$dest/SourceSer
 curl -fsSL "$source_serif_base/VAR/SourceSerif4Variable-Roman.otf" -o "$dest/SourceSerif4Variable-Roman.otf"
 curl -fsSL "$source_serif_base/LICENSE.md" -o "$dest/SourceSerif4-LICENSE.md"
 
+# Variable-font fixtures: Inconsolata (OFL) from the pinned vello checkout.
+cp "$ref/assets/inconsolata/Inconsolata.ttf" "$dest/Inconsolata.ttf"
+cp "$ref/assets/inconsolata/LICENSE.txt" "$dest/Inconsolata-LICENSE.txt"
+
 sha256sum \
     "$dest/probe.rgba" \
     "$dest/probe.png" \
@@ -54,5 +58,7 @@ sha256sum \
     "$dest/colr_test_glyphs-LICENSE.txt" \
     "$dest/SourceSerif4-Regular.otf" \
     "$dest/SourceSerif4Variable-Roman.otf" \
-    "$dest/SourceSerif4-LICENSE.md"
+    "$dest/SourceSerif4-LICENSE.md" \
+    "$dest/Inconsolata.ttf" \
+    "$dest/Inconsolata-LICENSE.txt"
 echo "ok: upstream fixtures imported from $VELLO_REV + source-serif $source_serif_rev"

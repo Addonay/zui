@@ -19,6 +19,8 @@ regenerated so tests never need a Rust toolchain or Git LFS.
 | `SourceSerif4-Regular.otf` | `adobe-fonts/source-serif` `OTF/SourceSerif4-Regular.otf` at commit `5f220b17d27ed64873f22cde0dd593685387bd19` (`release` branch) | OFL-1.1; see `SourceSerif4-LICENSE.md`. Static CFF (version 1) face: 1464 glyphs, upem 1000, global + local subrs, `hmtx` advances, no `HVAR`. The M3 CFF outline fixture. Downloaded via `tools/import_upstream_fixtures.sh`; not a Git LFS object. |
 | `SourceSerif4Variable-Roman.otf` | `adobe-fonts/source-serif` `VAR/SourceSerif4Variable-Roman.otf` at commit `5f220b17d27ed64873f22cde0dd593685387bd19` | OFL-1.1. CFF2 variable face with 6 FDArray subfonts (FDSelect format 3), an item variation store and 34,012 `blend` operators at the default location. The M3 CFF2 fixture; the port supports its outlines bit-exactly but gates non-empty coordinates on `HVAR` (not ported) and CFF hinting. |
 | `SourceSerif4-LICENSE.md` | `adobe-fonts/source-serif` `LICENSE.md` at the same commit | OFL-1.1 notice. |
+| `Inconsolata.ttf` | `assets/inconsolata/Inconsolata.ttf` | OFL-1.1; see `Inconsolata-LICENSE.txt`. The variable-font fixture (M3 T6): `fvar` axes `wght` 200..900 (default 400) and `wdth` 50..200 (default 100), `gvar` with 962 glyphs and 8 shared tuples, `HVAR`, `avar`, and `fpgm`/`prep` bytecode so both the unhinted `gvar` path and the hinted path (interpreter + `GETVARIATION`) are gated. Not a Git LFS object. |
+| `Inconsolata-LICENSE.txt` | `assets/inconsolata/LICENSE.txt` | OFL-1.1 notice. |
 
 SHA-256:
 
@@ -35,6 +37,8 @@ edf160d0d584deee8a3bb2c3371b2a7624ca63580fbe02c57c1f4c91e84d8787  SourceSerif4-R
 88ff34af8db521e5e2520719706bc24388e7e976ac02dd818b867e0f6a8e0d13  probe.png
 01c87c436d7b3cfaa357dfaad9259f57b4fdcb27a62da9658afb10056ee54bea  probe.rgba
 8aa611b1ca97044ac6f13dc982fde29256612f0a5acc6ef47ca541a7a5b99b28  test_glyphs-glyf_colr_1.ttf
+228b071e67b1bafa952149559505aaed0a20269f457e0a18a8d7739d031561dc  Inconsolata.ttf
+e564f06d018e7b95bc3594c96a17f1d41865af4038c375e7aa974dd69df38602  Inconsolata-LICENSE.txt
 ```
 
 The SHA-256 values were computed from the pinned checkout with `sha256sum`

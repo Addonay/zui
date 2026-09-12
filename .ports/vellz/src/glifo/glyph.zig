@@ -23,14 +23,16 @@
 //!   COLR/CPAL is ported (T4) and embedded bitmaps (`sbix`/`CBDT`/`EBDT`) are
 //!   ported (T5); `Bgra`/`Mask` bitmap payloads and undecodable PNGs fall
 //!   through to the outline branch exactly like upstream's `.ok()`-filtered
-//!   `Pixmap::from_png`. Faces without TrueType outlines use an empty outline
-//!   collection, so outline fallbacks are skipped there (upstream would draw
-//!   CFF outlines; CFF is not ported).
+//!   `Pixmap::from_png`. Outlines resolve through `outlines.zig` (`glyf` or
+//!   the CFF/CFF2 charstring interpreter); a face with neither a supported
+//!   outline source nor a bitmap strike is rejected.
 //! - Decoration (`renderDecoration`) is ported: the upstream `Vec` of merged
 //!   exclusion spans lives on `GlyphPrepCache` and the Rust iterator/closure
 //!   pair becomes one pass over that list.
-//! - Synthetic embolden (`kurbo::expand_path`) and non-empty variation
-//!   coordinates remain explicit `error.Unsupported`.
+//! - Variation coordinates are ported: they are forwarded to `skrifa`-style
+//!   `gvar` deltas, hint-instance setup (`cvar`) and the second-level outline
+//!   and atlas cache maps. Synthetic embolden (`kurbo::expand_path`) remains
+//!   an explicit `error.Unsupported`.
 //! - Upstream's `OutlineCacheSession` is replaced by an explicit
 //!   `*OutlineCache` threaded through the draw loop and `renderer.fillGlyph`/
 //!   `strokeGlyph`.
@@ -66,8 +68,8 @@ const outlines_mod = @import("outlines.zig");
 
 /// Errors from glyph run preparation and drawing.
 pub const Error = font_mod.Error || outlines_mod.DrawError || error{
-    /// A feature that is scoped but not ported yet: hinting, embolden,
-    /// variation coordinates, and bitmap glyphs.
+    /// Features still scoped out: synthetic embolden (`kurbo::expand_path`),
+    /// CFF hinting, the autohinter, and COLRv1 variation deltas.
     Unsupported,
 };
 
@@ -184,9 +186,9 @@ pub fn GlyphRunBuilder(comptime Backend: type) type {
 
         /// Set whether font hinting is enabled.
         ///
-        /// Hinting is not ported yet: a run whose transform is eligible for
-        /// vertical hinting fails with `error.Unsupported` when drawn. Runs
-        /// that upstream would render `Direct` (no hinting applied) proceed.
+        /// Eligible runs go through the TrueType interpreter (M3 G3b) and are
+        /// cached in `HintCache` by font, size and coordinates. Autohinter-
+        /// only fonts fail with `error.Unsupported` when drawn.
         pub fn hint(self: Self, enabled: bool) Self {
             var result = self;
             result.run.hint = enabled;
@@ -194,6 +196,11 @@ pub fn GlyphRunBuilder(comptime Backend: type) type {
         }
 
         /// Set normalized variation coordinates for variable fonts.
+        ///
+        /// `coords` is a slice of F2Dot14 `i16` values (`glifo`'s
+        /// `NormalizedCoord`), borrowed for the lifetime of the run. Empty or
+        /// all-zero coordinates take the static path; on a font without variation
+        /// tables they are a no-op.
         pub fn normalizedCoords(self: Self, coords: []const NormalizedCoord) Self {
             var result = self;
             result.run.normalized_coords = coords;
@@ -282,8 +289,9 @@ pub const HintCache = struct {
         self.serial = 0;
     }
 
-    /// Returns a hinting instance configured for `(font, size)`, reusing an
-    /// exact match or reconfiguring the least-recently-used entry when full.
+    /// Returns a hinting instance configured for `(font, size, coords)`,
+    /// reusing an exact match or reconfiguring the least-recently-used entry
+    /// when full.
     pub fn get(
         self: *HintCache,
         allocator: std.mem.Allocator,
@@ -291,12 +299,14 @@ pub const HintCache = struct {
         font_index: u32,
         outlines: *const outlines_mod.Outlines,
         size: f32,
+        coords: []const i16,
     ) Error!*const glyf.HintInstance {
         if (!outlines.supportsHinting()) return error.Unsupported;
         for (self.entries.items) |*entry| {
             if (entry.font_id == font_id and
                 entry.font_index == font_index and
-                entry.size == size)
+                entry.size == size and
+                std.mem.eql(i16, entry.instance.location(), coords))
             {
                 self.serial += 1;
                 entry.serial = self.serial;
@@ -321,7 +331,7 @@ pub const HintCache = struct {
                 sp.scale,
                 sp.ppem,
                 glyf.glifo_hint_target,
-                &.{},
+                coords,
                 size,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -334,7 +344,12 @@ pub const HintCache = struct {
             entry.serial = self.serial;
             return &entry.instance;
         }
-        var instance = try outlines.createHintInstance(allocator, size, glyf.glifo_hint_target);
+        var instance = try outlines.createHintInstance(
+            allocator,
+            size,
+            coords,
+            glyf.glifo_hint_target,
+        );
         errdefer instance.deinit();
         try self.entries.append(allocator, .{
             .font_id = font_id,
@@ -554,7 +569,8 @@ pub const PreparedGlyphRun = struct {
     draw_props: DrawProps,
     /// The original transform for the paint in scene space.
     scene_paint_transform: kurbo.Affine,
-    /// Variation coordinates (always empty until `gvar` lands).
+    /// Normalized variation coordinates (`i16` F2Dot14 bits), borrowed from
+    /// the caller like upstream's `GlyphRun<'a>`.
     normalized_coords: []const NormalizedCoord,
     /// Hinting instance for this run; `null` when the run is unhinted (or the
     /// effective transform is `Direct`, which never hints upstream).
@@ -585,9 +601,12 @@ pub const GlyphScaleProperties = struct {
 
 /// Prepare a glyph run for rendering.
 ///
-/// Fails with `error.Unsupported` for deferred inputs: hinting, non-empty
-/// variation coordinates, synthetic embolden, and faces without any glyph
-/// source the port can render (CFF/CFF2-only, or no bitmap strike either).
+/// Fails with `error.Unsupported` for deferred inputs: synthetic embolden
+/// and faces without any glyph source the port can render (CFF/CFF2-only, or
+/// no bitmap strike either). Hinted runs whose transform would absorb a
+/// uniform vertical scale need a hint cache and are rejected by this entry
+/// point; variation coordinates are carried on the prepared run (and are a
+/// no-op without variation tables, like upstream).
 pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun {
     // No hint cache: hinted-scale absorption is rejected with
     // `error.Unsupported` (the allocator is never used).
@@ -600,7 +619,6 @@ pub fn prepareGlyphRunWithCache(
     hint_cache: ?*HintCache,
     allocator: std.mem.Allocator,
 ) Error!PreparedGlyphRun {
-    if (run.normalized_coords.len != 0) return error.Unsupported;
     if (!run.font_embolden.isDefault()) return error.Unsupported;
 
     const full_transform = run.transform.compose(run.glyph_transform orelse kurbo.Affine.IDENTITY);
@@ -657,6 +675,7 @@ pub fn prepareGlyphRunWithCache(
                 run.font.index,
                 &hinted_outlines,
                 vertical_font_size,
+                run.normalized_coords,
             );
             // The scale has been absorbed into the font size, so remove it
             // from the skew coefficient as well: otherwise the skew would be
@@ -1245,6 +1264,20 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
 
                 // ── COLR glyphs ───────────────────────────────────────────
                 if (prepared.color_glyphs.get(glyph.id)) |color_glyph| {
+                    // `Var*` records in a COLRv1 paint graph are resolved
+                    // against the run's coordinates by `skrifa` when the COLR
+                    // table carries a variation store. That
+                    // `ItemVariationStore` path is not ported, so non-default
+                    // coordinates are a typed error rather than a
+                    // default-variation approximation. Without a store (or
+                    // for COLRv0) variation deltas are always zero and the
+                    // coordinates are an exact no-op, like upstream.
+                    if (color_glyph.format() == .colr_v1 and
+                        color_glyph.colr.hasVarStore() and
+                        glyf.effectiveCoords(prepared.normalized_coords).len != 0)
+                    {
+                        return error.Unsupported;
+                    }
                     const metrics = try calculateColrMetrics(
                         allocator,
                         prepared,
@@ -1876,7 +1909,7 @@ test "hinted run is rejected with Unsupported" {
     _ = allocator;
 }
 
-test "non-empty variation coordinates and embolden are rejected" {
+test "non-empty variation coordinates are accepted and embolden is rejected" {
     const font = try testFontData();
     const base: GlyphRun = .{
         .font = font,
@@ -1884,9 +1917,15 @@ test "non-empty variation coordinates and embolden are rejected" {
         .scene_paint_transform = kurbo.Affine.IDENTITY,
         .hint = false,
     };
+    // Roboto has no `gvar`, so coordinates are a no-op but must not fail.
     var with_coords = base;
     with_coords.normalized_coords = &.{0};
-    try testing.expectError(error.Unsupported, prepareGlyphRun(with_coords));
+    const prepared = try prepareGlyphRun(with_coords);
+    try testing.expectEqualSlices(
+        NormalizedCoord,
+        &.{0},
+        prepared.normalized_coords,
+    );
 
     var with_embolden = base;
     with_embolden.font_embolden = FontEmbolden.new(.{ 1.0, 0.0 });
@@ -2065,6 +2104,126 @@ fn ensureColrCache() !void {
     try drawTestGlyph(allocator, font, glyph, true, .fill, &renderer, &prep_cache, &glyph_atlas, &image_cache);
     try testing.expectEqual(@as(usize, 1), glyph_atlas.len());
     try testing.expectEqual(@as(u64, 1), glyph_atlas.cacheHits());
+}
+
+fn drawTestGlyphVariation(
+    allocator: std.mem.Allocator,
+    font: FontData,
+    glyph: Glyph,
+    coords: []const NormalizedCoord,
+    renderer: *RecordingRenderer,
+    prep_cache: *GlyphPrepCache,
+    glyph_atlas: *atlas.GlyphAtlas,
+    image_cache: *atlas.ImageCache,
+) !void {
+    const transform = kurbo.Affine.translate(kurbo.Vec2.new(0.0, 20.0));
+    const run: GlyphRun = .{
+        .font = font,
+        .font_size = 20.0,
+        .transform = transform,
+        .scene_paint_transform = transform,
+        .hint = false,
+        .normalized_coords = coords,
+    };
+    const cacher: AtlasCacher = .{ .enabled = .{
+        .glyph_atlas = glyph_atlas,
+        .image_cache = image_cache,
+    } };
+    const iterator = iterate(&.{glyph});
+    var run_renderer = try buildRenderer(allocator, run, iterator, prep_cache.asMut(), cacher);
+    try run_renderer.fillGlyphs(allocator, renderer);
+}
+
+test "colr v1 variation stores reject non-default coordinates" {
+    const allocator = testing.allocator;
+    var blob = try allocator.dupe(u8, try test_fixture.colrTestGlyphs());
+    defer allocator.free(blob);
+    // The pinned COLRv1 test font carries no variation store (it is not a
+    // variable font), so point `itemVariationStoreOffset` (COLR v1 header
+    // bytes 30..34) at the header itself: present, never dereferenced by the
+    // gate. This is the only fixture path that reaches the typed error.
+    const face = try sfnt.Face.parse(blob, 0);
+    var i: usize = 0;
+    var colr_offset: usize = 0;
+    while (i < face.num_tables) : (i += 1) {
+        const record = face.recordAt(i) orelse break;
+        if (std.mem.eql(u8, &record.tag, &sfnt.tag_colr)) {
+            colr_offset = record.offset;
+            break;
+        }
+    }
+    try testing.expect(colr_offset != 0);
+    blob[colr_offset + 30] = 0;
+    blob[colr_offset + 31] = 0;
+    blob[colr_offset + 32] = 0;
+    blob[colr_offset + 33] = 34;
+    const font = FontData.init(blob, 0);
+    // Glyph 8 is a COLRv1 paint-graph base glyph in the test font.
+    const glyph = Glyph{ .id = 8 };
+
+    var renderer = RecordingRenderer{};
+    defer renderer.deinit();
+    var prep_cache = GlyphPrepCache{};
+    defer prep_cache.deinit(allocator);
+    var glyph_atlas = atlas.GlyphAtlas.init();
+    defer glyph_atlas.deinit(allocator);
+    var image_cache = try atlas.ImageCache.initWithConfig(allocator, .{ .atlas_size = .{ 512, 512 } });
+    defer image_cache.deinit(allocator);
+
+    // Default coordinates still draw (nothing varies).
+    try drawTestGlyphVariation(
+        allocator,
+        font,
+        glyph,
+        &.{},
+        &renderer,
+        &prep_cache,
+        &glyph_atlas,
+        &image_cache,
+    );
+    // Variable `Var*` deltas are not ported: reject instead of approximating.
+    try testing.expectError(error.Unsupported, drawTestGlyphVariation(
+        allocator,
+        font,
+        glyph,
+        &.{0x4000},
+        &renderer,
+        &prep_cache,
+        &glyph_atlas,
+        &image_cache,
+    ));
+}
+
+test "colr glyphs without a variation store treat coordinates as a no-op" {
+    const allocator = testing.allocator;
+    const font = FontData.init(try test_fixture.notoColor(), 0);
+    const glyph = Glyph{ .id = 2 };
+
+    var renderer = RecordingRenderer{};
+    defer renderer.deinit();
+    var prep_cache = GlyphPrepCache{};
+    defer prep_cache.deinit(allocator);
+    var glyph_atlas = atlas.GlyphAtlas.init();
+    defer glyph_atlas.deinit(allocator);
+    var image_cache = try atlas.ImageCache.initWithConfig(allocator, .{ .atlas_size = .{ 512, 512 } });
+    defer image_cache.deinit(allocator);
+
+    // Noto's COLRv1 carries no variation store and the font has no
+    // variation tables, so the coordinate slice only selects the variable
+    // cache map.
+    try drawTestGlyphVariation(
+        allocator,
+        font,
+        glyph,
+        &.{0x4000},
+        &renderer,
+        &prep_cache,
+        &glyph_atlas,
+        &image_cache,
+    );
+    try testing.expect(renderer.fill_rect_count > 0);
+    try testing.expectEqual(@as(usize, 1), glyph_atlas.len());
+    try testing.expectEqual(@as(usize, 1), glyph_atlas.variable_entries.count());
 }
 
 test "colr glyph is cached when atlas cache is enabled" {
@@ -2294,11 +2453,11 @@ test "hint cache configures, reuses and reconfigures instances" {
     var cache = HintCache{};
     defer cache.deinit(allocator);
 
-    const first = try cache.get(allocator, font_id, 0, &outlines, 16.0);
+    const first = try cache.get(allocator, font_id, 0, &outlines, 16.0, &.{});
     try testing.expect(first.isEnabled());
-    const second = try cache.get(allocator, font_id, 0, &outlines, 16.0);
+    const second = try cache.get(allocator, font_id, 0, &outlines, 16.0, &.{});
     try testing.expectEqual(first, second);
-    const other_size = try cache.get(allocator, font_id, 0, &outlines, 24.0);
+    const other_size = try cache.get(allocator, font_id, 0, &outlines, 24.0, &.{});
     try testing.expect(other_size != first);
     try testing.expectEqual(@as(usize, 2), cache.entries.items.len);
     try testing.expectEqual(@as(f32, 24.0), other_size.size);

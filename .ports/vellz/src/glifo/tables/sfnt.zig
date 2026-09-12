@@ -53,7 +53,11 @@ pub const tag_ebdt = Tag{ 'E', 'B', 'D', 'T' };
 pub const tag_eblc = Tag{ 'E', 'B', 'L', 'C' };
 pub const tag_cff = Tag{ 'C', 'F', 'F', ' ' };
 pub const tag_cff2 = Tag{ 'C', 'F', 'F', '2' };
+/// Variation tables (M3 variable-font closure).
+pub const tag_gvar = Tag{ 'g', 'v', 'a', 'r' };
+pub const tag_cvar = Tag{ 'c', 'v', 'a', 'r' };
 pub const tag_hvar = Tag{ 'H', 'V', 'A', 'R' };
+pub const tag_fvar = Tag{ 'f', 'v', 'a', 'r' };
 
 pub const sfnt_version_true: u32 = 0x00010000;
 pub const sfnt_version_otto: u32 = 0x4F54544F; // "OTTO"

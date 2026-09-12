@@ -244,8 +244,9 @@ pub const GlyphRunSpec = struct {
     glyph_transform: ?Affine = null,
     /// Synthetic embolden amount (x, y); non-zero is `error.Unsupported`.
     embolden: ?[2]f32 = null,
-    /// Normalized variation coordinates; non-empty is `error.Unsupported`.
-    normalized_coords: ?[]const i16 = null,
+    /// Normalized variation coordinates in `[-1, 1]`, converted at the run
+    /// boundary with `F2Dot14::from_f32` (`glifo.f2dot14FromF32`).
+    normalized_coords: ?[]const f32 = null,
     atlas_cache: bool = false,
     style: GlyphStyle = .fill,
     glyphs: []const PositionedGlyphSpec,
@@ -732,12 +733,9 @@ fn parseGlyphRun(alloc: std.mem.Allocator, obj: std.json.ObjectMap) ParseError!G
             .array => |a| a,
             else => return error.InvalidScene,
         };
-        const coords = try alloc.alloc(i16, array.items.len);
+        const coords = try alloc.alloc(f32, array.items.len);
         for (array.items, 0..) |item, i| {
-            coords[i] = switch (item) {
-                .integer => |n| std.math.cast(i16, n) orelse return error.InvalidScene,
-                else => return error.InvalidScene,
-            };
+            coords[i] = @floatCast(try numberAsF64(item));
         }
         spec.normalized_coords = coords;
     }
@@ -1224,12 +1222,12 @@ test "glyph_run scenes parse with expected properties" {
     try std.testing.expectEqual(@as(f32, 1.5), spec.glyphs[0].x);
     try std.testing.expectEqual(@as(f32, 3.25), spec.glyphs[1].x);
 
-    // Optional deferred knobs parse and are carried through.
+    // Optional knobs parse and are carried through.
     const deferred =
         \\{"version":1,"width":8,"height":8,
         \\ "commands":[{"op":"glyph_run",
         \\   "font":{"asset":"f.ttf"},"font_size":12.0,"style":"stroke",
-        \\   "embolden":[0.5,0.0],"normalized_coords":[100],
+        \\   "embolden":[0.5,0.0],"normalized_coords":[1.0,-0.5],
         \\   "decoration":{"x_range":[0,10],"baseline_y":5,"offset":1,"size":2,"buffer":0.5},
         \\   "glyphs":[{"id":1,"x":0,"y":0}]}]}
     ;
@@ -1238,7 +1236,8 @@ test "glyph_run scenes parse with expected properties" {
     const deferred_spec = deferred_parsed.scene.commands[0].glyph_run;
     try std.testing.expectEqual(GlyphStyle.stroke, deferred_spec.style);
     try std.testing.expectEqual([2]f32{ 0.5, 0.0 }, deferred_spec.embolden.?);
-    try std.testing.expectEqual(@as(i16, 100), deferred_spec.normalized_coords.?[0]);
+    try std.testing.expectEqual(@as(f32, 1.0), deferred_spec.normalized_coords.?[0]);
+    try std.testing.expectEqual(@as(f32, -0.5), deferred_spec.normalized_coords.?[1]);
     try std.testing.expectEqual(@as(f32, 0.5), deferred_spec.decoration.?.buffer);
 }
 

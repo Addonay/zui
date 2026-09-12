@@ -7,11 +7,12 @@
 //! outline pipeline needs (`head`, `maxp`, `hhea`, `hmtx`; `loca`/`glyf`/
 //! `cmap` are resolved on demand).
 //!
-//! Unsupported inputs are explicit: variable-font outline deltas
-//! (`gvar`/`HVAR`) and CFF hinting fail with `error.Unsupported` instead of
-//! being approximated; outlines themselves resolve for `glyf`, CFF and CFF2
-//! faces (`outlines.zig`). Bitmap-only faces have no `outlines()` but expose
-//! their embedded strikes through `bitmapStrikes()`.
+//! Unsupported inputs are explicit: CFF hinting and synthetic embolden fail
+//! with `error.Unsupported` instead of being approximated; outlines resolve
+//! for `glyf`, CFF and CFF2 faces (`outlines.zig`), and `gvar`/`cvar`/`HVAR`
+//! are exposed through `gvar()`, `cvar()` and `hasHvar()` for the outline
+//! pipeline. Bitmap-only faces have no `outlines()` but expose their embedded
+//! strikes through `bitmapStrikes()`.
 
 const std = @import("std");
 
@@ -22,6 +23,7 @@ const hhea_mod = @import("tables/hhea.zig");
 const hmtx_mod = @import("tables/hmtx.zig");
 const cmap_mod = @import("tables/cmap.zig");
 const bitmap_mod = @import("tables/bitmap.zig");
+const gvar_mod = @import("tables/gvar.zig");
 const glyf_mod = @import("glyf.zig");
 const cff_mod = @import("cff.zig");
 const outlines_mod = @import("outlines.zig");
@@ -39,6 +41,22 @@ pub const NOTDEF: GlyphId = 0;
 /// Normalized variation coordinate in 2.14 fixed point, matching `glifo`'s
 /// `NormalizedCoord` alias for `skrifa::instance::NormalizedCoord`.
 pub const NormalizedCoord = i16;
+
+/// Rust `f32 as i16` for the coordinate conversion: saturating, NaN maps to 0.
+fn saturatingF32ToI16(value: f32) i16 {
+    if (std.math.isNan(value)) return 0;
+    if (value >= 32768.0) return std.math.maxInt(i16);
+    if (value <= -32768.0) return std.math.minInt(i16);
+    return @intFromFloat(value);
+}
+
+/// `F2Dot14::from_f32`: `(x * 16384 + (sign ? 1 : 0) - 0.5) as i16`, the
+/// conversion upstream applies to user-facing normalized coordinates
+/// (round half away from zero, then a saturating cast).
+pub fn f2dot14FromF32(value: f32) NormalizedCoord {
+    const frac: f32 = (if (std.math.signbit(value)) @as(f32, 0.0) else @as(f32, 1.0)) - 0.5;
+    return saturatingF32ToI16(value * 16384.0 + frac);
+}
 
 pub const Error = sfnt.Error || error{
     /// The requested feature is not ported yet (CFF, bitmaps, variations).
@@ -146,7 +164,48 @@ pub const Font = struct {
     pub fn bitmapStrikes(self: Font) bitmap_mod.Strikes {
         return bitmap_mod.Strikes.init(self);
     }
+
+    /// The parsed `gvar` table, or `null` when absent/malformed.
+    ///
+    /// Mirrors `FontRef::gvar().ok()`: a table shorter than the 20-byte header
+    /// (or an unparsable offset array) is treated as "no variations", not an
+    /// error, so a broken variation table never blocks static outlines.
+    pub fn gvar(self: Font) ?gvar_mod.Gvar {
+        const data = self.face.table(sfnt.tag_gvar) orelse return null;
+        return gvar_mod.Gvar.parse(data) catch null;
+    }
+
+    /// The parsed `cvar` table, or `null` when absent/malformed.
+    pub fn cvar(self: Font) ?gvar_mod.Cvar {
+        const data = self.face.table(sfnt.tag_cvar) orelse return null;
+        return gvar_mod.Cvar.parse(data) catch null;
+    }
+
+    /// True when a usable `HVAR` table is present.
+    ///
+    /// The `glyf` scaler only consults HVAR's *presence* to mirror FreeType's
+    /// different rounding of phantom-point gvar deltas; the advances
+    /// themselves come from the phantom points. Requires the 20-byte header
+    /// (`Hvar::read`'s minimum), like `FontRef::hvar().ok()`.
+    pub fn hasHvar(self: Font) bool {
+        const data = self.face.table(sfnt.tag_hvar) orelse return false;
+        return data.len >= 20;
+    }
 };
+
+test "f2dot14FromF32 matches F2Dot14::from_f32" {
+    // Exact values and round-half-away-from-zero for positive/negative inputs.
+    try std.testing.expectEqual(@as(i16, 0x4000), f2dot14FromF32(1.0));
+    try std.testing.expectEqual(@as(i16, -0x4000), f2dot14FromF32(-1.0));
+    try std.testing.expectEqual(@as(i16, 0x2000), f2dot14FromF32(0.5));
+    try std.testing.expectEqual(@as(i16, -0x2000), f2dot14FromF32(-0.5));
+    try std.testing.expectEqual(@as(i16, 4915), f2dot14FromF32(0.3));
+    try std.testing.expectEqual(@as(i16, -4915), f2dot14FromF32(-0.3));
+    // Rust's `f32 as i16` saturates out-of-range values.
+    try std.testing.expectEqual(std.math.maxInt(i16), f2dot14FromF32(3.0));
+    try std.testing.expectEqual(std.math.minInt(i16), f2dot14FromF32(-3.0));
+    try std.testing.expectEqual(@as(i16, 0), f2dot14FromF32(std.math.nan(f32)));
+}
 
 test "Roboto face parses with the expected metrics" {
     const fixture = @import("test_fixture.zig");
