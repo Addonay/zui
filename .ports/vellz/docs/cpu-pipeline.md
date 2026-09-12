@@ -236,6 +236,57 @@ pub const RenderContext = struct {
 };
 ```
 
+## Glyph rendering (`vellz.glifo` + `vellz.cpu.text`)
+
+```zig
+// glifo/glyph.zig
+pub const GlyphRun = struct {
+    font: FontData, font_size: f32, font_embolden: FontEmbolden,
+    transform: Affine, scene_paint_transform: Affine,
+    glyph_transform: ?Affine, normalized_coords: []const NormalizedCoord, hint: bool,
+};
+pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun; // error.Unsupported: hinting/embolden/coords
+pub fn GlyphRunBuilder(comptime Backend: type) type; // fontSize/fontEmbolden/glyphTransform/hint/
+                                                     // normalizedCoords/atlasCache/fillGlyphs/strokeGlyphs
+pub fn buildRenderer(run, glyphs, prep_cache, atlas_cacher) Error!GlyphRunRenderer(Glyphs);
+
+// glifo/renderer.zig: fillGlyph / strokeGlyph / renderCachedGlyph /
+// replayAtlasCommands / calculateRasterMetrics / supportsAtlasCaching.
+// glifo/interface.zig holds the comptime duck-typing contracts (`DrawSink`,
+// `GlyphRenderer`) and the `assert*` helpers renderer.zig instantiates.
+
+// cpu/render.zig
+pub const Resources = struct {
+    image_registry: ImageRegistry,
+    glyph_prep_cache: glifo.GlyphPrepCache,
+    glyph_resources: ?text.GlyphAtlasResources, // lazily created
+};
+pub fn RenderContext.glyphRun(self, resources, font) GlyphRunBuilder;
+
+// Frame protocol, same order as upstream `render_with`:
+//   beforeRender  -> replay pending atlas commands into the page pixmaps,
+//                    register atlas pages in the image registry
+//   target clear  -> rasterize (image ids >= ATLAS_IMAGE_ID_BASE resolve pages)
+//   afterRender   -> maintain/evict, unregister pages, clear evicted regions
+```
+
+- `text.GlyphAtlasResources` owns the atlas cache, the image allocator, one
+  page-sized `RenderContext` (always `num_threads = 0`, as upstream) and one
+  shared `Pixmap` per atlas page; `renderWith` drives the protocol above.
+- `GlyphCacheKey` carries font id/index, gid, size bits, hinted, the four
+  subpixel buckets, the packed context color and the embolden bits;
+  `var_coords` is excluded from equality (upstream's second-level map; only
+  empty coordinates are supported here).
+- Determinism divergence: the glyph cache map uses fixed-seed Wyhash instead
+  of upstream's fixed-seed `foldhash`. Eviction/iteration order can differ;
+  pixels cannot, because atlas slots are disjoint and sampled at integer
+  offsets.
+- Deferred with typed errors, never approximated: hinting interpreter/autohint
+  (an eligible hinted run fails up front), `gvar`/`HVAR` coordinates, CFF/CFF2,
+  CBDT/CBLC/sbix bitmaps, COLR/CPAL and decoration. A font carrying a
+  COLR/CBDT/CBLC/sbix table rejects the whole run with `error.Unsupported`
+  instead of silently dropping the color/bitmap representation.
+
 ## Error policy
 
 - Invalid usage (unpopped layers at render, mismatched mask sizes, missing

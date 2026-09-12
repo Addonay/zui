@@ -36,6 +36,7 @@ pub const multi_threaded = @import("dispatch/multi_threaded.zig");
 pub const fine = @import("fine/mod.zig");
 pub const render = @import("render.zig");
 pub const probe = @import("probe.zig");
+pub const text = @import("text.zig");
 
 pub const Span = util.Span;
 pub const F32Kernel = fine.F32Kernel;
@@ -80,4 +81,5 @@ test {
     _ = @import("fine/lowp/image.zig");
     _ = @import("render.zig");
     _ = @import("probe.zig");
+    _ = @import("text.zig");
 }

@@ -37,6 +37,13 @@ pub const tag_maxp = Tag{ 'm', 'a', 'x', 'p' };
 pub const tag_cmap = Tag{ 'c', 'm', 'a', 'p' };
 pub const tag_loca = Tag{ 'l', 'o', 'c', 'a' };
 pub const tag_glyf = Tag{ 'g', 'l', 'y', 'f' };
+/// Color/bitmap tables used to detect deferred glyph sources (T4/T3b).
+pub const tag_colr = Tag{ 'C', 'O', 'L', 'R' };
+pub const tag_cbdt = Tag{ 'C', 'B', 'D', 'T' };
+pub const tag_cblc = Tag{ 'C', 'B', 'L', 'C' };
+pub const tag_sbix = Tag{ 's', 'b', 'i', 'x' };
+pub const tag_cff = Tag{ 'C', 'F', 'F', ' ' };
+pub const tag_cff2 = Tag{ 'C', 'F', 'F', '2' };
 
 pub const sfnt_version_true: u32 = 0x00010000;
 pub const sfnt_version_otto: u32 = 0x4F54544F; // "OTTO"

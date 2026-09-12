@@ -12,6 +12,7 @@
 //!
 //! This binary is development tooling. It is not distributed with the package.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -24,12 +25,12 @@ use vello_cpu::color::{AlphaColor, Srgb};
 use vello_cpu::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_cpu::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke};
 use vello_cpu::peniko::{
-    BlendMode, ColorStop, ColorStops, Compose, Extend, Fill, Gradient, ImageAlphaType,
-    ImageQuality, ImageSampler, LinearGradientPosition, Mix, RadialGradientPosition,
-    SweepGradientPosition,
+    BlendMode, Blob, ColorStop, ColorStops, Compose, Extend, Fill, FontData, Gradient,
+    ImageAlphaType, ImageQuality, ImageSampler, LinearGradientPosition, Mix,
+    RadialGradientPosition, SweepGradientPosition,
 };
 use vello_cpu::{
-    Image, ImageSource, Level, Mask, PaintType, PixelFormat, PixelMetadata, Pixmap,
+    Glyph, Image, ImageSource, Level, Mask, PaintType, PixelFormat, PixelMetadata, Pixmap,
     RasterizerSettings, RenderContext, RenderMode, RenderSettings, TargetInit,
 };
 
@@ -143,7 +144,64 @@ enum Command {
     SetFilterEffect { filter: FilterSpec },
     /// Clear the paint-level filter.
     ResetFilterEffect,
+    /// Draw an explicitly positioned glyph run through the `glifo` stack.
+    GlyphRun(GlyphRunSpec),
     Reset,
+}
+
+/// Font asset for a positioned glyph run.
+#[derive(Debug, Deserialize)]
+struct FontSpec {
+    /// Path relative to the scene file's directory.
+    asset: String,
+    #[serde(default)]
+    index: u32,
+}
+
+/// One positioned glyph: font glyph id plus run-space position.
+#[derive(Debug, Deserialize)]
+struct PositionedGlyphSpec {
+    id: u32,
+    x: f32,
+    y: f32,
+}
+
+/// Decoration placement (T5); parsed so scenes that request it fail loudly.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DecorationSpec {
+    x_range: [f32; 2],
+    baseline_y: f32,
+    offset: f32,
+    size: f32,
+    buffer: f32,
+}
+
+fn default_hint() -> bool {
+    true
+}
+
+/// A positioned glyph run drawn through the `glifo` stack.
+#[derive(Debug, Deserialize)]
+struct GlyphRunSpec {
+    font: FontSpec,
+    font_size: f32,
+    #[serde(default = "default_hint")]
+    hint: bool,
+    #[serde(default)]
+    glyph_transform: Option<[f64; 6]>,
+    #[serde(default)]
+    embolden: Option<[f32; 2]>,
+    #[serde(default)]
+    normalized_coords: Option<Vec<i16>>,
+    #[serde(default)]
+    atlas_cache: bool,
+    /// "fill" (default) or "stroke".
+    #[serde(default)]
+    style: Option<String>,
+    glyphs: Vec<PositionedGlyphSpec>,
+    #[serde(default)]
+    decoration: Option<DecorationSpec>,
 }
 
 /// `set_paint` payload; exactly one variant must be present.
@@ -554,6 +612,9 @@ fn run() -> Result<(), String> {
 
     let mut ctx = RenderContext::new_with(scene.width, scene.height, render_settings);
     let mut resources = vello_cpu::Resources::new();
+    // Font blobs are cached per scene so repeated runs share one `FontData`
+    // id and glyph atlas cache entries.
+    let mut font_cache: HashMap<(PathBuf, u32), FontData> = HashMap::new();
 
     for command in &scene.commands {
         match command {
@@ -669,6 +730,9 @@ fn run() -> Result<(), String> {
             Command::PopLayer => ctx.pop_layer(),
             Command::SetFilterEffect { filter } => ctx.set_filter_effect(build_filter(filter)),
             Command::ResetFilterEffect => ctx.reset_filter_effect(),
+            Command::GlyphRun(spec) => {
+                draw_glyph_run(&mut ctx, &mut resources, scene_dir, spec, &mut font_cache)?
+            }
             Command::Reset => ctx.reset(),
         }
     }
@@ -956,6 +1020,78 @@ fn build_paint(spec: &PaintSpec, scene_dir: &Path) -> Result<PaintType, String> 
     }
     let image = spec.image.as_ref().expect("checked above");
     Ok(load_image(image, scene_dir)?.into())
+}
+
+/// Draw one positioned glyph run through the pinned upstream `glifo` stack.
+///
+/// Deferred features (`decoration`, `embolden`, `normalized_coords`) are hard
+/// errors so a scene can never silently drop them.
+fn draw_glyph_run(
+    ctx: &mut RenderContext,
+    resources: &mut vello_cpu::Resources,
+    scene_dir: &Path,
+    spec: &GlyphRunSpec,
+    font_cache: &mut HashMap<(PathBuf, u32), FontData>,
+) -> Result<(), String> {
+    if spec.decoration.is_some() {
+        return Err("glyph_run decoration is not ported yet (T5)".into());
+    }
+    if let Some(embolden) = spec.embolden
+        && (embolden[0] != 0.0 || embolden[1] != 0.0)
+    {
+        return Err("glyph_run embolden is not ported yet (error.Unsupported)".into());
+    }
+    if let Some(coords) = &spec.normalized_coords
+        && !coords.is_empty()
+    {
+        return Err("glyph_run normalized_coords are not supported (gvar deferred)".into());
+    }
+
+    let font = load_font(scene_dir, &spec.font, font_cache)?;
+    let mut builder = ctx
+        .glyph_run(resources, &font)
+        .font_size(spec.font_size)
+        .hint(spec.hint)
+        .atlas_cache(spec.atlas_cache);
+    if let Some(transform) = spec.glyph_transform {
+        builder = builder.glyph_transform(parse_affine(transform));
+    }
+
+    let glyphs: Vec<Glyph> = spec
+        .glyphs
+        .iter()
+        .map(|glyph| Glyph {
+            id: glyph.id,
+            x: glyph.x,
+            y: glyph.y,
+        })
+        .collect();
+
+    match spec.style.as_deref() {
+        None | Some("fill") => builder.fill_glyphs(glyphs.into_iter()),
+        Some("stroke") => builder.stroke_glyphs(glyphs.into_iter()),
+        Some(other) => return Err(format!("unknown glyph_run style {other:?}")),
+    }
+    Ok(())
+}
+
+/// Load (and cache) a font asset as `FontData`; the cache keeps one blob per
+/// (path, face index) so repeated runs share the same font id.
+fn load_font(
+    scene_dir: &Path,
+    spec: &FontSpec,
+    font_cache: &mut HashMap<(PathBuf, u32), FontData>,
+) -> Result<FontData, String> {
+    let path = scene_dir.join(&spec.asset);
+    let key = (path.clone(), spec.index);
+    if let Some(font) = font_cache.get(&key) {
+        return Ok(font.clone());
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("reading font {}: {e}", path.display()))?;
+    let font = FontData::new(Blob::new(Arc::new(bytes)), spec.index);
+    font_cache.insert(key, font.clone());
+    Ok(font)
 }
 
 /// Builds a single-primitive filter from a scene spec.

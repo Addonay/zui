@@ -300,6 +300,15 @@ fn renderScene(
     var scratch_path = kurbo.BezPath.init();
     defer scratch_path.deinit(allocator);
 
+    // Font blobs are cached per scene so repeated runs share one `FontData`
+    // id (and therefore one set of glyph atlas cache entries).
+    var font_blobs: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer {
+        var blob_it = font_blobs.valueIterator();
+        while (blob_it.next()) |blob| allocator.free(blob.*);
+        font_blobs.deinit(allocator);
+    }
+
     for (scene.commands) |command| {
         switch (command) {
             .set_transform => |c| ctx.setTransform(kurbo.Affine.new(c)),
@@ -342,6 +351,15 @@ fn renderScene(
                 ctx.setFilterEffect(filter);
             },
             .reset_filter_effect => ctx.resetFilterEffect(),
+            .glyph_run => |spec| try renderGlyphRun(
+                allocator,
+                io,
+                scene_dir,
+                &ctx,
+                &resources,
+                &font_blobs,
+                spec,
+            ),
             .reset => ctx.reset(),
         }
     }
@@ -362,6 +380,57 @@ fn renderScene(
         "ok {d}x{d} bytes={d} fnv1a={x:0>16} scene_fnv1a={x:0>16}\n",
         .{ scene.width, scene.height, expected, output_hash, scene_hash },
     );
+}
+
+/// Draw one positioned glyph run through `vellz.glifo`.
+///
+/// Deferred features (`decoration`, non-zero `embolden`, non-empty
+/// `normalized_coords`) are typed `error.Unsupported`, never silently dropped.
+fn renderGlyphRun(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scene_dir: []const u8,
+    ctx: *vellz.cpu.RenderContext,
+    resources: *vellz.cpu.Resources,
+    font_blobs: *std.StringHashMapUnmanaged([]const u8),
+    spec: scene_mod.GlyphRunSpec,
+) !void {
+    const glifo = vellz.glifo;
+    if (spec.decoration != null) return error.Unsupported;
+    if (spec.embolden) |amount| {
+        if (amount[0] != 0.0 or amount[1] != 0.0) return error.Unsupported;
+    }
+    if (spec.normalized_coords) |coords| {
+        if (coords.len != 0) return error.Unsupported;
+    }
+
+    const blob = font_blobs.get(spec.font.asset) orelse blk: {
+        const path = try std.fs.path.join(allocator, &.{ scene_dir, spec.font.asset });
+        defer allocator.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
+        try font_blobs.put(allocator, spec.font.asset, bytes);
+        break :blk bytes;
+    };
+    const font_data = glifo.FontData.init(blob, spec.font.index);
+
+    const glyphs = try allocator.alloc(glifo.Glyph, spec.glyphs.len);
+    defer allocator.free(glyphs);
+    for (spec.glyphs, 0..) |glyph, i| {
+        glyphs[i] = .{ .id = glyph.id, .x = glyph.x, .y = glyph.y };
+    }
+
+    var builder = ctx.glyphRun(resources, font_data)
+        .fontSize(spec.font_size)
+        .hint(spec.hint)
+        .atlasCache(spec.atlas_cache);
+    if (spec.glyph_transform) |transform| {
+        builder = builder.glyphTransform(kurbo.Affine.new(transform));
+    }
+
+    switch (spec.style) {
+        .fill => try builder.fillGlyphs(allocator, glifo.iterate(glyphs)),
+        .stroke => try builder.strokeGlyphs(allocator, glifo.iterate(glyphs)),
+    }
 }
 
 fn fillPath(

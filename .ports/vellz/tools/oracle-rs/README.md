@@ -109,6 +109,7 @@ Commands:
 | `push_layer` / `pop_layer` | `kind`: `clip` \| `blend` \| `opacity` \| `mask` \| `filter` | isolated layer; see below |
 | `set_filter_effect` | `filter` | wraps each subsequent draw in a filter layer |
 | `reset_filter_effect` | | clears the paint-level filter |
+| `glyph_run` | `font`, `font_size`, `glyphs`, ... | positioned glyph run through `glifo`; see below |
 | `reset` | | upstream `RenderContext::reset` |
 
 ### Paints
@@ -210,6 +211,36 @@ to multiple draws. A filter layer accepts an optional `clip` (SVG path data),
 { "op": "pop_layer" }
 ```
 
-Blurred rounded rectangles and glyph runs remain planned; they are added when
-the corresponding vellz feature is ported, and the same file is consumed by
-both implementations.
+Blurred rounded rectangles and glyph runs are consumed by both
+implementations. Glyph runs never shape: the scene carries an explicit
+positioned glyph list, so the oracle and vellz receive identical inputs.
+
+### Glyph runs (M3 T3)
+
+```json
+{ "op": "glyph_run",
+  "font": { "asset": "../fixtures/upstream/Roboto-Regular.ttf", "index": 0 },
+  "font_size": 50.0,
+  "hint": false,
+  "atlas_cache": true,
+  "style": "fill",
+  "glyph_transform": [1, 0, -0.36, 1, 0, 0],
+  "glyphs": [ { "id": 43, "x": 0.0, "y": 0.0 }, { "id": 72, "x": 32.5, "y": 0.0 } ] }
+```
+
+| field | notes |
+| --- | --- |
+| `font` | `asset` is relative to the scene file; `index` selects a TTC face |
+| `font_size` | pixels per em |
+| `hint` | default `true` (upstream); the M3 corpus uses `false` because the interpreter is not ported yet |
+| `glyph_transform` | optional affine applied per glyph (after positioning) |
+| `atlas_cache` | optional; toggles the glyph atlas path |
+| `style` | `fill` (default) or `stroke` (uses the current `set_stroke`) |
+| `glyphs` | `{id, x, y}` list; `id` is the font glyph id from `--dump-cmap` |
+| `embolden` / `normalized_coords` | parsed and rejected with an explicit error until ported (`error.Unsupported`) |
+| `decoration` | parsed and rejected with an explicit error until T5 |
+
+The current scene transform and `set_paint_transform` are captured by
+`RenderContext::glyph_run` exactly as in `vello_cpu`, so the usual commands
+apply. `tools/gen_glyph_scenes.py` generates the committed corpus cases from
+the font's cmap/hmtx; see `tests/README.md` for the gate and tolerance policy.
