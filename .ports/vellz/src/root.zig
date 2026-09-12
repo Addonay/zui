@@ -34,4 +34,13 @@ pub const gpu = if (build_options.gpu) @import("gpu/root.zig") else struct {};
 
 test {
     @import("std").testing.refAllDecls(@This());
+
+    // The GPU host/shader layout contract is CPU-safe (its modules import only
+    // `vellz.common`/`vellz.peniko`, never `wgpu`), so its tests run in the
+    // default build even though the wgpu backend is gated behind `-Dgpu=true`.
+    _ = @import("gpu/util.zig");
+    _ = @import("gpu/copy.zig");
+    _ = @import("gpu/blend.zig");
+    _ = @import("gpu/filter.zig");
+    _ = @import("gpu/render/common.zig");
 }

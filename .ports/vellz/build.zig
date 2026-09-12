@@ -50,6 +50,14 @@ pub fn build(b: *std.Build) void {
     import_buf[import_count] = .{ .name = "probe_reference", .module = probe_reference_module };
     import_count += 1;
 
+    // The wgpu module import, resolved to the real sibling package when
+    // `-Dgpu=true`; a CPU-only build gets an inert stub instead. Zig 0.17's
+    // AstGen resolves every `@import` literal in every parsed file, including
+    // files that are only reachable through untaken comptime branches, so the
+    // backend sources always name `wgpu`. The stub keeps a CPU-only build from
+    // resolving, building, or linking the sibling package.
+    var gpu_wgpu_module: ?*std.Build.Module = null;
+
     if (gpu_enabled) {
         const native_prefix = b.option(
             []const u8,
@@ -80,7 +88,8 @@ pub fn build(b: *std.Build) void {
             .@"wgpu-native-linkage" = native_linkage,
             .@"wgpu-native-link" = native_link,
         })) |dep| {
-            import_buf[import_count] = .{ .name = "wgpu", .module = dep.module("wgpu") };
+            gpu_wgpu_module = dep.module("wgpu");
+            import_buf[import_count] = .{ .name = "wgpu", .module = gpu_wgpu_module.? };
             import_count += 1;
         } else {
             // With a local path dependency this cannot happen; it would mean the
@@ -92,6 +101,14 @@ pub fn build(b: *std.Build) void {
             );
             std.process.exit(1);
         }
+    } else {
+        const wgpu_stub = b.createModule(.{
+            .root_source_file = b.path("src/gpu/backend/wgpu_stub.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        import_buf[import_count] = .{ .name = "wgpu", .module = wgpu_stub };
+        import_count += 1;
     }
 
     const mod = b.addModule("vellz", .{
@@ -178,6 +195,46 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Compile the library and all buildable examples");
     check_step.dependOn(&unit_tests.step);
     check_step.dependOn(&scene_tests.step);
+
+    // -------------------------------------------------------- GPU smoke test
+    // `-Dgpu=true` only: device bootstrap + clear through the checked-in WGSL
+    // + readback, all offscreen. `run-gpu-smoke-failure` re-runs the same
+    // binary with `--force-adapter-failure`, which must exit non-zero with
+    // `error.NoAdapter`.
+    if (gpu_enabled) {
+        const wgpu_mod = gpu_wgpu_module orelse {
+            std.debug.print("vellz: internal error: GPU module missing while gpu is enabled\n", .{});
+            std.process.exit(1);
+        };
+        const smoke = b.addExecutable(.{
+            .name = "vellz-gpu-smoke",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/gpu_smoke.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "vellz", .module = mod },
+                    .{ .name = "wgpu", .module = wgpu_mod },
+                },
+            }),
+        });
+        check_step.dependOn(&smoke.step);
+
+        const run_smoke = b.addRunArtifact(smoke);
+        run_smoke.addPassthruArgs();
+        const smoke_step = b.step("run-gpu-smoke", "Run the offscreen GPU device/clear/readback smoke test");
+        smoke_step.dependOn(&run_smoke.step);
+
+        const run_smoke_failure = b.addRunArtifact(smoke);
+        run_smoke_failure.addArg("--force-adapter-failure");
+        run_smoke_failure.expectExitCode(1);
+        const smoke_failure_step = b.step(
+            "run-gpu-smoke-failure",
+            "Verify the forced adapter-failure path returns error.NoAdapter",
+        );
+        smoke_failure_step.dependOn(&run_smoke_failure.step);
+        check_step.dependOn(&run_smoke_failure.step);
+    }
 }
 
 test "pinned revision is recorded and matches the plan" {

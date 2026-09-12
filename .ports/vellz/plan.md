@@ -208,15 +208,20 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 
 | Upstream area | Zig target | Status | Notes |
 | --- | --- | --- | --- |
-| `render/common.rs` (Config, GpuStrip, encoded paint structs) | `gpu/render/common.zig` | defer | layouts fixed in `docs/shader-interface.md` |
-| `render/wgpu/mod.rs` (Programs, passes, resources) | `gpu/render/wgpu.zig` | defer | M5 |
+| `render/common.rs` (Config, GpuStrip, clear/encoded paint structs, packing) | `gpu/render/common.zig` | port | 8 layout/packing tests run in the default `zig build test`; comptime `@sizeOf`/`@offsetOf` asserts match `docs/shader-interface.md` §4 |
+| `render/wgpu/mod.rs` (device bootstrap/readback/clear subset) | `gpu/backend/{device,wgpu,readback}.zig` | partial | T1: instance/adapter/device/queue, error scopes, uncaptured/device-lost capture, limits, adapter-info printing, checked-in clear WGSL pipeline, texture readback; `run-gpu-smoke` passes offscreen on lavapipe (all handles released, zero validation errors) |
+| `render/wgpu/mod.rs` (Programs, passes, resources) | `gpu/render/wgpu.zig` | defer | M5 T3–T5 |
 | `draw.rs`, `scene.rs` | `gpu/draw.zig`, `gpu/scene.zig` | defer | M5 |
 | `schedule/*`, `target.rs` | `gpu/schedule.zig`, `gpu/target.zig` | defer | M5 |
-| `blend.rs`, `copy.rs`, `paint.rs`, `rect.rs`, `filter.rs` | `gpu/*.zig` | defer | M5 |
+| `util.rs` (packing subset) | `gpu/util.zig` | partial | `pack_u16_pair`/`pack_opacity` landed; `Ranges`/`RangedSlice` with the schedule |
+| `copy.rs` | `gpu/copy.zig` | partial | `GpuCopyInstance` (16 B) + packing test |
+| `blend.rs` | `gpu/blend.zig` | partial | `GpuBlendInstance` (32 B) + `blend_config` bit packing; `new`/`copy_from_scratch` need the schedule |
+| `filter.rs` (layout subset) | `gpu/filter.zig` | partial | 48-byte blocks, `FilterInstanceData` (36 B), header/pass-kind constants; `PreparedFilter` conversions and the pass planner follow |
+| `paint.rs`, `rect.rs` | `gpu/paint.zig`, `gpu/rect.zig` | defer | M5 |
 | `gradient_cache.rs` | `gpu/gradient_cache.zig` | defer | M5 |
 | `resources.rs`, `text.rs` | `gpu/resources.zig`, `gpu/text.zig` | defer | M5/M3 |
 | `render/webgl/*` | — | unsup | WebGL out of scope |
-| WGSL shaders | `gpu/shaders/generated.zig` | defer | checked-in compiled WGSL |
+| WGSL shaders | `gpu/shaders/generated.zig` | port | checked-in compiled WGSL; `clear.wgsl` drives the offscreen smoke |
 
 ### `glifo` → `src/glifo/`
 
@@ -647,3 +652,28 @@ of panics, thread ownership).
   `layer_opacity_64`, `image_bilinear_64`, `gradient_sweep_64`,
   `fill_wave_seams_128`) match the committed fixtures byte-for-byte;
   filter+MT and u8+MT fail with typed `error.Unsupported`.
+- 2026-09-12: **M5 T1/T2 landed** (branch `vellz-gpu`). T2 host/shader contract:
+  `gpu/render/common.zig` (`Config` 32 B, `GpuStrip` 24 B, `GpuClearInstance`
+  28 B, encoded paints 48/32/64/48/80 B, paint/rect/flag + image/gradient/tint
+  packing), `gpu/copy.zig` (16 B), `gpu/blend.zig` (32 B, `blend_config` bits),
+  `gpu/filter.zig` (48-byte blocks, `FilterInstanceData` 36 B, header/pass-kind
+  constants), `gpu/util.zig`; all asserted at comptime and exercised by 8 tests
+  that run in the default CPU build (`zig build test` = 646/646; corpus stays
+  48/48 byte-exact). T1 bootstrap: `gpu/backend/device.zig`
+  (instance -> adapter -> device/queue, error scopes, uncaptured + device-lost
+  capture, typed `Error`, limits, adapter-info printing, `--force-adapter-failure`
+  => `error.NoAdapter`), `readback.zig` (texture -> 256-B row-aligned buffer ->
+  map/poll -> tightly packed RGBA8), `wgpu.zig` (checked-in `clear.wgsl` module
+  + 28-B instanced rectangle pipeline + clear encoder), `tools/gpu_smoke.zig`
+  wired in `build.zig` as `run-gpu-smoke` / `run-gpu-smoke-failure` and compiled
+  by `-Dgpu=true check`. Evidence: `zig build -Dgpu=true run-gpu-smoke` on the
+  llvmpipe adapter (`backend=vulkan type=cpu execution=software-adapter
+  vendorID=0x10005`, Mesa 25.2.8, `maxTextureDimension2D=8192`) clears a 64×64
+  `Rgba8Unorm` texture to `0xFFBF8040` and all 4096 readback pixels match; zero
+  validation errors; every handle released. `zig build -Dgpu=true test` =
+  653/653. Environment finding recorded: Zig 0.17 AstGen resolves every
+  `@import` literal in every parsed file, even inside untaken comptime branches,
+  so `build.zig` provides an inert `wgpu_stub.zig` module name for CPU-only
+  builds; the real `.ports/wgpu` dependency is never resolved or linked there.
+  Next: T3 (pipeline factory + clear through the strip/encoded infrastructure),
+  T4 (root strip pass for solid fills), then the G5 harness.

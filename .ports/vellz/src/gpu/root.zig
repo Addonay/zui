@@ -1,27 +1,31 @@
 //! GPU backend root.
-//!
-//! This module is analyzed only when the package is built with `-Dgpu=true`.
-//! It deliberately does not import the sibling `wgpu` package: the shader
-//! assets and shared GPU layouts are usable (and testable) without it.
-//!
-//! The wgpu-backed renderer lands in Milestone 5 as `src/gpu/backend/` and is
-//! referenced from `src/root.zig` only when `-Dgpu=true`; Zig resolves import
-//! paths even in untaken comptime branches, so the backend root directory must
-//! exist before it can be referenced there.
 
 const build_options = @import("build_options");
 
 /// Compiled WGSL sources from the pinned `vello_gpu_shaders` revision.
 pub const shaders = @import("shaders/generated.zig");
 
-comptime {
-    // Keep the option observable so a build with `-Dgpu=true` and no backend
-    // fails loudly instead of silently shipping a CPU-only root.
-    if (build_options.gpu) {
-        @compileError("vellz GPU backend is not implemented yet (Milestone 5)");
-    }
-}
+/// Host/shader layout contract (CPU-safe: no `wgpu` import).
+pub const util = @import("util.zig");
+pub const copy = @import("copy.zig");
+pub const blend = @import("blend.zig");
+pub const filter = @import("filter.zig");
+pub const render = @import("render/common.zig");
+
+/// The wgpu-backed device/pipeline layer. Referenced only when the package is
+/// built with `-Dgpu=true`; the path must still exist in a CPU-only build
+/// because Zig resolves import paths even in untaken comptime branches.
+pub const backend = if (build_options.gpu) @import("backend/root.zig") else struct {};
 
 test {
     @import("std").testing.refAllDecls(@This());
+
+    // The layout modules are exercised in the default test build through the
+    // unconditional imports in `src/root.zig`; import them here as well so a
+    // `-Dgpu=true` test run analyzes them from the GPU root.
+    _ = @import("util.zig");
+    _ = @import("copy.zig");
+    _ = @import("blend.zig");
+    _ = @import("filter.zig");
+    _ = @import("render/common.zig");
 }
