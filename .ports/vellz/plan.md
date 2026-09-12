@@ -964,3 +964,32 @@ of panics, thread ownership).
   llvmpipe. `sbix`/`EBDT` have synthetic-font unit tests only (no pinned
   asset); PNG 16-bit/Adam7 is typed `error.Unsupported` and falls through to
   outlines.
+- 2026-09-12: **M5 atlas images + GPU text landed** (branch `vellz-gpures`,
+  first checkpoint). `gpu/resources.zig` ports `vello_gpu/src/resources.rs`:
+  persistent `Resources` (image atlas cache, `GlyphPrepCache`, lazily created
+  page-sized glyph scene), `configureAtlas` normalizing the atlas size against
+  the device's resource texture dimension, and an erased `GlyphUploader` hook
+  so `glifo`'s uncached bitmap path can upload its `Pixmap` source instead of
+  hitting upstream's panic. `gpu/paint.zig` resolves `ImageSource.opaque_id`
+  through the image cache (size/offset/padding + atlas texture source) and
+  reports `error.MissingImage` for unknown ids. `gpu/text.zig` ports
+  `vello_gpu/src/text.rs`: `SceneSink` implements the `DrawSink`/`GlyphRenderer`
+  contract over the hybrid `Scene` (state clone/restore, `GLYPH_PADDING` atlas
+  paint transform, pixmap-to-atlas rewrite) and `HybridGlyphRunBackend` drives
+  the `glifo` fill/stroke/decoration loop with the shared glyph atlas.
+  `backend/renderer.zig` gains persistent atlas textures, `configureResources`,
+  frame-start `prepareResources` (replay pending glyph pages with
+  `render_to_atlas` + submit, queue bitmap uploads) and frame-end
+  `finishResources` (cache maintenance, `queue.writeTexture` region clears),
+  plus `uploadImage`/`writeToAtlas`; `renderWithResources` keeps the main
+  render's root-target pipeline choice (`user_surface` vs `atlas_layer`) and
+  rejects atlas feedback loops. `glifo`'s `atlasImageSource` now receives both
+  the image-cache allocation id and the page index (CPU behavior unchanged).
+  `tools/gpu_render.zig` registers every image asset in the image atlas
+  (`opaque_id`) and implements `glyph_run` (fill/stroke/decoration, hint,
+  glyph transform, atlas cache on/off). Evidence: `zig build test` green
+  (879/879 across the four steps), `gpu-corpus` still 44/44, and a
+  representative glyph sweep on llvmpipe is at max-abs 1 for outline/hinted/
+  stroked/scaled/skewed/decoration scenes, 2 for COLR Noto scenes, and 2 for
+  the bitmap scenes (non-cache bitmap now renders through an automatic atlas
+  upload).

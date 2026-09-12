@@ -15,7 +15,9 @@
 //!   `RenderContext.setPaint` needs no glyph-specific types.
 //! - `atlasImageSource`/`atlasPaintTransform` take primitive parameters
 //!   instead of `AtlasSlot` so the CPU renderer does not have to import
-//!   `vellz.glifo`.
+//!   `vellz.glifo`. `atlasImageSource` receives both the shared image-cache
+//!   allocation id (GPU) and the glyph-atlas page index (CPU), because each
+//!   backend resolves a different identity.
 
 const std = @import("std");
 

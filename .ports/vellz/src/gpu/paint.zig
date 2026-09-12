@@ -26,9 +26,12 @@ const Paint = common.paint.Paint;
 
 /// Errors from resolving a paint to its GPU representation.
 pub const Error = error{
-    /// The paint kind is not implemented by this milestone (atlas-backed
-    /// images, pixmap image sources).
+    /// The paint kind is not implemented by this milestone (pixmap image
+    /// sources).
     Unsupported,
+    /// An `ImageSource.opaque_id` reference has no allocation in the image
+    /// cache (upstream unwraps the lookup).
+    MissingImage,
 };
 
 /// Errors from preparing encoded paints.
@@ -83,6 +86,9 @@ pub const PaintResolver = struct {
     encoded: []const EncodedPaint = &.{},
     /// GPU data offset (in `Rgba32Uint` texels) for each encoded paint.
     gpu_offsets: []const u32 = &.{},
+    /// Image atlas cache resolving `ImageSource.opaque_id` sources. Paints
+    /// without it reject atlas-backed images with `error.MissingImage`.
+    image_cache: ?*const common.image_cache.ImageCache = null,
 
     /// Empty resolver: only solid paints resolve.
     pub const solid_only: PaintResolver = .{};
@@ -90,6 +96,17 @@ pub const PaintResolver = struct {
     /// Build a resolver over prepared encoded paints.
     pub fn new(encoded: []const EncodedPaint, gpu_offsets: []const u32) PaintResolver {
         return .{ .encoded = encoded, .gpu_offsets = gpu_offsets };
+    }
+
+    /// Add the image cache needed to resolve atlas-backed image paints
+    /// (upstream `PaintResolver::with_image_cache`).
+    pub fn withImageCache(
+        self: PaintResolver,
+        image_cache: *const common.image_cache.ImageCache,
+    ) PaintResolver {
+        var result = self;
+        result.image_cache = image_cache;
+        return result;
     }
 
     /// Pack one recorded paint for the shader.
@@ -116,9 +133,16 @@ pub const PaintResolver = struct {
                             .paint_type = render_common.PAINT_TYPE_IMAGE,
                             .texture_source = .{ .external = external.id.asU64() },
                         },
-                        // Atlas-backed images need the image-cache/atlas
-                        // upload path, which is not ported yet.
-                        .opaque_id => return error.Unsupported,
+                        .opaque_id => |registered| resolved: {
+                            const cache = self.image_cache orelse return error.MissingImage;
+                            const resource = cache.get(registered.id) orelse return error.MissingImage;
+                            break :resolved .{
+                                .paint_type = render_common.PAINT_TYPE_IMAGE,
+                                .texture_source = .{ .atlas = resource.atlas_id.asU32() },
+                            };
+                        },
+                        // Upstream `vello_gpu` panics for pixmap image sources
+                        // ("not supported by Vello GPU").
                         .pixmap => return error.Unsupported,
                     },
                     .gradient => |*gradient| .{
@@ -185,13 +209,15 @@ pub const PreparedPaints = struct {
 
 /// Pack every encoded paint into its `Rgba32Uint` representation.
 ///
-/// Atlas-backed (`opaque_id`) and pixmap image sources need the image cache /
-/// atlas upload path, which is not ported yet; they return `error.Unsupported`
-/// rather than approximating.
+/// `image_cache` resolves atlas-backed (`opaque_id`) image sources to their
+/// allocation's size/offset; when it is `null` those paints fail with
+/// `error.MissingImage`. Pixmap sources are explicitly unsupported by upstream
+/// GPU too (`error.Unsupported`).
 pub fn prepareGpuEncodedPaints(
     allocator: std.mem.Allocator,
     encoded_paints: []const EncodedPaint,
     cache: *GradientRampCache,
+    image_cache: ?*const common.image_cache.ImageCache,
 ) PrepareError!PreparedPaints {
     var prepared = PreparedPaints{ .allocator = allocator };
     errdefer prepared.deinit();
@@ -203,7 +229,7 @@ pub fn prepareGpuEncodedPaints(
         prepared.offsets.appendAssumeCapacity(current_texel);
         switch (paint.*) {
             .image => |*image| {
-                const gpu_image = try encodeImagePaint(image);
+                const gpu_image = try encodeImagePaint(image, image_cache);
                 const size_texels = render_common.GPU_ENCODED_IMAGE_SIZE_TEXELS;
                 try appendPaint(&prepared.data, allocator, .{ .image = gpu_image }, size_texels);
                 current_texel += size_texels;
@@ -245,7 +271,10 @@ fn appendPaint(
 }
 
 /// Build the `GpuEncodedImage` for an encoded image paint.
-pub fn encodeImagePaint(image: *const EncodedImage) PrepareError!render_common.GpuEncodedImage {
+pub fn encodeImagePaint(
+    image: *const EncodedImage,
+    image_cache: ?*const common.image_cache.ImageCache,
+) PrepareError!render_common.GpuEncodedImage {
     const coeffs = image.transform.asCoeffs();
     const transform: [6]f32 = .{
         @floatCast(coeffs[0]),
@@ -278,9 +307,22 @@ pub fn encodeImagePaint(image: *const EncodedImage) PrepareError!render_common.G
             .tint_mode = tint.mode,
             .image_padding = 0,
         },
-        // Atlas-backed images need the atlas upload path (`resources.rs`);
-        // pixmap sources are explicitly unsupported by upstream GPU too.
-        .opaque_id, .pixmap => error.Unsupported,
+        .opaque_id => |registered| blk: {
+            const cache = image_cache orelse return error.MissingImage;
+            const resource = cache.get(registered.id) orelse return error.MissingImage;
+            break :blk .{
+                .image_params = params,
+                .image_size = render_common.packImageSize(resource.width, resource.height),
+                .image_offset = render_common.packImageOffset(resource.offset[0], resource.offset[1]),
+                .transform = transform,
+                .tint = tint.color,
+                .tint_mode = tint.mode,
+                .image_padding = resource.padding,
+            };
+        },
+        // Pixmap sources are explicitly unsupported by upstream GPU too
+        // (`panic!("pixmap image sources are not supported by Vello GPU")`).
+        .pixmap => error.Unsupported,
     };
 }
 

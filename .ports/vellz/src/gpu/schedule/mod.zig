@@ -79,6 +79,8 @@ pub const Error = std.mem.Allocator.Error || error{
     UnsupportedCapability,
     MissingTextureBinding,
     TextureFeedbackLoop,
+    /// An `ImageSource.opaque_id` paint has no allocation in the image cache.
+    MissingImage,
 };
 
 /// Counts of allocated or required intermediate textures.

@@ -852,6 +852,20 @@ pub fn writeRgba8(
     width: u32,
     height: u32,
 ) Error!void {
+    return writeRgba8At(dev, texture, bytes, width, height, 0, 0);
+}
+
+/// Upload tightly packed `Rgba8Unorm` pixel data into `(x, y)` with
+/// 256-byte-aligned rows.
+pub fn writeRgba8At(
+    dev: *device.Device,
+    texture: c.WGPUTexture,
+    bytes: []const u8,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+) Error!void {
     if (width == 0 or height == 0) return error.TextureTooLarge;
     const row_bytes: usize = @as(usize, width) * 4;
     const expected = row_bytes * height;
@@ -861,7 +875,7 @@ pub fn writeRgba8(
     var dest = c.wgpu_zig_init_WGPUTexelCopyTextureInfo();
     dest.texture = texture;
     dest.mipLevel = 0;
-    dest.origin = .{ .x = 0, .y = 0, .z = 0 };
+    dest.origin = .{ .x = x, .y = y, .z = 0 };
     dest.aspect = c.WGPUTextureAspect_All;
 
     var layout = c.wgpu_zig_init_WGPUTexelCopyBufferLayout();

@@ -1104,8 +1104,17 @@ pub const RenderContext = struct {
     }
 
     /// Resolve an atlas page index to its registered image id.
-    pub fn atlasImageSource(self: *const RenderContext, page_index: u32) paint_mod.ImageSource {
+    ///
+    /// `image_id` is the shared image-cache allocation (used by the GPU
+    /// backend); the CPU registry stores whole pages, so it resolves
+    /// `page_index` instead.
+    pub fn atlasImageSource(
+        self: *const RenderContext,
+        image_id: u32,
+        page_index: u32,
+    ) paint_mod.ImageSource {
         _ = self;
+        _ = image_id;
         return paint_mod.ImageSource.initOpaqueId(
             paint_mod.ImageId.new(ATLAS_IMAGE_ID_BASE + page_index),
         );
