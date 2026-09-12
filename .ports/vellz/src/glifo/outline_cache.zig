@@ -22,6 +22,7 @@ const std = @import("std");
 const kurbo = @import("../kurbo/root.zig");
 const font_mod = @import("font.zig");
 const glyf = @import("glyf.zig");
+const hinting = @import("hinting.zig");
 const pen_mod = @import("pen.zig");
 
 pub const GlyphId = font_mod.GlyphId;
@@ -146,10 +147,11 @@ pub const OutlineCache = struct {
 
     /// Looks up, or draws and stores, the outline for `gid`.
     ///
-    /// `hint_instance` runs the TrueType interpreter (configured for `size`)
-    /// and makes the cache key hint-distinct; `null` draws unhinted. Rejects
-    /// the remaining deferred inputs with `error.Unsupported`: non-empty
-    /// variation coordinates and non-default embolden.
+    /// `hint_instance` runs the configured hinting engine (interpreter or
+    /// autohinter) and makes the cache key hint-distinct; `null` draws
+    /// unhinted. Rejects the remaining deferred inputs with
+    /// `error.Unsupported`: non-empty variation coordinates and non-default
+    /// embolden.
     pub fn getOrInsert(
         self: *OutlineCache,
         allocator: std.mem.Allocator,
@@ -159,7 +161,7 @@ pub const OutlineCache = struct {
         size: f32,
         embolden: FontEmbolden,
         coords: []const NormalizedCoord,
-        hint_instance: ?*const glyf.HintInstance,
+        hint_instance: ?*hinting.HintingInstance,
     ) glyf.DrawError!CachedOutline {
         if (coords.len != 0) return error.Unsupported;
         if (!embolden.isDefault()) return error.Unsupported;
@@ -193,10 +195,20 @@ pub const OutlineCache = struct {
             allocator.destroy(path);
         }
         var path_pen = pen_mod.PathPen.init(allocator, path);
-        const metrics = try outlines.draw(allocator, gid, .{
-            .size = size,
-            .hint_instance = hint_instance,
-        }, &path_pen);
+        const metrics = if (hint_instance) |instance| switch (instance.kind) {
+            .interpreter => |*interpreter| try outlines.draw(allocator, gid, .{
+                .size = size,
+                .hint_instance = interpreter,
+            }, &path_pen),
+            .auto => |*auto| try auto.draw(
+                allocator,
+                gid,
+                size,
+                &.{},
+                .freetype,
+                &path_pen,
+            ),
+        } else try outlines.draw(allocator, gid, .{ .size = size }, &path_pen);
         _ = metrics;
         const bbox = path.boundingBox();
         const entry = try allocator.create(OutlineEntry);
@@ -414,9 +426,11 @@ test "outline cache rejects unsupported inputs" {
     const outlines = try font.outlines();
     var cache = OutlineCache{};
     defer cache.deinit(std.testing.allocator);
-    var instance = try outlines.createHintInstance(
+    var instance = try hinting.create(
         std.testing.allocator,
+        &outlines,
         16.0,
+        &.{},
         glyf.glifo_hint_target,
     );
     defer instance.deinit();

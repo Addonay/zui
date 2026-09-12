@@ -53,6 +53,8 @@ pub const tag_ebdt = Tag{ 'E', 'B', 'D', 'T' };
 pub const tag_eblc = Tag{ 'E', 'B', 'L', 'C' };
 pub const tag_cff = Tag{ 'C', 'F', 'F', ' ' };
 pub const tag_cff2 = Tag{ 'C', 'F', 'F', '2' };
+pub const tag_gsub = Tag{ 'G', 'S', 'U', 'B' };
+pub const tag_post = Tag{ 'p', 'o', 's', 't' };
 
 pub const sfnt_version_true: u32 = 0x00010000;
 pub const sfnt_version_otto: u32 = 0x4F54544F; // "OTTO"

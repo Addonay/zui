@@ -97,7 +97,9 @@ pub const Font = struct {
     }
 
     pub fn charmap(self: Font) Charmap {
-        return Charmap.init(self.face.table(sfnt.tag_cmap));
+        var map = Charmap.init(self.face.table(sfnt.tag_cmap));
+        map.glyph_count = self.numGlyphs();
+        return map;
     }
 
     /// Left side bearing in font units, or 0 when absent.
@@ -114,6 +116,39 @@ pub const Font = struct {
             if (hmtx.advance(gid)) |value| return value;
         }
         return 0;
+    }
+
+    /// Advance width in font units; `null` when the glyph is outside the
+    /// `hmtx` records (mirrors `GlyphMetrics::advance_width`).
+    pub fn advanceWidthOpt(self: Font, gid: GlyphId) ?i32 {
+        if (gid >= self.numGlyphs()) return null;
+        const hmtx = self.hmtx orelse return null;
+        const value = hmtx.advance(gid) orelse return null;
+        return value;
+    }
+
+    /// `FontRef::attributes().style != Style::Normal`: OS/2 `fsSelection`
+    /// italic/oblique when present, else `head.macStyle` italic.
+    pub fn isItalic(self: Font) bool {
+        if (self.face.table(sfnt.tag_os2)) |os2| {
+            const fs_selection = sfnt.readU16(os2, 62) orelse 0;
+            const italic: u16 = 1 << 0;
+            const oblique: u16 = 1 << 9;
+            return fs_selection & (italic | oblique) != 0;
+        }
+        if (self.face.table(sfnt.tag_head)) |head| {
+            const mac_style = sfnt.readU16(head, 44) orelse 0;
+            const mac_italic: u16 = 1 << 1;
+            return mac_style & mac_italic != 0;
+        }
+        return false;
+    }
+
+    /// `post.isFixedPitch() != 0` (the byte at offset 12 of `post`).
+    pub fn isFixedPitch(self: Font) bool {
+        const post = self.face.table(sfnt.tag_post) orelse return false;
+        const value = sfnt.readU32(post, 12) orelse return false;
+        return value != 0;
     }
 
     /// Builds the `glyf` outline scaler for this face.

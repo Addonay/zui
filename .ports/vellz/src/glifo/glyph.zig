@@ -47,6 +47,7 @@ const bitmap_mod = @import("tables/bitmap.zig");
 const cpal_mod = @import("tables/cpal.zig");
 const font_mod = @import("font.zig");
 const glyf = @import("glyf.zig");
+const hinting = @import("hinting.zig");
 const colr = @import("colr.zig");
 const png_mod = @import("png.zig");
 const outline_cache = @import("outline_cache.zig");
@@ -261,7 +262,7 @@ pub const HintCache = struct {
         font_id: u64,
         font_index: u32,
         size: f32,
-        instance: glyf.HintInstance,
+        instance: hinting.HintingInstance,
         serial: u64,
     };
 
@@ -289,7 +290,7 @@ pub const HintCache = struct {
         font_index: u32,
         outlines: *const glyf.Outlines,
         size: f32,
-    ) Error!*const glyf.HintInstance {
+    ) Error!*hinting.HintingInstance {
         for (self.entries.items) |*entry| {
             if (entry.font_id == font_id and
                 entry.font_index == font_index and
@@ -311,18 +312,14 @@ pub const HintCache = struct {
                 }
             }
             const entry = &self.entries.items[lru];
-            const sp = outlines.hintedScaleAndPpem(size);
-            entry.instance.reconfigure(
-                outlines.program,
-                sp.scale,
-                sp.ppem,
-                glyf.glifo_hint_target,
-                &.{},
+            try hinting.reconfigure(
+                &entry.instance,
+                allocator,
+                outlines,
                 size,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.HintError,
-            };
+                &.{},
+                glyf.glifo_hint_target,
+            );
             entry.font_id = font_id;
             entry.font_index = font_index;
             entry.size = size;
@@ -330,7 +327,7 @@ pub const HintCache = struct {
             entry.serial = self.serial;
             return &entry.instance;
         }
-        var instance = try outlines.createHintInstance(allocator, size, glyf.glifo_hint_target);
+        var instance = try hinting.create(allocator, outlines, size, &.{}, glyf.glifo_hint_target);
         errdefer instance.deinit();
         try self.entries.append(allocator, .{
             .font_id = font_id,
@@ -554,7 +551,7 @@ pub const PreparedGlyphRun = struct {
     normalized_coords: []const NormalizedCoord,
     /// Hinting instance for this run; `null` when the run is unhinted (or the
     /// effective transform is `Direct`, which never hints upstream).
-    hinting_instance: ?*const glyf.HintInstance = null,
+    hinting_instance: ?*hinting.HintingInstance = null,
 };
 
 /// The scale at which an outline is cached and the factor to the draw size.
@@ -630,7 +627,7 @@ pub fn prepareGlyphRunWithCache(
 
     var effective_transform: kurbo.Affine = undefined;
     var draw_font_size: f32 = undefined;
-    var hinting_instance: ?*const glyf.HintInstance = null;
+    var hinting_instance: ?*hinting.HintingInstance = null;
     switch (mode) {
         // The scale is absorbed into the font size; remove it from the skew
         // coefficient as well so it is not applied twice.

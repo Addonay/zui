@@ -32,6 +32,9 @@ pub const Subtable = union(enum) {
 pub const Charmap = struct {
     subtable: ?Subtable = null,
     is_symbol: bool = false,
+    /// `maxp.numGlyphs`, or `u16::MAX` when absent (upstream
+    /// `CmapIterLimits::default_for_font`). Only used by `mappings()`.
+    glyph_count: u32 = std.math.maxInt(u16),
 
     /// Builds a charmap from the raw `cmap` table bytes.
     pub fn init(table: ?[]const u8) Charmap {
@@ -105,6 +108,122 @@ pub const Charmap = struct {
             .format12 => |sub| mapFormat12(sub, codepoint),
         } orelse return null;
         return if (gid == 0) null else gid;
+    }
+
+    /// Iterates every `(codepoint, gid)` mapping with a non-zero gid, in the
+    /// same order as skrifa's `Charmap::mappings()` (`Cmap4Iter` /
+    /// `Cmap12Iter`).
+    pub fn mappings(self: Charmap) Mappings {
+        return .{ .subtable = self.subtable, .glyph_count = self.glyph_count };
+    }
+};
+
+pub const Mapping = struct { codepoint: u32, gid: u32 };
+
+pub const Mappings = struct {
+    subtable: ?Subtable,
+    glyph_count: u32,
+    // Format 4 state.
+    f4_initialized: bool = false,
+    f4_range_ix: usize = 0,
+    f4_start: u32 = 0,
+    f4_end: u32 = 0,
+    f4_cp: u32 = 0,
+    // Format 12 state.
+    f12_initialized: bool = false,
+    f12_group_ix: usize = 0,
+    f12_start_code: u32 = 0,
+    f12_ref: u32 = 0,
+    f12_cp: u64 = 0,
+    f12_end: u64 = 0,
+
+    pub fn next(self: *Mappings) ?Mapping {
+        const subtable = self.subtable orelse return null;
+        return switch (subtable) {
+            .format4 => |sub| self.nextFormat4(sub),
+            .format12 => |sub| self.nextFormat12(sub),
+        };
+    }
+
+    fn nextFormat4(self: *Mappings, sub: []const u8) ?Mapping {
+        const seg_count_x2 = sfnt.readU16(sub, 6) orelse return null;
+        const seg_count = @as(usize, seg_count_x2) / 2;
+        const end_codes: U16Array = .{ .bytes = sliceArray(sub, 14, 2, seg_count) };
+        const start_codes: U16Array = .{ .bytes = sliceArray(sub, 16 + 2 * seg_count, 2, seg_count) };
+        if (!self.f4_initialized) {
+            self.f4_initialized = true;
+            if (!self.loadFormat4Range(&end_codes, &start_codes, 0)) return null;
+        }
+        while (true) {
+            while (self.f4_cp < self.f4_end) {
+                const cp = self.f4_cp;
+                self.f4_cp += 1;
+                const gid = lookupGlyphId4(
+                    sub,
+                    @truncate(cp),
+                    self.f4_range_ix,
+                    @truncate(self.f4_start),
+                    seg_count,
+                ) orelse continue;
+                if (gid != 0) return .{ .codepoint = cp, .gid = gid };
+            }
+            self.f4_range_ix += 1;
+            if (!self.loadFormat4Range(&end_codes, &start_codes, self.f4_range_ix)) return null;
+        }
+    }
+
+    fn loadFormat4Range(
+        self: *Mappings,
+        end_codes: *const U16Array,
+        start_codes: *const U16Array,
+        ix: usize,
+    ) bool {
+        const start = start_codes.get(ix) orelse return false;
+        const end = end_codes.get(ix) orelse return false;
+        const next_start: u32 = start;
+        const next_end: u32 = @as(u32, end) + 1;
+        self.f4_start = @max(next_start, self.f4_end);
+        self.f4_end = @max(next_end, self.f4_end);
+        self.f4_cp = self.f4_start;
+        return true;
+    }
+
+    fn nextFormat12(self: *Mappings, sub: []const u8) ?Mapping {
+        if (!self.f12_initialized) {
+            self.f12_initialized = true;
+            if (!self.loadFormat12Group(sub, 0)) return null;
+        }
+        while (true) {
+            while (self.f12_cp < self.f12_end) {
+                const cp = self.f12_cp;
+                self.f12_cp += 1;
+                const gid = self.f12_ref +% (@as(u32, @truncate(cp)) -% self.f12_start_code);
+                if (gid != 0) return .{ .codepoint = @truncate(cp), .gid = gid };
+            }
+            self.f12_group_ix += 1;
+            if (!self.loadFormat12Group(sub, self.f12_group_ix)) return null;
+        }
+    }
+
+    fn loadFormat12Group(self: *Mappings, sub: []const u8, ix: usize) bool {
+        const num_groups = sfnt.readU32(sub, 12) orelse return false;
+        if (ix >= num_groups) return false;
+        const off = 16 + 12 * ix;
+        const start = sfnt.readU32(sub, off) orelse return false;
+        const end = sfnt.readU32(sub, off + 4) orelse return false;
+        const ref = sfnt.readU32(sub, off + 8) orelse return false;
+        // `CmapIterLimits::default_for_font` prunes by the glyph count and
+        // the maximum Unicode scalar.
+        const glyph_limit = @as(u64, self.glyph_count) -| @as(u64, ref) +| @as(u64, start);
+        var end_exclusive = @as(u64, end) + 1;
+        end_exclusive = @min(end_exclusive, @min(glyph_limit, 0x10FFFF));
+        var range_start: u64 = start;
+        if (range_start < self.f12_end) range_start = self.f12_end;
+        self.f12_start_code = start;
+        self.f12_ref = ref;
+        self.f12_cp = range_start;
+        self.f12_end = end_exclusive;
+        return true;
     }
 };
 

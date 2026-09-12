@@ -11,6 +11,7 @@
 const std = @import("std");
 const font_mod = @import("font.zig");
 const glyf = @import("glyf.zig");
+const hinting = @import("hinting.zig");
 const pen_mod = @import("pen.zig");
 
 pub const Error = glyf.DrawError || std.Io.Writer.Error;
@@ -38,20 +39,23 @@ pub fn writeGlyphDump(
     try writer.print("size {x:0>8}\n", .{@as(u32, @bitCast(size))});
     if (hint) try writer.print("hint 1\n", .{});
 
-    var instance: ?glyf.HintInstance = null;
+    var instance: ?hinting.HintingInstance = null;
     defer if (instance) |*inst| inst.deinit();
     if (hint) {
-        instance = try outlines.createHintInstance(allocator, size, glyf.glifo_hint_target);
+        instance = try hinting.create(allocator, outlines, size, &.{}, glyf.glifo_hint_target);
     }
 
     var pen = pen_mod.PathElementPen.init(allocator);
     defer pen.deinit();
     for (gids) |gid| {
         pen.clearRetainingCapacity();
-        const metrics = try outlines.draw(allocator, gid, .{
-            .size = size,
-            .hint_instance = if (instance) |*inst| inst else null,
-        }, &pen);
+        const metrics = if (instance) |*inst| switch (inst.kind) {
+            .interpreter => |*interpreter| try outlines.draw(allocator, gid, .{
+                .size = size,
+                .hint_instance = interpreter,
+            }, &pen),
+            .auto => |*auto| try auto.draw(allocator, gid, size, &.{}, .freetype, &pen),
+        } else try outlines.draw(allocator, gid, .{ .size = size }, &pen);
         var lsb_buf: [8]u8 = undefined;
         var advance_buf: [8]u8 = undefined;
         try writer.print("gid {d} format glyf elems {d} lsb {s} advance {s}\n", .{
@@ -143,6 +147,7 @@ fn fontBlob(font_id: u8) ![]const u8 {
         manifest.font_roboto => try fixture.roboto(),
         manifest.font_noto => try fixture.notoColor(),
         manifest.font_noto_cbtf => try fixture.notoCbtf(),
+        manifest.font_notosans => try fixture.notoSans(),
         else => error.TestUnexpectedResult,
     };
 }
