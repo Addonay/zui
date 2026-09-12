@@ -117,19 +117,21 @@ pub fn main(init: std.process.Init) !void {
                 try gpu.pushClipPath(scratch_path.elements.items);
             },
             .pop_clip_path => try gpu.popClipPath(),
-            .fill_blurred_rounded_rect,
-            .push_clip_layer,
-            .push_layer,
-            .pop_layer,
-            .set_filter_effect,
-            .reset_filter_effect,
-            => {
-                std.debug.print(
-                    "vellz-gpu-render: scene command '{s}' is not supported by the root strip milestone\n",
-                    .{@tagName(command)},
-                );
-                return error.Unsupported;
+            .fill_blurred_rounded_rect => |spec| try gpu.fillBlurredRoundedRect(
+                kurbo.Rect.new(spec.rect[0], spec.rect[1], spec.rect[2], spec.rect[3]),
+                @floatCast(spec.radius),
+                @floatCast(spec.std_dev),
+                spec.invert,
+            ),
+            .push_clip_layer => |svg| {
+                try parseSvg(allocator, &scratch_path, svg);
+                defer resetScratch(allocator, &scratch_path);
+                try gpu.pushClipLayer(scratch_path.elements.items);
             },
+            .push_layer => |spec| try pushLayerSpec(allocator, &gpu, &scratch_path, spec),
+            .pop_layer => try gpu.popLayer(),
+            .set_filter_effect => |filter_spec| gpu.setFilterEffect(try filterFromSpec(allocator, filter_spec)),
+            .reset_filter_effect => gpu.resetFilterEffect(),
         }
     }
 
@@ -203,6 +205,105 @@ fn usage() error{InvalidArguments} {
     return error.InvalidArguments;
 }
 
+fn blendFromSpec(spec: scene_mod.BlendSpec) peniko.BlendMode {
+    return .{
+        .mix = std.meta.stringToEnum(peniko.Mix, @tagName(spec.mix)).?,
+        .compose = std.meta.stringToEnum(peniko.Compose, @tagName(spec.compose)).?,
+    };
+}
+
+fn edgeModeFromSpec(mode: scene_mod.EdgeMode) common.filter_effects.EdgeMode {
+    return std.meta.stringToEnum(common.filter_effects.EdgeMode, @tagName(mode)).?;
+}
+
+fn filterFromSpec(allocator: std.mem.Allocator, spec: scene_mod.FilterSpec) !common.filter_effects.Filter {
+    const fe = common.filter_effects;
+    const toColor = struct {
+        fn call(rgba: [4]u8) peniko.Color {
+            return peniko.color.Color.fromRgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
+        }
+    }.call;
+
+    const primitive: fe.FilterPrimitive = switch (spec) {
+        .flood => |rgba| .{ .flood = .{ .color = toColor(rgba) } },
+        .gaussian_blur => |blur| .{ .gaussian_blur = .{
+            .std_deviation = @floatCast(blur.std_deviation),
+            .edge_mode = edgeModeFromSpec(blur.edge_mode),
+        } },
+        .offset => |offset| .{ .offset = .{
+            .dx = @floatCast(offset.dx),
+            .dy = @floatCast(offset.dy),
+        } },
+        .drop_shadow => |shadow| .{ .drop_shadow = .{
+            .dx = @floatCast(shadow.dx),
+            .dy = @floatCast(shadow.dy),
+            .std_deviation = @floatCast(shadow.std_deviation),
+            .color = toColor(shadow.rgba8),
+            .edge_mode = edgeModeFromSpec(shadow.edge_mode),
+        } },
+        .drop_shadow_only => |shadow| .{ .drop_shadow_only = .{
+            .dx = @floatCast(shadow.dx),
+            .dy = @floatCast(shadow.dy),
+            .std_deviation = @floatCast(shadow.std_deviation),
+            .color = toColor(shadow.rgba8),
+            .edge_mode = edgeModeFromSpec(shadow.edge_mode),
+        } },
+    };
+    return fe.Filter.fromPrimitive(allocator, primitive);
+}
+
+/// Map a layer spec onto the GPU scene's layer stack.
+///
+/// Mask layers are unsupported by the GPU render pipeline and fail with a
+/// typed error (no approximation).
+fn pushLayerSpec(
+    allocator: std.mem.Allocator,
+    gpu: *gpu_scene.Scene,
+    scratch: *kurbo.BezPath,
+    spec: scene_mod.LayerSpec,
+) !void {
+    switch (spec) {
+        .clip => |svg| {
+            try parseSvg(allocator, scratch, svg);
+            defer resetScratch(allocator, scratch);
+            try gpu.pushClipLayer(scratch.elements.items);
+        },
+        .blend => |blend| try gpu.pushBlendLayer(blendFromSpec(blend)),
+        .opacity => |opacity| try gpu.pushOpacityLayer(@floatCast(opacity)),
+        .mask => {
+            std.debug.print(
+                "vellz-gpu-render: mask layers are not supported by the GPU render pipeline\n",
+                .{},
+            );
+            return error.Unsupported;
+        },
+        .filter => |filter_spec| {
+            const filter = try filterFromSpec(allocator, filter_spec.filter);
+            var clip_elements: ?[]const kurbo.PathEl = null;
+            if (filter_spec.clip) |svg| {
+                try parseSvg(allocator, scratch, svg);
+                clip_elements = scratch.elements.items;
+            }
+            defer if (clip_elements != null) resetScratch(allocator, scratch);
+
+            const blend: ?peniko.BlendMode = if (filter_spec.blend) |blend|
+                blendFromSpec(blend)
+            else
+                null;
+            const opacity: ?f32 = if (filter_spec.opacity) |value| @floatCast(value) else null;
+            if (filter_spec.mask != null) {
+                std.debug.print(
+                    "vellz-gpu-render: mask layers are not supported by the GPU render pipeline\n",
+                    .{},
+                );
+                filter.deinit(allocator);
+                return error.Unsupported;
+            }
+            try gpu.pushLayer(clip_elements, blend, opacity, null, filter);
+        },
+    }
+}
+
 fn applyPaint(gpu: *gpu_scene.Scene, spec: scene_mod.PaintSpec) !void {
     switch (spec) {
         .solid => |rgba| {
@@ -210,10 +311,46 @@ fn applyPaint(gpu: *gpu_scene.Scene, spec: scene_mod.PaintSpec) !void {
                 peniko.color.Color.fromRgba8(rgba[0], rgba[1], rgba[2], rgba[3]),
             ));
         },
-        .gradient, .image => {
+        .gradient => |g| {
+            var gradient: peniko.Gradient = .{};
+            gradient.extend = std.meta.stringToEnum(peniko.Extend, @tagName(g.extend)).?;
+            gradient.kind = switch (g.kind) {
+                .linear => |l| .{ .linear = peniko.LinearGradientPosition.new(
+                    .{ .x = l.start[0], .y = l.start[1] },
+                    .{ .x = l.end[0], .y = l.end[1] },
+                ) },
+                .radial => |r| .{ .radial = peniko.RadialGradientPosition.newTwoPoint(
+                    .{ .x = r.start_center[0], .y = r.start_center[1] },
+                    @floatCast(r.start_radius),
+                    .{ .x = r.end_center[0], .y = r.end_center[1] },
+                    @floatCast(r.end_radius),
+                ) },
+                .sweep => |sw| .{ .sweep = peniko.SweepGradientPosition.new(
+                    .{ .x = sw.center[0], .y = sw.center[1] },
+                    @floatCast(sw.start_angle),
+                    @floatCast(sw.end_angle),
+                ) },
+            };
+            const stops = try gpu.allocator.alloc(peniko.ColorStop, g.stops.len);
+            defer gpu.allocator.free(stops);
+            for (g.stops, 0..) |stop, i| {
+                stops[i] = .{
+                    .offset = @floatCast(stop.offset),
+                    .color = peniko.color.Color.fromRgba8(
+                        stop.rgba8[0],
+                        stop.rgba8[1],
+                        stop.rgba8[2],
+                        stop.rgba8[3],
+                    ),
+                };
+            }
+            gradient.stops = try peniko.ColorStops.fromSlice(gpu.allocator, stops);
+            gpu.setPaint(common.paint.PaintType.fromGradient(gradient));
+        },
+        .image => {
             std.debug.print(
-                "vellz-gpu-render: paint kind '{s}' needs the encoded-paint milestone\n",
-                .{@tagName(spec)},
+                "vellz-gpu-render: image paints need the encoded-paint milestone\n",
+                .{},
             );
             return error.Unsupported;
         },

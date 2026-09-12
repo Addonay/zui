@@ -1111,7 +1111,17 @@ pub fn clearTexture(
 // Strip pass
 // ---------------------------------------------------------------------------
 
-/// Everything `stripPass` needs to encode one root draw pass.
+/// A run of strips drawn with one external-texture bind group.
+pub const StripRun = struct {
+    /// First strip index (inclusive) within the pass's strip slice.
+    start: u32,
+    /// End strip index (exclusive) within the pass's strip slice.
+    end: u32,
+    /// Bind group for render group 1 for this run.
+    bind_group: c.WGPUBindGroup,
+};
+
+/// Everything `stripPass` needs to encode one draw pass.
 pub const StripPass = struct {
     /// Color target.
     view: c.WGPUTextureView,
@@ -1129,9 +1139,15 @@ pub const StripPass = struct {
     alpha_strips: []const common.GpuStrip = &.{},
     /// Target is the user surface (enables the alpha/depth-alpha selection).
     is_root: bool = true,
-    /// Bind groups for groups 0–3.
+    /// Bind groups for group 0 (alphas/config/child layer).
     strip_bind_group: c.WGPUBindGroup,
+    /// Fallback bind group for render group 1 (no external textures).
     external_bind_group: c.WGPUBindGroup,
+    /// Per-run external bind groups for the opaque strips.
+    opaque_external_runs: []const StripRun = &.{},
+    /// Per-run external bind groups for the alpha strips.
+    alpha_external_runs: []const StripRun = &.{},
+    /// Bind groups for groups 2–3.
     encoded_paints_bind_group: c.WGPUBindGroup,
     gradient_bind_group: c.WGPUBindGroup,
     /// Pipelines to select from.
@@ -1208,14 +1224,13 @@ pub fn stripPass(
     defer c.wgpuRenderPassEncoderRelease(pass);
 
     c.wgpuRenderPassEncoderSetBindGroup(pass, 0, options.strip_bind_group, 0, null);
-    c.wgpuRenderPassEncoderSetBindGroup(pass, 1, options.external_bind_group, 0, null);
     c.wgpuRenderPassEncoderSetBindGroup(pass, 2, options.encoded_paints_bind_group, 0, null);
     c.wgpuRenderPassEncoderSetBindGroup(pass, 3, options.gradient_bind_group, 0, null);
     c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, buffer, 0, c.WGPU_WHOLE_SIZE);
 
     if (opaque_count > 0) {
         c.wgpuRenderPassEncoderSetPipeline(pass, options.pipelines.opaque_strip);
-        c.wgpuRenderPassEncoderDraw(pass, 4, @intCast(opaque_count), 0, 0);
+        drawStripRuns(pass, options.external_bind_group, options.opaque_external_runs, opaque_count, 0);
     }
     if (alpha_count > 0) {
         const pipeline = if (options.is_root and options.depth_view != null)
@@ -1225,9 +1240,34 @@ pub fn stripPass(
         else
             options.pipelines.intermediate_strip;
         c.wgpuRenderPassEncoderSetPipeline(pass, pipeline);
-        c.wgpuRenderPassEncoderDraw(pass, 4, @intCast(alpha_count), 0, @intCast(opaque_count));
+        drawStripRuns(
+            pass,
+            options.external_bind_group,
+            options.alpha_external_runs,
+            alpha_count,
+            @intCast(opaque_count),
+        );
     }
     c.wgpuRenderPassEncoderEnd(pass);
+}
+
+/// Draw `count` strip instances, switching render group 1 per external run.
+fn drawStripRuns(
+    pass: c.WGPURenderPassEncoder,
+    fallback: c.WGPUBindGroup,
+    runs: []const StripRun,
+    count: usize,
+    first_instance: u32,
+) void {
+    if (runs.len == 0) {
+        c.wgpuRenderPassEncoderSetBindGroup(pass, 1, fallback, 0, null);
+        c.wgpuRenderPassEncoderDraw(pass, 4, @intCast(count), 0, first_instance);
+        return;
+    }
+    for (runs) |run| {
+        c.wgpuRenderPassEncoderSetBindGroup(pass, 1, run.bind_group, 0, null);
+        c.wgpuRenderPassEncoderDraw(pass, 4, run.end - run.start, 0, first_instance + run.start);
+    }
 }
 
 /// Encode a load-op clear of the full target (upstream `clear_full_target`).
@@ -1293,6 +1333,210 @@ pub fn clearPass(
     };
     defer c.wgpuRenderPassEncoderRelease(pass);
     c.wgpuRenderPassEncoderSetPipeline(pass, pipeline.pipeline);
+    c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, buffer, 0, c.WGPU_WHOLE_SIZE);
+    c.wgpuRenderPassEncoderDraw(pass, 4, @intCast(instances.len), 0, 0);
+    c.wgpuRenderPassEncoderEnd(pass);
+}
+
+// ---------------------------------------------------------------------------
+// Texture-operation passes (copy, blend, filter)
+// ---------------------------------------------------------------------------
+
+/// Copy group 0: the source texture for a copy pass.
+pub fn createCopySourceBindGroup(
+    dev: *device.Device,
+    layout: c.WGPUBindGroupLayout,
+    view: c.WGPUTextureView,
+) Error!c.WGPUBindGroup {
+    const entries = [_]c.WGPUBindGroupEntry{textureBindEntry(0, view)};
+    return createBindGroup(dev, layout, "vellz-copy-source-bind-group", &entries);
+}
+
+/// Blend group 0: the two bound layer pages plus the alpha texture.
+pub fn createBlendBindGroup(
+    dev: *device.Device,
+    layout: c.WGPUBindGroupLayout,
+    even_view: c.WGPUTextureView,
+    odd_view: c.WGPUTextureView,
+    alphas_view: c.WGPUTextureView,
+) Error!c.WGPUBindGroup {
+    const entries = [_]c.WGPUBindGroupEntry{
+        textureBindEntry(0, even_view),
+        textureBindEntry(1, odd_view),
+        textureBindEntry(2, alphas_view),
+    };
+    return createBindGroup(dev, layout, "vellz-blend-bind-group", &entries);
+}
+
+/// Filter group 0: the filter data texture.
+pub fn createFilterDataBindGroup(
+    dev: *device.Device,
+    layout: c.WGPUBindGroupLayout,
+    view: c.WGPUTextureView,
+) Error!c.WGPUBindGroup {
+    const entries = [_]c.WGPUBindGroupEntry{textureBindEntry(0, view)};
+    return createBindGroup(dev, layout, "vellz-filter-data-bind-group", &entries);
+}
+
+/// Filter group 1: the sampled source texture plus its filtering sampler.
+pub fn createFilterInputBindGroup(
+    dev: *device.Device,
+    layout: c.WGPUBindGroupLayout,
+    sampler: c.WGPUSampler,
+    view: c.WGPUTextureView,
+) Error!c.WGPUBindGroup {
+    var sampler_entry = c.wgpu_zig_init_WGPUBindGroupEntry();
+    sampler_entry.binding = 1;
+    sampler_entry.sampler = sampler;
+    const entries = [_]c.WGPUBindGroupEntry{
+        textureBindEntry(0, view),
+        sampler_entry,
+    };
+    return createBindGroup(dev, layout, "vellz-filter-input-bind-group", &entries);
+}
+
+/// Filter group 2: the original (unfiltered) texture used for composite steps.
+pub fn createFilterOriginalBindGroup(
+    dev: *device.Device,
+    layout: c.WGPUBindGroupLayout,
+    view: c.WGPUTextureView,
+) Error!c.WGPUBindGroup {
+    const entries = [_]c.WGPUBindGroupEntry{textureBindEntry(0, view)};
+    return createBindGroup(dev, layout, "vellz-filter-original-bind-group", &entries);
+}
+
+fn createTextureOpInstanceBuffer(
+    dev: *device.Device,
+    bytes: []const u8,
+    label: []const u8,
+) Error!c.WGPUBuffer {
+    const buffer = try createBuffer(
+        dev,
+        @intCast(bytes.len),
+        c.WGPUBufferUsage_Vertex | c.WGPUBufferUsage_CopyDst,
+        label,
+    );
+    errdefer c.wgpuBufferRelease(buffer);
+    if (bytes.len > 0) {
+        c.wgpuQueueWriteBuffer(dev.queue, buffer, 0, bytes.ptr, @intCast(bytes.len));
+    }
+    return buffer;
+}
+
+/// Encode a copy pass from `source_bind_group` into `dest_view`.
+pub fn encodeCopyPass(
+    dev: *device.Device,
+    encoder: c.WGPUCommandEncoder,
+    pipeline: c.WGPURenderPipeline,
+    instances: []const common.GpuCopyInstance,
+    source_bind_group: c.WGPUBindGroup,
+    dest_view: c.WGPUTextureView,
+    label: []const u8,
+) Error!void {
+    if (instances.len == 0) return;
+    if (dev.isLost()) return error.DeviceLost;
+
+    const buffer = try createTextureOpInstanceBuffer(dev, std.mem.sliceAsBytes(instances), "vellz-copy-instances");
+    defer c.wgpuBufferRelease(buffer);
+
+    var attachment = c.wgpu_zig_init_WGPURenderPassColorAttachment();
+    attachment.view = dest_view;
+    attachment.depthSlice = c.WGPU_DEPTH_SLICE_UNDEFINED;
+    attachment.loadOp = c.WGPULoadOp_Load;
+    attachment.storeOp = c.WGPUStoreOp_Store;
+
+    var desc = c.wgpu_zig_init_WGPURenderPassDescriptor();
+    desc.label = wgpu.stringView(label);
+    desc.colorAttachmentCount = 1;
+    desc.colorAttachments = &attachment;
+    const pass = c.wgpuCommandEncoderBeginRenderPass(encoder, &desc) orelse {
+        return error.RenderPassFailed;
+    };
+    defer c.wgpuRenderPassEncoderRelease(pass);
+    c.wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+    c.wgpuRenderPassEncoderSetBindGroup(pass, 0, source_bind_group, 0, null);
+    c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, buffer, 0, c.WGPU_WHOLE_SIZE);
+    c.wgpuRenderPassEncoderDraw(pass, 4, @intCast(instances.len), 0, 0);
+    c.wgpuRenderPassEncoderEnd(pass);
+}
+
+/// Encode a blend pass into `scratch_view` (upstream `blend_pass_inner`).
+///
+/// The blend shader samples both the parent and child layer textures, so the
+/// result is written to the shared scratch texture and copied back by the
+/// caller.
+pub fn encodeBlendPass(
+    dev: *device.Device,
+    encoder: c.WGPUCommandEncoder,
+    pipeline: c.WGPURenderPipeline,
+    blend_bind_group: c.WGPUBindGroup,
+    instances: []const common.GpuBlendInstance,
+    scratch_view: c.WGPUTextureView,
+    label: []const u8,
+) Error!void {
+    if (instances.len == 0) return;
+    if (dev.isLost()) return error.DeviceLost;
+
+    const buffer = try createTextureOpInstanceBuffer(dev, std.mem.sliceAsBytes(instances), "vellz-blend-instances");
+    defer c.wgpuBufferRelease(buffer);
+
+    var attachment = c.wgpu_zig_init_WGPURenderPassColorAttachment();
+    attachment.view = scratch_view;
+    attachment.depthSlice = c.WGPU_DEPTH_SLICE_UNDEFINED;
+    attachment.loadOp = c.WGPULoadOp_Load;
+    attachment.storeOp = c.WGPUStoreOp_Store;
+
+    var desc = c.wgpu_zig_init_WGPURenderPassDescriptor();
+    desc.label = wgpu.stringView(label);
+    desc.colorAttachmentCount = 1;
+    desc.colorAttachments = &attachment;
+    const pass = c.wgpuCommandEncoderBeginRenderPass(encoder, &desc) orelse {
+        return error.RenderPassFailed;
+    };
+    defer c.wgpuRenderPassEncoderRelease(pass);
+    c.wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+    c.wgpuRenderPassEncoderSetBindGroup(pass, 0, blend_bind_group, 0, null);
+    c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, buffer, 0, c.WGPU_WHOLE_SIZE);
+    c.wgpuRenderPassEncoderDraw(pass, 4, @intCast(instances.len), 0, 0);
+    c.wgpuRenderPassEncoderEnd(pass);
+}
+
+/// Encode one filter pass step into `dest_view`.
+pub fn encodeFilterPass(
+    dev: *device.Device,
+    encoder: c.WGPUCommandEncoder,
+    pipeline: c.WGPURenderPipeline,
+    filter_data_bind_group: c.WGPUBindGroup,
+    input_bind_group: c.WGPUBindGroup,
+    original_bind_group: c.WGPUBindGroup,
+    instances: []const filter_mod.FilterInstanceData,
+    dest_view: c.WGPUTextureView,
+    label: []const u8,
+) Error!void {
+    if (instances.len == 0) return;
+    if (dev.isLost()) return error.DeviceLost;
+
+    const buffer = try createTextureOpInstanceBuffer(dev, std.mem.sliceAsBytes(instances), "vellz-filter-instances");
+    defer c.wgpuBufferRelease(buffer);
+
+    var attachment = c.wgpu_zig_init_WGPURenderPassColorAttachment();
+    attachment.view = dest_view;
+    attachment.depthSlice = c.WGPU_DEPTH_SLICE_UNDEFINED;
+    attachment.loadOp = c.WGPULoadOp_Load;
+    attachment.storeOp = c.WGPUStoreOp_Store;
+
+    var desc = c.wgpu_zig_init_WGPURenderPassDescriptor();
+    desc.label = wgpu.stringView(label);
+    desc.colorAttachmentCount = 1;
+    desc.colorAttachments = &attachment;
+    const pass = c.wgpuCommandEncoderBeginRenderPass(encoder, &desc) orelse {
+        return error.RenderPassFailed;
+    };
+    defer c.wgpuRenderPassEncoderRelease(pass);
+    c.wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+    c.wgpuRenderPassEncoderSetBindGroup(pass, 0, filter_data_bind_group, 0, null);
+    c.wgpuRenderPassEncoderSetBindGroup(pass, 1, input_bind_group, 0, null);
+    c.wgpuRenderPassEncoderSetBindGroup(pass, 2, original_bind_group, 0, null);
     c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, buffer, 0, c.WGPU_WHOLE_SIZE);
     c.wgpuRenderPassEncoderDraw(pass, 4, @intCast(instances.len), 0, 0);
     c.wgpuRenderPassEncoderEnd(pass);
