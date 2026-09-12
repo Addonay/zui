@@ -496,3 +496,28 @@ test "clear drops entries and command recorders" {
     // the test if any command leaked.
 }
 
+test "replay clears commands even when the callback errors" {
+    const allocator = testing.allocator;
+    var cache = try testCache(allocator, .{ 256, 256 });
+    defer cache.deinit(allocator);
+    var atlas = GlyphAtlas.init();
+    defer atlas.deinit(allocator);
+
+    _ = (try atlas.insert(allocator, &cache, testKey(9), testMetrics(4, 4))).?;
+    const recorder = try atlas.recorderForPage(allocator, 0, 256, 256);
+    try recorder.setTransform(allocator, @import("../../kurbo/root.zig").Affine.IDENTITY);
+    try testing.expectEqual(@as(usize, 1), recorder.commands.items.len);
+
+    const Failing = struct {
+        pub fn replay(_: @This(), _: *commands.AtlasCommandRecorder) !void {
+            return error.ReplayFailed;
+        }
+    };
+    try testing.expectError(
+        error.ReplayFailed,
+        atlas.replayPendingAtlasCommands(allocator, Failing{}),
+    );
+    // Upstream clears every recorder after replay, success or failure.
+    try testing.expectEqual(@as(usize, 0), recorder.commands.items.len);
+}
+

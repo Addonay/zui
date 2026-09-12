@@ -1,8 +1,8 @@
-//! `vellz.glifo` — glyph outline loading for text rendering.
+//! `vellz.glifo` — glyph outline loading and run rendering for text.
 //!
-//! Port of `glifo 0.3.0`'s font/outline side (`glifo/src/glyph.rs` outline
-//! cache plus `skrifa 0.44.0`'s `glyf` scaler), staged per
-//! `.ports/vellz/docs/glifo-m3-plan.md` task T2. The module is
+//! Port of `glifo 0.3.0` (`font.zig`, `glyf.zig`, `outline_cache.zig`,
+//! `util.zig`, `glyph.zig`, `renderer.zig` and `atlas/*`), staged per
+//! `.ports/vellz/docs/glifo-m3-plan.md` tasks T2/T3. The module is
 //! self-contained: it borrows a font blob, parses the small sfnt subset, and
 //! produces `vellz.kurbo` path elements that are **bit-identical** to the
 //! pinned upstream `PathStyle::FreeType` output.
@@ -21,10 +21,15 @@
 //! - `OutlineCache` — glifo's outline cache keyed by
 //!   `(font id, face index, gid, size bits, embolden bits, hint)` with
 //!   upstream's `maintain()`/`clear()` eviction policy.
+//! - `glyph` — `Glyph`, `GlyphRun`, `GlyphRunBuilder`, `GlyphRunRenderer`,
+//!   `GlyphPrepCache`, transform absorption (`prepareGlyphRun`) and the
+//!   outline draw loop; `renderer` — atlas-first fill/stroke, cached glyph
+//!   sampling and command replay; `atlas` — `GlyphAtlas`/`GlyphCacheKey`/
+//!   `AtlasCommandRecorder`/`ImageCache`; `interface` — the comptime
+//!   `DrawSink`/`GlyphRenderer` duck-typing contracts.
 //! - `NormalizedCoord = i16` and `FontEmbolden` — carried in cache keys for
 //!   API parity; non-default values are rejected with `error.Unsupported`.
-//! - `util` — the `glifo` float/affine predicates (`FloatExt`/`AffineExt`)
-//!   T3 needs for run preparation.
+//! - `util` — the `glifo` float/affine predicates used by run preparation.
 //!
 //! # Fixed-point contract
 //!
@@ -36,14 +41,18 @@
 //!
 //! Hinting (`HintingInstance`, interpreter), autohinting, `gvar`/`HVAR`/`avar`
 //! variation deltas (any non-empty coords), CFF/CFF2, CBDT/CBLC/sbix bitmaps,
-//! and synthetic embolden are all `error.Unsupported`. None are approximated.
+//! COLR/CPAL, synthetic embolden and decoration are all `error.Unsupported`.
+//! None are approximated; fonts carrying COLR/bitmap tables reject the whole
+//! run instead of silently dropping glyphs.
 //!
 //! # Oracle comparison
 //!
 //! `tools/oracle-rs --dump-glyphs` / `--dump-cmap` print the pinned
 //! `skrifa` output as f32 bit patterns; `tools/vellz_cli.zig` has the same
 //! modes and `tools/compare_glyphs.sh` diffs them. The committed corpus and
-//! per-vector hashes live in `tests/fixtures/glyphs/`.
+//! per-vector hashes live in `tests/fixtures/glyphs/`. Positioned glyph runs
+//! are gated end to end by the `glyph_run` scenes in `tests/scenes/`
+//! (byte-exact vs the pinned oracle, atlas cache on and off).
 
 const std = @import("std");
 

@@ -203,7 +203,7 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `dispatch/multi_threaded*.rs` | `cpu/dispatch/multi_threaded.zig` + `multi_threaded/{task,cost,worker,sync}.zig` | conn | f32 MT byte-identical to ST on the differential scene (`render.zig`); u8/filters `error.Unsupported`; corpus stays threads=0 |
 | `filter/*` | `cpu/filter/*.zig` | port | connected; oracle-verified (8 filter scenes byte-exact); highp uses upstream's lowp blur/drop-shadow internals; multi-primitive graphs -> `error.Unsupported` |
 | `fine/common/rounded_blurred_rect.rs` | `cpu/fine/blurred_rect.zig` | port | connected; oracle-verified (normal + inverted scenes byte-exact) |
-| `text.rs`, `text_debug.rs` | `cpu/text.zig` | defer | M3 |
+| `text.rs`, `text_debug.rs` | `cpu/text.zig` | port | `GlyphAtlasResources` + frame protocol (`beforeRender`/`afterRender`), `CpuGlyphRunBackend`, `RenderContext.glyphRun`; bitmap upload path deferred |
 | `util.rs` (`Span`, `div255`, `Premultiply`) | `cpu/util.zig` | port | 6 tests |
 
 ### `vello_gpu` → `src/gpu/`
@@ -229,12 +229,12 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 
 | Upstream module | Zig target | Status | Notes |
 | --- | --- | --- | --- |
-| `lib.rs`, `interface.rs` (Glyph, DrawSink, GlyphRenderer) | `glifo/root.zig`, `glifo/interface.zig` | defer | M3 |
-| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | defer | M3 |
-| `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | defer | M3 |
-| `colr.rs` (COLR/CPAL painting) | `glifo/colr.zig` | defer | M3 |
-| `atlas/*` (cache, keys, regions, commands) | `glifo/atlas/*.zig` | defer | M3 |
-| `util.rs` | `glifo/util.zig` | defer | M3 |
+| `lib.rs`, `interface.rs` (Glyph, DrawSink, GlyphRenderer) | `glifo/root.zig`, `glifo/interface.zig` | port | comptime duck-typing contracts + `assert*` helpers; COLR/bitmap-specific methods deferred |
+| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | outline subset: run builder, transform absorption, prep cache, draw loop; hinting/embolden/coords/COLR/bitmap/decoration -> typed `error.Unsupported` |
+| `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline fill/stroke, subpixel keys, command replay, raster metrics; COLR/bitmap paths deferred |
+| `colr.rs` (COLR/CPAL painting) | `glifo/colr.zig` | defer | M3 T4 |
+| `atlas/*` (cache, keys, regions, commands) | `glifo/atlas/*.zig` | port | cache/eviction, fixed-seed key hashing, recorder + replay; variable-font second-level map deferred with `gvar` |
+| `util.rs` | `glifo/util.zig` | port | T2 |
 
 ### Ported dependency sources (`kurbo`, `color`, `peniko`)
 
@@ -697,3 +697,24 @@ of panics, thread ownership).
   `zig build corpus` = 48/48 byte-exact in Debug/ReleaseSafe/ReleaseFast,
   `zig build probe` byte-exact, `zig build glyphs` pass, and
   `zig build -Dgpu=true check` + `run-gpu-smoke` green on llvmpipe.
+- 2026-09-12: **M3 T3 landed** (branch `vellz-glyph`). Glyph stack end to end:
+  `glifo/atlas/*` (key/region/commands/cache with age-based eviction and
+  page-indexed command recorders), `glifo/glyph.zig` (GlyphRun, builder,
+  transform absorption, `GlyphPrepCache`, outline draw loop),
+  `glifo/renderer.zig` (atlas-first fill/stroke, subpixel-bucket raster
+  metrics, cached-glyph sampling, command replay) and `glifo/interface.zig`
+  (comptime DrawSink/GlyphRenderer contracts). `cpu/text.zig` adds
+  `GlyphAtlasResources` (lazy init, page pixmaps, page-sized `RenderContext`,
+  maintenance/eviction), the upstream frame protocol
+  (`beforeRender` -> replay + register atlas pages, rasterize, `afterRender`
+  -> maintain + unregister + clear evicted regions) and
+  `RenderContext.glyphRun`; `cpu/render.zig` gains state save/restore, tint,
+  atlas image id/transform hooks. The oracle and CLI speak a new
+  `glyph_run` command (explicit positioned glyphs, optional glyph transform,
+  atlas cache toggle) and `tools/gen_glyph_scenes.py` generates 15 G3a scenes
+  mirroring `vello_tests/tests/glyph.rs`. Gate: all 15 scenes byte-exact
+  against the pinned oracle with the atlas cache off and on (`tolerance=0`);
+  corpus 63/63. Hinting, embolden, variation, COLR/bitmap and decoration
+  remain typed `error.Unsupported`. `zig build test` = 756/756
+  (748 lib + 8 scene), also green in ReleaseSafe; `zig build corpus` =
+  63/63 byte-exact in Debug/ReleaseSafe/ReleaseFast.

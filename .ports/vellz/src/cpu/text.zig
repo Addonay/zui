@@ -23,6 +23,8 @@ const glifo = @import("../glifo/root.zig");
 const common_pixmap = @import("../common/pixmap.zig");
 const paint_mod = @import("../common/paint.zig");
 const shared_mod = @import("../common/shared.zig");
+const peniko = @import("../peniko/root.zig");
+const kurbo = @import("../kurbo/root.zig");
 const simd = @import("../simd/root.zig");
 
 const RenderContext = cpu_render.RenderContext;
@@ -147,11 +149,29 @@ pub fn ensureGlyphResources(
     allocator: std.mem.Allocator,
     level: simd.Level,
 ) !void {
+    return ensureGlyphResourcesWithSize(
+        resources,
+        allocator,
+        DEFAULT_GLYPH_ATLAS_SIZE,
+        DEFAULT_GLYPH_ATLAS_SIZE,
+        level,
+    );
+}
+
+/// Same as `ensureGlyphResources` with an explicit page size; tests use a
+/// small page so the unit suite does not allocate 4096x4096 buffers.
+pub fn ensureGlyphResourcesWithSize(
+    resources: *Resources,
+    allocator: std.mem.Allocator,
+    page_width: u16,
+    page_height: u16,
+    level: simd.Level,
+) !void {
     if (resources.glyph_resources == null) {
         resources.glyph_resources = try GlyphAtlasResources.init(
             allocator,
-            DEFAULT_GLYPH_ATLAS_SIZE,
-            DEFAULT_GLYPH_ATLAS_SIZE,
+            page_width,
+            page_height,
             level,
             .{},
         );
@@ -375,13 +395,13 @@ pub const GlyphRunBuilder = glifo.GlyphRunBuilder(CpuGlyphRunBackend);
 
 const testing = std.testing;
 
-test "glyph atlas resources page registration and teardown" {
+test "glyph atlas resources lazy init, page registration and teardown" {
     const allocator = testing.allocator;
     var resources = Resources.init();
     defer resources.deinit(allocator);
     try testing.expect(resources.glyph_resources == null);
 
-    resources.glyph_resources = try GlyphAtlasResources.init(allocator, 16, 16, .baseline, .{});
+    try ensureGlyphResourcesWithSize(&resources, allocator, 16, 16, .baseline);
     const glyph_resources = &resources.glyph_resources.?;
     try testing.expectEqual(@as(usize, 0), glyph_resources.pixmaps.items.len);
 
@@ -400,6 +420,66 @@ test "glyph atlas resources page registration and teardown" {
 
     try testing.expect(resources.image_registry.destroyAtlasPage(allocator, 0));
     try testing.expect(resources.resolveImage(atlas_id) == null);
+}
+
+test "render context glyph run with the atlas cache end to end" {
+    const allocator = testing.allocator;
+    const fixture = @import("../glifo/test_fixture.zig");
+    const font_data = glifo.FontData.init(try fixture.roboto(), 0);
+
+    var ctx = try RenderContext.init(allocator, 32, 32, .{
+        .level = .baseline,
+        .num_threads = 0,
+    });
+    defer ctx.deinit(allocator);
+    var resources = Resources.init();
+    defer resources.deinit(allocator);
+    // Small pages keep the unit test cheap; production uses 4096 (`ensureGlyphResources`).
+    try ensureGlyphResourcesWithSize(&resources, allocator, 64, 64, .baseline);
+    const glyph_resources = &resources.glyph_resources.?;
+
+    ctx.setPaint(peniko.Color.BLACK);
+    ctx.setTransform(kurbo.Affine.translate(kurbo.Vec2.new(0.0, 24.0)));
+    const glyphs = [_]glifo.Glyph{.{ .id = 37, .x = 0.0, .y = 0.0 }};
+    const builder = ctx.glyphRun(&resources, font_data)
+        .fontSize(24.0)
+        .hint(false)
+        .atlasCache(true);
+    try builder.fillGlyphs(allocator, glifo.iterate(&glyphs));
+
+    // Encoding recorded one atlas entry and one page of deferred commands.
+    try testing.expectEqual(@as(usize, 1), glyph_resources.glyph_atlas.len());
+    try testing.expectEqual(
+        @as(usize, 1),
+        glyph_resources.glyph_atlas.pending_atlas_commands.items.len,
+    );
+
+    var pixmap = try Pixmap.init(allocator, 32, 32);
+    defer pixmap.deinit(allocator);
+    try ctx.renderWith(&pixmap, &resources, .{
+        .render_mode = .optimize_quality,
+        .target_init = .{ .clear = peniko.Color.TRANSPARENT },
+        .pixel_format = .rgba8,
+        .offset = .{ .x = 0, .y = 0 },
+    });
+
+    // The page was rasterized, registered for the frame, then unregistered by
+    // `afterRender`.
+    try testing.expectEqual(@as(usize, 1), glyph_resources.pixmaps.items.len);
+    try testing.expectEqual(
+        @as(usize, 0),
+        glyph_resources.glyph_atlas.pending_atlas_commands.items[0].?.commands.items.len,
+    );
+    try testing.expect(
+        resources.resolveImage(paint_mod.ImageId.new(cpu_render.ATLAS_IMAGE_ID_BASE)) == null,
+    );
+
+    // The run produced visible coverage.
+    var nonzero: usize = 0;
+    for (pixmap.dataAsU8Slice()) |byte| {
+        if (byte != 0) nonzero += 1;
+    }
+    try testing.expect(nonzero > 0);
 }
 
 test "evicted region clearing zeroes atlas bytes" {

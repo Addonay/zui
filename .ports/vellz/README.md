@@ -55,16 +55,20 @@ bit-exact against upstream `skrifa`/`glifo` — sfnt/`head`/`maxp`/`hhea`/`hmtx`
 outlines, compared across 250,016 path elements / 685,392 coordinates and
 327,680 cmap mappings at tolerance 0 (`zig build glyphs`) — and the atlas stack
 (`guillotiere`, `multi_atlas`, `image_cache`) is ported with a Rust-golden
-placement trace. The GPU side has the wgpu-native device bootstrap plus the
+placement trace. T3 wires the stack end to end: positioned `glyph_run` scenes
+(fill/stroke, transform absorption, skew, glyph transforms, gradient paint)
+render through `vellz.glifo` + `vellz.cpu` byte-exact against the pinned
+oracle with the glyph atlas cache on and off (15 new scenes; 63/63 corpus,
+tolerance 0). The GPU side has the wgpu-native device bootstrap plus the
 full host/shader layout contract, with an offscreen clear/readback smoke test
 passing on the llvmpipe adapter.
 
-Not yet implemented (explicit typed errors, never placeholder pixels): glyph
-run rendering/painting, COLR, and the Cozmic adapter (M3 remainder); the GPU
-pipelines, renderer, and G5 corpus (M5 remainder). G4 still needs SIMD-level
-dispatch and methodology-complete speedup measurements; MT filter layers and
-u8 + MT return `error.Unsupported` (documented upstream limitations). See
-[`plan.md`](plan.md) for the ledgers and milestones.
+Not yet implemented (explicit typed errors, never placeholder pixels): hinted
+outlines (the interpreter), COLR/CPAL, glyph decoration and the Cozmic adapter
+(M3 remainder); the GPU pipelines, renderer, and G5 corpus (M5 remainder). G4
+still needs SIMD-level dispatch and methodology-complete speedup measurements;
+MT filter layers and u8 + MT return `error.Unsupported` (documented upstream
+limitations). See [`plan.md`](plan.md) for the ledgers and milestones.
 
 ## Layout
 

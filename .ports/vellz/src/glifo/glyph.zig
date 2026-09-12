@@ -44,8 +44,6 @@ pub const Error = font_mod.Error || glyf.DrawError || error{
     /// A feature that is scoped but not ported yet: hinting, embolden,
     /// variation coordinates, COLR/CPAL, bitmap glyphs, decoration.
     Unsupported,
-    /// The glyph iterator yielded without a glyph (internal).
-    EmptyGlyphRun,
 };
 
 /// Positioned glyph.
