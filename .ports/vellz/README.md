@@ -29,8 +29,8 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 815/815 unit and integration tests (807 lib + 8 scene)
-zig build corpus   # 63/63 corpus scenes byte-exact vs the upstream oracle
+zig build test     # 830/830 unit and integration tests (822 lib + 8 scene)
+zig build corpus   # 90/90 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
