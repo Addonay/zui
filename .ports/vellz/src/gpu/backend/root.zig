@@ -7,6 +7,7 @@ const device = @import("device.zig");
 
 pub const readback = @import("readback.zig");
 pub const wgpu = @import("wgpu.zig");
+pub const renderer = @import("renderer.zig");
 
 pub const Instance = device.Instance;
 pub const Adapter = device.Adapter;
@@ -25,4 +26,5 @@ test {
     _ = @import("device.zig");
     _ = @import("readback.zig");
     _ = @import("wgpu.zig");
+    _ = @import("renderer.zig");
 }

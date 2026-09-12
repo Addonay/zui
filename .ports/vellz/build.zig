@@ -259,6 +259,47 @@ pub fn build(b: *std.Build) void {
         );
         smoke_failure_step.dependOn(&run_smoke_failure.step);
         check_step.dependOn(&run_smoke_failure.step);
+
+        // ------------------------------------------------ GPU corpus renderer
+        // `vellz-gpu-render` replays a shared-corpus scene through the root
+        // strip passes into an offscreen RGBA8 texture and writes the result
+        // for comparison with the pinned oracle.
+        const gpu_render = b.addExecutable(.{
+            .name = "vellz-gpu-render",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/gpu_render.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "vellz", .module = mod },
+                    .{ .name = "wgpu", .module = wgpu_mod },
+                },
+            }),
+        });
+        check_step.dependOn(&gpu_render.step);
+
+        const run_gpu_render = b.addRunArtifact(gpu_render);
+        run_gpu_render.addPassthruArgs();
+        const gpu_render_step = b.step(
+            "run-gpu-render",
+            "Render one corpus scene offscreen through the GPU backend",
+        );
+        gpu_render_step.dependOn(&run_gpu_render.step);
+
+        // ------------------------------------------------ GPU corpus gate
+        // `tools/gpu_corpus.sh` invokes the built renderer per scene and
+        // compares against the oracle with the documented GPU tolerance.
+        const gpu_corpus = b.addSystemCommand(&.{"tools/gpu_corpus.sh"});
+        gpu_corpus.addArtifactArg(gpu_render);
+        gpu_corpus.step.dependOn(&gpu_render.step);
+        gpu_corpus.addFileInput(b.path("tools/gpu_corpus.sh"));
+        gpu_corpus.addFileInput(b.path("tools/compare_raw.py"));
+        const gpu_corpus_step = b.step(
+            "gpu-corpus",
+            "Run the offscreen GPU corpus gate (T5)",
+        );
+        gpu_corpus_step.dependOn(&gpu_corpus.step);
+        check_step.dependOn(&gpu_corpus.step);
     }
 }
 
