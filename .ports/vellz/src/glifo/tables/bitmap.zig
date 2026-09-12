@@ -1258,3 +1258,159 @@ test "nearest-strike selection mirrors skrifa for exact, larger and smaller" {
     try testing.expect(Strikes.withFormat(font, .ebdt) == null);
     try testing.expect(Strikes.withFormat(font, .sbix) == null);
 }
+
+test "EBDT content formats reject PNG and expose masks" {
+    // Format 18 (big metrics, PNG) is color-only: the EBDT path (is_color =
+    // false) must return null, while the same record decodes for CBDT.
+    var png_record: [14]u8 = @splat(0);
+    png_record[0] = 2; // big metrics height
+    png_record[1] = 3; // big metrics width
+    std.mem.writeInt(u32, png_record[8..12], 1, .big);
+    png_record[12] = 0x5A;
+    const png_tables = Bdt{ .location = &.{}, .data = &png_record };
+    const png_location = BitmapLocation{
+        .format = 18,
+        .data_offset = 0,
+        .data_size = png_record.len,
+        .bit_depth = 32,
+    };
+    try testing.expect(png_tables.bitmapData(png_location, false) == null);
+    const color = png_tables.bitmapData(png_location, true).?;
+    try testing.expectEqual(DataFormat.png, color.format);
+    try testing.expectEqualSlices(u8, &.{0x5A}, color.data);
+
+    // Format 2 (small metrics, bit-aligned data) is the mask path: bit depth
+    // 8 gives one byte per pixel, tightly packed.
+    const mask_record = [_]u8{ 2, 3, 0, 2, 3, 10, 20, 30, 40, 50, 60 };
+    const mask_tables = Bdt{ .location = &.{}, .data = &mask_record };
+    const parsed = mask_tables.bitmapData(.{
+        .format = 2,
+        .data_offset = 0,
+        .data_size = mask_record.len,
+        .bit_depth = 8,
+    }, false).?;
+    try testing.expectEqual(DataFormat.bit_aligned, parsed.format);
+    const glyph = fromBdt(.{
+        .record_offset = 0,
+        .start_glyph_index = 1,
+        .end_glyph_index = 1,
+        .ppem_x = 16,
+        .ppem_y = 16,
+        .bit_depth = 8,
+    }, parsed).?;
+    switch (glyph.data) {
+        .mask => |mask| {
+            try testing.expectEqual(@as(u8, 8), mask.bpp);
+            try testing.expect(mask.is_packed);
+            const decoded = try mask.decode(testing.allocator, 3, 2);
+            defer testing.allocator.free(decoded);
+            try testing.expectEqualSlices(u8, &.{ 10, 20, 30, 40, 50, 60 }, decoded);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Composite formats are rejected by `from_bdt`.
+    const composite = Bdt{ .location = &.{}, .data = &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
+    try testing.expect(composite.bitmapData(.{
+        .format = 9,
+        .data_offset = 0,
+        .data_size = 10,
+        .bit_depth = 1,
+    }, false) == null);
+}
+
+/// Builds a minimal sfnt blob with `sbix` + `maxp` (2 glyphs) tables: one
+/// 109 ppem strike whose glyph 1 is a PNG record and glyph 0 is empty.
+fn buildSyntheticSbixFont(allocator: std.mem.Allocator) ![]u8 {
+    // 24-byte PNG prefix: signature, IHDR length/type, width, height.
+    var png: [24]u8 = @splat(0);
+    @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, png[8..12], 13, .big);
+    @memcpy(png[12..16], "IHDR");
+    std.mem.writeInt(u32, png[16..20], 136, .big);
+    std.mem.writeInt(u32, png[20..24], 128, .big);
+
+    var glyph_record: [32]u8 = @splat(0);
+    std.mem.writeInt(i16, glyph_record[0..2], 4, .big);
+    std.mem.writeInt(i16, glyph_record[2..4], -27, .big);
+    @memcpy(glyph_record[4..8], "png ");
+    @memcpy(glyph_record[8..32], &png);
+
+    const strike_header = 4 + 4 * 3;
+    const sbix_len = 12 + strike_header + glyph_record.len;
+    const sbix = try allocator.alloc(u8, sbix_len);
+    defer allocator.free(sbix);
+    @memset(sbix, 0);
+    std.mem.writeInt(u16, sbix[0..2], 1, .big);
+    std.mem.writeInt(u16, sbix[2..4], 1, .big);
+    std.mem.writeInt(u32, sbix[4..8], 1, .big);
+    std.mem.writeInt(u32, sbix[8..12], 12, .big);
+    const strike = sbix[12..];
+    std.mem.writeInt(u16, strike[0..2], 109, .big);
+    std.mem.writeInt(u16, strike[2..4], 72, .big);
+    std.mem.writeInt(u32, strike[4..8], 0, .big); // glyph 0: empty
+    std.mem.writeInt(u32, strike[8..12], strike_header, .big); // glyph 1 start
+    std.mem.writeInt(
+        u32,
+        strike[12..16],
+        strike_header + @as(u32, @intCast(glyph_record.len)),
+        .big,
+    );
+    @memcpy(strike[strike_header..][0..glyph_record.len], &glyph_record);
+
+    var maxp: [6]u8 = @splat(0);
+    std.mem.writeInt(u32, maxp[0..4], 0x00010000, .big);
+    std.mem.writeInt(u16, maxp[4..6], 2, .big);
+
+    const header_size = 12 + 2 * 16;
+    const sbix_offset = header_size;
+    const maxp_offset = sbix_offset + sbix_len;
+    const blob = try allocator.alloc(u8, maxp_offset + maxp.len);
+    @memset(blob, 0);
+    std.mem.writeInt(u32, blob[0..4], 0x00010000, .big);
+    std.mem.writeInt(u16, blob[4..6], 2, .big);
+    const sbix_record = blob[12..28];
+    @memcpy(sbix_record[0..4], "sbix");
+    std.mem.writeInt(u32, sbix_record[8..12], @intCast(sbix_offset), .big);
+    std.mem.writeInt(u32, sbix_record[12..16], @intCast(sbix_len), .big);
+    const maxp_record = blob[28..44];
+    @memcpy(maxp_record[0..4], "maxp");
+    std.mem.writeInt(u32, maxp_record[8..12], @intCast(maxp_offset), .big);
+    std.mem.writeInt(u32, maxp_record[12..16], maxp.len, .big);
+    @memcpy(blob[sbix_offset .. sbix_offset + sbix_len], sbix);
+    @memcpy(blob[maxp_offset..], &maxp);
+    return blob;
+}
+
+test "sbix strikes resolve glyph records through the font" {
+    const allocator = testing.allocator;
+    const blob = try buildSyntheticSbixFont(allocator);
+    defer allocator.free(blob);
+
+    const font = try font_mod.Font.init(blob, 0);
+    const strikes = Strikes.init(font);
+    try testing.expectEqual(Format.sbix, strikes.format().?);
+    try testing.expectEqual(@as(usize, 1), strikes.len());
+    try testing.expectEqual(@as(f32, 109.0), strikes.get(0).?.ppem());
+
+    // Glyph 0 is empty, glyph 1 is present; both resolve through the strike.
+    try testing.expect(strikes.glyphForSize(50.0, 0) == null);
+    const glyph = strikes.glyphForSize(50.0, 1).?;
+    try testing.expectEqual(@as(f32, 4.0), glyph.inner_bearing_x);
+    try testing.expectEqual(@as(f32, -27.0), glyph.inner_bearing_y);
+    try testing.expectEqual(@as(f32, 0.0), glyph.bearing_x);
+    try testing.expectEqual(@as(f32, 0.0), glyph.bearing_y);
+    try testing.expectEqual(@as(f32, 109.0), glyph.ppem_x);
+    try testing.expectEqual(@as(f32, 109.0), glyph.ppem_y);
+    try testing.expectEqual(@as(u32, 136), glyph.width);
+    try testing.expectEqual(@as(u32, 128), glyph.height);
+    try testing.expectEqual(Origin.bottom_left, glyph.placement_origin);
+    switch (glyph.data) {
+        .png => |data| try testing.expectEqualSlices(u8, "\x89PNG\r\n\x1a\n", data[0..8]),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // No CBLC/CBDT tables: those formats yield no strikes.
+    try testing.expect(Strikes.withFormat(font, .cbdt) == null);
+    try testing.expect(Strikes.withFormat(font, .ebdt) == null);
+}
