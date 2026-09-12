@@ -203,7 +203,7 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | `dispatch/multi_threaded*.rs` | `cpu/dispatch/multi_threaded.zig` + `multi_threaded/{task,cost,worker,sync}.zig` | conn | f32 MT byte-identical to ST on the differential scene (`render.zig`); u8/filters `error.Unsupported`; corpus stays threads=0 |
 | `filter/*` | `cpu/filter/*.zig` | port | connected; oracle-verified (8 filter scenes byte-exact); highp uses upstream's lowp blur/drop-shadow internals; multi-primitive graphs -> `error.Unsupported` |
 | `fine/common/rounded_blurred_rect.rs` | `cpu/fine/blurred_rect.zig` | port | connected; oracle-verified (normal + inverted scenes byte-exact) |
-| `text.rs`, `text_debug.rs` | `cpu/text.zig` | port | `GlyphAtlasResources` + frame protocol (`beforeRender`/`afterRender`), `CpuGlyphRunBackend`, `RenderContext.glyphRun`; bitmap upload path deferred |
+| `text.rs`, `text_debug.rs` | `cpu/text.zig` | port | `GlyphAtlasResources` + frame protocol (`beforeRender`/`afterRender`), `CpuGlyphRunBackend`, `RenderContext.glyphRun`; bitmap upload path (`PendingBitmapUpload` copied at frame start) |
 | `util.rs` (`Span`, `div255`, `Premultiply`) | `cpu/util.zig` | port | 6 tests |
 
 ### `vello_gpu` → `src/gpu/`
@@ -231,9 +231,10 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | Upstream module | Zig target | Status | Notes |
 | --- | --- | --- | --- |
 | `lib.rs`, `interface.rs` (Glyph, DrawSink, GlyphRenderer) | `glifo/root.zig`, `glifo/interface.zig` | port | comptime duck-typing contracts + `assert*` helpers |
-| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, `HintCache` (16-entry LRU), COLR > bitmap > outline draw loop, COLR metrics, skip-ink `renderDecoration`; embolden/coords/bitmap -> typed `error.Unsupported`; TrueType hinting ported (M3 G3b, `glifo/hint.zig`) |
-| `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline/COLR fill/stroke, subpixel keys, COLR command recording, command replay, raster metrics; bitmap paths deferred |
+| `glyph.rs` (GlyphRun, hints, transforms) | `glifo/glyph.zig` | port | run builder, transform absorption, prep cache, `HintCache` (16-entry LRU), COLR > bitmap > outline draw loop, COLR metrics, skip-ink `renderDecoration`, bitmap transform + decode; embolden/coords -> typed `error.Unsupported`; TrueType hinting ported (M3 G3b, `glifo/hint.zig`) |
+| `renderer.rs` (atlas-first drawing) | `glifo/renderer.zig` | port | atlas-first outline/bitmap/COLR fill/stroke, subpixel keys, COLR command recording, command replay, raster metrics, pending bitmap uploads |
 | `colr.rs` (COLR/CPAL painting) + `skrifa/src/color/*` | `glifo/colr.zig`, `glifo/tables/{colr,cpal}.zig` | port | COLRv0/v1 paint graph, gradients, transforms, clip boxes, composite modes, palette/foreground colors (M3 T4) |
+| `skrifa/src/bitmap.rs` + `read-fonts` `sbix`/`CBDT`/`CBLC`/`EBDT`/`EBLC` | `glifo/tables/bitmap.zig`, `glifo/png.zig` | port | strike selection (sbix > CBDT > EBDT, nearest strike), CBLC/EBLC index subtable formats 1–5, CBDT/EBDT record decode (PNG/BGRA/mask), sbix glyph records, png 0.18-compatible decode; 16-bit/Adam7 -> typed `error.Unsupported` (M3 T5) |
 | `atlas/*` (cache, keys, regions, commands) | `glifo/atlas/*.zig` | port | cache/eviction, fixed-seed key hashing, recorder + replay; variable-font second-level map deferred with `gvar` |
 | `util.rs` | `glifo/util.zig` | port | T2 |
 
@@ -454,9 +455,10 @@ of panics, thread ownership).
 
 ### Milestone 3 — Glyph rendering and Cozmic adapter
 
-- **Status (2026-09-12):** outline subset, atlas cache, decoration and the
-  Cozmic adapter are landed (T1–T3, T5); hinting (G3b), COLR (G3c) and
-  embolden/bitmap remain staged with typed `error.Unsupported`.
+- **Status (2026-09-12):** outline subset, atlas cache, COLR (G3c), hinting
+  (G3b), decoration and the Cozmic adapter (T5) and embedded bitmaps (G3e)
+  are landed (T1–T5); autohint, `gvar`/variation, CFF and embolden remain
+  staged with typed `error.Unsupported`.
 - `glifo` port; stable font identity/face index/variation/glyph/size/placement
   contract; monochrome + COLR behavior; cache invalidation.
 - **Gate:** glyph corpus renders match upstream for the same font resources;
@@ -821,6 +823,29 @@ of panics, thread ownership).
   boxes, all composite modes, cache on/off), all byte-exact at
   `--max-abs-diff 0 --max-diff-pixels 0`; corpus 90/90, `zig build test` =
   799/799 (791 lib + 8 scene), also green in ReleaseSafe.
+- 2026-09-12: **M3 T5 landed** (branch `vellz-bitmap`). Embedded bitmap
+  glyphs: `glifo/tables/bitmap.zig` ports the `skrifa 0.44` bitmap facade and
+  the `read-fonts 0.41` `sbix`/`CBDT`/`CBLC`/`EBDT`/`EBLC` subset (strike
+  selection prefers `sbix` > `CBDT` > `EBDT`, exact-then-larger-then-smaller
+  size fold, CBLC/EBLC index subtable formats 1-5, CBDT/EBDT record decode,
+  `MaskData` decode); `glifo/png.zig` ports the `png 0.18`
+  `normalize_to_color8() | ALPHA` decode path (indexed `PLTE`+`tRNS`, 8-bit
+  RGB/gray/gray-alpha, filters 0-4, CRC checks) returning straight RGBA8 for
+  `Pixmap.fromParts`; 16-bit and Adam7 are typed `error.Unsupported`.
+  `prepareGlyphRun` accepts bitmap-only faces (empty outline collection,
+  `has_outlines=false`) and the draw loop runs the upstream
+  COLR > bitmap > outline cascade with `calculate_bitmap_transform`;
+  `renderer.zig` adds direct pixmap sampling and atlas insertion via
+  `PendingBitmapUpload`, and `cpu/text.zig` copies queued uploads into the
+  atlas page at frame start. Oracle adds `--dump-advances` (bitmap-only faces
+  have no `--dump-glyphs` outlines) and the generator emits 5 bitmap G3e scenes
+  (`glyph_run_bitmap_noto*`, `..._transform_composition_*`, cache on/off,
+  mirroring `glyphs_bitmap_noto*` and
+  `glyphs_transform_composition_rows_bitmap`). Gate: all 5 scenes byte-exact
+  against the pinned oracle at `tolerance=0` -- including the
+  transform-composition rows upstream marks `cpu_u8_tolerance = 3`, so no
+  allowance is recorded -- with the atlas cache off and on; corpus 95/95,
+  `zig build test` = 849/849 (841 lib + 8 scene), `zig build glyphs` green.
 - 2026-09-12 (branch `vellz-simd`): **M4 remainder landed; G4 MET.** Added
   real SIMD backends behind the runtime `simd.Level` dispatch
   (`Level.detect`/`fromName`, `dispatch()` mirroring `fearless_simd::dispatch!`,
@@ -915,3 +940,27 @@ of panics, thread ownership).
   glyph + 3 cmap vectors (including 1,361,120 hinted coordinates) byte-exact,
   `zig build probe` byte-exact, and `zig build -Dgpu=true gpu-corpus` 44/44 on
   llvmpipe.
+- 2026-09-12: **M3 G3e embedded bitmaps merged with the hinting/T5 line**
+  (no-ff merge of `vellz-bitmap`). `glifo/tables/bitmap.zig` ports the
+  `skrifa 0.44` bitmap facade (`sbix`/`CBDT`/`EBLC`/`EBDT` strike selection,
+  CBLC/EBLC index subtable formats 1-5, PNG/BGRA/mask record decode),
+  `glifo/png.zig` ports the `png 0.18` decode path, and the draw loop runs the
+  upstream COLR > bitmap > outline cascade; `renderer.zig` samples/inserts
+  bitmaps and `cpu/text.zig` copies `PendingBitmapUpload`s at frame start. The
+  merge composes rather than picks: `glyph.zig` keeps the decoration and
+  hint-cache tests and adds the bitmap-transform test, `root.zig` documents
+  hinting + COLR + bitmaps, the oracle keeps both `--dump-decoration` and
+  `--dump-advances`, and the generator keeps every scene family. The 5 bitmap
+  scenes were stale (their advances were decoded little-endian against the
+  oracle's big-endian `{:08x}` output, collapsing every run to x=0);
+  `dump_advances_at` now decodes big-endian, the scenes were regenerated with
+  real positions, and their fixtures were rebuilt via
+  `tools/render_corpus.sh --png` (all 108 scenes re-rendered deterministically;
+  the other 103 fixture pairs stayed byte-identical). Evidence: `zig build
+  test` = 879/879 (862 lib + 8 scene + 4 adapter + 5 Cozmic bridge), `zig
+  build corpus` = 108/108 byte-exact at tolerance 0 in Debug, ReleaseSafe and
+  ReleaseFast, `zig build glyphs` = 20 glyph + 3 cmap vectors byte-exact,
+  `zig build probe` byte-exact, and `zig build -Dgpu=true gpu-corpus` 44/44 on
+  llvmpipe. `sbix`/`EBDT` have synthetic-font unit tests only (no pinned
+  asset); PNG 16-bit/Adam7 is typed `error.Unsupported` and falls through to
+  outlines.

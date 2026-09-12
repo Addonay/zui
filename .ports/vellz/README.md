@@ -29,10 +29,10 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 860/860 unit and integration tests (843 lib + 8 scene
+zig build test     # 879/879 unit and integration tests (862 lib + 8 scene
                    #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
                    #   the .ports/cozmic sibling checkout is absent)
-zig build corpus   # 103/103 corpus scenes byte-exact vs the upstream oracle
+zig build corpus   # 108/108 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo (hinted + unhinted)
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
@@ -83,19 +83,26 @@ oracle `--dump-decoration` span dump) and the opt-in Cozmic adapter
 (`vellz.cozmic_adapter`, never a dependency of the rendering core): it maps
 already-positioned glyphs 1:1 onto `glifo.GlyphRun` runs and is gated by a
 bridge test that renders byte-identical pixels to a direct `glyph_run`, with
-an explicit skip when `.ports/cozmic` is absent. All of it renders byte-exact
-against the pinned oracle, atlas cache on and off (103/103 corpus, tolerance
-0). The GPU side has the wgpu-native device bootstrap, the full host/shader
-layout
+an explicit skip when `.ports/cozmic` is absent. T5 also ports embedded
+bitmap glyphs (`CBDT`/`CBLC`, `sbix`, `EBDT`/`EBLC`) through the upstream
+COLR > bitmap > outline cascade with the pending-upload atlas path and a
+`png 0.18`-compatible decoder, plus a 5-scene G3e bitmap corpus (Noto CBTF
+colour emoji: fill, stroke, cache on/off, transform-composition rows). `sbix`
+and `EBDT`/`EBLC` are covered by synthetic-font unit tests (the pinned assets
+gate `CBDT`/`CBLC` end to end); PNG 16-bit/Adam7 payloads fall through to the
+outline branch. All of
+it renders byte-exact against the pinned oracle, atlas cache on and off
+(108/108 corpus, tolerance 0). The GPU side has the wgpu-native device
+bootstrap, the full host/shader layout
 contract, the schedule/layer executor, encoded paints (gradients and images),
 GPU filters, and a 44-scene `gpu-corpus` gate (27 byte-exact, the rest within
 the documented per-scene tolerance registry, plus typed
 device-loss/unsupported-capability/missing-binding/feedback-loop errors)
 running on the llvmpipe software adapter.
 
-Not yet implemented (explicit typed errors, never placeholder pixels):
-embedded bitmaps (M3 remainder), plus fonts that would need the autohinter or
-hinted advances from `hdmx` without backward compatibility (both typed
+Not yet implemented (explicit typed errors, never placeholder pixels): PNG
+16-bit/Adam7 decode, plus fonts that would need the autohinter or hinted
+advances from `hdmx` without backward compatibility (all typed
 `error.Unsupported`); GPU masks, atlas-backed images, GPU text, and the full
 G5 corpus (M5 remainder). G4 is met: `zig build corpus` is byte-exact at every
 SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage
@@ -135,7 +142,7 @@ CPU-only, no GPU dependency:
 ```sh
 zig build test                  # unit + integration tests
 zig build check                 # compile without running
-zig build corpus                # corpus gate: 103 scenes byte-exact vs pinned fixtures
+zig build corpus                # corpus gate: 108 scenes byte-exact vs pinned fixtures
 zig build probe                 # upstream probe fixture (tolerance-3 policy)
 zig build run-cpu-example       # writes cpu_example.ppm
 zig build vellz-cli             # corpus renderer CLI -> zig-out/bin

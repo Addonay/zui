@@ -11,7 +11,7 @@ regenerated so tests never need a Rust toolchain or Git LFS.
 | `Roboto-Regular.ttf` | `assets/roboto/Roboto-Regular.ttf` | Apache-2.0; see `Roboto-LICENSE.txt`. Used for positioned-glyph tests in Milestone 3. |
 | `Roboto-LICENSE.txt` | `assets/roboto/LICENSE.txt` | Apache-2.0 notice. |
 | `NotoColorEmoji-Subset.ttf` | `assets/noto_color_emoji/NotoColorEmoji-Subset.ttf` | OFL-1.1; see `NotoColorEmoji-LICENSE.txt`. 44 glyphs, `glyf` + `COLR`/`CPAL`, cmap formats 4/12/14: the format 12 and variation-sequence fixture. |
-| `NotoColorEmoji-CBTF-Subset.ttf` | `assets/noto_color_emoji/NotoColorEmoji-CBTF-Subset.ttf` | OFL-1.1. Bitmap-only (`CBDT`/`CBLC`): the `error.Unsupported` fixture for non-`glyf` outlines. |
+| `NotoColorEmoji-CBTF-Subset.ttf` | `assets/noto_color_emoji/NotoColorEmoji-CBTF-Subset.ttf` | OFL-1.1. Bitmap-only (`CBDT`/`CBLC`): one 109 ppem colour strike whose four glyphs carry 32-bit indexed PNGs (`PLTE`+`tRNS`). The bitmap glyph fixture (M3 T5) and the earlier `error.Unsupported` fixture for non-`glyf` outlines. |
 | `NotoColorEmoji-LICENSE.txt` | `assets/noto_color_emoji/LICENSE.txt` | OFL-1.1 notice (covers both Noto files). |
 | `test_glyphs-glyf_colr_1.ttf` | `assets/colr_test_glyphs/test_glyphs-glyf_colr_1.ttf` | Apache-2.0; see `colr_test_glyphs-LICENSE.txt`. The upstream COLRv1 test font ("Font is taken from https://github.com/googlefonts/color-fonts"): COLRv0 glyphs 168..175 plus a COLRv1 paint graph exercising layers, solids, linear/radial/sweep gradients, glyph clips, all transform formats and all composite modes; also carries the CPAL fixture used by the COLR tests. Not a Git LFS object (`file` header, not a pointer). |
 | `colr_test_glyphs-LICENSE.txt` | `assets/colr_test_glyphs/LICENSE.txt` | Apache-2.0 notice. |

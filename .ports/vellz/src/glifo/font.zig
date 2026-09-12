@@ -7,9 +7,10 @@
 //! outline pipeline needs (`head`, `maxp`, `hhea`, `hmtx`; `loca`/`glyf`/
 //! `cmap` are resolved on demand).
 //!
-//! Unsupported inputs are explicit: CFF/CFF2 outlines, bitmap-only fonts, and
-//! variable-font instances all fail with `error.Unsupported` instead of being
-//! approximated (see `.ports/vellz/docs/glifo-m3-plan.md` §2).
+//! Unsupported inputs are explicit: CFF/CFF2 outlines and variable-font
+//! instances fail with `error.Unsupported` instead of being approximated (see
+//! `.ports/vellz/docs/glifo-m3-plan.md` §2). Bitmap-only faces have no
+//! `outlines()` but expose their embedded strikes through `bitmapStrikes()`.
 
 const std = @import("std");
 
@@ -19,6 +20,7 @@ const maxp_mod = @import("tables/maxp.zig");
 const hhea_mod = @import("tables/hhea.zig");
 const hmtx_mod = @import("tables/hmtx.zig");
 const cmap_mod = @import("tables/cmap.zig");
+const bitmap_mod = @import("tables/bitmap.zig");
 const glyf_mod = @import("glyf.zig");
 
 pub const Head = head_mod.Head;
@@ -126,6 +128,11 @@ pub const Font = struct {
         const loca_data = self.face.table(sfnt.tag_loca) orelse return error.Unsupported;
         const glyf_data = self.face.table(sfnt.tag_glyf) orelse return error.Unsupported;
         return glyf_mod.Outlines.init(self, head, maxp, loca_data, glyf_data);
+    }
+
+    /// Embedded bitmap strikes (`sbix` > `CBDT` > `EBDT`), or an empty set.
+    pub fn bitmapStrikes(self: Font) bitmap_mod.Strikes {
+        return bitmap_mod.Strikes.init(self);
     }
 };
 

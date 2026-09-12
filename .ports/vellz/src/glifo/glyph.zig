@@ -19,16 +19,18 @@
 //!   through the interpreter keyed by the hint instance. Interpreter failures
 //!   are `error.HintError`; autohinter-only fonts are `error.Unsupported`
 //!   instead of silently rendering unhinted.
-//! - Synthetic embolden (`kurbo::expand_path`), non-empty variation
-//!   coordinates and bitmap glyphs (CBDT/CBLC/sbix) remain explicit
-//!   `error.Unsupported`.
+//! - Glyphs resolve through the upstream COLR > bitmap > outline cascade:
+//!   COLR/CPAL is ported (T4) and embedded bitmaps (`sbix`/`CBDT`/`EBDT`) are
+//!   ported (T5); `Bgra`/`Mask` bitmap payloads and undecodable PNGs fall
+//!   through to the outline branch exactly like upstream's `.ok()`-filtered
+//!   `Pixmap::from_png`. Faces without TrueType outlines use an empty outline
+//!   collection, so outline fallbacks are skipped there (upstream would draw
+//!   CFF outlines; CFF is not ported).
 //! - Decoration (`renderDecoration`) is ported: the upstream `Vec` of merged
 //!   exclusion spans lives on `GlyphPrepCache` and the Rust iterator/closure
 //!   pair becomes one pass over that list.
-//! - A font carrying bitmap tables rejects the whole run: upstream resolves
-//!   glyphs through a COLR > bitmap > outline cascade, and a glyph without a
-//!   COLR entry could fall back to a bitmap that is not ported, so the
-//!   representation is never silently dropped. COLR/CPAL is ported (T4).
+//! - Synthetic embolden (`kurbo::expand_path`) and non-empty variation
+//!   coordinates remain explicit `error.Unsupported`.
 //! - Upstream's `OutlineCacheSession` is replaced by an explicit
 //!   `*OutlineCache` threaded through the draw loop and `renderer.fillGlyph`/
 //!   `strokeGlyph`.
@@ -38,15 +40,22 @@ const kurbo = @import("../kurbo/root.zig");
 const peniko = @import("../peniko/root.zig");
 
 const paint_mod = @import("../common/paint.zig");
+const pixmap_mod = @import("../common/pixmap.zig");
+const shared_mod = @import("../common/shared.zig");
 const sfnt = @import("tables/sfnt.zig");
+const bitmap_mod = @import("tables/bitmap.zig");
 const cpal_mod = @import("tables/cpal.zig");
 const font_mod = @import("font.zig");
 const glyf = @import("glyf.zig");
 const colr = @import("colr.zig");
+const png_mod = @import("png.zig");
 const outline_cache = @import("outline_cache.zig");
 const atlas = @import("atlas/root.zig");
 const renderer_mod = @import("renderer.zig");
 const interface = @import("interface.zig");
+
+/// A shared, reference-counted pixmap (upstream `Arc<Pixmap>`).
+pub const SharedPixmap = shared_mod.Shared(pixmap_mod.Pixmap);
 
 pub const NormalizedCoord = font_mod.NormalizedCoord;
 pub const FontEmbolden = outline_cache.FontEmbolden;
@@ -453,10 +462,21 @@ pub const GlyphColr = struct {
     has_non_default_blend: bool,
 };
 
+/// A glyph defined by a bitmap.
+pub const GlyphBitmap = struct {
+    /// The decoded, premultiplied pixmap of the glyph.
+    pixmap: SharedPixmap,
+    /// The rectangular area that should be filled with the bitmap when
+    /// painting (`0, 0, width, height`).
+    area: kurbo.Rect,
+};
+
 /// A type of glyph.
 pub const GlyphType = union(enum) {
     /// An outline glyph.
     outline: GlyphOutline,
+    /// A bitmap glyph.
+    bitmap: GlyphBitmap,
     /// A COLR glyph.
     colr: GlyphColr,
 };
@@ -507,7 +527,15 @@ pub const PreparedGlyphRun = struct {
     /// Basic metadata about the underlying font.
     font_info: FontInfo,
     /// The parsed TrueType outlines (upstream `font_ref.outline_glyphs()`).
+    /// Empty when the face has no `glyf` table (bitmap-only faces).
     outlines: glyf.Outlines,
+    /// Whether `outlines` came from a real `glyf` table. Faces without `glyf`
+    /// (bitmap-only, or CFF + bitmaps) have no ported outline source, so
+    /// `false` skips the outline branch instead of parsing an empty `loca`
+    /// (upstream's CFF fallback is not ported).
+    has_outlines: bool = true,
+    /// The embedded bitmap strikes (upstream `font_ref.bitmap_strikes()`).
+    bitmap_strikes: bitmap_mod.Strikes,
     /// The parsed color glyphs (upstream `font_ref.color_glyphs()`).
     color_glyphs: colr.ColorGlyphCollection,
     /// The face's `CPAL` table, or `null`.
@@ -554,8 +582,8 @@ pub const GlyphScaleProperties = struct {
 /// Prepare a glyph run for rendering.
 ///
 /// Fails with `error.Unsupported` for deferred inputs: hinting, non-empty
-/// variation coordinates, synthetic embolden, and fonts whose glyphs would
-/// come from COLR/CPAL or bitmap tables.
+/// variation coordinates, synthetic embolden, and faces without any glyph
+/// source the port can render (CFF/CFF2-only, or no bitmap strike either).
 pub fn prepareGlyphRun(run: GlyphRun) Error!PreparedGlyphRun {
     // No hint cache: hinted-scale absorption is rejected with
     // `error.Unsupported` (the allocator is never used).
@@ -639,18 +667,19 @@ pub fn prepareGlyphRunWithCache(
     const upem: f32 = @floatFromInt(font.unitsPerEm());
 
     const face = font.face;
-    if (face.table(sfnt.tag_cbdt) != null or
-        face.table(sfnt.tag_cblc) != null or
-        face.table(sfnt.tag_sbix) != null)
-    {
-        // Bitmap glyphs are deferred. Upstream runs a COLR > bitmap > outline
-        // cascade per glyph; a glyph without a COLR entry on such a font would
-        // fall back to the bitmap, so reject the run explicitly rather than
-        // silently dropping the representation.
-        return error.Unsupported;
-    }
+    const bitmap_strikes = font.bitmapStrikes();
 
-    const outlines = try font.outlines();
+    // Faces without `glyf` outlines (bitmap-only, or CFF + bitmaps) keep an
+    // empty outline collection, like upstream's `outline_glyphs()`.
+    var has_outlines = true;
+    const outlines = font.outlines() catch |err| switch (err) {
+        error.Unsupported => blk: {
+            if (bitmap_strikes.isEmpty()) return error.Unsupported;
+            has_outlines = false;
+            break :blk glyf.Outlines.empty(font);
+        },
+        else => return err,
+    };
     const color_glyphs = colr.ColorGlyphCollection.init(face);
     const cpal = if (face.table(sfnt.tag_cpal)) |data| cpal_mod.Cpal.parse(data) else null;
 
@@ -662,6 +691,8 @@ pub fn prepareGlyphRunWithCache(
             .upem = upem,
         },
         .outlines = outlines,
+        .has_outlines = has_outlines,
+        .bitmap_strikes = bitmap_strikes,
         .color_glyphs = color_glyphs,
         .cpal = cpal,
         .run_size = run.font_size,
@@ -847,6 +878,108 @@ fn createColrGlyph(
 fn satU16(value: f64) u16 {
     if (std.math.isNan(value)) return 0;
     return @intFromFloat(std.math.clamp(value, 0.0, 65535.0));
+}
+
+/// Decode a bitmap glyph's payload into a premultiplied pixmap.
+///
+/// Mirrors upstream `glifo`: only PNG payloads are rendered; `Bgra`/`Mask`
+/// payloads and PNG decode failures fall through to the outline branch
+/// (upstream `Pixmap::from_png(..).ok()` → `None`). Allocation failures
+/// propagate instead of being swallowed.
+pub fn decodeBitmapPixmap(
+    allocator: std.mem.Allocator,
+    bitmap_glyph: *const bitmap_mod.BitmapGlyph,
+) !?SharedPixmap {
+    const png_data = switch (bitmap_glyph.data) {
+        .png => |data| data,
+        // The others are not worth implementing for now (unless we can find a
+        // test case), they should be very rare.
+        .bgra, .mask => return null,
+    };
+    const decoded = png_mod.decode(allocator, png_data) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer allocator.free(decoded.pixels);
+
+    var pixmap = pixmap_mod.Pixmap.fromParts(
+        allocator,
+        decoded.pixels,
+        decoded.width,
+        decoded.height,
+        .{ .alpha_type = .alpha, .may_have_transparency = true },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidDataLength => return null,
+    };
+    errdefer pixmap.deinit(allocator);
+    return try SharedPixmap.create(allocator, pixmap);
+}
+
+/// Create bitmap glyph data: wrap the decoded pixmap with its display area.
+///
+/// The caller transfers one reference to `pixmap` (the returned value owns
+/// it).
+pub fn createBitmapGlyph(pixmap: SharedPixmap) GlyphBitmap {
+    // The scale factor already accounts for ppem, so the area is just the
+    // size of the actual image.
+    return .{
+        .pixmap = pixmap,
+        .area = kurbo.Rect.new(
+            0.0,
+            0.0,
+            @floatFromInt(pixmap.get().width),
+            @floatFromInt(pixmap.get().height),
+        ),
+    };
+}
+
+/// Calculate the final positioning transform for a bitmap glyph, mirroring
+/// `glifo::glyph::calculate_bitmap_transform`.
+pub fn calculateBitmapTransform(
+    glyph: Glyph,
+    pixmap: *const pixmap_mod.Pixmap,
+    draw_props: DrawProps,
+    font_size: f32,
+    upem: f32,
+    bitmap_glyph: *const bitmap_mod.BitmapGlyph,
+    bitmap_format: ?bitmap_mod.Format,
+) kurbo.Affine {
+    const x_scale_factor = font_size / bitmap_glyph.ppem_x;
+    const y_scale_factor = font_size / bitmap_glyph.ppem_y;
+    const font_units_to_size = font_size / upem;
+
+    // CoreText appears to special-case Apple Color Emoji, adding a 100 font
+    // unit vertical offset. We do the same, but only when the vertical offset
+    // is 0 to avoid incorrect rendering if Apple ever encodes it directly.
+    const bearing_y = if (bitmap_glyph.bearing_y == 0.0 and bitmap_format == .sbix)
+        100.0
+    else
+        bitmap_glyph.bearing_y;
+
+    const origin_shift = switch (bitmap_glyph.placement_origin) {
+        .top_left => kurbo.Vec2.ZERO,
+        .bottom_left => kurbo.Vec2.new(
+            0.0,
+            -@as(f64, @floatFromInt(pixmap.height)),
+        ),
+    };
+
+    return draw_props
+        .positionedTransform(glyph)
+        // Apply outer bearings.
+        .preTranslate(kurbo.Vec2.new(
+            -bitmap_glyph.bearing_x * font_units_to_size,
+            bearing_y * font_units_to_size,
+        ))
+        // Scale to pixel space.
+        .preScaleNonUniform(x_scale_factor, y_scale_factor)
+        // Apply inner bearings.
+        .preTranslate(kurbo.Vec2.new(
+            -bitmap_glyph.inner_bearing_x,
+            -bitmap_glyph.inner_bearing_y,
+        ))
+        .preTranslate(origin_shift);
 }
 
 /// Renderer state for one prepared run.
@@ -1189,7 +1322,98 @@ pub fn GlyphRunRenderer(comptime Glyphs: type) type {
                     continue;
                 }
 
+                // ── Bitmap glyphs ─────────────────────────────────────────
+                if (prepared.bitmap_strikes.glyphForSize(
+                    prepared.draw_props.font_size,
+                    glyph.id,
+                )) |bitmap_glyph| {
+                    if (try decodeBitmapPixmap(allocator, &bitmap_glyph)) |pixmap| {
+                        defer pixmap.release(allocator);
+
+                        // Bitmaps use the strike's own ppem, not the run's,
+                        // because the image was pre-rendered at that size.
+                        const bitmap_ppem = bitmap_glyph.ppem_x;
+                        const bitmap_transform = calculateBitmapTransform(
+                            glyph,
+                            pixmap.get(),
+                            prepared.draw_props,
+                            prepared.draw_props.font_size,
+                            prepared.font_info.upem,
+                            &bitmap_glyph,
+                            prepared.bitmap_strikes.format(),
+                        );
+
+                        // Bitmaps are not hinted and have no sub-pixel offset
+                        // or context color; variation coordinates are
+                        // irrelevant for fixed strikes.
+                        const bitmap_cache_key: ?atlas.GlyphCacheKey =
+                            if (colr_bitmap_cache_enabled) blk: {
+                                var key = atlas.key.newKey(
+                                    prepared.font_info.id,
+                                    prepared.font_info.index,
+                                    glyph.id,
+                                    bitmap_ppem,
+                                    false,
+                                    0.0,
+                                    peniko.Color.BLACK,
+                                    atlas.key.packColor(peniko.Color.BLACK),
+                                    FontEmbolden{},
+                                    &.{},
+                                );
+                                key.subpixel_x = atlas.key.SUBPIXEL_BITMAP;
+                                break :blk key;
+                            } else null;
+
+                        if (bitmap_cache_key) |key| {
+                            if (self.atlas_cacher.get(key)) |cached_slot| {
+                                try renderer_mod.renderCachedGlyph(
+                                    allocator,
+                                    renderer,
+                                    cached_slot,
+                                    bitmap_transform,
+                                    .bitmap,
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Cache miss: wrap the decoded pixmap for rendering.
+                        // The reference is released after the draw, so a
+                        // pending upload (which retains its own reference)
+                        // survives into the next frame.
+                        const pixmap_reference = pixmap.clone();
+                        defer pixmap_reference.release(allocator);
+                        const prepared_glyph: PreparedGlyph = .{
+                            .glyph_type = .{ .bitmap = createBitmapGlyph(pixmap_reference) },
+                            .outline_transform = bitmap_transform,
+                            .relative_paint_transform = kurbo.Affine.IDENTITY,
+                            .cache_key = bitmap_cache_key,
+                        };
+                        switch (style) {
+                            .fill => try renderer_mod.fillGlyph(
+                                allocator,
+                                renderer,
+                                &prepared_glyph,
+                                &self.atlas_cacher,
+                                self.outline_cache,
+                            ),
+                            .stroke => try renderer_mod.strokeGlyph(
+                                allocator,
+                                renderer,
+                                &prepared_glyph,
+                                &self.atlas_cacher,
+                                self.outline_cache,
+                            ),
+                        }
+                        continue;
+                    }
+                }
+
                 // ── Outline glyphs ────────────────────────────────────────
+                // A bitmap-only face has an empty outline collection; every
+                // lookup reports `OutOfBounds` and the glyph is skipped, like
+                // upstream's empty `OutlineGlyphCollection`.
+                if (!prepared.has_outlines) continue;
                 // The speculative check above already computed the transform
                 // and key; reuse them here.
                 const raw_glyph = prepared.outlines.getGlyph(glyph.id) catch |err| switch (err) {
@@ -1710,7 +1934,7 @@ test "prepare accepts COLR fonts and exposes their color glyphs" {
     try testing.expect(prepared.color_glyphs.get(3) != null);
 }
 
-test "prepare still rejects fonts with deferred bitmap tables" {
+test "prepare accepts bitmap fonts and exposes their strikes" {
     const noto_cbtf = FontData.init(try test_fixture.notoCbtf(), 0);
     const run: GlyphRun = .{
         .font = noto_cbtf,
@@ -1718,7 +1942,110 @@ test "prepare still rejects fonts with deferred bitmap tables" {
         .scene_paint_transform = kurbo.Affine.IDENTITY,
         .hint = false,
     };
-    try testing.expectError(error.Unsupported, prepareGlyphRun(run));
+    const prepared = try prepareGlyphRun(run);
+    // The subset has no `glyf`/`loca`, so the outline collection is empty and
+    // the cascade resolves glyphs through the CBDT strike.
+    try testing.expect(!prepared.has_outlines);
+    try testing.expectEqual(bitmap_mod.Format.cbdt, prepared.bitmap_strikes.format().?);
+    try testing.expectEqual(@as(usize, 1), prepared.bitmap_strikes.len());
+    try testing.expect(prepared.bitmap_strikes.glyphForSize(50.0, 2) != null);
+}
+
+test "bitmap glyphs decode to premultiplied pixmaps" {
+    const allocator = testing.allocator;
+    const font = try font_mod.Font.init(try test_fixture.notoCbtf(), 0);
+    const strikes = font.bitmapStrikes();
+    const bitmap_glyph = strikes.glyphForSize(50.0, 1).?;
+
+    const pixmap = (try decodeBitmapPixmap(allocator, &bitmap_glyph)).?;
+    defer pixmap.release(allocator);
+    try testing.expectEqual(@as(u16, 136), pixmap.get().width);
+    try testing.expectEqual(@as(u16, 128), pixmap.get().height);
+    try testing.expect(pixmap.get().mayHaveTransparency());
+
+    // `Bgra`/`Mask` payloads are skipped (upstream returns `None`), so the
+    // caller can fall through to the outline branch.
+    var bgra_glyph = bitmap_glyph;
+    bgra_glyph.data = .{ .bgra = &.{} };
+    try testing.expect((try decodeBitmapPixmap(allocator, &bgra_glyph)) == null);
+    var mask_glyph = bitmap_glyph;
+    mask_glyph.data = .{ .mask = .{ .bpp = 1, .is_packed = false, .data = &.{} } };
+    try testing.expect((try decodeBitmapPixmap(allocator, &mask_glyph)) == null);
+}
+
+fn drawBitmapTestGlyph(
+    allocator: std.mem.Allocator,
+    glyph_id: u32,
+    atlas_cache_enabled: bool,
+    renderer: *RecordingRenderer,
+    prep_cache: *GlyphPrepCache,
+    glyph_atlas: *atlas.GlyphAtlas,
+    image_cache: *atlas.ImageCache,
+) !void {
+    const font = FontData.init(try test_fixture.notoCbtf(), 0);
+    const transform = kurbo.Affine.translate(kurbo.Vec2.new(0.0, 20.0));
+    const run: GlyphRun = .{
+        .font = font,
+        .font_size = 20.0,
+        .transform = transform,
+        .scene_paint_transform = transform,
+        .hint = false,
+    };
+    const cacher: AtlasCacher = if (atlas_cache_enabled)
+        .{ .enabled = .{ .glyph_atlas = glyph_atlas, .image_cache = image_cache } }
+    else
+        .disabled;
+    const glyphs = [_]Glyph{.{ .id = glyph_id }};
+    const iterator = iterate(&glyphs);
+    var run_renderer = try buildRenderer(allocator, run, iterator, prep_cache.asMut(), cacher);
+    try run_renderer.fillGlyphs(allocator, renderer);
+}
+
+test "bitmap glyph with the atlas cache queues an upload and hits next draw" {
+    const allocator = testing.allocator;
+    var renderer = RecordingRenderer{};
+    defer renderer.deinit();
+    var prep_cache = GlyphPrepCache{};
+    defer prep_cache.deinit(allocator);
+    var glyph_atlas = atlas.GlyphAtlas.init();
+    defer glyph_atlas.deinit(allocator);
+    var image_cache = try atlas.ImageCache.initWithConfig(allocator, .{ .atlas_size = .{ 512, 512 } });
+    defer image_cache.deinit(allocator);
+
+    try drawBitmapTestGlyph(allocator, 2, true, &renderer, &prep_cache, &glyph_atlas, &image_cache);
+    try testing.expectEqual(@as(usize, 1), glyph_atlas.len());
+    try testing.expectEqual(@as(usize, 1), glyph_atlas.pendingUploads().len);
+    try testing.expectEqual(@as(u64, 0), glyph_atlas.cacheHits());
+    try testing.expectEqual(@as(usize, 1), renderer.fill_rect_count);
+    // The slot is the decoded pixmap size (136x128), not the strike metrics.
+    try testing.expectEqual(@as(u16, 136), glyph_atlas.pendingUploads()[0].atlas_slot.width);
+
+    try drawBitmapTestGlyph(allocator, 2, true, &renderer, &prep_cache, &glyph_atlas, &image_cache);
+    try testing.expectEqual(@as(usize, 1), glyph_atlas.len());
+    try testing.expectEqual(@as(u64, 1), glyph_atlas.cacheHits());
+    try testing.expectEqual(@as(usize, 1), glyph_atlas.pendingUploads().len);
+    try testing.expectEqual(@as(usize, 2), renderer.fill_rect_count);
+
+    // Dropping the queued upload releases its pixmap reference.
+    glyph_atlas.clearPendingUploads(allocator);
+    try testing.expectEqual(@as(usize, 0), glyph_atlas.pendingUploads().len);
+}
+
+test "bitmap glyph without the atlas cache draws directly" {
+    const allocator = testing.allocator;
+    var renderer = RecordingRenderer{};
+    defer renderer.deinit();
+    var prep_cache = GlyphPrepCache{};
+    defer prep_cache.deinit(allocator);
+    var glyph_atlas = atlas.GlyphAtlas.init();
+    defer glyph_atlas.deinit(allocator);
+    var image_cache = try atlas.ImageCache.initWithConfig(allocator, .{ .atlas_size = .{ 512, 512 } });
+    defer image_cache.deinit(allocator);
+
+    try drawBitmapTestGlyph(allocator, 2, false, &renderer, &prep_cache, &glyph_atlas, &image_cache);
+    try testing.expectEqual(@as(usize, 0), glyph_atlas.len());
+    try testing.expectEqual(@as(usize, 0), glyph_atlas.pendingUploads().len);
+    try testing.expectEqual(@as(usize, 1), renderer.fill_rect_count);
 }
 
 fn ensureColrCache() !void {
@@ -2003,4 +2330,97 @@ test "hinted run preparation configures a hint instance" {
     try testing.expect(prepared.hinting_instance != null);
     try testing.expect(prepared.hinting_instance.?.isEnabled());
     try testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+}
+
+test "bitmap transform applies outer/inner bearings, scale and origin" {
+    const allocator = testing.allocator;
+    var pixmap = try pixmap_mod.Pixmap.init(allocator, 4, 2);
+    defer pixmap.deinit(allocator);
+
+    const draw_props: DrawProps = .{
+        .positioning_transform = kurbo.Affine.IDENTITY,
+        .effective_transform = kurbo.Affine.IDENTITY,
+        .font_size = 20.0,
+    };
+    const glyph = Glyph{ .id = 1, .x = 0.0, .y = 0.0 };
+    const base: bitmap_mod.BitmapGlyph = .{
+        .data = .{ .png = &.{} },
+        .bearing_x = 5.0,
+        .bearing_y = 25.0,
+        .inner_bearing_x = 1.0,
+        .inner_bearing_y = 3.0,
+        .ppem_x = 10.0,
+        .ppem_y = 10.0,
+        .advance = null,
+        .width = 4,
+        .height = 2,
+        .placement_origin = .top_left,
+    };
+
+    // font_size / ppem = 2 (scale), bearing_x/y in font units of 1/upem=0.02.
+    const top_left = calculateBitmapTransform(
+        glyph,
+        &pixmap,
+        draw_props,
+        20.0,
+        1000.0,
+        &base,
+        .cbdt,
+    );
+    // x' = -0.1 + 2*(x - 1); y' = 0.5 + 2*(y - 3).
+    try testing.expectEqual(@as(f64, 2.0), top_left.asCoeffs()[0]);
+    // Bearing offsets are computed in f32 and widened, so allow 1e-6.
+    try testing.expectApproxEqAbs(@as(f64, -2.1), top_left.asCoeffs()[4], 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, -5.5), top_left.asCoeffs()[5], 1e-6);
+
+    // Bottom-left origins shift down by the pixmap height (2 px * scale 2).
+    var bottom_left = base;
+    bottom_left.placement_origin = .bottom_left;
+    const shifted = calculateBitmapTransform(
+        glyph,
+        &pixmap,
+        draw_props,
+        20.0,
+        1000.0,
+        &bottom_left,
+        .cbdt,
+    );
+    try testing.expectApproxEqAbs(@as(f64, -9.5), shifted.asCoeffs()[5], 1e-6);
+
+    // `sbix` strikes with a zero outer bearing get CoreText's 100-unit offset.
+    var sbix = base;
+    sbix.bearing_y = 0.0;
+    const sbix_transform = calculateBitmapTransform(
+        glyph,
+        &pixmap,
+        draw_props,
+        20.0,
+        1000.0,
+        &sbix,
+        .sbix,
+    );
+    // y' = 2.0 + 2*(y - 3).
+    try testing.expectApproxEqAbs(@as(f64, -4.0), sbix_transform.asCoeffs()[5], 1e-6);
+    const cbdt_zero = calculateBitmapTransform(
+        glyph,
+        &pixmap,
+        draw_props,
+        20.0,
+        1000.0,
+        &sbix,
+        .cbdt,
+    );
+    try testing.expectApproxEqAbs(@as(f64, -6.0), cbdt_zero.asCoeffs()[5], 1e-6);
+
+    // Glyph positions feed `positionedTransform` in scaled device units.
+    const positioned = calculateBitmapTransform(
+        .{ .id = 1, .x = 3.0, .y = 0.0 },
+        &pixmap,
+        draw_props,
+        20.0,
+        1000.0,
+        &base,
+        .cbdt,
+    );
+    try testing.expectApproxEqAbs(@as(f64, 0.9), positioned.asCoeffs()[4], 1e-6);
 }

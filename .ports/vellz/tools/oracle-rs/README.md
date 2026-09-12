@@ -55,12 +55,23 @@ tools/oracle-rs/target/release/vellz-oracle \
 tools/oracle-rs/target/release/vellz-oracle \
     --dump-cmap --font tests/fixtures/upstream/NotoColorEmoji-Subset.ttf \
     --codepoints 65,0x1F389
+
+# Scaled advances/lsb for fonts without outlines (bitmap-only faces).
+tools/oracle-rs/target/release/vellz-oracle \
+    --dump-advances --font tests/fixtures/upstream/NotoColorEmoji-CBTF-Subset.ttf \
+    --size 50.0 --gids 1-4
 ```
+
+`--dump-advances` prints `glyph_metrics(Size::new(ppem)).advance_width` /
+`left_side_bearing` as f32 bit patterns (`gid N lsb <hex> advance <hex>`) and
+exists because `--dump-glyphs` needs outlines, which bitmap-only faces do not
+have. `tools/gen_glyph_scenes.py` uses it to position the bitmap `glyph_run`
+scenes with exact f32 advance accumulation.
 
 `--gids`/`--codepoints` accept comma-separated decimal or `0x` hex values and
 inclusive `start-end` ranges, and may be repeated. `--font`, `--index`,
-`--size` and the id list are shared by both modes. The glyph dump draws with
-`skrifa`'s `DrawSettings::unhinted(Size::new(size), LocationRef::default())`
+`--size` and the id list are shared by all three modes. The glyph dump draws
+with `skrifa`'s `DrawSettings::unhinted(Size::new(size), LocationRef::default())`
 and the default `PathStyle::FreeType`; that is exactly the call
 `glifo 0.3.0`'s `OutlineCache` makes for an unhinted run, and the dump also
 carries the resulting adjusted `lsb`/`advance`.

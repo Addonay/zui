@@ -303,6 +303,20 @@ pub const Outlines = struct {
         return self.glyph_count;
     }
 
+    /// An empty outline collection for faces without a `glyf` table
+    /// (bitmap-only faces). Every lookup reports `error.OutOfBounds`, which
+    /// the draw loop treats as "skip this glyph", matching upstream's
+    /// `outline_glyphs().get()` returning `None`.
+    pub fn empty(font: Font) Outlines {
+        return .{
+            .font = font,
+            .loca = Loca.parse(&.{}, false),
+            .glyf_data = &.{},
+            .upem = font.unitsPerEm(),
+            .glyph_count = font.numGlyphs(),
+        };
+    }
+
     pub fn unitsPerEm(self: *const Outlines) u16 {
         return self.upem;
     }
