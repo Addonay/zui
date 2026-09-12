@@ -210,6 +210,18 @@ macro allows a 55-pixel CPU/GPU gap, which vellz closes exactly. Cache-on
 determinism holds: the `_cache` scenes render identical bytes to the uncached
 scenes and to repeated runs.
 
+Cache-on vs cache-off: upstream's own note that "the cached versions of COLR
+glyphs seem to have a slight shift" is observable in the oracle fixtures. The
+`_cache` scenes reproduce that shift byte-for-byte instead of diverging, for
+example `glyph_run_colr_noto_250x70` differs from its uncached pair in
+1723 / 17500 pixels (max channel diff 151), `..._scaled_2x_500x140` in
+3305 / 70000 (max 100) and `..._transform_composition_210x410` in
+5759 / 86100 (max 255); the rotated scenes, whose transforms cannot be
+atlas-cached (skew), differ in 0 pixels. Every scene is compared against the
+oracle for its own `atlas_cache` setting, and `tools/render_corpus.sh` checks
+that repeated oracle runs are byte-identical, so cache-on determinism is
+gated on both sides.
+
 The gate caught one geometry-relevant upstream subtlety now pinned by a unit
 test: traversal pushes the COLR clip box of *every* nested `PaintColrGlyph`,
 not only the root glyph's. Dropping the nested clip boxes made a backdrop
