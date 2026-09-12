@@ -330,6 +330,12 @@ pub inline fn bitcast(comptime V: type, v: anytype) V {
     return @bitCast(v);
 }
 
+/// Horizontal add.
+///
+/// **Caution:** `@reduce(.Add, ...)` may reassociate lanes. The port's
+/// byte-exact paths sum in lane order with a sequential scalar loop (see
+/// `common/flatten.zig` `flattenCubicTail`); do not use this helper where the
+/// result feeds the oracle-exact pixel output unless upstream also reduces.
 pub inline fn reduceAdd(v: anytype) Lane(@TypeOf(v)) {
     return @reduce(.Add, v);
 }
