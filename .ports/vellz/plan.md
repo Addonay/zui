@@ -874,3 +874,14 @@ of panics, thread ownership).
   `run-gpu-errors` (now also covering `MissingTextureBinding` and
   `TextureFeedbackLoop`), and `gpu-corpus` all green; per-scene metrics are in
   `tests/README.md`'s tolerance registry.
+- 2026-09-12: **glyph scene generator decode fix; COLR fractional-position gap
+  found.** `tools/gen_glyph_scenes.py` decoded `--dump-glyphs` advances
+  little-endian, so the committed 15 baseline + 27 COLR scenes stack every
+  glyph at x=0 (byte-exact, but not exercising positioning). The generator is
+  fixed (merged with `vellz-cozmic`), and regenerating the scenes shows the
+  outline, decoration, and color-font test scenes still byte-exact but 39
+  Noto/composition COLR scenes differing from the oracle by max-abs 1 on a few
+  pixels at fractional glyph positions. The regenerated scenes/fixtures are
+  intentionally not on `main` yet: `zig build corpus` stays 96/96 green on the
+  existing fixtures while the COLR subpixel path is fixed on a branch; the fix
+  lands together with the regenerated corpus.
