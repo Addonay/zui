@@ -15,7 +15,10 @@
 //!    into runs at font/size changes only. Consecutive glyphs are never
 //!    regrouped or reordered.
 //! 3. Positions are layout-space, y-down. `glifo` applies the font-space Y
-//!    flip internally; the adapter must not pre-flip anything.
+//!    flip internally; the adapter must not pre-flip anything. Subpixel
+//!    positions are passed through as f32 and quantized once by `glifo`;
+//!    Cozmic's `.875` carry versus `glifo`'s clamp-to-bucket-3 differs by at
+//!    most 0.125 px (documented residual, M3 plan §3).
 //! 4. Synthetic embolden is forwarded to `glifo`, which rejects non-default
 //!    amounts with `error.Unsupported` until kurbo `expand_path` lands. It is
 //!    never silently dropped.
