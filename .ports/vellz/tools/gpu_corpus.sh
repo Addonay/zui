@@ -8,6 +8,9 @@
 # Usage:
 #   tools/gpu_corpus.sh [--update-tolerances] RENDERER [SCENE ...]
 #
+# Invoked directly by `zig build -Dgpu=true gpu-corpus` (the file must stay
+# executable).
+#
 #   RENDERER is the built `vellz-gpu-render` executable (the Zig build passes
 #   it via `addArtifactArg`). When no scenes are given, the root-pass subset
 #   below runs.
