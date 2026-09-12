@@ -29,7 +29,7 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 900/900 unit and integration tests (883 lib + 8 scene
+zig build test     # 901/901 unit and integration tests (884 lib + 8 scene
                    #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
                    #   the .ports/cozmic sibling checkout is absent)
 zig build corpus   # 120/120 corpus scenes byte-exact vs the upstream oracle
