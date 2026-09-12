@@ -22,9 +22,22 @@ const scene_mod = @import("scene.zig");
 const backend = vellz.gpu.backend;
 const gpu_scene = vellz.gpu.scene;
 
+const Asset = struct {
+    id: u64,
+    path: []const u8,
+    width: u16,
+    height: u16,
+    texture: c.WGPUTexture,
+    view: c.WGPUTextureView,
+    may_have_transparency: bool,
+};
+
 const kurbo = vellz.kurbo;
 const peniko = vellz.peniko;
 const common = vellz.common;
+
+/// Device used by lazy asset uploads (set once the device is acquired).
+var current_device: ?*backend.Device = null;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -77,6 +90,7 @@ pub fn main(init: std.process.Init) !void {
 
     var dev = try backend.Device.acquire(allocator, &adapter, "vellz-gpu-render");
     defer dev.deinit();
+    current_device = &dev;
 
     // Build the GPU scene from the corpus commands.
     var gpu = try gpu_scene.Scene.init(allocator, parsed_scene.width, parsed_scene.height);
@@ -85,13 +99,24 @@ pub fn main(init: std.process.Init) !void {
     var scratch_path = kurbo.BezPath.init();
     defer scratch_path.deinit(allocator);
 
+    var assets: std.ArrayList(Asset) = .empty;
+    defer {
+        for (assets.items) |asset| {
+            c.wgpuTextureViewRelease(asset.view);
+            c.wgpuTextureRelease(asset.texture);
+            allocator.free(asset.path);
+        }
+        assets.deinit(allocator);
+    }
+    const scene_dir = std.fs.path.dirname(scene_file) orelse ".";
+
     for (parsed_scene.commands) |command| {
         switch (command) {
             .set_transform => |affine| gpu.setTransform(kurbo.Affine.new(affine)),
             .reset_transform => gpu.resetTransform(),
             .set_paint_transform => |affine| gpu.setPaintTransform(kurbo.Affine.new(affine)),
             .reset_paint_transform => gpu.resetPaintTransform(),
-            .set_paint => |spec| try applyPaint(&gpu, spec),
+            .set_paint => |spec| try applyPaint(&gpu, allocator, io, scene_dir, &assets, spec),
             .set_fill_rule => |rule| gpu.setFillRule(switch (rule) {
                 .nonzero => .non_zero,
                 .evenodd => .even_odd,
@@ -117,16 +142,24 @@ pub fn main(init: std.process.Init) !void {
                 try gpu.pushClipPath(scratch_path.elements.items);
             },
             .pop_clip_path => try gpu.popClipPath(),
-            .fill_blurred_rounded_rect,
-            .push_clip_layer,
-            .push_layer,
-            .pop_layer,
-            .set_filter_effect,
-            .reset_filter_effect,
-            .glyph_run,
-            => {
+            .fill_blurred_rounded_rect => |spec| try gpu.fillBlurredRoundedRect(
+                kurbo.Rect.new(spec.rect[0], spec.rect[1], spec.rect[2], spec.rect[3]),
+                @floatCast(spec.radius),
+                @floatCast(spec.std_dev),
+                spec.invert,
+            ),
+            .push_clip_layer => |svg| {
+                try parseSvg(allocator, &scratch_path, svg);
+                defer resetScratch(allocator, &scratch_path);
+                try gpu.pushClipLayer(scratch_path.elements.items);
+            },
+            .push_layer => |spec| try pushLayerSpec(allocator, &gpu, &scratch_path, spec),
+            .pop_layer => try gpu.popLayer(),
+            .set_filter_effect => |filter_spec| gpu.setFilterEffect(try filterFromSpec(allocator, filter_spec)),
+            .reset_filter_effect => gpu.resetFilterEffect(),
+            .glyph_run => {
                 std.debug.print(
-                    "vellz-gpu-render: scene command '{s}' is not supported by the root strip milestone\n",
+                    "vellz-gpu-render: scene command '{s}' is not supported by the GPU renderer\n",
                     .{@tagName(command)},
                 );
                 return error.Unsupported;
@@ -175,11 +208,21 @@ pub fn main(init: std.process.Init) !void {
     var renderer = try backend.renderer.Renderer.init(allocator, &dev, target_format, width, height);
     defer renderer.deinit();
 
+    var binding_entries = try allocator.alloc(backend.renderer.TextureBindings.Entry, assets.items.len);
+    defer allocator.free(binding_entries);
+    for (assets.items, 0..) |asset, index| {
+        binding_entries[index] = .{
+            .id = asset.id,
+            .texture = .{ .view = asset.view, .texture = asset.texture },
+        };
+    }
+    const bindings = backend.renderer.TextureBindings{ .entries = binding_entries };
+
     const target_init: backend.renderer.TargetInit = switch (parsed_scene.target_init) {
         .clear => .{ .clear = peniko.color.Color.TRANSPARENT },
         .src_over => .src_over,
     };
-    try renderer.render(&gpu, target_view, depth_view, target_init);
+    try renderer.renderWithBindings(&gpu, target_view, depth_view, target_init, bindings, texture);
 
     const pixels = try backend.readback.readTexture(allocator, &dev, texture, width, height);
     defer allocator.free(pixels);
@@ -204,21 +247,253 @@ fn usage() error{InvalidArguments} {
     return error.InvalidArguments;
 }
 
-fn applyPaint(gpu: *gpu_scene.Scene, spec: scene_mod.PaintSpec) !void {
+fn blendFromSpec(spec: scene_mod.BlendSpec) peniko.BlendMode {
+    return .{
+        .mix = std.meta.stringToEnum(peniko.Mix, @tagName(spec.mix)).?,
+        .compose = std.meta.stringToEnum(peniko.Compose, @tagName(spec.compose)).?,
+    };
+}
+
+fn edgeModeFromSpec(mode: scene_mod.EdgeMode) common.filter_effects.EdgeMode {
+    return std.meta.stringToEnum(common.filter_effects.EdgeMode, @tagName(mode)).?;
+}
+
+fn filterFromSpec(allocator: std.mem.Allocator, spec: scene_mod.FilterSpec) !common.filter_effects.Filter {
+    const fe = common.filter_effects;
+    const toColor = struct {
+        fn call(rgba: [4]u8) peniko.Color {
+            return peniko.color.Color.fromRgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
+        }
+    }.call;
+
+    const primitive: fe.FilterPrimitive = switch (spec) {
+        .flood => |rgba| .{ .flood = .{ .color = toColor(rgba) } },
+        .gaussian_blur => |blur| .{ .gaussian_blur = .{
+            .std_deviation = @floatCast(blur.std_deviation),
+            .edge_mode = edgeModeFromSpec(blur.edge_mode),
+        } },
+        .offset => |offset| .{ .offset = .{
+            .dx = @floatCast(offset.dx),
+            .dy = @floatCast(offset.dy),
+        } },
+        .drop_shadow => |shadow| .{ .drop_shadow = .{
+            .dx = @floatCast(shadow.dx),
+            .dy = @floatCast(shadow.dy),
+            .std_deviation = @floatCast(shadow.std_deviation),
+            .color = toColor(shadow.rgba8),
+            .edge_mode = edgeModeFromSpec(shadow.edge_mode),
+        } },
+        .drop_shadow_only => |shadow| .{ .drop_shadow_only = .{
+            .dx = @floatCast(shadow.dx),
+            .dy = @floatCast(shadow.dy),
+            .std_deviation = @floatCast(shadow.std_deviation),
+            .color = toColor(shadow.rgba8),
+            .edge_mode = edgeModeFromSpec(shadow.edge_mode),
+        } },
+    };
+    return fe.Filter.fromPrimitive(allocator, primitive);
+}
+
+/// Map a layer spec onto the GPU scene's layer stack.
+///
+/// Mask layers are unsupported by the GPU render pipeline and fail with a
+/// typed error (no approximation).
+fn pushLayerSpec(
+    allocator: std.mem.Allocator,
+    gpu: *gpu_scene.Scene,
+    scratch: *kurbo.BezPath,
+    spec: scene_mod.LayerSpec,
+) !void {
+    switch (spec) {
+        .clip => |svg| {
+            try parseSvg(allocator, scratch, svg);
+            defer resetScratch(allocator, scratch);
+            try gpu.pushClipLayer(scratch.elements.items);
+        },
+        .blend => |blend| try gpu.pushBlendLayer(blendFromSpec(blend)),
+        .opacity => |opacity| try gpu.pushOpacityLayer(@floatCast(opacity)),
+        .mask => {
+            std.debug.print(
+                "vellz-gpu-render: mask layers are not supported by the GPU render pipeline\n",
+                .{},
+            );
+            return error.Unsupported;
+        },
+        .filter => |filter_spec| {
+            const filter = try filterFromSpec(allocator, filter_spec.filter);
+            var clip_elements: ?[]const kurbo.PathEl = null;
+            if (filter_spec.clip) |svg| {
+                try parseSvg(allocator, scratch, svg);
+                clip_elements = scratch.elements.items;
+            }
+            defer if (clip_elements != null) resetScratch(allocator, scratch);
+
+            const blend: ?peniko.BlendMode = if (filter_spec.blend) |blend|
+                blendFromSpec(blend)
+            else
+                null;
+            const opacity: ?f32 = if (filter_spec.opacity) |value| @floatCast(value) else null;
+            if (filter_spec.mask != null) {
+                std.debug.print(
+                    "vellz-gpu-render: mask layers are not supported by the GPU render pipeline\n",
+                    .{},
+                );
+                filter.deinit(allocator);
+                return error.Unsupported;
+            }
+            try gpu.pushLayer(clip_elements, blend, opacity, null, filter);
+        },
+    }
+}
+
+fn applyPaint(
+    gpu: *gpu_scene.Scene,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scene_dir: []const u8,
+    assets: *std.ArrayList(Asset),
+    spec: scene_mod.PaintSpec,
+) !void {
     switch (spec) {
         .solid => |rgba| {
             gpu.setPaint(common.paint.PaintType.fromAlphaColor(
                 peniko.color.Color.fromRgba8(rgba[0], rgba[1], rgba[2], rgba[3]),
             ));
         },
-        .gradient, .image => {
-            std.debug.print(
-                "vellz-gpu-render: paint kind '{s}' needs the encoded-paint milestone\n",
-                .{@tagName(spec)},
-            );
-            return error.Unsupported;
+        .gradient => |g| {
+            var gradient: peniko.Gradient = .{};
+            gradient.extend = std.meta.stringToEnum(peniko.Extend, @tagName(g.extend)).?;
+            gradient.kind = switch (g.kind) {
+                .linear => |l| .{ .linear = peniko.LinearGradientPosition.new(
+                    .{ .x = l.start[0], .y = l.start[1] },
+                    .{ .x = l.end[0], .y = l.end[1] },
+                ) },
+                .radial => |r| .{ .radial = peniko.RadialGradientPosition.newTwoPoint(
+                    .{ .x = r.start_center[0], .y = r.start_center[1] },
+                    @floatCast(r.start_radius),
+                    .{ .x = r.end_center[0], .y = r.end_center[1] },
+                    @floatCast(r.end_radius),
+                ) },
+                .sweep => |sw| .{ .sweep = peniko.SweepGradientPosition.new(
+                    .{ .x = sw.center[0], .y = sw.center[1] },
+                    @floatCast(sw.start_angle),
+                    @floatCast(sw.end_angle),
+                ) },
+            };
+            const stops = try allocator.alloc(peniko.ColorStop, g.stops.len);
+            defer allocator.free(stops);
+            for (g.stops, 0..) |stop, i| {
+                stops[i] = .{
+                    .offset = @floatCast(stop.offset),
+                    .color = peniko.color.Color.fromRgba8(
+                        stop.rgba8[0],
+                        stop.rgba8[1],
+                        stop.rgba8[2],
+                        stop.rgba8[3],
+                    ),
+                };
+            }
+            gradient.stops = try peniko.ColorStops.fromSlice(allocator, stops);
+            gpu.setPaint(common.paint.PaintType.fromGradient(gradient));
+        },
+        .image => |spec_image| {
+            const asset = try loadAsset(allocator, io, scene_dir, assets, spec_image);
+            const source = common.paint.ImageSource.initExternalTexture(
+                common.paint.TextureId.new(asset.id),
+                common.geometry.RectU16.new(0, 0, asset.width, asset.height),
+                asset.may_have_transparency,
+            ) catch |err| return err;
+            const image = common.paint.Image{
+                .image = source,
+                .sampler = .{
+                    .x_extend = std.meta.stringToEnum(peniko.Extend, @tagName(spec_image.sampler.x_extend)).?,
+                    .y_extend = std.meta.stringToEnum(peniko.Extend, @tagName(spec_image.sampler.y_extend)).?,
+                    .quality = std.meta.stringToEnum(peniko.ImageQuality, @tagName(spec_image.sampler.quality)).?,
+                    .alpha = @floatCast(spec_image.sampler.alpha),
+                },
+            };
+            gpu.setPaint(common.paint.PaintType.fromImage(image));
         },
     }
+}
+
+/// Load (or reuse) a raw RGBA8 asset as a premultiplied `Rgba8Unorm` texture.
+fn loadAsset(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scene_dir: []const u8,
+    assets: *std.ArrayList(Asset),
+    spec: scene_mod.ImageSpec,
+) !*const Asset {
+    for (assets.items) |*asset| {
+        if (asset.width == spec.width and
+            asset.height == spec.height and
+            std.mem.eql(u8, asset.path, spec.asset))
+        {
+            return asset;
+        }
+    }
+
+    const dev_handle = current_device orelse return error.DeviceLost;
+    // `Pixmap.fromParts` already premultiplies straight-alpha bytes in
+    // place, so the pixmap bytes can be uploaded as-is.
+    var pixmap = try loadRawPixmap(allocator, io, scene_dir, spec);
+    defer pixmap.deinit(allocator);
+
+    const texture = try backend.wgpu.createTexture2d(
+        dev_handle,
+        spec.width,
+        spec.height,
+        c.WGPUTextureFormat_RGBA8Unorm,
+        c.WGPUTextureUsage_TextureBinding | c.WGPUTextureUsage_CopyDst,
+        "vellz-image-asset",
+    );
+    errdefer c.wgpuTextureRelease(texture);
+    const view = try backend.wgpu.createFullView(
+        texture,
+        c.WGPUTextureFormat_RGBA8Unorm,
+        "vellz-image-asset-view",
+    );
+    errdefer c.wgpuTextureViewRelease(view);
+    try backend.wgpu.writeRgba8(dev_handle, texture, pixmap.dataAsU8Slice(), spec.width, spec.height);
+
+    const path = try allocator.dupe(u8, spec.asset);
+    errdefer allocator.free(path);
+    try assets.append(allocator, .{
+        .id = @intCast(assets.items.len + 1),
+        .path = path,
+        .width = spec.width,
+        .height = spec.height,
+        .texture = texture,
+        .view = view,
+        .may_have_transparency = pixmap.mayHaveTransparency(),
+    });
+    return &assets.items[assets.items.len - 1];
+}
+
+fn loadRawPixmap(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scene_dir: []const u8,
+    spec: scene_mod.ImageSpec,
+) !vellz.common.pixmap.Pixmap {
+    const path = try std.fs.path.join(allocator, &.{ scene_dir, spec.asset });
+    defer allocator.free(path);
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
+    defer allocator.free(bytes);
+
+    if (spec.format == .bgra8) {
+        var i: usize = 0;
+        while (i + 3 < bytes.len) : (i += 4) std.mem.swap(u8, &bytes[i], &bytes[i + 2]);
+    }
+
+    const peniko_alpha: peniko.ImageAlphaType = switch (spec.alpha_type) {
+        .alpha => .alpha,
+        .premultiplied => .alpha_premultiplied,
+    };
+    const metadata = vellz.common.pixmap.PixelMetadata.new(peniko_alpha, true);
+    return vellz.common.pixmap.Pixmap.fromParts(allocator, bytes, spec.width, spec.height, metadata);
 }
 
 fn parseSvg(

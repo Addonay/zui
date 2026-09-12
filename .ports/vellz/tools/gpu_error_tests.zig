@@ -11,6 +11,9 @@
 //!    lost and `Device.check` / `Renderer.render` return `error.DeviceLost`.
 //! 3. The forced-adapter-failure path returns `error.NoAdapter` (duplicated
 //!    from the smoke test so this executable is a single error-policy gate).
+//! 4. Image paints reject unbound textures (`error.MissingTextureBinding`)
+//!    and textures that are also the render target
+//!    (`error.TextureFeedbackLoop`).
 
 const std = @import("std");
 const vellz = @import("vellz");
@@ -138,6 +141,101 @@ pub fn main(init: std.process.Init) !void {
         dev.deinit();
     }
 
+    // 4. Image-binding policy: an image paint with no bound texture fails
+    // with `MissingTextureBinding`, and a texture that is also the render
+    // target fails with `TextureFeedbackLoop`. Both are emitted before any
+    // command is submitted and never fall back to a CPU path.
+    {
+        var instance = try backend.Instance.create();
+        defer instance.deinit();
+        var adapter = try backend.Adapter.acquire(&instance, .{});
+        defer adapter.deinit();
+        var dev = try backend.Device.acquire(allocator, &adapter, "vellz-gpu-errors-bindings");
+        defer dev.deinit();
+
+        var renderer = try backend.renderer.Renderer.init(
+            allocator,
+            &dev,
+            c.WGPUTextureFormat_RGBA8Unorm,
+            64,
+            64,
+        );
+        defer renderer.deinit();
+
+        const target = try backend.wgpu.createTexture2d(
+            &dev,
+            64,
+            64,
+            c.WGPUTextureFormat_RGBA8Unorm,
+            c.WGPUTextureUsage_RenderAttachment | c.WGPUTextureUsage_CopySrc,
+            "vellz-gpu-errors-image-target",
+        );
+        defer c.wgpuTextureRelease(target);
+        const target_view = try backend.wgpu.createFullView(
+            target,
+            c.WGPUTextureFormat_RGBA8Unorm,
+            "vellz-gpu-errors-image-target-view",
+        );
+        defer c.wgpuTextureViewRelease(target_view);
+
+        var scene = try gpu_scene.Scene.init(allocator, 64, 64);
+        defer scene.deinit();
+        const source = try vellz.common.paint.ImageSource.initExternalTexture(
+            vellz.common.paint.TextureId.new(42),
+            vellz.common.geometry.RectU16.new(0, 0, 1, 1),
+            true,
+        );
+        scene.setPaint(vellz.common.paint.PaintType.fromImage(.{
+            .image = source,
+            .sampler = .{},
+        }));
+        try scene.fillRect(&vellz.kurbo.Rect.new(0, 0, 64, 64));
+
+        const missing = renderer.renderWithBindings(
+            &scene,
+            target_view,
+            null,
+            .{ .clear = vellz.peniko.color.Color.TRANSPARENT },
+            .{},
+            target,
+        );
+        if (missing) |_| {
+            std.debug.print("FAIL: unbound image texture was accepted\n", .{});
+            failed = true;
+        } else |err| {
+            if (err != error.MissingTextureBinding) {
+                std.debug.print("FAIL: unbound image returned {s}, expected MissingTextureBinding\n", .{@errorName(err)});
+                failed = true;
+            } else {
+                std.debug.print("PASS: unbound image -> error.MissingTextureBinding\n", .{});
+            }
+        }
+
+        const entries = [_]backend.renderer.TextureBindings.Entry{.{
+            .id = 42,
+            .texture = .{ .view = target_view, .texture = target },
+        }};
+        const feedback = renderer.renderWithBindings(
+            &scene,
+            target_view,
+            null,
+            .{ .clear = vellz.peniko.color.Color.TRANSPARENT },
+            .{ .entries = &entries },
+            target,
+        );
+        if (feedback) |_| {
+            std.debug.print("FAIL: feedback-loop image texture was accepted\n", .{});
+            failed = true;
+        } else |err| {
+            if (err != error.TextureFeedbackLoop) {
+                std.debug.print("FAIL: feedback-loop image returned {s}, expected TextureFeedbackLoop\n", .{@errorName(err)});
+                failed = true;
+            } else {
+                std.debug.print("PASS: feedback-loop image -> error.TextureFeedbackLoop\n", .{});
+            }
+        }
+    }
+
     // 3. Forced adapter failure (same contract as the smoke test).
     {
         var instance = try backend.Instance.create();
@@ -159,5 +257,5 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (failed) return error.GpuErrorPolicyFailed;
-    std.debug.print("PASS: GPU error policy (capability, device loss, adapter failure)\n", .{});
+    std.debug.print("PASS: GPU error policy (capability, device loss, adapter failure, image bindings)\n", .{});
 }

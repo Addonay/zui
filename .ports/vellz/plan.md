@@ -212,17 +212,17 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | --- | --- | --- | --- |
 | `render/common.rs` (Config, GpuStrip, clear/encoded paint structs, packing) | `gpu/render/common.zig` | port | 8 layout/packing tests run in the default `zig build test`; comptime `@sizeOf`/`@offsetOf` asserts match `docs/shader-interface.md` §4 |
 | `render/wgpu/mod.rs` (device bootstrap/readback/clear subset) | `gpu/backend/{device,wgpu,readback}.zig` | partial | T1: instance/adapter/device/queue, error scopes, uncaptured/device-lost capture, limits, adapter-info printing, texture readback; `run-gpu-smoke` passes offscreen on lavapipe (all handles released, zero validation errors) |
-| `render/wgpu/mod.rs` (Programs, pipelines, resources, root passes) | `gpu/backend/{wgpu,renderer}.zig` | conn | T3/T4: shader modules from checked-in WGSL, bind-group layouts for render groups 0–3 + filter/blend/copy, four 24-B strip pipeline variants, layer/root/atlas clear, copy/blend/filter pipelines, Config uniform, `Rgba32Uint` uploads (256-B rows), offscreen root renderer. Evidence: `-Dgpu=true test` 768/768, `gpu-corpus` 9/9 scenes (7 byte-exact, 2 within max-abs 1); no layers/gradients/images/filters yet (`error.Unsupported`) |
-| `draw.rs`, `scene.rs` | `gpu/draw.zig`, `gpu/scene.zig` | port | T4: solid paints, rect fast path, filled/stroked paths, clip paths, `CommandRecorder`, opaque/alpha routing, depth counter, external-texture runs; layers/indexed paints return `error.Unsupported` until the schedule/encoded-paint milestones |
-| `schedule/*` | `gpu/schedule/*.zig` | defer | M5 T5+; root pass currently renders the single root draw directly |
-| `target.rs` | `gpu/target.zig` | port | Root/layer targets, parity, batch bindings, texture regions (T4) |
+| `render/wgpu/mod.rs` (Programs, pipelines, resources, root passes) | `gpu/backend/{wgpu,renderer}.zig` | conn | T3/T4 + schedule: shader modules from checked-in WGSL, bind-group layouts for render groups 0–3 + filter/blend/copy, four 24-B strip pipelines, layer/root/atlas clear, copy/blend/filter passes, per-target `Config` uniforms, `Rgba32Uint` uploads (256-B rows), encoded-paints/gradient/filter-data textures, external-texture runs, and a schedule executor over per-frame texture pages. Evidence: `-Dgpu=true test` 787/787, `gpu-corpus` 44/44 gated scenes |
+| `draw.rs`, `scene.rs` | `gpu/draw.zig`, `gpu/scene.zig` | port | solid + indexed paints (gradients, images, blurred rounded rects) via `common.encode`, layers (clip/blend/opacity/filter) and implicit per-draw filter/blend layers, clips, transforms, tints, fast-rect CPU-bbox emulation; mask layers typed `error.Unsupported` (upstream GPU has no mask path) |
+| `schedule/*` | `gpu/schedule/{allocate,mod}.zig` | port (adapted) | M5 T5: guillotiere atlas pages with filter padding, lazy bottom-up layer allocation and release clears, scratch-texture accounting, blend/filter/clear ops in dependency order. The round/stage batching is unnecessary here because each op opens its own render pass; documented in the module header |
+| `target.rs` | `gpu/target.zig` | port | Root/layer targets, parity, blend/filter bindings, texture regions (T4) |
 | `util.rs` | `gpu/util.zig` | port | packing helpers + `Ranges`/`RangedSlice` (T4) |
 | `copy.rs` | `gpu/copy.zig` | port | `GpuCopyInstance` (16 B) + packing test |
-| `blend.rs` | `gpu/blend.zig` | partial | `GpuBlendInstance` (32 B) + `blend_config` bit packing; `new`/`copy_from_scratch` need the schedule |
-| `filter.rs` (layout subset) | `gpu/filter.zig` | partial | 48-byte blocks, `FilterInstanceData` (36 B), header/pass-kind constants; `PreparedFilter` conversions and the pass planner follow |
-| `paint.rs`, `rect.rs` | `gpu/paint.zig`, `gpu/rect.zig` | port | T4: solid paint packing + full `split_rect`/coverage port; indexed paints return `error.Unsupported` until encoded paints land |
-| `gradient_cache.rs` | `gpu/gradient_cache.zig` | defer | M5 |
-| `resources.rs`, `text.rs` | `gpu/resources.zig`, `gpu/text.zig` | defer | M5/M3 |
+| `blend.rs` | `gpu/blend.zig` | port | `GpuBlendInstance` (32 B), `BlendOp`/`BlendStrip`, `new`/`copy_from_scratch` |
+| `filter.rs` | `gpu/filter.zig` | port | 48-byte blocks, `FilterInstanceData` (36 B), `PreparedFilter` → Gpu* conversions, `FilterContext` (offsets + serialization), `FilterPassPlan` blur/shadow step sequences |
+| `paint.rs`, `rect.rs` | `gpu/paint.zig`, `gpu/rect.zig` | port | solid + indexed paint packing, external-image texture sources, `prepare_gpu_encoded_paints` (offsets + `Rgba32Uint` data), full `split_rect` |
+| `gradient_cache.rs` | `gpu/gradient_cache.zig` | port (adapted) | packed RGBA8 gradient LUTs deduplicated by `GradientCacheKey`; per-render cache, no LRU eviction (documented) |
+| `resources.rs`, `text.rs` | `gpu/resources.zig`, `gpu/text.zig` | defer | image atlas uploads (`ImageSource.opaque_id`) and text; typed `error.Unsupported` today |
 | `render/webgl/*` | — | unsup | WebGL out of scope |
 | WGSL shaders | `gpu/shaders/generated.zig` | port | checked-in compiled WGSL; all five modules create successfully on lavapipe; clear + render drive the smoke and root corpus |
 
@@ -817,3 +817,33 @@ of panics, thread ownership).
   every stage because the native build lets LLVM auto-vectorize the scalar
   transcriptions; that is recorded honestly rather than claimed as a win.
   `vellz-cli`/`tools/compare_corpus.sh` gained `--level` for per-level gates.
+- 2026-09-12: **M5 schedule/layers/gradients/images/filters landed** (branch
+  `vellz-gpu3`). `gpu/schedule/{allocate,mod}.zig`: guillotiere atlas pages
+  with padded filter regions, lazy bottom-up layer allocation, release clears,
+  scratch-texture accounting, and a dependency-ordered draw/filter/blend/clear
+  plan (the upstream round batching is unnecessary because this backend opens
+  one pass per operation; documented in the module header). `gpu/scene.zig`
+  now encodes indexed paints through `common.encode`, pushes/pops clip, blend,
+  opacity, and filter layers (plus the implicit per-draw filter/blend layer
+  from `setFilterEffect`), supports tints and blurred rounded rects, and
+  mirrors the CPU sparse-strip bbox for fast rectangles so layer extents match
+  the oracle. `gpu/paint.zig` resolves indexed paints and packs the
+  `Rgba32Uint` encoded-paints data; `gpu/gradient_cache.zig` packs the RGBA8
+  LUTs (dedup by `GradientCacheKey`, per-render cache without LRU);
+  `gpu/filter.zig` converts `PreparedFilter` to the 48-byte GPU blocks and
+  plans blur/shadow pass sequences; `backend/wgpu.zig` adds blend/copy/filter
+  passes, layer clears, child-layer strip bind groups, and external-texture
+  run draws; `backend/renderer.zig` executes the schedule over per-frame
+  texture pages. Masks stay typed `error.Unsupported`: upstream `vello_gpu`
+  has no mask sampling path, so `mask_alpha_64`, `mask_alpha_64_speed`, and
+  `mask_luminance_64` are not gated. Atlas-backed (`opaque_id`) image sources
+  and text remain unsupported (image-cache upload milestone). GPU corpus gate:
+  **44/44 gated scenes pass** (was 9), including every layer, filter, gradient,
+  and image scene; `image_bicubic_64_speed` is measured but ungated (max-abs 9
+  from the u8 oracle's bicubic filter). Evidence on llvmpipe
+  (`backend=vulkan type=cpu execution=software-adapter`): `zig build test`
+  = 774/774 (767 unit + 7 scene), `zig build corpus` 48/48 byte-exact,
+  `zig build -Dgpu=true test` = 787/787, `run-gpu-smoke`,
+  `run-gpu-errors` (now also covering `MissingTextureBinding` and
+  `TextureFeedbackLoop`), and `gpu-corpus` all green; per-scene metrics are in
+  `tests/README.md`'s tolerance registry.

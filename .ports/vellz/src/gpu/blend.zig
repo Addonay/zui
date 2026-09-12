@@ -9,7 +9,52 @@
 
 const std = @import("std");
 const peniko = @import("../peniko/root.zig");
+const common = @import("../common/root.zig");
+const copy = @import("copy.zig");
+const target = @import("target.zig");
 const util = @import("util.zig");
+
+const LayerTextureRegion = target.LayerTextureRegion;
+const RectU16 = common.geometry.RectU16;
+const SizeU16 = common.geometry.SizeU16;
+
+/// A strip for performing a clipped blend operation.
+pub const BlendStrip = struct {
+    /// Atlas-space bounds of the segment.
+    rect: RectU16,
+    /// Alpha texture column index, or `null` for a plain fill segment.
+    alpha_col_idx: ?u32,
+
+    /// Build a strip from a shifted fill segment.
+    pub fn fromFillSegment(rect: RectU16, alpha_col_idx: ?u32) BlendStrip {
+        return .{ .rect = rect, .alpha_col_idx = alpha_col_idx };
+    }
+};
+
+/// A scheduled non-default blend between a parent and child layer
+/// (upstream `schedule::round::BlendOp`).
+pub const BlendOp = struct {
+    /// Parent layer serving as both backdrop and blend destination.
+    parent_region: LayerTextureRegion,
+    /// Child layer serving as the blend source.
+    child_region: LayerTextureRegion,
+    /// Scene-space bounds affected by the blend.
+    blend_bbox: RectU16,
+    /// The blend mode that should be applied.
+    blend_mode: peniko.BlendMode,
+    /// Opacity applied to the child before sampling.
+    opacity: f32,
+    /// Range of strips used for clipping the blend layer, if any.
+    clip_strips: ?common.record.Range(u32),
+};
+
+/// Geometry shared while constructing a [`GpuBlendInstance`].
+const BlendGeometry = struct {
+    /// Atlas-space bounds of the geometry.
+    rect: RectU16,
+    /// Alpha texture column used by clipped strip geometry, if present.
+    alpha_col_idx: ?u32,
+};
 
 /// Per-instance data for one blend pass (`GpuBlendInstance` upstream).
 ///
@@ -36,6 +81,57 @@ pub const GpuBlendInstance = extern struct {
     /// Packed blend mode, opacity, parent/child texture parity, and
     /// alpha-presence flag.
     blend_config: u32,
+
+    /// Build the instance for one blend operation (upstream
+    /// `GpuBlendInstance::new`).
+    pub fn new(
+        blend_op: *const BlendOp,
+        clip_strip: ?BlendStrip,
+        parent_texture_size: SizeU16,
+    ) GpuBlendInstance {
+        const parent_rect = blend_op.parent_region.textureRect(blend_op.blend_bbox);
+        const child_parent_rect = blend_op.parent_region.textureRect(blend_op.child_region.layer_bbox);
+        const geometry = if (clip_strip) |strip|
+            BlendGeometry{ .rect = strip.rect, .alpha_col_idx = strip.alpha_col_idx }
+        else
+            BlendGeometry{ .rect = parent_rect, .alpha_col_idx = null };
+
+        return .{
+            .geometry_origin = util.packU16Pair(geometry.rect.x0, geometry.rect.y0),
+            .geometry_size = util.packU16Pair(geometry.rect.width(), geometry.rect.height()),
+            .geometry_alpha_col_idx = geometry.alpha_col_idx orelse 0,
+            .parent_texture_size = util.packU16Pair(parent_texture_size.width(), parent_texture_size.height()),
+            .child_texture_origin = util.packU16Pair(
+                blend_op.child_region.texture.rect.x0,
+                blend_op.child_region.texture.rect.y0,
+            ),
+            .child_parent_origin = util.packU16Pair(child_parent_rect.x0, child_parent_rect.y0),
+            .child_rect_size = util.packU16Pair(
+                blend_op.child_region.layer_bbox.width(),
+                blend_op.child_region.layer_bbox.height(),
+            ),
+            .blend_config = packBlendConfig(
+                blend_op.blend_mode.mix,
+                blend_op.blend_mode.compose,
+                blend_op.opacity,
+                blend_op.parent_region.texture.target.texture_parity == .odd,
+                blend_op.child_region.texture.target.texture_parity == .odd,
+                geometry.alpha_col_idx != null,
+            ),
+        };
+    }
+
+    /// The copy instance that moves the blended scratch region back into the
+    /// parent layer (upstream `GpuBlendInstance::copy_from_scratch`). The
+    /// scratch texture mirrors the target allocation, so origins are equal.
+    pub fn copyFromScratch(self: GpuBlendInstance) copy.GpuCopyInstance {
+        return .{
+            .dest_texture_origin = self.geometry_origin,
+            .source_texture_origin = self.geometry_origin,
+            .copy_rect_size = self.geometry_size,
+            .dest_texture_size = self.parent_texture_size,
+        };
+    }
 };
 
 comptime {

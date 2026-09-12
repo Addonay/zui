@@ -9,6 +9,10 @@
 
 const std = @import("std");
 const common = @import("../common/root.zig");
+const kurbo = @import("../kurbo/root.zig");
+const peniko = @import("../peniko/root.zig");
+const copy_mod = @import("copy.zig");
+const target_mod = @import("target.zig");
 
 /// Maximum size of the gaussian kernel (odd, ≤ `u8::MAX`); re-exported from
 /// the CPU-side filter model so both sides always agree.
@@ -238,6 +242,590 @@ comptime {
             @compileError("FilterInstanceData field offsets diverged from the shader contract");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `PreparedFilter` -> parameter-block conversions (upstream `filter.rs`)
+// ---------------------------------------------------------------------------
+
+/// A linear-sampling kernel derived from a discrete Gaussian kernel.
+///
+/// Pairs of adjacent texels are merged into one bilinear tap so each pass
+/// samples half as many times; see the linked article in the upstream source.
+pub const LinearKernel = struct {
+    /// Weight of the center tap.
+    center_weight: f32,
+    /// Merged weights for each tap pair (first `n_taps` entries valid).
+    weights: [MAX_TAPS_PER_SIDE]f32,
+    /// Fractional offsets for each tap pair (first `n_taps` entries valid).
+    offsets: [MAX_TAPS_PER_SIDE]f32,
+    /// The actual number of taps per side.
+    n_taps: u8,
+
+    /// Build a linear-sampling kernel from a discrete Gaussian kernel.
+    pub fn init(kernel: *const [common.filter.MAX_KERNEL_SIZE]f32, kernel_size: u8) LinearKernel {
+        const size: usize = kernel_size;
+        const radius = size / 2;
+        var result = LinearKernel{
+            .center_weight = kernel[radius],
+            .weights = @splat(0.0),
+            .offsets = @splat(0.0),
+            .n_taps = 0,
+        };
+
+        // The kernel is symmetric; only the positive side is processed.
+        var k: usize = 0;
+        while (radius + 1 + 2 * k + 1 < size) : (k += 1) {
+            const w1 = kernel[radius + 1 + 2 * k];
+            const w2 = kernel[radius + 1 + 2 * k + 1];
+            const merged_weight = w1 + w2;
+            const offset1: f32 = @floatFromInt(2 * k + 1);
+            const merged_offset = if (merged_weight > 0.0)
+                (w1 * offset1 + w2 * (offset1 + 1.0)) / merged_weight
+            else
+                offset1;
+            result.weights[result.n_taps] = merged_weight;
+            result.offsets[result.n_taps] = merged_offset;
+            result.n_taps += 1;
+        }
+
+        // A leftover tap samples a single pixel with no fractional offset.
+        if (radius + 1 + 2 * k < size) {
+            result.weights[result.n_taps] = kernel[radius + 1 + 2 * k];
+            result.offsets[result.n_taps] = @floatFromInt(radius);
+            result.n_taps += 1;
+        }
+        return result;
+    }
+};
+
+/// Pack two `u16` values with the first in the low half, matching the
+/// shaders' `u16x2` unpack order (`x | y << 16`; upstream `pack_u16_pair`).
+pub fn packU16Pair(x: u16, y: u16) u32 {
+    return @as(u32, x) | (@as(u32, y) << 16);
+}
+
+const testing = std.testing;
+
+/// Build a `GpuOffset` block from an offset filter.
+pub fn gpuOffsetFrom(offset: *const common.filter.Offset) GpuOffset {
+    return .{
+        .header = packHeader(filter_type.OFFSET),
+        .dx = offset.dx,
+        .dy = offset.dy,
+        ._padding = @splat(0),
+    };
+}
+
+/// Build a `GpuFlood` block from a flood filter.
+pub fn gpuFloodFrom(flood: *const common.filter.Flood) GpuFlood {
+    return .{
+        .header = packHeader(filter_type.FLOOD),
+        .color = flood.color.premultiply().toRgba8().toU32(),
+        ._padding = @splat(0),
+    };
+}
+
+/// Build a `GpuGaussianBlur` block from a prepared gaussian blur.
+pub fn gpuGaussianBlurFrom(blur: *const common.filter.GaussianBlur) GpuGaussianBlur {
+    const kernel = LinearKernel.init(&blur.kernel, blur.kernel_size);
+    return .{
+        .header = packHeaderWithGaussianParams(
+            filter_type.GAUSSIAN_BLUR,
+            edgeModeToGpu(blur.edge_mode),
+            @intCast(blur.n_decimations),
+            kernel.n_taps,
+        ),
+        .center_weight = kernel.center_weight,
+        .linear_weights = kernel.weights,
+        .linear_offsets = kernel.offsets,
+        ._padding = @splat(0),
+    };
+}
+
+/// Build a `GpuDropShadow` block from a prepared drop shadow.
+pub fn gpuDropShadowFrom(shadow: *const common.filter.DropShadow) GpuDropShadow {
+    const kernel = LinearKernel.init(&shadow.kernel, shadow.kernel_size);
+    const composite_original: u32 = if (shadow.composite_original) COMPOSITE_ORIGINAL_MASK else 0;
+    return .{
+        .header = packHeaderWithGaussianParams(
+            filter_type.DROP_SHADOW,
+            edgeModeToGpu(shadow.edge_mode),
+            @intCast(shadow.n_decimations),
+            kernel.n_taps,
+        ) | composite_original,
+        .center_weight = kernel.center_weight,
+        .linear_weights = kernel.weights,
+        .linear_offsets = kernel.offsets,
+        .dx = shadow.dx,
+        .dy = shadow.dy,
+        .color = shadow.color.premultiply().toRgba8().toU32(),
+        ._padding = @splat(0),
+    };
+}
+
+/// Convert a prepared filter into its type-erased 48-byte block.
+pub fn gpuFilterDataFrom(prepared: *const common.filter.PreparedFilter) GpuFilterData {
+    var data: GpuFilterData = undefined;
+    switch (prepared.*) {
+        .offset => |*offset| {
+            const block = gpuOffsetFrom(offset);
+            @memcpy(std.mem.asBytes(&data), std.mem.asBytes(&block));
+        },
+        .flood => |*flood| {
+            const block = gpuFloodFrom(flood);
+            @memcpy(std.mem.asBytes(&data), std.mem.asBytes(&block));
+        },
+        .gaussian_blur => |*blur| {
+            const block = gpuGaussianBlurFrom(blur);
+            @memcpy(std.mem.asBytes(&data), std.mem.asBytes(&block));
+        },
+        .drop_shadow => |*shadow| {
+            const block = gpuDropShadowFrom(shadow);
+            @memcpy(std.mem.asBytes(&data), std.mem.asBytes(&block));
+        },
+    }
+    return data;
+}
+
+/// Context tracking filter blocks accumulated while scheduling a scene.
+pub const FilterContext = struct {
+    /// Encoded filter parameter blocks, in offset order.
+    filters: std.ArrayList(GpuFilterData) = .empty,
+
+    /// Release the parameter blocks.
+    pub fn deinit(self: *FilterContext, allocator: std.mem.Allocator) void {
+        self.filters.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Drop all parameter blocks, keeping capacity.
+    pub fn clear(self: *FilterContext) void {
+        self.filters.clearRetainingCapacity();
+    }
+
+    /// Encode `filter_data` and return its offset block.
+    ///
+    /// Upstream panics on an unsupported filter shape; this port returns
+    /// `error.Unsupported`.
+    pub fn push(
+        self: *FilterContext,
+        allocator: std.mem.Allocator,
+        filter_data: *const common.filter.FilterData,
+    ) (std.mem.Allocator.Error || error{Unsupported})!PreparedGpuFilter {
+        const data_offset = self.totalTexels();
+        const prepared = common.filter.PreparedFilter.new(
+            &filter_data.filter,
+            filter_data.transform,
+        ) catch |err| switch (err) {
+            error.Unsupported => return error.Unsupported,
+        };
+        const data = gpuFilterDataFrom(&prepared);
+        try self.filters.append(allocator, data);
+        return .{ .data_offset = data_offset, .data = data };
+    }
+
+    /// Whether no filters have been encoded.
+    pub fn isEmpty(self: *const FilterContext) bool {
+        return self.filters.items.len == 0;
+    }
+
+    /// Total number of `RGBA32Uint` texels occupied by the parameter blocks.
+    pub fn totalTexels(self: *const FilterContext) u32 {
+        return @intCast(self.filters.items.len * FILTER_SIZE_TEXELS);
+    }
+
+    /// Serialize the blocks into `buffer` (which must be large enough).
+    pub fn serializeToBuffer(self: *const FilterContext, buffer: []u8) void {
+        const src = std.mem.sliceAsBytes(self.filters.items);
+        std.debug.assert(buffer.len >= src.len);
+        @memcpy(buffer[0..src.len], src);
+    }
+
+    /// Required height for the filter data texture, or `null` when empty.
+    pub fn requiredFilterDataHeight(self: *const FilterContext, resource_dimension: u32) ?u32 {
+        const required_texels = self.totalTexels();
+        if (required_texels == 0) return null;
+        return (required_texels + resource_dimension - 1) / resource_dimension;
+    }
+};
+
+/// Offset and encoded parameters for one filter recorded in `FilterContext`.
+pub const PreparedGpuFilter = struct {
+    /// Texel offset of the parameter block in the filter data texture.
+    data_offset: u32,
+    /// Encoded filter parameters.
+    data: GpuFilterData,
+};
+
+/// Concrete filter-execution plan for a batch of scheduled filters.
+pub const FilterPassPlan = struct {
+    /// Copies preserving original layer contents in the shared scratch texture.
+    copy_pass: std.ArrayList(copy_mod.GpuCopyInstance) = .empty,
+    /// Filter instances grouped by their index in each filter's pass sequence.
+    steps: std.ArrayList(std.ArrayList(FilterInstanceData)) = .empty,
+
+    /// Release the plan's storage.
+    pub fn deinit(self: *FilterPassPlan, allocator: std.mem.Allocator) void {
+        for (self.steps.items) |*step| step.deinit(allocator);
+        self.steps.deinit(allocator);
+        self.copy_pass.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Rebuild the plan for `filters`.
+    pub fn init(
+        self: *FilterPassPlan,
+        allocator: std.mem.Allocator,
+        filters: []const FilterOp,
+        texture_size: common.geometry.SizeU16,
+    ) std.mem.Allocator.Error!void {
+        self.clear();
+        for (filters) |filter| {
+            var builder = FilterPassBuilder{
+                .op = filter,
+                .texture_size = texture_size,
+                .passes = self,
+                .sizer = common.filter.DecimationSizer.init(
+                    filter.textures.original.rect.width(),
+                    filter.textures.original.rect.height(),
+                ),
+                .current_is_original = true,
+                .step = 0,
+            };
+            if (filter.gpu_filter.needsCopyPass()) {
+                try builder.pushCopyToScratchPass(allocator);
+            }
+            switch (filter.gpu_filter.filterType()) {
+                filter_type.OFFSET => try builder.emit(allocator, pass_kind.OFFSET),
+                filter_type.FLOOD => try builder.emit(allocator, pass_kind.FLOOD),
+                filter_type.GAUSSIAN_BLUR => try builder.emitBlurSequence(allocator, filter.gpu_filter.nDecimations()),
+                filter_type.DROP_SHADOW => {
+                    try builder.emit(allocator, pass_kind.OFFSET);
+                    try builder.emitBlurSequence(allocator, filter.gpu_filter.nDecimations());
+                    if (filter.gpu_filter.compositeOriginal()) {
+                        try builder.emit(allocator, pass_kind.COMPOSITE_DROP_SHADOW);
+                    } else {
+                        try builder.emit(allocator, pass_kind.COLORIZE);
+                    }
+                },
+                else => unreachable, // unsupported filter types are never encoded
+            }
+            try builder.ensureResultInOriginal(allocator);
+        }
+    }
+
+    /// The filter instances for each pass step.
+    pub fn stepItems(self: *const FilterPassPlan, step: usize) []const FilterInstanceData {
+        return self.steps.items[step].items;
+    }
+
+    /// Number of pass steps.
+    pub fn stepCount(self: *const FilterPassPlan) usize {
+        return self.steps.items.len;
+    }
+
+    /// The copy-to-scratch instances, or `null` when no copy is planned.
+    pub fn copyPass(self: *const FilterPassPlan) ?[]const copy_mod.GpuCopyInstance {
+        return if (self.copy_pass.items.len == 0) null else self.copy_pass.items;
+    }
+
+    /// Drop all planned passes, keeping capacity.
+    pub fn clear(self: *FilterPassPlan) void {
+        for (self.steps.items) |*step| step.clearRetainingCapacity();
+        self.copy_pass.clearRetainingCapacity();
+    }
+
+    fn stepMut(self: *FilterPassPlan, allocator: std.mem.Allocator, step: usize) std.mem.Allocator.Error!*std.ArrayList(FilterInstanceData) {
+        while (self.steps.items.len <= step) {
+            try self.steps.append(allocator, .empty);
+        }
+        return &self.steps.items[step];
+    }
+};
+
+/// Expands one scheduled filter into entries in a shared `FilterPassPlan`.
+pub const FilterPassBuilder = struct {
+    /// Scheduled filter and its original/temporary texture regions.
+    op: FilterOp,
+    /// Full dimensions of the intermediate texture pages.
+    texture_size: common.geometry.SizeU16,
+    /// The filter pass plan being written into.
+    passes: *FilterPassPlan,
+    /// Tracks dimensions through blur downscaling and upscaling.
+    sizer: common.filter.DecimationSizer,
+    /// Whether the next pass reads from the original region.
+    current_is_original: bool,
+    /// Index of the next pass in this filter's sequence.
+    step: usize,
+
+    /// Emit one pass, reading from the current region and writing to the other.
+    pub fn emit(self: *FilterPassBuilder, allocator: std.mem.Allocator, kind: u32) std.mem.Allocator.Error!void {
+        const sizes = self.applyPassDimensions(kind);
+        const original = self.op.textures.original;
+        const temporary = self.op.textures.temporary;
+        const rects: [2]common.geometry.RectU16 = if (self.current_is_original)
+            .{ original.rect, temporary.rect }
+        else
+            .{ temporary.rect, original.rect };
+        const source_rect = rects[0];
+        const dest_rect = rects[1];
+        const dest_texture_size = self.texture_size;
+
+        const step = try self.passes.stepMut(allocator, self.step);
+        try step.append(allocator, .{
+            .source_origin = packU16Pair(source_rect.x0, source_rect.y0),
+            .source_size = packU16Pair(sizes[0].width(), sizes[0].height()),
+            .dest_origin = packU16Pair(dest_rect.x0, dest_rect.y0),
+            .dest_size = packU16Pair(sizes[1].width(), sizes[1].height()),
+            .dest_texture_size = packU16Pair(dest_texture_size.width(), dest_texture_size.height()),
+            .filter_data_offset = self.op.filter_data_offset,
+            .original_origin = packU16Pair(original.rect.x0, original.rect.y0),
+            .original_size = packU16Pair(original.rect.width(), original.rect.height()),
+            .filter_pass_kind = kind,
+        });
+        self.step += 1;
+        self.current_is_original = !self.current_is_original;
+    }
+
+    /// Emit the full Gaussian blur sequence for `n_decimations`.
+    pub fn emitBlurSequence(self: *FilterPassBuilder, allocator: std.mem.Allocator, n_decimations: usize) std.mem.Allocator.Error!void {
+        for (0..n_decimations) |_| try self.emit(allocator, pass_kind.DOWNSCALE);
+        try self.emit(allocator, pass_kind.BLUR_H);
+
+        var final_pass: u32 = pass_kind.BLUR_V;
+        if (n_decimations > 0) {
+            try self.emit(allocator, pass_kind.BLUR_V);
+            for (0..n_decimations - 1) |_| try self.emit(allocator, pass_kind.UPSCALE);
+            final_pass = pass_kind.UPSCALE;
+        }
+        try self.emit(allocator, final_pass);
+    }
+
+    /// Emit a copy pass if the result ended up in the temporary region.
+    pub fn ensureResultInOriginal(self: *FilterPassBuilder, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
+        if (!self.current_is_original) try self.emit(allocator, pass_kind.COPY);
+    }
+
+    /// Preserve the unfiltered original layer in the shared scratch texture.
+    pub fn pushCopyToScratchPass(self: *FilterPassBuilder, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
+        const original = self.op.textures.original;
+        const dest_texture_size = self.texture_size;
+        try self.passes.copy_pass.append(allocator, .{
+            .dest_texture_origin = packU16Pair(original.rect.x0, original.rect.y0),
+            .source_texture_origin = packU16Pair(original.rect.x0, original.rect.y0),
+            .copy_rect_size = packU16Pair(original.rect.width(), original.rect.height()),
+            .dest_texture_size = packU16Pair(dest_texture_size.width(), dest_texture_size.height()),
+        });
+    }
+
+    fn applyPassDimensions(self: *FilterPassBuilder, kind: u32) [2]common.geometry.SizeU16 {
+        const SizeU16 = common.geometry.SizeU16;
+        switch (kind) {
+            pass_kind.DOWNSCALE => {
+                const current = self.sizer.current();
+                const next = self.sizer.downscale();
+                return .{ SizeU16.from(current), SizeU16.from(next) };
+            },
+            pass_kind.UPSCALE => {
+                const current = self.sizer.current();
+                const next = self.sizer.upscale();
+                return .{ SizeU16.from(current), SizeU16.from(next) };
+            },
+            else => {
+                const current = self.sizer.current();
+                const value = SizeU16.from(current);
+                return .{ value, value };
+            },
+        }
+    }
+};
+
+/// Round-bindings-free filter operation: parameter offsets plus texture regions.
+pub const FilterTextureRegions = struct {
+    /// Region containing the input and final filtered result.
+    original: target_mod.TextureRegion,
+    /// Opposite-parity region used for intermediate passes.
+    temporary: target_mod.TextureRegion,
+
+    /// Create new regions.
+    pub fn new(original: target_mod.TextureRegion, temporary: target_mod.TextureRegion) FilterTextureRegions {
+        return .{ .original = original, .temporary = temporary };
+    }
+
+    /// The bindings required by this filter operation.
+    pub fn roundBindings(self: FilterTextureRegions) target_mod.RoundBindings {
+        return target_mod.RoundBindings.new(self.original.target)
+            .merge(target_mod.RoundBindings.new(self.temporary.target)).?;
+    }
+};
+
+/// A scheduled filter and the texture regions on which it operates.
+pub const FilterOp = struct {
+    /// Original and temporary regions used by the filter passes.
+    textures: FilterTextureRegions,
+    /// Texel offset of this filter's parameters in the filter data texture.
+    filter_data_offset: u32,
+    /// Prepared filter parameters used to select and size passes.
+    gpu_filter: GpuFilterData,
+};
+
+test "linear kernel merges taps" {
+    const kernel = common.filter.computeGaussianKernel(2.0);
+    const linear = LinearKernel.init(&kernel.kernel, kernel.kernel_size);
+    try std.testing.expectEqual(@as(u8, 3), linear.n_taps);
+    var sum = linear.center_weight;
+    for (0..linear.n_taps) |i| sum += 2.0 * linear.weights[i];
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-5);
+
+    const identity = common.filter.planDecimatedBlur(0.0);
+    const identity_linear = LinearKernel.init(&identity.kernel, identity.kernel_size);
+    try std.testing.expectEqual(@as(u8, 0), identity_linear.n_taps);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), identity_linear.center_weight, 1e-6);
+}
+
+test "filter instance pair packing matches the shader" {
+    // Shaders unpack `u16x2` as `(value & 0xffff, value >> 16)`.
+    try testing.expectEqual(@as(u32, 0x0002_0001), packU16Pair(1, 2));
+    try testing.expectEqual(@as(u32, 0x0002_0001), copy_mod.GpuCopyInstance.new(
+        .{ 1, 2 },
+        .{ 0, 0 },
+        .{ 0, 0 },
+        .{ 0, 0 },
+    ).dest_texture_origin);
+}
+
+test "prepared filter conversions round trip headers" {
+    const offset = common.filter.Offset.new(1.0, 2.0);
+    const offset_block = gpuOffsetFrom(&offset);
+    try std.testing.expectEqual(filter_type.OFFSET, offset_block.header & 0x1F);
+    var erased: GpuFilterData = undefined;
+    @memcpy(std.mem.asBytes(&erased), std.mem.asBytes(&offset_block));
+    try std.testing.expectEqual(filter_type.OFFSET, erased.filterType());
+
+    const flood = common.filter.Flood.new(peniko.color.Color.fromRgba8(255, 0, 0, 128));
+    const flood_block = gpuFloodFrom(&flood);
+    try std.testing.expectEqual(filter_type.FLOOD, flood_block.header & 0x1F);
+
+    const blur = common.filter.GaussianBlur.new(2.0, .none);
+    const blur_block = gpuGaussianBlurFrom(&blur);
+    try std.testing.expectEqual(filter_type.GAUSSIAN_BLUR, blur_block.header & 0x1F);
+    try std.testing.expectEqual(@as(u32, 3), (blur_block.header >> 11) & 0x3);
+
+    const shadow = common.filter.DropShadow.new(
+        3.0,
+        -4.0,
+        8.0,
+        .none,
+        peniko.color.Color.fromRgb8(0, 0, 0),
+    );
+    const shadow_block = gpuDropShadowFrom(&shadow);
+    try std.testing.expectEqual(filter_type.DROP_SHADOW, shadow_block.header & 0x1F);
+    try std.testing.expect(shadow_block.header & COMPOSITE_ORIGINAL_MASK != 0);
+
+    const prepared = common.filter.PreparedFilter{ .offset = offset };
+    const data = gpuFilterDataFrom(&prepared);
+    try std.testing.expectEqual(filter_type.OFFSET, data.filterType());
+    try std.testing.expect(!data.needsCopyPass());
+}
+
+test "filter context offsets and serialization" {
+    const allocator = testing.allocator;
+    var context = FilterContext{};
+    defer context.deinit(allocator);
+
+    var offset_data = common.filter.FilterData.new(
+        try common.filter_effects.Filter.fromPrimitive(allocator, .{ .offset = .{ .dx = 1.0, .dy = 2.0 } }),
+        kurbo.Affine.IDENTITY,
+    );
+    defer offset_data.deinit(allocator);
+    const first = try context.push(allocator, &offset_data);
+    try testing.expectEqual(@as(u32, 0), first.data_offset);
+    try testing.expectEqual(@as(u32, 3), context.totalTexels());
+    try testing.expectEqual(@as(?u32, 1), context.requiredFilterDataHeight(4096));
+
+    var blur_data = common.filter.FilterData.new(
+        try common.filter_effects.Filter.fromPrimitive(allocator, .{
+            .gaussian_blur = .{ .std_deviation = 3.0, .edge_mode = .none },
+        }),
+        kurbo.Affine.IDENTITY,
+    );
+    defer blur_data.deinit(allocator);
+    const second = try context.push(allocator, &blur_data);
+    try testing.expectEqual(@as(u32, 3), second.data_offset);
+    try testing.expectEqual(@as(u32, 6), context.totalTexels());
+
+    var buffer: [FILTER_SIZE_BYTES * 2]u8 = undefined;
+    context.serializeToBuffer(&buffer);
+    try testing.expectEqual(@as(u32, filter_type.OFFSET), std.mem.bytesAsValue(u32, buffer[0..4]).* & 0x1F);
+    try testing.expectEqual(@as(u32, filter_type.GAUSSIAN_BLUR), std.mem.bytesAsValue(u32, buffer[48..52]).* & 0x1F);
+}
+
+test "filter pass plan sequences" {
+    const allocator = testing.allocator;
+    const SizeU16 = common.geometry.SizeU16;
+    const regions = FilterTextureRegions.new(
+        .{ .target = target_mod.LayerTextureId.new(.odd, 0), .rect = common.geometry.RectU16.new(0, 0, 32, 24) },
+        .{ .target = target_mod.LayerTextureId.new(.even, 0), .rect = common.geometry.RectU16.new(40, 0, 72, 24) },
+    );
+
+    var blur_data = common.filter.FilterData.new(
+        try common.filter_effects.Filter.fromPrimitive(allocator, .{
+            .gaussian_blur = .{ .std_deviation = 8.0, .edge_mode = .none },
+        }),
+        kurbo.Affine.IDENTITY,
+    );
+    defer blur_data.deinit(allocator);
+    var context = FilterContext{};
+    defer context.deinit(allocator);
+    const prepared = try context.push(allocator, &blur_data);
+    try testing.expect(prepared.data.nDecimations() > 0);
+
+    var plan = FilterPassPlan{};
+    defer plan.deinit(allocator);
+    try plan.init(
+        allocator,
+        &.{.{
+            .textures = regions,
+            .filter_data_offset = prepared.data_offset,
+            .gpu_filter = prepared.data,
+        }},
+        SizeU16.new(64),
+    );
+    try testing.expect(plan.copyPass() == null);
+    try testing.expectEqual(@as(u32, pass_kind.DOWNSCALE), plan.stepItems(0)[0].filter_pass_kind);
+    // A blur that decimates ends in the original region after its final
+    // upscale, so no extra copy pass is required.
+    try testing.expectEqual(
+        @as(u32, pass_kind.UPSCALE),
+        plan.stepItems(plan.stepCount() - 1)[0].filter_pass_kind,
+    );
+
+    var shadow_data = common.filter.FilterData.new(
+        try common.filter_effects.Filter.fromPrimitive(allocator, .{
+            .drop_shadow = .{
+                .dx = 3.0,
+                .dy = -4.0,
+                .std_deviation = 8.0,
+                .edge_mode = .none,
+                .color = peniko.color.Color.fromRgb8(0, 0, 0),
+            },
+        }),
+        kurbo.Affine.IDENTITY,
+    );
+    defer shadow_data.deinit(allocator);
+    const shadow = try context.push(allocator, &shadow_data);
+    try testing.expect(shadow.data.needsCopyPass());
+    try plan.init(
+        allocator,
+        &.{.{
+            .textures = regions,
+            .filter_data_offset = shadow.data_offset,
+            .gpu_filter = shadow.data,
+        }},
+        SizeU16.new(64),
+    );
+    try testing.expect(plan.copyPass() != null);
 }
 
 test "filter block layouts" {

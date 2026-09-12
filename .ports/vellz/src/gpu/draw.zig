@@ -272,7 +272,7 @@ pub fn DrawBuilder(comptime T: type) type {
             if (clip_path) |clip| {
                 const strips = strip_storage.strips.items[clip.strip_range.start..clip.strip_range.end];
                 const depth_index = self.state.depth_counter.next(false);
-                const tile_bounds = sample_bbox.toTileBounds();
+                const tile_bounds = toTileBounds(sample_bbox);
 
                 var ctx = LayerFillVisitContext(T){
                     .builder = self,
