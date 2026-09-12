@@ -116,5 +116,17 @@ byte-equal to each other in general (integer `div_255` rounding vs f32); the
 corpus compares each pipeline against its own oracle output, never against the
 other pipeline.
 
+## Multithreaded dispatch
+
+`RenderSettings.num_threads` in `1..=255` selects the multi-threaded
+dispatcher (`cpu/dispatch/mod.zig` vtable + `multi_threaded.zig`); `0` keeps
+the single-threaded one. The f32 MT output is asserted byte-identical to the
+single-threaded output by the differential test in `cpu/render.zig` (0..4
+threads). Corpus scenes keep `"threads": 0` so the committed fixtures stay the
+gold for both dispatchers; MT was additionally checked by rendering the
+committed scenes with `"threads": 4` and comparing against the same fixtures
+byte-for-byte. MT filter layers and u8 + MT return typed `error.Unsupported`
+(documented upstream limitations, never a silent fallback).
+
 Planned: positioned glyphs, mixed scripts, resource exhaustion,
 repeated resize.

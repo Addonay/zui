@@ -74,8 +74,8 @@ Non-goals for the first pass:
 - Window/event integration inside the library (examples may use platform glue).
 - The `research/` compute renderer, its encoding pipeline, or its shading model.
 - WebGL/WebGPU-targeted variants of `vello_gpu` (`render/webgl`, wasm builds).
-- `pico_svg`, `probe`, and other debug-only upstream features unless the oracle
-  corpus needs them.
+- `pico_svg` and other debug-only upstream features unless the oracle corpus
+  needs them (the upstream `probe` fixture is imported; see §12).
 
 ## 3. Architecture and dependency graph
 
@@ -448,6 +448,10 @@ of panics, thread ownership).
 
 ### Milestone 4 — CPU optimization
 
+- **Status (2026-09-12):** the u8 low-precision pipeline and multithreaded
+  f32 dispatch are landed on `main` and oracle/differential-verified (G4 is
+  not claimed yet: SIMD-level dispatch and methodology-complete timings are
+  still open).
 - u8 low-precision pipeline ported and connected behind
   `RenderMode.optimize_speed` (`cpu/fine/lowp/*`, dispatcher kernel selection).
 - Multi-threaded f32 dispatch ported: `dispatch/mod.zig` `Dispatcher` vtable +
@@ -621,3 +625,25 @@ of panics, thread ownership).
   fixtures byte-for-byte in Debug, ReleaseSafe, and ReleaseFast. Remaining
   for G4: native SIMD levels, MT filters, u8 + MT, and measured speedups.
 
+- 2026-09-12: **integration complete.** Merged `vellz-probe` (`2ce5579`),
+  `vellz-lowp` (`344f5c5`), and `vellz-mt` (`04f2c62`) into `main` in that
+  order. Composition: MT's `Dispatcher` vtable + persistent worker pool keep
+  the architecture; lowp's comptime kernel selection lives inside the
+  single-threaded dispatcher's `rasterizeWith(K)` (including upstream's
+  generic `rasterize_filter_layers`), and main's M2 filter layers keep
+  working on both kernels; the MT dispatcher still rejects `optimize_speed`
+  and filter layers with typed `error.Unsupported`. `RenderContext.flush`
+  stays `!void` (`error.NotFlushed` before an MT render), and the push-layer
+  seam now carries `Option<FilterData>` by value (upstream's shape): the
+  single-threaded dispatcher consumes it, MT releases it and errors. One
+  composition fix beyond textual merges: `cpu/fine/blurred_rect.zig` gained
+  the upstream `paintU8` path so the u8 kernel can use the M2 blurred-rect
+  painter. Final gates on `main`: `zig build test` = 638/638 (631 lib + 7
+  scene) and `zig build corpus` = 48/48 byte-exact at `tolerance=0` in Debug,
+  ReleaseSafe, and ReleaseFast; `zig build probe` byte-exact; `zig build
+  run-cpu-example` smoke test passes. MT spot checks: nine varied scenes
+  rendered with `"threads": 4` (`fill_overlap_alpha_64`,
+  `gradient_radial_64`, `stroke_basic_64`, `mask_alpha_64`, `clip_layer_64`,
+  `layer_opacity_64`, `image_bilinear_64`, `gradient_sweep_64`,
+  `fill_wave_seams_128`) match the committed fixtures byte-for-byte;
+  filter+MT and u8+MT fail with typed `error.Unsupported`.

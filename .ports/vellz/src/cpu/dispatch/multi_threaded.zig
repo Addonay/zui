@@ -31,9 +31,10 @@
 //!   transactional. Task ordering and recorded output are unchanged.
 //! - Upstream creates the per-thread `Fine`/`DepthBuffer` per rasterize call;
 //!   the port keeps them in each worker for reuse. No output difference.
-//! - Filter layers return `error.Unsupported` (upstream `unimplemented!`), and
-//!   `optimize_speed` returns `error.Unsupported` until the u8 kernel lands
-//!   (the dispatch seam the u8 port composes with).
+//! - Filter layers and `optimize_speed` return `error.Unsupported` (the
+//!   upstream multi-threaded limitations), never a silent fallback to the
+//!   single-threaded dispatcher; the u8 kernel is reached only through
+//!   `single_threaded.zig`.
 
 const std = @import("std");
 const simd = @import("../../simd/root.zig");
@@ -1194,4 +1195,59 @@ fn workerMain(worker: *worker_mod.Worker, shared: *SharedState) void {
         if (shared.shutdown) return;
         // Either a new run opened or the queue has work; loop for tasks.
     }
+}
+
+test "filter layers and optimize_speed stay typed errors (no fallback)" {
+    const allocator = testing.allocator;
+    const filter_effects = @import("../../common/filter_effects.zig");
+
+    var dispatcher = try MultiThreadedDispatcher.init(allocator, 8, 8, 2, .baseline);
+    defer dispatcher.deinit(allocator);
+
+    // Filter layers: upstream `unimplemented!` becomes a typed error, and the
+    // owned `FilterData` is released by the rejected call.
+    const filter = try filter_effects.Filter.fromPrimitive(allocator, .{
+        .flood = .{ .color = palette.RED },
+    });
+    const filter_data = filter_data_mod.FilterData.new(filter, kurbo.Affine.IDENTITY);
+    try testing.expectError(
+        error.Unsupported,
+        dispatcher.pushLayer(
+            allocator,
+            null,
+            .non_zero,
+            kurbo.Affine.IDENTITY,
+            BlendMode.default,
+            1.0,
+            null,
+            null,
+            filter_data,
+        ),
+    );
+    try testing.expect(!dispatcher.hasLayers());
+    try testing.expect(dispatcher.isMultiThreaded());
+
+    // `optimize_speed` is single-threaded only (upstream limitation): the MT
+    // rasterizer must not silently render it with the f32 kernel.
+    var pixmap = try pixmap_mod.Pixmap.init(allocator, 8, 8);
+    defer pixmap.deinit(allocator);
+    var target = pixmap.asMut();
+    try dispatcher.flush(allocator);
+    try testing.expectError(
+        error.Unsupported,
+        dispatcher.rasterize(
+            allocator,
+            &target,
+            8,
+            8,
+            .{
+                .render_mode = .optimize_speed,
+                .target_init = .{ .clear = peniko.Color.TRANSPARENT },
+                .pixel_format = .rgba8,
+                .offset = .{ .x = 0, .y = 0 },
+            },
+            &.{},
+            paint_mod.NO_OP_IMAGE_RESOLVER,
+        ),
+    );
 }

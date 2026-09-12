@@ -18,17 +18,19 @@ package (wgpu-native `v29.0.1.1`) rather than re-binding the C API locally.
 
 ## Status
 
-**Milestones 1 and 2 complete (G1 and G2 met 2026-09-12).** The CPU renderer
-produces premultiplied RGBA8 pixels through the full upstream pipeline (path
-encoding → flatten → tiles → sparse strips → coarse bucketing → fine
-rasterization) and every scene in the shared corpus — solid fills, strokes,
-gradients, images, layers, masks, filter layers, and blurred rounded
-rectangles — is **byte-exact against the pinned upstream oracle**
-(`tolerance=0`, all four channels) in Debug, ReleaseSafe, and ReleaseFast:
+**Milestones 1 and 2 complete (G1 and G2 met 2026-09-12); the M4 u8 and
+multithreaded CPU pipelines have landed (G4 not yet claimed).** The CPU
+renderer produces premultiplied RGBA8 pixels through the full upstream
+pipeline (path encoding → flatten → tiles → sparse strips → coarse bucketing →
+fine rasterization) and every scene in the shared corpus — solid fills,
+strokes, gradients, images, layers, masks, filter layers, and blurred rounded
+rectangles, each also in its low-precision `*_speed` variant — is
+**byte-exact against the pinned upstream oracle** (`tolerance=0`, all four
+channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 590/590 unit and integration tests
-zig build corpus   # 32/32 corpus scenes byte-exact vs the upstream oracle
+zig build test     # 638/638 unit and integration tests (631 lib + 7 scene)
+zig build corpus   # 48/48 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
 ```
 
@@ -39,16 +41,18 @@ gradients with LUT/repeat extend, nearest/bilinear image sampling with
 reflect, opacity and multiply-blend layers, alpha/luminance masks, filter
 layers (flood, offset, gaussian blur, drop shadow and shadow-only, composed
 with clip/opacity/blend), analytic blurred rounded rectangles (normal and
-inverted), and the ported upstream probe scene (solid, alpha blending,
-gradient, nearest/bilinear images, opacity layer, difference blend,
-rotation). The imported upstream `probe.rgba` fixture is byte-exact
+inverted), the ported upstream probe scene (solid, alpha blending, gradient,
+nearest/bilinear images, opacity layer, difference blend, rotation), the u8
+`optimize_speed` pipeline (16 `*_speed` scenes, u8-native LUT gradients and
+bilinear images), and multithreaded f32 dispatch (1–255 threads, byte-identical
+to single-threaded). The imported upstream `probe.rgba` fixture is byte-exact
 (tolerance policy 3, measured difference 0).
 
-Not yet on `main` (verified on integration branches, pending merge):
-u8-speed rasterization (`optimize_speed`, 16 extra corpus scenes) and
-multithreaded dispatch (byte-identical at 1–4 threads). Still to implement:
-glyph rendering and the GPU backend. See [`plan.md`](plan.md) for the ledgers
-and milestones.
+Not yet implemented (explicit typed errors, never placeholder pixels): glyph
+rendering (M3) and the hybrid GPU backend (M5). G4 still needs SIMD-level
+dispatch and methodology-complete speedup measurements; MT filter layers and
+u8 + MT return `error.Unsupported` (documented upstream limitations). See
+[`plan.md`](plan.md) for the ledgers and milestones.
 
 ## Layout
 
@@ -80,7 +84,7 @@ CPU-only, no GPU dependency:
 ```sh
 zig build test                  # unit + integration tests
 zig build check                 # compile without running
-zig build corpus                # G1 corpus gate against pinned oracle fixtures
+zig build corpus                # corpus gate: 48 scenes byte-exact vs pinned fixtures
 zig build probe                 # upstream probe fixture (tolerance-3 policy)
 zig build run-cpu-example       # writes cpu_example.ppm
 zig build vellz-cli             # corpus renderer CLI -> zig-out/bin
