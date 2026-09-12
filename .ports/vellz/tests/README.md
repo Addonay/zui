@@ -222,6 +222,7 @@ fixture.
 | CFF (Source Serif 4 OTF): fill, stroke, scale absorption, cache on/off | `glyph_run_cff_source_serif_*` |
 | CFF2 variable (Source Serif 4 VF OTF): fill, rotated direct mode, cache on/off | `glyph_run_cff2_source_serif_variable_*` |
 | variable fonts (`gvar`/`cvar`: wght/wdth min/max/both, composites, stroke, hint + cache on/off) | `glyph_run_var_*` |
+| synthetic embolden (`kurbo.expandPath`): hinted multi-row run, unhinted anisotropic, decoration skip-ink, cache on/off | `glyph_run_emboldened_*`, `glyph_run_embolden_decoration_*` |
 | upstream probe fixture | `tools/check_probe.sh` (`zig build probe`, embedded in `zig build test`) |
 
 The `*_speed` variants of the scenes above (16 scenes) are identical except for
@@ -232,9 +233,10 @@ They cover the u8-native gradient LUT and bilinear painters, the f32-painter
 `paintU8` conversion (nearest/bicubic images and undefined radial gradients),
 and the integer blend/composite/mask paths.
 
-All scenes above render byte-exact with `zig build corpus` (142/142,
+All scenes above render byte-exact with `zig build corpus` (148/148,
 `tolerance=0`: 32 quality/f32 + 16 speed/u8 + 34 outline glyph +
-6 decoration + 27 COLR + 5 bitmap + 10 CFF/CFF2 + 12 variable). The
+6 decoration + 27 COLR + 5 bitmap + 10 CFF/CFF2 + 12 variable + 6 embolden).
+The
 f32 and u8 pipelines are not byte-equal to each other in general (integer
 `div_255` rounding vs f32); the corpus compares each pipeline against its own
 oracle output, never against the other pipeline.
@@ -356,8 +358,12 @@ outlines). The oracle renders these scenes byte-identically with `hint(true)`
 `sbix` and `EBDT`/`EBLC` are ported at the table level (`tables/bitmap.zig`)
 and covered by synthetic-font unit tests (strike selection, glyph records,
 EBDT mask formats); the pinned checkout ships no `sbix`/`EBDT` asset, so no
-scene gates them end to end. `Bgra`/`Mask` payloads and PNG 16-bit/Adam7 fall
-through to the outline branch, matching upstream `glifo`'s `.ok()` filter.
+scene gates them end to end. `Bgra`/`Mask` payloads fall through to the
+outline branch, matching upstream `glifo`'s `.ok()` filter. PNG 16-bit and
+Adam7 payloads are decoded like `png 0.18` (`STRIP_16` high-byte strip and
+sparse Adam7 deinterleaving) and covered by unit tests against externally
+encoded streams; the pinned fonts only carry 8-bit non-interlaced PNGs, so no
+corpus scene gates those payloads end to end.
 
 Cache-on vs cache-off: the bitmap cache key carries the strike's own ppem
 (109) instead of the run size, and the decoded pixmap is queued as a
@@ -388,8 +394,8 @@ coordinates and CFF2 `seac`. The same fixtures also back the dump gate:
 `tools/compare_glyphs.sh` compares every glyph of both faces at several sizes
 (9 vectors) through the oracle's `--dump-glyphs` path.
 
-The dump gate covers 60 glyph vectors / 5 cmap vectors in total (2,335,632 path
-elements, 6,812,052 f32 coordinates, 458,752 cmap mappings) with per-vector
+The dump gate covers 64 glyph vectors / 5 cmap vectors in total (2,368,790 path
+elements, 6,921,912 f32 coordinates, 458,752 cmap mappings) with per-vector
 SHA-256s in `tests/fixtures/glyphs/manifest.zig`, checked by `zig build test`
 without a Rust toolchain; `zig build glyphs` re-runs the live comparison.
 
@@ -414,7 +420,7 @@ header carries a variation store).
 
 The same vectors gate the dump: 18 `Inconsolata.ttf` and variable-Roboto
 entries (hinted/unhinted, in-range and saturating out-of-range coordinates)
-are part of the 60-vector union manifest.
+are part of the 64-vector union manifest.
 
 ## Autohint corpus (M3 G3b autohint)
 
@@ -436,9 +442,24 @@ silently falls back to unhinted output.
 
 The same faces gate 14 dump vectors (`NotoSans-Regular` at eight sizes,
 plus NotoSansMono and NotoSansDevanagari at two sizes each, all `--hint`) as
-part of the 60-vector union manifest. The autohinter parses no variation
+part of the 64-vector union manifest. The autohinter parses no variation
 deltas, so non-empty coordinates on the autohint path are a typed
 `error.Unsupported` (the interpreter path handles them).
+
+## Embolden corpus (M3 embolden)
+
+`tests/scenes/glyph_run_emboldened_*` and `glyph_run_embolden_decoration_*`
+gate synthetic embolden (`FontEmbolden` -> `kurbo.expandPath`, backed by the
+ported `kurbo` `arc`/`expand`): upstream's two-run `glyphs_emboldened` case
+(regular then dilated, hinted), an unhinted anisotropic run (40 x 20 units),
+and a decoration run whose skip-ink ink extents include the dilation. The
+expansion is applied after hinting and before the cached bbox, and the
+outline/atlas cache keys carry the amount/join/miter/tolerance bits
+(upstream's explicit `join_bits`). All six scenes are byte-exact against the
+pinned oracle at `tolerance=0`, cache on and off. The same path backs 4 dump
+vectors (hinted/unhinted, isotropic/anisotropic, offset gid ranges) in the
+64-vector union manifest; `--embolden X,Y` is wired through the
+Zig CLI, the scene format and the pinned oracle.
 
 ## Multithreaded dispatch
 

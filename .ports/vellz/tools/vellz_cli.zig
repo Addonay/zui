@@ -41,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
     var font_index: u32 = 0;
     var font_size: ?f32 = null;
     var hint = false;
+    var embolden: ?[2]f64 = null;
     var level_override: ?[]const u8 = null;
     var coords: std.ArrayList(i16) = .empty;
     defer coords.deinit(allocator);
@@ -70,6 +71,13 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--coords")) {
             const value = args_iter.next() orelse return usage();
             try parseCoords(allocator, &coords, value);
+        } else if (std.mem.eql(u8, arg, "--embolden")) {
+            const value = args_iter.next() orelse return usage();
+            const comma = std.mem.indexOfScalar(u8, value, ',') orelse return usage();
+            embolden = .{
+                std.fmt.parseFloat(f64, value[0..comma]) catch return usage(),
+                std.fmt.parseFloat(f64, value[comma + 1 ..]) catch return usage(),
+            };
         } else if (std.mem.eql(u8, arg, "--level")) {
             level_override = args_iter.next() orelse return usage();
         } else if (std.mem.eql(u8, arg, "--gids") or std.mem.eql(u8, arg, "--codepoints")) {
@@ -102,6 +110,7 @@ pub fn main(init: std.process.Init) !void {
                 font_size orelse return usage(),
                 hint,
                 coords.items,
+                embolden,
                 id_specs.items,
             );
         }
@@ -129,7 +138,7 @@ fn usage() error{InvalidArguments} {
     std.debug.print(
         "usage: vellz-cli --scene SCENE.json --out OUT.rgba [--level fallback|native|avx2|...]\n" ++
             "       vellz-cli --probe [--out OUT.rgba]\n" ++
-            "       vellz-cli --dump-glyphs --font FONT [--index N] [--hint] [--coords 1.0,-1.0] --size PPEM --gids 1,3,5-9\n" ++
+            "       vellz-cli --dump-glyphs --font FONT [--index N] [--hint] [--coords 1.0,-1.0] [--embolden X,Y] --size PPEM --gids 1,3,5-9\n" ++
             "       vellz-cli --dump-cmap --font FONT [--index N] --codepoints 65,0x1F600\n",
         .{},
     );
@@ -147,6 +156,7 @@ fn runDumpGlyphs(
     size: f32,
     hint: bool,
     coords: []const glifo.NormalizedCoord,
+    embolden: ?[2]f64,
     id_specs: []const []const u8,
 ) !void {
     const font = try glifo.Font.init(blob, font_index);
@@ -169,6 +179,7 @@ fn runDumpGlyphs(
         size,
         hint,
         coords,
+        embolden,
         gids.items,
     ) catch |err| {
         std.debug.print("vellz-cli: dumping glyphs: {s}\n", .{@errorName(err)});
@@ -430,9 +441,9 @@ fn renderScene(
 
 /// Draw one positioned glyph run through `vellz.glifo`.
 ///
-/// Non-zero `embolden` is a typed `error.Unsupported`, never silently
-/// dropped. `normalized_coords` are converted from the scene's `[-1, 1]`
-/// values with `F2Dot14::from_f32` and forwarded to the builder. `decoration`
+/// `normalized_coords` are converted from the scene's `[-1, 1]` values with
+/// `F2Dot14::from_f32` and forwarded to the builder; `embolden` is forwarded
+/// as `FontEmbolden` (synthetic dilation via `kurbo.expandPath`). `decoration`
 /// is drawn after the fill/stroke pass, matching the upstream decoration
 /// tests.
 fn renderGlyphRun(
@@ -444,9 +455,6 @@ fn renderGlyphRun(
     font_blobs: *std.StringHashMapUnmanaged([]const u8),
     spec: scene_mod.GlyphRunSpec,
 ) !void {
-    if (spec.embolden) |amount| {
-        if (amount[0] != 0.0 or amount[1] != 0.0) return error.Unsupported;
-    }
     const coords: []glifo.NormalizedCoord = if (spec.normalized_coords) |raw| blk: {
         const converted = try allocator.alloc(glifo.NormalizedCoord, raw.len);
         for (raw, 0..) |value, i| converted[i] = glifo.f2dot14FromF32(value);
@@ -475,6 +483,12 @@ fn renderGlyphRun(
         .atlasCache(spec.atlas_cache);
     if (coords.len != 0) {
         builder = builder.normalizedCoords(coords);
+    }
+    if (spec.embolden) |amount| {
+        builder = builder.fontEmbolden(glifo.FontEmbolden.new(.{
+            @as(f64, amount[0]),
+            @as(f64, amount[1]),
+        }));
     }
     if (spec.glyph_transform) |transform| {
         builder = builder.glyphTransform(kurbo.Affine.new(transform));

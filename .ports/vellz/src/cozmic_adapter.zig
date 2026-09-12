@@ -19,9 +19,9 @@
 //!    positions are passed through as f32 and quantized once by `glifo`;
 //!    Cozmic's `.875` carry versus `glifo`'s clamp-to-bucket-3 differs by at
 //!    most 0.125 px (documented residual, M3 plan §3).
-//! 4. Synthetic embolden is forwarded to `glifo`, which rejects non-default
-//!    amounts with `error.Unsupported` until kurbo `expand_path` lands. It is
-//!    never silently dropped.
+//! 4. Synthetic embolden is forwarded to `glifo`, which dilates the outline
+//!    with `kurbo.expand_path` (ported) exactly like upstream. It is never
+//!    silently dropped.
 //! 5. `FontData.blob` is the resolved byte slice, so the resolver must return
 //!    a stable address for a given `font_id` (the slice's pointer is the
 //!    font identity in cache keys, exactly like upstream `FontData`).
@@ -88,15 +88,15 @@ pub const Style = enum { fill, stroke };
 pub const Options = struct {
     /// Fill (default) or stroke the glyphs.
     style: Style = .fill,
-    /// Forwarded to `glifo`'s builder; hint-requiring transforms are rejected
-    /// by the core with `error.Unsupported` until the interpreter lands.
+    /// Forwarded to `glifo`'s builder; hint-requiring transforms run through
+    /// the ported TrueType interpreter.
     hint: bool = false,
     /// Enable glyph-atlas-backed caching for the runs.
     atlas_cache: bool = true,
     /// Optional per-glyph transform (for example a skew for fake italics).
     glyph_transform: ?kurbo.Affine = null,
-    /// Synthetic embolden forwarded verbatim; non-default amounts are
-    /// `error.Unsupported` in the core.
+    /// Synthetic embolden forwarded verbatim; non-default amounts dilate the
+    /// outline through the ported `kurbo.expand_path`.
     embolden: glifo.FontEmbolden = .{},
 };
 
@@ -199,7 +199,7 @@ const Recorder = struct {
     run_sizes: std.ArrayListUnmanaged(f32) = .empty,
     run_fonts: std.ArrayListUnmanaged(usize) = .empty,
     run_styles: std.ArrayListUnmanaged(Style) = .empty,
-    run_emboldens: std.ArrayListUnmanaged([2]f32) = .empty,
+    run_emboldens: std.ArrayListUnmanaged([2]f64) = .empty,
     resolve_calls: usize = 0,
     atlas_cache_calls: usize = 0,
     last_atlas_cache: bool = false,
@@ -385,7 +385,7 @@ test "adapter propagates unknown font ids and empty input" {
     try testing.expectEqual(@as(usize, 0), recorder.glyphs.items.len);
 }
 
-test "adapter rejects non-default embolden with Unsupported" {
+test "adapter forwards non-default embolden verbatim" {
     const allocator = testing.allocator;
     var recorder = Recorder{};
     defer recorder.deinit(allocator);
@@ -400,26 +400,15 @@ test "adapter rejects non-default embolden with Unsupported" {
     const positioned = [_]PositionedGlyph{
         .{ .glyph_id = 1, .font_id = 0, .font_size = 16.0, .x = 0.0, .y = 0.0 },
     };
-    const font = glifo.FontData.init("font", 0);
-    const run: glifo.GlyphRun = .{
-        .font = font,
-        .font_size = 16.0,
-        .transform = kurbo.Affine.IDENTITY,
-        .scene_paint_transform = kurbo.Affine.IDENTITY,
-        .font_embolden = glifo.FontEmbolden.new(.{ 1.0, 0.0 }),
-        .hint = false,
-    };
-    try testing.expectError(error.Unsupported, glifo.prepareGlyphRun(run));
-
-    // The adapter forwards the same embolden request verbatim; the real CPU
-    // backend turns it into `error.Unsupported` through the same
-    // `prepareGlyphRun` call asserted above (see the bridge test).
+    // The adapter forwards the embolden request verbatim; the real CPU backend
+    // applies it through `prepareGlyphRun` -> `OutlineCache.getOrInsert`
+    // (`kurbo.expandPath`; see the bridge test for pixel equivalence).
     try drawRun(allocator, &ctx, {}, resolver_state.resolver(), &positioned, .{
         .embolden = glifo.FontEmbolden.new(.{ 1.0, 0.0 }),
     });
     try testing.expectEqual(@as(usize, 1), recorder.glyphs.items.len);
     try testing.expectEqualDeep(
-        [2]f32{ 1.0, 0.0 },
+        [2]f64{ 1.0, 0.0 },
         recorder.run_emboldens.items[0],
     );
 }

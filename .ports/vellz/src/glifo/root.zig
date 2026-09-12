@@ -35,8 +35,11 @@
 //!   either the TrueType interpreter (`hint.zig`) or the automatic hinter
 //!   (`autohint/`: script/style tables, widths/blues, segments/edges, JIT
 //!   grid-fitting and the BestEffort GSUB shaper subset).
-//! - `NormalizedCoord = i16` and `FontEmbolden` — carried in cache keys for
-//!   API parity; non-default values are rejected with `error.Unsupported`.
+//! - `NormalizedCoord = i16` — carried in cache keys and routed through the
+//!   `gvar`/`cvar` pipeline; user-space normalization is caller-side.
+//!   `FontEmbolden` is fully ported: `OutlineCache.getOrInsert` dilates the
+//!   drawn (hinted or unhinted, interpreter or autohint) outline with
+//!   `kurbo.expand_path` after hinting and before the bounding box.
 //! - `util` — the `glifo` float/affine predicates used by run preparation.
 //!
 //! # Fixed-point contract
@@ -48,7 +51,8 @@
 //! # Deferred with typed errors
 //!
 //! COLRv1 `Var*` deltas (non-default coordinates on a v1 paint graph), CFF
-//! hinting (`skrifa/cff/hint.rs`), CFF2 `seac` and synthetic embolden are all
+//! hinting (`skrifa/cff/hint.rs`), CFF2 `seac` and `Bgra`/`Mask` bitmap
+//! payloads are all
 //! `error.Unsupported`; none are approximated. `gvar`/`cvar` deltas and the
 //! variable-font cache maps are ported: user-space normalization
 //! (`fvar`/`avar`) stays caller-side exactly like `glifo`'s `normalizedCoords`
@@ -56,14 +60,16 @@
 //! the port does not thread varied outlines through `autohint/`). TrueType
 //! hinting
 //! (M3 G3b) and the `Engine::AutoFallback` autohinter (`autohint/`,
-//! instruction-less TrueType fonts), decoration (T5) and COLRv0/COLRv1 (T4,
+//! instruction-less TrueType fonts), decoration (T5), synthetic embolden
+//! (`kurbo.expand_path`, applied after hinting) and COLRv0/COLRv1 (T4,
 //! including gradients, transforms, clip boxes and composite modes) are
 //! ported, the unhinted
 //! CFF/CFF2 scaler (M3 CFF, including CFF2 blend/variation-store scalars) is
 //! ported, and embedded bitmaps (`sbix`/`CBDT`/`EBDT`, T5) resolve through the
-//! upstream COLR > bitmap > outline cascade with PNG decoding; `Bgra`/`Mask`
-//! payloads and PNG features outside the decoder (16-bit, Adam7) fall through
-//! to the outline branch exactly like upstream's `.ok()` filter.
+//! upstream COLR > bitmap > outline cascade with PNG decoding (indexed,
+//! grayscale, RGB, gray-alpha and RGBA at 1–16 bits, including Adam7);
+//! `Bgra`/`Mask` payloads fall through to the outline branch exactly like
+//! upstream's `.ok()` filter.
 //!
 //! # Oracle comparison
 //!

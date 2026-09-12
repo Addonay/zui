@@ -29,7 +29,9 @@ use skrifa::outline::{
 };
 use vello_cpu::color::{AlphaColor, Srgb};
 use vello_cpu::filter_effects::{EdgeMode, Filter, FilterPrimitive};
-use vello_cpu::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke};
+use vello_cpu::kurbo::{
+    Affine, BezPath, Cap, Diagonal2, Join, PathEl, Point, Rect, Stroke, expand_path,
+};
 use vello_cpu::peniko::{
     BlendMode, Blob, ColorStop, ColorStops, Compose, Extend, Fill, FontData, Gradient,
     ImageAlphaType, ImageQuality, ImageSampler, LinearGradientPosition, Mix,
@@ -805,12 +807,15 @@ fn run() -> Result<(), String> {
 /// as its raw bit pattern in lowercase hex, so the Zig side can be compared
 /// byte-for-byte without any float formatting.
 ///
-/// `--dump-glyphs --font PATH [--index N] [--hint] --size PPEM --gids 1,3,5-9`
+/// `--dump-glyphs --font PATH [--index N] [--hint] [--embolden X,Y] --size PPEM --gids 1,3,5-9`
 ///   emits `skrifa`'s `PathStyle::FreeType` path elements plus the adjusted
 ///   lsb/advance from the same draw. Without `--hint` this is exactly the call
 ///   `glifo`'s `OutlineCache` makes for an unhinted run; with `--hint` it uses
 ///   the same `HintingInstance`/`HintingOptions` glifo builds for a hinted
-///   run and adds a `hint 1` marker line.
+///   run and adds a `hint 1` marker line. With a non-zero `--embolden` the
+///   drawn outline is dilated with `kurbo::expand_path` (miter join, miter
+///   limit 4.0, tolerance 0.1) and dumped as f64 bit patterns, mirroring
+///   `OutlineCacheSession::get_or_insert`.
 ///
 /// `--dump-cmap --font PATH [--index N] --codepoints 65,66,0x1F600`
 ///   emits the selected cmap subtable's mappings (skrifa's selection strategy,
@@ -831,6 +836,9 @@ fn dump_glyphs(args: &[String]) -> Result<(), String> {
         .map(|coord| skrifa::instance::NormalizedCoord::from_f32(*coord))
         .collect();
     let location = skrifa::instance::LocationRef::new(&normalized);
+    let expand = parsed
+        .embolden
+        .filter(|amount| amount[0] != 0.0 || amount[1] != 0.0);
     let mut out = String::new();
     out.push_str("vellz-glyph-dump v1\n");
     out.push_str(&format!("face {}\n", parsed.index));
@@ -844,6 +852,15 @@ fn dump_glyphs(args: &[String]) -> Result<(), String> {
             out.push_str(&format!(" {}", coord.to_bits()));
         }
         out.push('\n');
+    }
+    if let Some(amount) = expand {
+        // f64 bit patterns: the expanded outline is f64-valued (kurbo), so the
+        // dump carries the full precision of `expand_path` here.
+        out.push_str(&format!(
+            "embolden {:016x} {:016x}\n",
+            amount[0].to_bits(),
+            amount[1].to_bits()
+        ));
     }
     // The same configuration glifo 0.3.0 uses for hinted runs.
     let hinting_options = HintingOptions {
@@ -880,6 +897,55 @@ fn dump_glyphs(args: &[String]) -> Result<(), String> {
         let metrics = glyph
             .draw(settings, &mut elements)
             .map_err(|e| format!("drawing glyph {gid}: {e}"))?;
+        if let Some(amount) = expand {
+            // Mirror `glifo`'s `OutlineCacheSession::get_or_insert`: dilate the
+            // drawn outline with the default `FontEmbolden` join settings.
+            let path = expand_path(
+                &elements_to_bezpath(&elements),
+                Diagonal2::new(amount[0], amount[1]),
+                Join::Miter,
+                4.0,
+                0.1,
+            );
+            out.push_str(&format!(
+                "gid {gid} format {format} elems {} lsb {} advance {}\n",
+                path.elements().len(),
+                format_opt_f32(metrics.lsb),
+                format_opt_f32(metrics.advance_width),
+            ));
+            for el in path.elements() {
+                match el {
+                    PathEl::MoveTo(p) => {
+                        out.push_str(&format!("M {:016x} {:016x}\n", p.x.to_bits(), p.y.to_bits()));
+                    }
+                    PathEl::LineTo(p) => {
+                        out.push_str(&format!("L {:016x} {:016x}\n", p.x.to_bits(), p.y.to_bits()));
+                    }
+                    PathEl::QuadTo(p1, p2) => {
+                        out.push_str(&format!(
+                            "Q {:016x} {:016x} {:016x} {:016x}\n",
+                            p1.x.to_bits(),
+                            p1.y.to_bits(),
+                            p2.x.to_bits(),
+                            p2.y.to_bits(),
+                        ));
+                    }
+                    PathEl::CurveTo(p1, p2, p3) => {
+                        out.push_str(&format!(
+                            "C {:016x} {:016x} {:016x} {:016x} {:016x} {:016x}\n",
+                            p1.x.to_bits(),
+                            p1.y.to_bits(),
+                            p2.x.to_bits(),
+                            p2.y.to_bits(),
+                            p3.x.to_bits(),
+                            p3.y.to_bits(),
+                        ));
+                    }
+                    PathEl::ClosePath => out.push_str("Z\n"),
+                }
+            }
+            continue;
+        }
         out.push_str(&format!(
             "gid {gid} format {format} elems {} lsb {} advance {}\n",
             elements.len(),
@@ -928,6 +994,39 @@ fn dump_glyphs(args: &[String]) -> Result<(), String> {
     out.push_str("end\n");
     print!("{out}");
     Ok(())
+}
+
+/// Convert a skrifa `PathElement` list into a `BezPath` for expansion.
+///
+/// `PathElement` stores f32 coordinates; widening them to f64 is exact, so the
+/// result is bit-identical to glifo drawing straight into a `BezPath` through
+/// its `OutlinePen` implementation.
+fn elements_to_bezpath(elements: &[PathElement]) -> BezPath {
+    let mut path = BezPath::new();
+    for el in elements {
+        match *el {
+            PathElement::MoveTo { x, y } => path.move_to((f64::from(x), f64::from(y))),
+            PathElement::LineTo { x, y } => path.line_to((f64::from(x), f64::from(y))),
+            PathElement::QuadTo { cx0, cy0, x, y } => path.quad_to(
+                (f64::from(cx0), f64::from(cy0)),
+                (f64::from(x), f64::from(y)),
+            ),
+            PathElement::CurveTo {
+                cx0,
+                cy0,
+                cx1,
+                cy1,
+                x,
+                y,
+            } => path.curve_to(
+                (f64::from(cx0), f64::from(cy0)),
+                (f64::from(cx1), f64::from(cy1)),
+                (f64::from(x), f64::from(y)),
+            ),
+            PathElement::Close => path.close_path(),
+        }
+    }
+    path
 }
 
 /// cmap dump companion to [`dump_glyphs`].
@@ -1003,6 +1102,9 @@ struct DumpArgs {
     /// Normalized coordinates as supplied on the command line (before
     /// `F2Dot14` conversion).
     coords: Vec<f32>,
+    /// Synthetic embolden `(x, y)`; non-zero runs `kurbo::expand_path` on the
+    /// drawn outline before dumping (matching `glifo`'s outline cache).
+    embolden: Option<[f64; 2]>,
 }
 
 /// Parses the shared `--dump-glyphs`/`--dump-cmap` arguments.
@@ -1013,6 +1115,7 @@ fn parse_dump_args(args: &[String], want_size: bool, what: &str) -> Result<DumpA
     let mut ids: Vec<u32> = Vec::new();
     let mut hint = false;
     let mut coords: Vec<f32> = Vec::new();
+    let mut embolden: Option<[f64; 2]> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -1058,6 +1161,21 @@ fn parse_dump_args(args: &[String], want_size: bool, what: &str) -> Result<DumpA
                 hint = true;
                 i += 1;
             }
+            "--embolden" => {
+                let value = args.get(i + 1).ok_or("--embolden needs X,Y")?;
+                let (x, y) = value
+                    .split_once(',')
+                    .ok_or_else(|| format!("--embolden must be X,Y, got {value:?}"))?;
+                embolden = Some([
+                    x.trim()
+                        .parse()
+                        .map_err(|_| format!("--embolden X must be a number, got {x:?}"))?,
+                    y.trim()
+                        .parse()
+                        .map_err(|_| format!("--embolden Y must be a number, got {y:?}"))?,
+                ]);
+                i += 2;
+            }
             "--gids" | "--codepoints" => {
                 let value = args.get(i + 1).ok_or("list argument needs a value")?;
                 ids.extend(parse_id_list(value, what)?);
@@ -1077,6 +1195,7 @@ fn parse_dump_args(args: &[String], want_size: bool, what: &str) -> Result<DumpA
         ids,
         hint,
         coords,
+        embolden,
     })
 }
 
@@ -1133,10 +1252,11 @@ fn build_paint(spec: &PaintSpec, scene_dir: &Path) -> Result<PaintType, String> 
 
 /// Draw one positioned glyph run through the pinned upstream `glifo` stack.
 ///
-/// Deferred features (`embolden`) are hard errors so a scene can never
-/// silently drop them. `normalized_coords` are converted with
-/// `F2Dot14::from_f32` before being handed to the builder. `decoration` draws
-/// after the fill/stroke pass, like the upstream decoration tests.
+/// `normalized_coords` are converted with `F2Dot14::from_f32` before being
+/// handed to the builder; `embolden` is forwarded as `FontEmbolden` (synthetic
+/// dilation). `decoration` draws after the fill/stroke pass, like the upstream
+/// decoration tests, with the same embolden settings so skip-ink ink extents
+/// match.
 fn draw_glyph_run(
     ctx: &mut RenderContext,
     resources: &mut vello_cpu::Resources,
@@ -1144,11 +1264,12 @@ fn draw_glyph_run(
     spec: &GlyphRunSpec,
     font_cache: &mut HashMap<(PathBuf, u32), FontData>,
 ) -> Result<(), String> {
-    if let Some(embolden) = spec.embolden
-        && (embolden[0] != 0.0 || embolden[1] != 0.0)
-    {
-        return Err("glyph_run embolden is not ported yet (error.Unsupported)".into());
-    }
+    let embolden = spec
+        .embolden
+        .filter(|amount| amount[0] != 0.0 || amount[1] != 0.0)
+        .map(|amount| {
+            glifo::FontEmbolden::new(Diagonal2::new(f64::from(amount[0]), f64::from(amount[1])))
+        });
 
     let font = load_font(scene_dir, &spec.font, font_cache)?;
     // glifo's public `NormalizedCoord` is the `i16` bit pattern of F2Dot14.
@@ -1166,6 +1287,9 @@ fn draw_glyph_run(
         .atlas_cache(spec.atlas_cache);
     if !coords.is_empty() {
         builder = builder.normalized_coords(&coords);
+    }
+    if let Some(amount) = embolden {
+        builder = builder.font_embolden(amount);
     }
     if let Some(transform) = spec.glyph_transform {
         builder = builder.glyph_transform(parse_affine(transform));
@@ -1195,6 +1319,9 @@ fn draw_glyph_run(
             .atlas_cache(spec.atlas_cache);
         if !coords.is_empty() {
             deco_builder = deco_builder.normalized_coords(&coords);
+        }
+        if let Some(amount) = embolden {
+            deco_builder = deco_builder.font_embolden(amount);
         }
         if let Some(transform) = spec.glyph_transform {
             deco_builder = deco_builder.glyph_transform(parse_affine(transform));

@@ -108,6 +108,7 @@ fn render(
     resolver: adapter.FontResolver,
     via_adapter: bool,
     hint: bool,
+    embolden: ?vellz.glifo.FontEmbolden,
 ) ![]u8 {
     var ctx = try vellz.cpu.RenderContext.init(allocator, width, height, .{
         .level = .baseline,
@@ -124,6 +125,7 @@ fn render(
         try adapter.drawRun(allocator, &ctx, &resources, resolver, positioned, .{
             .hint = hint,
             .atlas_cache = false,
+            .embolden = embolden orelse .{},
         });
     } else if (positioned.len > 0) {
         // The direct path must mirror the adapter's split criteria (one run
@@ -147,11 +149,14 @@ fn render(
                 .y = positioned_glyph.y,
             };
         }
-        try ctx.glyphRun(&resources, font)
+        var direct_builder = ctx.glyphRun(&resources, font)
             .fontSize(first.font_size)
             .hint(hint)
-            .atlasCache(false)
-            .fillGlyphs(allocator, vellz.glifo.iterate(glyphs));
+            .atlasCache(false);
+        if (embolden) |embolden_settings| {
+            direct_builder = direct_builder.fontEmbolden(embolden_settings);
+        }
+        try direct_builder.fillGlyphs(allocator, vellz.glifo.iterate(glyphs));
     }
 
     try ctx.flush();
@@ -201,45 +206,61 @@ test "adapter pixels are byte-identical to a direct glyph_run" {
     defer testing.allocator.free(positioned);
 
     var font_map = FontMap{};
-    const from_adapter = try render(testing.allocator, positioned, font_map.resolver(), true, false);
+    const from_adapter = try render(testing.allocator, positioned, font_map.resolver(), true, false, null);
     defer testing.allocator.free(from_adapter);
     // No shaping: the resolver is consulted once for the whole run, not once
     // per glyph or per character.
     try testing.expectEqual(@as(usize, 1), font_map.calls);
 
-    const direct = try render(testing.allocator, positioned, font_map.resolver(), false, false);
+    const direct = try render(testing.allocator, positioned, font_map.resolver(), false, false, null);
     defer testing.allocator.free(direct);
     try testing.expectEqual(@as(usize, 2), font_map.calls);
 
     try testing.expectEqualSlices(u8, direct, from_adapter);
 }
 
-test "adapter forwards embolden to the core, which rejects it" {
+test "adapter forwards embolden and matches a direct emboldened run" {
     const physicals = try layoutHello();
     const positioned = try fromPhysicalSlice(testing.allocator, &physicals);
     defer testing.allocator.free(positioned);
 
-    var ctx = try vellz.cpu.RenderContext.init(testing.allocator, width, height, .{
-        .level = .baseline,
-        .num_threads = 0,
-    });
-    defer ctx.deinit(testing.allocator);
-    var resources = vellz.cpu.Resources.init();
-    defer resources.deinit(testing.allocator);
+    // Unhinted runs cache at the font's upem (2048 here), so a 128-unit
+    // dilation is ~1.5 px at 24 px and visibly changes the raster.
+    const embolden = vellz.glifo.FontEmbolden.new(.{ 128.0, 128.0 });
 
     var font_map = FontMap{};
-    try testing.expectError(error.Unsupported, adapter.drawRun(
+    const plain = try render(
         testing.allocator,
-        &ctx,
-        &resources,
-        font_map.resolver(),
         positioned,
-        .{
-            .hint = false,
-            .atlas_cache = false,
-            .embolden = vellz.glifo.FontEmbolden.new(.{ 1.0, 0.0 }),
-        },
-    ));
+        font_map.resolver(),
+        false,
+        false,
+        null,
+    );
+    defer testing.allocator.free(plain);
+    const direct = try render(
+        testing.allocator,
+        positioned,
+        font_map.resolver(),
+        false,
+        false,
+        embolden,
+    );
+    defer testing.allocator.free(direct);
+    const from_adapter = try render(
+        testing.allocator,
+        positioned,
+        font_map.resolver(),
+        true,
+        false,
+        embolden,
+    );
+    defer testing.allocator.free(from_adapter);
+
+    // Dilation changed the ink, and the adapter path is byte-identical to the
+    // direct `glyph_run` with the same settings.
+    try testing.expect(!std.mem.eql(u8, plain, direct));
+    try testing.expectEqualSlices(u8, direct, from_adapter);
 }
 
 test "adapter forwards hinting through the core" {
@@ -248,9 +269,9 @@ test "adapter forwards hinting through the core" {
     defer testing.allocator.free(positioned);
 
     var font_map = FontMap{};
-    const from_adapter = try render(testing.allocator, positioned, font_map.resolver(), true, true);
+    const from_adapter = try render(testing.allocator, positioned, font_map.resolver(), true, true, null);
     defer testing.allocator.free(from_adapter);
-    const direct = try render(testing.allocator, positioned, font_map.resolver(), false, true);
+    const direct = try render(testing.allocator, positioned, font_map.resolver(), false, true, null);
     defer testing.allocator.free(direct);
 
     // Hinted runs absorb the (identity) scale and draw through the

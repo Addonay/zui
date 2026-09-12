@@ -52,6 +52,14 @@ if [ ! -x "$oracle" ]; then
     needs_oracle_build=1
 elif "$oracle" --dump-glyphs 2>&1 | grep -q "unknown argument"; then
     needs_oracle_build=1
+else
+    # Binary predating `--embolden` (or `--coords`) prints "unknown argument"
+    # and exits non-zero; capture instead of piping so `set -o pipefail` does
+    # not mask the match.
+    probe_out="$("$oracle" --dump-glyphs --embolden 1,1 2>&1 || true)"
+    case "$probe_out" in
+        *"unknown argument"*) needs_oracle_build=1 ;;
+    esac
 fi
 if [ "$needs_oracle_build" -eq 1 ]; then
     echo "building vellz-oracle..."
@@ -67,7 +75,9 @@ fi
 
 mkdir -p "$out" "$(dirname "$manifest")"
 
-# font filename, size in px, first gid, last gid, hint (n = unhinted, h = hinted)
+# font filename, size in px, first gid, last gid, hint (n = unhinted, h = hinted),
+# optional typed tokens: `coords=X,Y` / bare `X,Y` for normalized coordinates and
+# `emb=X,Y` for synthetic embolden (both default to none)
 glyph_vectors=(
     "Roboto-Regular.ttf 12.0 0 1293"
     "Roboto-Regular.ttf 16.0 0 1293"
@@ -146,6 +156,16 @@ glyph_vectors=(
     "NotoSansMono-Regular.ttf 7.0 0 3919 h"
     "NotoSansDevanagari-Regular.ttf 16.0 0 844 h"
     "NotoSansDevanagari-Regular.ttf 7.0 0 844 h"
+    # M3 embolden: `kurbo::expand_path` applied to the drawn (hinted or
+    # unhinted) outline, matching `OutlineCache.getOrInsert`. Isotropic and
+    # anisotropic amounts, both hint modes. Amounts are positive (upstream's
+    # `expand_path` contract); a zero factor makes upstream produce NaN
+    # geometry, whose NaN sign/payload is not stable across LLVM codegen
+    # (rendering is unaffected because NaN path elements are ignored).
+    "Roboto-Regular.ttf 16.0 0 300 n emb=1.0,1.0"
+    "Roboto-Regular.ttf 16.0 0 300 h emb=1.0,1.0"
+    "Roboto-Regular.ttf 23.5 300 600 n emb=2.0,1.0"
+    "Roboto-Regular.ttf 12.0 600 900 h emb=0.5,1.5"
 )
 
 # font filename, first codepoint, last codepoint
@@ -187,8 +207,19 @@ total_coordinates=0
 
 glyph_rows=""
 for vector in "${glyph_vectors[@]}"; do
-    read -r font size gid_start gid_end hint_flag coords <<<"$vector"
+    read -r font size gid_start gid_end hint_flag spec1 spec2 <<<"$vector"
     name="${font%.*}_s${size}_${gid_start}-${gid_end}"
+    coords=""
+    embolden_spec=""
+    for token in "${spec1:-}" "${spec2:-}"; do
+        case "$token" in
+            "") ;;
+            emb=*) embolden_spec="${token#emb=}" ;;
+            coords=*) coords="${token#coords=}" ;;
+            -) ;;
+            *) coords="$token" ;;
+        esac
+    done
     hint_arg=""
     manifest_hint="false"
     if [ "$hint_flag" = "h" ]; then
@@ -203,12 +234,23 @@ for vector in "${glyph_vectors[@]}"; do
         coords_suffix="_c$(printf '%s' "$coords" | tr ',.-' '___')"
     fi
     name="${name}${coords_suffix}"
+    emb_arg=""
+    manifest_emb_x="0"
+    manifest_emb_y="0"
+    if [ -n "${embolden_spec:-}" ] && [ "$embolden_spec" != "-" ]; then
+        emb_arg="--embolden $embolden_spec"
+        emb_x="${embolden_spec%,*}"
+        emb_y="${embolden_spec#*,}"
+        manifest_emb_x="$(python3 -c 'import struct,sys; print("0x%016x" % struct.unpack("<Q", struct.pack("<d", float(sys.argv[1])))[0])' "$emb_x")"
+        manifest_emb_y="$(python3 -c 'import struct,sys; print("0x%016x" % struct.unpack("<Q", struct.pack("<d", float(sys.argv[1])))[0])' "$emb_y")"
+        name="${name}_emb${emb_x//./p}_${emb_y//./p}"
+    fi
     oracle_dump="$out/oracle_$name.txt"
     zig_dump="$out/zig_$name.txt"
     "$oracle" --dump-glyphs --font "$fonts_dir/$font" --size "$size" $hint_arg \
-        "${coords_arg[@]}" --gids "$gid_start-$gid_end" >"$oracle_dump"
+        "${coords_arg[@]}" $emb_arg --gids "$gid_start-$gid_end" >"$oracle_dump"
     "$cli" --dump-glyphs --font "$fonts_dir/$font" --size "$size" $hint_arg \
-        "${coords_arg[@]}" --gids "$gid_start-$gid_end" >"$zig_dump"
+        "${coords_arg[@]}" $emb_arg --gids "$gid_start-$gid_end" >"$zig_dump"
     count_elements="$(elements "$oracle_dump")"
     count_coordinates="$(coordinates "$oracle_dump")"
     total_elements=$((total_elements + count_elements))
@@ -230,7 +272,7 @@ for vector in "${glyph_vectors[@]}"; do
             coords_bits="$(awk '/^coords / { for (i = 3; i <= NF; i++) printf "%s, ", $i }' "$oracle_dump")"
             manifest_coords=".coords = &.{ $coords_bits}, "
         fi
-        glyph_rows+="    .{ .font = $(font_id "$font"), .size_bits = 0x$size_bits, .gid_start = $gid_start, .gid_end = $gid_end, .hint = $manifest_hint, $manifest_coords.elements = $count_elements, .coordinates = $count_coordinates, .sha256 = .{ $bytes} },\n"
+        glyph_rows+="    .{ .font = $(font_id "$font"), .size_bits = 0x$size_bits, .gid_start = $gid_start, .gid_end = $gid_end, .hint = $manifest_hint, $manifest_coords.embolden_x_bits = $manifest_emb_x, .embolden_y_bits = $manifest_emb_y, .elements = $count_elements, .coordinates = $count_coordinates, .sha256 = .{ $bytes} },\n"
     fi
 done
 
@@ -291,6 +333,8 @@ if [ "$update_manifest" -eq 1 ]; then
         echo "    hint: bool,"
         echo "    /// Normalized F2Dot14 coordinates; empty for static vectors."
         echo "    coords: []const i16 = &.{},"
+        echo "    embolden_x_bits: u64,"
+        echo "    embolden_y_bits: u64,"
         echo "    elements: usize,"
         echo "    coordinates: usize,"
         echo "    sha256: [32]u8,"

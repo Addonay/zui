@@ -29,12 +29,12 @@ low-precision `*_speed` variant — is
 channels) in Debug, ReleaseSafe, and ReleaseFast:
 
 ```sh
-zig build test     # 937/937 unit and integration tests (920 lib + 8 scene
+zig build test     # 953/953 unit and integration tests (936 lib + 8 scene
                    #   + 4 adapter + 5 Cozmic bridge; the bridge skips when
                    #   the .ports/cozmic sibling checkout is absent)
-zig build corpus   # 142/142 corpus scenes byte-exact vs the upstream oracle
+zig build corpus   # 148/148 corpus scenes byte-exact vs the upstream oracle
 zig build probe    # upstream probe fixture, byte-exact (tolerance-3 policy)
-zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo (glyf, CFF, CFF2, gvar/cvar, autohint)
+zig build glyphs   # outlines/cmap byte-identical to upstream skrifa/glifo (glyf, CFF, CFF2, gvar/cvar, autohint, embolden)
 zig build bench    # per-stage CPU benchmarks (see docs/benchmarks.md)
 ```
 
@@ -98,8 +98,10 @@ COLR > bitmap > outline cascade with the pending-upload atlas path and a
 `png 0.18`-compatible decoder, plus a 5-scene G3e bitmap corpus (Noto CBTF
 colour emoji: fill, stroke, cache on/off, transform-composition rows). `sbix`
 and `EBDT`/`EBLC` are covered by synthetic-font unit tests (the pinned assets
-gate `CBDT`/`CBLC` end to end); PNG 16-bit/Adam7 payloads fall through to the
-outline branch. T6 closes the variable-font deferral: `gvar` deltas (simple,
+gate `CBDT`/`CBLC` end to end); PNG 16-bit and Adam7 payloads are decoded
+like `png 0.18` (`STRIP_16` high-byte strip, sparse deinterleaving) and
+unit-tested against synthetic streams because the pinned fonts only carry
+8-bit non-interlaced PNGs. T6 closes the variable-font deferral: `gvar` deltas (simple,
 composite, empty glyphs, shared tuples, IUP and phantom points), `cvar` CVT
 deltas during hint-instance setup, second-level variable maps in the outline
 and glyph-atlas caches, and normalized coordinates through
@@ -114,9 +116,14 @@ and the `HintCache` engine swap. The pinned instruction-less
 `NotoSans-Regular`/`NotoSansMono`/`NotoSansDevanagari` (OFL-1.1, unhinted
 build tree) gate 12 `glyph_run_autohint_*` scenes (fill, small, skew, scale
 absorption, composites, transform-composition rows, cache on/off) and 14 dump
-vectors, all byte-exact at tolerance 0. All of
+vectors, all byte-exact at tolerance 0. Synthetic embolden (`FontEmbolden` +
+`kurbo.expandPath`, backed by the ported `kurbo` `arc`/`expand`) is applied
+after hinting and before the bbox, flows through the atlas/outline cache keys
+(amount/join/miter/tolerance bits, upstream's explicit `join_bits`) and
+decoration skip-ink extents; the 6 `glyph_run_embolden*` scenes and 4 dump
+vectors are byte-exact. All of
 it renders byte-exact against the pinned oracle, atlas cache on and off
-(142/142 corpus, tolerance 0). The GPU side has the wgpu-native device
+(148/148 corpus, tolerance 0). The GPU side has the wgpu-native device
 bootstrap, the full host/shader layout
 contract, the schedule/layer executor, encoded paints (gradients and images),
 the image atlas + GPU glyph text (`gpu/resources.zig`, `gpu/text.zig`), the
@@ -126,11 +133,10 @@ per-scene tolerance registry plus typed
 device-loss/unsupported-capability/missing-binding/feedback-loop errors)
 running on the llvmpipe software adapter.
 
-Not yet implemented (explicit typed errors, never placeholder pixels): PNG
-16-bit/Adam7 decode, CFF hinting (`skrifa/cff/hint.rs`), `HVAR` advance deltas
-on CFF2/variable outlines, COLRv1 `Var*` paint deltas at non-default
-coordinates, hinted advances from `hdmx` without backward compatibility, and
-synthetic embolden (all typed
+Not yet implemented (explicit typed errors, never placeholder pixels): CFF
+hinting (`skrifa/cff/hint.rs`), `HVAR` advance deltas on CFF2/variable
+outlines, COLRv1 `Var*` paint deltas at non-default coordinates, and hinted
+advances from `hdmx` without backward compatibility (all typed
 `error.Unsupported`); GPU multi-pass filter graphs and the full G5 corpus (M5
 remainder). G4 is met: `zig build corpus` is byte-exact at every
 SIMD level (`fallback`, `sse2`, `sse4_2`, `avx2`, `avx512`), with per-stage
@@ -170,7 +176,7 @@ CPU-only, no GPU dependency:
 ```sh
 zig build test                  # unit + integration tests
 zig build check                 # compile without running
-zig build corpus                # corpus gate: 142 scenes byte-exact vs pinned fixtures
+zig build corpus                # corpus gate: 148 scenes byte-exact vs pinned fixtures
 zig build probe                 # upstream probe fixture (tolerance-3 policy)
 zig build run-cpu-example       # writes cpu_example.ppm
 zig build vellz-cli             # corpus renderer CLI -> zig-out/bin

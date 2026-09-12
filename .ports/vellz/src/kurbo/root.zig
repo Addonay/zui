@@ -27,6 +27,8 @@ pub const cubicbez = @import("cubicbez.zig");
 pub const quadbez = @import("quadbez.zig");
 pub const svg = @import("svg.zig");
 pub const stroke = @import("stroke.zig");
+pub const arc = @import("arc.zig");
+pub const expand = @import("expand.zig");
 
 pub const Point = point.Point;
 pub const Vec2 = vec2.Vec2;
@@ -41,6 +43,10 @@ pub const Line = line.Line;
 pub const Circle = circle.Circle;
 pub const CubicBez = cubicbez.CubicBez;
 pub const QuadBez = quadbez.QuadBez;
+pub const Arc = arc.Arc;
+pub const Diagonal2 = expand.Diagonal2;
+pub const expandPath = expand.expandPath;
+pub const expandPathSigned = expand.expandPathSigned;
 pub const Stroke = stroke.Stroke;
 pub const Cap = stroke.Cap;
 pub const Join = stroke.Join;
@@ -70,4 +76,6 @@ test {
     _ = @import("quadbez.zig");
     _ = @import("svg.zig");
     _ = @import("stroke.zig");
+    _ = @import("arc.zig");
+    _ = @import("expand.zig");
 }

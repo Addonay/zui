@@ -34,9 +34,9 @@
 //!
 //! Deferred with typed errors: HarfBuzz path style (`error.Unsupported`),
 //! CFF/bitmap faces (rejected by `font.Font.outlines`; CFF hinting is
-//! `error.Unsupported`), `hdmx` advances outside backward compatibility, and
-//! embolden (rejected by the outline cache). Variation coordinates are
-//! handled here (`gvar`/`cvar` deltas). Instruction-less fonts
+//! `error.Unsupported`) and `hdmx` advances outside backward compatibility.
+//! Variation coordinates are handled here (`gvar`/`cvar` deltas).
+//! Instruction-less fonts
 //! (`prefer_interpreter == false`) are drawn by the autohinter through
 //! `hinting.zig`; `draw` itself still
 //! rejects an interpreter instance for them, so a hinted draw can never

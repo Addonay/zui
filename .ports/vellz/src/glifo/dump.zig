@@ -3,12 +3,15 @@
 //! The text format is shared byte-for-byte with
 //! `tools/oracle-rs --dump-glyphs` / `--dump-cmap` (see its module docs):
 //! coordinates are f32 bit patterns in lowercase hex, integers are decimal.
+//! Emboldened glyph dumps add an `embolden <x> <y>` marker and emit the
+//! expanded path's f64 bit patterns (`kurbo.expandPath` output).
 //! `tools/compare_glyphs.sh` diffs the two outputs and
 //! `tests/fixtures/glyphs/manifest.zig` stores SHA-256 hashes of the pinned
 //! oracle dumps so `zig build test` can guard the port without a Rust
 //! toolchain.
 
 const std = @import("std");
+const kurbo = @import("../kurbo/root.zig");
 const font_mod = @import("font.zig");
 const glyf = @import("glyf.zig");
 const outlines_mod = @import("outlines.zig");
@@ -22,13 +25,22 @@ fn optF32Hex(value: ?f32, buf: *[8]u8) []const u8 {
     return std.fmt.bufPrint(buf, "{x:0>8}", .{bits}) catch unreachable;
 }
 
+inline fn f64Bits(value: f64) u64 {
+    return @bitCast(value);
+}
+
 /// Writes the canonical `--dump-glyphs` text for `gids`.
 ///
 /// `hint` runs the TrueType interpreter (`glifo`'s `HintingOptions`) instead
 /// of the unhinted scaler and emits the extra `hint 1` marker line.
 /// Non-empty `coords` are normalized F2Dot14 values and emit a
 /// `coords <n> <value...>` line so a coordinate-conversion mismatch is
-/// visible in the diff as well as in the outlines.
+/// visible in the diff as well as in the outlines. A non-zero `embolden`
+/// draws into a `BezPath` and dilates it with `kurbo.expandPath` (miter join,
+/// miter limit 4.0, tolerance 0.1, matching `FontEmbolden`'s defaults), then
+/// emits the `embolden` marker line and f64 coordinates; otherwise the raw
+/// f32 scaler elements are emitted. The oracle (`tools/oracle-rs`) mirrors
+/// all branches byte-for-byte.
 pub fn writeGlyphDump(
     writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
@@ -37,8 +49,14 @@ pub fn writeGlyphDump(
     size: f32,
     hint: bool,
     coords: []const font_mod.NormalizedCoord,
+    embolden: ?[2]f64,
     gids: []const u32,
 ) Error!void {
+    const expand_amount: ?[2]f64 = if (embolden) |amount|
+        (if (amount[0] != 0.0 or amount[1] != 0.0) amount else null)
+    else
+        null;
+
     try writer.print("vellz-glyph-dump v1\n", .{});
     try writer.print("face {d}\n", .{font_index});
     try writer.print("size {x:0>8}\n", .{@as(u32, @bitCast(size))});
@@ -47,6 +65,12 @@ pub fn writeGlyphDump(
         try writer.print("coords {d}", .{coords.len});
         for (coords) |coord| try writer.print(" {d}", .{coord});
         try writer.print("\n", .{});
+    }
+    if (expand_amount) |amount| {
+        try writer.print("embolden {x:0>16} {x:0>16}\n", .{
+            f64Bits(amount[0]),
+            f64Bits(amount[1]),
+        });
     }
 
     var instance: ?hinting.HintingInstance = null;
@@ -59,6 +83,85 @@ pub fn writeGlyphDump(
             coords,
             glyf.glifo_hint_target,
         );
+    }
+
+    if (expand_amount) |amount| {
+        var path = kurbo.BezPath.init();
+        defer path.deinit(allocator);
+        for (gids) |gid| {
+            path.truncate(0);
+            var path_pen = pen_mod.PathPen.init(allocator, &path);
+            const metrics = if (instance) |*inst| switch (inst.kind) {
+                .interpreter => |*interpreter| try outlines.draw(allocator, gid, .{
+                    .size = size,
+                    .coords = coords,
+                    .hint_instance = interpreter,
+                }, &path_pen),
+                .auto => |*auto| try auto.draw(
+                    allocator,
+                    gid,
+                    size,
+                    coords,
+                    .freetype,
+                    &path_pen,
+                ),
+            } else try outlines.draw(allocator, gid, .{
+                .size = size,
+                .coords = coords,
+            }, &path_pen);
+            var expanded = try kurbo.expandPath(
+                allocator,
+                path.elementsSlice(),
+                .{ .xx = amount[0], .yy = amount[1] },
+                .miter,
+                4.0,
+                0.1,
+            );
+            defer expanded.deinit(allocator);
+            var lsb_buf: [8]u8 = undefined;
+            var advance_buf: [8]u8 = undefined;
+            try writer.print("gid {d} format glyf elems {d} lsb {s} advance {s}\n", .{
+                gid,
+                expanded.elementsSlice().len,
+                optF32Hex(metrics.lsb, &lsb_buf),
+                optF32Hex(metrics.advance_width, &advance_buf),
+            });
+            for (expanded.elementsSlice()) |element| {
+                switch (element) {
+                    .MoveTo => |p| try writer.print("M {x:0>16} {x:0>16}\n", .{
+                        f64Bits(p.x),
+                        f64Bits(p.y),
+                    }),
+                    .LineTo => |p| try writer.print("L {x:0>16} {x:0>16}\n", .{
+                        f64Bits(p.x),
+                        f64Bits(p.y),
+                    }),
+                    .QuadTo => |q| try writer.print(
+                        "Q {x:0>16} {x:0>16} {x:0>16} {x:0>16}\n",
+                        .{
+                            f64Bits(q.p1.x),
+                            f64Bits(q.p1.y),
+                            f64Bits(q.p2.x),
+                            f64Bits(q.p2.y),
+                        },
+                    ),
+                    .CurveTo => |c| try writer.print(
+                        "C {x:0>16} {x:0>16} {x:0>16} {x:0>16} {x:0>16} {x:0>16}\n",
+                        .{
+                            f64Bits(c.p1.x),
+                            f64Bits(c.p1.y),
+                            f64Bits(c.p2.x),
+                            f64Bits(c.p2.y),
+                            f64Bits(c.p3.x),
+                            f64Bits(c.p3.y),
+                        },
+                    ),
+                    .ClosePath => try writer.print("Z\n", .{}),
+                }
+            }
+        }
+        try writer.print("end\n", .{});
+        return;
     }
 
     var pen = pen_mod.PathElementPen.init(allocator);
@@ -195,6 +298,13 @@ fn dumpGlyphVector(allocator: std.mem.Allocator, vector: manifest.GlyphVector) !
     while (gid <= vector.gid_end) : (gid += 1) try gids.append(allocator, gid);
     var allocating = std.Io.Writer.Allocating.init(allocator);
     errdefer allocating.deinit();
+    const embolden: ?[2]f64 = if (vector.embolden_x_bits == 0 and vector.embolden_y_bits == 0)
+        null
+    else
+        .{
+            @as(f64, @bitCast(vector.embolden_x_bits)),
+            @as(f64, @bitCast(vector.embolden_y_bits)),
+        };
     try writeGlyphDump(
         &allocating.writer,
         allocator,
@@ -203,6 +313,7 @@ fn dumpGlyphVector(allocator: std.mem.Allocator, vector: manifest.GlyphVector) !
         @bitCast(vector.size_bits),
         vector.hint,
         vector.coords,
+        embolden,
         gids.items,
     );
     return allocating.toOwnedSlice();
