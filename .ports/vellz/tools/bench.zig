@@ -51,6 +51,12 @@ const DEFAULT_SCENES = [_][]const u8{
 
 const LevelPair = struct { name: []const u8, level: vellz.simd.Level };
 
+const StatKind = enum {
+    min,
+    median,
+    mean,
+};
+
 const Options = struct {
     scenes: std.ArrayList([]const u8) = .empty,
     levels: std.ArrayList([]const u8) = .empty,
@@ -58,6 +64,7 @@ const Options = struct {
     runs: usize = 30,
     warmup: usize = 5,
     threads: u16 = 0,
+    stat: StatKind = .min,
 
     fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.scenes.deinit(allocator);
@@ -120,6 +127,8 @@ const RunResult = struct {
     level_name: []const u8,
     stats: [6]Stats,
     setup_ns: u64,
+    /// FNV-1a of the rendered pixmap; all levels of a scene/mode must agree.
+    pixmap_hash: u64,
 };
 
 /// One replayed scene operation; the SVG paths are parsed during the
@@ -181,6 +190,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--threads")) {
             options.threads = std.fmt.parseInt(u16, args.next() orelse return usage(), 10) catch
                 return usage();
+        } else if (std.mem.eql(u8, arg, "--stat")) {
+            const name = args.next() orelse return usage();
+            options.stat = std.meta.stringToEnum(StatKind, name) orelse return usage();
         } else {
             return usage();
         }
@@ -218,7 +230,7 @@ pub fn main(init: std.process.Init) !void {
             "- Build: {s}, Zig {s}\n" ++
             "- Detected SIMD level: {s}\n" ++
             "- Threads: {d} (0 = single-threaded dispatch)\n" ++
-            "- Runs per sample: {d} (warmup {d})\n" ++
+            "- Runs per sample: {d} (warmup {d}), statistic: {s}\n" ++
             "- Clock: std.Io monotonic wall time; phases from RasterizerSettings.timings\n",
         .{
             builtin.cpu.model.name,
@@ -228,6 +240,7 @@ pub fn main(init: std.process.Init) !void {
             options.threads,
             options.runs,
             options.warmup,
+            @tagName(options.stat),
         },
     );
 
@@ -255,7 +268,7 @@ pub fn main(init: std.process.Init) !void {
 
     var stdout_buffer: [4096]u8 = undefined;
     var file_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
-    try printTables(&file_writer.interface, allocator, results.items);
+    try printTables(&file_writer.interface, allocator, results.items, options.stat);
     try file_writer.flush();
 }
 
@@ -497,7 +510,17 @@ fn benchScene(
         .level_name = pair.name,
         .stats = stats,
         .setup_ns = setup_ns,
+        .pixmap_hash = fnv1a(pixmap.dataAsU8Slice()),
     };
+}
+
+fn fnv1a(bytes: []const u8) u64 {
+    var hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (bytes) |byte| {
+        hash ^= byte;
+        hash *%= 0x0000_0100_0000_01b3;
+    }
+    return hash;
 }
 
 /// Apply one scene paint; gradient stops and image handles are rebuilt every
@@ -562,38 +585,51 @@ fn applyPaint(
     }
 }
 
+fn statValue(stats: Stats, kind: StatKind) u64 {
+    return switch (kind) {
+        .min => stats.min_ns,
+        .median => stats.median_ns,
+        .mean => stats.mean_ns,
+    };
+}
+
 fn printTables(
     writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     results: []const RunResult,
+    stat: StatKind,
 ) !void {
     // Raw per-scene table.
-    try writer.writeAll("\n## Per-scene phase times (median, microseconds)\n\n");
+    try writer.print(
+        "\n## Per-scene phase times ({s}, microseconds) and output hash\n\n",
+        .{@tagName(stat)},
+    );
     try writer.writeAll(
-        "| scene | mode | level | setup | construct | preprocess | bucket | fine | render | total |\n" ++
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| scene | mode | level | setup | construct | preprocess | bucket | fine | render | total | fnv1a |\n" ++
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for (results) |result| {
         try writer.print(
-            "| {s} | {s} | {s} | {d} | {d} | {d} | {d} | {d} | {d} | {d} |\n",
+            "| {s} | {s} | {s} | {d} | {d} | {d} | {d} | {d} | {d} | {d} | {x:0>16} |\n",
             .{
                 shortName(result.scene),
                 result.mode_name,
                 result.level_name,
                 toUs(result.setup_ns),
-                toUs(result.stats[@intFromEnum(Phase.construct)].median_ns),
-                toUs(result.stats[@intFromEnum(Phase.preprocess)].median_ns),
-                toUs(result.stats[@intFromEnum(Phase.bucket)].median_ns),
-                toUs(result.stats[@intFromEnum(Phase.fine)].median_ns),
-                toUs(result.stats[@intFromEnum(Phase.render)].median_ns),
-                toUs(result.stats[@intFromEnum(Phase.total)].median_ns),
+                toUs(statValue(result.stats[@intFromEnum(Phase.construct)], stat)),
+                toUs(statValue(result.stats[@intFromEnum(Phase.preprocess)], stat)),
+                toUs(statValue(result.stats[@intFromEnum(Phase.bucket)], stat)),
+                toUs(statValue(result.stats[@intFromEnum(Phase.fine)], stat)),
+                toUs(statValue(result.stats[@intFromEnum(Phase.render)], stat)),
+                toUs(statValue(result.stats[@intFromEnum(Phase.total)], stat)),
+                result.pixmap_hash,
             },
         );
     }
 
     // Speedup summary: consecutive levels per (scene, mode), first is the
     // baseline (normally `fallback`).
-    try writer.writeAll("\n## Speedup vs first level (from median times)\n\n");
+    try writer.writeAll("\n## Speedup vs first level (from selected statistic)\n\n");
     var header_levels: std.ArrayList([]const u8) = .empty;
     defer header_levels.deinit(allocator);
     for (results) |result| {
@@ -621,9 +657,9 @@ fn printTables(
                 "| {s} | {s} | {s} |",
                 .{ shortName(base.scene), base.mode_name, phase.label() },
             );
-            const base_ns = base.stats[@intFromEnum(phase)].median_ns;
+            const base_ns = statValue(base.stats[@intFromEnum(phase)], stat);
             for (results[i + 1 ..][0 .. group - 1]) |other| {
-                const other_ns = other.stats[@intFromEnum(phase)].median_ns;
+                const other_ns = statValue(other.stats[@intFromEnum(phase)], stat);
                 if (base_ns == 0 or other_ns == 0) {
                     try writer.writeAll(" n/a |");
                 } else {
@@ -638,7 +674,9 @@ fn printTables(
     try writer.writeAll(
         "\n`fallback` is the scalar backend; `native` is the level detected for the build target.\n" ++
             "`bucket`/`fine` are measured inside `renderWith` via `RasterizerSettings.timings`;\n" ++
-            "`render` is the whole `renderWith` call, so `bucket + fine <= render`.\n",
+            "`render` is the whole `renderWith` call, so `bucket + fine <= render`.\n" ++
+            "All levels of a (scene, mode) row must print the same `fnv1a` hash; `min` is the\n" ++
+            "robust default statistic on shared/contended machines (`--stat median` for medians).\n",
     );
 }
 
