@@ -986,6 +986,7 @@ pub const MultiThreadedDispatcher = struct {
         // does not support filter layers.
         var filters = try FilterContext.init(allocator, 0);
         defer filters.deinit(allocator);
+        const bucket_start = if (settings.timings) |t| t.now_ns() else 0;
         try self.bucketer.reset(allocator, RectU16.new(0, 0, scene_width, scene_height));
         try self.bucketer.bucketCommands(
             allocator,
@@ -996,6 +997,7 @@ pub const MultiThreadedDispatcher = struct {
             encoded_paints,
             &filters,
         );
+        if (settings.timings) |t| t.bucket_ns += t.now_ns() - bucket_start;
 
         try self.refreshAlphaViews(allocator);
         const no_filter_paints = [_]encode_mod.EncodedPaint{};
@@ -1023,7 +1025,9 @@ pub const MultiThreadedDispatcher = struct {
             .root_is_blend_target = self.recorder.root_is_blend_target,
         };
 
+        const fine_start = if (settings.timings) |t| t.now_ns() else 0;
         try self.rasterizeParallel(&job);
+        if (settings.timings) |t| t.fine_ns += t.now_ns() - fine_start;
         if (job.firstError()) |err| return err;
     }
 

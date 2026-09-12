@@ -144,6 +144,25 @@ pub fn build(b: *std.Build) void {
     const cli_step = b.step("vellz-cli", "Build the corpus renderer CLI into zig-out/bin");
     cli_step.dependOn(&b.addInstallArtifact(cli, .{}).step);
 
+    // ---------------------------------------------------------------- bench
+    // In-process per-stage benchmark (plan.md §12 methodology): scene
+    // construction, preprocessing, coarse bucketing, and fine rasterization,
+    // measured separately through `RasterizerSettings.timings`. Development
+    // tooling; not part of the default install.
+    const bench = b.addExecutable(.{
+        .name = "vellz-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vellz", .module = mod }},
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.addPassthruArgs();
+    const bench_step = b.step("bench", "Run the in-process stage benchmark");
+    bench_step.dependOn(&run_bench.step);
+
     // --------------------------------------------------------------- example
     const cpu_example = b.addExecutable(.{
         .name = "vellz-cpu-example",
@@ -220,6 +239,7 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Compile the library and all buildable examples");
     check_step.dependOn(&unit_tests.step);
     check_step.dependOn(&scene_tests.step);
+    check_step.dependOn(&bench.step);
 
     // -------------------------------------------------------- GPU smoke test
     // `-Dgpu=true` only: device bootstrap + clear through the checked-in WGSL

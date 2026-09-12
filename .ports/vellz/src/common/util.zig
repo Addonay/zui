@@ -34,9 +34,24 @@ pub const TILE_HEIGHT: u16 = 4;
 /// Upstream truncates `f32x16` to `u32x16` and takes the low byte of each
 /// lane. On x86 that is `cvttps2dq`; on the scalar fallback it is Rust
 /// `as u32` (saturating). The two differ outside 0..1, which upstream
-/// documents as the only portable range. The lane loop below reproduces the
-/// x86 behavior without target intrinsics.
+/// documents as the only portable range. The vector path below reproduces the
+/// x86 behavior (including NaN and out-of-range lanes becoming the low byte of
+/// `u32::MIN`, i.e. 0) and is checked lane-for-lane against the scalar
+/// reference in the test below.
 pub fn f32ToU8(val: simd_backend.F32x16) simd_backend.U8x16 {
+    const V = simd_backend.F32x16;
+    const truncated = @trunc(val);
+    const valid = (truncated >= @as(V, @splat(-2147483648.0))) &
+        (truncated < @as(V, @splat(2147483648.0)));
+    const safe = @select(f32, valid, truncated, @as(V, @splat(0.0)));
+    const as_i32: simd_backend.I32x16 = @intFromFloat(safe);
+    const as_u32: simd_backend.U32x16 = @bitCast(as_i32);
+    return @truncate(as_u32);
+}
+
+/// Scalar reference for [`f32ToU8`]: the exact lane-loop semantics (x86
+/// `cvttps2dq` low byte, NaN/out-of-range -> 0).
+fn f32ToU8Scalar(val: simd_backend.F32x16) simd_backend.U8x16 {
     var out: simd_backend.U8x16 = undefined;
     inline for (0..@typeInfo(simd_backend.F32x16).vector.len) |lane| {
         out[lane] = f32LaneToU8(val[lane]);
@@ -520,6 +535,48 @@ test "f32_to_u8_truncates" {
         2, 3, 100, 0, 0, 255, 0, 0,
     };
     try std.testing.expectEqual(expected, f32ToU8(input));
+}
+
+test "f32_to_u8 vector path matches the scalar reference" {
+    // Boundary values (NaN, infinities, exactly +/-2^31, the f32 neighbours of
+    // the range limits) are checked explicitly; random bit patterns cover the
+    // rest of the domain.
+    const boundaries = [_]f32{
+        std.math.nan(f32),
+        std.math.inf(f32),
+        -std.math.inf(f32),
+        0.0,
+        -0.0,
+        2147483520.0, // largest f32 below 2^31
+        -2147483648.0,
+        2147483648.0,
+        -2147483904.0, // next f32 below -2^31
+        4294967295.0,
+        255.0,
+        255.999,
+        -255.999,
+    };
+    const boundary_vec: simd_backend.F32x16 = .{
+        boundaries[0], boundaries[1],  boundaries[2],  boundaries[3],
+        boundaries[4], boundaries[5],  boundaries[6],  boundaries[7],
+        boundaries[8], boundaries[9],  boundaries[10], boundaries[11],
+        boundaries[12], boundaries[0], boundaries[1],  boundaries[2],
+    };
+    try std.testing.expectEqual(f32ToU8Scalar(boundary_vec), f32ToU8(boundary_vec));
+
+    var prng = std.Random.DefaultPrng.init(0x5eed_f32a);
+    const random = prng.random();
+    var iter: usize = 0;
+    while (iter < 20_000) : (iter += 1) {
+        var input: simd_backend.F32x16 = undefined;
+        inline for (0..16) |lane| {
+            input[lane] = if (lane % 3 == 0)
+                @bitCast(random.int(u32))
+            else
+                random.float(f32) * 3000.0 - 100.0;
+        }
+        try std.testing.expectEqual(f32ToU8Scalar(input), f32ToU8(input));
+    }
 }
 
 test "div255 and normalized_mul_u8" {

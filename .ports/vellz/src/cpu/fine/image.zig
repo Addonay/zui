@@ -592,11 +592,29 @@ pub fn f32ToU32(value: f32) u32 {
     return @intFromFloat(value);
 }
 
-/// Lane-wise [`f32ToU32`].
-inline fn f32ToU32Vec(val: F32x4) U32x4 {
-    var out: U32x4 = undefined;
-    inline for (0..4) |lane| out[lane] = f32ToU32(val[lane]);
+/// Lane-wise [`f32ToU32`] for any vector width.
+///
+/// Vectorized: lanes outside the valid `@intFromFloat` range are selected to
+/// zero first (making the conversion safe in Debug/ReleaseSafe), then lanes at
+/// or above `u32::MAX` are saturated. NaN and non-positive lanes become 0
+/// exactly like the scalar reference (tested).
+pub inline fn f32ToU32VecN(val: anytype) @Vector(@typeInfo(@TypeOf(val)).vector.len, u32) {
+    const V = @TypeOf(val);
+    const U32V = @Vector(@typeInfo(V).vector.len, u32);
+    const truncated = @trunc(val);
+    const positive = truncated > @as(V, @splat(0.0));
+    const below_max = truncated < @as(V, @splat(4294967295.0));
+    const in_range = positive & below_max;
+    const safe = @select(f32, in_range, truncated, @as(V, @splat(0.0)));
+    var out: U32V = @intFromFloat(safe);
+    const at_or_above_max = truncated >= @as(V, @splat(4294967295.0));
+    out = @select(u32, at_or_above_max, @as(U32V, @splat(std.math.maxInt(u32))), out);
     return out;
+}
+
+/// Lane-wise [`f32ToU32`] for `f32x4`.
+pub inline fn f32ToU32Vec(val: F32x4) U32x4 {
+    return f32ToU32VecN(val);
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +774,35 @@ test "f32_to_u32 matches Rust saturating casts" {
     try testing.expectEqual(@as(u32, 3), f32ToU32(3.99));
     try testing.expectEqual(std.math.maxInt(u32), f32ToU32(std.math.inf(f32)));
     try testing.expectEqual(std.math.maxInt(u32), f32ToU32(1.0e30));
+}
+
+test "f32_to_u32 vector path matches the scalar reference" {
+    const boundaries = F32x4{
+        std.math.nan(f32),
+        4294967295.0,
+        4294967040.0,
+        -0.0,
+    };
+    try testing.expectEqual(
+        U32x4{ f32ToU32(boundaries[0]), f32ToU32(boundaries[1]), f32ToU32(boundaries[2]), f32ToU32(boundaries[3]) },
+        f32ToU32Vec(boundaries),
+    );
+
+    var prng = std.Random.DefaultPrng.init(0x5eed1234);
+    const random = prng.random();
+    var iter: usize = 0;
+    while (iter < 20_000) : (iter += 1) {
+        var input: F32x4 = undefined;
+        inline for (0..4) |lane| {
+            input[lane] = if (lane % 2 == 0)
+                @bitCast(random.int(u32))
+            else
+                random.float(f32) * 1.0e10 - 1.0e9;
+        }
+        var expected: U32x4 = undefined;
+        inline for (0..4) |lane| expected[lane] = f32ToU32(input[lane]);
+        try testing.expectEqual(expected, f32ToU32Vec(input));
+    }
 }
 
 test "cubic weights sum to one" {

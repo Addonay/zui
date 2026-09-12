@@ -167,6 +167,7 @@ pub const U16x16 = Vec(16, u16);
 pub const U32x4 = Vec(4, u32);
 pub const U32x16 = Vec(16, u32);
 pub const I32x4 = Vec(4, i32);
+pub const I32x16 = Vec(16, i32);
 
 pub fn Mask(comptime V: type) type {
     return @Vector(laneCount(V), bool);
