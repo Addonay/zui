@@ -21,12 +21,11 @@
 //! - Upstream `Stroke` derives `Clone`/`PartialEq`; Zig value semantics give
 //!   the copy behavior, and `Stroke.eql` provides the comparison because Zig
 //!   has no `==` for structs.
-//! - `Arc`/`Arc::to_cubic_beziers` (arc.rs) and `offset_cubic` (offset.rs) are
-//!   not yet separate modules in this port; the subsets needed by
-//!   `round_join`/`round_cap`/`do_cubic` are ported privately below.
-//!   `regularize_cusp`/`detect_cusp` (upstream `cubicbez.rs`, `pub(crate)`) are
-//!   likewise ported privately. When `offset.zig` lands, `doCubic` should call
-//!   it and the private copy here should go.
+//! - `Arc`/`Arc::to_cubic_beziers` now live in `arc.zig` and are shared with
+//!   `expand.zig`; `regularize_cusp`/`detect_cusp` (upstream `cubicbez.rs`,
+//!   `pub(crate)`) remain ported privately below, as does `offset_cubic`
+//!   (offset.rs). When `offset.zig` lands, `doCubic` should call it and the
+//!   private copy here should go.
 //! - `StrokeOptLevel.optimized` is accepted and stored exactly like upstream,
 //!   where the current implementation ignores it (upstream doc comment).
 
@@ -44,6 +43,7 @@ const segments = bezpath.segments;
 const Line = @import("line.zig").Line;
 const QuadBez = @import("quadbez.zig").QuadBez;
 const CubicBez = @import("cubicbez.zig").CubicBez;
+const Arc = @import("arc.zig").Arc;
 
 /// The number of dash lengths stored inline (upstream `SmallVec<[f64; 4]>`).
 const dash_capacity = 4;
@@ -675,7 +675,7 @@ fn roundJoin(
 ) !void {
     const a = Affine.new(.{ norm.x, norm.y, -norm.y, norm.x, center.x, center.y });
     const arc = Arc.new(Point.ORIGIN, Vec2.new(1.0, 1.0), std.math.pi - angle, angle, 0.0);
-    try appendArcCubics(allocator, out, arc, tolerance, a);
+    try arc.toCubicBeziers(allocator, out, tolerance, a);
 }
 
 fn roundJoinRev(
@@ -688,7 +688,7 @@ fn roundJoinRev(
 ) !void {
     const a = Affine.new(.{ norm.x, norm.y, norm.y, -norm.x, center.x, center.y });
     const arc = Arc.new(Point.ORIGIN, Vec2.new(1.0, 1.0), std.math.pi - angle, angle, 0.0);
-    try appendArcCubics(allocator, out, arc, tolerance, a);
+    try arc.toCubicBeziers(allocator, out, tolerance, a);
 }
 
 fn squareCap(
@@ -722,148 +722,6 @@ fn extendReversed(
             .QuadTo => |q| try out.quadTo(allocator, q.p1, end),
             .CurveTo => |c| try out.curveTo(allocator, c.p2, c.p1, end),
             else => unreachable,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Circular arc append iteration (port of the subset of arc.rs used here)
-// ---------------------------------------------------------------------------
-
-/// A single elliptical arc segment.
-///
-/// Private adaptation of upstream `arc.rs`: only what `round_join`/`round_cap`
-/// need. Upstream's `Arc::to_cubic_beziers` is folded into
-/// `appendArcCubics`.
-const Arc = struct {
-    center: Point,
-    radii: Vec2,
-    start_angle: f64,
-    sweep_angle: f64,
-    x_rotation: f64,
-
-    fn new(center: Point, radii: Vec2, start_angle: f64, sweep_angle: f64, x_rotation: f64) Arc {
-        return .{
-            .center = center,
-            .radii = radii,
-            .start_angle = start_angle,
-            .sweep_angle = sweep_angle,
-            .x_rotation = x_rotation,
-        };
-    }
-
-    /// Create an iterator generating Bézier path elements (upstream
-    /// `append_iter`).
-    fn appendIter(self: Arc, tolerance: f64) ArcAppendIter {
-        const sign = common.FloatFuncs.signum(self.sweep_angle);
-        const scaled_err = @max(self.radii.x, self.radii.y) / tolerance;
-        // Number of subdivisions per ellipse based on error tolerance.
-        // Note: this may slightly underestimate the error for quadrants.
-        const n_err = @max(common.FloatFuncs.powf(1.1163 * scaled_err, 1.0 / 6.0), 3.999_999);
-        const n_f = @ceil(n_err * @abs(self.sweep_angle) * (1.0 / (2.0 * std.math.pi)));
-        const angle_step = self.sweep_angle / n_f;
-        const n = common.castToUsize(n_f);
-        const arm_len = (4.0 / 3.0) * @tan(@abs(0.25 * angle_step)) * sign;
-        const angle0 = self.start_angle;
-        const p0 = sampleEllipse(self.radii, self.x_rotation, angle0);
-
-        return .{
-            .idx = 0,
-            .center = self.center,
-            .radii = self.radii,
-            .x_rotation = self.x_rotation,
-            .n = n,
-            .arm_len = arm_len,
-            .angle_step = angle_step,
-            .p0 = p0,
-            .angle0 = angle0,
-        };
-    }
-};
-
-const ArcAppendIter = struct {
-    idx: usize,
-
-    center: Point,
-    radii: Vec2,
-    x_rotation: f64,
-    n: usize,
-    arm_len: f64,
-    angle_step: f64,
-
-    p0: Vec2,
-    angle0: f64,
-
-    fn next(self: *ArcAppendIter) ?PathEl {
-        if (self.idx >= self.n) return null;
-
-        const angle1 = self.angle0 + self.angle_step;
-        const p0 = self.p0;
-        const p1 = p0.add(sampleEllipse(
-            self.radii,
-            self.x_rotation,
-            self.angle0 + std.math.pi / 2.0,
-        ).mulScalar(self.arm_len));
-        const p3 = sampleEllipse(self.radii, self.x_rotation, angle1);
-        const p2 = p3.sub(sampleEllipse(
-            self.radii,
-            self.x_rotation,
-            angle1 + std.math.pi / 2.0,
-        ).mulScalar(self.arm_len));
-
-        self.angle0 = angle1;
-        self.p0 = p3;
-        self.idx += 1;
-
-        return PathEl.curveTo(
-            self.center.addVec(p1),
-            self.center.addVec(p2),
-            self.center.addVec(p3),
-        );
-    }
-};
-
-/// Take the ellipse radii, how the radii are rotated, and the sweep angle, and
-/// return a point on the ellipse.
-fn sampleEllipse(radii: Vec2, x_rotation: f64, angle: f64) Vec2 {
-    const sc = common.FloatFuncs.sinCos(angle);
-    const angle_sin = sc[0];
-    const angle_cos = sc[1];
-    const u = radii.x * angle_cos;
-    const v = radii.y * angle_sin;
-    return rotatePt(Vec2.new(u, v), x_rotation);
-}
-
-/// Rotate `pt` about the origin by `angle` radians.
-fn rotatePt(pt: Vec2, angle: f64) Vec2 {
-    const sc = common.FloatFuncs.sinCos(angle);
-    const angle_sin = sc[0];
-    const angle_cos = sc[1];
-    return Vec2.new(
-        pt.x * angle_cos - pt.y * angle_sin,
-        pt.x * angle_sin + pt.y * angle_cos,
-    );
-}
-
-/// Append one arc as cubic Béziers, mapped through `a`; equivalent to upstream
-/// `arc.to_cubic_beziers(tolerance, |p1, p2, p3| out.curve_to(a * p1, ...))`.
-fn appendArcCubics(
-    allocator: std.mem.Allocator,
-    out: *BezPath,
-    arc: Arc,
-    tolerance: f64,
-    a: Affine,
-) !void {
-    var it = arc.appendIter(tolerance);
-    while (it.next()) |el| {
-        switch (el) {
-            .CurveTo => |c| try out.curveTo(
-                allocator,
-                a.transformPoint(c.p1),
-                a.transformPoint(c.p2),
-                a.transformPoint(c.p3),
-            ),
-            else => {},
         }
     }
 }
