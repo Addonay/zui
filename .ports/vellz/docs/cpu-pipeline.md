@@ -308,7 +308,9 @@ pub fn RenderContext.glyphRun(self, resources, font) GlyphRunBuilder;
   `.ok()`-filtered `Pixmap::from_png`.
 - Deferred with typed errors, never approximated: autohinting (a hinted run on
   a font without `fpgm`/`prep` fails up front), `hdmx` advances outside
-  backward compatibility, `gvar`/`HVAR` coordinates, CFF/CFF2.
+  backward compatibility, `gvar`/`HVAR` coordinates, CFF hinting and CFF2
+  `seac` (unhinted CFF/CFF2 outlines, including CFF2 blend scalars, are
+  ported).
 
 ## Error policy
 

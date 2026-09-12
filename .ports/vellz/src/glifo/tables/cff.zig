@@ -1661,3 +1661,45 @@ test "fdselect formats 0 and 3" {
     try testing.expectEqual(@as(u16, 4), fd3.fontIndex(2));
     try testing.expectEqual(@as(u16, 4), fd3.fontIndex(4));
 }
+
+test "blend state applies region scalars to the stack" {
+    // One-axis item variation store: region 0 = (-1, -0.5, 0), region 1 =
+    // (-1, -1, 0), one item variation data subtable referencing both regions.
+    var ivs: [38]u8 = undefined;
+    std.mem.writeInt(u16, ivs[0..2], 1, .big); // format
+    std.mem.writeInt(u32, ivs[2..6], 12, .big); // region list offset
+    std.mem.writeInt(u16, ivs[6..8], 1, .big); // item variation data count
+    std.mem.writeInt(u32, ivs[8..12], 28, .big); // subtable offset
+    std.mem.writeInt(u16, ivs[12..14], 1, .big); // axis count
+    std.mem.writeInt(u16, ivs[14..16], 2, .big); // region count
+    std.mem.writeInt(i16, ivs[16..18], @bitCast(@as(u16, 0xC000)), .big);
+    std.mem.writeInt(i16, ivs[18..20], @bitCast(@as(u16, 0xE000)), .big);
+    std.mem.writeInt(i16, ivs[20..22], 0, .big);
+    std.mem.writeInt(i16, ivs[22..24], @bitCast(@as(u16, 0xC000)), .big);
+    std.mem.writeInt(i16, ivs[24..26], @bitCast(@as(u16, 0xC000)), .big);
+    std.mem.writeInt(i16, ivs[26..28], 0, .big);
+    std.mem.writeInt(u16, ivs[28..30], 1, .big); // item count
+    std.mem.writeInt(u16, ivs[30..32], 0, .big); // word delta count
+    std.mem.writeInt(u16, ivs[32..34], 2, .big); // region index count
+    std.mem.writeInt(u16, ivs[34..36], 0, .big); // region 0
+    std.mem.writeInt(u16, ivs[36..38], 1, .big); // region 1
+
+    const store = try variations.ItemVariationStore.parse(&ivs);
+    var blend = try BlendState.init(store, &.{@bitCast(@as(u16, 0xD000))}, 0);
+    try testing.expectEqual(@as(usize, 2), try blend.regionCount());
+    // region 0 scalar: (coord - start)/(peak - start) = 0.25/0.5 = 0.5
+    // region 1 scalar: (end - coord)/(end - peak) = 0.75/1 = 0.75
+    var stack = Stack{};
+    try stack.pushI32(10);
+    try stack.pushI32(20);
+    try stack.pushI32(4);
+    try stack.pushI32(-8);
+    try stack.pushI32(-60);
+    try stack.pushI32(2);
+    try stack.pushI32(2); // target value count
+    try blend.applyBlend(&stack);
+    const values = try stack.fixedArray(2, 0);
+    try testing.expectEqual(@as(i32, 6 << 16), values[0].bits);
+    try testing.expectEqual(@as(i32, -557056), values[1].bits);
+    try testing.expectEqual(@as(usize, 2), stack.len());
+}

@@ -456,8 +456,9 @@ of panics, thread ownership).
 ### Milestone 3 — Glyph rendering and Cozmic adapter
 
 - **Status (2026-09-12):** outline subset, atlas cache, COLR (G3c), hinting
-  (G3b), decoration and the Cozmic adapter (T5) and embedded bitmaps (G3e)
-  are landed (T1–T5); autohint, `gvar`/variation, CFF and embolden remain
+  (G3b), decoration and the Cozmic adapter (T5), embedded bitmaps (G3e) and
+  the unhinted CFF/CFF2 scaler are landed (T1–T5 + `vellz-cff`); autohint,
+  `gvar`/variation, CFF hinting/`HVAR` deltas and embolden remain
   staged with typed `error.Unsupported`.
 - `glifo` port; stable font identity/face index/variation/glyph/size/placement
   contract; monochrome + COLR behavior; cache invalidation.
@@ -964,3 +965,37 @@ of panics, thread ownership).
   llvmpipe. `sbix`/`EBDT` have synthetic-font unit tests only (no pinned
   asset); PNG 16-bit/Adam7 is typed `error.Unsupported` and falls through to
   outlines.
+- 2026-09-12: **M3 CFF/CFF2 closure** (branch `vellz-cff`, commits
+  1d84b65 + 8e638ae + 424fe60 + this entry). The CFF deferral from
+  `docs/glifo-m3-plan.md` §2 is closed for unhinted outlines:
+  `glifo/cff.zig` ports the `skrifa 0.44.0` scaler (Subfont, FontMatrix
+  normalization/combination, `TransformSink`/`NopFilterSink`, `PenSink`,
+  width fallbacks and `transform_h_metric`) and the `read-fonts 0.41.0` Type2
+  charstring evaluator (full path/hint operator set, flex, `seac` explicit and
+  implicit, CFF2 `blend`/`vsindex`); `glifo/tables/cff.zig` ports INDEX
+  (v1/v2), DICT scanning with binary-coded decimals and delta prefix sums,
+  charset formats 0/1/2 + predefined sets, FDSelect 0/3/4 and the standard
+  encoding; `glifo/tables/variations.zig` ports the item variation store
+  region scalars; `glifo/fixed.zig` carries the 16.16/2.14 primitives.
+  `Font.outlines()` now dispatches `glyf` vs CFF/CFF2 through the
+  `outlines.zig` union and the call sites gate on `hasGlyph` instead of the
+  `glyf`-only `getGlyph`. Still typed `error.Unsupported`, never
+  approximated: CFF hinting (`skrifa/cff/hint.rs`; a disabled instance still
+  draws unhinted and rounds the advance), `HVAR` advance deltas for non-empty
+  coordinates, and CFF2 `seac`.
+  Fixtures: `SourceSerif4-Regular.otf` (CFF1, 1464 glyphs) and
+  `SourceSerif4Variable-Roman.otf` (CFF2, 6 FDArray subfonts, 34,012 `blend`
+  operators) imported byte-for-byte from Adobe Fonts `source-serif` commit
+  `5f220b17d27ed64873f22cde0dd593685387bd19` (OFL-1.1, license file copied),
+  with URLs/SHA-256 recorded in `tests/fixtures/upstream/README.md` and
+  re-fetched by `tools/import_upstream_fixtures.sh`.
+  Gates: `zig build glyphs` = 29 glyph vectors / 5 cmap vectors, now
+  866,901 elements / 2,500,272 f32 coordinates (9 new vectors sweep both CFF
+  faces at 0.5–2048 ppem, plus 2 cmap vectors); `zig build corpus` =
+  118/118 byte-exact at tolerance 0 (10 new `glyph_run` CFF/CFF2 scenes:
+  fill, stroke, scale absorption and rotated direct mode, cache on/off; the
+  scenes were rendered by the pinned oracle and their `.rgba`/`.json`/`.png`
+  fixtures regenerated via `tools/render_corpus.sh --png`, all deterministic);
+  `zig build test` = 896/896 (879 lib + 8 scene + 4 adapter + 5 Cozmic
+  bridge); `zig build probe` byte-exact. The corpus and glyph gates pass in
+  Debug, ReleaseSafe and ReleaseFast.

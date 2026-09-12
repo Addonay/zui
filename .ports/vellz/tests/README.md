@@ -187,6 +187,8 @@ fixture.
 | COLRv0/v1 color-fonts test glyph grid: all gradients, transform formats, composite modes, foreground colors | `glyph_run_colr_test_glyphs_*` |
 | embedded bitmap glyphs (Noto CBTF): fill, stroke (always filled), cache on/off | `glyph_run_bitmap_noto_*` |
 | embedded bitmap transform composition rows (absorption, translate, rotate, skew, flips) | `glyph_run_bitmap_transform_composition_*` |
+| CFF (Source Serif 4 OTF): fill, stroke, scale absorption, cache on/off | `glyph_run_cff_source_serif_*` |
+| CFF2 variable (Source Serif 4 VF OTF): fill, rotated direct mode, cache on/off | `glyph_run_cff2_source_serif_variable_*` |
 | upstream probe fixture | `tools/check_probe.sh` (`zig build probe`, embedded in `zig build test`) |
 
 The `*_speed` variants of the scenes above (16 scenes) are identical except for
@@ -197,9 +199,9 @@ They cover the u8-native gradient LUT and bilinear painters, the f32-painter
 `paintU8` conversion (nearest/bicubic images and undefined radial gradients),
 and the integer blend/composite/mask paths.
 
-All scenes above render byte-exact with `zig build corpus` (108/108,
+All scenes above render byte-exact with `zig build corpus` (118/118,
 `tolerance=0`: 32 quality/f32 + 16 speed/u8 + 22 outline glyph +
-6 decoration + 27 COLR + 5 bitmap). The
+6 decoration + 27 COLR + 5 bitmap + 10 CFF/CFF2). The
 f32 and u8 pipelines are not byte-equal to each other in general (integer
 `div_255` rounding vs f32); the corpus compares each pipeline against its own
 oracle output, never against the other pipeline.
@@ -324,6 +326,35 @@ Cache-on vs cache-off: the bitmap cache key carries the strike's own ppem
 (109) instead of the run size, and the decoded pixmap is queued as a
 `PendingBitmapUpload` that `cpu/text.zig` copies into the atlas page at frame
 start. Both settings are compared against their own oracle output.
+
+## CFF corpus (M3 CFF)
+
+`tests/scenes/glyph_run_cff*` cover the unhinted CFF/CFF2 scaler on the
+imported Source Serif 4 faces (`tests/fixtures/upstream/`, OFL-1.1; version 1
+OTF and the variable CFF2 OTF with six FDArray subfonts):
+
+- `glyph_run_cff_source_serif_{,cache_}300x70` and
+  `glyph_run_cff2_source_serif_variable_{,cache_}300x70` are fill runs; the
+  CFF2 face exercises the `blend`/`vsindex` charstring operators against the
+  ported item variation store scalars at the default location.
+- `glyph_run_cff_source_serif_stroked_unhinted_{,cache_}300x70` strokes cubic
+  CFF outlines (the stroker's curve path is otherwise only exercised by
+  `glyf`'s quadratics).
+- `glyph_run_cff_source_serif_scaled_unhinted_{,cache_}150x125` absorbs a
+  uniform run scale into the draw font size.
+- `glyph_run_cff2_source_serif_variable_rotated_unhinted_{,cache_}220x220`
+  takes the direct transform path with a rotation.
+
+Hinting is always off: CFF hinting (`skrifa/cff/hint.rs`) is a typed
+`error.Unsupported` in the port, as are `HVAR` advance deltas for non-empty
+coordinates and CFF2 `seac`. The same fixtures also back the dump gate:
+`tools/compare_glyphs.sh` compares every glyph of both faces at several sizes
+(9 vectors) through the oracle's `--dump-glyphs` path.
+
+The dump gate covers 29 glyph vectors / 5 cmap vectors in total (866,901 path
+elements, 2,500,272 f32 coordinates, 458,752 cmap mappings) with per-vector
+SHA-256s in `tests/fixtures/glyphs/manifest.zig`, checked by `zig build test`
+without a Rust toolchain; `zig build glyphs` re-runs the live comparison.
 
 ## Multithreaded dispatch
 

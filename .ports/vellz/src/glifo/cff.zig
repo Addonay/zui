@@ -1364,3 +1364,206 @@ test "CFF hinting and non-default HVAR coordinates are typed errors" {
         outlines.draw(testing.allocator, 36, .{ .size = 16.0, .coords = &.{0} }, &pen),
     );
 }
+
+// --------------------------------------------------- `seac` (unit-level)
+
+const CaptureEvent = union(enum) {
+    move: [2]i32,
+    line: [2]i32,
+    curve: [6]i32,
+    close,
+};
+
+const CaptureSink = struct {
+    events: [32]CaptureEvent = undefined,
+    len: usize = 0,
+
+    fn push(self: *CaptureSink, event: CaptureEvent) DrawError!void {
+        if (self.len == self.events.len) return error.OutOfBounds;
+        self.events[self.len] = event;
+        self.len += 1;
+    }
+
+    pub fn hstem(self: *CaptureSink, y: Fixed, dy: Fixed) DrawError!void {
+        _ = self;
+        _ = y;
+        _ = dy;
+    }
+    pub fn vstem(self: *CaptureSink, x: Fixed, dx: Fixed) DrawError!void {
+        _ = self;
+        _ = x;
+        _ = dx;
+    }
+    pub fn hintMask(self: *CaptureSink, mask: []const u8) DrawError!void {
+        _ = self;
+        _ = mask;
+    }
+    pub fn counterMask(self: *CaptureSink, mask: []const u8) DrawError!void {
+        _ = self;
+        _ = mask;
+    }
+    pub fn clearHints(self: *CaptureSink) DrawError!void {
+        _ = self;
+    }
+    pub fn finish(self: *CaptureSink) DrawError!void {
+        _ = self;
+    }
+    pub fn moveTo(self: *CaptureSink, x: Fixed, y: Fixed) DrawError!void {
+        try self.push(.{ .move = .{ x.bits, y.bits } });
+    }
+    pub fn lineTo(self: *CaptureSink, x: Fixed, y: Fixed) DrawError!void {
+        try self.push(.{ .line = .{ x.bits, y.bits } });
+    }
+    pub fn curveTo(
+        self: *CaptureSink,
+        c0x: Fixed,
+        c0y: Fixed,
+        c1x: Fixed,
+        c1y: Fixed,
+        x: Fixed,
+        y: Fixed,
+    ) DrawError!void {
+        try self.push(.{ .curve = .{ c0x.bits, c0y.bits, c1x.bits, c1y.bits, x.bits, y.bits } });
+    }
+    pub fn close(self: *CaptureSink) DrawError!void {
+        try self.push(.close);
+    }
+};
+
+/// Type2 integer operand encoding.
+fn appendInt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: i32) !void {
+    if (value >= -107 and value <= 107) {
+        try out.append(allocator, @intCast(value + 139));
+    } else if (value >= 108 and value <= 1131) {
+        const v = value - 108;
+        try out.append(allocator, @intCast(247 + @divTrunc(v, 256)));
+        try out.append(allocator, @intCast(@mod(v, 256)));
+    } else if (value >= -1131 and value <= -108) {
+        const v = -value - 108;
+        try out.append(allocator, @intCast(251 + @divTrunc(v, 256)));
+        try out.append(allocator, @intCast(@mod(v, 256)));
+    } else {
+        try out.append(allocator, 28);
+        try out.append(allocator, @intCast((value >> 8) & 0xFF));
+        try out.append(allocator, @intCast(value & 0xFF));
+    }
+}
+
+/// CFF1 INDEX with one-byte offsets.
+fn buildIndex(allocator: std.mem.Allocator, objects: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, @intCast(objects.len >> 8));
+    try out.append(allocator, @intCast(objects.len & 0xFF));
+    try out.append(allocator, 1);
+    var offset: usize = 1;
+    for (objects) |object| {
+        try out.append(allocator, @intCast(offset));
+        offset += object.len;
+    }
+    try out.append(allocator, @intCast(offset));
+    for (objects) |object| try out.appendSlice(allocator, object);
+    return out.toOwnedSlice(allocator);
+}
+
+test "explicit and implicit seac compose two charstrings" {
+    const allocator = testing.allocator;
+    // Base 'A' (code 65) and accent '`' (code 96) charstrings.
+    var base: std.ArrayList(u8) = .empty;
+    defer base.deinit(allocator);
+    for ([_]i32{ 50, 50 }) |value| try appendInt(&base, allocator, value);
+    try base.append(allocator, 21); // rmoveto
+    try appendInt(&base, allocator, 100);
+    try base.append(allocator, 6); // hlineto
+    try base.append(allocator, 14); // endchar
+
+    var accent: std.ArrayList(u8) = .empty;
+    defer accent.deinit(allocator);
+    for ([_]i32{ 10, 10 }) |value| try appendInt(&accent, allocator, value);
+    try accent.append(allocator, 21); // rmoveto
+    try appendInt(&accent, allocator, 20);
+    try accent.append(allocator, 7); // vlineto
+    try accent.append(allocator, 14); // endchar
+
+    const dummy = [_]u8{14};
+    const charstrings_data = try buildIndex(allocator, &.{ &dummy, base.items, accent.items });
+    defer allocator.free(charstrings_data);
+    const charstrings = try raw.Index.new(charstrings_data, false);
+
+    // Charset format 0 mapping gid 1 -> SID('A'), gid 2 -> SID('`').
+    const sid_base = raw.standard_encoding[65];
+    const sid_accent = raw.standard_encoding[96];
+    var charset_data: [9]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    charset_data[5] = @intCast(@as(u16, sid_base) >> 8);
+    charset_data[6] = @intCast(sid_base & 0xFF);
+    charset_data[7] = @intCast(@as(u16, sid_accent) >> 8);
+    charset_data[8] = @intCast(sid_accent & 0xFF);
+    const charset = try raw.Charset.init(&charset_data, 4, 3);
+    try testing.expectEqual(@as(u32, 1), try charset.glyphId(sid_base));
+    try testing.expectEqual(@as(u32, 2), try charset.glyphId(sid_accent));
+
+    const context = Context{
+        .charset = charset,
+        .charset_invalid = false,
+        .charstrings = charstrings,
+        .global_subrs = raw.Index.empty_index,
+        .subrs = raw.Index.empty_index,
+        .glyph_count = 3,
+    };
+
+    // Explicit `seac`: adx ady bchar achar seac.
+    var explicit: std.ArrayList(u8) = .empty;
+    defer explicit.deinit(allocator);
+    for ([_]i32{ 5, 7, 65, 96 }) |value| try appendInt(&explicit, allocator, value);
+    try explicit.appendSlice(allocator, &.{ 12, 6 }); // seac
+    var sink = CaptureSink{};
+    var evaluator = Evaluator(@TypeOf(sink)){
+        .context = &context,
+        .blend_state = null,
+        .sink = &sink,
+    };
+    try testing.expect((try evaluator.evaluate(explicit.items)) == null);
+    try testing.expectEqual(@as(usize, 6), sink.len);
+    try testing.expectEqual(CaptureEvent{ .move = .{ 50 << 16, 50 << 16 } }, sink.events[0]);
+    try testing.expectEqual(CaptureEvent{ .line = .{ 150 << 16, 50 << 16 } }, sink.events[1]);
+    try testing.expectEqual(CaptureEvent.close, sink.events[2]);
+    // Accent is placed at (dx + sbx - sb, dy) = (5, 7) in explicit mode.
+    try testing.expectEqual(CaptureEvent{ .move = .{ 15 << 16, 17 << 16 } }, sink.events[3]);
+    try testing.expectEqual(CaptureEvent{ .line = .{ 15 << 16, 37 << 16 } }, sink.events[4]);
+    try testing.expectEqual(CaptureEvent.close, sink.events[5]);
+
+    // Implicit `endchar` seac: dx dy bchar achar endchar; FreeType evaluates
+    // the accent first, then the base at the current point.
+    var implicit: std.ArrayList(u8) = .empty;
+    defer implicit.deinit(allocator);
+    for ([_]i32{ 5, 7, 65, 96 }) |value| try appendInt(&implicit, allocator, value);
+    try implicit.append(allocator, 14); // endchar
+    var sink2 = CaptureSink{};
+    var evaluator2 = Evaluator(@TypeOf(sink2)){
+        .context = &context,
+        .blend_state = null,
+        .sink = &sink2,
+    };
+    try testing.expect((try evaluator2.evaluate(implicit.items)) == null);
+    try testing.expectEqual(@as(usize, 6), sink2.len);
+    try testing.expectEqual(CaptureEvent{ .move = .{ 15 << 16, 17 << 16 } }, sink2.events[0]);
+    try testing.expectEqual(CaptureEvent{ .line = .{ 15 << 16, 37 << 16 } }, sink2.events[1]);
+    try testing.expectEqual(CaptureEvent.close, sink2.events[2]);
+    try testing.expectEqual(CaptureEvent{ .move = .{ 50 << 16, 50 << 16 } }, sink2.events[3]);
+    try testing.expectEqual(CaptureEvent{ .line = .{ 150 << 16, 50 << 16 } }, sink2.events[4]);
+    try testing.expectEqual(CaptureEvent.close, sink2.events[5]);
+
+    // A charstring that falls off the end without `endchar` gets the
+    // FreeType-simulated endchar, which triggers the implicit seac too.
+    var simulated = implicit.items[0 .. implicit.items.len - 1];
+    _ = &simulated;
+    var sink3 = CaptureSink{};
+    var evaluator3 = Evaluator(@TypeOf(sink3)){
+        .context = &context,
+        .blend_state = null,
+        .sink = &sink3,
+    };
+    try testing.expect((try evaluator3.evaluate(simulated)) == null);
+    try testing.expectEqual(@as(usize, 6), sink3.len);
+    try testing.expectEqual(CaptureEvent{ .move = .{ 15 << 16, 17 << 16 } }, sink3.events[0]);
+}

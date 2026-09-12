@@ -12,6 +12,9 @@ pub const pins = struct {
     pub const vello_gpu_shaders_version = "0.2.0";
     pub const glifo_version = "0.3.0";
     pub const tested_zig = "0.17.0-dev.2085+5e36170b5";
+    /// CFF fixture fonts (Source Serif 4, OFL-1.1) pinned release commit;
+    /// see tests/fixtures/upstream/README.md.
+    pub const source_serif_rev = "5f220b17d27ed64873f22cde0dd593685387bd19";
 };
 
 pub fn build(b: *std.Build) void {
