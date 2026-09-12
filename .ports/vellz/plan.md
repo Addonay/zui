@@ -211,19 +211,20 @@ public pipeline · `ver` oracle-verified · `adapt` deliberate divergence ·
 | Upstream area | Zig target | Status | Notes |
 | --- | --- | --- | --- |
 | `render/common.rs` (Config, GpuStrip, clear/encoded paint structs, packing) | `gpu/render/common.zig` | port | 8 layout/packing tests run in the default `zig build test`; comptime `@sizeOf`/`@offsetOf` asserts match `docs/shader-interface.md` §4 |
-| `render/wgpu/mod.rs` (device bootstrap/readback/clear subset) | `gpu/backend/{device,wgpu,readback}.zig` | partial | T1: instance/adapter/device/queue, error scopes, uncaptured/device-lost capture, limits, adapter-info printing, checked-in clear WGSL pipeline, texture readback; `run-gpu-smoke` passes offscreen on lavapipe (all handles released, zero validation errors) |
-| `render/wgpu/mod.rs` (Programs, passes, resources) | `gpu/render/wgpu.zig` | defer | M5 T3–T5 |
-| `draw.rs`, `scene.rs` | `gpu/draw.zig`, `gpu/scene.zig` | defer | M5 |
-| `schedule/*`, `target.rs` | `gpu/schedule.zig`, `gpu/target.zig` | defer | M5 |
-| `util.rs` (packing subset) | `gpu/util.zig` | partial | `pack_u16_pair`/`pack_opacity` landed; `Ranges`/`RangedSlice` with the schedule |
-| `copy.rs` | `gpu/copy.zig` | partial | `GpuCopyInstance` (16 B) + packing test |
+| `render/wgpu/mod.rs` (device bootstrap/readback/clear subset) | `gpu/backend/{device,wgpu,readback}.zig` | partial | T1: instance/adapter/device/queue, error scopes, uncaptured/device-lost capture, limits, adapter-info printing, texture readback; `run-gpu-smoke` passes offscreen on lavapipe (all handles released, zero validation errors) |
+| `render/wgpu/mod.rs` (Programs, pipelines, resources, root passes) | `gpu/backend/{wgpu,renderer}.zig` | conn | T3/T4: shader modules from checked-in WGSL, bind-group layouts for render groups 0–3 + filter/blend/copy, four 24-B strip pipeline variants, layer/root/atlas clear, copy/blend/filter pipelines, Config uniform, `Rgba32Uint` uploads (256-B rows), offscreen root renderer. Evidence: `-Dgpu=true test` 768/768, `gpu-corpus` 9/9 scenes (7 byte-exact, 2 within max-abs 1); no layers/gradients/images/filters yet (`error.Unsupported`) |
+| `draw.rs`, `scene.rs` | `gpu/draw.zig`, `gpu/scene.zig` | port | T4: solid paints, rect fast path, filled/stroked paths, clip paths, `CommandRecorder`, opaque/alpha routing, depth counter, external-texture runs; layers/indexed paints return `error.Unsupported` until the schedule/encoded-paint milestones |
+| `schedule/*` | `gpu/schedule/*.zig` | defer | M5 T5+; root pass currently renders the single root draw directly |
+| `target.rs` | `gpu/target.zig` | port | Root/layer targets, parity, batch bindings, texture regions (T4) |
+| `util.rs` | `gpu/util.zig` | port | packing helpers + `Ranges`/`RangedSlice` (T4) |
+| `copy.rs` | `gpu/copy.zig` | port | `GpuCopyInstance` (16 B) + packing test |
 | `blend.rs` | `gpu/blend.zig` | partial | `GpuBlendInstance` (32 B) + `blend_config` bit packing; `new`/`copy_from_scratch` need the schedule |
 | `filter.rs` (layout subset) | `gpu/filter.zig` | partial | 48-byte blocks, `FilterInstanceData` (36 B), header/pass-kind constants; `PreparedFilter` conversions and the pass planner follow |
-| `paint.rs`, `rect.rs` | `gpu/paint.zig`, `gpu/rect.zig` | defer | M5 |
+| `paint.rs`, `rect.rs` | `gpu/paint.zig`, `gpu/rect.zig` | port | T4: solid paint packing + full `split_rect`/coverage port; indexed paints return `error.Unsupported` until encoded paints land |
 | `gradient_cache.rs` | `gpu/gradient_cache.zig` | defer | M5 |
 | `resources.rs`, `text.rs` | `gpu/resources.zig`, `gpu/text.zig` | defer | M5/M3 |
 | `render/webgl/*` | — | unsup | WebGL out of scope |
-| WGSL shaders | `gpu/shaders/generated.zig` | port | checked-in compiled WGSL; `clear.wgsl` drives the offscreen smoke |
+| WGSL shaders | `gpu/shaders/generated.zig` | port | checked-in compiled WGSL; all five modules create successfully on lavapipe; clear + render drive the smoke and root corpus |
 
 ### `glifo` → `src/glifo/`
 
@@ -697,3 +698,34 @@ of panics, thread ownership).
   `zig build corpus` = 48/48 byte-exact in Debug/ReleaseSafe/ReleaseFast,
   `zig build probe` byte-exact, `zig build glyphs` pass, and
   `zig build -Dgpu=true check` + `run-gpu-smoke` green on llvmpipe.
+- 2026-09-12: **M5 T3/T4/T5 landed** (branch `vellz-gpu2`). T4 bottom-up port:
+  `gpu/target.zig`, `gpu/rect.zig` (full `split_rect` + coverage packing),
+  `gpu/paint.zig` (solid packing; indexed paints typed-unsupported),
+  `gpu/scene.zig` (fill/stroke/clip + `CommandRecorder`), `gpu/draw.zig`
+  (`GpuStrip` encoding, opaque/alpha routing, depth counter, external runs),
+  and `Ranges`/`RangedSlice` in `gpu/util.zig`; 29 new CPU-build tests.
+  T3/T4 backend: `gpu/backend/wgpu.zig` bind-group layouts for render groups
+  0–3 + filter/blend/copy, shader modules for all five checked-in WGSL blobs,
+  the four 24-B strip pipelines (intermediate/alpha/depth-alpha/opaque),
+  layer/root/atlas clears, copy/blend/filter pipelines, `Config` uniform,
+  256-B-row `Rgba32Uint`/`Rgba8` uploads, and `stripPass`/clear encoders;
+  `gpu/backend/renderer.zig` owns the offscreen root renderer (+1 placeholder
+  encoded-paints/gradient bind groups, growable alpha texture).
+  T5: `tools/gpu_render.zig` + `tools/gpu_corpus.sh` wired as
+  `run-gpu-render`/`gpu-corpus`, and `tools/gpu_error_tests.zig` as
+  `run-gpu-errors`. Evidence on llvmpipe (`backend=vulkan type=cpu
+  execution=software-adapter`, Mesa 25.2.8, `maxTextureDimension2D=8192`):
+  `zig build test` = 758/758 (CPU), `zig build corpus` 48/48 byte-exact,
+  `zig build -Dgpu=true test` = 768/768, `run-gpu-smoke` pass,
+  `run-gpu-errors` pass (oversized target -> `UnsupportedCapability`,
+  destroyed device -> `DeviceLost` on render + check, forced adapter ->
+  `NoAdapter`), `gpu-corpus` 9/9 scenes: `empty_64`,
+  `fill_overlap_alpha_64`, `fill_path_nonzero_64`, `fill_path_evenodd_64`,
+  `stroke_basic_64`, `clip_nested_64`, `degenerate_64` byte-exact;
+  `fill_rect_64` max-abs 1 with 41/4096 pixels and `transform_rotate_64`
+  max-abs 1 with 84/4096 pixels (fractional/rotated edge AA; registry in
+  `tests/README.md`). `fill_tile_grid_128` and `fill_wave_seams_128` render
+  with max-abs 1 but are not gated yet (tile-seam coverage rounding; metrics
+  recorded in `tests/README.md`). Still `error.Unsupported`: layers
+  (blend/opacity/filter/mask), gradients, images, filters, and GPU masks —
+  schedule + encoded paints + `gradient_cache` are the next milestones.

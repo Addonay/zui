@@ -259,6 +259,87 @@ pub fn build(b: *std.Build) void {
         );
         smoke_failure_step.dependOn(&run_smoke_failure.step);
         check_step.dependOn(&run_smoke_failure.step);
+
+        // ------------------------------------------------ GPU corpus renderer
+        // `vellz-gpu-render` replays a shared-corpus scene through the root
+        // strip passes into an offscreen RGBA8 texture and writes the result
+        // for comparison with the pinned oracle.
+        const gpu_render = b.addExecutable(.{
+            .name = "vellz-gpu-render",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/gpu_render.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "vellz", .module = mod },
+                    .{ .name = "wgpu", .module = wgpu_mod },
+                },
+            }),
+        });
+        check_step.dependOn(&gpu_render.step);
+
+        const run_gpu_render = b.addRunArtifact(gpu_render);
+        run_gpu_render.addPassthruArgs();
+        const gpu_render_step = b.step(
+            "run-gpu-render",
+            "Render one corpus scene offscreen through the GPU backend",
+        );
+        gpu_render_step.dependOn(&run_gpu_render.step);
+
+        // ------------------------------------------------ GPU corpus gate
+        // `tools/gpu_corpus.sh` invokes the built renderer per scene and
+        // compares against the oracle with the documented GPU tolerance.
+        const gpu_corpus = b.addSystemCommand(&.{"tools/gpu_corpus.sh"});
+        gpu_corpus.addArtifactArg(gpu_render);
+        gpu_corpus.step.dependOn(&gpu_render.step);
+        gpu_corpus.addFileInput(b.path("tools/gpu_corpus.sh"));
+        gpu_corpus.addFileInput(b.path("tools/compare_raw.py"));
+        // Track the scenes the script reads so edits invalidate the run.
+        for ([_][]const u8{
+            "empty_64",
+            "fill_rect_64",
+            "fill_overlap_alpha_64",
+            "fill_path_nonzero_64",
+            "fill_path_evenodd_64",
+            "transform_rotate_64",
+            "stroke_basic_64",
+            "clip_nested_64",
+            "degenerate_64",
+        }) |scene_name| {
+            gpu_corpus.addFileInput(b.path(b.fmt("tests/scenes/{s}.json", .{scene_name})));
+            gpu_corpus.addFileInput(b.path(b.fmt("tests/fixtures/oracle/{s}.rgba", .{scene_name})));
+        }
+        const gpu_corpus_step = b.step(
+            "gpu-corpus",
+            "Run the offscreen GPU corpus gate (T5)",
+        );
+        gpu_corpus_step.dependOn(&gpu_corpus.step);
+        check_step.dependOn(&gpu_corpus.step);
+
+        // ------------------------------------------------ GPU error policy
+        // Typed errors for unsupported capabilities and device loss; never a
+        // CPU fallback.
+        const gpu_errors = b.addExecutable(.{
+            .name = "vellz-gpu-errors",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/gpu_error_tests.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "vellz", .module = mod },
+                    .{ .name = "wgpu", .module = wgpu_mod },
+                },
+            }),
+        });
+        check_step.dependOn(&gpu_errors.step);
+
+        const run_gpu_errors = b.addRunArtifact(gpu_errors);
+        const gpu_errors_step = b.step(
+            "run-gpu-errors",
+            "Run the GPU typed-error policy tests (T5)",
+        );
+        gpu_errors_step.dependOn(&run_gpu_errors.step);
+        check_step.dependOn(&run_gpu_errors.step);
     }
 }
 
