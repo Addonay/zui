@@ -143,12 +143,12 @@ fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_col
     if (node.kind == .text) paintText(frame, scene, node, text_color, clip);
     if (node.kind == .image) paintImage(frame, scene, node, opacity, clip);
 
-    if (node.listener != null or node.mouse_down_listener != null or node.double_click_listener != null or node.focus != null) {
+    if (node.listener != null or node.mouse_down_listener != null or node.mouse_up_listener != null or node.mouse_move_listener != null or node.double_click_listener != null or node.scroll_listener != null or node.focus != null) {
         // Hit regions obey the same effective clip as paint: a clipped-away
         // control cannot be clicked. Empty clips register nothing.
         const hit = intersect(node.bounds, clip);
         if (hit.w > 0 and hit.h > 0) {
-            _ = frame.addRegion(.{ .bounds = hit, .listener = node.listener, .mouse_down_listener = node.mouse_down_listener, .double_click_listener = node.double_click_listener, .focus = node.focus, .cursor = node.style.cursor });
+            _ = frame.addRegion(.{ .bounds = hit, .listener = node.listener, .mouse_down_listener = node.mouse_down_listener, .mouse_up_listener = node.mouse_up_listener, .mouse_move_listener = node.mouse_move_listener, .double_click_listener = node.double_click_listener, .scroll_listener = node.scroll_listener, .focus = node.focus, .cursor = node.style.cursor });
         }
     }
 
@@ -597,9 +597,9 @@ test "overflowing text clips to parent content box" {
     // Scene geometry is logical (uncut); the clip binds at rasterization.
     // Render and assert no painted pixel escapes the 60px field.
     var buf: [200 * 100 * 4]u8 = undefined;
-    const target = gpu.software.Target.init(&buf, 200, 100, .rgba32);
-    target.clear(core.Color.hex(0x000000));
-    target.renderScene(scene, &.{}, &.{});
+    var renderer = gpu.vellz.Renderer.init(t.allocator);
+    defer renderer.deinit();
+    try renderer.render(&buf, 200, 100, .rgba32, core.Color.hex(0x000000), scene, &.{}, &.{});
     var y: usize = 0;
     while (y < 100) : (y += 1) {
         var x: usize = 60;
@@ -646,9 +646,13 @@ test "hot frame structs stay within stack budget" {
     // Structural fix (pools behind init/deinit) is plan M10; until then
     // these pins fail loudly on growth instead of segfaulting rarely.
     const t = @import("std").testing;
+    // The second pin moved from 9MB to 9.25MB when HitRegion gained the
+    // mouse-move/mouse-up/scroll listener slots (3 x 32 bytes x 512 regions,
+    // ~49KB). Growth beyond this still fails loudly; the real structural fix
+    // (pooled frame storage, plan M10) stays open.
     try t.expect(@sizeOf(element.Frame) < 4 * 1024 * 1024);
     try t.expect(@sizeOf(gpu.Scene) < 7 * 1024 * 1024);
-    try t.expect(@sizeOf(element.Frame) + @sizeOf(gpu.Scene) < 9 * 1024 * 1024);
+    try t.expect(@sizeOf(element.Frame) + @sizeOf(gpu.Scene) < 9.25 * 1024 * 1024);
 }
 
 test "shaped text emits atlas glyphs, not bitmap quads" {
@@ -733,9 +737,9 @@ test "rounded border ring leaves no notches" {
     try t.expectEqual(@as(usize, 2), scene.slice().len);
 
     var buf: [24 * 24 * 4]u8 = undefined;
-    const target = gpu.software.Target.init(&buf, 24, 24, .rgba32);
-    target.clear(core.Color.hex(0x000000));
-    target.renderScene(scene, &.{}, &.{});
+    var renderer = gpu.vellz.Renderer.init(t.allocator);
+    defer renderer.deinit();
+    try renderer.render(&buf, 24, 24, .rgba32, core.Color.hex(0x000000), scene, &.{}, &.{});
     const at = struct {
         fn pixel(pixels: []u8, x: usize, y: usize) u8 {
             return pixels[(y * 24 + x) * 4 + 1]; // green channel
@@ -800,9 +804,9 @@ test "img element measures intrinsic size and paints one blit" {
 
     // Pixels land in the target: red top row, blue bottom row.
     var buf: [100 * 100 * 4]u8 = undefined;
-    const target = gpu.software.Target.init(&buf, 100, 100, .rgba32);
-    target.clear(core.Color.hex(0x000000));
-    target.renderScene(scene, &.{}, cache.pool[0..cache.used]);
+    var renderer = gpu.vellz.Renderer.init(t.allocator);
+    defer renderer.deinit();
+    try renderer.render(&buf, 100, 100, .rgba32, core.Color.hex(0x000000), scene, &.{}, cache.pool[0..cache.used]);
     try t.expectEqual(@as(u8, 255), buf[(25 * 100 + 0) * 4]);
     try t.expectEqual(@as(u8, 255), buf[(74 * 100 + 0) * 4 + 2]);
 }
@@ -913,9 +917,9 @@ test "nested opacity multiplies down the tree" {
     scene.* = .{};
     paint(frame, root, scene);
     var buf: [10 * 10 * 4]u8 = undefined;
-    const target = gpu.software.Target.init(&buf, 10, 10, .rgba32);
-    target.clear(core.Color.hex(0x000000));
-    target.renderScene(scene, &.{}, &.{});
+    var renderer = gpu.vellz.Renderer.init(t.allocator);
+    defer renderer.deinit();
+    try renderer.render(&buf, 10, 10, .rgba32, core.Color.hex(0x000000), scene, &.{}, &.{});
     const v = buf[(5 * 10 + 5) * 4];
     try t.expect(v > 55 and v < 75);
 }

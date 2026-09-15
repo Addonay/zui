@@ -3,7 +3,7 @@
 //! One foreground thread owns state (`App`/`Entity`/`Context`); views render
 //! transient elements each dirty frame, laid out by `elements/layout`,
 //! painted into a `gpu.Scene`, and presented by the native `platform`
-//! backend via the `gpu/software` rasterizer.
+//! backend via the `gpu.vellz` renderer.
 //!
 //! Attribution, not copies:
 //! - Windowing: one backend vtable + bootstrap probe order, `dlopen`ed
@@ -54,6 +54,7 @@ pub const FocusHandle = app.FocusHandle;
 pub const TestHarness = app.TestHarness;
 
 pub const Element = elements.Element;
+pub const Listener = elements.Listener;
 pub const TextField = widgets.TextField;
 pub const SharedString = core.SharedString;
 pub const string = core.string;

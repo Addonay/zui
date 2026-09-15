@@ -288,6 +288,8 @@ const PointerListener = extern struct {
     axis_source: ?*const fn (?*anyopaque, *Pointer, u32) callconv(.c) void = null,
     axis_stop: ?*const fn (?*anyopaque, *Pointer, u32, u32) callconv(.c) void = null,
     axis_discrete: ?*const fn (?*anyopaque, *Pointer, u32, i32) callconv(.c) void = null,
+    axis_value120: ?*const fn (?*anyopaque, *Pointer, u32, i32) callconv(.c) void = null,
+    axis_relative_direction: ?*const fn (?*anyopaque, *Pointer, u32, u32) callconv(.c) void = null,
 };
 
 // XDG Shell Protocol Interfaces (manual definitions since not in libwayland-client)
@@ -325,9 +327,7 @@ const xdg_toplevel_methods = [_]Message{
     .{ .name = "move", .signature = "ou", .types = null },
     .{ .name = "resize", .signature = "ouu", .types = null },
     .{ .name = "set_max_size", .signature = "ii", .types = null },
-    .{ .name = "unset_max_size", .signature = "", .types = null },
     .{ .name = "set_min_size", .signature = "ii", .types = null },
-    .{ .name = "unset_min_size", .signature = "", .types = null },
     .{ .name = "set_maximized", .signature = "", .types = null },
     .{ .name = "unset_maximized", .signature = "", .types = null },
     .{ .name = "set_fullscreen", .signature = "o", .types = null },
@@ -337,7 +337,7 @@ const xdg_toplevel_methods = [_]Message{
 const xdg_toplevel_interface: Interface = .{
     .name = "xdg_toplevel",
     .version = 5,
-    .method_count = 16,
+    .method_count = 14,
     .methods = @ptrCast(&xdg_toplevel_methods),
     .event_count = 4,
     .events = @ptrCast(&xdg_toplevel_events),
@@ -484,6 +484,8 @@ pub const WaylandBackend = struct {
     allocator: std.mem.Allocator,
     lib: dl.Library,
     api: WaylandApi,
+    /// Vellz-backed frame renderer, persistent across presents.
+    renderer: gpu.vellz.Renderer,
 
     display: *Display,
     registry: *Registry,
@@ -540,6 +542,10 @@ pub const WaylandBackend = struct {
     axis_h: i32 = 0,
     disc_v: i32 = 0,
     disc_h: i32 = 0,
+    // High-resolution steps (wl_pointer.axis_value120, v8+), in 1/120ths
+    // of a wheel notch.
+    v120_v: i32 = 0,
+    v120_h: i32 = 0,
     // Clipboard (data-device) state.
     ddm: ?*DataDeviceManager = null,
     data_device: ?*DataDevice = null,
@@ -622,6 +628,7 @@ pub const WaylandBackend = struct {
             .registry = reg,
             .size = .{ .w = @floatFromInt(width), .h = @floatFromInt(height) },
             .debug_events = getenv("ZUI_DEBUG_EVENTS") != null,
+            .renderer = gpu.vellz.Renderer.init(allocator),
         };
 
         // Attach registry listener
@@ -726,6 +733,7 @@ pub const WaylandBackend = struct {
     }
 
     pub fn deinit(self: *WaylandBackend) void {
+        self.renderer.deinit();
         self.destroyBuffer();
 
         if (self.decoration) |d| {
@@ -934,13 +942,16 @@ pub const WaylandBackend = struct {
     fn registryGlobalRemove(_: ?*anyopaque, _: *Registry, _: u32) callconv(.c) void {}
 
     /// Create pointer/keyboard objects once the seat reports capabilities.
-    /// Version 1 for both: it carries every event we consume (later
-    /// versions only add axis niceties and repeat info we don't use yet).
+    /// Compositors version the child object after the seat resource, so a
+    /// v5 seat still yields v5 pointer events (axis_source/axis_stop/…).
+    /// The listener tables below handle every event slot; the version
+    /// requested here mirrors the parent like the generated C stubs do.
     fn ensureSeatDevices(self: *WaylandBackend) void {
         const seat = self.seat orelse return;
         if (self.pointer == null and (self.seat_caps & WL_SEAT_CAP_POINTER) != 0) {
             // wl_seat.get_pointer is opcode 0.
-            const raw = self.api.wl_proxy_marshal_flags(@ptrCast(seat), 0, self.api.wl_pointer_interface, 1, 0, @as(?*anyopaque, null));
+            const pointer_version = @min(self.api.wl_proxy_get_version(@ptrCast(seat)), @as(u32, @intCast(self.api.wl_pointer_interface.version)));
+            const raw = self.api.wl_proxy_marshal_flags(@ptrCast(seat), 0, self.api.wl_pointer_interface, pointer_version, 0, @as(?*anyopaque, null));
             if (raw) |p| {
                 self.pointer = @ptrCast(p);
                 _ = self.api.wl_proxy_add_listener(@ptrCast(p), &default_pointer_listener, self);
@@ -948,7 +959,8 @@ pub const WaylandBackend = struct {
         }
         if (self.keyboard == null and (self.seat_caps & WL_SEAT_CAP_KEYBOARD) != 0) {
             // wl_seat.get_keyboard is opcode 1.
-            const raw = self.api.wl_proxy_marshal_flags(@ptrCast(seat), 1, self.api.wl_keyboard_interface, 1, 0, @as(?*anyopaque, null));
+            const keyboard_version = @min(self.api.wl_proxy_get_version(@ptrCast(seat)), @as(u32, @intCast(self.api.wl_keyboard_interface.version)));
+            const raw = self.api.wl_proxy_marshal_flags(@ptrCast(seat), 1, self.api.wl_keyboard_interface, keyboard_version, 0, @as(?*anyopaque, null));
             if (raw) |k| {
                 self.keyboard = @ptrCast(k);
                 _ = self.api.wl_proxy_add_listener(@ptrCast(k), &default_keyboard_listener, self);
@@ -991,6 +1003,7 @@ pub const WaylandBackend = struct {
             .pos = .{ .x = self.pointer_x, .y = self.pointer_y },
             .button = .left,
             .pressed = false,
+            .motion = true,
             .modifiers = evdev.modifiersFromMask(self.mods_mask),
         } });
     }
@@ -1008,6 +1021,7 @@ pub const WaylandBackend = struct {
             .pos = .{ .x = self.pointer_x, .y = self.pointer_y },
             .button = .left,
             .pressed = false,
+            .motion = true,
             .modifiers = evdev.modifiersFromMask(self.mods_mask),
             .time_ms = time,
         } });
@@ -1039,16 +1053,24 @@ pub const WaylandBackend = struct {
         };
     }
 
-    /// Axis number → scroll lines. Discrete wheel steps win when present;
-    /// otherwise the continuous value (≈10 units per click) is scaled.
-    /// Vertical positive means down on the wire; our dy positive is up.
-    fn axisLines(discrete: i32, value: i32, is_vertical: bool) f32 {
-        var lines: f32 = if (discrete != 0)
+    /// Axis values → scroll lines. High-resolution steps (1/120th of a
+    /// notch) win, then legacy discrete steps, then the continuous value
+    /// (≈10 units per click) scaled down. Vertical positive means down on
+    /// the wire; our dy positive is up. Pure for testability.
+    fn axisScrollLines(v120: i32, discrete: i32, value: i32, is_vertical: bool) f32 {
+        var lines: f32 = if (v120 != 0)
+            @as(f32, @floatFromInt(v120)) / 120.0
+        else if (discrete != 0)
             @floatFromInt(discrete)
         else
             @as(f32, @floatFromInt(value)) / 10.0;
         if (is_vertical) lines = -lines;
         return lines;
+    }
+
+    /// Axis number → scroll lines for plain discrete/continuous input.
+    fn axisLines(discrete: i32, value: i32, is_vertical: bool) f32 {
+        return axisScrollLines(0, discrete, value, is_vertical);
     }
 
     fn pointerAxis(data: ?*anyopaque, _: *Pointer, time: u32, axis: u32, value: i32) callconv(.c) void {
@@ -1070,14 +1092,40 @@ pub const WaylandBackend = struct {
         }
     }
 
+    /// High-resolution wheel steps (v8+): positive is down/right, same
+    /// wire convention as axis and axis_discrete.
+    fn pointerAxisValue120(data: ?*anyopaque, _: *Pointer, axis: u32, value120: i32) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (axis == 0) {
+            self.v120_v = value120;
+        } else {
+            self.v120_h = value120;
+        }
+    }
+
+    /// The axis source (wheel, finger, tablet tool...) does not change how
+    /// deltas become lines, but the slot must be non-null: libwayland aborts
+    /// the process when a v5 compositor sends it and the listener is null.
+    fn pointerAxisSource(_: ?*anyopaque, _: *Pointer, _: u32) callconv(.c) void {}
+
+    /// Gesture end marker. pointerFrame already flushes the accumulated
+    /// deltas on every frame, so there is nothing left to do here.
+    fn pointerAxisStop(_: ?*anyopaque, _: *Pointer, _: u32, _: u32) callconv(.c) void {}
+
+    /// v9 scroll direction hint (natural vs. traditional wheels). Mirrors
+    /// the compositor-resolved axis deltas we already consume, so ignore it.
+    fn pointerAxisRelativeDirection(_: ?*anyopaque, _: *Pointer, _: u32, _: u32) callconv(.c) void {}
+
     fn pointerFrame(data: ?*anyopaque, _: *Pointer) callconv(.c) void {
         const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
-        const dy = axisLines(self.disc_v, self.axis_v, true);
-        const dx = axisLines(self.disc_h, self.axis_h, false);
+        const dy = axisScrollLines(self.v120_v, self.disc_v, self.axis_v, true);
+        const dx = axisScrollLines(self.v120_h, self.disc_h, self.axis_h, false);
         self.axis_v = 0;
         self.axis_h = 0;
         self.disc_v = 0;
         self.disc_h = 0;
+        self.v120_v = 0;
+        self.v120_h = 0;
         if (dx != 0 or dy != 0) {
             self.pushInputEvent(.{ .scroll = .{
                 .pos = .{ .x = self.pointer_x, .y = self.pointer_y },
@@ -1473,8 +1521,8 @@ pub const WaylandBackend = struct {
     fn minimizeFn(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const top = self.xdg_toplevel orelse return;
-        // xdg_toplevel.set_minimized is opcode 15.
-        _ = self.api.wl_proxy_marshal_flags(@ptrCast(top), 15, null, self.api.wl_proxy_get_version(@ptrCast(top)), 0);
+        // xdg_toplevel.set_minimized is opcode 13.
+        _ = self.api.wl_proxy_marshal_flags(@ptrCast(top), 13, null, self.api.wl_proxy_get_version(@ptrCast(top)), 0);
         _ = self.api.wl_display_flush(self.display);
     }
 
@@ -1483,11 +1531,11 @@ pub const WaylandBackend = struct {
         const top = self.xdg_toplevel orelse return;
         const ver = self.api.wl_proxy_get_version(@ptrCast(top));
         if (self.maximized) {
-            // unset_maximized is opcode 12.
-            _ = self.api.wl_proxy_marshal_flags(@ptrCast(top), 12, null, ver, 0);
+            // unset_maximized is opcode 10.
+            _ = self.api.wl_proxy_marshal_flags(@ptrCast(top), 10, null, ver, 0);
         } else {
-            // set_maximized is opcode 11.
-            _ = self.api.wl_proxy_marshal_flags(@ptrCast(top), 11, null, ver, 0);
+            // set_maximized is opcode 9.
+            _ = self.api.wl_proxy_marshal_flags(@ptrCast(top), 9, null, ver, 0);
         }
         _ = self.api.wl_display_flush(self.display);
     }
@@ -1607,9 +1655,11 @@ pub const WaylandBackend = struct {
         .button = pointerButton,
         .axis = pointerAxis,
         .frame = pointerFrame,
-        .axis_source = null,
-        .axis_stop = null,
+        .axis_source = pointerAxisSource,
+        .axis_stop = pointerAxisStop,
         .axis_discrete = pointerAxisDiscrete,
+        .axis_value120 = pointerAxisValue120,
+        .axis_relative_direction = pointerAxisRelativeDirection,
     };
 
     const default_keyboard_listener = KeyboardListener{
@@ -1774,18 +1824,17 @@ pub const WaylandBackend = struct {
         {
             const px = e.pixels.?;
             zlog.log("wayland", "present {d}x{d} quads={d} glyphs={d}", .{ w, h, scene.slice().len, scene.glyphSlice().len });
-            const target = gpu.software.Target.init(px, w, h, .argb32);
             if (std.c.getenv("ZUI_COLOR_BARS") != null) {
                 // Diagnostic: three full-width bands. If the compositor
                 // shows R/G/B correctly the buffer path is innocent.
                 var y: u32 = 0;
                 while (y < h) : (y += 1) {
                     const c = if (y < h / 3)
-                        gpu.software.Color.rgb(1, 0, 0)
+                        gpu.vellz.Color.rgb(1, 0, 0)
                     else if (y < 2 * h / 3)
-                        gpu.software.Color.rgb(0, 1, 0)
+                        gpu.vellz.Color.rgb(0, 1, 0)
                     else
-                        gpu.software.Color.rgb(0, 0, 1);
+                        gpu.vellz.Color.rgb(0, 0, 1);
                     var x: u32 = 0;
                     while (x < w) : (x += 1) {
                         const off = (@as(usize, y) * w + x) * 4;
@@ -1796,8 +1845,10 @@ pub const WaylandBackend = struct {
                     }
                 }
             } else {
-                target.clear(gpu.software.Color.hex(0x0e0e13)); // theme.bg
-                target.renderScene(scene, glyph_pixels, image_pixels);
+                self.renderer.render(px, w, h, .argb32, gpu.vellz.Color.hex(0x0e0e13), scene, glyph_pixels, image_pixels) catch |err| {
+                    zlog.log("wayland", "vellz render failed: {s}", .{@errorName(err)});
+                    return;
+                };
             }
             if (std.c.getenv("ZUI_MAGENTA_FRAME") != null) {
                 // Diagnostic: magenta 2px frame so screenshots reveal the
@@ -1862,7 +1913,7 @@ test "wayland availability and initialization" {
     try std.testing.expectEqual(@as(f32, 240), handle.windowInfo().size.h);
 
     var sc = gpu.Scene{};
-    _ = sc.push(.{ .x = 10, .y = 10, .w = 100, .h = 100, .color = gpu.software.Color.hex(0x00FF00) });
+    _ = sc.push(.{ .x = 10, .y = 10, .w = 100, .h = 100, .color = gpu.vellz.Color.hex(0x00FF00) });
     handle.present(&sc, &.{}, &.{});
     try std.testing.expectEqual(@as(u32, 1), b.presents);
 }
@@ -1906,6 +1957,7 @@ test "wayland key emission and repeat bookkeeping" {
         .allocator = t.allocator,
         .lib = undefined,
         .api = undefined,
+        .renderer = gpu.vellz.Renderer.init(t.allocator),
         .display = @ptrFromInt(1),
         .registry = @ptrFromInt(2),
     };
@@ -1978,6 +2030,7 @@ test "wayland wire keycodes translate reported letters and editing keys" {
         .allocator = std.testing.allocator,
         .lib = undefined,
         .api = undefined,
+        .renderer = gpu.vellz.Renderer.init(std.testing.allocator),
         .display = @ptrFromInt(1),
         .registry = @ptrFromInt(2),
     };
@@ -2005,13 +2058,68 @@ test "wayland wire keycodes translate reported letters and editing keys" {
 }
 
 test "wayland scroll lines prefer discrete steps" {
-    // Wheel click down: discrete -1 on the vertical axis → +1 line up.
+    // Wheel click up: discrete -1 on the vertical axis → +1 line (dy up).
     try std.testing.expectApproxEqAbs(@as(f32, 1), WaylandBackend.axisLines(-1, -10, true), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, -2), WaylandBackend.axisLines(2, 20, true), 0.0001);
     // No discrete steps: continuous value scales at 10 units per line.
     try std.testing.expectApproxEqAbs(@as(f32, 1.5), WaylandBackend.axisLines(0, 15, false), 0.0001);
     // Wire -10 on the vertical axis means "up", i.e. +1 line.
     try std.testing.expectApproxEqAbs(@as(f32, 1), WaylandBackend.axisLines(0, -10, true), 0.0001);
+}
+
+test "wayland scroll lines prefer high-resolution steps" {
+    // One notch down in axis_value120 units (positive is down) → -1 line.
+    try std.testing.expectApproxEqAbs(@as(f32, -1), WaylandBackend.axisScrollLines(120, 0, 0, true), 0.0001);
+    // Half a notch up.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), WaylandBackend.axisScrollLines(-60, 0, 0, true), 0.0001);
+    // v120 wins when the continuous value arrives alongside it.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), WaylandBackend.axisScrollLines(-60, 1, 10, true), 0.0001);
+    // Without v120, discrete wins; without either, continuous / 10.
+    try std.testing.expectApproxEqAbs(@as(f32, -2), WaylandBackend.axisScrollLines(0, 2, 20, true), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), WaylandBackend.axisScrollLines(0, 0, 15, false), 0.0001);
+}
+
+test "wayland pointer listener covers every event slot" {
+    // libwayland aborts the process when an incoming event maps to a null
+    // listener slot (this is how scrolling used to crash on v5 seats), so
+    // every slot through axis_relative_direction must be populated.
+    inline for (@typeInfo(PointerListener).@"struct".field_names) |field| {
+        try std.testing.expect(@field(WaylandBackend.default_pointer_listener, field) != null);
+    }
+}
+
+test "wayland scroll survives axis_source and high-resolution steps" {
+    const t = std.testing;
+    // Bare backend value: the scroll callbacks only touch accumulators and
+    // the target queue, never display/api/lib.
+    var b = WaylandBackend{
+        .allocator = t.allocator,
+        .lib = undefined,
+        .api = undefined,
+        .renderer = gpu.vellz.Renderer.init(t.allocator),
+        .display = @ptrFromInt(1),
+        .registry = @ptrFromInt(2),
+    };
+    var q = event.EventQueue{};
+    b.target_queue = &q;
+    const ptr: *Pointer = @ptrFromInt(4);
+
+    // A v5 compositor announces the axis source before the deltas; that
+    // listener slot used to be null and libwayland aborted the process.
+    WaylandBackend.pointerAxisSource(@ptrCast(&b), ptr, 0);
+    // One notch down in high-resolution units, flushed by the frame.
+    WaylandBackend.pointerAxisValue120(@ptrCast(&b), ptr, 0, 120);
+    WaylandBackend.pointerFrame(@ptrCast(&b), ptr);
+    const ev = q.pop() orelse return error.MissingScrollEvent;
+    switch (ev) {
+        .scroll => |s| try t.expectApproxEqAbs(@as(f32, -1), s.dy, 0.0001),
+        else => return error.UnexpectedEvent,
+    }
+    try t.expect(q.pop() == null);
+
+    // The stop marker arrives after the frame and must be a harmless no-op.
+    WaylandBackend.pointerAxisStop(@ptrCast(&b), ptr, 0, 0);
+    try t.expect(q.pop() == null);
 }
 
 test "wayland clipboard mime preference order" {
@@ -2041,4 +2149,14 @@ test "wayland decoration protocol values match the spec XML" {
     try std.testing.expectEqual(XDG_RESIZE_BOTTOM, WaylandBackend.resizeEdgeCode(.bottom));
     try std.testing.expectEqual(XDG_RESIZE_BOTTOM_LEFT, WaylandBackend.resizeEdgeCode(.bottom_left));
     try std.testing.expectEqual(XDG_RESIZE_LEFT, WaylandBackend.resizeEdgeCode(.left));
+}
+
+test "xdg_toplevel request opcodes match the stable protocol" {
+    try std.testing.expectEqual(@as(usize, 14), xdg_toplevel_methods.len);
+    try std.testing.expectEqual(@as(c_int, 14), xdg_toplevel_interface.method_count);
+    try std.testing.expectEqualStrings("set_maximized", std.mem.span(xdg_toplevel_methods[9].name));
+    try std.testing.expectEqualStrings("unset_maximized", std.mem.span(xdg_toplevel_methods[10].name));
+    try std.testing.expectEqualStrings("set_fullscreen", std.mem.span(xdg_toplevel_methods[11].name));
+    try std.testing.expectEqualStrings("unset_fullscreen", std.mem.span(xdg_toplevel_methods[12].name));
+    try std.testing.expectEqualStrings("set_minimized", std.mem.span(xdg_toplevel_methods[13].name));
 }

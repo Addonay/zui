@@ -44,9 +44,9 @@ pub fn main(init: std.process.Init) !void {
     const height: u32 = 96;
     const pixels = try gpa.alloc(u8, @as(usize, width) * height * 4);
     defer gpa.free(pixels);
-    const target = zui.gpu.software.Target.init(pixels, width, height, .rgba32);
-    target.clear(zui.hex(0x0e0e13));
-    target.renderScene(&scene, &.{}, cache.pool[0..cache.used]);
+    var renderer = zui.gpu.vellz.Renderer.init(gpa);
+    defer renderer.deinit();
+    try renderer.render(pixels, width, height, .rgba32, zui.hex(0x0e0e13), &scene, &.{}, cache.pool[0..cache.used]);
 
     var path_buf: [4096]u8 = undefined;
     if (out_path.len >= path_buf.len) return error.NameTooLong;

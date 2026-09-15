@@ -37,6 +37,15 @@ pub fn build(b: *std.Build) void {
     // required at runtime.
     build_options.addOptionPath("cozmic_corpus_font", cozmic_dep.path("tests/fonts/Inter-Regular.ttf"));
 
+    // Vello-derived 2D renderer (published package:
+    // https://github.com/Addonay/vellz, pinned in build.zig.zon). CPU-first
+    // rendering library; its GPU backend and the wgpu dependency are lazy and
+    // are never resolved by zui's CPU build.
+    const vellz_dep = b.dependency("vellz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("zui", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -45,6 +54,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "layout", .module = layout_mod },
             .{ .name = "cozmic", .module = cozmic_dep.module("cozmic") },
+            .{ .name = "vellz", .module = vellz_dep.module("vellz") },
             .{ .name = "build_options", .module = build_options.createModule() },
         },
     });
@@ -128,6 +138,52 @@ pub fn build(b: *std.Build) void {
 
     const run_images_step = b.step("run-images", "Render the images demo to a PPM snapshot");
     run_images_step.dependOn(&run_images.step);
+
+    const dash = b.addExecutable(.{
+        .name = "dash",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/dash/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{
+                .name = "zui",
+                .module = mod,
+            }},
+            .strip = true,
+        }),
+        .use_llvm = use_llvm,
+    });
+    const run_dash = b.addRunArtifact(dash);
+
+    const run_dash_step = b.step("run-dash", "Run the dashboard example");
+    run_dash_step.dependOn(&run_dash.step);
+
+    // Headless integration: synthetic clicks through the real event queue ->
+    // App -> Window -> hit-test -> listener path, asserting dashboard state.
+    const selftest_dash = b.addRunArtifact(dash);
+    selftest_dash.setEnvironmentVariable("ZUI_BACKEND", "null");
+    selftest_dash.setEnvironmentVariable("ZUI_SELFTEST", "1");
+    const selftest_dash_step = b.step("selftest-dash", "Run the dashboard headless integration selftest");
+    selftest_dash_step.dependOn(&selftest_dash.step);
+    test_step.dependOn(&selftest_dash.step);
+
+    // The Rust + gpui-kit take on the same dashboard lives in
+    // `examples/dash-gpui`. Cargo owns that build; this step just forwards to
+    // it, so it requires a Rust toolchain on PATH.
+    //
+    // Release, not debug: GPUI frameworks are unusably slow without
+    // optimizations (layout, painting and wgpu are all affected), and the
+    // first release build can take a few minutes.
+    //   zig build run-dash-kit
+    const run_dash_kit = b.addSystemCommand(&.{
+        "cargo",
+        "run",
+        "--release",
+        "--manifest-path",
+        "examples/dash-gpui/Cargo.toml",
+    });
+    const run_dash_kit_step = b.step("run-dash-kit", "Run the Rust gpui-kit dashboard example");
+    run_dash_kit_step.dependOn(&run_dash_kit.step);
 
     // Headless text-frame benchmark (no window, no `ZUI_BACKEND` selection):
     // drives the real `elements.layout` + `elements.painter` path over frames

@@ -356,6 +356,8 @@ pub const X11Backend = struct {
     wakeups: u32 = 0,
     pixels: []u8,
     image: ?*XImage = null,
+    /// Vellz-backed frame renderer, persistent across presents.
+    renderer: gpu.vellz.Renderer,
     /// Gated `ZUI_DEBUG_EVENTS` input logging (read once at init).
     debug_events: bool = false,
     // Clipboard + selection state.
@@ -491,6 +493,7 @@ pub const X11Backend = struct {
             .wakeups = 0,
             .pixels = pixels,
             .image = null,
+            .renderer = gpu.vellz.Renderer.init(allocator),
             .debug_events = getenv("ZUI_DEBUG_EVENTS") != null,
             .atom_clipboard = atom_clipboard,
             .atom_utf8_string = atom_utf8,
@@ -512,6 +515,7 @@ pub const X11Backend = struct {
     }
 
     pub fn deinit(self: *X11Backend) void {
+        self.renderer.deinit();
         self.destroyImage();
         for (self.cursors) |c| {
             if (c != 0) _ = self.api.XFreeCursor(self.display, c);
@@ -687,6 +691,7 @@ pub const X11Backend = struct {
                         .pos = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) },
                         .button = .left,
                         .pressed = false,
+                        .motion = true,
                         .modifiers = evdev.modifiersFromMask(m.state),
                         .time_ms = @intCast(m.time),
                     },
@@ -1005,10 +1010,11 @@ pub const X11Backend = struct {
         const w: u32 = @intFromFloat(self.size.w);
         const h: u32 = @intFromFloat(self.size.h);
 
-        const target = gpu.software.Target.init(self.pixels, w, h, .bgra32);
         // Default fashion dark background (theme.bg = #0e0e13)
-        target.clear(gpu.software.Color.hex(0x0e0e13));
-        target.renderScene(scene, glyph_pixels, image_pixels);
+        self.renderer.render(self.pixels, w, h, .bgra32, gpu.vellz.Color.hex(0x0e0e13), scene, glyph_pixels, image_pixels) catch |err| {
+            zlog.log("x11", "vellz render failed: {s}", .{@errorName(err)});
+            return;
+        };
 
         if (self.image) |img| {
             _ = self.api.XPutImage(self.display, self.window, self.gc, img, 0, 0, 0, 0, w, h);
@@ -1033,7 +1039,7 @@ test "x11 availability and creation" {
     try std.testing.expectEqual(@as(f32, 150), handle.windowInfo().size.h);
 
     var sc = gpu.Scene{};
-    _ = sc.push(.{ .x = 10, .y = 10, .w = 80, .h = 80, .color = gpu.software.Color.hex(0xFF0000) });
+    _ = sc.push(.{ .x = 10, .y = 10, .w = 80, .h = 80, .color = gpu.vellz.Color.hex(0xFF0000) });
     handle.present(&sc, &.{}, &.{});
     try std.testing.expectEqual(@as(u32, 1), b.presents);
 }

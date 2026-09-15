@@ -3,21 +3,24 @@
     .version = "0.1.0",
     .fingerprint = 0x841d6b8e47fec155, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0-dev.2085+5e36170b5",
-    // The GPU backend links against the sibling wgpu package (which itself
+    // The GPU backend links against the published wgpu package (which itself
     // links wgpu-native). The dependency is lazy: a CPU-only build never
-    // resolves it, so no wgpu source, native library, or sibling checkout is
-    // required unless `-Dgpu=true` is passed.
+    // resolves it, so no wgpu source or native library is required unless
+    // `-Dgpu=true` is passed.
     .dependencies = .{
         .wgpu = .{
-            .path = "../wgpu",
+            .url = "git+https://github.com/Addonay/wgpu.git#efd94fed85abcf4891aa7b055d9d9f5c4757b4b6",
+            .hash = "wgpu-0.1.0-hZv3miibBgCXbQKA1jAytJ_0pnhdPKd3LahA3ivmuGSE",
             .lazy = true,
         },
     },
     // Only files required to compile the package are distributed. Reference
     // checkouts (.reference/), build outputs, examples beyond the CPU set, and
-    // tooling that depends on the host are intentionally excluded. The probe
-    // reference is an exception: `src/common/probe.zig` embeds it so the
-    // upstream comparison runs inside `zig build test`.
+    // tooling that depends on the host are intentionally excluded. Two test
+    // inputs are exceptions because the build graph imports them: the probe
+    // reference (`src/common/probe.zig` embeds it) and the glyph dump manifest
+    // (`src/glifo/dump.zig`). `tests/cozmic_adapter_test.zig` ships so the
+    // package's own `zig build test` resolves; it skips when Cozmic is absent.
     .paths = .{
         "build.zig",
         "build.zig.zon",
@@ -28,5 +31,7 @@
         "LICENSE-APACHE",
         "LICENSE-MIT",
         "tests/fixtures/upstream/probe.rgba",
+        "tests/fixtures/glyphs/manifest.zig",
+        "tests/cozmic_adapter_test.zig",
     },
 }

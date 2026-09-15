@@ -7,7 +7,7 @@
 //! CPU fallback; `null_device` discards frames for headless tests.
 
 pub const scene = @import("scene.zig");
-pub const software = @import("software.zig");
+pub const vellz = @import("vellz.zig");
 pub const device = @import("device.zig");
 pub const null_device = @import("null_device.zig");
 pub const software_device = @import("software_device.zig");
@@ -28,7 +28,7 @@ pub const TextureFormat = device.TextureFormat;
 
 test {
     _ = @import("scene.zig");
-    _ = @import("software.zig");
+    _ = @import("vellz.zig");
     _ = @import("device.zig");
     _ = @import("null_device.zig");
     _ = @import("software_device.zig");

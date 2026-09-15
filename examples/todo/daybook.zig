@@ -468,9 +468,9 @@ fn snapshotHeadless(gpa: std.mem.Allocator, path: []const u8) !void {
 
     const pixels = try gpa.alloc(u8, @as(usize, width) * height * 4);
     defer gpa.free(pixels);
-    const target = zui.gpu.software.Target.init(pixels, width, height, .rgba32);
-    target.clear(theme.bg);
-    target.renderScene(&win.scene, app.glyphPixels(), app.imagePixels());
+    var renderer = zui.gpu.vellz.Renderer.init(gpa);
+    defer renderer.deinit();
+    try renderer.render(pixels, width, height, .rgba32, theme.bg, &win.scene, app.glyphPixels(), app.imagePixels());
 
     const file = file: {
         var path_buf: [4096]u8 = undefined;

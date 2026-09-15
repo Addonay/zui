@@ -57,8 +57,8 @@ pub const Color = color_mod.Color;
 // Device identity
 // ============================================================================
 
-/// Which render API backs a `Device`. `software` is the CPU rasterizer
-/// (`software.zig` / `software_device.zig`); `null` validates and counts
+/// Which render API backs a `Device`. `software` is the CPU (vellz)
+/// rasterizer (`vellz.zig` / `software_device.zig`); `null` validates and counts
 /// for headless tests.
 pub const DeviceKind = enum {
     software,
@@ -518,7 +518,7 @@ pub fn blockExtent(format: TextureFormat) struct { w: u32, h: u32 } {
 /// Total bytes for one mip level of w×h in `format`, blocks rounded up.
 /// Mirrors `SDL_CalculateGPUTextureFormatSize`.
 // TODO(gpu): SDL_GetPixelFormatFromGPUTextureFormat mapping lives here
-// when GPU readback meets the software path (download → software.Target
+// when GPU readback meets the software path (download → vellz pixels
 // needs a format bridge; ZUI otherwise speaks core.Color, not SDL pixels).
 pub fn textureFormatSize(format: TextureFormat, width: u32, height: u32) u32 {
     if (format == .invalid or width == 0 or height == 0) return 0;

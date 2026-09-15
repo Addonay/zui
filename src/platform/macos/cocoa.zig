@@ -108,6 +108,8 @@ fn send(comptime Fn: type) Fn {
 
 pub const CocoaBackend = struct {
     allocator: std.mem.Allocator,
+    /// Vellz-backed frame renderer, persistent across presents.
+    renderer: gpu.vellz.Renderer,
     appkit: dl.Library,
     foundation: dl.Library,
     quartzcore: dl.Library,
@@ -406,6 +408,7 @@ pub const CocoaBackend = struct {
             .scale_factor = @floatCast(@max(1.0, scale)),
             .pixels = pixels,
             .debug_events = getenv("ZUI_DEBUG_EVENTS") != null,
+            .renderer = gpu.vellz.Renderer.init(allocator),
         };
         active = self;
         self.recreateBitmap();
@@ -413,6 +416,7 @@ pub const CocoaBackend = struct {
     }
 
     pub fn deinit(self: *CocoaBackend) void {
+        self.renderer.deinit();
         if (active == self) {
             active = null;
             msg_send_fn = null;
@@ -617,6 +621,7 @@ pub const CocoaBackend = struct {
                 .pos = self.posOf(nev),
                 .button = .left,
                 .pressed = false,
+                .motion = true,
                 .modifiers = self.modsOf(nev),
                 .time_ms = self.timeOf(nev),
             } });
@@ -905,9 +910,10 @@ pub const CocoaBackend = struct {
         const w: u32 = @intFromFloat(self.size.w);
         const h: u32 = @intFromFloat(self.size.h);
         if (self.bitmap_ctx) |_| {
-            const target = gpu.software.Target.init(self.pixels, w, h, .rgba32);
-            target.clear(gpu.software.Color.hex(0x0e0e13));
-            target.renderScene(scene, glyph_pixels, image_pixels);
+            self.renderer.render(self.pixels, w, h, .rgba32, gpu.vellz.Color.hex(0x0e0e13), scene, glyph_pixels, image_pixels) catch |err| {
+                std.debug.print("cocoa: vellz render failed: {s}\n", .{@errorName(err)});
+                return;
+            };
             const image = self.cg.bitmapContextCreateImage(self.bitmap_ctx);
             if (image) |img| {
                 if (self.image) |old| self.cg.imageRelease(old);
@@ -925,6 +931,7 @@ pub const CocoaBackend = struct {
 test "cocoa backend reports kind and honors the platform gate" {
     var backend_instance = CocoaBackend{
         .allocator = std.testing.allocator,
+        .renderer = gpu.vellz.Renderer.init(std.testing.allocator),
         .appkit = undefined,
         .foundation = undefined,
         .quartzcore = undefined,

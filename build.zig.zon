@@ -7,18 +7,21 @@
     .minimum_zig_version = "0.17.0-dev.2085+5e36170b5",
     .fingerprint = 0xc00160dbcf146dfd,
     .dependencies = .{
-        // Text layout/editing engine: https://github.com/Addonay/cozmic,
-        // pinned to the v0.0.1 release commit (immutable SHA + package hash).
         .cozmic = .{
             .url = "git+https://github.com/Addonay/cozmic.git#83e791d1752a1d86d7eadb19987a10fcd44307a8",
             .hash = "cozmic-0.0.1-wv6CLXwXdACzzBiH7DZ0nw4RpxnyTkxVGwxxk6s6pc8u",
         },
-        // Standalone layout-engine package: https://github.com/Addonay/zlay,
-        // pinned to the initial release commit. It has its own build, tests,
-        // fixtures and benchmarks (`cd ../zlay && zig build test [-Dserde=true]`).
         .zlay = .{
             .url = "git+https://github.com/Addonay/zlay.git#dbce9266163ba5400385693aebd86c0726464a94",
             .hash = "zlay-0.1.0-0OJsDbPRDgDhk2RghWTtm2uGYh5ze2D6GrPo-wDSEj5r",
+        },
+        // Vello-derived 2D renderer: https://github.com/Addonay/vellz,
+        // pinned to the commit that makes the package self-sufficient
+        // (glyph manifest + bridge test in `.paths`). vellz's wgpu
+        // dependency is lazy; CPU-only builds of zui never fetch it.
+        .vellz = .{
+            .url = "git+https://github.com/Addonay/vellz.git#d5aa45e7eda4d3924b64c2b9dfabf1c4f3412916",
+            .hash = "vellz-0.1.0-VcH-R2VsPQBqbVwTgiWE82P4bz6fK8tx1hpBnF7zj2tg",
         },
     },
     .paths = .{

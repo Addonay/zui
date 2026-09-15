@@ -1,0 +1,17 @@
+[package]
+name = "dash-gpui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = "0.6.1"
+
+# Debug builds of GPUI run with no optimizations in the framework itself, which
+# makes layout, painting and wgpu validation abusively slow. Optimizing the
+# dependency graph (and keeping the app at opt-level 1 for fast rebuilds) is
+# the layout Zed recommends for GPUI applications.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

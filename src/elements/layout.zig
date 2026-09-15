@@ -68,9 +68,39 @@ pub fn measure(frame: *element.Frame, index: u16) core.Size {
                     natural.h += child_size.h;
                 }
             }
-            if (normal_count > 1) {
+            if (normal_count > 1 and !(node.style.flex_wrap and node.style.direction == .row)) {
                 const gaps = @as(f32, @floatFromInt(normal_count - 1)) * node.style.gap;
                 if (node.style.direction == .row) natural.w += gaps else natural.h += gaps;
+            }
+            // Wrapping rows need a definite width to break against; with one,
+            // recompute the natural box from the packed lines (main = widest
+            // line, cross = the line heights plus gaps).
+            if (node.style.flex_wrap and node.style.direction == .row) {
+                if (node.style.width) |width| {
+                    const constraint = @max(0, width - node.style.padding.left - node.style.padding.right);
+                    var line_w: f32 = 0;
+                    var line_h: f32 = 0;
+                    var used_h: f32 = 0;
+                    var lines: usize = 0;
+                    child = node.first_child;
+                    while (child) |child_index| : (child = frame.nodes[child_index].next_sibling) {
+                        const child_node = &frame.nodes[child_index];
+                        if (child_node.style.absolute) continue;
+                        const cs = child_node.measured;
+                        if (line_w > 0 and line_w + node.style.gap + cs.w > constraint) {
+                            used_h += line_h + (if (lines > 0) node.style.gap else 0);
+                            lines += 1;
+                            line_w = cs.w;
+                            line_h = cs.h;
+                        } else {
+                            if (line_w > 0) line_w += node.style.gap;
+                            line_w += cs.w;
+                            line_h = @max(line_h, cs.h);
+                        }
+                    }
+                    natural.w = width;
+                    natural.h = used_h + line_h + node.style.padding.top + node.style.padding.bottom;
+                }
             }
             natural.w += node.style.padding.left + node.style.padding.right;
             natural.h += node.style.padding.top + node.style.padding.bottom;
@@ -117,9 +147,12 @@ fn place(frame: *element.Frame, index: u16, available: core.Rect, forced: bool) 
     if (node.kind != .container) return;
 
     const padding = node.style.padding;
+    // Scroll offset translates the content box the children are placed into;
+    // clipping stays on the container's own bounds (the painter clips every
+    // container to its content box).
     const content = core.Rect{
-        .x = node.bounds.x + padding.left,
-        .y = node.bounds.y + padding.top,
+        .x = node.bounds.x + padding.left - node.style.scroll_x,
+        .y = node.bounds.y + padding.top - node.style.scroll_y,
         .w = @max(0, node.bounds.w - padding.left - padding.right),
         .h = @max(0, node.bounds.h - padding.top - padding.bottom),
     };
@@ -146,6 +179,15 @@ fn place(frame: *element.Frame, index: u16, available: core.Rect, forced: bool) 
     if (node.style.justify == .center and flex_total == 0) cursor += remaining / 2;
     if (node.style.justify == .between and normal_count > 1 and flex_total == 0) {
         dynamic_gap = node.style.gap + remaining / @as(f32, @floatFromInt(normal_count - 1));
+    }
+
+    if (node.style.flex_wrap and node.style.direction == .row) {
+        placeWrappedRow(frame, node, content);
+        child = node.first_child;
+        while (child) |child_index| : (child = frame.nodes[child_index].next_sibling) {
+            if (frame.nodes[child_index].style.absolute) placeAbsolute(frame, child_index, node.bounds);
+        }
+        return;
     }
 
     child = node.first_child;
@@ -178,6 +220,66 @@ fn place(frame: *element.Frame, index: u16, available: core.Rect, forced: bool) 
             place(frame, child_index, .{ .x = x, .y = cursor, .w = child_size.w, .h = child_size.h }, true);
             cursor += child_size.h + dynamic_gap;
         }
+    }
+}
+
+/// Walk to the next non-absolute child starting at `start` (inclusive).
+fn nextNormal(frame: *element.Frame, start: ?u16) ?u16 {
+    var index = start;
+    while (index) |i| {
+        if (!frame.nodes[i].style.absolute) return i;
+        index = frame.nodes[i].next_sibling;
+    }
+    return null;
+}
+
+/// Pack the row's normal children into lines that fit `content.w`, then
+/// place each line. Grow factors are shared within a line.
+fn placeWrappedRow(frame: *element.Frame, node: *const element.Node, content: core.Rect) void {
+    const gap = node.style.gap;
+    var line_y = content.y;
+    var first_of_line = nextNormal(frame, node.first_child);
+    while (first_of_line) |line_start| {
+        // Pack one line: count, natural width, grow total, tallest child.
+        var count: usize = 0;
+        var natural_total: f32 = 0;
+        var grow_total: f32 = 0;
+        var line_h: f32 = 0;
+        var index: ?u16 = line_start;
+        while (index) |i| {
+            const c = frame.nodes[i];
+            if (count > 0 and natural_total + gap + c.measured.w > content.w) break;
+            natural_total += (if (count > 0) gap else 0) + c.measured.w;
+            grow_total += c.style.flex_grow;
+            line_h = @max(line_h, c.measured.h);
+            count += 1;
+            index = nextNormal(frame, c.next_sibling);
+        }
+        const remaining = @max(0, content.w - natural_total);
+        var cursor_x = content.x;
+        var placed: usize = 0;
+        var child: ?u16 = line_start;
+        while (placed < count) : (placed += 1) {
+            const child_index = child.?;
+            const child_node = &frame.nodes[child_index];
+            var child_size = child_node.measured;
+            if (child_node.style.flex_grow > 0 and grow_total > 0) {
+                // Grow adds to the measured width: wrapped children usually
+                // carry real measured widths (explicit `.w()`), unlike the
+                // single-line path's zero-width grow spacers.
+                child_size.w += remaining * child_node.style.flex_grow / grow_total;
+            }
+            if (child_node.style.full_height) child_size.h = content.h;
+            if (child_node.style.height) |h| child_size.h = h;
+            if (child_node.style.square) |s| child_size.h = s;
+            var y = line_y;
+            if (node.style.alignment == .center) y += (line_h - child_size.h) / 2;
+            place(frame, child_index, .{ .x = cursor_x, .y = y, .w = child_size.w, .h = child_size.h }, true);
+            cursor_x += child_size.w + gap;
+            child = nextNormal(frame, child_node.next_sibling);
+        }
+        line_y += line_h + gap;
+        first_of_line = child;
     }
 }
 
@@ -341,4 +443,39 @@ fn testEngine() !*@import("../fonts/text_engine.zig").Engine {
         error.ShaperUnavailable, error.LibraryUnavailable, error.NoFontsAvailable, error.FontCorpusIncomplete => return error.SkipZigTest,
         else => return err,
     };
+}
+
+test "wrapped row packs children into lines" {
+    var frame = element.Frame{};
+    frame.reset(@ptrFromInt(1), .{});
+    element.beginFrame(&frame);
+    defer element.endFrame();
+    const root = element.div().flex_row().flex_wrap().w(100).gap(4)
+        .child(element.div().w(40).h(10))
+        .child(element.div().w(40).h(10))
+        .child(element.div().w(40).h(10));
+    layout(&frame, root, .{ .w = 100, .h = 200 });
+    const first = frame.nodes[root.index].first_child.?;
+    const second = frame.nodes[first].next_sibling.?;
+    const third = frame.nodes[second].next_sibling.?;
+    // Two fit per 100px line (40 + 4 + 40), the third wraps below.
+    try std.testing.expectApproxEqAbs(@as(f32, 0), frame.nodes[first].bounds.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), frame.nodes[first].bounds.y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 44), frame.nodes[second].bounds.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), frame.nodes[second].bounds.y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), frame.nodes[third].bounds.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 14), frame.nodes[third].bounds.y, 0.001);
+}
+
+test "scroll offset translates children" {
+    var frame = element.Frame{};
+    frame.reset(@ptrFromInt(1), .{});
+    element.beginFrame(&frame);
+    defer element.endFrame();
+    const root = element.div().w(100).h(100).scroll_y(30)
+        .child(element.div().w(10).h(20));
+    layout(&frame, root, .{ .w = 100, .h = 100 });
+    const child = frame.nodes[root.index].first_child.?;
+    try std.testing.expectApproxEqAbs(@as(f32, -30), frame.nodes[child].bounds.y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), frame.nodes[child].bounds.h, 0.001);
 }

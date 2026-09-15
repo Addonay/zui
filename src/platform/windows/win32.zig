@@ -147,6 +147,8 @@ fn modifiersFromWparam(wparam: b.WPARAM) event.Modifiers {
 
 pub const Win32Backend = struct {
     allocator: std.mem.Allocator,
+    /// Vellz-backed frame renderer, persistent across presents.
+    renderer: gpu.vellz.Renderer,
     user32: dl.Library,
     kernel32: dl.Library,
     gdi32: dl.Library,
@@ -262,6 +264,7 @@ pub const Win32Backend = struct {
             .instance = instance,
             .pixels = pixels,
             .debug_events = getenv("ZUI_DEBUG_EVENTS") != null,
+            .renderer = gpu.vellz.Renderer.init(allocator),
         };
         active = self;
 
@@ -283,6 +286,7 @@ pub const Win32Backend = struct {
     }
 
     pub fn deinit(self: *Win32Backend) void {
+        self.renderer.deinit();
         if (active == self) active = null;
         self.destroyDib();
         if (self.hwnd) |hwnd| {
@@ -473,7 +477,7 @@ pub const Win32Backend = struct {
                 return 0;
             },
             b.WM_MOUSEMOVE => {
-                if (self) |s| s.pushEvent(.{ .mouse = .{ .pos = clientPos(lparam), .button = .left, .pressed = false, .modifiers = modifiersFromWparam(wparam), .time_ms = timeMs() } });
+                if (self) |s| s.pushEvent(.{ .mouse = .{ .pos = clientPos(lparam), .button = .left, .pressed = false, .motion = true, .modifiers = modifiersFromWparam(wparam), .time_ms = timeMs() } });
                 return 0;
             },
             b.WM_MOUSEWHEEL, b.WM_MOUSEHWHEEL => {
@@ -743,13 +747,15 @@ pub const Win32Backend = struct {
         // matches the software .bgra32 layout byte for byte).
         if (self.dib_bits) |bits| {
             const px: [*]u8 = @ptrCast(bits);
-            const target = gpu.software.Target.init(px[0 .. @as(usize, w) * h * 4], w, h, .bgra32);
-            target.clear(gpu.software.Color.hex(0x0e0e13));
-            target.renderScene(scene, glyph_pixels, image_pixels);
+            self.renderer.render(px[0 .. @as(usize, w) * h * 4], w, h, .bgra32, gpu.vellz.Color.hex(0x0e0e13), scene, glyph_pixels, image_pixels) catch |err| {
+                std.debug.print("win32: vellz render failed: {s}\n", .{@errorName(err)});
+                return;
+            };
         } else {
-            const target = gpu.software.Target.init(self.pixels, w, h, .bgra32);
-            target.clear(gpu.software.Color.hex(0x0e0e13));
-            target.renderScene(scene, glyph_pixels, image_pixels);
+            self.renderer.render(self.pixels, w, h, .bgra32, gpu.vellz.Color.hex(0x0e0e13), scene, glyph_pixels, image_pixels) catch |err| {
+                std.debug.print("win32: vellz render failed: {s}\n", .{@errorName(err)});
+                return;
+            };
         }
         self.blitBackbuffer();
         self.presents += 1;
@@ -759,6 +765,7 @@ pub const Win32Backend = struct {
 test "win32 stub reports kind but constructs nowhere" {
     var backend_instance = Win32Backend{
         .allocator = std.testing.allocator,
+        .renderer = gpu.vellz.Renderer.init(std.testing.allocator),
         .user32 = undefined,
         .kernel32 = undefined,
         .gdi32 = undefined,
@@ -783,6 +790,7 @@ test "win32 stub reports kind but constructs nowhere" {
     backend_instance.size = .{ .w = 64, .h = 64 };
     const scene = gpu.Scene{};
     handle.present(&scene, &.{}, &.{});
+    backend_instance.renderer.deinit();
     try std.testing.expectEqual(@as(u32, 1), backend_instance.presents);
 }
 

@@ -3,7 +3,7 @@
 Hand-rolled retained UI framework in Zig. One foreground thread owns state
 (`App`/`Entity`/`Context`), views render transient elements (`div()`/`text()`),
 a layout pass sizes them, a painter records a `Scene`, and a native backend
-presents it with the CPU rasterizer. GPU drivers are future work.
+presents it with the vellz CPU renderer. GPU drivers are future work.
 
 ## Toolchain
 
@@ -59,7 +59,7 @@ App / scheduler            owns entities, platform connection, text engine, imag
     elements.Frame         transient nodes rebuilt each dirty render
       elements.layout      flexbox measure/place (standalone layout/ port NOT yet wired)
       elements.painter     nodes -> gpu.Scene (quads + glyphs + image blits)
-      gpu.software         CPU rasterizer; platform backends present the pixels
+      gpu.vellz            Vello-derived CPU renderer; platform backends present
 fonts/                     text engine: cozmic shaping/layout, FreeType raster,
                            swash image cache + the ZUI glyph atlas
 images/                    stb/nanosvg decoders + decoded-pixel cache
@@ -86,7 +86,7 @@ Roadmap: `plan.md` (milestones M0–M7). Port ledger: `src/layout/port.md`.
 - Scene draws quads, then glyphs, then images — cross-type paint order is
   **not** preserved (plan M2). No per-window DPI scaling yet.
 - `gpu/device` + Vulkan/Metal/D3D12 are skeletons returning
-  `error.Unsupported`; presentation goes through `gpu/software`.
+  `error.Unsupported`; presentation goes through `gpu/vellz`.
 - Hot structs (`Scene` ~5.9MB, element `Frame` ~2.5MB, all inline storage)
   must be heap-allocated or embedded in a heap owner — never stacked
   together in one function. The engine is heap-allocated for the same

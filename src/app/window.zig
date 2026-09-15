@@ -82,6 +82,17 @@ pub const Window = struct {
     cozmic_engine_fn: ?*const fn (*anyopaque) ?*text_engine.Engine = null,
     cozmic_engine_ctx: ?*anyopaque = null,
     pointer_position: geometry.Point = .{ .x = -10000, .y = -10000 },
+    /// Region armed by the last left press. Motion and release keep routing
+    /// to it even when the pointer leaves its bounds (pointer capture).
+    captured_mouse_region: ?elements.HitRegion = null,
+    /// True while the left mouse button is held.
+    left_button_down: bool = false,
+    /// Set while dispatching the captured region's motion callback, so the
+    /// drag source can tell that call apart from the hovered-region one.
+    motion_from_capture: bool = false,
+    /// Most recent scroll event delivered to this window, readable by the
+    /// scroll listener that received it.
+    last_scroll: platform.event.ScrollEvent = .{ .pos = .{ .x = 0, .y = 0 } },
     focused: elements.FocusHandle = .{},
     keymap: keymap.Keymap = .{},
     /// Window-level context tags (outermost keymap frame, after "Window").
@@ -122,6 +133,43 @@ pub const Window = struct {
         if (self.closed) return;
         self.dirty = true;
         self.wakeup_fn(self.app);
+    }
+
+    /// Keep the frame loop drawing back-to-back frames. Call it from render
+    /// while an animation is active; stop calling it to let the app idle.
+    pub fn requestAnimationFrame(self: *Window) void {
+        self.requestRender();
+    }
+
+    /// Monotonic-ish wall clock in milliseconds, for animation progress.
+    pub fn timeMs(self: *const Window) i64 {
+        _ = self;
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) == 0) {
+            return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+        }
+        return 0;
+    }
+
+    /// Pointer position in window coordinates (updated on every mouse event).
+    pub fn pointerPosition(self: *const Window) geometry.Point {
+        return self.pointer_position;
+    }
+
+    /// True while the left mouse button is held.
+    pub fn mouseIsDown(self: *const Window) bool {
+        return self.left_button_down;
+    }
+
+    /// True while the captured (drag source) region is receiving the motion
+    /// callback; false for the hovered region under the pointer.
+    pub fn motionFromCapture(self: *const Window) bool {
+        return self.motion_from_capture;
+    }
+
+    /// The scroll event that just reached a scroll listener.
+    pub fn scrollEvent(self: *const Window) platform.event.ScrollEvent {
+        return self.last_scroll;
     }
 
     pub fn markDirty(self: *Window) void {
@@ -327,7 +375,10 @@ pub const Window = struct {
             .mouse => |mouse| {
                 self.pointer_position = mouse.pos;
                 self.updateHoverCursor();
-                if (mouse.pressed and mouse.button == .left) {
+                if (mouse.motion) {
+                    self.dispatchMouseMotion(mouse);
+                } else if (mouse.pressed and mouse.button == .left) {
+                    self.left_button_down = true;
                     // Double-click needs wall time, which lives with the OS
                     // backend (both Wayland and X11 timestamp input). Events
                     // carry it in `time_ms`; zero means unknown and never
@@ -356,8 +407,17 @@ pub const Window = struct {
                             if (region.double_click_listener) |listener| listener.call(self);
                         }
                         if (region.listener) |listener| listener.call(self);
+                        // Arm pointer capture so motion/release continue to
+                        // reach this control after the pointer leaves it.
+                        if (region.mouse_move_listener != null or region.mouse_up_listener != null) {
+                            self.captured_mouse_region = region;
+                        }
                         break;
                     }
+                } else if (!mouse.pressed and mouse.button == .left) {
+                    self.left_button_down = false;
+                    self.dispatchMouseUp(mouse);
+                    self.captured_mouse_region = null;
                 }
                 self.requestRender();
             },
@@ -375,13 +435,74 @@ pub const Window = struct {
             .scroll => |scroll| {
                 self.pointer_position = scroll.pos;
                 self.updateHoverCursor();
-                if (self.focused.dispatch(event, self)) {
-                    self.requestRender();
-                    return;
+                self.last_scroll = scroll;
+                // Scroll goes to the topmost scrollable container under the
+                // pointer; focused-element dispatch stays as the fallback.
+                var handled = false;
+                var i = self.ui_frame.region_count;
+                while (i > 0) {
+                    i -= 1;
+                    const region = self.ui_frame.regions[i];
+                    if (!region.bounds.contains(scroll.pos)) continue;
+                    if (region.scroll_listener) |listener| {
+                        listener.call(self);
+                        handled = true;
+                        break;
+                    }
+                }
+                if (!handled) {
+                    _ = self.focused.dispatch(event, self);
                 }
                 self.requestRender();
             },
             .window => {},
+        }
+    }
+
+    /// Motion: the topmost region under the pointer gets a move callback
+    /// (hover tracking), and the captured region gets one too (drag source)
+    /// unless it is the same target.
+    fn dispatchMouseMotion(self: *Window, mouse: platform.event.MouseEvent) void {
+        var hovered: ?elements.HitRegion = null;
+        var i = self.ui_frame.region_count;
+        while (i > 0) {
+            i -= 1;
+            const region = self.ui_frame.regions[i];
+            if (!region.bounds.contains(mouse.pos)) continue;
+            hovered = region;
+            break;
+        }
+        if (hovered) |region| {
+            if (region.mouse_move_listener) |listener| listener.call(self);
+        }
+        if (self.captured_mouse_region) |captured| {
+            const same_target = if (hovered) |h|
+                (h.mouse_move_listener != null and captured.mouse_move_listener != null and
+                    h.mouse_move_listener.?.target == captured.mouse_move_listener.?.target)
+            else
+                false;
+            if (!same_target) {
+                self.motion_from_capture = true;
+                defer self.motion_from_capture = false;
+                if (captured.mouse_move_listener) |listener| listener.call(self);
+            }
+        }
+    }
+
+    /// Release: the captured region gets the up callback (drag end), and the
+    /// topmost region under the pointer handles plain releases elsewhere.
+    fn dispatchMouseUp(self: *Window, mouse: platform.event.MouseEvent) void {
+        if (self.captured_mouse_region) |captured| {
+            if (captured.mouse_up_listener) |listener| listener.call(self);
+            return;
+        }
+        var i = self.ui_frame.region_count;
+        while (i > 0) {
+            i -= 1;
+            const region = self.ui_frame.regions[i];
+            if (!region.bounds.contains(mouse.pos)) continue;
+            if (region.mouse_up_listener) |listener| listener.call(self);
+            break;
         }
     }
 
@@ -557,4 +678,118 @@ test "double-click history seeds from zero" {
     try std.testing.expectEqual(@as(u32, 0), doubles);
     press(win, 300);
     try std.testing.expectEqual(@as(u32, 1), doubles);
+}
+
+var move_hits: u32 = 0;
+var up_hits: u32 = 0;
+var scroll_hits: u32 = 0;
+var last_scroll_dy: f32 = 0;
+
+fn countMove(_: *anyopaque, _: *const elements.element.ListenerPayload, _: *anyopaque) void {
+    move_hits += 1;
+}
+
+fn countUp(_: *anyopaque, _: *const elements.element.ListenerPayload, _: *anyopaque) void {
+    up_hits += 1;
+}
+
+fn countScroll(_: *anyopaque, _: *const elements.element.ListenerPayload, raw_window: *anyopaque) void {
+    scroll_hits += 1;
+    const w: *Window = @ptrCast(@alignCast(raw_window));
+    last_scroll_dy = w.scrollEvent().dy;
+}
+
+fn resetCounters() void {
+    move_hits = 0;
+    up_hits = 0;
+    scroll_hits = 0;
+    last_scroll_dy = 0;
+}
+
+test "mouse motion reaches the region under the pointer" {
+    const TestApp = @import("app.zig").App;
+    var app = try TestApp.initHeadless(std.testing.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, struct {
+        fn draw(w: *Window, sc: *gpu.Scene) void {
+            _ = w;
+            _ = sc;
+        }
+    }.draw);
+    resetCounters();
+
+    var marker: u8 = 0;
+    win.ui_frame.region_count = 1;
+    win.ui_frame.regions[0] = .{
+        .bounds = .{ .x = 0, .y = 0, .w = 100, .h = 100 },
+        .mouse_move_listener = .{ .target = @ptrCast(&marker), .call_fn = countMove },
+    };
+
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 10, .y = 10 }, .button = .left, .pressed = false, .motion = true } });
+    try std.testing.expectEqual(@as(u32, 1), move_hits);
+    // Outside every region: no dispatch.
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 500, .y = 500 }, .button = .left, .pressed = false, .motion = true } });
+    try std.testing.expectEqual(@as(u32, 1), move_hits);
+}
+
+test "press captures motion and release outside the source region" {
+    const TestApp = @import("app.zig").App;
+    var app = try TestApp.initHeadless(std.testing.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, struct {
+        fn draw(w: *Window, sc: *gpu.Scene) void {
+            _ = w;
+            _ = sc;
+        }
+    }.draw);
+    resetCounters();
+
+    var marker: u8 = 0;
+    win.ui_frame.region_count = 1;
+    win.ui_frame.regions[0] = .{
+        .bounds = .{ .x = 0, .y = 0, .w = 50, .h = 50 },
+        .mouse_move_listener = .{ .target = @ptrCast(&marker), .call_fn = countMove },
+        .mouse_up_listener = .{ .target = @ptrCast(&marker), .call_fn = countUp },
+    };
+
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 10, .y = 10 }, .button = .left, .pressed = true } });
+    try std.testing.expect(win.mouseIsDown());
+    // Motion far outside still reaches the captured region (drag source).
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 900, .y = 900 }, .button = .left, .pressed = false, .motion = true } });
+    try std.testing.expectEqual(@as(u32, 1), move_hits);
+    // Release outside still ends the drag on the captured region.
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 900, .y = 900 }, .button = .left, .pressed = false } });
+    try std.testing.expectEqual(@as(u32, 1), up_hits);
+    try std.testing.expect(!win.mouseIsDown());
+    // Capture cleared: a second release does nothing.
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 900, .y = 900 }, .button = .left, .pressed = false } });
+    try std.testing.expectEqual(@as(u32, 1), up_hits);
+}
+
+test "scroll dispatches to the scrollable region under the pointer" {
+    const TestApp = @import("app.zig").App;
+    var app = try TestApp.initHeadless(std.testing.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, struct {
+        fn draw(w: *Window, sc: *gpu.Scene) void {
+            _ = w;
+            _ = sc;
+        }
+    }.draw);
+    resetCounters();
+
+    var marker: u8 = 0;
+    win.ui_frame.region_count = 2;
+    // A non-scrollable top region and a scrollable one beneath it.
+    win.ui_frame.regions[0] = .{ .bounds = .{ .x = 0, .y = 0, .w = 200, .h = 200 } };
+    win.ui_frame.regions[1] = .{
+        .bounds = .{ .x = 0, .y = 0, .w = 200, .h = 200 },
+        .scroll_listener = .{ .target = @ptrCast(&marker), .call_fn = countScroll },
+    };
+    win.handleEvent(.{ .scroll = .{ .pos = .{ .x = 50, .y = 50 }, .dy = 3 } });
+    try std.testing.expectEqual(@as(u32, 1), scroll_hits);
+    try std.testing.expectEqual(@as(f32, 3), last_scroll_dy);
+    // Outside: nothing.
+    win.handleEvent(.{ .scroll = .{ .pos = .{ .x = 500, .y = 500 }, .dy = 1 } });
+    try std.testing.expectEqual(@as(u32, 1), scroll_hits);
 }

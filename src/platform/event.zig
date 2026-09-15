@@ -93,6 +93,9 @@ pub const MouseEvent = struct {
     pos: geometry.Point,
     button: MouseButton,
     pressed: bool,
+    /// True for pointer motion (hover/drag); false for button presses and
+    /// releases, which are otherwise indistinguishable on the wire.
+    motion: bool = false,
     modifiers: Modifiers = .{},
     /// Milliseconds since an arbitrary monotonic epoch, from the OS event
     /// timestamp (Wayland/X11 both provide these). Zero means unknown —

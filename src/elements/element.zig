@@ -48,7 +48,10 @@ pub const HitRegion = struct {
     bounds: core.Rect,
     listener: ?Listener = null,
     mouse_down_listener: ?Listener = null,
+    mouse_up_listener: ?Listener = null,
+    mouse_move_listener: ?Listener = null,
     double_click_listener: ?Listener = null,
+    scroll_listener: ?Listener = null,
     focus: ?FocusHandle = null,
     /// Hover cursor for this region, if any. Window picks the topmost
     /// region under the pointer; null means "no opinion".
@@ -89,6 +92,13 @@ pub const Style = struct {
     hover_background: ?core.Color = null,
     border_color: ?core.Color = null,
     hover_border: ?core.Color = null,
+    /// Row flex containers wrap children onto new lines when they would
+    /// exceed the content width (only meaningful with a definite width).
+    flex_wrap: bool = false,
+    /// Scroll translation applied to children (clipping already happens for
+    /// every container; the offset is owned by the caller's state).
+    scroll_x: f32 = 0,
+    scroll_y: f32 = 0,
     border_width: f32 = 0,
     border_bottom_only: bool = false,
     dashed_border: bool = false,
@@ -154,7 +164,10 @@ pub const Node = struct {
     measured: core.Size = .{},
     listener: ?Listener = null,
     mouse_down_listener: ?Listener = null,
+    mouse_up_listener: ?Listener = null,
+    mouse_move_listener: ?Listener = null,
     double_click_listener: ?Listener = null,
+    scroll_listener: ?Listener = null,
     focus: ?FocusHandle = null,
     /// True when `layout.measure` actually ran the cozmic layout for this
     /// text node; false when no engine was installed or the shape failed.
@@ -460,6 +473,11 @@ pub const Element = struct {
         self.node().style.radius = 8;
         return self;
     }
+    /// Arbitrary corner radius in px (the named helpers set 8/12/16/999).
+    pub fn rounded(self: Element, value: f32) Element {
+        self.node().style.radius = value;
+        return self;
+    }
     pub fn rounded_xl(self: Element) Element {
         self.node().style.radius = 12;
         return self;
@@ -535,6 +553,30 @@ pub const Element = struct {
     }
     pub fn on_mouse_down(self: Element, listener: Listener) Element {
         self.node().mouse_down_listener = listener;
+        return self;
+    }
+    pub fn on_mouse_up(self: Element, listener: Listener) Element {
+        self.node().mouse_up_listener = listener;
+        return self;
+    }
+    pub fn on_mouse_move(self: Element, listener: Listener) Element {
+        self.node().mouse_move_listener = listener;
+        return self;
+    }
+    pub fn on_scroll(self: Element, listener: Listener) Element {
+        self.node().scroll_listener = listener;
+        return self;
+    }
+    pub fn flex_wrap(self: Element) Element {
+        self.node().style.flex_wrap = true;
+        return self;
+    }
+    pub fn scroll_x(self: Element, value: f32) Element {
+        self.node().style.scroll_x = value;
+        return self;
+    }
+    pub fn scroll_y(self: Element, value: f32) Element {
+        self.node().style.scroll_y = value;
         return self;
     }
     pub fn on_double_click(self: Element, listener: Listener) Element {

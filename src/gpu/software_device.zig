@@ -1,12 +1,12 @@
-//! Software GPU device: the CPU rasterizer behind the full device vtable.
+//! Software GPU device: the vellz CPU renderer behind the full device vtable.
 //!
 //! Layout-compatible with `NullDevice` (its `base` is the first field, so
 //! every non-overridden vtable entry — which casts to `*NullDevice` —
 //! keeps working; see the comptime offset assert). Only `drawScene` is
-//! overridden: it rasterizes the `Scene` into the attached frame via
-//! `software.Target`, then counts the draw like null does. Backends with
-//! CPU-visible swapchain memory (Wayland SHM, X11 `XShm`) attach their
-//! mapped buffer each frame with `attachFrame`.
+//! overridden: it rasterizes the `Scene` into the attached frame through the
+//! caller-owned `vellz.Renderer`, then counts the draw like null does.
+//! Backends with CPU-visible swapchain memory (Wayland SHM, X11 `XShm`)
+//! attach their mapped buffer each frame with `attachFrame`.
 //!
 //! TODO(gpu-software): resource calls are validation-only (shared null
 //! entries) — buffers/textures have no CPU backing. Decide when Vulkan
@@ -16,17 +16,29 @@
 const std = @import("std");
 const device = @import("device.zig");
 const null_device = @import("null_device.zig");
-const software = @import("software.zig");
+const vellz = @import("vellz.zig");
 const scene_mod = @import("scene.zig");
 
 pub const SoftwareDevice = struct {
     base: null_device.NullDevice = .{},
-    frame: ?software.Target = null,
+    renderer: ?*vellz.Renderer = null,
+    frame: ?Frame = null,
 
     comptime {
         // The whole vtable-sharing trick depends on this.
         if (@offsetOf(@This(), "base") != 0) @compileError("SoftwareDevice.base must be the first field");
     }
+
+    /// One attached CPU-visible frame buffer.
+    pub const Frame = struct {
+        pixels: []u8,
+        width: u32,
+        height: u32,
+        format: vellz.PixelFormat = .rgba32,
+        /// Background color applied by every `drawScene` (vellz clears the
+        /// internal pixmap, which is then converted into `pixels`).
+        clear: vellz.Color = .transparent,
+    };
 
     pub const vtable: device.VTable = blk: {
         var t = null_device.NullDevice.vtable;
@@ -41,14 +53,16 @@ pub const SoftwareDevice = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    /// Point the device at CPU-visible frame memory. The slice must outlive
-    /// every `drawScene` until `detachFrame`.
-    pub fn attachFrame(self: *@This(), target: software.Target) void {
-        self.frame = target;
+    /// Point the device at a caller-owned renderer and CPU-visible frame
+    /// memory. Both must outlive every `drawScene` until `detachFrame`.
+    pub fn attachFrame(self: *@This(), renderer: *vellz.Renderer, frame: Frame) void {
+        self.renderer = renderer;
+        self.frame = frame;
     }
 
     pub fn detachFrame(self: *@This()) void {
         self.frame = null;
+        self.renderer = null;
     }
 
     fn kindFn(ptr: *anyopaque) device.DeviceKind {
@@ -69,10 +83,14 @@ pub const SoftwareDevice = struct {
     fn drawSceneFn(ptr: *anyopaque, cmd: *device.CommandBuffer, scene: *const scene_mod.Scene, pixels: []const u8) bool {
         _ = cmd;
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        // TODO(images): thread the App image pool through the gpu.Device
-        // contract when Backend.present routes through a claimed Device;
-        // image blits bound-check to a skip on the empty pool until then.
-        if (self.frame) |target| target.renderScene(scene, pixels, &.{});
+        if (self.renderer) |renderer| {
+            if (self.frame) |frame| {
+                renderer.render(frame.pixels, frame.width, frame.height, frame.format, frame.clear, scene, pixels, &.{}) catch |err| {
+                    std.debug.print("software device: vellz render failed: {s}\n", .{@errorName(err)});
+                    return false;
+                };
+            }
+        }
         self.base.tracker.draws += 1;
         return true;
     }
@@ -88,10 +106,16 @@ test "software device rasterizes scenes into the attached frame" {
     // No frame attached: counts, paints nothing, never crashes.
     try std.testing.expect(d.render(&scene_mod.Scene{}, &.{}));
 
+    var renderer = vellz.Renderer.init(std.testing.allocator);
+    defer renderer.deinit();
     var buf: [8 * 8 * 4]u8 = std.mem.zeroes([8 * 8 * 4]u8);
-    var target = software.Target.init(&buf, 8, 8, .rgba32);
-    target.clear(core.Color.hex(0x000000));
-    dev.attachFrame(target);
+    dev.attachFrame(&renderer, .{
+        .pixels = &buf,
+        .width = 8,
+        .height = 8,
+        .format = .rgba32,
+        .clear = core.Color.black,
+    });
 
     var scene = scene_mod.Scene{};
     try std.testing.expect(scene.push(.{
