@@ -131,6 +131,51 @@ pub const TextEvent = struct {
     }
 };
 
+/// All protocol ranges are UTF-8 byte offsets, half-open. Native adapters
+/// must convert UTF-16 offsets explicitly. No borrowed strings enter the queue.
+pub const TextRange = struct { start: usize = 0, end: usize = 0 };
+pub const CompositionText = struct {
+    bytes: [256]u8 = @splat(0),
+    len: u16 = 0,
+    /// Selection within preedit, not within surrounding committed text.
+    marked: TextRange = .{},
+    /// Optional replacement in committed surrounding text (UTF-8 bytes).
+    replacement: ?TextRange = null,
+    pub fn init(text: []const u8) !CompositionText {
+        if (text.len > 256) return error.TextTooLong;
+        if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
+        var result = CompositionText{};
+        @memcpy(result.bytes[0..text.len], text);
+        result.len = @intCast(text.len);
+        result.marked = .{ .start = text.len, .end = text.len };
+        return result;
+    }
+    pub fn slice(self: *const CompositionText) ?[]const u8 {
+        if (self.len > self.bytes.len) return null;
+        const text = self.bytes[0..self.len];
+        if (!std.unicode.utf8ValidateSlice(text)) return null;
+        if (self.marked.start > self.marked.end or self.marked.end > text.len) return null;
+        for ([_]usize{ self.marked.start, self.marked.end }) |i| {
+            if (i < text.len and text[i] & 0xc0 == 0x80) return null;
+        }
+        return text;
+    }
+};
+pub const CompositionEvent = union(enum) {
+    preedit: CompositionText,
+    commit: CompositionText,
+    cancel,
+};
+/// Consumer supplies window-local logical pixels; backend converts to native
+/// screen coordinates/DPI. Optional and headless-safe, called after placement.
+pub const CaretReporter = struct {
+    context: ?*anyopaque = null,
+    report: ?*const fn (?*anyopaque, geometry.Rect) void = null,
+    pub fn update(self: CaretReporter, rect: geometry.Rect) void {
+        if (self.report) |callback| callback(self.context, rect);
+    }
+};
+
 pub const WindowEvent = enum {
     close_requested,
     resized,
@@ -142,6 +187,7 @@ pub const Event = union(enum) {
     mouse: MouseEvent,
     key: KeyEvent,
     text: TextEvent,
+    composition: CompositionEvent,
     scroll: ScrollEvent,
     window: WindowEvent,
 };
@@ -184,6 +230,10 @@ pub const EventQueue = struct {
             .key => |k| !k.pressed,
             .mouse => |m| !m.motion and !m.pressed,
             .text => true,
+            .composition => |c| switch (c) {
+                .commit, .cancel => true,
+                .preedit => false,
+            },
             .scroll => false,
             .window => |w| switch (w) {
                 .close_requested, .unfocused => true,
@@ -426,4 +476,37 @@ test "critical with no victim errors instead of silent loss" {
     }
     try std.testing.expect(!r.push(.{ .key = .{ .key = .b, .pressed = true } }));
     try std.testing.expectEqual(@as(u64, 1), r.dropped);
+}
+
+test "composition protocol validates payloads, owns bytes and retains queue policy" {
+    const t = std.testing;
+    var input = [_]u8{ 'a', 'b' };
+    const payload = try CompositionText.init(&input);
+    input[0] = 'z';
+    try t.expectEqualStrings("ab", payload.slice().?);
+    var invalid = try CompositionText.init("é");
+    invalid.marked.start = 1;
+    try t.expect(invalid.slice() == null);
+    const huge: [257]u8 = @splat('a');
+    try t.expectError(error.TextTooLong, CompositionText.init(&huge));
+    try t.expectError(error.InvalidUtf8, CompositionText.init("\xff"));
+    var q = EventQueue{};
+    try t.expect(q.push(.{ .composition = .{ .preedit = payload } }));
+    try t.expect(q.push(.{ .composition = .{ .commit = payload } }));
+    try t.expect(q.push(.{ .composition = .cancel }));
+    try t.expect(q.pop().?.composition == .preedit);
+    try t.expect(q.pop().?.composition == .commit);
+    try t.expect(q.pop().?.composition == .cancel);
+    try t.expect(EventQueue.isCritical(.{ .composition = .{ .commit = payload } }));
+    try t.expect(EventQueue.isCritical(.{ .composition = .cancel }));
+    try t.expect(!EventQueue.isCoalescable(.{ .composition = .{ .preedit = payload } }));
+    var rect: geometry.Rect = .{};
+    const reporter = CaretReporter{ .context = &rect, .report = struct {
+        fn report(ctx: ?*anyopaque, r: geometry.Rect) void {
+            const out: *geometry.Rect = @ptrCast(@alignCast(ctx.?));
+            out.* = r;
+        }
+    }.report };
+    reporter.update(.{ .x = 12, .y = 20, .w = 1, .h = 18 });
+    try t.expectEqual(@as(f32, 12), rect.x);
 }

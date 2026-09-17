@@ -367,7 +367,7 @@ pub const App = struct {
                 },
                 .focused, .unfocused => {},
             },
-            .mouse, .key, .text, .scroll => {
+            .mouse, .key, .text, .composition, .scroll => {
                 for (&self.windows) |*maybe_win| {
                     if (maybe_win.*) |win| {
                         if (win.closed) continue;

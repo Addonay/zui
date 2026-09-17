@@ -414,6 +414,63 @@ pub const Layout = struct {
         return self.buffer.cursorPosition(&cursor);
     }
 
+    /// Nearest distinct visual grapheme caret on the same visual line.
+    /// Strong caret only: split-caret affinity at bidi boundaries is deferred.
+    pub fn visualMove(self: *const Layout, cursor: cozmic.Cursor, right: bool) ?cozmic.Cursor {
+        const origin = self.cursorPosition(cursor) orelse return null;
+        var best: ?cozmic.Cursor = null;
+        var distance: f32 = std.math.inf(f32);
+        if (cursor.line >= self.buffer.lines.items.len) return null;
+        const text = self.buffer.lines.items[cursor.line].textSlice();
+        var it = cozmic.unicode.graphemeIndices(text);
+        var index: usize = 0;
+        while (true) {
+            const candidate = cozmic.Cursor{ .line = cursor.line, .index = index };
+            if (self.cursorPosition(candidate)) |p| {
+                const delta = if (right) p.x - origin.x else origin.x - p.x;
+                if (@abs(p.y - origin.y) < 0.01 and delta > 0.01 and delta < distance) {
+                    distance = delta;
+                    best = candidate;
+                }
+            }
+            _ = it.next() orelse break;
+            index = it.pos;
+        }
+        return best;
+    }
+
+    /// Selection rectangles in layout-local coordinates, across wrapped runs
+    /// and bidi spans. Caller owns the returned slice. Cursors use paragraph-
+    /// local UTF-8 bytes (wrapped visual lines keep the same paragraph index).
+    pub fn selectionRects(self: *const Layout, alloc: std.mem.Allocator, a: cozmic.Cursor, b: cozmic.Cursor) ![]@import("../core/geometry.zig").Rect {
+        const Rect = @import("../core/geometry.zig").Rect;
+        var out: std.ArrayList(Rect) = .empty;
+        errdefer out.deinit(alloc);
+        const reverse = a.line > b.line or (a.line == b.line and a.index > b.index);
+        const start = if (reverse) b else a;
+        const end = if (reverse) a else b;
+        if (start.line == end.line and start.index == end.index) return out.toOwnedSlice(alloc);
+        var it = self.runs();
+        while (it.next()) |run| {
+            if (run.line_i < start.line or run.line_i > end.line) continue;
+            // Glyph ranges come directly from shaping. Interpolate only at
+            // grapheme boundaries inside ligatures, respecting glyph direction.
+            for (run.glyphs) |g| {
+                const lo = if (run.line_i == start.line) @max(start.index, g.start) else g.start;
+                const hi = if (run.line_i == end.line) @min(end.index, g.end) else g.end;
+                if (lo >= hi or g.end <= g.start) continue;
+                const cluster = run.text[g.start..g.end];
+                const count: f32 = @floatFromInt(@max(1, cozmic.unicode.countGraphemes(cluster)));
+                const left: f32 = @floatFromInt(cozmic.unicode.countGraphemes(run.text[g.start..lo]));
+                const selected: f32 = @floatFromInt(cozmic.unicode.countGraphemes(run.text[lo..hi]));
+                const width = g.w * selected / count;
+                const x = if (g.level & 1 == 1) g.x + g.w - g.w * left / count - width else g.x + g.w * left / count;
+                if (width > 0) try out.append(alloc, .{ .x = x, .y = run.line_top, .w = width, .h = run.line_height });
+            }
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
     /// Number of laid-out glyphs in the whole layout.
     pub fn glyphCount(self: *const Layout) usize {
         return self.glyph_count;
@@ -551,6 +608,146 @@ fn runExtent(run: cozmic.buffer.LayoutRun) f32 {
 }
 
 /// Forwards every callback to the wrapped renderer and counts them.
+// ---------------------------------------------------------------------------
+// Color glyph spike: does rasterization already deliver color ink, and does
+// the coverage-only atlas reject it without corrupting the pool? (see
+// docs/TEXT_ROADMAP.md)
+// ---------------------------------------------------------------------------
+
+/// Path of an installed color emoji font, probed like cozmic's own raster
+/// tests (`raster_ft.zig`). CBDT bitmap faces (Twemoji, NotoColorEmoji) are
+/// first: they produce color ink through the whole engine path today. COLRv1
+/// faces are listed last so hosts with both prefer the working path; the
+/// COLRv1 limitation itself is pinned by the second spike test below.
+const color_font_paths = [_][]const u8{
+    "/usr/share/fonts/twemoji/Twemoji.ttf",
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/google-noto-color-emoji-fonts/Noto-COLRv1.ttf",
+};
+
+test "color spike: engine rasterizes emoji as color ink the atlas rejects" {
+    const t = testing;
+    const alloc = t.allocator;
+    const engine = try testEngine();
+    defer engine.deinit();
+
+    // An installed color emoji font, loaded directly into the engine's db.
+    const bytes = blk: {
+        for (color_font_paths) |path| {
+            const data = std.Io.Dir.cwd().readFileAlloc(t.io, path, alloc, .limited(1 << 26)) catch continue;
+            break :blk data;
+        }
+        return error.SkipZigTest;
+    };
+    defer alloc.free(bytes);
+    const font_id = try engine.fs.db.addFaceFromBytes(bytes, 0, "spike-emoji");
+    // db registration is metadata only: family matching still needs these
+    // bytes in the HarfBuzz shaper backend (`addFontData`), and the FreeType
+    // raster registry snapshot was taken at Engine.init, so register the
+    // late face there too.
+    try engine.fs.addFontData(font_id, bytes, 0, false, null);
+    try engine.raster.addFromFontSystem(&engine.fs, &.{font_id});
+    try t.expect(engine.raster.getFace(font_id) != null);
+
+    // Shape a flag sequence and rasterize it through the engine's SwashCache.
+    // Fallback for the non-Latin run must resolve to the color face (the db
+    // query matches its real family name); this also proves the db-facing
+    // family name for embedders.
+    const info = engine.fs.db.face(font_id).?;
+    try t.expect(info.families.len > 0);
+    var layout = try engine.layout(alloc, "🇳🇿", .{ .family = info.families[0], .size = 16, .line_height = 20 }, null);
+    defer layout.deinit();
+    try t.expect(layout.glyphCount() > 0);
+    var used_color_font = false;
+    var runs_for_face = layout.runs();
+    while (runs_for_face.next()) |run| {
+        for (run.glyphs) |glyph| {
+            if (glyph.font_id == font_id) used_color_font = true;
+        }
+    }
+    try t.expect(used_color_font);
+    var saw_color = false;
+    var runs = layout.runs();
+    while (runs.next()) |run| {
+        for (run.glyphs) |glyph| {
+            const image = engine.cache.getImage(glyph.physical(0, 0, 1.0).cache_key) catch continue;
+            const view = image orelse continue;
+            if (view.content == .color) {
+                saw_color = true;
+                try t.expectEqual(view.placement.width * view.placement.height * 4, view.data.len);
+                try t.expect(view.placement.width > 0 and view.placement.height > 0);
+                // Real ink, not an all-zero buffer: some pixel has alpha
+                // (observed 76x72 with non-zero alpha on this host).
+                var inked = false;
+                var i: usize = 3;
+                while (i < view.data.len) : (i += 4) {
+                    if (view.data[i] != 0) {
+                        inked = true;
+                        break;
+                    }
+                }
+                try t.expect(inked);
+            }
+        }
+    }
+    // A host whose only color font is env-blocked (COLRv1 with a FreeType
+    // that does not traverse paint graphs) yields no color ink at all; that
+    // environment case is pinned by the dedicated COLRv1 test below.
+    if (!saw_color) return error.SkipZigTest;
+
+    // The coverage-only atlas contract holds: color ink is rejected without
+    // entering the pool, and cannot be read back as a mask entry.
+    var probe = Atlas{};
+    const fake_key = AtlasKey{ .face_id = font_id, .glyph_id = 99, .size_px = 16 };
+    const rgba = [_]u8{ 255, 0, 0, 255 };
+    try t.expectError(error.ColorUnsupported, probe.putBitmap(fake_key, 1, 1, 4, &rgba, 0, 0, .color, false));
+    try t.expect(probe.get(fake_key) == null);
+    try t.expectEqual(@as(usize, 0), probe.pixels_used);
+}
+
+test "color spike: COLRv1 renders empty ink at every load-flag combination" {
+    // Environment observation, deliberately NOT a portable expectation: on
+    // hosts whose FreeType does traverse COLRv1 paint graphs this font
+    // produces ink and the assertions below would be false. Skip there.
+    const t = testing;
+    const alloc = t.allocator;
+    var lib = cozmic.raster_ft.Library.init() catch |err| switch (err) {
+        error.LibraryUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer lib.deinit();
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        t.io,
+        "/usr/share/fonts/google-noto-color-emoji-fonts/Noto-COLRv1.ttf",
+        alloc,
+        .limited(1 << 26),
+    ) catch return error.SkipZigTest;
+    defer alloc.free(bytes);
+    var face = try cozmic.raster_ft.Face.initMemory(&lib, bytes, 0);
+    defer face.deinit();
+    if (!face.hasColor()) return error.SkipZigTest;
+    // Emoji flags are GSUB ligatures: a lone regional indicator has no paint
+    // data, so assert on both the lone codepoint and the shaped ligature gid
+    // the engine layout above produced (3773 for "🇳🇿" on this corpus).
+    const lone = face.charIndex('🇳');
+    try t.expect(lone != 0);
+    const ligature: u32 = 3773;
+    // Raw-FT verdict (verified with an independent C probe against
+    // FreeType 2.14.3, printing glyph formats and bitmaps): the COLRv1 base
+    // glyphs load as outlines but every render path — FT_LOAD_COLOR,
+    // FT_LOAD_RENDER, explicit FT_Render_Glyph — yields a 0x0 bitmap with a
+    // null buffer. The CBDT control face yields 76x72 BGRA. Cozmic's flag
+    // passing is therefore NOT the root cause; this FreeType build simply
+    // does not rasterize COLRv1 paint graphs. See docs/TEXT_ROADMAP.md.
+    const lone_render = try face.loadRenderFlags(lone, 48, cozmic.raster_ft.FT_LOAD_DEFAULT | cozmic.raster_ft.FT_LOAD_COLOR);
+    const ligature_render = try face.loadRenderFlags(ligature, 48, cozmic.raster_ft.FT_LOAD_DEFAULT | cozmic.raster_ft.FT_LOAD_COLOR | cozmic.raster_ft.FT_LOAD_RENDER);
+    // The pinned environment observation holds only while this FreeType
+    // build cannot rasterize COLRv1. On a host where it can (or after a
+    // cozmic upgrade), both renders have ink: skip instead of failing.
+    if (lone_render.width > 0 or ligature_render.width > 0) return error.SkipZigTest;
+}
+
 const CountingRenderer = struct {
     inner: cozmic.render.Renderer,
     glyphs: usize = 0,
@@ -1047,4 +1244,30 @@ test "text engine: real bold faces and unknown ids need no dilation" {
     // are always exercised.
     try testing.expect(engine.needsSyntheticBold(999_999, 700));
     try testing.expect(!engine.needsSyntheticBold(999_999, 400));
+}
+
+test "selection geometry covers wrapped lines and mixed bidi without negative widths" {
+    const alloc = std.testing.allocator;
+    const engine = Engine.init(alloc) catch return error.SkipZigTest;
+    defer engine.deinit();
+    const text = "Latin אבג a\u{301} 👩🏽‍💻 more words wrapping across lines";
+    var layout = try engine.layout(alloc, text, .{ .size = 16, .line_height = 20 }, 100);
+    defer layout.deinit();
+    const rects = try layout.selectionRects(alloc, .{ .line = 0, .index = text.len }, .{ .line = 0, .index = 0 });
+    defer alloc.free(rects);
+    try std.testing.expect(rects.len > 0);
+    var max_y: f32 = 0;
+    for (rects) |r| {
+        try std.testing.expect(r.w > 0 and r.h == 20);
+        try std.testing.expect(r.x >= -0.01);
+        max_y = @max(max_y, r.y);
+    }
+    try std.testing.expect(max_y > 0);
+    const hit = (try layout.hit(0, max_y)).?;
+    try std.testing.expect(@import("cozmic").unicode.isGraphemeBoundary(text, hit.index));
+    const pos = layout.cursorPosition(hit).?;
+    try std.testing.expectApproxEqAbs(max_y, pos.y, 0.01);
+    const empty = try layout.selectionRects(alloc, hit, hit);
+    defer alloc.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }

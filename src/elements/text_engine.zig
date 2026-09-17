@@ -90,6 +90,26 @@ pub fn retainedLayout(frame: *const element.Frame, node: *const element.Node) ?*
     return cached;
 }
 
+/// Editing clients can borrow the retained measure layout, or own a fresh
+/// layout when querying before measure. Always deinit this handle; borrowed
+/// entries are never freed by it. Coordinates are local to the text node.
+pub const EditingGeometry = struct {
+    owned: ?fonts.Layout = null,
+    borrowed: ?*fonts.Layout = null,
+    pub fn layout(self: *EditingGeometry) *fonts.Layout {
+        return self.borrowed orelse &self.owned.?;
+    }
+    pub fn deinit(self: *EditingGeometry) void {
+        if (self.owned) |*value| value.deinit();
+        self.* = .{};
+    }
+};
+pub fn editingGeometry(frame: *const element.Frame, node: *const element.Node) !?EditingGeometry {
+    if (retainedLayout(frame, node)) |cached| return .{ .borrowed = &cached.layout };
+    const engine = engineFor(frame) orelse return null;
+    return .{ .owned = try shape(engine, node, frameAllocator(frame)) };
+}
+
 /// Synthetic-bold decision for one glyph, axis-aware (see
 /// `fonts.Engine.needsSyntheticBold`): a variable face whose `wght` axis
 /// covers the request rasterizes the requested weight itself, so it must not

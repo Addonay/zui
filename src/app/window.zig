@@ -103,6 +103,8 @@ pub const Window = struct {
     /// scroll listener that received it.
     last_scroll: platform.event.ScrollEvent = .{ .pos = .{ .x = 0, .y = 0 } },
     focused: elements.FocusHandle = .{},
+    /// Optional borrowed focus scope; host owns its ids until popScope.
+    focus_scope: ?@import("../widgets/focus.zig").Scope = null,
     keymap: keymap.Keymap = .{},
     /// Window-level context tags (outermost keymap frame, after "Window").
     context_tags: [4][]const u8 = undefined,
@@ -458,8 +460,9 @@ pub const Window = struct {
                         self.last_click_ms = mouse.time_ms;
                         self.last_click_pos = mouse.pos;
                     }
-                    // Clicking outside a focusable control releases keyboard focus.
-                    self.focused = .{};
+                    // A modal scope preserves focus and rejects background hits.
+                    const modal_scope = if (self.focus_scope) |scope| (if (scope.modal) scope else null) else null;
+                    if (modal_scope == null) self.focused = .{};
                     var i = self.ui_frame.region_count;
                     while (i > 0) {
                         i -= 1;
@@ -470,6 +473,10 @@ pub const Window = struct {
                         // dispatch — no focus adoption, no listener, no
                         // capture — as if unmounted.
                         if (!region.ownerAlive()) continue;
+                        if (modal_scope) |scope| {
+                            const handle = region.focus orelse continue;
+                            if (!scope.contains(handle.id)) continue;
+                        }
                         if (region.focus) |handle| self.focused = handle;
                         if (region.mouse_down_listener) |listener| listener.call(self);
                         if (double_click) {
@@ -490,14 +497,19 @@ pub const Window = struct {
                 }
                 self.requestRender();
             },
-            .key, .text => {
+            .key, .text, .composition => {
+                // Tab is a foundation default action, not a widget shortcut.
+                if (event == .key and event.key.key == .tab and !event.key.modifiers.ctrl and !event.key.modifiers.alt and !event.key.modifiers.super) {
+                    if (event.key.pressed) _ = @import("../widgets/focus.zig").handleTab(self, event.key.modifiers.shift, self.focus_scope);
+                    return;
+                }
                 if (self.focused.dispatch(event, self)) {
                     self.requestRender();
                     return;
                 }
                 switch (event) {
                     .key => |key_event| if (key_event.pressed) self.dispatchKeyAction(key_event.key, key_event.modifiers),
-                    .text => {},
+                    .text, .composition => {},
                     else => unreachable,
                 }
             },
