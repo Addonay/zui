@@ -452,8 +452,13 @@ pub fn mountView(store: *EntityStore, window: *Window, build_fn: anytype) void {
                 elements.element.beginFrame(&win.ui_frame);
                 defer elements.element.endFrame();
                 const root_element = value.render(win, &render_cx);
+                const diagnostics = @import("../debug/stats.zig");
+                const layout_start = diagnostics.nowNs();
                 elements.layout.layout(&win.ui_frame, root_element, .{ .x = 0, .y = 0, .w = win.bounds.size.w, .h = win.bounds.size.h });
+                win.frame_durations.layout_ns = diagnostics.elapsed(layout_start);
+                const paint_start = diagnostics.nowNs();
                 elements.painter.paint(&win.ui_frame, root_element, scene);
+                win.frame_durations.paint_ns = diagnostics.elapsed(paint_start);
                 win.updateHitRegions();
                 // NB: do NOT clear store.dirty here. App.step owns the
                 // store->window fan-out and clears before rendering, so a

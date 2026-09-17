@@ -47,6 +47,13 @@ pub const App = struct {
     /// replaced by the diagnostic placeholder before present).
     rejected_frames: u64 = 0,
 
+    /// Retains diagnostics when windows close before App.deinit.
+    retired_diagnostics: @import("../debug/stats.zig").Totals = .{},
+
+    pub fn diagnostics(self: *const App) @import("../debug/stats.zig").Snapshot {
+        return @import("../debug/stats.zig").capture(self);
+    }
+
     pub fn init(allocator: std.mem.Allocator) !App {
         var instance = try platform.createAuto(allocator, "ZUI Application", 800, 600);
         errdefer instance.deinit(allocator);
@@ -123,8 +130,10 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        @import("../debug/stats.zig").logExit(self);
         for (&self.windows) |*maybe_win| {
             if (maybe_win.*) |win| {
+                self.retired_diagnostics.add(win.diagnosticTotals());
                 win.deinit();
                 self.allocator.destroy(win);
                 maybe_win.* = null;
@@ -274,6 +283,7 @@ pub const App = struct {
         };
         self.next_window_id += 1;
 
+        win.inspector.enabled = @import("../debug/inspector.zig").environmentEnabled();
         win.setTitle(options.title);
         // Explicit bounds resize the native window to match (X11/Cocoa/
         // Win32 honor it; Wayland sizes via compositor configure instead).
@@ -307,6 +317,7 @@ pub const App = struct {
                 if (self.active_window_count > 0) {
                     self.active_window_count -= 1;
                 }
+                self.retired_diagnostics.add(win.diagnosticTotals());
                 win.deinit();
                 self.allocator.destroy(win);
                 break;
@@ -335,6 +346,7 @@ pub const App = struct {
                     if (self.active_window_count > 0) {
                         self.active_window_count -= 1;
                     }
+                    self.retired_diagnostics.add(win.diagnosticTotals());
                     win.deinit();
                     self.allocator.destroy(win);
                 }

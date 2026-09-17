@@ -120,6 +120,34 @@ pub const Window = struct {
     actions: [32]Action = undefined,
     action_count: usize = 0,
 
+    /// Opt-in diagnostics; no extra wakeups or frame deadlines.
+    inspector: @import("../debug/inspector.zig").Options = .{},
+    debug_overlay: @import("../debug/inspector.zig").Overlay = .{},
+    render_count: u64 = 0,
+    frame_durations: @import("../debug/stats.zig").Durations = .{},
+    total_layout_ns: u64 = 0,
+    total_paint_ns: u64 = 0,
+    overlay_skipped: u64 = 0,
+    inspector_failures: u64 = 0,
+
+    pub fn setInspector(self: *Window, options: @import("../debug/inspector.zig").Options) void {
+        self.inspector = options;
+        self.requestRender();
+    }
+
+    pub fn setDebugOverlay(self: *Window, options: @import("../debug/inspector.zig").Overlay) void {
+        self.debug_overlay = options;
+        self.requestRender();
+    }
+
+    pub fn diagnostics(self: *const Window) @import("../debug/stats.zig").WindowStats {
+        return .{ .frames = self.render_count, .rejected_frames = self.rejected_frames, .scene = @import("../debug/stats.zig").SceneStats.capture(&self.scene), .durations = self.frame_durations, .dropped_regions = self.ui_frame.dropped_regions, .duplicate_keys = self.ui_frame.duplicate_keys, .overlay_skipped = self.overlay_skipped, .inspector_failures = self.inspector_failures };
+    }
+
+    pub fn diagnosticTotals(self: *const Window) @import("../debug/stats.zig").Totals {
+        return .{ .frames = self.render_count, .rejected_frames = self.rejected_frames, .scene_dropped = self.scene.dropped, .dropped_regions = self.ui_frame.dropped_regions, .layout_ns = self.total_layout_ns, .paint_ns = self.total_paint_ns, .overlay_skipped = self.overlay_skipped, .inspector_failures = self.inspector_failures };
+    }
+
     pub fn title(self: *const Window) []const u8 {
         return self.title_buf[0..self.title_len];
     }
@@ -261,6 +289,8 @@ pub const Window = struct {
         // schedules another frame instead of being swallowed.
         self.dirty = false;
         self.scene.clear();
+        self.frame_durations = .{};
+        self.render_count += 1;
         if (self.renderer) |r| {
             r.call(self, &self.scene);
         }
@@ -276,6 +306,13 @@ pub const Window = struct {
             self.last_frame_rejected = true;
             zlog.log("window", "frame rejected: {d} scene pushes dropped (window {d}); presenting overflow placeholder", .{ drops, self.id });
             self.scene.renderOverflowPlaceholder(self.bounds.rect());
+        }
+        self.total_layout_ns += self.frame_durations.layout_ns orelse 0;
+        self.total_paint_ns += self.frame_durations.paint_ns orelse 0;
+        // Snapshot application ink before optional debug ink changes counts.
+        @import("../debug/inspector.zig").emit(self);
+        if (!self.last_frame_rejected) {
+            self.overlay_skipped += @import("../debug/inspector.zig").paintOverlay(&self.ui_frame, &self.scene, self.focused.id, self.debug_overlay);
         }
         // Regions were rebuilt above; refresh the cursor for a stationary
         // pointer sitting over changed content.

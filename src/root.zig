@@ -28,6 +28,7 @@ pub const images = @import("images/root.zig");
 pub const app = @import("app/root.zig");
 pub const elements = @import("elements/root.zig");
 pub const widgets = @import("widgets/root.zig");
+pub const debug = @import("debug/root.zig");
 
 pub const Color = core.Color;
 pub const Point = core.Point;
@@ -111,4 +112,5 @@ test {
     _ = @import("app/root.zig");
     _ = @import("elements/root.zig");
     _ = @import("widgets/root.zig");
+    _ = @import("debug/root.zig");
 }
