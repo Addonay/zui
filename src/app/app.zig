@@ -172,40 +172,18 @@ pub const App = struct {
         self.backend.wakeup();
     }
 
-    fn osSetTitle(raw: *anyopaque, title: []const u8) void {
-        const app: *App = @ptrCast(@alignCast(raw));
-        app.backend.setTitle(title);
+    fn osBackend(raw: *anyopaque) platform.Backend {
+        const win: *Window = @ptrCast(@alignCast(raw));
+        return win.native_backend.?;
     }
 
-    fn osSetCursor(raw: *anyopaque, shape: platform.CursorShape) void {
-        const app: *App = @ptrCast(@alignCast(raw));
-        app.backend.setCursor(shape);
-    }
-
-    fn osGetClipboard(raw: *anyopaque, out: []u8) usize {
-        const app: *App = @ptrCast(@alignCast(raw));
-        return app.backend.clipboardText(out);
-    }
-
-    fn osSetClipboard(raw: *anyopaque, text: []const u8) bool {
-        const app: *App = @ptrCast(@alignCast(raw));
-        return app.backend.setClipboardText(text);
-    }
-
-    fn osDragWindow(raw: *anyopaque) void {
-        const app: *App = @ptrCast(@alignCast(raw));
-        app.backend.dragWindow();
-    }
-
-    fn osMinimizeWindow(raw: *anyopaque) void {
-        const app: *App = @ptrCast(@alignCast(raw));
-        app.backend.minimizeWindow();
-    }
-
-    fn osToggleMaximizeWindow(raw: *anyopaque) void {
-        const app: *App = @ptrCast(@alignCast(raw));
-        app.backend.toggleMaximizeWindow();
-    }
+    fn osSetTitle(raw: *anyopaque, title: []const u8) void { osBackend(raw).setTitle(title); }
+    fn osSetCursor(raw: *anyopaque, shape: platform.CursorShape) void { osBackend(raw).setCursor(shape); }
+    fn osGetClipboard(raw: *anyopaque, out: []u8) usize { return osBackend(raw).clipboardText(out); }
+    fn osSetClipboard(raw: *anyopaque, text: []const u8) bool { return osBackend(raw).setClipboardText(text); }
+    fn osDragWindow(raw: *anyopaque) void { osBackend(raw).dragWindow(); }
+    fn osMinimizeWindow(raw: *anyopaque) void { osBackend(raw).minimizeWindow(); }
+    fn osToggleMaximizeWindow(raw: *anyopaque) void { osBackend(raw).toggleMaximizeWindow(); }
 
     pub fn activate(self: *App, ignoring_other_apps: bool) void {
         _ = ignoring_other_apps;
@@ -221,9 +199,8 @@ pub const App = struct {
     }
 
     pub fn openWindow(self: *App, options: WindowOptions, build_or_render: anytype) !*Window {
-        // One native window per connection until per-window surfaces land
-        // (plan M5). Null/headless keeps N logical windows for tests.
-        if (self.backend.kind() != .null and self.liveWindowCount() > 0) {
+        // Legacy backends have not yet split connection/window ownership.
+        if (self.backend.vtable.createWindow == null and self.active_window_count > 0) {
             return error.MultipleNativeWindowsNotSupported;
         }
         var slot: ?usize = null;
@@ -243,7 +220,19 @@ pub const App = struct {
             .size = self.backend.windowInfo().size,
         };
 
+        if (bounds.size.w <= 0 or bounds.size.h <= 0 or !std.math.isFinite(bounds.size.w) or !std.math.isFinite(bounds.size.h) or bounds.size.w > 32768 or bounds.size.h > 32768) return error.InvalidWindowSize;
+        const owns_native = self.backend.vtable.createWindow != null;
+        const native = if (owns_native) try self.backend.createWindow(self.allocator, .{
+            .id = self.next_window_id, .title = options.title,
+            .width = @intFromFloat(bounds.size.w), .height = @intFromFloat(bounds.size.h),
+            .decorated = options.chrome == .system,
+        }) else self.backend;
+        errdefer if (owns_native) native.destroyWindow();
         win.* = .{
+            .native_backend = native,
+            .owns_native_window = owns_native,
+            .native_focused = native.windowInfo().focused,
+            .scale_factor = native.windowInfo().scale_factor,
             .id = self.next_window_id,
             .app = self,
             .allocator = self.allocator,
@@ -260,7 +249,7 @@ pub const App = struct {
                 }
             }.call,
             .os = .{
-                .ctx = self,
+                .ctx = win,
                 .setTitle = osSetTitle,
                 .setCursor = osSetCursor,
                 .getClipboard = osGetClipboard,
@@ -289,11 +278,11 @@ pub const App = struct {
         // Win32 honor it; Wayland sizes via compositor configure instead).
         if (options.bounds) |explicit| {
             if (explicit.size.w > 0 and explicit.size.h > 0) {
-                self.backend.setSize(@intFromFloat(explicit.size.w), @intFromFloat(explicit.size.h));
+                native.setSize(@intFromFloat(explicit.size.w), @intFromFloat(explicit.size.h));
             }
         }
         // Framed uses the OS titlebar; custom draws its own chrome.
-        self.backend.setDecorated(options.chrome == .system);
+        native.setDecorated(options.chrome == .system);
 
         self.windows[idx] = win;
         self.active_window_count += 1;
@@ -365,31 +354,28 @@ pub const App = struct {
     }
 
     pub fn handleEvent(self: *App, ev: platform.Event) void {
-        switch (ev) {
-            .window => |wev| switch (wev) {
-                .close_requested => {
-                    self.closeFirstWindow();
+        const destination: ?u32 = if (ev == .targeted) ev.targeted.window_id else null;
+        // Compatibility for legacy producers is deliberately single-window only.
+        if (destination == null and self.liveWindowCount() != 1) return;
+        for (self.windows) |maybe_win| {
+            const win = maybe_win orelse continue;
+            if (win.closed) continue;
+            if (destination) |id| { if (win.id != id) continue; }
+            const payload = ev.untargeted();
+            switch (payload) {
+                .window => |wev| switch (wev) {
+                    .close_requested => win.close(),
+                    .resized, .scale_changed => {
+                        const info = win.native_backend.?.windowInfo();
+                        win.bounds.size = info.size;
+                        win.scale_factor = info.scale_factor;
+                        win.requestRender();
+                    },
+                    .focused, .unfocused => win.handleEvent(payload),
                 },
-                .resized => {
-                    const info = self.backend.windowInfo();
-                    for (&self.windows) |*maybe_win| {
-                        if (maybe_win.*) |win| {
-                            if (win.closed) continue;
-                            win.bounds.size = info.size;
-                            win.requestRender();
-                        }
-                    }
-                },
-                .focused, .unfocused => {},
-            },
-            .mouse, .key, .text, .composition, .scroll => {
-                for (&self.windows) |*maybe_win| {
-                    if (maybe_win.*) |win| {
-                        if (win.closed) continue;
-                        win.handleEvent(ev);
-                    }
-                }
-            },
+                else => win.handleEvent(payload),
+            }
+            return;
         }
     }
 
@@ -494,7 +480,7 @@ pub const App = struct {
                         self.rejected_frames += 1;
                         zlog.log("app", "step {d}: window {d} frame rejected for overflow ({d} dropped); presented placeholder", .{ self.step_count, win.id, win.scene.dropped_frame });
                     }
-                    self.backend.present(&win.scene, self.glyphPixels(), self.imagePixels());
+                    win.native_backend.?.present(&win.scene, self.glyphPixels(), self.imagePixels());
                     presented += 1;
                 }
             }
@@ -725,6 +711,191 @@ test "app lifecycle and window capacity" {
     try std.testing.expectEqual(@as(usize, limits.MAX_WINDOWS), app.active_window_count);
 }
 
+test "multiwindow: two headless windows keep independent state and routes" {
+    const t = std.testing;
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+
+    const win_a = try app.openWindow(.{ .title = "Alpha", .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 320, .h = 240 } } }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+    const win_b = try app.openWindow(.{ .title = "Beta", .bounds = .{ .origin = .{ .x = 340, .y = 0 }, .size = .{ .w = 640, .h = 480 } } }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+    try t.expect(win_a.id != win_b.id);
+
+    const nb = app.getNullBackend().?;
+    const native_a = nb.windows[0].?;
+    const native_b = nb.windows[1].?;
+    try t.expect(native_a != native_b);
+    try t.expect(native_a.parent == nb);
+    try t.expect(native_b.parent == nb);
+    try t.expectEqualStrings("Alpha", native_a.title_buf[0..native_a.title_len]);
+    try t.expectEqualStrings("Beta", native_b.title_buf[0..native_b.title_len]);
+    try t.expectEqual(@as(f32, 320), native_a.size.w);
+    try t.expectEqual(@as(f32, 640), native_b.size.w);
+    try t.expectEqual(@as(u32, 0), native_a.presents);
+    try t.expectEqual(@as(u32, 0), native_b.presents);
+
+    // Renaming one window cannot touch the other's native title.
+    win_a.setTitle("Alpha 2");
+    try t.expectEqualStrings("Alpha 2", native_a.title_buf[0..native_a.title_len]);
+    try t.expectEqualStrings("Beta", native_b.title_buf[0..native_b.title_len]);
+
+    // Independent focus + scale state per window-scoped backend.
+    native_b.scale_factor = 2;
+    native_b.focused = false;
+    try t.expectEqual(@as(f32, 1), native_a.backendHandle().windowInfo().scale_factor);
+    try t.expectEqual(@as(f32, 2), native_b.backendHandle().windowInfo().scale_factor);
+    try t.expect(native_a.backendHandle().windowInfo().focused);
+    try t.expect(!native_b.backendHandle().windowInfo().focused);
+
+    // Per-window presents: each window renders into its own backend surface.
+    try t.expect(app.step());
+    try t.expectEqual(@as(u32, 1), native_a.presents);
+    try t.expectEqual(@as(u32, 1), native_b.presents);
+    try t.expectEqual(@as(u32, 2), nb.presents);
+}
+
+test "multiwindow: input targets exactly the destination window" {
+    const t = std.testing;
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+
+    const win_a = try app.openWindow(.{}, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+    const win_b = try app.openWindow(.{}, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+
+    // Both render once: per-window surfaces, connection-aggregated count.
+    try t.expect(app.step());
+    const nb = app.getNullBackend().?;
+    const presents_a_before = nb.windows[0].?.presents;
+    const presents_b_before = nb.windows[1].?.presents;
+
+    // A key event for B's id must not reach A's scene (no render, no wake).
+    _ = nb.windows[1].?.pushEvent(.{ .key = .{ .key = .b, .pressed = true } });
+    _ = nb.windows[0].?.pushEvent(.{ .key = .{ .key = .a, .pressed = true } });
+    try t.expect(app.step());
+    // Unknown destinations are dropped silently and safely.
+    _ = nb.pushEvent(.{ .targeted = .{ .window_id = 999, .payload = .{ .key = .{ .key = .c, .pressed = true } } } });
+    try t.expect(app.step());
+    // A plain key press does not dirty a window: targeting shows up as zero
+    // re-presents for both windows and nothing lost at the connection queue.
+    try t.expectEqual(presents_a_before, nb.windows[0].?.presents);
+    try t.expectEqual(presents_b_before, nb.windows[1].?.presents);
+    try t.expectEqual(@as(u64, 0), nb.queue.dropped);
+    _ = win_a;
+    _ = win_b;
+}
+
+test "multiwindow: close_requested closes only its destination" {
+    const t = std.testing;
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+
+    const win_a = try app.openWindow(.{ .title = "A" }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+    const win_b = try app.openWindow(.{ .title = "B" }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+
+    // Both render once; the connection aggregates per-window presents.
+    try t.expect(app.step());
+    const presents_after_first = app.getNullBackend().?.presents;
+    const nb = app.getNullBackend().?;
+
+    // A close event routed to B's id closes only B. step()
+    // reaps at its safe points, so B's Window object is freed when step
+    // returns; liveness is observed through App and connection state.
+    _ = nb.pushEvent(.{ .targeted = .{ .window_id = win_b.id, .payload = .{ .window = .close_requested } } });
+    try t.expect(app.step());
+    try t.expectEqual(@as(usize, 1), app.liveWindowCount());
+    try t.expect(!win_a.isClosed());
+    try t.expectEqualStrings("A", app.windows[0].?.title());
+
+    const survivor = app.windows[0].?;
+    try t.expect(survivor.id == win_a.id);
+    survivor.requestRender();
+    try t.expect(app.step());
+    try t.expectEqual(presents_after_first + 1, nb.presents);
+
+    // Closing the last window ends the scheduler: step reports false.
+    _ = nb.windows[0].?.pushEvent(.{ .window = .close_requested });
+    try t.expect(!app.step());
+    try t.expectEqual(@as(usize, 0), app.liveWindowCount());
+    for (nb.windows) |slot| try t.expect(slot == null);
+}
+
+test "multiwindow: resize and scale events stay per window" {
+    const t = std.testing;
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+
+    const win_a = try app.openWindow(.{ .title = "A", .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 400, .h = 300 } } }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+    const win_b = try app.openWindow(.{ .title = "B", .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 800, .h = 600 } } }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+
+    const nb = app.getNullBackend().?;
+    try t.expect(app.step());
+    try t.expectEqual(@as(f32, 400), win_a.bounds.size.w);
+    try t.expectEqual(@as(f32, 800), win_b.bounds.size.w);
+
+    // Native resize of B only; A's bounds are untouched.
+    nativeResize(nb.windows[1].?, 500, 400);
+    _ = nb.windows[1].?.pushEvent(.{ .window = .resized });
+    try t.expect(app.step());
+    try t.expectEqual(@as(f32, 500), win_b.bounds.size.w);
+    try t.expectEqual(@as(f32, 400), win_b.bounds.size.h);
+    try t.expectEqual(@as(f32, 400), win_a.bounds.size.w);
+    try t.expectEqual(@as(f32, 300), win_a.bounds.size.h);
+
+    // Scale change is a per-window event: only B rescales.
+    nb.windows[1].?.scale_factor = 1.5;
+    _ = nb.windows[1].?.pushEvent(.{ .window = .scale_changed });
+    try t.expect(app.step());
+    try t.expectEqual(@as(f32, 1.5), win_b.scale_factor);
+    try t.expectEqual(@as(f32, 1), win_a.scale_factor);
+}
+
+test "multiwindow: legacy untargeted events require exactly one live window" {
+    const t = std.testing;
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+
+    const win_a = try app.openWindow(.{ .title = "A" }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+    const win_b = try app.openWindow(.{ .title = "B" }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+
+    // With two live windows a legacy untargeted event is ambiguous: it is
+    // dropped at routing, not broadcast to both.
+    try t.expect(app.step());
+    const rendered_before = win_a.render_count;
+    const rendered_b_before = win_b.render_count;
+    _ = app.getNullBackend().?.pushEvent(.{ .key = .{ .key = .a, .pressed = true } });
+    _ = app.step();
+    try t.expectEqual(rendered_before, win_a.render_count);
+    try t.expectEqual(rendered_b_before, win_b.render_count);
+
+    // A targeted variant of the same event still routes correctly.
+    _ = app.getNullBackend().?.pushEvent(.{ .targeted = .{ .window_id = win_a.id, .payload = .{ .key = .{ .key = .a, .pressed = true } } } });
+    try t.expect(app.step());
+}
+
+fn nativeResize(nb: *@import("../platform/null.zig").NullBackend, w: u32, h: u32) void {
+    nb.size.w = @floatFromInt(w);
+    nb.size.h = @floatFromInt(h);
+}
+
 test "frame loop on null backend drives 3 frames and asserts scene contents" {
     var app = try App.initHeadless(std.testing.allocator);
     defer app.deinit();
@@ -928,6 +1099,46 @@ test "app auto probe initializes available backend" {
 
     const k = app.backend.kind();
     try std.testing.expect(k == .wayland or k == .x11 or k == .null);
+}
+
+test "app drives two live x11 windows with targeted input" {
+    const x11 = platform.x11;
+    if (!x11.X11Backend.isAvailable()) return;
+    const t = std.testing;
+    var instance = x11.X11Backend.init(t.allocator, "ZUI App Multi", 320, 200) catch |err| switch (err) {
+        error.CannotOpenDisplay, error.NoDisplay => return,
+        else => return err,
+    };
+    defer instance.deinit();
+
+    var app = App.initWithBackend(t.allocator, instance.backendHandle());
+    defer app.deinit();
+
+    const win_a = try app.openWindow(.{ .title = "App A", .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 280, .h = 180 } } }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+    const win_b = try app.openWindow(.{ .title = "App B", .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 200, .h = 140 } } }, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+    try t.expect(win_a.native_backend.?.ptr != win_b.native_backend.?.ptr);
+    try t.expectEqualStrings("App A", win_a.title());
+    try t.expectEqualStrings("App B", win_b.title());
+
+    try t.expect(app.step());
+    try t.expect(app.getNullBackend() == null); // x11, not null
+    try t.expect(win_a.render_count >= 1);
+    try t.expect(win_b.render_count >= 1);
+
+    // Closing B (the deferred close path a WM close button takes) leaves A
+    // alive, rendering, and presenting through its own surface.
+    win_b.close();
+    try t.expect(app.step());
+    try t.expectEqual(@as(usize, 1), app.liveWindowCount());
+    try t.expect(!win_a.isClosed());
+    const renders_before = win_a.render_count;
+    win_a.requestRender();
+    try t.expect(app.step());
+    try t.expectEqual(renders_before + 1, win_a.render_count);
 }
 
 test "app owns no font stack; the engine owns the atlas" {

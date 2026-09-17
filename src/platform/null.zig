@@ -13,6 +13,11 @@ const limits = @import("../core/limits.zig");
 const gpu = @import("../gpu/root.zig");
 
 pub const NullBackend = struct {
+    parent: ?*NullBackend = null,
+    allocator: ?std.mem.Allocator = null,
+    window_id: u32 = 0,
+    focused: bool = true,
+    windows: [limits.MAX_WINDOWS]?*NullBackend = @splat(null),
     queue: event.EventQueue = .{},
     size: geometry.Size = .{ .w = 800, .h = 600 },
     scale_factor: f32 = 1,
@@ -27,6 +32,8 @@ pub const NullBackend = struct {
     maximized: bool = false,
 
     const vtable: backend.VTable = .{
+        .createWindow = createWindowFn,
+        .destroyWindow = destroyWindowFn,
         .kind = kindFn,
         .poll = pollFn,
         .waitTimeoutNs = waitFn,
@@ -44,6 +51,30 @@ pub const NullBackend = struct {
         .clipboardText = getClipboardFn,
         .present = presentFn,
     };
+
+    fn createWindowFn(ptr: *anyopaque, allocator: std.mem.Allocator, options: backend.WindowOptions) !backend.Backend {
+        const self: *NullBackend = @ptrCast(@alignCast(ptr));
+        for (&self.windows) |*slot| {
+            if (slot.* != null) continue;
+            const child = try allocator.create(NullBackend);
+            child.* = .{ .parent = self, .allocator = allocator, .window_id = options.id,
+                .size = .{ .w = @floatFromInt(options.width), .h = @floatFromInt(options.height) },
+                .decorated = options.decorated };
+            child.backendHandle().setTitle(options.title);
+            slot.* = child;
+            return child.backendHandle();
+        }
+        return error.TooManyWindows;
+    }
+
+    fn destroyWindowFn(ptr: *anyopaque) void {
+        const self: *NullBackend = @ptrCast(@alignCast(ptr));
+        const parent = self.parent orelse return;
+        for (&parent.windows) |*slot| {
+            if (slot.* == self) slot.* = null;
+        }
+        self.allocator.?.destroy(self);
+    }
 
     pub fn backendHandle(self: *@This()) backend.Backend {
         return .{ .ptr = self, .vtable = &vtable };
@@ -63,6 +94,11 @@ pub const NullBackend = struct {
         while (self.queue.pop()) |ev| {
             _ = out.push(ev);
         }
+        for (self.windows) |slot| {
+            if (slot) |child| while (child.queue.pop()) |ev| {
+                _ = out.push(ev.forWindow(child.window_id));
+            };
+        }
     }
 
     fn waitFn(ptr: *anyopaque, ns: u64) void {
@@ -78,7 +114,7 @@ pub const NullBackend = struct {
 
     fn infoFn(ptr: *anyopaque) backend.WindowInfo {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{ .size = self.size, .scale_factor = self.scale_factor };
+        return .{ .size = self.size, .scale_factor = self.scale_factor, .focused = self.focused };
     }
 
     fn titleFn(ptr: *anyopaque, title: []const u8) void {
@@ -146,6 +182,9 @@ pub const NullBackend = struct {
         _ = image_pixels;
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.presents += 1;
+        // Connection-level total: window-scoped presents aggregate upward so
+        // App-level diagnostics keep observing one counter.
+        if (self.parent) |parent| parent.presents += 1;
     }
 };
 

@@ -62,6 +62,7 @@ const ButtonRelease: c_int = 5;
 const MotionNotify: c_int = 6;
 const FocusIn: c_int = 9;
 const FocusOut: c_int = 10;
+const DestroyNotify: c_int = 17;
 const ConfigureNotify: c_int = 22;
 const ClientMessage: c_int = 33;
 
@@ -183,6 +184,25 @@ const XAnyEvent = extern struct {
     window: Window,
 };
 
+/// Xlib's default error handler exits the process on any protocol error.
+/// With multiple windows, an in-flight request racing an external destroy
+/// (BadDrawable/BadWindow on XPutImage) would kill EVERY window. GTK/Qt
+/// install a non-fatal handler: log, ignore, keep servicing the other
+/// windows. Signature per Xlib.h (no XErrorEvent struct needed — we only
+/// log the opcode and serial).
+const XErrorHandler = ?*const fn (?*Display, ?*anyopaque) callconv(.c) c_int;
+
+/// Non-fatal Xlib error hook installed at connection init. Returns 0
+/// (error consumed): the failed request is dropped, the connection and all
+/// other windows keep running. Per-error details would need the real
+/// XErrorEvent struct; the opcode+serial log line covers diagnosis.
+fn x11ErrorHandler(dpy: ?*Display, err: ?*anyopaque) callconv(.c) c_int {
+    _ = dpy;
+    _ = err;
+    zlog.log("x11", "non-fatal X protocol error (request dropped)", .{});
+    return 0;
+}
+
 const XEvent = extern union {
     type: c_int,
     xany: XAnyEvent,
@@ -303,6 +323,7 @@ const X11Api = struct {
     XFreeCursor: *const fn (*Display, Cursor) callconv(.c) c_int,
     XResizeWindow: *const fn (*Display, Window, c_uint, c_uint) callconv(.c) c_int,
     XIconifyWindow: *const fn (*Display, Window, c_int) callconv(.c) c_int,
+    XSetErrorHandler: *const fn (XErrorHandler) callconv(.c) XErrorHandler,
 
     fn load(lib: dl.Library) ?X11Api {
         return .{
@@ -341,6 +362,7 @@ const X11Api = struct {
             .XFreeCursor = lib.lookup(*const fn (*Display, Cursor) callconv(.c) c_int, "XFreeCursor") orelse return null,
             .XResizeWindow = lib.lookup(*const fn (*Display, Window, c_uint, c_uint) callconv(.c) c_int, "XResizeWindow") orelse return null,
             .XIconifyWindow = lib.lookup(*const fn (*Display, Window, c_int) callconv(.c) c_int, "XIconifyWindow") orelse return null,
+            .XSetErrorHandler = lib.lookup(*const fn (XErrorHandler) callconv(.c) XErrorHandler, "XSetErrorHandler") orelse return null,
         };
     }
 };
@@ -352,6 +374,16 @@ pub const X11Backend = struct {
     display: *Display,
     screen: c_int,
     window: Window,
+    /// Connection role: primary window (App-level handle) or a secondary
+    /// window-scoped handle sharing this connection. `windows` holds the
+    /// secondary native windows keyed by connection slot.
+    window_id: u32 = 0,
+    parent: ?*X11Backend = null,
+    windows: [limits.MAX_WINDOWS]?*X11Backend = @splat(null),
+    /// The X server destroyed this window out from under us (an external
+    /// XDestroyWindow, e.g. `xdotool windowclose`). Skip XDestroyWindow on
+    /// teardown and stop presenting to the dead drawable.
+    destroyed_by_server: bool = false,
     gc: GC,
     wm_delete_window: Atom,
     wm_protocols: Atom = 0,
@@ -396,6 +428,8 @@ pub const X11Backend = struct {
     cursors: [3]Cursor = .{ 0, 0, 0 },
 
     const vtable: backend.VTable = .{
+        .createWindow = createWindowFn,
+        .destroyWindow = destroyWindowFn,
         .kind = kindFn,
         .poll = pollFn,
         .waitTimeoutNs = waitFn,
@@ -442,6 +476,11 @@ pub const X11Backend = struct {
         const dpy = api.XOpenDisplay(null) orelse return error.CannotOpenDisplay;
         errdefer _ = api.XCloseDisplay(dpy);
 
+        // Non-fatal protocol errors: Xlib's default handler exits the
+        // process, which with multiple windows means one window racing an
+        // external destroy kills them all.
+        _ = api.XSetErrorHandler(x11ErrorHandler);
+
         const screen = api.XDefaultScreen(dpy);
         const root = api.XRootWindow(dpy, screen);
         const win = api.XCreateSimpleWindow(dpy, root, 0, 0, width, height, 0, 0, 0);
@@ -481,6 +520,10 @@ pub const X11Backend = struct {
         errdefer allocator.free(pixels);
         @memset(pixels, 0);
 
+        // Set the App-supplied title on the first (primary) window, keeping
+        // the uniform window-options path: connection struct carries id 0.
+        _ = api.XStoreName(dpy, win, title);
+
         const self = try allocator.create(X11Backend);
         self.* = .{
             .allocator = allocator,
@@ -502,6 +545,7 @@ pub const X11Backend = struct {
             .image = null,
             .renderer = gpu.vellz.Renderer.init(allocator),
             .debug_events = getenv("ZUI_DEBUG_EVENTS") != null,
+            .window_id = 0,
             .atom_clipboard = atom_clipboard,
             .atom_utf8_string = atom_utf8,
             .atom_targets = atom_targets,
@@ -522,13 +566,24 @@ pub const X11Backend = struct {
     }
 
     pub fn deinit(self: *X11Backend) void {
+        // Window-scoped children own their X windows and framebuffers;
+        // destroy them before the connection goes away.
+        for (&self.windows) |*slot| {
+            if (slot.*) |child| {
+                slot.* = null;
+                child.teardownWindow();
+            }
+        }
         self.renderer.deinit();
         self.destroyImage();
         for (self.cursors) |c| {
             if (c != 0) _ = self.api.XFreeCursor(self.display, c);
         }
         self.allocator.free(self.pixels);
-        _ = self.api.XDestroyWindow(self.display, self.window);
+        // Primary window may also have been destroyed externally.
+        if (!self.destroyed_by_server) {
+            _ = self.api.XDestroyWindow(self.display, self.window);
+        }
         _ = self.api.XCloseDisplay(self.display);
         self.lib.close();
         self.allocator.destroy(self);
@@ -536,6 +591,153 @@ pub const X11Backend = struct {
 
     pub fn backendHandle(self: *X11Backend) backend.Backend {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Mint one more native window on this shared connection. The returned
+    /// Backend is window-scoped: it owns its own X window, framebuffer,
+    /// renderer, scale, focus, and input routing, but shares the display
+    /// connection, atoms, cursors and clipboard selection with the
+    /// primary. A null createWindow on other legacy backends keeps them
+    /// single-window; X11 gets the full multi-window path.
+    fn createWindowFn(ptr: *anyopaque, allocator: std.mem.Allocator, options: backend.WindowOptions) !backend.Backend {
+        _ = allocator; // children reuse the connection's allocator
+        const self: *X11Backend = @ptrCast(@alignCast(ptr));
+        if (self.parent != null) return error.NotAConnection; // only the primary mints windows
+        // First logical window adopts the init-created native window so the
+        // connection never orphans its primary surface.
+        if (self.window_id == 0) {
+            self.window_id = options.id;
+            const handle = self.backendHandle();
+            handle.setTitle(options.title);
+            handle.setDecorated(options.decorated);
+            if (options.width != @as(u32, @intFromFloat(self.size.w)) or options.height != @as(u32, @intFromFloat(self.size.h))) {
+                handle.setSize(options.width, options.height);
+                self.size.w = @floatFromInt(options.width);
+                self.size.h = @floatFromInt(options.height);
+                const new_sz = @as(usize, options.width) * @as(usize, options.height) * 4;
+                if (new_sz != self.pixels.len) {
+                    if (self.allocator.realloc(self.pixels, new_sz)) |new_buf| {
+                        self.pixels = new_buf;
+                        self.recreateImage();
+                    } else |_| {}
+                }
+            }
+            return handle;
+        }
+        var slot: ?usize = null;
+        for (&self.windows, 0..) |maybe, i| {
+            if (maybe == null) {
+                slot = i;
+                break;
+            }
+        }
+        const idx = slot orelse return error.TooManyWindows;
+        const child = try createWindowOnConnection(self, options);
+        self.windows[idx] = child;
+        return child.backendHandle();
+    }
+
+    /// Shared creation path used by init (first window) and createWindowFn.
+    /// Keeps window options (id/title/size/decorated) uniform for both.
+    fn createWindowOnConnection(connection: *X11Backend, options: backend.WindowOptions) !*X11Backend {
+        const api = connection.api;
+        const dpy = connection.display;
+        const win = api.XCreateSimpleWindow(dpy, connection.root, 0, 0, options.width, options.height, 0, 0, 0);
+        errdefer _ = api.XDestroyWindow(dpy, win);
+        // Latin-1 fallback title via stack buffer (titles are bounded by
+        // WindowOptions), then the UTF-8 _NET_WM_NAME property.
+        var zbuf: [256]u8 = undefined;
+        const zlen = @min(options.title.len, zbuf.len - 1);
+        @memcpy(zbuf[0..zlen], options.title[0..zlen]);
+        zbuf[zlen] = 0;
+        _ = api.XStoreName(dpy, win, @ptrCast(&zbuf));
+        _ = api.XChangeProperty(dpy, win, connection.atom_net_wm_name, connection.atom_utf8_string, 8, PROP_MODE_REPLACE, options.title.ptr, @intCast(options.title.len));
+        _ = api.XSetWMProtocols(dpy, win, &[2]Atom{ connection.wm_delete_window, connection.net_wm_ping }, 2);
+        const mask = ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | StructureNotifyMask | FocusChangeMask;
+        _ = api.XSelectInput(dpy, win, mask);
+        _ = api.XMapWindow(dpy, win);
+        _ = api.XFlush(dpy);
+        errdefer _ = api.XDestroyWindow(dpy, win);
+
+        const pixels = try connection.allocator.alloc(u8, @as(usize, options.width) * options.height * 4);
+        errdefer connection.allocator.free(pixels);
+        @memset(pixels, 0);
+
+        const child = try connection.allocator.create(X11Backend);
+        errdefer connection.allocator.destroy(child);
+        child.* = .{
+            .allocator = connection.allocator,
+            .lib = connection.lib,
+            .api = api,
+            .display = dpy,
+            .screen = connection.screen,
+            .window = win,
+            .gc = connection.gc,
+            .wm_delete_window = connection.wm_delete_window,
+            .wm_protocols = connection.wm_protocols,
+            .net_wm_ping = connection.net_wm_ping,
+            .size = .{ .w = @floatFromInt(options.width), .h = @floatFromInt(options.height) },
+            .scale_factor = connection.scale_factor,
+            .focused = false,
+            .presents = 0,
+            .wakeups = 0,
+            .pixels = pixels,
+            .image = null,
+            .renderer = gpu.vellz.Renderer.init(connection.allocator),
+            .debug_events = connection.debug_events,
+            .window_id = options.id,
+            .parent = connection,
+            .atom_clipboard = connection.atom_clipboard,
+            .atom_utf8_string = connection.atom_utf8_string,
+            .atom_targets = connection.atom_targets,
+            .atom_text = connection.atom_text,
+            .atom_net_wm_name = connection.atom_net_wm_name,
+            .atom_incr = connection.atom_incr,
+            .atom_motif_hints = connection.atom_motif_hints,
+            .atom_net_wm_state = connection.atom_net_wm_state,
+            .atom_net_wm_maximized_vert = connection.atom_net_wm_maximized_vert,
+            .atom_net_wm_maximized_horz = connection.atom_net_wm_maximized_horz,
+            .atom_net_wm_moveresize = connection.atom_net_wm_moveresize,
+            .root = connection.root,
+            .paste_prop = connection.paste_prop,
+        };
+        child.recreateImage();
+        return child;
+    }
+
+    /// Destroy a window-scoped handle. Never closes the shared connection.
+    fn destroyWindowFn(ptr: *anyopaque) void {
+        const self: *X11Backend = @ptrCast(@alignCast(ptr));
+        const parent = self.parent orelse {
+            // Adopted primary window: reap only the native window; the
+            // renderer, framebuffer and connection are released once in
+            // deinit (this handle IS the connection struct).
+            if (!self.destroyed_by_server) {
+                _ = self.api.XDestroyWindow(self.display, self.window);
+            }
+            self.destroyed_by_server = true;
+            return;
+        };
+        for (&parent.windows) |*slot| {
+            if (slot.* == self) {
+                slot.* = null;
+                break;
+            }
+        }
+        self.teardownWindow();
+    }
+
+    /// Release per-window resources but keep the shared connection alive.
+    fn teardownWindow(self: *X11Backend) void {
+        self.renderer.deinit();
+        self.destroyImage();
+        self.allocator.free(self.pixels);
+        // The server already destroyed this window (DestroyNotify): a
+        // second XDestroyWindow would raise an async BadWindow error.
+        if (!self.destroyed_by_server) {
+            _ = self.api.XDestroyWindow(self.display, self.window);
+        }
+        self.allocator.destroy(self);
     }
 
     fn destroyImage(self: *X11Backend) void {
@@ -589,8 +791,29 @@ pub const X11Backend = struct {
 
     /// Translate one server event. Shared by poll and the synchronous
     /// paste pump (which stashes raw events for replay instead).
+    /// Each event is tagged with its native window id (targeted envelope);
+    /// per-window state (size, focus, framebuffer) is updated on the
+    /// owning window-scoped handle before translation.
     fn translateOne(self: *@This(), ev: XEvent, out: *event.EventQueue) void {
+        // Route by native window: the translated event is pushed as a
+        // targeted envelope for its owning window handle. Foreign or
+        // already-destroyed native ids are dropped, never misrouted.
+        // Route by native window. ConfigureNotify (and friends with an
+        // `event` field) carry the destination in `window` at a different
+        // offset than XAnyEvent — read the union member matching the type.
+        const native: Window = switch (ev.type) {
+            ConfigureNotify => ev.xconfigure.window,
+            else => ev.xany.window,
+        };
+        const owner: *X11Backend = self.lookupWindow(native) orelse return;
         switch (ev.type) {
+            DestroyNotify => {
+                // Someone else destroyed our window. Mark the handle dead,
+                // skip our own XDestroyWindow in teardown, and surface a
+                // normal close to the app so it reaps the logical window.
+                owner.destroyed_by_server = true;
+                owner.pushTargeted(out, .{ .window = .close_requested });
+            },
             ClientMessage => {
                 const client = ev.xclient;
                 if (client.message_type == self.wm_protocols) {
@@ -607,36 +830,36 @@ pub const X11Backend = struct {
                         _ = self.api.XSendEvent(self.display, self.root, 0, mask, &rev);
                         _ = self.api.XFlush(self.display);
                     } else if (client.data.l[0] == @as(c_long, @bitCast(self.wm_delete_window))) {
-                        _ = out.push(.{ .window = .close_requested });
+                        owner.pushTargeted(out, .{ .window = .close_requested });
                     }
                 } else if (client.data.l[0] == @as(c_long, @bitCast(self.wm_delete_window))) {
-                    _ = out.push(.{ .window = .close_requested });
+                    owner.pushTargeted(out, .{ .window = .close_requested });
                 }
             },
             ConfigureNotify => {
                 const cfg = ev.xconfigure;
                 const w = @as(f32, @floatFromInt(cfg.width));
                 const h = @as(f32, @floatFromInt(cfg.height));
-                if (w != self.size.w or h != self.size.h) {
-                    self.size.w = w;
-                    self.size.h = h;
+                if (w != owner.size.w or h != owner.size.h) {
+                    owner.size.w = w;
+                    owner.size.h = h;
                     const new_sz = @as(usize, @intCast(cfg.width)) * @as(usize, @intCast(cfg.height)) * 4;
-                    if (new_sz != self.pixels.len) {
-                        if (self.allocator.realloc(self.pixels, new_sz)) |new_buf| {
-                            self.pixels = new_buf;
-                            self.recreateImage();
+                    if (new_sz != owner.pixels.len) {
+                        if (owner.allocator.realloc(owner.pixels, new_sz)) |new_buf| {
+                            owner.pixels = new_buf;
+                            owner.recreateImage();
                         } else |_| {}
                     }
-                    _ = out.push(.{ .window = .resized });
+                    owner.pushTargeted(out, .{ .window = .resized });
                 }
             },
             FocusIn => {
-                self.focused = true;
-                _ = out.push(.{ .window = .focused });
+                owner.focused = true;
+                owner.pushTargeted(out, .{ .window = .focused });
             },
             FocusOut => {
-                self.focused = false;
-                _ = out.push(.{ .window = .unfocused });
+                owner.focused = false;
+                owner.pushTargeted(out, .{ .window = .unfocused });
             },
             SelectionRequest => {
                 var req: XSelectionRequestEvent = undefined;
@@ -664,7 +887,7 @@ pub const X11Backend = struct {
                 // scrolling. Release halves of wheel pairs are silent.
                 if (wheelScroll(b.button)) |delta| {
                     if (ev.type == ButtonPress) {
-                        _ = out.push(.{ .scroll = .{
+                        owner.pushTargeted(out, .{ .scroll = .{
                             .pos = .{ .x = @floatFromInt(b.x), .y = @floatFromInt(b.y) },
                             .dx = delta.dx,
                             .dy = delta.dy,
@@ -752,6 +975,24 @@ pub const X11Backend = struct {
             },
             else => {},
         }
+    }
+
+    /// Map a native X window id to its owning backend handle, or null when
+    /// the id belongs to a foreign or already-destroyed window (those are
+    /// dropped instead of misrouted).
+    fn lookupWindow(self: *X11Backend, native: Window) ?*X11Backend {
+        if (native == self.window) return self;
+        for (self.windows) |maybe| {
+            if (maybe) |child| {
+                if (child.window == native) return child;
+            }
+        }
+        return null;
+    }
+
+    /// Push one translated event as a targeted envelope for this window.
+    fn pushTargeted(owner: *X11Backend, out: *event.EventQueue, ev: event.EventPayload) void {
+        _ = out.push(.{ .targeted = .{ .window_id = owner.window_id, .payload = ev } });
     }
 
     fn waitFn(ptr: *anyopaque, ns: u64) void {
@@ -1023,11 +1264,16 @@ pub const X11Backend = struct {
             return;
         };
 
+        if (self.destroyed_by_server) return;
         if (self.image) |img| {
             _ = self.api.XPutImage(self.display, self.window, self.gc, img, 0, 0, 0, 0, w, h);
             _ = self.api.XFlush(self.display);
         }
         self.presents += 1;
+        // Connection-level total: window-scoped presents aggregate upward
+        // (same policy as the null backend) so App diagnostics observe one
+        // counter.
+        if (self.parent) |parent| parent.presents += 1;
     }
 };
 
@@ -1074,4 +1320,143 @@ test "x11 selection protocol constants match X.h" {
     try std.testing.expectEqual(@as(Atom, 4), XA_ATOM);
     try std.testing.expectEqual(@as(Atom, 31), XA_STRING);
     try std.testing.expectEqual(@as(c_int, 0), PROP_MODE_REPLACE);
+}
+
+test "x11 multiwindow: two native windows with independent state and routing" {
+    if (!X11Backend.isAvailable()) return;
+    const t = std.testing;
+    var b = X11Backend.init(t.allocator, "ZUI X11 Multi", 240, 160) catch |err| switch (err) {
+        error.CannotOpenDisplay => return,
+        else => return err,
+    };
+    defer b.deinit();
+    const conn = b.backendHandle();
+
+    // The init-created window becomes the first logical window (adopted in
+    // place); the second createWindow mints a fresh native window on the
+    // shared connection.
+    const w1 = try conn.createWindow(t.allocator, .{ .id = 7, .title = "One", .width = 200, .height = 120, .decorated = true });
+    const w2 = try conn.createWindow(t.allocator, .{ .id = 9, .title = "Two", .width = 300, .height = 180, .decorated = false });
+
+    try t.expect(w1.ptr == conn.ptr); // primary window handle is the connection struct
+    try t.expect(w2.ptr != conn.ptr);
+    try t.expectEqual(backend.BackendKind.x11, w1.kind());
+    try t.expectEqual(backend.BackendKind.x11, w2.kind());
+    try t.expectEqual(@as(u32, 7), b.window_id);
+    try t.expectEqual(@as(u32, 9), b.windows[0].?.window_id);
+    try t.expect(b.windows[0].?.display == b.display);
+    try t.expectEqual(@as(f32, 200), w1.windowInfo().size.w);
+    try t.expectEqual(@as(f32, 300), w2.windowInfo().size.w);
+    try t.expectEqual(@as(f32, 120), w1.windowInfo().size.h);
+    try t.expectEqual(@as(f32, 180), w2.windowInfo().size.h);
+
+    // Per-window framebuffers: distinct pixel pools, independent presents.
+    var sc = gpu.Scene{};
+    _ = sc.push(.{ .x = 0, .y = 0, .w = 5, .h = 5, .color = gpu.vellz.Color.hex(0xFF0000) });
+    w1.present(&sc, &.{}, &.{});
+    try t.expectEqual(@as(u32, 1), b.presents);
+    try t.expectEqual(@as(u32, 0), b.windows[0].?.presents);
+    w2.present(&sc, &.{}, &.{});
+    try t.expectEqual(@as(u32, 2), b.presents);
+    try t.expectEqual(@as(u32, 1), b.windows[0].?.presents);
+
+    // Event routing by native window: a synthetic ConfigureNotify for w2
+    // emits exactly one targeted resize for window 9 and resizes only w2.
+    var q = event.EventQueue{};
+    var cfg = std.mem.zeroes(XEvent);
+    cfg.type = ConfigureNotify;
+    cfg.xconfigure.window = b.windows[0].?.window;
+    cfg.xconfigure.width = 333;
+    cfg.xconfigure.height = 222;
+    b.translateOne(cfg, &q);
+    try t.expectEqual(@as(usize, 1), q.len);
+    const routed = q.pop().?;
+    try t.expectEqual(@as(u32, 9), routed.targetWindowId().?);
+    try t.expectEqual(@as(f32, 333), w2.windowInfo().size.w);
+    try t.expectEqual(@as(f32, 200), w1.windowInfo().size.w);
+
+    // Destroying w2 leaves w1 fully alive and frees the slot.
+    w2.destroyWindow();
+    try t.expect(b.windows[0] == null);
+    try t.expectEqual(@as(f32, 200), w1.windowInfo().size.w);
+    // The id can be reused by a later createWindow.
+    const w3 = try conn.createWindow(t.allocator, .{ .id = 9, .title = "Again", .width = 100, .height = 90, .decorated = true });
+    try t.expect(b.windows[0] != null);
+    try t.expectEqual(@as(u32, 9), b.windows[0].?.window_id);
+    w3.destroyWindow();
+    try t.expect(b.windows[0] == null);
+}
+
+test "x11 repeated open/close cycles leave no ghost windows or leaks" {
+    if (!X11Backend.isAvailable()) return;
+    const t = std.testing;
+    var b = X11Backend.init(t.allocator, "ZUI X11 Cycle", 200, 150) catch |err| switch (err) {
+        error.CannotOpenDisplay => return,
+        else => return err,
+    };
+    defer b.deinit();
+    const conn = b.backendHandle();
+
+    // Cycle: adopt primary (id 1), mint a second (id 2), destroy the
+    // primary, mint a replacement on the same connection struct, destroy
+    // both. Each round-trip must free every native window it created.
+    const p1 = try conn.createWindow(t.allocator, .{ .id = 1, .title = "Cycle A", .width = 160, .height = 120, .decorated = true });
+    const c1 = try conn.createWindow(t.allocator, .{ .id = 2, .title = "Cycle B", .width = 120, .height = 90, .decorated = true });
+    try t.expect(b.windows[0] != null);
+    try t.expectEqual(@as(u32, 1), b.window_id); // primary adopted id 1
+
+    p1.destroyWindow(); // adopted primary: native window reaped in place
+    try t.expectEqual(@as(f32, 120), c1.windowInfo().size.w);
+
+    // The primary slot is spent after its first adoption: later windows are
+    // always fresh children (App renders each through its own handle, so
+    // the connection's own window fields are never presented again).
+    const p2 = try conn.createWindow(t.allocator, .{ .id = 3, .title = "Cycle C", .width = 100, .height = 80, .decorated = true });
+    try t.expect(p2.ptr != conn.ptr);
+    try t.expectEqual(@as(f32, 100), p2.windowInfo().size.w);
+    c1.destroyWindow();
+    p2.destroyWindow();
+    for (b.windows) |slot| try t.expect(slot == null);
+    try t.expect(b.destroyed_by_server); // adopted-primary destroy marked it
+}
+test "x11 external destroy surfaces close and skips native teardown" {
+    if (!X11Backend.isAvailable()) return;
+    const t = std.testing;
+    var b = X11Backend.init(t.allocator, "ZUI X11 Ext", 200, 150) catch |err| switch (err) {
+        error.CannotOpenDisplay => return,
+        else => return err,
+    };
+    defer b.deinit();
+    const conn = b.backendHandle();
+    // First createWindow adopts the primary init-created window.
+    const w2 = try conn.createWindow(t.allocator, .{ .id = 5, .title = "Victim", .width = 120, .height = 90, .decorated = true });
+    const victim: *X11Backend = @ptrCast(@alignCast(w2.ptr));
+    try t.expectEqual(@as(u32, 5), victim.window_id);
+
+    // Simulate the server destroying the window behind our back (external
+    // XDestroyWindow): DestroyNotify must (1) mark the handle dead, (2)
+    // emit a targeted close for the app, and (3) make present a no-op so
+    // no X_PutImage reaches the dead drawable.
+    var q = event.EventQueue{};
+    var dn = std.mem.zeroes(XEvent);
+    dn.type = DestroyNotify;
+    dn.xany.window = victim.window;
+    b.translateOne(dn, &q);
+    try t.expectEqual(@as(usize, 1), q.len);
+    const closed = q.pop().?;
+    try t.expectEqual(@as(u32, 5), closed.targetWindowId().?);
+    try t.expect(closed.untargeted() == .window and closed.untargeted().window == .close_requested);
+    try t.expect(victim.destroyed_by_server);
+    // Presenting to the dead drawable must be a silent no-op (no crash,
+    // no counter): the guard runs before any X request is queued.
+    var sc = gpu.Scene{};
+    _ = sc.push(.{ .x = 0, .y = 0, .w = 4, .h = 4, .color = gpu.vellz.Color.hex(0x00FF00) });
+    w2.present(&sc, &.{}, &.{});
+    try t.expectEqual(@as(u32, 0), victim.presents);
+
+    // Reaping through destroyWindow must NOT call XDestroyWindow again
+    // (would be an async BadWindow); the adopted primary handle survives
+    // (it is the connection struct itself) with the flag still set.
+    w2.destroyWindow();
+    try t.expect(victim.destroyed_by_server);
 }

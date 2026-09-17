@@ -11,6 +11,15 @@ pub const Progress = @import("controls.zig").Progress;
 pub const RadioGroup = @import("radio_group.zig").RadioGroup;
 pub const ScrollArea = @import("scroll_area.zig").ScrollArea;
 pub const VirtualList = @import("virtual_list.zig").VirtualList;
+pub const overlay = @import("overlay.zig");
+pub const Menu = @import("menu.zig").Menu;
+pub const ContextMenu = @import("menu.zig").ContextMenu;
+pub const Select = @import("menu.zig").Select;
+pub const ComboBox = @import("menu.zig").ComboBox;
+pub const Tooltip = @import("tooltip.zig").Tooltip;
+pub const Popover = @import("popover.zig").Popover;
+pub const Modal = @import("popover.zig").Modal;
+pub const Dialog = @import("popover.zig").Dialog;
 
 test {
     _ = @import("text_field.zig");
@@ -18,6 +27,7 @@ test {
     _ = focus;
     _ = theme;
     _ = @import("controls_test.zig");
+    _ = @import("overlay_test.zig");
     _ = @import("scroll_test.zig");
     _ = @import("scroll_model.zig");
 }

@@ -47,7 +47,19 @@ pub const ResizeEdge = enum(u32) {
     left = 7,
 };
 
+pub const WindowOptions = struct {
+    id: u32,
+    title: []const u8,
+    width: u32,
+    height: u32,
+    decorated: bool = true,
+};
+
 pub const VTable = struct {
+    /// Connection creates a window-scoped handle. Null means legacy single-window backend.
+    createWindow: ?*const fn (*anyopaque, @import("std").mem.Allocator, WindowOptions) anyerror!Backend = null,
+    /// Only called on a successfully created window-scoped handle, at a safe reap point.
+    destroyWindow: ?*const fn (*anyopaque) void = null,
     kind: *const fn (*anyopaque) BackendKind,
     poll: *const fn (*anyopaque, *event.EventQueue) void,
     waitTimeoutNs: *const fn (*anyopaque, u64) void,
@@ -91,6 +103,15 @@ pub const VTable = struct {
 pub const Backend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+
+    pub fn createWindow(self: Backend, allocator: @import("std").mem.Allocator, options: WindowOptions) !Backend {
+        const create = self.vtable.createWindow orelse return error.MultipleNativeWindowsNotSupported;
+        return create(self.ptr, allocator, options);
+    }
+
+    pub fn destroyWindow(self: Backend) void {
+        if (self.vtable.destroyWindow) |destroy| destroy(self.ptr);
+    }
 
     pub fn kind(self: @This()) BackendKind {
         return self.vtable.kind(self.ptr);

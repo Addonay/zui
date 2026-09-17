@@ -181,15 +181,49 @@ pub const WindowEvent = enum {
     resized,
     focused,
     unfocused,
+    scale_changed,
 };
 
-pub const Event = union(enum) {
+pub const EventPayload = union(enum) {
     mouse: MouseEvent,
     key: KeyEvent,
     text: TextEvent,
     composition: CompositionEvent,
     scroll: ScrollEvent,
     window: WindowEvent,
+};
+
+pub const Event = union(enum) {
+    /// Explicit destination. Untargeted legacy events are accepted by App only
+    /// when exactly one live window exists; they are never broadcast.
+    targeted: struct { window_id: u32, payload: EventPayload },
+    mouse: MouseEvent,
+    key: KeyEvent,
+    text: TextEvent,
+    composition: CompositionEvent,
+    scroll: ScrollEvent,
+    window: WindowEvent,
+
+    pub fn forWindow(self: Event, window_id: u32) Event {
+        return switch (self) {
+            .targeted => |envelope| .{ .targeted = .{ .window_id = window_id, .payload = envelope.payload } },
+            inline else => |payload, tag| .{ .targeted = .{ .window_id = window_id, .payload = @unionInit(EventPayload, @tagName(tag), payload) } },
+        };
+    }
+
+    pub fn untargeted(self: Event) Event {
+        return switch (self) {
+            .targeted => |envelope| switch (envelope.payload) {
+                inline else => |payload, tag| @unionInit(Event, @tagName(tag), payload),
+            },
+            else => self,
+        };
+    }
+
+    /// Destination for routing: null for legacy untargeted events.
+    pub fn targetWindowId(self: Event) ?u32 {
+        return if (self == .targeted) self.targeted.window_id else null;
+    }
 };
 
 /// Fixed ring queue with an explicit overflow policy (gap §3).
@@ -227,6 +261,7 @@ pub const EventQueue = struct {
     /// Events that must not disappear: releases, commits, close, focus loss.
     pub fn isCritical(ev: Event) bool {
         return switch (ev) {
+            .targeted => isCritical(ev.untargeted()),
             .key => |k| !k.pressed,
             .mouse => |m| !m.motion and !m.pressed,
             .text => true,
@@ -237,7 +272,7 @@ pub const EventQueue = struct {
             .scroll => false,
             .window => |w| switch (w) {
                 .close_requested, .unfocused => true,
-                .resized, .focused => false,
+                .resized, .focused, .scale_changed => false,
             },
         };
     }
@@ -246,6 +281,7 @@ pub const EventQueue = struct {
     /// wins; no closure/commit semantics are lost by replacing a peer.
     pub fn isCoalescable(ev: Event) bool {
         return switch (ev) {
+            .targeted => isCoalescable(ev.untargeted()),
             .mouse => |m| m.motion,
             .window => |w| w == .resized,
             else => false,
@@ -253,6 +289,12 @@ pub const EventQueue = struct {
     }
 
     fn sameCoalesceKind(a: Event, b: Event) bool {
+        // Never replace another window's latest state under queue pressure.
+        if (a == .targeted or b == .targeted) {
+            if (a != .targeted or b != .targeted) return false;
+            if (a.targeted.window_id != b.targeted.window_id) return false;
+            return sameCoalesceKind(a.untargeted(), b.untargeted());
+        }
         return switch (a) {
             .mouse => |m| m.motion and switch (b) {
                 .mouse => |n| n.motion,

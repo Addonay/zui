@@ -112,6 +112,11 @@ pub const Window = struct {
     last_scroll: platform.event.ScrollEvent = .{ .pos = .{ .x = 0, .y = 0 } },
     /// Opt-in wheel remainder. Legacy listeners consume the entire event.
     scroll_chain_requested: bool = false,
+    /// Native focus is separate from retained element focus.
+    native_focused: bool = true,
+    scale_factor: f32 = 1,
+    native_backend: ?platform.Backend = null,
+    owns_native_window: bool = false,
     focused: elements.FocusHandle = .{},
     /// Optional borrowed focus scope; host owns its ids until popScope.
     focus_scope: ?@import("../widgets/focus.zig").Scope = null,
@@ -365,6 +370,11 @@ pub const Window = struct {
     /// (which normally clears them) must not leak them.
     pub fn deinit(self: *Window) void {
         self.ui_frame.clearCozmicLayouts();
+        if (self.owns_native_window) {
+            self.native_backend.?.destroyWindow();
+            self.native_backend = null;
+            self.owns_native_window = false;
+        }
     }
 
     pub fn isClosed(self: *const Window) bool {
@@ -531,6 +541,10 @@ pub const Window = struct {
 
     pub fn handleEvent(self: *Window, event: platform.Event) void {
         if (self.closed) return;
+        if (event == .targeted) {
+            if (event.targeted.window_id == self.id) self.handleEvent(event.untargeted());
+            return;
+        }
         if (event == .mouse) {
             for (self.ui_frame.observers[0..self.ui_frame.observer_count]) |observer| _ = observer.dispatch(event, self);
         }
@@ -651,7 +665,20 @@ pub const Window = struct {
                 }
                 self.requestRender();
             },
-            .window => {},
+            .targeted => unreachable,
+            .window => |wev| switch (wev) {
+                .unfocused => {
+                    self.native_focused = false;
+                    self.captured_mouse_region = null;
+                    self.left_button_down = false;
+                    self.keymap.pending_first = null;
+                    self.keymap.pending_single = null;
+                    self.keymap.pending_deadline_ms = null;
+                    self.requestRender();
+                },
+                .focused => { self.native_focused = true; self.requestRender(); },
+                else => {},
+            },
         }
     }
 
@@ -820,8 +847,9 @@ test "window os hooks push title cursor and clipboard" {
         }
     }.draw);
 
-    // openWindow pushed the title straight to the backend.
-    const nb = app.getNullBackend().?;
+    // openWindow pushed the title straight to the window-scoped backend;
+    // the connection-level root stays empty for multi-window isolation.
+    const nb = app.getNullBackend().?.windows[0].?;
     try std.testing.expectEqualStrings("Hooked", nb.title_buf[0..nb.title_len]);
     win.setTitle("Renamed");
     try std.testing.expectEqualStrings("Renamed", nb.title_buf[0..nb.title_len]);
@@ -849,8 +877,7 @@ test "hover cursor follows topmost region opinion" {
             _ = sc;
         }
     }.draw);
-    const nb = app.getNullBackend().?;
-
+    const nb = app.getNullBackend().?.windows[0].?;
     win.ui_frame.region_count = 2;
     win.ui_frame.regions[0] = .{ .bounds = .{ .x = 0, .y = 0, .w = 100, .h = 100 } };
     win.ui_frame.regions[1] = .{ .bounds = .{ .x = 10, .y = 10, .w = 20, .h = 20 }, .cursor = .pointer };
