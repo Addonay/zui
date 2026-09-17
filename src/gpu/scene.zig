@@ -275,6 +275,14 @@ pub const Glyph = struct {
     color: color.Color,
     /// Byte offset into the atlas pixel pool.
     atlas_offset: u32,
+    /// Raster density of the mask this entry references: 1 for the
+    /// painter's logical 1x atlas, `window.scale_factor` after
+    /// `Engine.scaleScene` re-rasterized it for a high-DPI present. The
+    /// rasterizer divides target scale by this per glyph, so a mask that
+    /// failed to upgrade stretches instead of leaving a hole, and an
+    /// upgraded mask is never scaled twice. Scene x/y stay LOGICAL either
+    /// way; only mask bytes/placement carry density.
+    density: f32 = 1,
     /// Painter clip at emission; the blit honors it per pixel.
     clip: geometry.Rect,
 };

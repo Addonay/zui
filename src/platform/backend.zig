@@ -9,6 +9,7 @@
 const geometry = @import("../core/geometry.zig");
 const event = @import("event.zig");
 const gpu = @import("../gpu/root.zig");
+const std = @import("std");
 
 pub const BackendKind = enum {
     null,
@@ -24,6 +25,23 @@ pub const WindowInfo = struct {
     scale_factor: f32 = 1,
     focused: bool = true,
 };
+
+/// §5G scale acquisition shared by native backends: `ZUI_SCALE` (fractional,
+/// e.g. 1.5) wins, then the desktop convention `GDK_SCALE` (integer), then
+/// 1.0. Clamped to a sane range so a bad env value cannot explode buffers.
+/// Compositor/OS-reported per-monitor scale (Wayland fractional-scale-v1,
+/// RandR) is layered on top by the backend that can observe it.
+pub fn envScaleFactor() f32 {
+    if (std.c.getenv("ZUI_SCALE")) |raw| {
+        const v = std.fmt.parseFloat(f32, std.mem.span(raw)) catch 0;
+        if (v >= 0.5 and v <= 8.0) return v;
+    }
+    if (std.c.getenv("GDK_SCALE")) |raw| {
+        const v = std.fmt.parseInt(u32, std.mem.span(raw), 10) catch 0;
+        if (v >= 1 and v <= 8) return @floatFromInt(v);
+    }
+    return 1.0;
+}
 
 /// Native pointer shapes. Every backend implements all three; where the
 /// compositor owns the cursor (Wayland) the backend resolves the shape

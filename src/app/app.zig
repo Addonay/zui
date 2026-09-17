@@ -177,13 +177,27 @@ pub const App = struct {
         return win.native_backend.?;
     }
 
-    fn osSetTitle(raw: *anyopaque, title: []const u8) void { osBackend(raw).setTitle(title); }
-    fn osSetCursor(raw: *anyopaque, shape: platform.CursorShape) void { osBackend(raw).setCursor(shape); }
-    fn osGetClipboard(raw: *anyopaque, out: []u8) usize { return osBackend(raw).clipboardText(out); }
-    fn osSetClipboard(raw: *anyopaque, text: []const u8) bool { return osBackend(raw).setClipboardText(text); }
-    fn osDragWindow(raw: *anyopaque) void { osBackend(raw).dragWindow(); }
-    fn osMinimizeWindow(raw: *anyopaque) void { osBackend(raw).minimizeWindow(); }
-    fn osToggleMaximizeWindow(raw: *anyopaque) void { osBackend(raw).toggleMaximizeWindow(); }
+    fn osSetTitle(raw: *anyopaque, title: []const u8) void {
+        osBackend(raw).setTitle(title);
+    }
+    fn osSetCursor(raw: *anyopaque, shape: platform.CursorShape) void {
+        osBackend(raw).setCursor(shape);
+    }
+    fn osGetClipboard(raw: *anyopaque, out: []u8) usize {
+        return osBackend(raw).clipboardText(out);
+    }
+    fn osSetClipboard(raw: *anyopaque, text: []const u8) bool {
+        return osBackend(raw).setClipboardText(text);
+    }
+    fn osDragWindow(raw: *anyopaque) void {
+        osBackend(raw).dragWindow();
+    }
+    fn osMinimizeWindow(raw: *anyopaque) void {
+        osBackend(raw).minimizeWindow();
+    }
+    fn osToggleMaximizeWindow(raw: *anyopaque) void {
+        osBackend(raw).toggleMaximizeWindow();
+    }
 
     pub fn activate(self: *App, ignoring_other_apps: bool) void {
         _ = ignoring_other_apps;
@@ -223,8 +237,10 @@ pub const App = struct {
         if (bounds.size.w <= 0 or bounds.size.h <= 0 or !std.math.isFinite(bounds.size.w) or !std.math.isFinite(bounds.size.h) or bounds.size.w > 32768 or bounds.size.h > 32768) return error.InvalidWindowSize;
         const owns_native = self.backend.vtable.createWindow != null;
         const native = if (owns_native) try self.backend.createWindow(self.allocator, .{
-            .id = self.next_window_id, .title = options.title,
-            .width = @intFromFloat(bounds.size.w), .height = @intFromFloat(bounds.size.h),
+            .id = self.next_window_id,
+            .title = options.title,
+            .width = @intFromFloat(bounds.size.w),
+            .height = @intFromFloat(bounds.size.h),
             .decorated = options.chrome == .system,
         }) else self.backend;
         errdefer if (owns_native) native.destroyWindow();
@@ -360,7 +376,9 @@ pub const App = struct {
         for (self.windows) |maybe_win| {
             const win = maybe_win orelse continue;
             if (win.closed) continue;
-            if (destination) |id| { if (win.id != id) continue; }
+            if (destination) |id| {
+                if (win.id != id) continue;
+            }
             const payload = ev.untargeted();
             switch (payload) {
                 .window => |wev| switch (wev) {
@@ -479,6 +497,17 @@ pub const App = struct {
                         // log scan finds every rejection in one place.
                         self.rejected_frames += 1;
                         zlog.log("app", "step {d}: window {d} frame rejected for overflow ({d} dropped); presented placeholder", .{ self.step_count, win.id, win.scene.dropped_frame });
+                    }
+                    // §5G stage 2: upgrade the painter's 1x glyph masks to
+                    // the window's density right before present. Paint and
+                    // present are adjacent, so the scaled masks (which live
+                    // in Engine.scaled_glyphs) cannot be evicted mid-frame;
+                    // the next window's render resets it first. Backend
+                    // renderers read scene glyph density per glyph.
+                    if (win.cozmic_engine_fn) |provide| {
+                        if (provide(win.cozmic_engine_ctx orelse win)) |engine| {
+                            engine.scaleScene(&win.scene, win.scale_factor);
+                        }
                     }
                     win.native_backend.?.present(&win.scene, self.glyphPixels(), self.imagePixels());
                     presented += 1;
@@ -1149,6 +1178,144 @@ test "app owns no font stack; the engine owns the atlas" {
     // upload until the first render installs it.
     try std.testing.expect(app.cozmic_engine == null);
     try std.testing.expectEqual(@as(usize, 0), app.glyphPixels().len);
+}
+
+test "window at scale renders physical-density text and quads end to end" {
+    // §5G stage 2 acceptance: through the REAL App.step wiring (render ->
+    // scaleScene -> present), a 2x window (a) upgrades glyph masks to
+    // per-glyph density 2 with sharp 2x raster sizes and (b) rasterizes a
+    // logical 20x10 rect to 40x20 physical pixels.
+    const t = std.testing;
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+    const DrawState = struct {
+        count: u32 = 0,
+        seed: @import("../gpu/scene.zig").Glyph,
+        fn draw(ctx: ?*anyopaque, w: *Window, sc: *gpu.Scene) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.count += 1;
+            _ = w;
+            // Production order: the painter pushes after Window.render
+            // clears; the callback runs at exactly that point.
+            _ = sc.push(.{ .x = 5, .y = 5, .w = 20, .h = 10, .color = color.Color.white });
+            _ = sc.pushGlyph(self.seed);
+        }
+    };
+    var draw_state = DrawState{ .seed = undefined };
+    const win = try app.openWindow(.{ .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 200, .h = 100 } } }, Renderer{ .ptr = &draw_state, .render_fn = DrawState.draw });
+    const nb = app.getNullBackend().?;
+
+    // Real corpus engine; font-independent (only mask sizes are asserted).
+    // App owns it: app.deinit() frees it, so no local deinit here.
+    const engine = text_engine.Engine.init(t.allocator) catch |err| switch (err) {
+        error.ShaperUnavailable, error.LibraryUnavailable, error.NoFontsAvailable, error.FontCorpusIncomplete => return error.SkipZigTest,
+        else => return err,
+    };
+    app.cozmic_engine = engine;
+    app.cozmic_engine_attempted = true;
+
+    // Seed one real painter-style 1x glyph (1x mask, logical origin) so
+    // scaleScene has something to upgrade. The atlas entry persists in
+    // engine.glyphs; the scene copy is pushed per frame by the draw
+    // callback AFTER Window.render clears, exactly where production paint
+    // runs.
+    const layout = try engine.layout(t.allocator, "H", .{ .size = 16, .line_height = 20 }, null);
+    var l = layout;
+    defer l.deinit();
+    var runs_iter = l.runs();
+    var seeded: usize = 0;
+    while (runs_iter.next()) |run| {
+        for (run.glyphs) |glyph| {
+            const physical = glyph.physical(0, 0, 1.0);
+            const image = engine.cache.getImage(physical.cache_key) catch null orelse continue;
+            if (image.content != .mask) continue;
+            const entry = engine.glyphs.putBitmap(.{ .face_id = physical.cache_key.font_id, .glyph_id = physical.cache_key.glyph_id, .size_px = text_engine.sizeToPx(16), .x_bin = physical.cache_key.x_bin, .y_bin = physical.cache_key.y_bin, .font_weight = physical.cache_key.font_weight, .flags = physical.cache_key.flags }, image.placement.width, image.placement.height, image.placement.width, image.data.ptr, image.placement.left, image.placement.top, .mask, false) catch continue;
+            // Painter placement convention (GlyphSink.glyph): the mask box
+            // origin includes the bearing, y measured down from the baseline.
+            draw_state.seed = .{ .x = 10 + @as(f32, @floatFromInt(entry.bearing_x)), .y = 20 - @as(f32, @floatFromInt(entry.bearing_y)), .w = entry.width, .h = entry.height, .color = color.Color.white, .atlas_offset = entry.offset, .clip = .{ .x = 0, .y = 0, .w = 200, .h = 100 } };
+            seeded += 1;
+            break;
+        }
+        if (seeded > 0) break;
+    }
+    try t.expect(seeded > 0);
+
+    // Move the window to a 2x monitor before the frame.
+    nb.windows[0].?.scale_factor = 2;
+    win.scale_factor = 2;
+
+    // App.step does the wiring: render() -> scaleScene() -> present() with
+    // the renderer scale set. The present is a stub on null, so rasterize
+    // the same post-scaleScene scene through vellz for pixel evidence.
+    try t.expect(app.step());
+    try t.expectEqual(@as(u32, 1), draw_state.count);
+    const g = win.scene.glyphSlice()[0];
+    try t.expectEqual(@as(f32, 2), g.density);
+    // Re-rasterized at 32px, not stretched: hinted ink differs from 2x the
+    // 16px mask (FreeType hinting is nonlinear: observed 11x12 -> 18x24).
+    try t.expect(g.w > draw_state.seed.w and g.h > draw_state.seed.h);
+    try t.expect(g.atlas_offset != draw_state.seed.atlas_offset); // new pool entry
+    // Logical geometry untouched: the quad stays at its logical x (5, not
+    // 10 physical) and the glyph pen position is preserved. The mask BOX
+    // origin may shift sub-pixel when the higher-density raster has a
+    // different bearing (scaleScene keeps ink aligned by pen position:
+    // g.x += new_bearing/scale - old_bearing, always < 1 logical px).
+    try t.expectEqual(@as(f32, 5), win.scene.slice()[0].x);
+    try t.expectApproxEqAbs(draw_state.seed.x, g.x, 1.0);
+
+    var pixels: [400 * 200 * 4]u8 = undefined;
+    var renderer = gpu.vellz.Renderer.init(t.allocator);
+    defer renderer.deinit();
+    renderer.scale_factor = 2;
+    try renderer.render(&pixels, 400, 200, .rgba32, color.Color.black, &win.scene, engine.glyphs.pixels[0..engine.glyphs.pixels_used], &.{});
+    // Physical ink at the scaled rect: 40x20 == 800 px, all opaque.
+    // The upgraded glyph mask (physical box at 2x over density 2) is also
+    // in the scene; pixels inside its physical box are skipped rather than
+    // asserted so this test pins the QUAD mapping without coupling to the
+    // glyph's hinted ink coverage.
+    var ink: usize = 0;
+    var stray_count: usize = 0;
+    var stray: ?struct { x0: usize, y0: usize, x1: usize, y1: usize } = null;
+    const gx0: i32 = @intFromFloat(@round(g.x * 2));
+    const gy0: i32 = @intFromFloat(@round(g.y * 2));
+    const gx1: i32 = gx0 + @as(i32, @intCast(g.w));
+    const gy1: i32 = gy0 + @as(i32, @intCast(g.h));
+    for (0..200) |y| {
+        for (0..400) |x| {
+            const xi: i32 = @intCast(x);
+            const yi: i32 = @intCast(y);
+            const in_glyph = xi >= gx0 and xi < gx1 and yi >= gy0 and yi < gy1;
+            if (x >= 10 and x < 50 and y >= 10 and y < 30) {
+                try t.expectEqual(@as(u8, 255), pixels[(y * 400 + x) * 4]);
+                ink += 1;
+            } else if (!in_glyph) {
+                if (pixels[(y * 400 + x) * 4] != 0) {
+                    if (stray == null) stray = .{ .x0 = x, .y0 = y, .x1 = x, .y1 = y };
+                    const s = &stray.?;
+                    s.x0 = @min(s.x0, x);
+                    s.y0 = @min(s.y0, y);
+                    s.x1 = @max(s.x1, x);
+                    s.y1 = @max(s.y1, y);
+                    stray_count += 1;
+                }
+            }
+        }
+    }
+    if (stray) |s| {
+        std.debug.print("stray ink: {d} px in box ({d},{d})-({d},{d}); quad=(10,10)-(30,20) glyph=({d},{d})-({d},{d})\n", .{ stray_count, s.x0, s.y0, s.x1, s.y1, gx0, gy0, gx1, gy1 });
+        for (s.y0..s.y1 + 1) |yy| {
+            if (yy >= 200) break;
+            var xx = s.x0;
+            while (xx <= s.x1 and xx < 400) : (xx += 1) {
+                std.debug.print("({d},{d})={d} ", .{ xx, yy, pixels[(yy * 400 + xx) * 4] });
+            }
+            std.debug.print("\n", .{});
+        }
+    }
+    try t.expectEqual(@as(usize, 0), stray_count);
+    // (loop body end)
+    try t.expectEqual(@as(usize, 40 * 20), ink);
+    std.debug.print("dpi end-to-end: rect 20x10 logical -> physical (10,10)-(50,30) at 2x; glyph density={d}\n", .{g.density});
 }
 
 test "cozmic engine wiring installs the App-owned engine" {

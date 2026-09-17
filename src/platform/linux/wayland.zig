@@ -119,6 +119,11 @@ const DecorationListener = extern struct {
     configure: ?*const fn (?*anyopaque, *Decoration, u32) callconv(.c) void = null,
 };
 
+/// §5G DPI: fractional-scale-v1 preferred_scale. Wire value is scale*120.
+const FractionalScaleListener = extern struct {
+    preferred_scale: ?*const fn (?*anyopaque, *anyopaque, u32) callconv(.c) void = null,
+};
+
 const DECOR_MODE_CLIENT_SIDE: u32 = 1;
 const DECOR_MODE_SERVER_SIDE: u32 = 2;
 
@@ -373,6 +378,64 @@ const decoration_manager_interface: Interface = .{
     .events = null,
 };
 
+// §5G DPI: viewporter + fractional-scale-v1. With fractional scale the
+// compositor scales the PHYSICAL buffer down to the logical destination
+// rect, so the app rasterizes sharp at any fractional density.
+const viewport_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "set_source", .signature = "fffff", .types = null },
+    .{ .name = "set_destination", .signature = "iiii", .types = null },
+};
+const viewport_interface: Interface = .{
+    .name = "wp_viewport",
+    .version = 1,
+    .method_count = 3,
+    .methods = @ptrCast(&viewport_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+const viewporter_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "get_viewporter", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&viewport_interface), null } },
+};
+const viewporter_interface: Interface = .{
+    .name = "wp_viewporter",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&viewporter_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+const fractional_scale_events = [_]Message{
+    .{ .name = "preferred_scale", .signature = "u", .types = null },
+};
+const fractional_scale_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+};
+const fractional_scale_interface: Interface = .{
+    .name = "wp_fractional_scale_v1",
+    .version = 1,
+    .method_count = 1,
+    .methods = @ptrCast(&fractional_scale_methods),
+    .event_count = 1,
+    .events = @ptrCast(&fractional_scale_events),
+};
+
+const fractional_scale_manager_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "get_fractional_scale", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&fractional_scale_interface), null } },
+};
+const fractional_scale_manager_interface: Interface = .{
+    .name = "wp_fractional_scale_manager_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&fractional_scale_manager_methods),
+    .event_count = 0,
+    .events = null,
+};
+
 const xdg_wm_base_events = [_]Message{
     .{ .name = "ping", .signature = "u", .types = null },
 };
@@ -580,6 +643,16 @@ pub const WaylandBackend = struct {
     decorated: bool = true,
     deco_mode: u32 = 0, // last configure mode; 0 = unknown yet
     maximized: bool = false,
+    // §5G DPI. `viewporter_manager`/`frac_manager` are connection globals;
+    // `viewport`/`frac_scale` are per-window surface objects. With
+    // fractional scale active the compositor maps the PHYSICAL buffer onto
+    // the logical destination rect reported per present.
+    viewporter_manager: ?*anyopaque = null,
+    frac_manager: ?*anyopaque = null,
+    viewport: ?*anyopaque = null,
+    frac_scale: ?*anyopaque = null,
+    /// Fractional-scale-v1 negotiated for this window (preferred_scale seen).
+    fractional: bool = false,
 
     const vtable: backend.VTable = .{
         .createWindow = createWindowFn,
@@ -692,6 +765,10 @@ pub const WaylandBackend = struct {
         }
 
         try self.createSurface(std.mem.span(title), width, height);
+        // §5G DPI: env acquires the initial scale; the compositor's
+        // fractional-scale-v1 preferred_scale is authoritative once it
+        // arrives (see fractionalPreferredScale).
+        self.scale_factor = backend.envScaleFactor();
         if (api.wl_display_roundtrip(dpy) < 0) return error.WaylandDisconnected;
         return self;
     }
@@ -747,6 +824,21 @@ pub const WaylandBackend = struct {
             }
         }
 
+        // §5G DPI: per-surface fractional-scale objects. The compositor
+        // answers with preferred_scale (wire units are scale * 120); the
+        // handler updates this window's scale and emits scale_changed.
+        if (self.frac_manager != null and self.viewporter_manager != null) {
+            // get_viewporter (opcode 1) mints a wp_viewport object: the
+            // interface arg is the CREATED object's interface.
+            const vp = api.wl_proxy_marshal_flags(@ptrCast(self.viewporter_manager.?), 1, &viewport_interface, 1, 0, @as(?*anyopaque, null), @as(*anyopaque, @ptrCast(self.surface.?)));
+            self.viewport = @ptrCast(vp);
+            const fs = api.wl_proxy_marshal_flags(@ptrCast(self.frac_manager.?), 1, &fractional_scale_interface, 1, 0, @as(?*anyopaque, null), @as(*anyopaque, @ptrCast(self.surface.?)));
+            if (fs) |f| {
+                self.frac_scale = @ptrCast(f);
+                _ = api.wl_proxy_add_listener(@ptrCast(f), &default_frac_listener, self);
+            }
+        }
+
         // Allocate initial shm buffer
         try self.recreateBuffer(width, height);
 
@@ -788,12 +880,20 @@ pub const WaylandBackend = struct {
         const idx = free_slot orelse return error.TooManyWindows;
         const child = try self.allocator.create(WaylandBackend);
         child.* = .{
-            .allocator = self.allocator, .lib = self.lib, .api = self.api,
-            .display = self.display, .registry = self.registry,
-            .compositor = self.compositor, .shm = self.shm, .wm_base = self.wm_base,
-            .dec_manager = self.dec_manager, .parent = self, .window_id = options.id,
+            .allocator = self.allocator,
+            .lib = self.lib,
+            .api = self.api,
+            .display = self.display,
+            .registry = self.registry,
+            .compositor = self.compositor,
+            .shm = self.shm,
+            .wm_base = self.wm_base,
+            .dec_manager = self.dec_manager,
+            .parent = self,
+            .window_id = options.id,
             .size = .{ .w = @floatFromInt(options.width), .h = @floatFromInt(options.height) },
-            .focused = false, .decorated = options.decorated,
+            .focused = false,
+            .decorated = options.decorated,
             .renderer = gpu.vellz.Renderer.init(self.allocator),
         };
         errdefer {
@@ -927,6 +1027,16 @@ pub const WaylandBackend = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    /// §5G DPI: PHYSICAL framebuffer dimensions for the current logical
+    /// size and scale. Buffers, raster target and attach are physical;
+    /// `size`, `windowInfo().size` and input surface coords stay logical.
+    pub fn physW(self: *const WaylandBackend) u32 {
+        return @intFromFloat(@max(1, @round(self.size.w * self.scale_factor)));
+    }
+    pub fn physH(self: *const WaylandBackend) u32 {
+        return @intFromFloat(@max(1, @round(self.size.h * self.scale_factor)));
+    }
+
     /// (Re)declare the whole surface opaque. wl_compositor.create_region
     /// is opcode 1, wl_region.add is opcode 1, wl_surface.set_opaque_region
     /// is opcode 4. Takes effect on the next commit.
@@ -1021,8 +1131,9 @@ pub const WaylandBackend = struct {
         for (&self.bufs) |*e| {
             if (e.buf == buf) {
                 e.busy = false;
-                const cw: u32 = @intFromFloat(self.size.w);
-                const ch: u32 = @intFromFloat(self.size.h);
+                // §5G DPI: buffers are PHYSICAL-sized.
+                const cw: u32 = self.physW();
+                const ch: u32 = self.physH();
                 if (e.w != cw or e.h != ch) {
                     zlog.log("wayland", "release: dropping stale {d}x{d} buffer", .{ e.w, e.h });
                     self.destroyEntry(e);
@@ -1066,6 +1177,15 @@ pub const WaylandBackend = struct {
             const one: u32 = 1;
             const dm = self.api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &decoration_manager_interface, one, 0, name, decoration_manager_interface.name, one, &decoration_manager_interface);
             self.dec_manager = @ptrCast(dm);
+        } else if (std.mem.eql(u8, iface_name, "wp_viewporter")) {
+            // §5G DPI: per-surface logical-destination scaling.
+            const one: u32 = 1;
+            const vp = self.api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &viewporter_interface, one, 0, name, viewporter_interface.name, one, &viewporter_interface);
+            self.viewporter_manager = @ptrCast(vp);
+        } else if (std.mem.eql(u8, iface_name, "wp_fractional_scale_manager_v1")) {
+            const one: u32 = 1;
+            const fm = self.api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &fractional_scale_manager_interface, one, 0, name, fractional_scale_manager_interface.name, one, &fractional_scale_manager_interface);
+            self.frac_manager = @ptrCast(fm);
         }
     }
 
@@ -1125,6 +1245,12 @@ pub const WaylandBackend = struct {
         _ = q.push(if (self.window_id == 0) ev else ev.forWindow(self.window_id));
     }
 
+    /// §5G DPI: targeted window-state event (scale_changed) from a
+    /// compositor callback outside the normal input path.
+    fn pushTargeted(self: *WaylandBackend, out: *event.EventQueue, payload: event.EventPayload) void {
+        _ = out.push(.{ .targeted = .{ .window_id = self.window_id, .payload = payload } });
+    }
+
     fn clearAxes(self: *WaylandBackend) void {
         self.axis_v = 0;
         self.axis_h = 0;
@@ -1151,8 +1277,10 @@ pub const WaylandBackend = struct {
         self.last_serial = serial;
         self.pointer_enter_serial = serial;
         owner.last_serial = serial;
-        self.pointer_x = wlFixedToFloat(sx);
-        self.pointer_y = wlFixedToFloat(sy);
+        // §5G DPI: surface coords are LOGICAL; the App contract takes
+        // PHYSICAL pixels (window divides by scale before dispatch).
+        self.pointer_x = wlFixedToFloat(sx) * owner.scale_factor;
+        self.pointer_y = wlFixedToFloat(sy) * owner.scale_factor;
         self.applyCursor();
         owner.pushInputEvent(.{ .mouse = .{
             .pos = .{ .x = self.pointer_x, .y = self.pointer_y },
@@ -1175,8 +1303,10 @@ pub const WaylandBackend = struct {
     fn pointerMotion(data: ?*anyopaque, _: *Pointer, time: u32, sx: i32, sy: i32) callconv(.c) void {
         const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
         const owner = self.pointer_owner orelse return;
-        self.pointer_x = wlFixedToFloat(sx);
-        self.pointer_y = wlFixedToFloat(sy);
+        // §5G DPI: surface coords are LOGICAL; the App contract takes
+        // PHYSICAL pixels (window divides by scale before dispatch).
+        self.pointer_x = wlFixedToFloat(sx) * owner.scale_factor;
+        self.pointer_y = wlFixedToFloat(sy) * owner.scale_factor;
         owner.pushInputEvent(.{ .mouse = .{
             .pos = .{ .x = self.pointer_x, .y = self.pointer_y },
             .button = .left,
@@ -1666,6 +1796,22 @@ pub const WaylandBackend = struct {
         self.deco_mode = mode;
     }
 
+    /// §5G DPI: the compositor's preferred scale for this surface (wire
+    /// units scale*120). First arrival marks the protocol as negotiated;
+    /// changes emit a targeted scale_changed so the App re-rasterizes at
+    /// the new density (framebuffer + glyph masks heal on the next
+    /// present, which allocates physical-size buffers lazily).
+    fn fractionalPreferredScale(data: ?*anyopaque, _: *anyopaque, wire_scale: u32) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        self.fractional = true;
+        const scale = @as(f32, @floatFromInt(wire_scale)) / 120.0;
+        if (scale >= 0.25 and scale <= 8.0 and scale != self.scale_factor) {
+            zlog.log("wayland", "preferred_scale: {d} -> {d} (window {d})", .{ self.scale_factor, scale, self.window_id });
+            self.scale_factor = scale;
+            if (self.target_queue) |out| self.pushTargeted(out, .{ .window = .scale_changed });
+        }
+    }
+
     /// Push the current decorated flag: client-side for app-drawn chrome,
     /// unset (compositor default) for framed.
     fn applyDecorations(self: *@This()) void {
@@ -1883,6 +2029,10 @@ pub const WaylandBackend = struct {
         .configure = decorationConfigure,
     };
 
+    const default_frac_listener = FractionalScaleListener{
+        .preferred_scale = fractionalPreferredScale,
+    };
+
     const default_wm_listener = XdgWmBaseListener{
         .ping = xdgPing,
     };
@@ -1995,8 +2145,11 @@ pub const WaylandBackend = struct {
             if (self.parent) |parent| parent.presents += 1;
             return;
         }
-        const w: u32 = @intFromFloat(self.size.w);
-        const h: u32 = @intFromFloat(self.size.h);
+        // §5G DPI: the framebuffer is PHYSICAL (logical * scale); layout
+        // and the scene stay logical. Glyph masks carry per-glyph density.
+        const w: u32 = self.physW();
+        const h: u32 = self.physH();
+        self.renderer.scale_factor = self.scale_factor;
         // Lazily (re)fill the pool so a configure that arrived without
         // buffers (or a release that dropped a stale entry) heals here.
         self.recreateBuffer(w, h) catch |err| {
@@ -2076,10 +2229,23 @@ pub const WaylandBackend = struct {
 
             if (self.surface) |s| {
                 if (e.buf) |b| {
+                    // §5G DPI: tell the compositor how to map the PHYSICAL
+                    // buffer. Fractional scale: logical destination rect
+                    // (viewport, applied on this commit). Integer fallback:
+                    // set_buffer_scale (v2+). At scale 1 no request needed.
+                    if (self.fractional) {
+                        if (self.viewport) |vp| {
+                            _ = self.api.wl_proxy_marshal_flags(@ptrCast(vp), 2, null, self.api.wl_proxy_get_version(@ptrCast(vp)), 0, @as(i32, @intFromFloat(self.size.w)), @as(i32, @intFromFloat(self.size.h)));
+                        }
+                    } else if (self.scale_factor > 1.01) {
+                        _ = self.api.wl_proxy_marshal_flags(@ptrCast(s), 8, null, self.api.wl_proxy_get_version(@ptrCast(s)), 0, @as(i32, @intFromFloat(@round(self.scale_factor))));
+                    }
                     // Opcode 1: wl_surface::attach(buffer, x=0, y=0)
                     _ = self.api.wl_proxy_marshal_flags(@ptrCast(s), 1, null, self.api.wl_proxy_get_version(@ptrCast(s)), 0, b, @as(i32, 0), @as(i32, 0));
-                    // Opcode 2: wl_surface::damage(x=0, y=0, w, h)
-                    _ = self.api.wl_proxy_marshal_flags(@ptrCast(s), 2, null, self.api.wl_proxy_get_version(@ptrCast(s)), 0, @as(i32, 0), @as(i32, 0), @as(i32, @intCast(w)), @as(i32, @intCast(h)));
+                    // Opcode 2: wl_surface::damage(x=0, y=0, w, h) — SURFACE
+                    // (logical) coordinates, so the whole window is covered
+                    // at any scale.
+                    _ = self.api.wl_proxy_marshal_flags(@ptrCast(s), 2, null, self.api.wl_proxy_get_version(@ptrCast(s)), 0, @as(i32, 0), @as(i32, 0), @as(i32, @intFromFloat(self.size.w)), @as(i32, @intFromFloat(self.size.h)));
                     // Opcode 6: wl_surface::commit()
                     _ = self.api.wl_proxy_marshal_flags(@ptrCast(s), 6, null, self.api.wl_proxy_get_version(@ptrCast(s)), 0);
                     _ = self.api.wl_display_flush(self.display);

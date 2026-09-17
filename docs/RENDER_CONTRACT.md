@@ -40,17 +40,47 @@ Companion to the gap report §3 (overflow policy) and §5E (scene semantics).
 - The vellz `Renderer` is owned per presenting window; its context,
   resources, and pixmap persist across frames and are recreated on resize.
 
-## 4. Scale
+## 4. Scale (logical/physical pipeline)
 
-- Backends report a per-window `scale_factor` in `windowInfo` (X11: 1.0,
-  Wayland: from compositor, Cocoa: display scale, Win32: DPI/96).
-- The scene, layout, and rasterizer currently work in logical pixels end to
-  end: **no logical/physical pipeline is implemented yet**. Moving a window
-  across differently-scaled monitors does not re-rasterize text, and there
-  is no fractional-scale atlas invalidation. This matches gap report §5G
-  and must be fixed before any HiDPI claim. Contributors: do not add a
-  second `scale` float threaded by hand; define the pipeline
-  (logical layout units → framebuffer pixels → content scale) first.
+The contract (gap report §5G stage 2):
+
+- **Layout and scene coordinates are LOGICAL pixels** (f32, fractional OK).
+  `elements/layout.zig` and the painter never see the scale factor.
+- **The window framebuffer is PHYSICAL pixels.** Backends size their SHM /
+  XImage buffers and `Renderer.render(width, height)` in physical pixels.
+- **`Window.scale_factor: f32`** bridges them: `physical = logical * scale`.
+  Acquired from the platform (X11 RandR per-monitor scale with Xft.dpi
+  fallback; Wayland fractional-scale-v1 / wl_output scale; Cocoa backing
+  scale; Win32 DPI/96; null backend: whatever the test sets).
+- **Conversion points:**
+  1. *Rasterization (paint at physical resolution):* `gpu.vellz.Renderer`
+     carries `scale_factor` (set by each backend's `presentFn` from
+     `windowInfo().scale_factor`) and multiplies logical quad/glyph/blit
+     geometry, borders, radii and clips by it. The pixmap stays framebuffer-
+     sized, so geometry is rendered at native density.
+  2. *Text:* the painter emits 1x masks with logical origins;
+     `text_engine.Engine.scaleScene(scene, scale)` re-rasterizes each atlas
+     entry at `size_px * scale` into `Engine.scaled_glyphs` (a separate
+     atlas so nothing referenced by the present is evicted) and rewrites
+     the scene glyph to the physical mask. Fractional scales rasterize at
+     the exact fractional font size (cozmic keys include full f32 size
+     bits), never stretch the 1x mask; a failed re-raster keeps the 1x mask
+     and the renderer stretches it via `glyph_scale`.
+  3. *Input:* pointer positions arrive in physical pixels and are divided
+     by `scale_factor` at the window boundary before hit-testing and
+     region dispatch (`Window.handleEvent` normalizes; callbacks and
+     regions see logical coordinates).
+  4. *Fonts:* measurement stays logical (`TextAttrs.size` in logical px);
+     only rasterization scales.
+- **Rounding policy:** geometry stays f32 logical end to end; pixel rects
+  are produced by the rasterizer at physical resolution (vellz rounds
+  glyph origins to whole physical pixels). No integer snapping happens at
+  the scene or layout layer.
+- **`scale_changed`** (platform event) → `App.handleEvent` copies the new
+  `windowInfo().scale_factor` into `Window`, marks dirty, and the next
+  present re-rasterizes text at the new density and rebuilds the scaled
+  atlas. A window moved between monitors therefore keeps text sharp and
+  hit alignment, per the §5G acceptance criteria.
 
 ## 5. Completion
 

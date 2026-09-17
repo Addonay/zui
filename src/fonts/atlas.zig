@@ -39,6 +39,10 @@ pub const AtlasKey = struct {
     face_id: u32,
     glyph_id: u32,
     size_px: u16,
+    /// Density-specific raster size bits (exact f32 font size the
+    /// rasterizer used); zero identifies legacy 1x keys. Fractional scales
+    /// must never alias the 1x mask, and 1.5x must never alias 2x.
+    raster_size_bits: u32 = 0,
     /// Subpixel bin of the raster position. Coverage and placement differ
     /// per bin (`FT_Set_Transform` offsets), so bins need their own entries.
     x_bin: SubpixelBin = .zero,
@@ -58,6 +62,7 @@ pub const AtlasKey = struct {
         return a.face_id == b.face_id and
             a.glyph_id == b.glyph_id and
             a.size_px == b.size_px and
+            a.raster_size_bits == b.raster_size_bits and
             a.x_bin == b.x_bin and
             a.y_bin == b.y_bin and
             a.font_weight == b.font_weight and

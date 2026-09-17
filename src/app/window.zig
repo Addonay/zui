@@ -539,12 +539,31 @@ pub const Window = struct {
         self.focused = .{};
     }
 
-    pub fn handleEvent(self: *Window, event: platform.Event) void {
+    pub fn handleEvent(self: *Window, platform_event: platform.Event) void {
         if (self.closed) return;
+        var event = platform_event;
         if (event == .targeted) {
             if (event.targeted.window_id == self.id) self.handleEvent(event.untargeted());
             return;
         }
+        // Pointer positions arrive in PHYSICAL framebuffer pixels; layout,
+        // regions and callbacks work in LOGICAL coordinates. One inverse
+        // normalization at the window boundary keeps hit-testing, drag
+        // routing, double-click distance and the cursor query in logical
+        // space (fractions preserved; no integer snapping).
+        if (self.scale_factor != 1) switch (event) {
+            .mouse => |m| {
+                var normalized = m;
+                normalized.pos = .{ .x = m.pos.x / self.scale_factor, .y = m.pos.y / self.scale_factor };
+                event = .{ .mouse = normalized };
+            },
+            .scroll => |s| {
+                var normalized = s;
+                normalized.pos = .{ .x = s.pos.x / self.scale_factor, .y = s.pos.y / self.scale_factor };
+                event = .{ .scroll = normalized };
+            },
+            else => {},
+        };
         if (event == .mouse) {
             for (self.ui_frame.observers[0..self.ui_frame.observer_count]) |observer| _ = observer.dispatch(event, self);
         }
@@ -676,7 +695,10 @@ pub const Window = struct {
                     self.keymap.pending_deadline_ms = null;
                     self.requestRender();
                 },
-                .focused => { self.native_focused = true; self.requestRender(); },
+                .focused => {
+                    self.native_focused = true;
+                    self.requestRender();
+                },
                 else => {},
             },
         }
@@ -1067,4 +1089,48 @@ test "scroll dispatches to the scrollable region under the pointer" {
     // Outside: nothing.
     win.handleEvent(.{ .scroll = .{ .pos = .{ .x = 500, .y = 500 }, .dy = 1 } });
     try std.testing.expectEqual(@as(u32, 1), scroll_hits);
+}
+
+test "physical pointer input is normalized into logical hit coordinates" {
+    const TestApp = @import("app.zig").App;
+    var app = try TestApp.initHeadless(std.testing.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, struct {
+        fn draw(w: *Window, sc: *gpu.Scene) void {
+            _ = w;
+            _ = sc;
+        }
+    }.draw);
+    resetCounters();
+
+    var marker: u8 = 0;
+    // Logical button at 50..100 x 40..60 (physical 100..200 x 80..120 at 2x).
+    // Logical button 50..100 x 40..60 == physical 100..200 x 80..120 at 2x.
+    win.scale_factor = 2;
+    win.ui_frame.region_count = 1;
+    win.ui_frame.regions[0] = .{
+        .bounds = .{ .x = 50, .y = 40, .w = 50, .h = 20 },
+        .mouse_move_listener = .{ .target = @ptrCast(&marker), .call_fn = countMove },
+        .mouse_up_listener = .{ .target = @ptrCast(&marker), .call_fn = countUp },
+    };
+
+    // Physical motion at (150,90) -> logical (75,45): inside, one callback.
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 150, .y = 90 }, .button = .left, .pressed = false, .motion = true } });
+    try std.testing.expectEqual(@as(u32, 1), move_hits);
+    // Normalized hover position stays logical for the cursor query.
+    try std.testing.expectApproxEqAbs(@as(f32, 75), win.pointer_position.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 45), win.pointer_position.y, 0.001);
+    // Physical (90,70) -> logical (45,35), outside: no second callback.
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 90, .y = 70 }, .button = .left, .pressed = false, .motion = true } });
+    try std.testing.expectEqual(@as(u32, 1), move_hits);
+    // Press arms capture (move listener present); release outside the
+    // window's logical bounds still reaches the captured region.
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 150, .y = 90 }, .button = .left, .pressed = true } });
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 300, .y = 160 }, .button = .left, .pressed = false } });
+    try std.testing.expectEqual(@as(u32, 1), up_hits);
+    // 1.5x: the same logical button spans physical 75..150 x 60..90;
+    // (112,68) -> logical (74.67,45.33) hits it.
+    win.scale_factor = 1.5;
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 112, .y = 68 }, .button = .left, .pressed = false, .motion = true } });
+    try std.testing.expectEqual(@as(u32, 2), move_hits);
 }

@@ -69,6 +69,12 @@ const ClipState = struct {
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
 
+    /// Scene geometry is logical f32; target dimensions are physical pixels.
+    /// Set by the window backend, never by layout. Glyph mask density
+    /// travels per glyph (`Scene.Glyph.density`); this renderer field
+    /// remains for callers that rasterize whole scenes at a fixed density.
+    scale_factor: f32 = 1,
+    glyph_scale: f32 = 1,
     width: u16 = 0,
     height: u16 = 0,
     ctx: ?cpu.RenderContext = null,
@@ -139,7 +145,14 @@ pub const Renderer = struct {
         for (scene.commandSlice()) |cmd| {
             switch (cmd.kind) {
                 .quad => {
-                    const q = scene.slice()[cmd.index];
+                    var q = scene.slice()[cmd.index];
+                    q.x *= self.scale_factor;
+                    q.y *= self.scale_factor;
+                    q.w *= self.scale_factor;
+                    q.h *= self.scale_factor;
+                    q.radius *= self.scale_factor;
+                    q.border_width *= self.scale_factor;
+                    if (q.clip) |clip| q.clip = scaledRect(clip, self.scale_factor);
                     if (q.w <= 0 or q.h <= 0 or q.color.a <= 0) continue;
                     if (q.clip) |clip| {
                         if (clip.w <= 0 or clip.h <= 0) continue;
@@ -152,14 +165,29 @@ pub const Renderer = struct {
                     const g = scene.glyphSlice()[cmd.index];
                     if (g.w == 0 or g.h == 0 or g.color.a <= 0) continue;
                     if (g.clip.w <= 0 or g.clip.h <= 0) continue;
-                    const gx = @round(g.x);
-                    const gy = @round(g.y);
-                    const keys = clipKeysFor(gx, gy, @floatFromInt(g.w), @floatFromInt(g.h), g.clip, 0, &clip_buf);
+                    // One logical→physical mapping per glyph: target scale
+                    // over this mask's raster density. An upgraded mask
+                    // (density == scale) renders 1:1; a 1x mask stretches
+                    // by the full factor.
+                    const ratio = self.scale_factor / g.density;
+                    const gx = @round(g.x * self.scale_factor);
+                    const gy = @round(g.y * self.scale_factor);
+                    var physical = g;
+                    physical.x = gx;
+                    physical.y = gy;
+                    physical.clip = scaledRect(g.clip, self.scale_factor);
+                    const keys = clipKeysFor(gx, gy, @as(f32, @floatFromInt(g.w)) * ratio, @as(f32, @floatFromInt(g.h)) * ratio, physical.clip, 0, &clip_buf);
                     try self.updateClip(keys);
-                    try self.drawGlyph(g, gx, gy, glyph_pixels);
+                    try self.drawGlyph(physical, gx, gy, glyph_pixels, ratio);
                 },
                 .blit => {
-                    const b = scene.imageSlice()[cmd.index];
+                    var b = scene.imageSlice()[cmd.index];
+                    b.x *= self.scale_factor;
+                    b.y *= self.scale_factor;
+                    b.w *= self.scale_factor;
+                    b.h *= self.scale_factor;
+                    b.radius *= self.scale_factor;
+                    b.clip = scaledRect(b.clip, self.scale_factor);
                     if (b.w <= 0 or b.h <= 0 or b.src_w == 0 or b.src_h == 0) continue;
                     if (b.clip.w <= 0 or b.clip.h <= 0) continue;
                     const keys = clipKeysFor(b.x, b.y, b.w, b.h, b.clip, b.radius, &clip_buf);
@@ -257,15 +285,16 @@ pub const Renderer = struct {
         }
     }
 
-    fn drawGlyph(self: *Renderer, g: scene_mod.Glyph, gx: f32, gy: f32, glyph_pixels: []const u8) !void {
+    fn drawGlyph(self: *Renderer, g: scene_mod.Glyph, gx: f32, gy: f32, glyph_pixels: []const u8, ratio: f32) !void {
         const id = try self.glyphImage(g, glyph_pixels);
         const ctx = &self.ctx.?;
         ctx.setTint(.{ .color = penikoColor(g.color), .mode = .alpha_mask });
         self.setImagePaint(id, .low);
         // Image paints live in image pixel space; place the mask at the
-        // glyph origin.
-        ctx.setPaintTransform(kurbo.Affine.new(.{ 1, 0, 0, 1, gx, gy }));
-        try ctx.fillRect(self.allocator, kurbo.Rect.new(gx, gy, gx + @as(f32, @floatFromInt(g.w)), gy + @as(f32, @floatFromInt(g.h))));
+        // glyph origin, stretched by the target scale over the mask's own
+        // raster density (1 for an unupgraded 1x mask).
+        ctx.setPaintTransform(kurbo.Affine.new(.{ ratio, 0, 0, ratio, gx, gy }));
+        try ctx.fillRect(self.allocator, kurbo.Rect.new(gx, gy, gx + @as(f32, @floatFromInt(g.w)) * ratio, gy + @as(f32, @floatFromInt(g.h)) * ratio));
         ctx.resetPaintTransform();
         ctx.setTint(null);
     }
@@ -436,6 +465,88 @@ pub const Renderer = struct {
         }
     }
 };
+
+test "logical rectangle rasterizes at physical window density" {
+    const t = std.testing;
+    const scene = try t.allocator.create(scene_mod.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    try t.expect(scene.push(.{ .x = 0, .y = 0, .w = 100, .h = 50, .color = Color.white }));
+    var renderer = Renderer.init(t.allocator);
+    defer renderer.deinit();
+    const pixels = try t.allocator.alloc(u8, 202 * 102 * 4);
+    defer t.allocator.free(pixels);
+    for ([_]f32{ 1, 2, 1.5 }) |scale| {
+        renderer.scale_factor = scale;
+        const width: usize = @intFromFloat(100 * scale);
+        const height: usize = @intFromFloat(50 * scale);
+        try renderer.render(pixels, 202, 102, .rgba32, Color.black, scene, &.{}, &.{});
+        var ink: usize = 0;
+        for (0..102) |y| {
+            for (0..202) |x| {
+                const expected: u8 = if (x < width and y < height) 255 else 0;
+                try t.expectEqual(expected, pixels[(y * 202 + x) * 4]);
+                if (expected != 0) ink += 1;
+            }
+        }
+        try t.expectEqual(width * height, ink);
+        std.debug.print("dpi raster: {d}x: 100x50 logical -> {d}x{d} physical ({d} pixels)\n", .{ scale, width, height, ink });
+    }
+    try t.expectEqual(@as(f32, 100), scene.slice()[0].w);
+}
+
+test "glyph mask stretches or renders 1:1 by its own density" {
+    const t = std.testing;
+    const scene = try t.allocator.create(scene_mod.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    // One opaque mask pixel at logical (0,0), 1x-rasterized.
+    const glyph = scene_mod.Glyph{
+        .x = 0,
+        .y = 0,
+        .w = 1,
+        .h = 1,
+        .color = Color.white,
+        .atlas_offset = 0,
+        .clip = .{ .x = 0, .y = 0, .w = 100, .h = 100 },
+    };
+    try t.expect(scene.pushGlyph(glyph));
+    var pool = [_]u8{ 255, 255, 255, 255 };
+    var renderer = Renderer.init(t.allocator);
+    defer renderer.deinit();
+    const pixels = try t.allocator.alloc(u8, 10 * 10 * 4);
+    defer t.allocator.free(pixels);
+
+    // Density 1 at scale 2: the 1x mask stretches to 2x2 physical pixels.
+    // (Single heap scene, mutated in place: Scene is multi-MB and must
+    // never be stack-copied — see the hot-frame-structs stack budget test.)
+    scene.glyphs[0].density = 1;
+    renderer.scale_factor = 2;
+    try renderer.render(pixels, 10, 10, .rgba32, Color.black, scene, &pool, &.{});
+    try t.expectEqual(@as(u8, 255), pixels[0]);
+    try t.expectEqual(@as(u8, 255), pixels[(1 * 10 + 1) * 4]); // (1,1) covered
+    try t.expectEqual(@as(u8, 0), pixels[(2 * 10 + 2) * 4]); // (2,2) clear
+
+    // Density 2 at scale 2 (the upgraded 2x2 mask): renders 1:1, same ink.
+    scene.glyphs[0] = .{ .x = 0, .y = 0, .w = 2, .h = 2, .color = Color.white, .atlas_offset = 0, .density = 2, .clip = glyph.clip };
+    try renderer.render(pixels, 10, 10, .rgba32, Color.black, scene, &pool, &.{});
+    try t.expectEqual(@as(u8, 255), pixels[0]);
+    try t.expectEqual(@as(u8, 255), pixels[(1 * 10 + 1) * 4]);
+    try t.expectEqual(@as(u8, 0), pixels[(2 * 10 + 2) * 4]);
+
+    // Density 2 at scale 1 (window moved to an unscaled monitor): the
+    // higher-density mask compacts to the original 1x1 logical pixel.
+    renderer.scale_factor = 1;
+    try renderer.render(pixels, 10, 10, .rgba32, Color.black, scene, &pool, &.{});
+    try t.expectEqual(@as(u8, 255), pixels[0]);
+    try t.expectEqual(@as(u8, 0), pixels[(1 * 10 + 1) * 4]);
+    try t.expectEqual(@as(u8, 0), pixels[(9 * 10 + 9) * 4]);
+    std.debug.print("dpi glyph density: stretch/1:1/compact paths all render\n", .{});
+}
+
+fn scaledRect(r: geometry.Rect, scale: f32) geometry.Rect {
+    return .{ .x = r.x * scale, .y = r.y * scale, .w = r.w * scale, .h = r.h * scale };
+}
 
 fn penikoColor(c: Color) peniko.Color {
     return peniko.Color.fromRgba8(u8c(c.r), u8c(c.g), u8c(c.b), u8c(c.a));
@@ -637,8 +748,8 @@ test "vellz blits pool images and maps crops to the dest rect" {
 
     // 2x1 source: one red pixel, one blue pixel (straight RGBA8).
     const pool = [_]u8{
-        255, 0, 0, 255,
-        0, 0, 255, 255,
+        255, 0, 0,   255,
+        0,   0, 255, 255,
     };
     var buf: [8 * 4 * 4]u8 = undefined;
     var scene = scene_mod.Scene{};

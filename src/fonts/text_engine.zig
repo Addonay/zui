@@ -360,6 +360,61 @@ pub const Engine = struct {
         return l.render(renderer, opaqueBlack);
     }
 
+    /// Upgrade painter-emitted 1x masks at the window boundary. Layout and
+    /// scene origins remain LOGICAL; glyph w/h and atlas bytes become
+    /// PHYSICAL density-specific masks. Runs between paint and present only
+    /// (App.step renders and presents adjacently, so upgraded masks live
+    /// exactly one present and cannot be evicted mid-frame by another
+    /// window's paint). Upgraded masks go into the SAME `glyphs` atlas pool
+    /// the present already receives, keyed with `raster_size_bits` set so
+    /// they never alias the 1x entry or another density; failed upgrades
+    /// keep the 1x mask and their `density` stays 1, so vellz stretches
+    /// them instead of leaving a hole.
+    pub fn scaleScene(self: *Engine, scene: *@import("../gpu/scene.zig").Scene, scale: f32) void {
+        if (scale == 1) return;
+        for (scene.glyphs[0..scene.glyph_len]) |*g| {
+            g.density = scale;
+            // Identify the 1x entry by its stable (offset, size) pair, the
+            // only scene-side link back to the painter atlas.
+            var original: ?AtlasEntry = null;
+            for (self.glyphs.entries[0..self.glyphs.entry_count]) |entry| {
+                if (entry.offset == g.atlas_offset and entry.width == g.w and entry.height == g.h) {
+                    original = entry;
+                    break;
+                }
+            }
+            const old = original orelse continue;
+            const key = old.key;
+            const size: f32 = @as(f32, @floatFromInt(key.size_px)) * scale;
+            var scaled_key = key;
+            scaled_key.raster_size_bits = @bitCast(size);
+            const entry = self.glyphs.get(scaled_key) orelse blk: {
+                const image = (self.cache.getImage(.{
+                    .font_id = key.face_id,
+                    .glyph_id = @intCast(key.glyph_id),
+                    .font_size_bits = @bitCast(size),
+                    .x_bin = key.x_bin,
+                    .y_bin = key.y_bin,
+                    .font_weight = key.font_weight,
+                    .flags = key.flags,
+                }) catch null) orelse continue;
+                if (image.content != .mask) continue;
+                // Synthetic bold at 1x is a fixed 1px dilation; the density
+                // raster re-derives it from the same requested weight, so
+                // the variant flag stays in the key but is never re-applied.
+                break :blk self.glyphs.putBitmap(scaled_key, image.placement.width, image.placement.height, image.placement.width, image.data.ptr, image.placement.left, image.placement.top, .mask, false) catch continue;
+            };
+            // Re-place the mask at the scaled glyph origin: bearings move
+            // with density (divide the new placement by scale to stay in
+            // logical units before the renderer multiplies again).
+            g.x += @as(f32, @floatFromInt(entry.bearing_x)) / scale - @as(f32, @floatFromInt(old.bearing_x));
+            g.y -= @as(f32, @floatFromInt(entry.bearing_y)) / scale - @as(f32, @floatFromInt(old.bearing_y));
+            g.w = entry.width;
+            g.h = entry.height;
+            g.atlas_offset = entry.offset;
+        }
+    }
+
     /// True when `font_id`'s ink at `wanted` still needs the 1px synthetic
     /// dilation: the request is bold-ish (>= 600), the matched face is
     /// lighter than requested, and the face cannot rasterize the requested
@@ -625,6 +680,54 @@ const color_font_paths = [_][]const u8{
     "/usr/share/fonts/noto/NotoColorEmoji.ttf",
     "/usr/share/fonts/google-noto-color-emoji-fonts/Noto-COLRv1.ttf",
 };
+
+test "scene glyph masks rerasterize at window density, origins stay logical" {
+    const t = testing;
+    const alloc = t.allocator;
+    const engine = try testEngine();
+    defer engine.deinit();
+    const scene = try alloc.create(@import("../gpu/scene.zig").Scene);
+    defer alloc.destroy(scene);
+    scene.* = .{};
+    const layout = try engine.layout(alloc, "Hi", .{ .size = 16, .line_height = 20 }, null);
+    var layout_owned = layout;
+    defer layout_owned.deinit();
+    var placed: usize = 0;
+    var runs_iter = layout.runs();
+    while (runs_iter.next()) |run| {
+        for (run.glyphs) |glyph| {
+            const physical = glyph.physical(0, 0, 1.0);
+            const image = engine.cache.getImage(physical.cache_key) catch null orelse continue;
+            if (image.content != .mask) continue;
+            const entry = engine.glyphs.putBitmap(.{ .face_id = physical.cache_key.font_id, .glyph_id = physical.cache_key.glyph_id, .size_px = sizeToPx(16), .x_bin = physical.cache_key.x_bin, .y_bin = physical.cache_key.y_bin, .font_weight = physical.cache_key.font_weight, .flags = physical.cache_key.flags }, image.placement.width, image.placement.height, image.placement.width, image.data.ptr, image.placement.left, image.placement.top, .mask, false) catch continue;
+            if (!scene.pushGlyph(.{
+                .x = 40 + @as(f32, @floatFromInt(physical.x)) + @as(f32, @floatFromInt(entry.bearing_x)),
+                .y = 30 + @as(f32, @floatFromInt(-entry.bearing_y)),
+                .w = entry.width,
+                .h = entry.height,
+                .atlas_offset = entry.offset,
+                .color = @import("../core/color.zig").Color.white,
+                .clip = .{ .x = 0, .y = 0, .w = 1000, .h = 1000 },
+            })) continue;
+            placed += 1;
+        }
+    }
+    try t.expect(placed > 0);
+    for ([_]f32{ 2, 1.5 }) |scale| {
+        var at = scene.*;
+        engine.scaleScene(&at, scale);
+        const scaled = at.glyphSlice();
+        const before = scene.glyphSlice();
+        for (scaled, before) |g, was| {
+            // Scene coordinates stay LOGICAL: the renderer multiplies by
+            // scale_factor. Only mask density (w/h/bearings) changes here.
+            try t.expectApproxEqAbs(was.x, g.x, 1.5);
+            try t.expectApproxEqAbs(was.y, g.y, 1.5);
+            try t.expect(@as(f32, @floatFromInt(g.w)) > @as(f32, @floatFromInt(was.w)));
+        }
+        std.debug.print("dpi text: {d}x: {d} glyph(s) remapped; first mask {d}x{d} -> {d}x{d}\n", .{ scale, placed, before[0].w, before[0].h, scaled[0].w, scaled[0].h });
+    }
+}
 
 test "color spike: engine rasterizes emoji as color ink the atlas rejects" {
     const t = testing;

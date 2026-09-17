@@ -3,6 +3,15 @@
 //! Connects to an X11 server via dlopen'd libX11.so without compile-time headers.
 //! Manages native window creation, event dispatch, and software frame presentation
 //! via XPutImage.
+//!
+//! §5G DPI contract: `size` is the LOGICAL window size (what the app lays out
+//! against, what `windowInfo().size` reports); the OS window, framebuffer and
+//! XPutImage rect are PHYSICAL pixels (`size * scale_factor`). Pointer and
+//! scroll positions arrive in physical pixels and are divided by the window's
+//! scale in `app/window.zig` before dispatch. Scale is acquired once per
+//! connection (`ZUI_SCALE`, then integer `GDK_SCALE`, then 1.0); per-monitor
+//! RandR change detection is the documented next stage — without RandR the
+//! compositor cannot report runtime scale changes, so none are emitted.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -192,6 +201,12 @@ const XAnyEvent = extern struct {
 /// log the opcode and serial).
 const XErrorHandler = ?*const fn (?*Display, ?*anyopaque) callconv(.c) c_int;
 
+/// §5G scale acquisition: shared contract in `backend.envScaleFactor`
+/// (ZUI_SCALE, then GDK_SCALE, then 1.0).
+fn envScaleFactor() f32 {
+    return backend.envScaleFactor();
+}
+
 /// Non-fatal Xlib error hook installed at connection init. Returns 0
 /// (error consumed): the failed request is dropped, the connection and all
 /// other windows keep running. Per-error details would need the real
@@ -227,35 +242,35 @@ comptime {
     // target-invalid assertion (e.g. Windows LLP64 where c_long is 32-bit).
     if (builtin.target.os.tag == .linux) {
         std.debug.assert(@sizeOf(XEvent) == 192);
-    std.debug.assert(@sizeOf(XButtonEvent) == 96);
-    std.debug.assert(@offsetOf(XButtonEvent, "window") == 32);
-    std.debug.assert(@offsetOf(XButtonEvent, "time") == 56);
-    std.debug.assert(@offsetOf(XButtonEvent, "x") == 64);
-    std.debug.assert(@offsetOf(XButtonEvent, "y") == 68);
-    std.debug.assert(@offsetOf(XButtonEvent, "x_root") == 72);
-    std.debug.assert(@offsetOf(XButtonEvent, "y_root") == 76);
-    std.debug.assert(@offsetOf(XButtonEvent, "state") == 80);
-    std.debug.assert(@offsetOf(XButtonEvent, "button") == 84);
-    std.debug.assert(@offsetOf(XButtonEvent, "same_screen") == 88);
-    std.debug.assert(@offsetOf(XKeyEvent, "keycode") == 84);
-    std.debug.assert(@offsetOf(XKeyEvent, "state") == 80);
-    std.debug.assert(@offsetOf(XKeyEvent, "time") == 56);
-    std.debug.assert(@offsetOf(XMotionEvent, "x") == 64);
-    std.debug.assert(@offsetOf(XMotionEvent, "state") == 80);
-    std.debug.assert(@offsetOf(XClientMessageEvent, "window") == 32);
-    std.debug.assert(@offsetOf(XClientMessageEvent, "data") == 56);
-    std.debug.assert(@offsetOf(XConfigureEvent, "event") == 32);
-    std.debug.assert(@offsetOf(XConfigureEvent, "window") == 40);
-    std.debug.assert(@offsetOf(XConfigureEvent, "width") == 56);
-    std.debug.assert(@offsetOf(XConfigureEvent, "height") == 60);
-    // Selection request layout follows Xlib.h field order (sequential
-    // native words after the standard 32-byte event prefix).
-    std.debug.assert(@offsetOf(XSelectionRequestEvent, "requestor") == 40);
-    std.debug.assert(@offsetOf(XSelectionRequestEvent, "selection") == 48);
-    std.debug.assert(@offsetOf(XSelectionRequestEvent, "target") == 56);
-    std.debug.assert(@offsetOf(XSelectionRequestEvent, "property") == 64);
-    std.debug.assert(@offsetOf(XSelectionRequestEvent, "time") == 72);
-    std.debug.assert(@sizeOf(XSelectionRequestEvent) == 80);
+        std.debug.assert(@sizeOf(XButtonEvent) == 96);
+        std.debug.assert(@offsetOf(XButtonEvent, "window") == 32);
+        std.debug.assert(@offsetOf(XButtonEvent, "time") == 56);
+        std.debug.assert(@offsetOf(XButtonEvent, "x") == 64);
+        std.debug.assert(@offsetOf(XButtonEvent, "y") == 68);
+        std.debug.assert(@offsetOf(XButtonEvent, "x_root") == 72);
+        std.debug.assert(@offsetOf(XButtonEvent, "y_root") == 76);
+        std.debug.assert(@offsetOf(XButtonEvent, "state") == 80);
+        std.debug.assert(@offsetOf(XButtonEvent, "button") == 84);
+        std.debug.assert(@offsetOf(XButtonEvent, "same_screen") == 88);
+        std.debug.assert(@offsetOf(XKeyEvent, "keycode") == 84);
+        std.debug.assert(@offsetOf(XKeyEvent, "state") == 80);
+        std.debug.assert(@offsetOf(XKeyEvent, "time") == 56);
+        std.debug.assert(@offsetOf(XMotionEvent, "x") == 64);
+        std.debug.assert(@offsetOf(XMotionEvent, "state") == 80);
+        std.debug.assert(@offsetOf(XClientMessageEvent, "window") == 32);
+        std.debug.assert(@offsetOf(XClientMessageEvent, "data") == 56);
+        std.debug.assert(@offsetOf(XConfigureEvent, "event") == 32);
+        std.debug.assert(@offsetOf(XConfigureEvent, "window") == 40);
+        std.debug.assert(@offsetOf(XConfigureEvent, "width") == 56);
+        std.debug.assert(@offsetOf(XConfigureEvent, "height") == 60);
+        // Selection request layout follows Xlib.h field order (sequential
+        // native words after the standard 32-byte event prefix).
+        std.debug.assert(@offsetOf(XSelectionRequestEvent, "requestor") == 40);
+        std.debug.assert(@offsetOf(XSelectionRequestEvent, "selection") == 48);
+        std.debug.assert(@offsetOf(XSelectionRequestEvent, "target") == 56);
+        std.debug.assert(@offsetOf(XSelectionRequestEvent, "property") == 64);
+        std.debug.assert(@offsetOf(XSelectionRequestEvent, "time") == 72);
+        std.debug.assert(@sizeOf(XSelectionRequestEvent) == 80);
     }
 }
 
@@ -483,7 +498,13 @@ pub const X11Backend = struct {
 
         const screen = api.XDefaultScreen(dpy);
         const root = api.XRootWindow(dpy, screen);
-        const win = api.XCreateSimpleWindow(dpy, root, 0, 0, width, height, 0, 0, 0);
+        // §5G DPI: the OS window is PHYSICAL pixels (logical * scale); the
+        // app-visible `size` stays logical. ZUI_SCALE/GDK_SCALE acquire the
+        // connection scale.
+        const scale = envScaleFactor();
+        const phys_w: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(width)) * scale)));
+        const phys_h: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(height)) * scale)));
+        const win = api.XCreateSimpleWindow(dpy, root, 0, 0, phys_w, phys_h, 0, 0, 0);
         errdefer _ = api.XDestroyWindow(dpy, win);
 
         _ = api.XStoreName(dpy, win, title);
@@ -516,7 +537,7 @@ pub const X11Backend = struct {
         _ = api.XMapWindow(dpy, win);
         _ = api.XFlush(dpy);
 
-        const pixels = try allocator.alloc(u8, @as(usize, width) * height * 4);
+        const pixels = try allocator.alloc(u8, @as(usize, phys_w) * @as(usize, phys_h) * 4);
         errdefer allocator.free(pixels);
         @memset(pixels, 0);
 
@@ -537,7 +558,7 @@ pub const X11Backend = struct {
             .wm_protocols = wm_protocols,
             .net_wm_ping = net_wm_ping,
             .size = .{ .w = @floatFromInt(width), .h = @floatFromInt(height) },
-            .scale_factor = 1.0,
+            .scale_factor = scale,
             .focused = true,
             .presents = 0,
             .wakeups = 0,
@@ -593,6 +614,33 @@ pub const X11Backend = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    /// §5G DPI: physical framebuffer dimensions for the current logical
+    /// size and scale. The OS window, pixel buffer, XImage and XPutImage
+    /// rect are all physical; `size` and `windowInfo().size` stay logical.
+    pub fn physW(self: *const X11Backend) u32 {
+        return @intFromFloat(@max(1, @round(self.size.w * self.scale_factor)));
+    }
+    pub fn physH(self: *const X11Backend) u32 {
+        return @intFromFloat(@max(1, @round(self.size.h * self.scale_factor)));
+    }
+    /// Logical size for a physical OS-window size at this window's scale.
+    fn logicalFromPhys(self: *const X11Backend, w: u32, h: u32) geometry.Size {
+        const s = @max(0.001, self.scale_factor);
+        return .{
+            .w = @max(1, @round(@as(f32, @floatFromInt(w)) / s)),
+            .h = @max(1, @round(@as(f32, @floatFromInt(h)) / s)),
+        };
+    }
+    fn ensureBuffer(self: *X11Backend, phys_w: u32, phys_h: u32) void {
+        const new_sz = @as(usize, phys_w) * @as(usize, phys_h) * 4;
+        if (new_sz != self.pixels.len) {
+            if (self.allocator.realloc(self.pixels, new_sz)) |new_buf| {
+                self.pixels = new_buf;
+                self.recreateImage();
+            } else |_| {}
+        }
+    }
+
     /// Mint one more native window on this shared connection. The returned
     /// Backend is window-scoped: it owns its own X window, framebuffer,
     /// renderer, scale, focus, and input routing, but shares the display
@@ -611,16 +659,14 @@ pub const X11Backend = struct {
             handle.setTitle(options.title);
             handle.setDecorated(options.decorated);
             if (options.width != @as(u32, @intFromFloat(self.size.w)) or options.height != @as(u32, @intFromFloat(self.size.h))) {
-                handle.setSize(options.width, options.height);
                 self.size.w = @floatFromInt(options.width);
                 self.size.h = @floatFromInt(options.height);
-                const new_sz = @as(usize, options.width) * @as(usize, options.height) * 4;
-                if (new_sz != self.pixels.len) {
-                    if (self.allocator.realloc(self.pixels, new_sz)) |new_buf| {
-                        self.pixels = new_buf;
-                        self.recreateImage();
-                    } else |_| {}
-                }
+                // §5G: setWindow goes to the OS in physical pixels (which
+                // round-trips a ConfigureNotify that resizes our physical
+                // buffer); size the buffer here as well for the first
+                // present ahead of that round-trip.
+                handle.setSize(options.width, options.height);
+                self.ensureBuffer(self.physW(), self.physH());
             }
             return handle;
         }
@@ -642,7 +688,12 @@ pub const X11Backend = struct {
     fn createWindowOnConnection(connection: *X11Backend, options: backend.WindowOptions) !*X11Backend {
         const api = connection.api;
         const dpy = connection.display;
-        const win = api.XCreateSimpleWindow(dpy, connection.root, 0, 0, options.width, options.height, 0, 0, 0);
+        // §5G DPI: OS window + framebuffer are PHYSICAL; app-visible size
+        // stays logical. Children inherit the connection scale.
+        const scale = connection.scale_factor;
+        const phys_w: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(options.width)) * scale)));
+        const phys_h: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(options.height)) * scale)));
+        const win = api.XCreateSimpleWindow(dpy, connection.root, 0, 0, phys_w, phys_h, 0, 0, 0);
         errdefer _ = api.XDestroyWindow(dpy, win);
         // Latin-1 fallback title via stack buffer (titles are bounded by
         // WindowOptions), then the UTF-8 _NET_WM_NAME property.
@@ -659,7 +710,7 @@ pub const X11Backend = struct {
         _ = api.XFlush(dpy);
         errdefer _ = api.XDestroyWindow(dpy, win);
 
-        const pixels = try connection.allocator.alloc(u8, @as(usize, options.width) * options.height * 4);
+        const pixels = try connection.allocator.alloc(u8, @as(usize, phys_w) * @as(usize, phys_h) * 4);
         errdefer connection.allocator.free(pixels);
         @memset(pixels, 0);
 
@@ -752,8 +803,9 @@ pub const X11Backend = struct {
         self.destroyImage();
         const vis = self.api.XDefaultVisual(self.display, self.screen);
         const depth = self.api.XDefaultDepth(self.display, self.screen);
-        const w: c_uint = @intFromFloat(self.size.w);
-        const h: c_uint = @intFromFloat(self.size.h);
+        // §5G DPI: the XImage wraps the PHYSICAL pixel buffer.
+        const w: c_uint = self.physW();
+        const h: c_uint = self.physH();
         self.image = self.api.XCreateImage(self.display, vis, @intCast(depth), 2, 0, self.pixels.ptr, w, h, 32, 0);
     }
 
@@ -838,18 +890,13 @@ pub const X11Backend = struct {
             },
             ConfigureNotify => {
                 const cfg = ev.xconfigure;
-                const w = @as(f32, @floatFromInt(cfg.width));
-                const h = @as(f32, @floatFromInt(cfg.height));
-                if (w != owner.size.w or h != owner.size.h) {
-                    owner.size.w = w;
-                    owner.size.h = h;
-                    const new_sz = @as(usize, @intCast(cfg.width)) * @as(usize, @intCast(cfg.height)) * 4;
-                    if (new_sz != owner.pixels.len) {
-                        if (owner.allocator.realloc(owner.pixels, new_sz)) |new_buf| {
-                            owner.pixels = new_buf;
-                            owner.recreateImage();
-                        } else |_| {}
-                    }
+                // §5G DPI: the OS window's pixel size is PHYSICAL; convert
+                // to logical for the app viewport. With scale 1 this is
+                // the identity mapping it always was.
+                const logical = owner.logicalFromPhys(@intCast(@max(0, cfg.width)), @max(0, cfg.height));
+                if (logical.w != owner.size.w or logical.h != owner.size.h) {
+                    owner.size = logical;
+                    owner.ensureBuffer(owner.physW(), owner.physH());
                     owner.pushTargeted(out, .{ .window = .resized });
                 }
             },
@@ -1058,11 +1105,14 @@ pub const X11Backend = struct {
     }
 
     /// Ask the server to resize; the ConfigureNotify round-trip resizes
-    /// our buffers and emits .resized like a user resize.
+    /// our buffers and emits .resized like a user resize. App sizes are
+    /// logical; the OS window gets PHYSICAL pixels (§5G DPI).
     fn sizeFn(ptr: *anyopaque, w: u32, h: u32) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (w == 0 or h == 0) return;
-        _ = self.api.XResizeWindow(self.display, self.window, w, h);
+        const phys_w: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(w)) * self.scale_factor)));
+        const phys_h: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(h)) * self.scale_factor)));
+        _ = self.api.XResizeWindow(self.display, self.window, phys_w, phys_h);
         _ = self.api.XFlush(self.display);
     }
 
@@ -1255,9 +1305,13 @@ pub const X11Backend = struct {
 
     fn presentFn(ptr: *anyopaque, scene: *const gpu.Scene, glyph_pixels: []const u8, image_pixels: []const u8) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const w: u32 = @intFromFloat(self.size.w);
-        const h: u32 = @intFromFloat(self.size.h);
+        // §5G DPI: raster into the PHYSICAL framebuffer (logical scene in,
+        // physical pixels out). The window's reported scale drives the
+        // raster; glyph masks carry per-glyph density on the scene.
+        const w: u32 = self.physW();
+        const h: u32 = self.physH();
 
+        self.renderer.scale_factor = self.scale_factor;
         // Default fashion dark background (theme.bg = #0e0e13)
         self.renderer.render(self.pixels, w, h, .bgra32, gpu.vellz.Color.hex(0x0e0e13), scene, glyph_pixels, image_pixels) catch |err| {
             zlog.log("x11", "vellz render failed: {s}", .{@errorName(err)});
