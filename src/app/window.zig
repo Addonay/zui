@@ -104,6 +104,9 @@ pub const Window = struct {
     captured_mouse_region: ?elements.HitRegion = null,
     /// True while the left mouse button is held.
     left_button_down: bool = false,
+    /// Modifiers carried by the most recent mouse event, readable by the
+    /// mouse listener that received it (row ctrl/shift selection).
+    mouse_modifiers: platform.event.Modifiers = .{},
     /// Set while dispatching the captured region's motion callback, so the
     /// drag source can tell that call apart from the hovered-region one.
     motion_from_capture: bool = false,
@@ -574,6 +577,7 @@ pub const Window = struct {
         switch (event) {
             .mouse => |mouse| {
                 self.pointer_position = mouse.pos;
+                self.mouse_modifiers = mouse.modifiers;
                 self.updateHoverCursor();
                 if (mouse.motion) {
                     self.dispatchMouseMotion(mouse);

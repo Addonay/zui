@@ -11,6 +11,7 @@ pub const Progress = @import("controls.zig").Progress;
 pub const RadioGroup = @import("radio_group.zig").RadioGroup;
 pub const ScrollArea = @import("scroll_area.zig").ScrollArea;
 pub const VirtualList = @import("virtual_list.zig").VirtualList;
+pub const VirtualTable = @import("virtual_table.zig").VirtualTable;
 pub const overlay = @import("overlay.zig");
 pub const Menu = @import("menu.zig").Menu;
 pub const ContextMenu = @import("menu.zig").ContextMenu;
@@ -30,4 +31,6 @@ test {
     _ = @import("overlay_test.zig");
     _ = @import("scroll_test.zig");
     _ = @import("scroll_model.zig");
+    _ = @import("virtual_table.zig");
+    _ = @import("virtual_table_test.zig");
 }

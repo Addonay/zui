@@ -3,7 +3,7 @@ const std = @import("std");
 const Rect = @import("../core/geometry.zig").Rect;
 const element = @import("../elements/element.zig");
 pub const capacity = 512;
-pub const Role = enum { group, button, checkbox, radio_group, radio, switch_control, slider, progress, text_input, label, dialog, list, listitem, menu, menuitem, menuitem_checkbox, tooltip, combobox, listbox, option };
+pub const Role = enum { group, button, checkbox, radio_group, radio, switch_control, slider, progress, text_input, label, dialog, list, listitem, menu, menuitem, menuitem_checkbox, tooltip, combobox, listbox, option, table, row, tableheader, cell };
 pub const Action = enum { activate, increment, decrement, set_value, focus };
 pub const Request = struct { action: Action, value: f64 = 0 };
 pub const Actions = packed struct { activate: bool = false, increment: bool = false, decrement: bool = false, set_value: bool = false, focus: bool = false };
