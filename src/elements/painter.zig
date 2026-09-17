@@ -12,6 +12,7 @@ pub fn paint(frame: *element.Frame, root: element.Element, scene: *gpu.Scene) vo
     // Counters describe one paint: a second paint on the same frame (e.g. a
     // repaint without `reset`) must report that paint's values, not the sum
     // of both. Per-node counters are cleared in `paintText` likewise.
+    @import("../a11y/root.zig").build(frame, root);
     frame.cozmic_painted_extent = 0;
     frame.cozmic_painted_glyphs = 0;
     frame.cozmic_skipped_glyphs = 0;

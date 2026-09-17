@@ -369,7 +369,15 @@ pub const Frame = struct {
     /// cleared by `reset()`.
     owner_overflows: u64 = 0,
 
+    semantic_bindings: [@import("../a11y/root.zig").capacity]@import("../a11y/root.zig").Binding = undefined,
+    semantic_count: usize = 0,
+    semantic_dropped: usize = 0,
+    semantic_tree: @import("../a11y/root.zig").Tree = .{},
+
     pub fn reset(self: *Frame, window: *anyopaque, pointer: core.Point) void {
+        self.semantic_count = 0;
+        self.semantic_dropped = 0;
+        self.semantic_tree = .{};
         // A new frame owns no retained layouts from the previous one: free
         // them before node slots are overwritten (createNode starts writing
         // at index 0, which would otherwise drop the only pointer to them).
@@ -402,6 +410,56 @@ pub const Frame = struct {
     /// layout+paint in a loop without calling `reset` in between.
     pub fn clearCozmicLayouts(self: *Frame) void {
         for (self.nodes[0..self.node_count]) |*node| node.clearCozmicLayout();
+    }
+
+    /// Deinitialize the frame, freeing any retained cozmic layouts.
+    /// Safe to call on a fresh frame (no-op beyond clearing layouts).
+    pub fn deinit(self: *Frame) void {
+        self.clearCozmicLayouts();
+        self.node_count = 0;
+        self.region_count = 0;
+        self.text_len = 0;
+    }
+
+    /// Clone the frame into a new allocation. The clone shares the same
+    /// engine and images pointers but has independent node data, allowing
+    /// two layout paths to run on identical trees without interfering.
+    pub fn clone(self: *const Frame) !Frame {
+        var copy = Frame{
+            .node_count = self.node_count,
+            .region_count = self.region_count,
+            .dropped_regions = self.dropped_regions,
+            .text_len = self.text_len,
+            .window = self.window,
+            .pointer = self.pointer,
+            .engine = self.engine,
+            .images = self.images,
+            .frame_id = self.frame_id,
+            .allocator = self.allocator,
+            .generation = self.generation,
+            .seen_key_count = self.seen_key_count,
+            .duplicate_keys = self.duplicate_keys,
+            .owner_count = self.owner_count,
+            .owner_overflows = self.owner_overflows,
+            .cozmic_painted_extent = self.cozmic_painted_extent,
+            .cozmic_painted_glyphs = self.cozmic_painted_glyphs,
+            .cozmic_skipped_glyphs = self.cozmic_skipped_glyphs,
+            .cozmic_paint_failures = self.cozmic_paint_failures,
+        };
+        copy.semantic_count = self.semantic_count;
+        copy.semantic_dropped = self.semantic_dropped;
+        @memcpy(copy.semantic_bindings[0..self.semantic_count], self.semantic_bindings[0..self.semantic_count]);
+        // Like text_value on cloned nodes, semantic strings borrow the source
+        // frame. Keep it alive until the comparison clone is consumed.
+        @memcpy(copy.nodes[0..self.node_count], self.nodes[0..self.node_count]);
+        @memcpy(copy.regions[0..self.region_count], self.regions[0..self.region_count]);
+        @memcpy(copy.text_storage[0..self.text_len], self.text_storage[0..self.text_len]);
+        @memcpy(copy.seen_keys[0..self.seen_key_count], self.seen_keys[0..self.seen_key_count]);
+        @memcpy(copy.owner_targets[0..self.owner_count], self.owner_targets[0..self.owner_count]);
+        @memcpy(copy.owner_stores[0..self.owner_count], self.owner_stores[0..self.owner_count]);
+        @memcpy(copy.owner_ids[0..self.owner_count], self.owner_ids[0..self.owner_count]);
+        @memcpy(copy.owner_generations[0..self.owner_count], self.owner_generations[0..self.owner_count]);
+        return copy;
     }
 
     fn createNode(self: *Frame, kind: NodeKind) u16 {
@@ -805,6 +863,23 @@ pub const Element = struct {
     }
     pub fn on_double_click(self: Element, listener: Listener) Element {
         self.node().double_click_listener = listener;
+        return self;
+    }
+
+    /// Attach semantics to a keyed element. Strings are copied into the frame;
+    /// targets must outlive this frame (or be registered with trackOwner).
+    pub fn semantic(self: Element, properties: @import("../a11y/root.zig").Properties) Element {
+        _ = self.node();
+        const frame = currentFrame();
+        if (frame.semantic_count == frame.semantic_bindings.len) {
+            frame.semantic_dropped += 1;
+            return self;
+        }
+        var owned = properties;
+        owned.name = frame.copyText(properties.name);
+        owned.text_value = frame.copyText(properties.text_value);
+        frame.semantic_bindings[frame.semantic_count] = .{ .index = self.index, .properties = owned };
+        frame.semantic_count += 1;
         return self;
     }
 
