@@ -3,11 +3,11 @@ const std = @import("std");
 const Rect = @import("../core/geometry.zig").Rect;
 const element = @import("../elements/element.zig");
 pub const capacity = 512;
-pub const Role = enum { group, button, checkbox, radio_group, radio, switch_control, slider, progress, text_input, label, dialog, list, listitem };
+pub const Role = enum { group, button, checkbox, radio_group, radio, switch_control, slider, progress, text_input, label, dialog, list, listitem, menu, menuitem, menuitem_checkbox, tooltip, combobox, listbox, option };
 pub const Action = enum { activate, increment, decrement, set_value, focus };
 pub const Request = struct { action: Action, value: f64 = 0 };
 pub const Actions = packed struct { activate: bool = false, increment: bool = false, decrement: bool = false, set_value: bool = false, focus: bool = false };
-pub const States = struct { disabled: bool = false, checked: ?bool = null, selected: bool = false, focused: bool = false, read_only: bool = false, hidden: bool = false, scrollable: bool = false };
+pub const States = struct { modal: bool = false, expanded: ?bool = null, disabled: bool = false, checked: ?bool = null, selected: bool = false, focused: bool = false, read_only: bool = false, hidden: bool = false, scrollable: bool = false };
 pub const Value = struct { current: f64, min: f64 = 0, max: f64 = 1, step: f64 = 0 };
 pub const Handler = struct {
     target: *anyopaque,
@@ -26,6 +26,8 @@ pub const Properties = struct {
     /// Stable-key relationships, not transient element indices.
     labelled_by: u64 = 0,
     described_by: u64 = 0,
+    controls: u64 = 0,
+    active_descendant: u64 = 0,
     handler: ?Handler = null,
 };
 pub const Binding = struct { index: u16, properties: Properties };
@@ -82,6 +84,9 @@ pub const Tree = struct {
 /// into Frame.text_storage by semantic(); valid until that frame is reset.
 pub fn build(frame: *element.Frame, root: element.Element) void {
     frame.semantic_tree = .{ .generation = frame.generation };
+    visit(frame, root.index, 0, .{ .x = -1e9, .y = -1e9, .w = 2e9, .h = 2e9 });
+}
+pub fn append(frame: *element.Frame, root: element.Element) void {
     visit(frame, root.index, 0, .{ .x = -1e9, .y = -1e9, .w = 2e9, .h = 2e9 });
 }
 fn intersection(a: Rect, b: Rect) Rect {

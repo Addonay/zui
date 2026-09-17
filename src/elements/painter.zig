@@ -29,6 +29,25 @@ pub fn paint(frame: *element.Frame, root: element.Element, scene: *gpu.Scene) vo
         .w = 2e9,
         .h = 2e9,
     });
+    // Portals escape ancestor clips and always follow ordinary sibling ink.
+    for (frame.portals[0..frame.portal_count]) |*portal| {
+        if (!portal.owner.isLive() or !portal.state.open) continue;
+        const window: *@import("../app/window.zig").Window = @ptrCast(@alignCast(frame.window.?));
+        const ov = @import("../widgets/overlay.zig");
+        const state = portal.state;
+        state.rect = ov.position(if (state.anchor_key != 0) ov.bounds(window, state.anchor_key) else state.anchor, state.size, window.bounds.size, state.placement, 4);
+        const panel = &frame.nodes[frame.nodes[portal.root.index].first_child.?];
+        panel.style.left = state.rect.x;
+        panel.style.top = state.rect.y;
+        panel.style.width = state.rect.w;
+        panel.style.height = state.rect.h;
+        @import("layout.zig").layout(frame, portal.root, .{ .w = window.bounds.size.w, .h = window.bounds.size.h });
+        @import("../a11y/root.zig").append(frame, portal.root);
+        portal.region_start = frame.region_count;
+        paintNode(frame, portal.root.index, scene, core.Color.white, 1, .{ .x = 0, .y = 0, .w = window.bounds.size.w, .h = window.bounds.size.h });
+        portal.region_end = frame.region_count;
+    }
+    if (frame.portal_count > 0) if (frame.window) |raw| @import("../widgets/overlay.zig").sync(@ptrCast(@alignCast(raw)));
     // The measure→paint handoff is consumed: release every retained layout
     // so repaints, teardown, and layout+paint loops that never call `reset`
     // cannot leak a shaped buffer. A paint without a new measure reshapes

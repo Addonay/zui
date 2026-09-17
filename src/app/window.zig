@@ -531,6 +531,13 @@ pub const Window = struct {
 
     pub fn handleEvent(self: *Window, event: platform.Event) void {
         if (self.closed) return;
+        if (event == .mouse) {
+            for (self.ui_frame.observers[0..self.ui_frame.observer_count]) |observer| _ = observer.dispatch(event, self);
+        }
+        if (@import("../widgets/overlay.zig").intercept(self, event)) {
+            if (event == .mouse) self.pointer_position = event.mouse.pos;
+            return;
+        }
         switch (event) {
             .mouse => |mouse| {
                 self.pointer_position = mouse.pos;
@@ -567,9 +574,12 @@ pub const Window = struct {
                         // dispatch — no focus adoption, no listener, no
                         // capture — as if unmounted.
                         if (!region.ownerAlive()) continue;
+                        if (!@import("../widgets/overlay.zig").allowsRegion(self, i)) continue;
                         if (modal_scope) |scope| {
-                            const handle = region.focus orelse continue;
-                            if (!scope.contains(handle.id)) continue;
+                            if (self.ui_frame.portal_count == 0) {
+                                const handle = region.focus orelse continue;
+                                if (!scope.contains(handle.id)) continue;
+                            }
                         }
                         if (region.focus) |handle| self.focused = handle;
                         if (region.mouse_down_listener) |listener| listener.call(self);

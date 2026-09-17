@@ -370,11 +370,19 @@ pub const Frame = struct {
     owner_overflows: u64 = 0,
 
     semantic_bindings: [@import("../a11y/root.zig").capacity]@import("../a11y/root.zig").Binding = undefined,
+    /// Transient top-layer roots, laid out and painted after the main tree.
+    portals: [32]@import("../widgets/overlay.zig").Portal = undefined,
+    portal_count: usize = 0,
+    /// Passive observers (hover leave, context menus), generation checked.
+    observers: [32]FocusHandle = undefined,
+    observer_count: usize = 0,
     semantic_count: usize = 0,
     semantic_dropped: usize = 0,
     semantic_tree: @import("../a11y/root.zig").Tree = .{},
 
     pub fn reset(self: *Frame, window: *anyopaque, pointer: core.Point) void {
+        self.portal_count = 0;
+        self.observer_count = 0;
         self.semantic_count = 0;
         self.semantic_dropped = 0;
         self.semantic_tree = .{};
