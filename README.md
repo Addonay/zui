@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # ZUI
 
 Hand-rolled retained UI framework in Zig. One foreground thread owns state

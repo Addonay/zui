@@ -14,6 +14,9 @@
 /zig-pkg/
 /.zig-cache/
 /target/
+**/target/
+*.AppImage
+*.aria2
 /.zig-global/
 /.zig-cache-layout/
 /.opencode/

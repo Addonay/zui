@@ -949,8 +949,10 @@ test "imgHandle validates generations, drops stale" {
     // Next frame the pool resets around the retained handle (stale pin, no
     // current-frame pins): the same element now paints nothing instead of
     // another image's recycled bytes. The reset is forced by rasterizing
-    // the icon at 1024x2048 (exactly the pool size) on frame 2.
-    _ = try cache.svgFromBytes(t.allocator, test_icon, 1024, 2048, null, 2);
+    // the icon at exactly the pool size on frame 2 (2048x2048 RGBA8 =
+    // MAX_IMAGE_POOL_BYTES; dimensions also respect MAX_IMAGE_DIMENSION
+    // and MAX_IMAGE_PIXELS).
+    _ = try cache.svgFromBytes(t.allocator, test_icon, 2048, 2048, null, 2);
     {
         const frame = try t.allocator.create(element.Frame);
         defer t.allocator.destroy(frame);

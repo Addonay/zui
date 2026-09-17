@@ -12,6 +12,11 @@ const EntityHeader = struct {
     value_ptr: *anyopaque,
     next: ?*EntityHeader = null,
     destroy_fn: *const fn (*EntityHeader) void,
+    /// The allocation this header lives in (the `Box`), carried explicitly:
+    /// values with alignment above the header's (any stored `Listener`,
+    /// whose payload is a 16-byte extern union) cannot be recovered with
+    /// `@fieldParentPtr` from the header pointer alone.
+    destroy_ctx: ?*anyopaque = null,
 };
 
 pub const EntityStore = struct {
@@ -47,11 +52,12 @@ pub const EntityStore = struct {
             .next = self.head,
             .destroy_fn = struct {
                 fn destroy(raw: *EntityHeader) void {
-                    const typed: *Box = @fieldParentPtr("header", raw);
+                    const typed: *Box = @ptrCast(@alignCast(raw.destroy_ctx.?));
                     if (@hasDecl(T, "deinit")) typed.value.deinit();
-                    typed.header.store.allocator.destroy(typed);
+                    raw.store.allocator.destroy(typed);
                 }
             }.destroy,
+            .destroy_ctx = @ptrCast(box),
         };
         self.next_id += 1;
         self.head = &box.header;
@@ -296,6 +302,26 @@ pub const TestHarness = struct {
         return self.store.create(T, options, null);
     }
 };
+
+test "entities can hold over-aligned values" {
+    // Regression: a value whose alignment exceeds EntityHeader's (any stored
+    // `Listener`, whose payload is a 16-byte extern union) used to fail the
+    // box's @fieldParentPtr.
+    const t = std.testing;
+    const Over = struct {
+        pub const Options = struct {};
+        payload: elements.element.ListenerPayload = .{ .alignment = 0 },
+
+        pub fn init(_: *Context(@This()), _: Options) @This() {
+            return .{};
+        }
+    };
+
+    var harness = try TestHarness.init(t.allocator);
+    defer harness.deinit();
+    const entity = harness.new(Over, .{});
+    try t.expect(@intFromPtr(entity.value) % 16 == 0);
+}
 
 test "element frames install the provider's engine" {
     // Regression: measure and paint must share one engine (or neither), so

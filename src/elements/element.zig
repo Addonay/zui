@@ -393,6 +393,11 @@ pub const Element = struct {
         self.node().style.full_width = true;
         return self;
     }
+    /// Fill the parent's content height (`style.full_height`).
+    pub fn h_full(self: Element) Element {
+        self.node().style.full_height = true;
+        return self;
+    }
     pub fn size(self: Element, value: f32) Element {
         self.node().style.square = value;
         return self;
@@ -430,6 +435,10 @@ pub const Element = struct {
     }
     pub fn pt(self: Element, value: f32) Element {
         self.node().style.padding.top = value;
+        return self;
+    }
+    pub fn pb(self: Element, value: f32) Element {
+        self.node().style.padding.bottom = value;
         return self;
     }
     pub fn absolute(self: Element) Element {

@@ -328,7 +328,11 @@ pub const MAX_IMAGE_DIMENSION: u32 = 4096;
 pub const MAX_IMAGE_PIXELS: u32 = 2048 * 2048;
 
 /// Decoded RGBA8 pool bytes owned by the App image cache (bump-allocated).
-pub const MAX_IMAGE_POOL_BYTES: u32 = 8 * 1024 * 1024;
+/// Measured working set (2026-09-17): the shadcn-zui charts gallery holds
+/// ~8.4MB of rasterized chart/icon SVGs at 1400px width, so 8MB left the
+/// trailing sections silently blank (ImageCacheFull is swallowed by the
+/// painter). 16MB restores ~2x headroom; revisit if pages grow further.
+pub const MAX_IMAGE_POOL_BYTES: u32 = 16 * 1024 * 1024;
 
 /// Maximum cached images (pool entries) at once.
 pub const MAX_CACHED_IMAGES: u32 = 64;

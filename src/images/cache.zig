@@ -159,7 +159,12 @@ pub const Cache = struct {
             // Reclaim only when no entry is pinned by the current frame;
             // otherwise already-emitted Scene refs would go stale.
             for (&self.entries) |*e| {
-                if (e.live and e.pin == frame) return PlaceError.ImageCacheFull;
+                if (e.live and e.pin == frame) {
+                    // Visible: the painter swallows this error, so a silent
+                    // return here blanks trailing images with no trace.
+                    zlog.log("images", "pool full ({d}/{d} bytes); entry dropped", .{ self.used, self.pool.len });
+                    return PlaceError.ImageCacheFull;
+                }
             }
             for (&self.entries) |*e| e.live = false;
             self.used = 0;
