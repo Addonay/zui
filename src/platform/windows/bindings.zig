@@ -62,6 +62,8 @@ pub const WM_CHAR: UINT = 0x0102;
 pub const WM_SYSKEYDOWN: UINT = 0x0104;
 pub const WM_SYSKEYUP: UINT = 0x0105;
 pub const WM_MOUSEMOVE: UINT = 0x0200;
+/// Win10+ per-monitor DPI change (lparam: suggested rect; wparam HIWORD: DPI).
+pub const WM_DPICHANGED: UINT = 0x02E0;
 pub const WM_LBUTTONDOWN: UINT = 0x0201;
 pub const WM_LBUTTONUP: UINT = 0x0202;
 pub const WM_RBUTTONDOWN: UINT = 0x0204;
@@ -111,6 +113,7 @@ pub const SWP_NOSIZE: UINT = 0x0001;
 pub const SWP_NOMOVE: UINT = 0x0002;
 pub const SWP_NOZORDER: UINT = 0x0004;
 pub const SWP_FRAMECHANGED: UINT = 0x0020;
+pub const SWP_NOACTIVATE: UINT = 0x0010;
 
 // Window-long indices, frame styles, show commands (stable ABI).
 pub const GWL_STYLE: c_int = -16;

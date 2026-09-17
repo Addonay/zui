@@ -283,11 +283,14 @@ pub const Win32Backend = struct {
         _ = api.SetWindowLongPtrW(hwnd, b.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
         _ = api.ShowWindow(hwnd, b.SW_SHOW);
         // Per-monitor DPI when available (Win10+); 96 → scale 1 otherwise.
+        // §5G: the requested size is LOGICAL; size the client area to
+        // PHYSICAL pixels for the discovered scale.
         if (api.GetDpiForWindow) |dpiFn| {
             const dpi = dpiFn(hwnd);
             if (dpi > 0) self.scale_factor = @as(f32, @floatFromInt(dpi)) / 96.0;
         }
-        self.recreateDib();
+        self.setClientSize(width, height);
+        self.ensureBuffer();
         return self;
     }
 
@@ -311,10 +314,52 @@ pub const Win32Backend = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    /// §5G DPI: PHYSICAL framebuffer dimensions (logical * scale). The OS
+    /// window's client rect, DIB and raster target are physical; `size`
+    /// and `windowInfo().size` stay logical (what the app lays out against).
+    pub fn physW(self: *const Win32Backend) u32 {
+        return @intFromFloat(@max(1, @round(self.size.w * self.scale_factor)));
+    }
+    pub fn physH(self: *const Win32Backend) u32 {
+        return @intFromFloat(@max(1, @round(self.size.h * self.scale_factor)));
+    }
+    /// Logical size for a PHYSICAL client size at this window's scale.
+    fn logicalFromPhys(self: *const Win32Backend, w: u32, h: u32) geometry.Size {
+        const s = @max(0.001, self.scale_factor);
+        return .{
+            .w = @max(1, @round(@as(f32, @floatFromInt(w)) / s)),
+            .h = @max(1, @round(@as(f32, @floatFromInt(h)) / s)),
+        };
+    }
+
+    /// Resize the OS window so the CLIENT area is `logical_w x logical_h`
+    /// at the current scale (physical pixels inside the frame).
+    fn setClientSize(self: *Win32Backend, logical_w: u32, logical_h: u32) void {
+        const hwnd = self.hwnd orelse return;
+        const pw: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(logical_w)) * self.scale_factor)));
+        const ph: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(logical_h)) * self.scale_factor)));
+        var rect = b.RECT{ .left = 0, .top = 0, .right = @intCast(pw), .bottom = @intCast(ph) };
+        _ = self.api.AdjustWindowRect(&rect, b.WS_OVERLAPPEDWINDOW, 0);
+        _ = self.api.SetWindowPos(hwnd, null, 0, 0, rect.right - rect.left, rect.bottom - rect.top, b.SWP_NOMOVE | b.SWP_NOZORDER);
+    }
+
+    /// (Re)create the PHYSICAL pixel buffer for the current logical size.
+    fn ensureBuffer(self: *Win32Backend) void {
+        const npx = @as(usize, self.physW()) * self.physH() * 4;
+        if (npx != self.pixels.len) {
+            if (self.allocator.realloc(self.pixels, npx)) |buf| {
+                self.pixels = buf;
+            } else |_| {}
+        }
+        self.recreateDib();
+    }
+
     fn recreateDib(self: *Win32Backend) void {
         self.destroyDib();
-        const w: u32 = @intFromFloat(self.size.w);
-        const h: u32 = @intFromFloat(self.size.h);
+        // §5G DPI: the DIB is PHYSICAL (logical * scale); the renderer
+        // scales the logical scene into it at present.
+        const w: u32 = self.physW();
+        const h: u32 = self.physH();
         if (w == 0 or h == 0 or self.hwnd == null) return;
         var info = std.mem.zeroes(b.BITMAPINFO);
         info.header.biSize = @sizeOf(b.BITMAPINFOHEADER);
@@ -377,18 +422,35 @@ pub const Win32Backend = struct {
             },
             b.WM_SIZE => {
                 if (self) |s| {
+                    // §5G DPI: WM_SIZE client dims are PHYSICAL pixels; the
+                    // app-visible size is logical at the window's scale.
                     const w: u32 = @intCast(lparam & 0xFFFF);
                     const h: u32 = @intCast((lparam >> 16) & 0xFFFF);
-                    if (w > 0 and h > 0 and (@as(f32, @floatFromInt(w)) != s.size.w or @as(f32, @floatFromInt(h)) != s.size.h)) {
-                        s.size.w = @floatFromInt(w);
-                        s.size.h = @floatFromInt(h);
-                        const npx = @as(usize, w) * h * 4;
-                        if (npx != s.pixels.len) {
-                            if (s.allocator.realloc(s.pixels, npx)) |buf| {
-                                s.pixels = buf;
-                                s.recreateDib();
-                            } else |_| {}
+                    if (w > 0 and h > 0) {
+                        const logical = s.logicalFromPhys(w, h);
+                        if (logical.w != s.size.w or logical.h != s.size.h) {
+                            s.size = logical;
+                            s.ensureBuffer();
+                            s.pushEvent(.{ .window = .resized });
                         }
+                    }
+                }
+                return 0;
+            },
+            b.WM_DPICHANGED => {
+                // §5G DPI: the window moved between monitors (Win10+).
+                // wparam HIWORD is the new DPI; lparam is a suggested RECT.
+                if (self) |s| {
+                    const dpi: u32 = @intCast((wparam >> 16) & 0xFFFF);
+                    const next_scale = @as(f32, @floatFromInt(dpi)) / 96.0;
+                    if (dpi > 0 and next_scale != s.scale_factor) {
+                        s.scale_factor = next_scale;
+                        s.ensureBuffer();
+                        // Honor the suggested frame (physical px) so the OS
+                        // doesn't fight us; WM_SIZE converts it to logical.
+                        const rect: *const b.RECT = @ptrFromInt(@as(usize, @bitCast(@as(isize, @truncate(@as(i64, @bitCast(lparam)))))));
+                        _ = s.api.SetWindowPos(s.hwnd orelse return 0, null, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, b.SWP_NOZORDER | b.SWP_NOACTIVATE);
+                        s.pushEvent(.{ .window = .scale_changed });
                         s.pushEvent(.{ .window = .resized });
                     }
                 }
@@ -649,14 +711,12 @@ pub const Win32Backend = struct {
     }
 
     /// Resize the client area; WM_SIZE resizes our buffers through the
-    /// same path as a user resize.
+    /// same path as a user resize. §5G DPI: the request is LOGICAL; the
+    /// OS window gets PHYSICAL client pixels.
     fn sizeFn(ptr: *anyopaque, w: u32, h: u32) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const hwnd = self.hwnd orelse return;
         if (w == 0 or h == 0) return;
-        var rect = b.RECT{ .left = 0, .top = 0, .right = @intCast(w), .bottom = @intCast(h) };
-        _ = self.api.AdjustWindowRect(&rect, b.WS_OVERLAPPEDWINDOW, 0);
-        _ = self.api.SetWindowPos(hwnd, null, 0, 0, rect.right - rect.left, rect.bottom - rect.top, b.SWP_NOMOVE | b.SWP_NOZORDER);
+        self.setClientSize(w, h);
     }
 
     fn cursorFn(ptr: *anyopaque, shape: backend.CursorShape) void {
@@ -762,8 +822,10 @@ pub const Win32Backend = struct {
 
     fn presentFn(ptr: *anyopaque, scene: *const gpu.Scene, glyph_pixels: []const u8, image_pixels: []const u8) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const w: u32 = @intFromFloat(self.size.w);
-        const h: u32 = @intFromFloat(self.size.h);
+        // §5G DPI: logical scene in, PHYSICAL framebuffer out.
+        const w: u32 = self.physW();
+        const h: u32 = self.physH();
+        self.renderer.scale_factor = self.scale_factor;
         // Rasterize into the DIB directly when present (top-down BGRA
         // matches the software .bgra32 layout byte for byte).
         if (self.dib_bits) |bits| {

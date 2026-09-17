@@ -386,7 +386,11 @@ pub const CocoaBackend = struct {
         );
 
         const scale = send(*const fn (b.id, b.SEL) callconv(.c) b.CGFloat)(window, sel.backingScaleFactor);
-        const pixels = try allocator.alloc(u8, @as(usize, width) * height * 4);
+        // §5G DPI: the pixel buffer is PHYSICAL backing pixels (points *
+        // scale); app-visible size stays logical points.
+        const pw: usize = @intFromFloat(@as(f32, @floatFromInt(width)) * @max(1.0, @as(f32, @floatCast(scale))));
+        const ph: usize = @intFromFloat(@as(f32, @floatFromInt(height)) * @max(1.0, @as(f32, @floatCast(scale))));
+        const pixels = try allocator.alloc(u8, pw * ph * 4);
         errdefer allocator.free(pixels);
         @memset(pixels, 0);
 
@@ -445,6 +449,16 @@ pub const CocoaBackend = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    /// §5G DPI: PHYSICAL backing-pixel dimensions (points * scale). The
+    /// bitmap context and raster target are backing pixels; `size`,
+    /// NSView frames and `windowInfo().size` are logical points.
+    pub fn physW(self: *const CocoaBackend) usize {
+        return @intFromFloat(@max(1, @round(self.size.w * self.scale_factor)));
+    }
+    pub fn physH(self: *const CocoaBackend) usize {
+        return @intFromFloat(@max(1, @round(self.size.h * self.scale_factor)));
+    }
+
     fn recreateBitmap(self: *CocoaBackend) void {
         if (self.image) |img| {
             self.cg.imageRelease(img);
@@ -455,8 +469,9 @@ pub const CocoaBackend = struct {
             self.bitmap_ctx = null;
         }
         if (self.colorspace == null) self.colorspace = self.cg.colorSpaceCreateDeviceRGB();
-        const w: usize = @intFromFloat(self.size.w);
-        const h: usize = @intFromFloat(self.size.h);
+        // §5G DPI: the backing context is PHYSICAL pixels for sharp text.
+        const w: usize = self.physW();
+        const h: usize = self.physH();
         if (w == 0 or h == 0) return;
         self.bitmap_ctx = self.cg.bitmapContextCreate(self.pixels.ptr, w, h, 8, w * 4, self.colorspace, b.CG_IMAGE_ALPHA_PREMULTIPLIED_LAST | b.CG_BITMAP_BYTE_ORDER_32_BIG);
     }
@@ -641,13 +656,18 @@ pub const CocoaBackend = struct {
 
     fn delegateDidResize(_: b.id, _: b.SEL, _: b.id) callconv(.c) void {
         if (active) |self| {
+            // NSView frame is logical POINTS; re-query the backing scale so
+            // a window moved between Retina densities stays sharp.
             const frame = send(*const fn (b.id, b.SEL) callconv(.c) b.NSRect)(self.view, self.sel.frame);
             const w: f32 = @floatCast(frame.size.w);
             const h: f32 = @floatCast(frame.size.h);
+            const scale: f32 = @floatCast(@max(1.0, send(*const fn (b.id, b.SEL) callconv(.c) b.CGFloat)(self.window, self.sel.backingScaleFactor)));
+            const scale_changed = scale != self.scale_factor;
+            if (scale_changed) self.scale_factor = scale;
             if (w != self.size.w or h != self.size.h) {
                 self.size.w = w;
                 self.size.h = h;
-                const npx = @as(usize, @intFromFloat(w)) * @as(usize, @intFromFloat(h)) * 4;
+                const npx: usize = self.physW() * self.physH() * 4;
                 if (npx != self.pixels.len) {
                     if (self.allocator.realloc(self.pixels, npx)) |buf| {
                         self.pixels = buf;
@@ -655,6 +675,11 @@ pub const CocoaBackend = struct {
                     } else |_| {}
                 }
                 self.pushEvent(.{ .window = .resized });
+            } else if (scale_changed) {
+                // Same point size on a different backing density: buffers
+                // heal at the next present; report the new scale now.
+                self.recreateBitmap();
+                self.pushEvent(.{ .window = .scale_changed });
             }
         }
     }
@@ -909,8 +934,10 @@ pub const CocoaBackend = struct {
 
     fn presentFn(ptr: *anyopaque, scene: *const gpu.Scene, glyph_pixels: []const u8, image_pixels: []const u8) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const w: u32 = @intFromFloat(self.size.w);
-        const h: u32 = @intFromFloat(self.size.h);
+        // §5G DPI: logical scene in, PHYSICAL backing pixels out.
+        const w: u32 = @intCast(self.physW());
+        const h: u32 = @intCast(self.physH());
+        self.renderer.scale_factor = self.scale_factor;
         if (self.bitmap_ctx) |_| {
             self.renderer.render(self.pixels, w, h, .rgba32, gpu.vellz.Color.hex(0x0e0e13), scene, glyph_pixels, image_pixels) catch |err| {
                 std.debug.print("cocoa: vellz render failed: {s}\n", .{@errorName(err)});
