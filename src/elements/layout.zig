@@ -124,6 +124,19 @@ pub fn measure(frame: *element.Frame, index: u16) core.Size {
 }
 
 pub fn layout(frame: *element.Frame, root: element.Element, viewport: core.Rect) void {
+    const adapter = @import("zlay_adapter.zig");
+    if (adapter.useZlayLayout()) {
+        adapter.layout(frame, root, viewport) catch |err| {
+            @import("../core/log.zig").log("layout", "Zlay failed ({s}); falling back to legacy", .{@errorName(err)});
+            layoutLegacy(frame, root, viewport);
+        };
+        return;
+    }
+    layoutLegacy(frame, root, viewport);
+}
+
+/// Explicit legacy entry point for differential fixtures (ignores env).
+pub fn layoutLegacy(frame: *element.Frame, root: element.Element, viewport: core.Rect) void {
     _ = measure(frame, root.index);
     place(frame, root.index, viewport, true);
 }

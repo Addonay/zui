@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "layout", .module = layout_mod },
+            .{ .name = "zlay", .module = layout_mod },
             .{ .name = "cozmic", .module = cozmic_dep.module("cozmic") },
             .{ .name = "vellz", .module = vellz_dep.module("vellz") },
             .{ .name = "build_options", .module = build_options.createModule() },
@@ -70,6 +71,11 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
+
+    const adapter_tests = b.addTest(.{ .root_module = mod, .filters = &.{"adapter"} });
+    const run_adapter_tests = b.addRunArtifact(adapter_tests);
+    const adapter_test_step = b.step("test-zlay", "Run focused adapter agreement and grid regression tests");
+    adapter_test_step.dependOn(&run_adapter_tests.step);
 
     // Compile the layout module as its own root as well. This catches
     // accidental dependencies on the wider ZUI surface and documents the
@@ -166,6 +172,21 @@ pub fn build(b: *std.Build) void {
     const selftest_dash_step = b.step("selftest-dash", "Run the dashboard headless integration selftest");
     selftest_dash_step.dependOn(&selftest_dash.step);
     test_step.dependOn(&selftest_dash.step);
+
+    // Opt-in migration gate uses the real mounted trees; default tests above
+    // intentionally retain legacy layout until geometry parity is broader.
+    const zlay_todo = b.addRunArtifact(todo);
+    zlay_todo.setEnvironmentVariable("ZUI_LAYOUT", "zlay");
+    zlay_todo.setEnvironmentVariable("ZUI_BACKEND", "null");
+    zlay_todo.setEnvironmentVariable("ZUI_TODO_DEMO", "1");
+    zlay_todo.setEnvironmentVariable("ZUI_SELFTEST", "1");
+    const zlay_dash = b.addRunArtifact(dash);
+    zlay_dash.setEnvironmentVariable("ZUI_LAYOUT", "zlay");
+    zlay_dash.setEnvironmentVariable("ZUI_BACKEND", "null");
+    zlay_dash.setEnvironmentVariable("ZUI_SELFTEST", "1");
+    const zlay_step = b.step("selftest-zlay", "Run real todo/dashboard trees through experimental Zlay layout");
+    zlay_step.dependOn(&zlay_todo.step);
+    zlay_step.dependOn(&zlay_dash.step);
 
     // The Rust + gpui-kit take on the same dashboard lives in
     // `examples/dash-gpui`. Cargo owns that build; this step just forwards to
