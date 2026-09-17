@@ -1,0 +1,16 @@
+.{
+    .name = .smoke_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0xa8051ea1ae79968a,
+    .minimum_zig_version = "0.17.0-dev.2085+5e36170b5",
+    .dependencies = .{
+        .zui = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

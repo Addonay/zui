@@ -13,6 +13,9 @@
 /zig-out/
 /zig-pkg/
 /.zig-cache/
+**/zig-out/
+**/zig-pkg/
+**/.zig-cache/
 /target/
 **/target/
 *.AppImage

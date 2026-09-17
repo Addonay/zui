@@ -207,4 +207,25 @@ pub fn build(b: *std.Build) void {
     run_bench_text.addPassthruArgs();
     const bench_text_step = b.step("bench-text", "Benchmark the text element frame path (headless, no window)");
     bench_text_step.dependOn(&run_bench_text.step);
+
+    // Compile-only gate: builds every test root and example binary without
+    // executing anything. `zig build test` cannot run on foreign targets
+    // (RunArtifact would exec a foreign binary), so CI cross-target jobs
+    // use `zig build check -Dtarget=<triple>` instead.
+    const check_step = b.step("check", "Compile all tests and examples without running them");
+    check_step.dependOn(&mod_tests.step);
+    check_step.dependOn(&layout_tests.step);
+    check_step.dependOn(&todo_tests.step);
+    check_step.dependOn(&todo.step);
+    check_step.dependOn(&dash.step);
+    check_step.dependOn(&images_demo.step);
+    check_step.dependOn(&bench_text_exe.step);
+
+    // External-consumer smoke test: builds the minimal out-of-tree package
+    // in tools/smoke_consumer against this checkout via a path dependency.
+    // Manual equivalent: `cd tools/smoke_consumer && zig build`.
+    const smoke = b.addSystemCommand(&.{ "zig", "build", "--summary", "all" });
+    smoke.setCwd(b.path("tools/smoke_consumer"));
+    const smoke_step = b.step("smoke", "Build the external path-dependency consumer package");
+    smoke_step.dependOn(&smoke.step);
 }

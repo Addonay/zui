@@ -1,6 +1,3 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
-
 # ZUI
 
 Hand-rolled retained UI framework in Zig. One foreground thread owns state
@@ -10,10 +7,11 @@ presents it with the vellz CPU renderer. GPU drivers are future work.
 
 ## Toolchain
 
-- Tested with `zig version 0.17.0-dev.2085+5e36170b5` on Linux.
-- `build.zig.zon` declares `minimum_zig_version 0.17.0-dev.1970+67f39b551`
+- Tested with `zig version 0.17.0-dev.2151+2ec5523d5` on Linux.
+- `build.zig.zon` declares `minimum_zig_version 0.17.0-dev.2085+5e36170b5`
   (a floor, not the tested revision). Bump it deliberately and note the
-  tested revision here when upgrading.
+  tested revision here when upgrading. See `docs/PLATFORM_MATRIX.md`
+  for the toolchain policy.
 - System libraries (Wayland/X11, Vulkan loader) are reached through
   hand-written `extern` tables via runtime `dlopen` — never hard-linked.
   The cozmic text engine dlopens FreeType/HarfBuzz/Fontconfig itself; ZUI
@@ -60,14 +58,19 @@ inspect or remove that checkout explicitly before rerunning it.
 App / scheduler            owns entities, platform connection, text engine, image cache
   Window                   one logical window (native window ownership: see Limits)
     elements.Frame         transient nodes rebuilt each dirty render
-      elements.layout      flexbox measure/place (standalone layout/ port NOT yet wired)
-      elements.painter     nodes -> gpu.Scene (quads + glyphs + image blits)
+      elements.layout      flexbox measure/place for element trees (the
+                           packaged zlay engine is tested but NOT yet
+                           wired into element layout; adapter is plan M3)
+      elements.painter     nodes -> ordered gpu.Scene commands
+                           (quads + glyphs + image blits, drawn in order)
       gpu.vellz            Vello-derived CPU renderer; platform backends present
 fonts/                     text engine: cozmic shaping/layout, FreeType raster,
                            swash image cache + the ZUI glyph atlas
 images/                    stb/nanosvg decoders + decoded-pixel cache
-layout/                    source-shaped Taffy port, standalone; adapter is plan M3
-gpu/device.zig             experimental SDL-shaped vtable; no working driver yet
+zlay (package)             source-shaped Taffy port, standalone dependency;
+                           see PLATFORM_MATRIX/plan for wiring status
+gpu/device.zig             SDL-shaped device contract; software/null drivers
+                           validate, Vulkan/Metal/D3D12 init is unsupported
 ```
 
 Roadmap: `plan.md` (milestones M0–M7). Port ledger: `src/layout/port.md`.
@@ -75,8 +78,9 @@ Roadmap: `plan.md` (milestones M0–M7). Port ledger: `src/layout/port.md`.
 ## Supported / limitations
 
 - Backends: Linux Wayland + X11 (runtime-verified); macOS Cocoa and Windows
-  Win32 exist as source but are **not** runtime-validated here. Headless
-  `null` backend for tests. `ZUI_BACKEND=wayland|x11|null` pins the choice.
+  Win32 exist as source but are **not** runtime-validated here — and
+  foreign-target compilation currently fails (see `docs/PLATFORM_MATRIX.md`).
+  Headless `null` backend for tests. `ZUI_BACKEND=wayland|x11|null` pins the choice.
 - One native window per process for now (`error.MultipleNativeWindowsNotSupported`
   otherwise); headless supports up to `MAX_WINDOWS` logical windows.
 - Text: cozmic is the only text engine. Element measure and paint both run
@@ -85,12 +89,23 @@ Roadmap: `plan.md` (milestones M0–M7). Port ledger: `src/layout/port.md`.
   holds only the glyph atlas (`atlas.zig`) and the engine
   (`text_engine.zig`); there is no legacy `-Dtext-engine` switch. When no
   engine is installed in a frame, text draws nothing. TextField is
-  append-only with no selection/IME yet (plan M3/M4).
-- Scene draws quads, then glyphs, then images — cross-type paint order is
-  **not** preserved (plan M2). No per-window DPI scaling yet.
+  single-line with caret movement, insertion at the caret, deletion, and
+  codepoint-safe capacity clipping — but no selection, undo, or IME yet
+  (plan M3/M4).
+- Scene is an ordered command stream (`src/gpu/scene.zig`) consumed in
+  paint order by the Vellz CPU path; cross-type overlap is preserved.
+  Commands are bounded (`MAX_RENDER_COMMANDS` 8192); overflow is reported
+  via `Scene.dropped`, not silently hidden. No per-window DPI scaling yet.
 - `gpu/device` + Vulkan/Metal/D3D12 are skeletons returning
-  `error.Unsupported`; presentation goes through `gpu/vellz`.
+  `error.Unsupported`; presentation goes through `gpu/vellz` CPU rendering.
 - Hot structs (`Scene` ~5.9MB, element `Frame` ~2.5MB, all inline storage)
   must be heap-allocated or embedded in a heap owner — never stacked
   together in one function. The engine is heap-allocated for the same
   reason (its atlas is ~1MB inline).
+
+## License / platform status
+
+- License: MIT (`LICENSE`); third-party notices: `NOTICE.md`.
+- Platform support levels (source vs compile vs launch vs validated):
+  `docs/PLATFORM_MATRIX.md`. CI runs native tests plus compile-only
+  cross-target checks (`.github/workflows/ci.yml`).

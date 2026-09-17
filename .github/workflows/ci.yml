@@ -1,0 +1,71 @@
+# Stage 0 baseline CI: native tests plus compile-only cross-target checks.
+#
+# Toolchain is pinned to the exact tested revision via the download index
+# (see docs/PLATFORM_MATRIX.md). Cross-target jobs are compile-only
+# (`zig build check` never executes binaries) and are currently
+# `continue-on-error` because foreign-target compilation fails with the
+# known defects listed in docs/PLATFORM_MATRIX.md (report section 5H).
+# They exist so regressions and fixes are both visible.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  # Exact tested compiler; keep in sync with README.md and build.zig.zon.
+  ZIG_VERSION: 0.17.0-dev.2151+2ec5523d5
+
+jobs:
+  native-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Zig
+        run: |
+          curl -s https://ziglang.org/download/index.json -o /tmp/zig-index.json
+          URL=$(python3 -c "import json; print(json.load(open('/tmp/zig-index.json'))['master']['x86_64-linux']['tarball'])")
+          curl -L "$URL" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig" && tar -xf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+      - name: Toolchain
+        run: zig version
+      - name: Native tests (unit + headless selftests)
+        run: zig build test --summary all
+      - name: External package smoke test
+        run: zig build smoke --summary all
+
+  check-windows:
+    # Known-failing: see docs/PLATFORM_MATRIX.md section "Windows".
+    name: check (x86_64-windows-gnu, known-failing)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Zig
+        run: |
+          curl -s https://ziglang.org/download/index.json -o /tmp/zig-index.json
+          URL=$(python3 -c "import json; print(json.load(open('/tmp/zig-index.json'))['master']['x86_64-linux']['tarball'])")
+          curl -L "$URL" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig" && tar -xf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+      - name: Compile-only check (never executes)
+        run: zig build check -Dtarget=x86_64-windows-gnu --summary all
+
+  check-macos:
+    # Known-failing: see docs/PLATFORM_MATRIX.md section "macOS".
+    name: check (aarch64-macos, known-failing)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Zig
+        run: |
+          curl -s https://ziglang.org/download/index.json -o /tmp/zig-index.json
+          URL=$(python3 -c "import json; print(json.load(open('/tmp/zig-index.json'))['master']['x86_64-linux']['tarball'])")
+          curl -L "$URL" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig" && tar -xf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+      - name: Compile-only check (never executes)
+        run: zig build check -Dtarget=aarch64-macos --summary all
