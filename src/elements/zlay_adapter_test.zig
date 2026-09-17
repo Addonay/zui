@@ -78,6 +78,10 @@ test "adapter measurement callbacks: text handoff and image intrinsic aspect" {
     f.* = .{};
     f.allocator = t.allocator;
     f.engine = engine;
+    const cache = try @import("../images/root.zig").Cache.init(t.allocator);
+    defer cache.deinit(t.allocator);
+    f.images = cache;
+    _ = try cache.assets.preloadBytes("<svg width=\"40\" height=\"20\" xmlns=\"http://www.w3.org/2000/svg\"></svg>", 0);
     e.beginFrame(f);
     defer e.endFrame();
     const image = e.svg("<svg width=\"40\" height=\"20\" xmlns=\"http://www.w3.org/2000/svg\"></svg>").w(20);

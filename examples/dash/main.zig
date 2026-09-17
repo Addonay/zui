@@ -177,6 +177,7 @@ pub const Dash = struct {
 
     alloc: std.mem.Allocator,
     chart_svg: ?[]u8 = null,
+    chart_sources: [3]?[]u8 = @splat(null),
     sidebar_open: bool = true,
     range: Range = .months90,
     tab: Tab = .outline,
@@ -264,8 +265,11 @@ pub const Dash = struct {
 
     /// Rebuild the rotating loader glyph for the current frame time.
     fn refreshSpinner(self: *@This(), window: *Window) void {
-        const phi = @as(f64, @floatFromInt(@mod(window.timeMs(), 800))) / 800.0;
-        const angle = phi * 360.0;
+        const phase = @divTrunc(@mod(window.timeMs(), 800), 50);
+        self.buildSpinner(@as(f64, @floatFromInt(phase)) * 22.5);
+    }
+
+    fn buildSpinner(self: *@This(), angle: f64) void {
         const open_end = std.mem.indexOfScalar(u8, icons.loader, '>') orelse return;
         const close_start = std.mem.lastIndexOf(u8, icons.loader, "</svg>") orelse return;
         const body = icons.loader[open_end + 1 .. close_start];
@@ -306,7 +310,24 @@ pub const Dash = struct {
     }
 
     pub fn deinit(self: *@This()) void {
-        if (self.chart_svg) |svg| self.alloc.free(svg);
+        for (self.chart_sources) |source| if (source) |bytes| self.alloc.free(bytes);
+    }
+
+    /// All image work happens before the first view frame. SVG variants use
+    /// intrinsic resolution; layout scales them without rasterizing in paint.
+    fn preloadAssets(self: *@This(), cache: *zui.images.Cache) !void {
+        inline for (comptime std.meta.declarations(icons)) |decl| {
+            _ = try cache.assets.preloadBytes(@field(icons, decl), 0);
+        }
+        inline for (.{ Range.months90, Range.days30, Range.days7 }, 0..) |range, i| {
+            const bytes = try chart.build(self.alloc, range.days(&data.DAYS), 250);
+            self.chart_sources[i] = bytes;
+            _ = try cache.assets.preloadBytes(bytes, 0);
+        }
+        for (0..16) |phase| {
+            self.buildSpinner(@as(f64, @floatFromInt(phase)) * 22.5);
+            _ = try cache.assets.preloadBytes(self.spinner(), 0);
+        }
     }
 
     /// Plot height for the current page width (mirrors the reference's flat
@@ -317,21 +338,12 @@ pub const Dash = struct {
     }
 
     pub fn setRange(self: *@This(), value: Range) void {
-        if (self.chart_svg) |svg| {
-            self.alloc.free(svg);
-            self.chart_svg = null;
-        }
         self.range = value;
     }
 
     fn ensureChart(self: *@This(), height: f32) void {
-        if (self.chart_svg != null and self.chart_h == height) return;
-        if (self.chart_svg) |svg| {
-            self.alloc.free(svg);
-            self.chart_svg = null;
-        }
         self.chart_h = height;
-        self.chart_svg = chart.build(self.alloc, self.range.days(&data.DAYS), self.chart_h) catch null;
+        self.chart_svg = self.chart_sources[@intFromEnum(self.range)];
     }
 
     // -- window chrome -----------------------------------------------------
@@ -434,8 +446,11 @@ pub const Dash = struct {
 // ---------------------------------------------------------------------------
 
 fn buildRoot(window: *Window, vcx: *Context(Dash)) Entity(Dash) {
-    _ = window;
-    return vcx.new(Dash, .{});
+    const view = vcx.new(Dash, .{});
+    if (window.images) |cache| view.readMut().preloadAssets(cache) catch |err| {
+        std.log.err("asset preload: {s}", .{@errorName(err)});
+    };
+    return view;
 }
 
 fn onOpen(cx: *App) void {

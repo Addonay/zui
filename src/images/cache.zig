@@ -47,6 +47,8 @@ const Entry = struct {
 };
 
 pub const Cache = struct {
+    /// Asset registry shares this App-owned pool's lifetime.
+    assets: @import("service.zig").Service = undefined,
     pool: []u8 = &.{},
     used: usize = 0,
     entries: [limits.MAX_CACHED_IMAGES]Entry = undefined,
@@ -60,12 +62,14 @@ pub const Cache = struct {
         const self = try allocator.create(Cache);
         errdefer allocator.destroy(self);
         self.* = .{};
+        self.assets = @import("service.zig").Service.init(allocator, self);
         for (&self.entries) |*e| e.* = .{};
         self.pool = try allocator.alloc(u8, limits.MAX_IMAGE_POOL_BYTES);
         return self;
     }
 
     pub fn deinit(self: *Cache, allocator: std.mem.Allocator) void {
+        self.assets.deinit();
         allocator.free(self.pool);
         allocator.destroy(self);
     }
@@ -137,7 +141,7 @@ pub const Cache = struct {
         return self.place(hash, rendered.pixels, rendered.w, rendered.h, frame);
     }
 
-    fn lookup(self: *Cache, hash: u64, frame: u64) ?Handle {
+    pub fn lookup(self: *Cache, hash: u64, frame: u64) ?Handle {
         for (&self.entries) |*e| {
             if (e.live and e.hash == hash) {
                 e.pin = frame;
@@ -169,7 +173,7 @@ pub const Cache = struct {
 
     const PlaceError = error{ ImageCacheFull, ImageTooLarge };
 
-    fn place(self: *Cache, hash: u64, src: []const u8, w: u32, h: u32, frame: u64) PlaceError!Handle {
+    pub fn place(self: *Cache, hash: u64, src: []const u8, w: u32, h: u32, frame: u64) PlaceError!Handle {
         if (src.len > self.pool.len) return PlaceError.ImageTooLarge;
         if (self.used + src.len > self.pool.len) {
             // Reclaim only when no entry is pinned by the current frame;

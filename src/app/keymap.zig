@@ -5,13 +5,13 @@
 //! pair one keystroke sequence with an action name plus an optional
 //! context predicate (`"TodoList && mode == normal"`). The deepest
 //! context-frame match wins; two-keystroke sequences (vim-style `"g g"`)
-//! pend until completed or a tick budget expires, at which point a
+//! pend until completed or a monotonic deadline expires, at which point a
 //! remembered single-key match fires.
 //!
 //! Zig adaptations: no trait objects (actions stay name→listener pairs on
 //! `Window`), no allocation (fixed pools in `core/limits.zig`), predicates
-//! compile to a fixed node array at bind time, and pending expiry counts
-//! `App.step` ticks instead of wall time (deterministic headless tests).
+//! compile to a fixed node array at bind time. Expiry uses monotonic
+//! milliseconds, with explicit timestamps for deterministic headless tests.
 
 const std = @import("std");
 const event = @import("../platform/event.zig");
@@ -313,7 +313,8 @@ pub const ContextFrame = struct {
 // Keymap
 // ============================================================================
 
-pub const MAX_PENDING_TICKS: u8 = 45;
+/// Approximately the old 45-frame budget at 60 Hz, independent of traffic.
+pub const PENDING_TIMEOUT_MS: i64 = 750;
 
 pub const KeyBinding = struct {
     strokes: [2]Keystroke = undefined,
@@ -327,7 +328,7 @@ pub const Keymap = struct {
     count: u8 = 0,
     pending_first: ?Keystroke = null,
     pending_single: ?[]const u8 = null,
-    pending_ticks: u8 = 0,
+    pending_deadline_ms: ?i64 = null,
 
     /// Bind `"ctrl-s"` / `"g g"` to an action in an optional context.
     /// False when unparsable or the table is full.
@@ -349,30 +350,42 @@ pub const Keymap = struct {
         return true;
     }
 
-    /// Advance pending-sequence expiry. Returns a timed-out single-key
-    /// action, if one was remembered. Called once per `App.step`.
-    pub fn tick(self: *@This()) ?[]const u8 {
-        if (self.pending_first == null) return null;
-        if (self.pending_ticks > 0) self.pending_ticks -= 1;
-        if (self.pending_ticks == 0) {
-            self.pending_first = null;
-            const single = self.pending_single;
-            self.pending_single = null;
-            return single;
-        }
-        return null;
+    pub fn nextDeadlineMs(self: *const @This()) ?i64 {
+        return self.pending_deadline_ms;
+    }
+
+    /// Call before dispatching input as well as on deadline wakes, so a late
+    /// second key cannot complete an expired sequence. Fires at most once.
+    pub fn expire(self: *@This(), now_ms: i64) ?[]const u8 {
+        const deadline = self.pending_deadline_ms orelse return null;
+        if (now_ms < deadline) return null;
+        self.pending_deadline_ms = null;
+        self.pending_first = null;
+        const single = self.pending_single;
+        self.pending_single = null;
+        return single;
     }
 
     /// Dispatch one pressed keystroke against `stack` (outermost first).
     /// Returns the action name, or null when nothing fires (including a
     /// sequence starter, which pends instead).
     pub fn dispatch(self: *@This(), stroke: Keystroke, stack: []const ContextFrame) ?[]const u8 {
+        return self.dispatchAt(stroke, stack, @import("window.zig").Window.monotonicMs());
+    }
+
+    /// Caller must deliver expire(now_ms) first to preserve a deferred single
+    /// action alongside the new keystroke. Window does this before dispatch.
+    pub fn dispatchAt(self: *@This(), stroke: Keystroke, stack: []const ContextFrame, now_ms: i64) ?[]const u8 {
         if (self.pending_first) |first| {
+            const in_time = if (self.pending_deadline_ms) |due| now_ms < due else false;
             self.pending_first = null;
             self.pending_single = null;
-            self.pending_ticks = 0;
-            // Complete a remembered sequence first.
-            if (self.bestSequence(first, stroke, stack)) |action| return action;
+            self.pending_deadline_ms = null;
+            // Never complete a stale sequence even if a direct caller forgot
+            // to deliver expire() first (that caller loses the single action).
+            if (in_time) {
+                if (self.bestSequence(first, stroke, stack)) |action| return action;
+            }
             // Otherwise the new keystroke starts fresh (GPUI replaces the
             // pending chord rather than queuing it).
         }
@@ -397,7 +410,7 @@ pub const Keymap = struct {
             // Ambiguous: pend the sequence, fire the single on timeout.
             self.pending_first = stroke;
             self.pending_single = single;
-            self.pending_ticks = MAX_PENDING_TICKS;
+            self.pending_deadline_ms = now_ms +| PENDING_TIMEOUT_MS;
             return null;
         }
         return single;
@@ -507,6 +520,25 @@ test "keymap dispatches deepest context first" {
     try t.expect(!full.bind("a", "x", null));
 }
 
+test "key sequence deadline uses elapsed milliseconds not dispatch count" {
+    const t = std.testing;
+    var map = Keymap{};
+    try t.expect(map.bind("g g", "sequence", null));
+    try t.expect(map.bind("g", "single", null));
+    const g = Keystroke{ .key = .g };
+    try t.expect(map.dispatchAt(g, &.{}, 1000) == null);
+    try t.expectEqual(@as(?i64, 1750), map.nextDeadlineMs());
+    for (0..5000) |_| try t.expect(map.expire(1000) == null);
+    try t.expectEqualStrings("sequence", map.dispatchAt(g, &.{}, 1749).?);
+    try t.expect(map.nextDeadlineMs() == null);
+    try t.expect(map.dispatchAt(g, &.{}, 2000) == null);
+    try t.expectEqualStrings("single", map.expire(2750).?);
+    try t.expect(map.dispatchAt(g, &.{}, 2750) == null);
+    // Even a direct caller cannot finish a stale sequence.
+    try t.expect(map.dispatchAt(g, &.{}, 10_000) == null);
+    try t.expectEqual(@as(?i64, 10_750), map.nextDeadlineMs());
+}
+
 test "keymap sequences pend, complete, expire, and reset" {
     const t = std.testing;
     var map = Keymap{};
@@ -526,12 +558,10 @@ test "keymap sequences pend, complete, expire, and reset" {
     try t.expect(map.dispatch(Keystroke{ .key = .a }, &stack) == null);
     // Pending cleared by the mismatch; plain g pends again.
     try t.expect(map.dispatch(g, &stack) == null);
-    // Ticks without completion fire the remembered single on expiry.
-    var i: u8 = 0;
-    var fired: ?[]const u8 = null;
-    while (i < MAX_PENDING_TICKS) : (i += 1) {
-        fired = map.tick();
-    }
-    try t.expectEqualStrings("gee", fired.?);
-    try t.expect(map.tick() == null);
+    // Traffic does not consume time: repeated checks cannot expire early.
+    const deadline = map.nextDeadlineMs().?;
+    for (0..1000) |_| try t.expect(map.expire(deadline - 1) == null);
+    try t.expectEqualStrings("gee", map.expire(deadline).?);
+    try t.expect(map.nextDeadlineMs() == null);
+    try t.expect(map.expire(deadline + 1) == null);
 }

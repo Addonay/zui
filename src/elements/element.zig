@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const core = @import("../core/root.zig");
 const platform = @import("../platform/root.zig");
 const fonts = @import("../fonts/text_engine.zig");
@@ -198,6 +197,7 @@ pub const ImageSource = union(enum) {
     bytes: []const u8,
     path: []const u8,
     handle: images.Handle,
+    asset: images.AssetHandle,
 };
 
 pub const ImageDesc = struct {
@@ -211,8 +211,8 @@ pub const ImageDesc = struct {
     /// Replaces `currentColor` in SVGs (GPUI icon tint); multiplies alpha
     /// into raster blits together with style opacity.
     tint: ?core.Color = null,
-    /// Intrinsic pixel size resolved at build (probe/header, no full
-    /// decode); zero when unknown so layout collapses the node.
+    /// Intrinsic size from preloaded metadata; unknown sources use a 24px
+    /// diagnostic placeholder rather than collapsing silently.
     intrinsic_w: f32 = 0,
     intrinsic_h: f32 = 0,
 };
@@ -330,10 +330,10 @@ pub const Frame = struct {
     /// Borrowed image cache for img()/svg() resolution. Null drops images.
     /// Set per frame from `Window.images`; never owned here.
     images: ?*images.Cache = null,
+    image_placeholders: u64 = 0,
     /// Owning App's step counter at render; pins image-cache entries.
     frame_id: u64 = 0,
-    /// Allocator for cold image work (file reads, decode dividends).
-    /// Null drops path sources and uncached decodes.
+    /// Allocator for frame text/layout work. Images never allocate here.
     allocator: ?std.mem.Allocator = null,
     /// Frame identity for transient-handle checks (gap §5A). Bumped by
     /// every `reset()`; each `Element` stamps the generation it was built
@@ -936,63 +936,25 @@ pub fn spacer() Element {
     return result.flex_1();
 }
 
-/// Resolve intrinsic pixel size without a full decode: raster headers via
-/// probe, SVG via width/height (or nanosvg's viewBox fallback). Path
-/// sources read through the frame allocator; anything missing yields 0x0
-/// so layout collapses the node instead of guessing.
-fn resolveIntrinsic(source: ImageSource, is_svg: bool, allocator: ?std.mem.Allocator) struct { w: f32, h: f32 } {
-    switch (source) {
-        .handle => |h| return .{ .w = @floatFromInt(h.w), .h = @floatFromInt(h.h) },
-        .bytes => |bytes| {
-            if (is_svg or images.sniff(bytes) == .svg) {
-                const s = images.svg.intrinsicSize(bytes) catch return .{ .w = 0, .h = 0 };
-                return .{ .w = s.w, .h = s.h };
-            }
-            const p = images.raster.probe(bytes) catch return .{ .w = 0, .h = 0 };
-            return .{ .w = @floatFromInt(p.w), .h = @floatFromInt(p.h) };
-        },
-        .path => |path| {
-            const alloc = allocator orelse return .{ .w = 0, .h = 0 };
-            const bytes = readPath(alloc, path) catch return .{ .w = 0, .h = 0 };
-            defer alloc.free(bytes);
-            return resolveIntrinsic(.{ .bytes = bytes }, is_svg, null);
-        },
-    }
+/// Resolve a preloaded source identity. No I/O, probing, decoding or hashing.
+pub fn sourceAsset(source: ImageSource, cache: *images.Cache) ?images.AssetHandle {
+    return switch (source) {
+        .asset => |h| h,
+        .path => |path| cache.assets.findPath(path),
+        .bytes => |bytes| cache.assets.findBytes(bytes),
+        .handle => null,
+    };
 }
 
-/// Read a whole file (cold path: dirty-frame builds only). Caller frees.
-/// Plain libc I/O, same pattern as the snapshot writer in examples/todo.
-pub fn readPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (!builtin.link_libc) return error.Unreadable;
-    var path_buf: [4096]u8 = undefined;
-    if (path.len == 0 or path.len >= path_buf.len) return error.BadPath;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-    const name: [*:0]const u8 = path_buf[0..path.len :0];
-    const f = std.c.fopen(name, "rb") orelse return error.Unreadable;
-    defer _ = std.c.fclose(f);
-    // Chunked read; a short fread ends input (regular files).
-    var cap: usize = 8192;
-    var out = allocator.alloc(u8, cap) catch return error.OutOfMemory;
-    errdefer allocator.free(out);
-    var len: usize = 0;
-    while (true) {
-        if (len == cap) {
-            if (cap >= core.limits.MAX_IMAGE_POOL_BYTES) return error.Unreadable;
-            cap = @min(cap * 2, core.limits.MAX_IMAGE_POOL_BYTES);
-            out = allocator.realloc(out, cap) catch return error.OutOfMemory;
+fn resolveIntrinsic(source: ImageSource, cache: ?*images.Cache) struct { w: f32, h: f32 } {
+    if (source == .handle) return .{ .w = @floatFromInt(source.handle.w), .h = @floatFromInt(source.handle.h) };
+    if (cache) |c| {
+        if (sourceAsset(source, c)) |h| {
+            if (c.assets.metadata(h)) |m| return .{ .w = m.w, .h = m.h };
         }
-        const n = std.c.fread(out.ptr + len, 1, cap - len, f);
-        len += n;
-        if (n == 0) break;
     }
-    if (!allocator.resize(out, len)) {
-        const exact = allocator.alloc(u8, len) catch return error.OutOfMemory;
-        @memcpy(exact, out[0..len]);
-        allocator.free(out);
-        return exact;
-    }
-    return out[0..len];
+    // Unrequested/loading/failed assets have a visible natural placeholder.
+    return .{ .w = 24, .h = 24 };
 }
 
 /// Image element from raw bytes (PNG/JPEG/GIF/BMP, or SVG which rasterizes
@@ -1001,7 +963,7 @@ pub fn img(source: []const u8) Element {
     return makeImage(.{ .bytes = source }, false);
 }
 
-/// Image element from a file path (read at build on dirty frames).
+/// Image from a preloaded file path; unknown paths show a placeholder.
 pub fn imgPath(path: []const u8) Element {
     return makeImage(.{ .path = path }, false);
 }
@@ -1009,6 +971,11 @@ pub fn imgPath(path: []const u8) Element {
 /// Image element from a decoded cache handle.
 pub fn imgHandle(handle: images.Handle) Element {
     return makeImage(.{ .handle = handle }, false);
+}
+
+/// Stable service handle, independent of decoded-pool slot generations.
+pub fn imgAsset(handle: images.AssetHandle) Element {
+    return makeImage(.{ .asset = handle }, false);
 }
 
 /// SVG element from raw bytes, tinted through `currentColor` (GPUI icon
@@ -1028,7 +995,7 @@ fn makeImage(source: ImageSource, is_svg: bool) Element {
     const n = result.node();
     n.image.source = source;
     n.image.svg = is_svg;
-    const size = resolveIntrinsic(source, is_svg, frame.allocator);
+    const size = resolveIntrinsic(source, frame.images);
     n.image.intrinsic_w = size.w;
     n.image.intrinsic_h = size.h;
     return result;

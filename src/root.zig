@@ -68,6 +68,7 @@ pub const when = elements.when;
 pub const img = elements.img;
 pub const imgPath = elements.imgPath;
 pub const imgHandle = elements.imgHandle;
+pub const imgAsset = elements.imgAsset;
 pub const svg = elements.svg;
 pub const svgPath = elements.svgPath;
 pub const ImageFit = elements.ImageFit;

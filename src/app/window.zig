@@ -69,6 +69,14 @@ pub const Window = struct {
     title_buf: [128]u8 = undefined,
     title_len: usize = 0,
     dirty: bool = true,
+    /// One-shot render timer and animation request, owned by this window.
+    render_deadline_ms: ?i64 = null,
+    animation_deadline_us: ?i64 = null,
+    last_animation_target_us: ?i64 = null,
+    last_animation_frame_ms: ?i64 = null,
+    /// Display cadence hook. Native refresh feedback can set this value;
+    /// current backend interface exposes none, so default explicitly to 60 Hz.
+    animation_interval_us: u32 = 16_667,
     closed: bool = false,
     scene: gpu.Scene = .{},
     renderer: ?Renderer = null,
@@ -146,13 +154,52 @@ pub const Window = struct {
         self.wakeup_fn(self.app);
     }
 
-    /// Keep the frame loop drawing back-to-back frames. Call it from render
-    /// while an animation is active; stop calling it to let the app idle.
+    /// One-shot animation request. Re-request from render while active;
+    /// unlike requestRender this does not make the window immediately dirty.
     pub fn requestAnimationFrame(self: *Window) void {
-        self.requestRender();
+        self.requestAnimationAt(self.timeMs());
     }
 
-    /// Monotonic-ish wall clock in milliseconds, for animation progress.
+    pub fn requestAnimation(self: *Window) void {
+        self.requestAnimationFrame();
+    }
+
+    /// Host/display-feedback hook, in microseconds (e.g. 8333 for 120 Hz).
+    /// Cadence is accumulated at sub-ms precision; waits round upward to ms.
+    pub fn setAnimationIntervalUs(self: *Window, interval_us: u32) void {
+        self.animation_interval_us = @max(interval_us, 1000);
+        self.last_animation_target_us = null;
+        self.animation_deadline_us = null;
+        self.requestAnimationFrame();
+    }
+
+    pub fn requestAnimationAt(self: *Window, now_ms: i64) void {
+        if (self.closed or self.animation_deadline_us != null) return;
+        const now_us = now_ms *| 1000;
+        const interval: i64 = self.animation_interval_us;
+        var next = (self.last_animation_target_us orelse now_us) +| interval;
+        // Skip missed frames, never burst to catch up after a slow render.
+        if (next <= now_us) next +|= (@divFloor(now_us - next, interval) + 1) *| interval;
+        self.animation_deadline_us = next;
+        self.wakeup_fn(self.app);
+    }
+
+    pub fn nextFrameDeadlineMs(self: *const Window) ?i64 {
+        const us = self.animation_deadline_us orelse return null;
+        return @divFloor(us, 1000) + @as(i64, if (@mod(us, 1000) != 0) 1 else 0);
+    }
+
+    /// Earliest one-shot render timer wins. Closing the window cancels it.
+    pub fn requestRenderAt(self: *Window, deadline_ms: i64) void {
+        if (self.closed) return;
+        if (self.render_deadline_ms) |old| {
+            if (old <= deadline_ms) return;
+        }
+        self.render_deadline_ms = deadline_ms;
+        self.wakeup_fn(self.app);
+    }
+
+    /// Monotonic clock in milliseconds, for animation progress.
     /// Windows has no clock_gettime, so it uses the performance counter;
     /// every other target uses CLOCK.MONOTONIC. (This snapshot's std.time
     /// carries only constants — no nanoTimestamp — hence the branch.)
@@ -164,7 +211,7 @@ pub const Window = struct {
     /// Portable monotonic milliseconds. The Windows branch is discarded at
     /// comptime on other targets (and vice versa), so neither side's
     /// OS-specific symbols leak into foreign builds.
-    fn monotonicMs() i64 {
+    pub fn monotonicMs() i64 {
         if (builtin.target.os.tag == .windows) {
             var counter: std.os.windows.LARGE_INTEGER = undefined;
             var freq: std.os.windows.LARGE_INTEGER = undefined;
@@ -602,7 +649,10 @@ pub const Window = struct {
         }
         const stack = [_]keymap.ContextFrame{frame};
         const stroke = keymap.Keystroke{ .key = key, .modifiers = modifiers };
-        const action_name = self.keymap.dispatch(stroke, &stack) orelse return;
+        const now_ms = self.timeMs();
+        if (self.keymap.expire(now_ms)) |expired| self.fireAction(expired);
+        if (self.closed) return;
+        const action_name = self.keymap.dispatchAt(stroke, &stack, now_ms) orelse return;
         self.fireAction(action_name);
     }
 

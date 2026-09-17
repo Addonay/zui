@@ -10,6 +10,9 @@ pub const raster = @import("raster.zig");
 pub const svg = @import("svg.zig");
 pub const cache = @import("cache.zig");
 
+pub const service = @import("service.zig");
+pub const Service = service.Service;
+pub const AssetHandle = service.Handle;
 pub const Cache = cache.Cache;
 pub const Handle = cache.Handle;
 pub const Format = raster.Format;
@@ -20,4 +23,5 @@ test {
     _ = @import("raster.zig");
     _ = @import("svg.zig");
     _ = @import("cache.zig");
+    _ = @import("service_test.zig");
 }

@@ -22,6 +22,9 @@ pub fn main(init: std.process.Init) !void {
 
     var cache = try zui.images.Cache.init(gpa);
     defer cache.deinit(gpa);
+    _ = try cache.assets.preloadPath("examples/images/checker.png", 0);
+    _ = try cache.assets.preloadBytes(ICON, 0);
+    _ = try cache.assets.preloadBytes(LOGO, 0);
 
     var frame = zui.elements.Frame{};
     frame.reset(@ptrFromInt(1), .{});

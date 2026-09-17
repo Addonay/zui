@@ -17,6 +17,7 @@ pub fn paint(frame: *element.Frame, root: element.Element, scene: *gpu.Scene) vo
     frame.cozmic_painted_glyphs = 0;
     frame.cozmic_skipped_glyphs = 0;
     frame.cozmic_paint_failures = 0;
+    frame.image_placeholders = 0;
 
     // Frame boundary for the glyph atlas: applies any eviction deferred
     // past the previous frame's emitted glyphs (safe — that frame already
@@ -243,28 +244,19 @@ fn paintBorder(scene: *gpu.Scene, bounds: core.Rect, color: core.Color, width: f
     }
 }
 
-/// Resolve an image node to a cache handle and emit a blit. Drops the
-/// image (logs at the cache) when sources fail, the cache is full, the
-/// retained handle went stale, or no cache/allocator is attached — same
-/// policy as quad overflow.
+/// Resolve only ready pixels and emit a blit. Missing, loading, failed and
+/// evicted sources render a diagnostic placeholder; paint never loads assets.
 fn paintImage(frame: *element.Frame, scene: *gpu.Scene, node: *const element.Node, opacity: f32, clip: core.Rect) void {
     const desc = node.image;
     const bw = node.bounds.w;
     const bh = node.bounds.h;
     if (bw <= 0 or bh <= 0) return;
-    const cache = frame.images orelse return;
-
-    // Retained handles resolve without decoding or I/O, so they need no
-    // allocator; bytes/path sources do.
+    const cache = frame.images orelse return imagePlaceholder(frame, scene, node, opacity, clip);
     const handle: images.Handle = switch (desc.source) {
-        .handle => |h| if (cache.validate(h, frame.frame_id)) h else return,
-        .bytes, .path => blk: {
-            const alloc = frame.allocator orelse return;
-            break :blk switch (desc.source) {
-                .bytes => |bytes| resolveBytes(cache, alloc, bytes, desc, bw, bh, frame.frame_id) orelse return,
-                .path => |path| readPathBytes(cache, alloc, path, desc, bw, bh, frame.frame_id) orelse return,
-                .handle => unreachable,
-            };
+        .handle => |h| if (cache.validate(h, frame.frame_id)) h else return imagePlaceholder(frame, scene, node, opacity, clip),
+        else => blk: {
+            const asset = element.sourceAsset(desc.source, cache) orelse return imagePlaceholder(frame, scene, node, opacity, clip);
+            break :blk cache.assets.resolve(asset, frame.frame_id) orelse return imagePlaceholder(frame, scene, node, opacity, clip);
         },
     };
 
@@ -320,38 +312,18 @@ fn paintImage(frame: *element.Frame, scene: *gpu.Scene, node: *const element.Nod
     });
 }
 
-/// Path sources: read the file, then resolve like bytes.
-fn readPathBytes(
-    cache: *images.Cache,
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    desc: element.ImageDesc,
-    bw: f32,
-    bh: f32,
-    frame_id: u64,
-) ?images.Handle {
-    const bytes = element.readPath(alloc, path) catch return null;
-    defer alloc.free(bytes);
-    return resolveBytes(cache, alloc, bytes, desc, bw, bh, frame_id);
-}
-
-/// Decode-or-rasterize bytes at the draw size (svg) or intrinsic size.
-fn resolveBytes(
-    cache: *images.Cache,
-    alloc: std.mem.Allocator,
-    bytes: []const u8,
-    desc: element.ImageDesc,
-    bw: f32,
-    bh: f32,
-    frame_id: u64,
-) ?images.Handle {
-    const is_svg = desc.svg or images.sniff(bytes) == .svg;
-    if (is_svg) {
-        const dw: u32 = @intFromFloat(@max(1.0, bw));
-        const dh: u32 = @intFromFloat(@max(1.0, bh));
-        return cache.svgFromBytes(alloc, bytes, dw, dh, desc.tint, frame_id) catch null;
-    }
-    return cache.imageFromBytes(alloc, bytes, frame_id) catch null;
+/// Visible diagnostic, including when intrinsic metadata is unavailable.
+/// Two contrasting tiles do not depend on fonts or image resources.
+fn imagePlaceholder(frame: *element.Frame, scene: *gpu.Scene, node: *const element.Node, opacity: f32, clip: core.Rect) void {
+    frame.image_placeholders += 1;
+    var bg = core.Color.hex(0x54202c);
+    bg.a *= opacity;
+    quad(scene, node.bounds, bg, node.style.radius, clip);
+    var fg = core.Color.hex(0xff7398);
+    fg.a *= opacity;
+    const b = node.bounds;
+    quad(scene, .{ .x = b.x + b.w * 0.4, .y = b.y + b.h * 0.2, .w = b.w * 0.2, .h = b.h * 0.4 }, fg, 0, clip);
+    quad(scene, .{ .x = b.x + b.w * 0.4, .y = b.y + b.h * 0.7, .w = b.w * 0.2, .h = b.h * 0.1 }, fg, 0, clip);
 }
 
 fn paintText(frame: *element.Frame, scene: *gpu.Scene, node: *element.Node, color: core.Color, clip: core.Rect) void {
@@ -837,6 +809,8 @@ const test_icon =
 ;
 
 fn testImageFrame(frame: *element.Frame, cache: *images.Cache) void {
+    _ = cache.assets.preloadBytes(test_png, 0) catch unreachable;
+    _ = cache.assets.preloadBytes(test_icon, 0) catch unreachable;
     frame.reset(@ptrFromInt(1), .{});
     frame.images = cache;
     frame.allocator = @import("std").testing.allocator;
@@ -952,7 +926,7 @@ test "svg icon paints tinted blit, drops without cache" {
         try t.expect(lit > 20);
     }
 
-    // No cache attached: drops silently, never crashes.
+    // No cache attached: visible diagnostic, never crashes.
     var bare = try t.allocator.create(element.Frame);
     defer t.allocator.destroy(bare);
     bare.* = .{};
@@ -966,6 +940,8 @@ test "svg icon paints tinted blit, drops without cache" {
     scene2.* = .{};
     paint(bare, root2, scene2);
     try t.expectEqual(@as(usize, 0), scene2.imageSlice().len);
+    try t.expectEqual(@as(u64, 1), bare.image_placeholders);
+    try t.expectEqual(@as(usize, 3), scene2.slice().len);
 }
 
 test "nested opacity multiplies down the tree" {
