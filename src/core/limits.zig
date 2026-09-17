@@ -19,6 +19,45 @@
 //! - Prefer fixed-capacity arrays over growing ArrayLists during rendering
 //! - Put a limit on hot buffers to prevent infinite loops and tail latency spikes
 //!
+//! ## Capacity policy (gap §3): one rule per overflow kind
+//!
+//! Hot-frame storage never grows mid-frame. When a bound is reached the
+//! outcome depends on what overflowed — four disjoint cases:
+//!
+//! 1. Recoverable growth (cold paths only): window creation, font
+//!    discovery, image decode, and Taffy tree storage may allocate through
+//!    the caller-provided allocator. These run outside the frame hot loop,
+//!    so growth is bounded by explicit input sizes (e.g.
+//!    `MAX_IMAGE_PIXELS`, `MAX_SVG_BYTES`) and reported as errors.
+//! 2. Rejected frames: the ordered scene command stream (`Scene.push`,
+//!    glyph and image-blit pushes) fails fast and counts `dropped` when
+//!    full. An overflowed frame is REJECTED, never presented partial:
+//!    `Window.render` substitutes the diagnostic placeholder
+//!    (`Scene.renderOverflowPlaceholder`), so the backend always receives
+//!    a complete frame; the rejection stays observable in
+//!    `dropped`/`dropped_frame`, `rejected_frames`, and benchmark gates —
+//!    and oversized workloads must virtualize or shrink (see the
+//!    text-benchmark overflow discussion in the gap report §3).
+//! 3. Diagnostic placeholders: resource pools that cannot fail the frame
+//!    degrade visibly and count the gap. The glyph atlas defers eviction
+//!    and reports overflow (missing glyphs are skipped and counted in
+//!    `cozmic_skipped_glyphs`, never overwritten mid-frame); hit-region
+//!    overflow counts `dropped_regions` instead of losing clicks silently;
+//!    image-pool exhaustion drops the image with a log line.
+//! 4. Preserved critical events: the input queue (`platform/event.zig`,
+//!    `MAX_EVENTS_PER_FRAME`) never silently drops key-up, button-up,
+//!    text commit, close, or focus loss. Under pressure it coalesces
+//!    motion/resize into queued peers and evicts the oldest coalescable
+//!    entry to admit criticals; only a queue with no coalescable victim
+//!    fails, and then it logs, counts `critical_overflow`, and returns an
+//!    error. Droppable input (key/button-down, focus-gain, scroll) is
+//!    discarded with a count in `dropped`.
+//!
+//! Element-node and frame-text exhaustion panic today (a programming bug,
+//! not a workload signal); scene and hit-region overflow produce counted
+//! partial output per (2)/(3). Do not conflate the two: panics mean the
+//! caller built an oversized tree, counters mean the frame shed load.
+//!
 //! ## Limit Hierarchy (what exists in this tree)
 //!
 //! ```
@@ -93,8 +132,18 @@ pub const MAX_LAYOUT_ELEMENTS: u32 = 4096;
 /// Maximum nested component depth (prevent stack overflow)
 pub const MAX_NESTED_COMPONENTS: u32 = 64;
 
-/// Maximum render commands per frame
-pub const MAX_RENDER_COMMANDS: u32 = 8192;
+/// Maximum render commands per frame (the ordered paint stream: one entry
+/// per pushed quad, glyph, or blit).
+///
+/// Coherence rule: this must cover a glyph-only frame, i.e. be >=
+/// MAX_SCENE_GLYPHS (each glyph costs one command). The old 8192 cap bound
+/// the command stream BEFORE the 16384 glyph payload filled, so the text
+/// benchmark silently dropped 128 glyphs on the 256-sentence row and 1664
+/// on the 64-paragraph row while payload space sat empty (gap report §3).
+/// Mixed quad+glyph frames still share this one budget — see the overflow
+/// policy in `gpu/scene.zig`; overflow rejects the frame, never partial
+/// presents.
+pub const MAX_RENDER_COMMANDS: u32 = 16384;
 
 // =============================================================================
 // Text Limits
@@ -364,8 +413,10 @@ comptime {
     // Ensure per-frame instance limit is reasonable
     std.debug.assert(MAX_PATHS_PER_FRAME >= 1024);
 
-    // Indices are derived from vertices correctly
-    std.debug.assert(MAX_PATH_TRIANGLES == MAX_PATH_VERTICES - 2);
+    // The ordered command stream must cover a glyph-only frame: every
+    // payload push records one command, so a command cap below the glyph
+    // cap would silently re-bind glyph-heavy frames (gap report §3).
+    std.debug.assert(MAX_RENDER_COMMANDS >= MAX_SCENE_GLYPHS);
     std.debug.assert(MAX_PATH_INDICES == MAX_PATH_TRIANGLES * 3);
 
     // GPU pools stay balanced: fences must cover in-flight frames with

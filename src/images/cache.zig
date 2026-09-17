@@ -70,7 +70,23 @@ pub const Cache = struct {
         allocator.destroy(self);
     }
 
+    /// Read-only resolution: returns empty unless `h` matches a live entry's
+    /// generation, offset, and dimensions. Stale validation is inseparable
+    /// from resolution here — callers can never observe recycled bytes
+    /// through a handle whose slot was reused or whose pool was reset.
+    /// Unlike `validate`, this takes a const pointer and never re-pins:
+    /// pinning (which protects bytes from reset/eviction) is an explicit
+    /// write effect done by `validate`/`lookup` on the paint/lookup path.
     pub fn pixels(self: *const Cache, h: Handle) []const u8 {
+        if (h.generation == 0) return &.{};
+        var live_match = false;
+        for (&self.entries) |*e| {
+            if (e.live and e.generation == h.generation and e.offset == h.offset and e.w == h.w and e.h == h.h) {
+                live_match = true;
+                break;
+            }
+        }
+        if (!live_match) return &.{};
         const end = @as(usize, h.offset) + @as(usize, h.w) * h.h * 4;
         if (end > self.pool.len) return &.{};
         return self.pool[h.offset..end];
@@ -292,4 +308,25 @@ test "cache handle goes stale across pool reset" {
     try std.testing.expect(!cache.validate(h, 2));
     // Invalid handles never validate.
     try std.testing.expect(!cache.validate(.invalid, 2));
+}
+
+test "stale handle pixels return empty, not recycled bytes" {
+    // Regression: pixels() used to bounds-check only, so a stale handle
+    // after a pool reset aliased whatever was placed at the same offset.
+    const t = std.testing.allocator;
+    var cache = try Cache.init(t);
+    defer cache.deinit(t);
+    var small: [16]u8 = @splat(3);
+    const stale = try cache.place(42, &small, 2, 2, 1);
+    try std.testing.expectEqualSlices(u8, &small, cache.pixels(stale));
+    const big = try t.alloc(u8, limits.MAX_IMAGE_POOL_BYTES);
+    defer t.free(big);
+    @memset(big, 0xCD);
+    const fresh = try cache.place(43, big, 1024, @intCast(limits.MAX_IMAGE_POOL_BYTES / 4096), 2);
+    // The recycled offset now holds new bytes; the stale handle must not
+    // expose them, and the invalid handle never resolves.
+    try std.testing.expectEqual(@as(usize, 0), cache.pixels(stale).len);
+    try std.testing.expect(!cache.validate(stale, 2));
+    try std.testing.expectEqual(@as(usize, 0), cache.pixels(.invalid).len);
+    try std.testing.expect(cache.pixels(fresh).len > 0);
 }

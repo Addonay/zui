@@ -4,6 +4,27 @@
 //! collect one frame of quads/glyphs on the CPU, then hand dense batches
 //! to Metal/Vulkan/GL. Backends stay thin; batching and clipping live
 //! here once. Storage is a fixed array so frames never allocate.
+//!
+//! ## Frame overflow policy (gap report §3)
+//!
+//! Pushes beyond capacity return false and count into `dropped`
+//! (cumulative) and `dropped_frame` (this frame only, reset by `clear`).
+//! A frame with `overflowed() == true` is REJECTED, never presented
+//! partial:
+//!
+//! - `Window.render` replaces a rejected frame with the diagnostic
+//!   placeholder (`renderOverflowPlaceholder`) and counts it in
+//!   `rejected_frames`, so what reaches the backend is always complete.
+//! - `App.step` counts the rejection in `App.rejected_frames` and logs it
+//!   (`ZUI_LOG=1` shows the scope/counts), then presents the placeholder.
+//! - Headless producers (`elements.painter.paint`, `tools/bench_text.zig`)
+//!   check `overflowed()` directly; the benchmark fails loudly instead of
+//!   reporting timings for missing content.
+//!
+//! Growing the caps is not the fix for unbounded content: shaping 39K
+//! glyphs costs a full frame budget whether or not they fit. The fix for
+//! large content is virtualization (don't shape invisible rows) plus this
+//! reject-instead-of-partial policy. See docs/RENDER_CONTRACT.md.
 
 const std = @import("std");
 const limits = @import("../core/limits.zig");
@@ -34,9 +55,10 @@ pub const Quad = struct {
 };
 
 /// Total draw cap per frame. Every push records one command, so this also
-/// bounds total pushes; 8K ordered draws far exceed what the software
-/// rasterizer can shade per frame, and virtualized lists (plan M7) bound
-/// content before this is reachable.
+/// bounds total pushes. Sized >= MAX_SCENE_GLYPHS (see limits.zig) so a
+/// glyph-only frame is bound by the payload arrays, never by the command
+/// stream first; virtualized lists (plan M7) bound content before either
+/// is reachable in ordinary UI.
 pub const MAX_COMMANDS_PER_FRAME: u32 = limits.MAX_RENDER_COMMANDS;
 
 /// One entry in the paint-order stream: which payload array and which slot.
@@ -74,12 +96,64 @@ pub const Scene = struct {
     /// painter drops instead of growing; this counter makes the drop
     /// observable instead of silent (plan M10). Never reset by clear().
     dropped: u64 = 0,
+    /// Push failures since the last `clear()`: the per-frame overflow
+    /// signal. `overflowed()` reads this; present paths reject the frame
+    /// when it is nonzero (see the module policy above).
+    dropped_frame: u64 = 0,
 
     pub fn clear(self: *@This()) void {
         self.len = 0;
         self.glyph_len = 0;
         self.blit_len = 0;
         self.command_len = 0;
+        self.dropped_frame = 0;
+    }
+
+    /// True when any push failed since the last `clear()`. A true frame
+    /// must not be presented as-is; see `Window.render` (placeholder
+    /// substitution) and the benchmark gates.
+    pub fn overflowed(self: *const @This()) bool {
+        return self.dropped_frame > 0;
+    }
+
+    /// Alias for callers that read `hasOverflow` more naturally.
+    pub fn hasOverflow(self: *const @This()) bool {
+        return self.overflowed();
+    }
+
+    /// Replace a rejected frame with a complete diagnostic placeholder:
+    /// clears all payloads, then emits an unmissable full-viewport quad
+    /// (magenta) with a dark inset so "overflow" is visible instead of
+    /// blank. Cumulative `dropped` is preserved as evidence;
+    /// `dropped_frame` restarts for the placeholder itself (a placeholder
+    /// that itself overflows is a capacity bug, and `overflowed()` stays
+    /// honest about it).
+    pub fn renderOverflowPlaceholder(self: *@This(), viewport: geometry.Rect) void {
+        const dropped_total = self.dropped;
+        const dropped_this_frame = self.dropped_frame;
+        self.clear();
+        self.dropped = dropped_total;
+        // A zero-area viewport still gets one sentinel quad at the origin
+        // so the frame is never empty-by-accident.
+        const w = if (viewport.w > 0) viewport.w else 64;
+        const h = if (viewport.h > 0) viewport.h else 64;
+        const x = viewport.x;
+        const y = viewport.y;
+        const magenta = color.Color{ .r = 1, .g = 0, .b = 1, .a = 1 };
+        const dark = color.Color{ .r = 0.1, .g = 0, .b = 0.1, .a = 1 };
+        const ok_outer = self.push(.{ .x = x, .y = y, .w = w, .h = h, .color = magenta, .clip = null });
+        const ok_inner = self.push(.{
+            .x = x + 8,
+            .y = y + 8,
+            .w = @max(0, w - 16),
+            .h = @max(0, h - 16),
+            .color = dark,
+            .clip = null,
+        });
+        // Restore the evidence the clear() above reset: the placeholder
+        // documents the rejection it replaced.
+        self.dropped_frame += dropped_this_frame;
+        if (!ok_outer or !ok_inner) self.dropped_frame += 1;
     }
 
     fn pushCommand(self: *@This(), kind: CommandKind, index: u32) bool {
@@ -96,6 +170,7 @@ pub const Scene = struct {
         std.debug.assert(q.h >= 0);
         if (self.len >= self.quads.len or self.command_len >= self.commands.len) {
             self.dropped += 1;
+            self.dropped_frame += 1;
             return false;
         }
         self.quads[self.len] = q;
@@ -114,6 +189,7 @@ pub const Scene = struct {
         std.debug.assert(g.h >= 0);
         if (self.glyph_len >= self.glyphs.len or self.command_len >= self.commands.len) {
             self.dropped += 1;
+            self.dropped_frame += 1;
             return false;
         }
         self.glyphs[self.glyph_len] = g;
@@ -132,6 +208,7 @@ pub const Scene = struct {
         std.debug.assert(b.h >= 0);
         if (self.blit_len >= self.blits.len or self.command_len >= self.commands.len) {
             self.dropped += 1;
+            self.dropped_frame += 1;
             return false;
         }
         self.blits[self.blit_len] = b;
@@ -304,13 +381,50 @@ test "scene records paint order across kinds" {
 
 test "scene command overflow drops atomically and counts" {
     var s = Scene{};
+    try std.testing.expect(!s.overflowed());
+    try std.testing.expect(!s.hasOverflow());
     s.command_len = s.commands.len;
     const quads_before = s.len;
     try std.testing.expect(!s.push(.{ .x = 0, .y = 0, .w = 1, .h = 1, .color = .white }));
     // Nothing recorded: no orphan payload without a command.
     try std.testing.expectEqual(quads_before, s.len);
     try std.testing.expectEqual(@as(u64, 1), s.dropped);
-    // Counter survives clear (cumulative, like atlas hits/misses).
+    try std.testing.expectEqual(@as(u64, 1), s.dropped_frame);
+    try std.testing.expect(s.overflowed());
+    try std.testing.expect(s.hasOverflow());
+    // Counter survives clear (cumulative, like atlas hits/misses); the
+    // per-frame signal resets so the next frame starts clean.
     s.clear();
     try std.testing.expectEqual(@as(u64, 1), s.dropped);
+    try std.testing.expectEqual(@as(u64, 0), s.dropped_frame);
+    try std.testing.expect(!s.overflowed());
+}
+
+test "overflow placeholder replaces a rejected frame with complete ink" {
+    var s = Scene{};
+    // Fill the command stream, then overflow once.
+    s.command_len = s.commands.len;
+    try std.testing.expect(!s.push(.{ .x = 0, .y = 0, .w = 1, .h = 1, .color = .white }));
+    try std.testing.expect(s.overflowed());
+    s.renderOverflowPlaceholder(.{ .x = 0, .y = 0, .w = 800, .h = 600 });
+    // Complete replacement ink: two quads, two commands, nothing partial.
+    try std.testing.expectEqual(@as(usize, 2), s.slice().len);
+    try std.testing.expectEqual(@as(usize, 2), s.commandSlice().len);
+    try std.testing.expectEqual(@as(f32, 800), s.slice()[0].w);
+    try std.testing.expectEqual(@as(f32, 600), s.slice()[0].h);
+    // Evidence preserved: cumulative total kept, and the frame still
+    // reports the rejection it replaced (consumers must not mistake the
+    // placeholder for a clean render).
+    try std.testing.expectEqual(@as(u64, 1), s.dropped);
+    try std.testing.expect(s.overflowed());
+    // A fresh clear starts a genuinely clean frame.
+    s.clear();
+    try std.testing.expect(!s.overflowed());
+}
+
+test "command capacity covers a glyph-only frame" {
+    // Coherence pin for gap report §3: the command stream must not bind
+    // before the glyph payload does, or glyph-heavy frames drop while
+    // payload space sits empty.
+    try std.testing.expect(MAX_COMMANDS_PER_FRAME >= limits.MAX_SCENE_GLYPHS);
 }

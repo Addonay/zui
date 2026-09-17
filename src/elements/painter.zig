@@ -57,6 +57,12 @@ fn contentBox(node: *const element.Node) core.Rect {
     };
 }
 
+/// Scene-push helpers (`quad`, `gradientQuad`, `ring`): a failed push is a
+/// counted drop, never silent growth. The scene records it in
+/// `dropped`/`dropped_frame`, and `Window.render` rejects an overflowed
+/// frame (placeholder substitution) instead of presenting it partial.
+/// Helpers intentionally return void: per-draw fallbacks would complicate
+/// paint order; frame-level rejection is the policy.
 fn gradientQuad(scene: *gpu.Scene, bounds: core.Rect, from: core.Color, to: core.Color, radius: f32, clip: core.Rect) void {
     if (bounds.w <= 0 or bounds.h <= 0) return;
     if (from.a <= 0 and to.a <= 0) return;
@@ -84,6 +90,33 @@ fn ring(scene: *gpu.Scene, bounds: core.Rect, color: core.Color, width: f32, rad
     _ = scene.push(.{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = bounds.h, .color = color, .radius = radius, .border_width = width, .clip = clip });
 }
 
+/// Resolve a node's region owner: the first listener/focus target with a
+/// frame owner-table registration (mint-time owner recorded by `runtime`).
+/// Hand-built targets miss and leave the region ungated. Read-only over
+/// live targets — registration, not dereference — so paint-time resolution
+/// is safe even alongside teardown.
+fn resolveRegionOwner(frame: *element.Frame, node: *const element.Node) ?element.OwnerRef {
+    const roles = [_]?element.Listener{
+        node.listener,
+        node.mouse_down_listener,
+        node.mouse_up_listener,
+        node.mouse_move_listener,
+        node.double_click_listener,
+        node.scroll_listener,
+    };
+    for (roles) |maybe_listener| {
+        if (maybe_listener) |listener| {
+            if (frame.lookupOwner(listener.target)) |owner| return owner;
+        }
+    }
+    if (node.focus) |handle| {
+        if (handle.target) |target| {
+            if (frame.lookupOwner(target)) |owner| return owner;
+        }
+    }
+    return null;
+}
+
 fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_color: core.Color, inherited_opacity: f32, clip: core.Rect) void {
     const node = &frame.nodes[index];
     // Hover follows the effective clip like hit-testing does: a clipped-away
@@ -92,19 +125,23 @@ fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_col
     const style = node.style;
     // Group opacity accumulates down the tree: a 0.5 child inside a 0.5
     // parent draws at 0.25. (True isolated group compositing would need an
-    // offscreen buffer; multiplied alpha is the documented approximation.)
+    // offscreen buffer; multiplied alpha is the documented approximation.
+    // It differs from isolation exactly when semi-transparent siblings
+    // overlap: see docs/RENDER_CONTRACT.md "known approximations".)
     const opacity = inherited_opacity * style.opacity;
 
     if (style.shadow) {
-        // Two-layer shadow: wide faint halo + tight contact layer. Reads as
-        // soft elevation instead of a hard offset slab.
+        // Two-layer shadow (§5E approximation, documented in
+        // docs/RENDER_CONTRACT.md): wide faint halo + tight contact layer.
+        // Reads as soft elevation instead of a hard offset slab.
         const outer = core.Rect{ .x = node.bounds.x - 6, .y = node.bounds.y + 4, .w = node.bounds.w + 12, .h = node.bounds.h + 12 };
         quad(scene, outer, alpha(core.Color.rgba(0, 0, 0, 0.14), opacity), style.radius + 6, clip);
         const inner = core.Rect{ .x = node.bounds.x - 2, .y = node.bounds.y + 2, .w = node.bounds.w + 4, .h = node.bounds.h + 4 };
         quad(scene, inner, alpha(core.Color.rgba(0, 0, 0, 0.16), opacity), style.radius + 2, clip);
     }
     if (style.blur > 0 and style.background != null) {
-        // Fake blur as a soft falloff: concentric expanding layers, largest
+        // Fake blur as a soft falloff (§5E approximation, documented in
+        // docs/RENDER_CONTRACT.md): concentric expanding layers, largest
         // and faintest first so the center accumulates softly with no hard
         // edge (single-quad "blurs" rendered as solid discs).
         const spread = style.blur * 0.3;
@@ -148,7 +185,17 @@ fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_col
         // control cannot be clicked. Empty clips register nothing.
         const hit = intersect(node.bounds, clip);
         if (hit.w > 0 and hit.h > 0) {
-            _ = frame.addRegion(.{ .bounds = hit, .listener = node.listener, .mouse_down_listener = node.mouse_down_listener, .mouse_up_listener = node.mouse_up_listener, .mouse_move_listener = node.mouse_move_listener, .double_click_listener = node.double_click_listener, .scroll_listener = node.scroll_listener, .focus = node.focus, .cursor = node.style.cursor });
+            var region: element.HitRegion = .{ .bounds = hit, .listener = node.listener, .mouse_down_listener = node.mouse_down_listener, .mouse_up_listener = node.mouse_up_listener, .mouse_move_listener = node.mouse_move_listener, .double_click_listener = node.double_click_listener, .scroll_listener = node.scroll_listener, .focus = node.focus, .cursor = node.style.cursor };
+            // Subscription cleanup (gap §5A): resolve the region's owning
+            // entity through the frame owner table — never by touching a
+            // target — so Window dispatch can skip regions whose owner was
+            // destroyed. First registered owner wins (see HitRegion).
+            if (resolveRegionOwner(frame, node)) |owner| {
+                region.owner_store = owner.store;
+                region.owner_id = owner.id;
+                region.owner_generation = owner.generation;
+            }
+            _ = frame.addRegion(region);
         }
     }
 
@@ -157,6 +204,14 @@ fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_col
     // titles, the composer placeholder) gets cut at the field edge instead
     // of bleeding into neighbors. Shadows/glow above intentionally use the
     // looser incoming clip so they can bleed outward.
+    //
+    // §5E limitation, stated explicitly: nesting is a single intersected
+    // RECTANGLE, not a clip stack — there is no save/restore depth, no
+    // rounded-rect descendant clip (a rounded background does NOT round
+    // its children; see docs/RENDER_CONTRACT.md), no transforms, and no
+    // overlay escape (menus/popovers must be painted outside the clipping
+    // ancestor, not as its child). Intersection makes rectangular nesting
+    // exact; everything beyond rects is a documented gap, not a bug.
     const child_clip = intersect(clip, contentBox(node));
     while (child) |child_index| : (child = frame.nodes[child_index].next_sibling) {
         paintNode(frame, child_index, scene, style.text_color orelse inherited_color, opacity, child_clip);
@@ -469,7 +524,10 @@ const GlyphSink = struct {
         })) {
             self.emitted += 1;
         } else {
-            self.skipped += 1; // scene full: no ink emitted
+            self.skipped += 1; // scene full: no ink emitted. Frame-level
+            // overflow is still explicit: the push counted into
+            // `Scene.dropped_frame`, so `scene.overflowed()` is true and
+            // the frame is rejected downstream (never silently partial).
         }
     }
 };
@@ -650,9 +708,20 @@ test "hot frame structs stay within stack budget" {
     // mouse-move/mouse-up/scroll listener slots (3 x 32 bytes x 512 regions,
     // ~49KB). Growth beyond this still fails loudly; the real structural fix
     // (pooled frame storage, plan M10) stays open.
+    //
+    // The third pin moved from 9.25MB to 9.75MB for two measured, reviewed
+    // growth sources (2026-09-17): the scene command stream grew ~330KB
+    // (scene.zig command payloads), and stable identity + ownership added
+    // ~115KB to the frame — 8-byte stable keys on every node (32KB),
+    // per-frame seen-key duplicate tracking (32KB), the entity-owner table
+    // (6KB), a 16-byte owner triple on hit regions (8KB), and the
+    // subscription guard on focus handles (8 bytes x ~4610 handles,
+    // ~36KB). The per-frame pin still passes with ~690KB of margin, so the
+    // frame itself is healthy; the sum pin only tracks the combined stack
+    // discipline. Shrink (or pool) before moving this pin again.
     try t.expect(@sizeOf(element.Frame) < 4 * 1024 * 1024);
     try t.expect(@sizeOf(gpu.Scene) < 7 * 1024 * 1024);
-    try t.expect(@sizeOf(element.Frame) + @sizeOf(gpu.Scene) < 9.25 * 1024 * 1024);
+    try t.expect(@sizeOf(element.Frame) + @sizeOf(gpu.Scene) < 9.75 * 1024 * 1024);
 }
 
 test "shaped text emits atlas glyphs, not bitmap quads" {

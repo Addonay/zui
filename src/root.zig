@@ -50,6 +50,7 @@ pub const WindowOptions = app.WindowOptions;
 pub const Renderer = app.Renderer;
 pub const Context = app.Context;
 pub const Entity = app.Entity;
+pub const WeakEntity = app.WeakEntity;
 pub const FocusHandle = app.FocusHandle;
 pub const TestHarness = app.TestHarness;
 

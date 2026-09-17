@@ -22,6 +22,14 @@
 //! that observable (`paint` is 0). The `raw` rows keep shaping in both spans,
 //! so `shape/(shape+paint)` stays the share of cozmic work the retained
 //! layout removes.
+//!
+//! Correctness gates (gap report §3): every standard row asserts its emitted
+//! counts and FAILS (nonzero exit) on scene overflow — timings for missing
+//! content are not performance-success results. The 256-paragraph row cannot
+//! fit any fixed per-frame scene (39K glyphs of ink vs a 16K payload cap;
+//! the answer is virtualization, not a bigger array), so it is a STRESS row:
+//! skipped by default, run only with `--allow-overflow`, where its overflow
+//! is reported loudly as characterized behavior instead of failing the gate.
 
 const std = @import("std");
 const zui = @import("zui");
@@ -82,6 +90,10 @@ const Options = struct {
     iters: usize = default_iters,
     warmup: usize = default_warmup,
     json: bool = false,
+    /// Run the intentional-overflow stress rows (256 wrapped paragraphs)
+    /// and characterize their overflow instead of skipping them. Standard
+    /// rows are gated either way.
+    allow_overflow: bool = false,
 };
 
 fn truthy(value: []const u8) bool {
@@ -96,6 +108,7 @@ fn parseArgs(args: []const []const u8, environ: *const std.process.Environ.Map) 
     var warmup: ?usize = null;
     var json = false;
     var quick = false;
+    var allow_overflow = false;
     var i: usize = 1; // args[0] is the program path.
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -112,6 +125,8 @@ fn parseArgs(args: []const []const u8, environ: *const std.process.Environ.Map) 
             json = true;
         } else if (std.mem.eql(u8, arg, "--quick")) {
             quick = true;
+        } else if (std.mem.eql(u8, arg, "--allow-overflow")) {
+            allow_overflow = true;
         }
     }
     const env_quick = if (environ.get("ZUI_BENCH_QUICK")) |v| truthy(v) else false;
@@ -120,6 +135,7 @@ fn parseArgs(args: []const []const u8, environ: *const std.process.Environ.Map) 
         .iters = @max(iters orelse if (use_quick) quick_iters else default_iters, 1),
         .warmup = warmup orelse if (use_quick) quick_warmup else default_warmup,
         .json = json,
+        .allow_overflow = allow_overflow,
     };
 }
 
@@ -523,8 +539,20 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
+    var gate_failures: u32 = 0;
+    var rows_checked: u32 = 0;
     for (configs) |cfg| {
         for (node_counts) |n| {
+            // Stress rows carry more ink than any fixed per-frame scene
+            // holds (256 wrapped paragraphs shape ~39K glyphs against a
+            // 16K payload cap). They run only under --allow-overflow, where
+            // their overflow is characterized loudly instead of failing the
+            // standard gate.
+            const is_stress = std.mem.eql(u8, cfg.name, "paragraph-16-wrap360") and n == 256;
+            if (is_stress and !opts.allow_overflow) {
+                try note(w, opts.json, "skip {s} n={d}: stress row, needs --allow-overflow", .{ cfg.name, n });
+                continue;
+            }
             const chars = configChars(cfg, n);
             const root = buildFrame(frame, engine.?, gpa, cfg, n);
 
@@ -599,6 +627,40 @@ pub fn main(init: std.process.Init) !void {
                 if (raw_sample.failures > 0) try w.print(" failures={d}", .{raw_sample.failures});
                 try w.print("\n", .{});
             }
+
+            // Correctness gates (gap report §3): timings are only
+            // performance-success results when the scene is complete.
+            rows_checked += 1;
+            var row_failures: u32 = 0;
+            const accounted = sample.cozmic_emitted + sample.cozmic_skipped;
+            if (sample.cozmic_nodes != n) {
+                try note(w, opts.json, "GATE FAIL: {s} n={d}: engine measured {d}/{d} text nodes", .{ cfg.name, n, sample.cozmic_nodes, n });
+                row_failures += 1;
+            }
+            if (sample.cozmic_failures > 0) {
+                try note(w, opts.json, "GATE FAIL: {s} n={d}: {d} paint failures", .{ cfg.name, n, sample.cozmic_failures });
+                row_failures += 1;
+            }
+            if (sample.glyphs != sample.cozmic_emitted) {
+                try note(w, opts.json, "GATE FAIL: {s} n={d}: scene holds {d} glyphs but {d} were emitted", .{ cfg.name, n, sample.glyphs, sample.cozmic_emitted });
+                row_failures += 1;
+            }
+            if (accounted != raw_sample.glyphs) {
+                try note(w, opts.json, "GATE FAIL: {s} n={d}: emitted {d} + skipped {d} != shaped {d}", .{ cfg.name, n, sample.cozmic_emitted, sample.cozmic_skipped, raw_sample.glyphs });
+                row_failures += 1;
+            }
+            if (!is_stress and sample.dropped > 0) {
+                try note(w, opts.json, "GATE FAIL: {s} n={d}: scene dropped {d} pushes (incomplete frame)", .{ cfg.name, n, sample.dropped });
+                row_failures += 1;
+            }
+            if (is_stress) {
+                if (sample.dropped > 0) {
+                    try note(w, opts.json, "INTENTIONAL OVERFLOW (stress): {s} n={d}: emitted {d}, dropped {d}, skipped {d} — rejected frame, not a perf result", .{ cfg.name, n, sample.glyphs, sample.dropped, sample.cozmic_skipped });
+                } else {
+                    try note(w, opts.json, "stress row {s} n={d} fit without overflow this run", .{ cfg.name, n });
+                }
+            }
+            gate_failures += row_failures;
         }
     }
 
@@ -627,5 +689,14 @@ pub fn main(init: std.process.Init) !void {
     }
     try note(w, opts.json, "engine init measured separately; warm rows reuse the engine (App lazy-once model)", .{});
 
+    if (opts.json) {
+        try w.print("{{\"bench\":\"text-frame\",\"kind\":\"gate\",\"rows\":{d},\"failures\":{d}}}\n", .{ rows_checked, gate_failures });
+    } else if (gate_failures == 0) {
+        try w.print("  gate: PASS ({d} rows checked, no drops, emitted counts account for every shaped glyph)\n", .{rows_checked});
+    } else {
+        try w.print("  gate: FAIL ({d} failures across {d} rows)\n", .{ gate_failures, rows_checked });
+    }
+
     try w.flush();
+    if (gate_failures > 0) return error.BenchGateFailed;
 }

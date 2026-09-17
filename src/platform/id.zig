@@ -21,12 +21,12 @@ fn fnv1a(bytes: []const u8, seed: u64) u64 {
 
 pub fn extend(parent: Id, file: []const u8, line: u32, col: u32, extra: u64) Id {
     var h = fnv1a(file, parent);
-    var buf: [12]u8 = undefined;
+    var buf: [16]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], line, .little);
     std.mem.writeInt(u32, buf[4..8], col, .little);
-    std.mem.writeInt(u64, buf[4..12], extra, .little);
-    h = fnv1a(buf[0..4], h);
-    h = fnv1a(buf[4..12], h);
+    std.mem.writeInt(u64, buf[8..16], extra, .little);
+    h = fnv1a(buf[0..8], h);
+    h = fnv1a(buf[8..16], h);
     return if (h == 0) 1 else h;
 }
 
@@ -42,4 +42,18 @@ test "ids are deterministic and parent-sensitive" {
     try std.testing.expectEqual(a, b);
     try std.testing.expect(a != c);
     try std.testing.expect(a != d);
+}
+
+test "same line different column yields different ids" {
+    // Regression for the buf[4..8]/buf[4..12] overlap: col was overwritten
+    // by the low half of extra, so same file+line with different cols
+    // collided whenever extra was equal.
+    const a = extend(0, "foo.zig", 10, 5, 0);
+    const b = extend(0, "foo.zig", 10, 6, 0);
+    try std.testing.expect(a != b);
+    // Same site, different extra (e.g. loop index) must also differ.
+    const c = extend(0, "foo.zig", 10, 5, 7);
+    const e = extend(0, "foo.zig", 10, 5, 8);
+    try std.testing.expect(c != e);
+    try std.testing.expect(a != c);
 }

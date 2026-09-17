@@ -32,7 +32,11 @@ pub const Library = struct {
         return Impl.lookup(T, self.handle, name);
     }
 
-    const Impl = struct {
+    // POSIX libdl on Unix-likes, kernel32 on Windows (which has no
+    // dlopen/dlsym/dlclose — linking those externs fails lld-link).
+    const Impl = if (builtin.target.os.tag == .windows) WindowsImpl else PosixImpl;
+
+    const PosixImpl = struct {
         extern "c" fn dlopen(filename: ?[*:0]const u8, flags: c_int) ?*anyopaque;
         extern "c" fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
         extern "c" fn dlclose(handle: ?*anyopaque) c_int;
@@ -53,7 +57,39 @@ pub const Library = struct {
         fn lookup(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
             const sym = dlsym(handle, name);
             if (sym) |s| {
-                return @as(T, @ptrCast(s));
+                // dlsym hands back a minimally-aligned data pointer; the
+                // loaded symbol is really a function, so assert the target
+                // alignment instead of growing it with a bare @ptrCast
+                // (which the compiler rejects on parameters with stricter
+                // alignment, e.g. aarch64 where fn pointers are 4-aligned).
+                return @as(T, @ptrCast(@alignCast(s)));
+            }
+            return null;
+        }
+    };
+
+    const WindowsImpl = struct {
+        extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn GetProcAddress(handle: *anyopaque, symbol: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn FreeLibrary(handle: *anyopaque) callconv(.winapi) c_int;
+
+        fn open(names: []const [*:0]const u8) ?Library {
+            for (names) |name| {
+                if (LoadLibraryA(name)) |h| {
+                    return .{ .handle = h };
+                }
+            }
+            return null;
+        }
+
+        fn close(handle: *anyopaque) void {
+            _ = FreeLibrary(handle);
+        }
+
+        fn lookup(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
+            const sym = GetProcAddress(handle, name);
+            if (sym) |s| {
+                return @as(T, @ptrCast(@alignCast(s)));
             }
             return null;
         }

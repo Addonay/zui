@@ -200,7 +200,13 @@ const XEvent = extern union {
 // +8 (buttons read as garbage, XLookupString typed garbage), so these pins
 // exist to catch exactly that class of mistake.
 comptime {
-    std.debug.assert(@sizeOf(XEvent) == 192);
+    // Xlib pins below assume the LP64 Linux ABI (c_long is 64-bit). This
+    // backend only ever runs on Linux, and foreign-target builds never
+    // import this module (see platform/root.zig) — but guard the pins
+    // anyway so a stray import fails safe instead of tripping a
+    // target-invalid assertion (e.g. Windows LLP64 where c_long is 32-bit).
+    if (builtin.target.os.tag == .linux) {
+        std.debug.assert(@sizeOf(XEvent) == 192);
     std.debug.assert(@sizeOf(XButtonEvent) == 96);
     std.debug.assert(@offsetOf(XButtonEvent, "window") == 32);
     std.debug.assert(@offsetOf(XButtonEvent, "time") == 56);
@@ -230,6 +236,7 @@ comptime {
     std.debug.assert(@offsetOf(XSelectionRequestEvent, "property") == 64);
     std.debug.assert(@offsetOf(XSelectionRequestEvent, "time") == 72);
     std.debug.assert(@sizeOf(XSelectionRequestEvent) == 80);
+    }
 }
 
 // Selection protocol (verified against /usr/include/X11/X.h).
@@ -840,7 +847,7 @@ pub const X11Backend = struct {
         msg.data.l[0] = self.last_root_x;
         msg.data.l[1] = self.last_root_y;
         msg.data.l[2] = @intCast(action);
-        msg.data.l[3] = self.last_button;
+        msg.data.l[3] = @intCast(self.last_button);
         msg.data.l[4] = 1; // normal application source
         @memcpy(std.mem.asBytes(&ev)[0..@sizeOf(XClientMessageEvent)], std.mem.asBytes(&msg));
         // SubstructureNotify + SubstructureRedirect on the root window.

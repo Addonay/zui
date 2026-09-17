@@ -1,6 +1,7 @@
 //! Window lifecycle, rendering target, and geometry bounds.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const geometry = @import("../core/geometry.zig");
 const limits = @import("../core/limits.zig");
 const color = @import("../core/color.zig");
@@ -10,6 +11,7 @@ const elements = @import("../elements/root.zig");
 const text_engine = @import("../fonts/text_engine.zig");
 const images = @import("../images/root.zig");
 const keymap = @import("keymap.zig");
+const zlog = @import("../core/log.zig");
 
 pub const Chrome = enum {
     system,
@@ -70,6 +72,13 @@ pub const Window = struct {
     closed: bool = false,
     scene: gpu.Scene = .{},
     renderer: ?Renderer = null,
+    /// Frames rejected for scene overflow since creation (overflowed scene
+    /// replaced by the diagnostic placeholder; see `render`). A nonzero
+    /// count means the user saw magenta, not missing content.
+    rejected_frames: u64 = 0,
+    /// True when the most recent `render()` rejected its frame. Cleared by
+    /// the next render; lets `App.step` log/count without re-inspecting.
+    last_frame_rejected: bool = false,
     /// Last App.step_count that rendered this window; feeds image-cache
     /// pinning so eviction never drops the current frame's entries.
     frame_id: u64 = 0,
@@ -142,13 +151,35 @@ pub const Window = struct {
     }
 
     /// Monotonic-ish wall clock in milliseconds, for animation progress.
+    /// Windows has no clock_gettime, so it uses the performance counter;
+    /// every other target uses CLOCK.MONOTONIC. (This snapshot's std.time
+    /// carries only constants — no nanoTimestamp — hence the branch.)
     pub fn timeMs(self: *const Window) i64 {
         _ = self;
-        var ts: std.c.timespec = undefined;
-        if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) == 0) {
-            return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+        return monotonicMs();
+    }
+
+    /// Portable monotonic milliseconds. The Windows branch is discarded at
+    /// comptime on other targets (and vice versa), so neither side's
+    /// OS-specific symbols leak into foreign builds.
+    fn monotonicMs() i64 {
+        if (builtin.target.os.tag == .windows) {
+            var counter: std.os.windows.LARGE_INTEGER = undefined;
+            var freq: std.os.windows.LARGE_INTEGER = undefined;
+            if (std.os.windows.ntdll.RtlQueryPerformanceFrequency(&freq).toBool() and
+                std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() and
+                freq > 0)
+            {
+                return @divTrunc(counter * 1000, freq);
+            }
+            return 0;
+        } else {
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) == 0) {
+                return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+            }
+            return 0;
         }
-        return 0;
     }
 
     /// Pointer position in window coordinates (updated on every mouse event).
@@ -184,9 +215,27 @@ pub const Window = struct {
         if (self.renderer) |r| {
             r.call(self, &self.scene);
         }
+        // Frame overflow policy (gap report §3): an overflowed scene is
+        // REJECTED, never presented partial. Substitute the diagnostic
+        // placeholder so the backend always receives a complete frame;
+        // the rejection stays observable via `rejected_frames`,
+        // `last_frame_rejected`, and the scene's own drop counters.
+        self.last_frame_rejected = false;
+        if (self.scene.overflowed()) {
+            const drops = self.scene.dropped_frame;
+            self.rejected_frames += 1;
+            self.last_frame_rejected = true;
+            zlog.log("window", "frame rejected: {d} scene pushes dropped (window {d}); presenting overflow placeholder", .{ drops, self.id });
+            self.scene.renderOverflowPlaceholder(self.bounds.rect());
+        }
         // Regions were rebuilt above; refresh the cursor for a stationary
         // pointer sitting over changed content.
         self.updateHoverCursor();
+    }
+
+    /// True when the last `render()` rejected its frame for overflow.
+    pub fn frameRejected(self: *const Window) bool {
+        return self.last_frame_rejected;
     }
 
     /// Cursor follows hover, not focus: topmost region under the pointer
@@ -328,7 +377,15 @@ pub const Window = struct {
 
     pub fn on_action(self: *Window, name: []const u8, target: anytype, comptime action: anytype) void {
         if (self.action_count >= self.actions.len) return;
-        self.actions[self.action_count] = .{ .name = name, .listener = target.actionListener(action) };
+        var entry: Action = .{ .name = name, .listener = target.actionListener(action) };
+        // Entity targets carry their subscription inline (see Action), so
+        // `fireAction` can skip actions whose owner was destroyed.
+        if (@hasDecl(@TypeOf(target), "is_entity")) {
+            entry.owner_store = target.header.store;
+            entry.owner_id = target.header.id;
+            entry.owner_generation = target.header.generation;
+        }
+        self.actions[self.action_count] = entry;
         self.action_count += 1;
     }
 
@@ -359,6 +416,13 @@ pub const Window = struct {
         for (self.ui_frame.regions[0..self.ui_frame.region_count]) |region| {
             if (region.focus) |handle| {
                 if (handle.id == self.focused.id) {
+                    // The owner may have been destroyed while its region
+                    // slot still exists: drop focus now instead of
+                    // lingering on a dead handle.
+                    if (!handle.isLive()) {
+                        self.focused = .{};
+                        return;
+                    }
                     self.focused = handle;
                     return;
                 }
@@ -401,6 +465,11 @@ pub const Window = struct {
                         i -= 1;
                         const region = self.ui_frame.regions[i];
                         if (!region.bounds.contains(mouse.pos)) continue;
+                        // Subscription cleanup (gap §5A): regions whose
+                        // owning entity was destroyed are invisible to
+                        // dispatch — no focus adoption, no listener, no
+                        // capture — as if unmounted.
+                        if (!region.ownerAlive()) continue;
                         if (region.focus) |handle| self.focused = handle;
                         if (region.mouse_down_listener) |listener| listener.call(self);
                         if (double_click) {
@@ -444,6 +513,7 @@ pub const Window = struct {
                     i -= 1;
                     const region = self.ui_frame.regions[i];
                     if (!region.bounds.contains(scroll.pos)) continue;
+                    if (!region.ownerAlive()) continue;
                     if (region.scroll_listener) |listener| {
                         listener.call(self);
                         handled = true;
@@ -469,6 +539,7 @@ pub const Window = struct {
             i -= 1;
             const region = self.ui_frame.regions[i];
             if (!region.bounds.contains(mouse.pos)) continue;
+            if (!region.ownerAlive()) continue;
             hovered = region;
             break;
         }
@@ -481,7 +552,9 @@ pub const Window = struct {
                     h.mouse_move_listener.?.target == captured.mouse_move_listener.?.target)
             else
                 false;
-            if (!same_target) {
+            // A captured region whose owner was destroyed ends the drag
+            // silently: no further motion reaches the freed target.
+            if (!same_target and captured.ownerAlive()) {
                 self.motion_from_capture = true;
                 defer self.motion_from_capture = false;
                 if (captured.mouse_move_listener) |listener| listener.call(self);
@@ -493,7 +566,9 @@ pub const Window = struct {
     /// topmost region under the pointer handles plain releases elsewhere.
     fn dispatchMouseUp(self: *Window, mouse: platform.event.MouseEvent) void {
         if (self.captured_mouse_region) |captured| {
-            if (captured.mouse_up_listener) |listener| listener.call(self);
+            if (captured.ownerAlive()) {
+                if (captured.mouse_up_listener) |listener| listener.call(self);
+            }
             return;
         }
         var i = self.ui_frame.region_count;
@@ -501,6 +576,7 @@ pub const Window = struct {
             i -= 1;
             const region = self.ui_frame.regions[i];
             if (!region.bounds.contains(mouse.pos)) continue;
+            if (!region.ownerAlive()) continue;
             if (region.mouse_up_listener) |listener| listener.call(self);
             break;
         }
@@ -521,6 +597,13 @@ pub const Window = struct {
     pub fn fireAction(self: *Window, action_name: []const u8) void {
         for (self.actions[0..self.action_count]) |action| {
             if (std.mem.eql(u8, action.name, action_name)) {
+                // Window-level subscription cleanup (gap §5A): actions
+                // owned by a destroyed entity never fire.
+                if (action.owner_store) |store| {
+                    if (elements.element.entity_is_alive_fn) |alive| {
+                        if (!alive(store, action.owner_id, action.owner_generation)) return;
+                    }
+                }
                 action.listener.call(self);
                 return;
             }
@@ -531,6 +614,12 @@ pub const Window = struct {
 const Action = struct {
     name: []const u8,
     listener: elements.Listener,
+    /// Owning entity subscription, populated by `on_action` when the
+    /// target is an entity. Heap-side (one Window, ≤32 actions), so the
+    /// hot `Listener` struct stays lean.
+    owner_store: ?*anyopaque = null,
+    owner_id: u32 = 0,
+    owner_generation: u32 = 0,
 };
 
 test "window basic properties and render" {
@@ -559,6 +648,36 @@ test "window basic properties and render" {
 
     win.requestRender();
     try std.testing.expect(win.dirty);
+}
+
+test "overflowed frame is rejected with a placeholder, never partial" {
+    const TestApp = @import("app.zig").App;
+    var app = try TestApp.initHeadless(std.testing.allocator);
+    defer app.deinit();
+
+    const win = try app.openWindow(.{
+        .title = "Overflow",
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 100, .h = 80 } },
+    }, struct {
+        fn draw(_: *Window, sc: *gpu.Scene) void {
+            var i: usize = 0;
+            while (i < gpu.scene.MAX_COMMANDS_PER_FRAME + 10) : (i += 1) {
+                _ = sc.push(.{ .x = 0, .y = 0, .w = 1, .h = 1, .color = color.Color.white });
+            }
+        }
+    }.draw);
+
+    win.render();
+    try std.testing.expect(win.frameRejected());
+    try std.testing.expectEqual(@as(u64, 1), win.rejected_frames);
+    // Placeholder, not partial: exactly the two diagnostic quads covering
+    // the window, and the scene still reports the rejection it replaced.
+    try std.testing.expectEqual(@as(usize, 2), win.scene.slice().len);
+    try std.testing.expectEqual(@as(f32, 100), win.scene.slice()[0].w);
+    try std.testing.expectEqual(@as(f32, 80), win.scene.slice()[0].h);
+    try std.testing.expectEqual(@as(usize, 2), win.scene.commandSlice().len);
+    try std.testing.expect(win.scene.overflowed());
+    try std.testing.expectEqual(@as(u64, 10), win.scene.dropped);
 }
 
 test "window os hooks push title cursor and clipboard" {

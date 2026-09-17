@@ -4,10 +4,13 @@ const core = @import("../core/root.zig");
 const platform = @import("../platform/root.zig");
 const fonts = @import("../fonts/text_engine.zig");
 const images = @import("../images/root.zig");
+const zlog = @import("../core/log.zig");
 
 pub const max_nodes = core.limits.MAX_LAYOUT_ELEMENTS;
 pub const max_regions = 512;
 pub const text_storage_len = 64 * 1024;
+/// Owner-registration slots per frame (see `Frame.owner_targets`).
+pub const max_owner_entries = 256;
 
 pub const FontWeight = enum { normal, medium, semibold, bold };
 pub const Direction = enum { row, column };
@@ -33,14 +36,35 @@ pub const FocusHandle = struct {
     id: u32 = 0,
     target: ?*anyopaque = null,
     event_fn: ?*const fn (*anyopaque, platform.Event, *anyopaque) bool = null,
+    /// Same subscription guard as the region owner (see `HitRegion`): the
+    /// `id` doubles as the owner entity id. Dispatch after the owning
+    /// entity was destroyed returns false without touching `target`.
+    /// Hand-built handles leave these null and dispatch straight through.
+    owner_store: ?*anyopaque = null,
+    owner_generation: u32 = 0,
 
     pub fn eql(self: FocusHandle, other: FocusHandle) bool {
         return self.id == other.id;
     }
 
     pub fn dispatch(self: FocusHandle, event: platform.Event, window: *anyopaque) bool {
+        if (self.owner_store) |store| {
+            if (entity_is_alive_fn) |alive| {
+                if (!alive(store, self.id, self.owner_generation)) return false;
+            }
+        }
         const callback = self.event_fn orelse return false;
         return callback(self.target orelse return false, event, window);
+    }
+
+    /// False when the owner entity is gone; unowned handles stay live.
+    pub fn isLive(self: FocusHandle) bool {
+        if (self.owner_store) |store| {
+            if (entity_is_alive_fn) |alive| {
+                return alive(store, self.id, self.owner_generation);
+            }
+        }
+        return true;
     }
 };
 
@@ -56,6 +80,48 @@ pub const HitRegion = struct {
     /// Hover cursor for this region, if any. Window picks the topmost
     /// region under the pointer; null means "no opinion".
     cursor: ?platform.CursorShape = null,
+    /// Owning entity subscription (gap §5A), installed by the painter from
+    /// the frame owner table (see `Frame.trackOwner`): the (store, id,
+    /// generation) of the entity that minted this region's listeners.
+    /// `Window` resolves liveness through the store *before* invoking any
+    /// listener on this region, so input dispatched after
+    /// `EntityStore.destroyEntity` is a safe skip instead of a
+    /// use-after-free. Regions from hand-built listeners carry null and
+    /// dispatch straight through, as before. All listeners on one node
+    /// should share an owner; mixed-ownership nodes gate on the first
+    /// registered owner (conservative: a dead first owner skips the region
+    /// even if a later role's owner still lives).
+    owner_store: ?*anyopaque = null,
+    owner_id: u32 = 0,
+    owner_generation: u32 = 0,
+
+    /// False when the owning entity is gone; unowned regions stay live.
+    /// Window dispatch consults this before every listener on the region.
+    pub fn ownerAlive(self: HitRegion) bool {
+        if (self.owner_store) |store| {
+            if (entity_is_alive_fn) |alive| {
+                return alive(store, self.owner_id, self.owner_generation);
+            }
+        }
+        return true;
+    }
+};
+
+/// Store-level entity liveness probe behind the `HitRegion`/`FocusHandle`
+/// subscription guards. Wired once by `EntityStore.init` (always the same
+/// function); kept here — rather than passed per value — so the hot
+/// `Listener`/`Node` structs stay lean and `window.zig` can consult it
+/// without importing `runtime` (which would be an import cycle). UI-thread
+/// only, like everything it guards. Null means ungated: pre-wiring or
+/// hand-built handles dispatch straight through, as before.
+pub var entity_is_alive_fn: ?*const fn (*anyopaque, u32, u32) bool = null;
+
+/// Entity owner reference resolved through the frame owner table
+/// (`Frame.lookupOwner`) and installed on hit regions by the painter.
+pub const OwnerRef = struct {
+    store: *anyopaque,
+    id: u32,
+    generation: u32,
 };
 
 pub const EdgeValues = struct {
@@ -162,6 +228,12 @@ pub const Node = struct {
     next_sibling: ?u16 = null,
     bounds: core.Rect = .{},
     measured: core.Size = .{},
+    /// Optional stable identity for keyed elements (gap §5A). Zero means
+    /// unkeyed; nonzero values are `platform.id` hashes that survive across
+    /// frames so row state can follow data when reordered (`platform.id`
+    /// never mints zero, so zero is an unambiguous sentinel). The frame
+    /// diagnoses duplicate keys per frame (see `Frame.duplicate_keys`).
+    stable_key: u64 = 0,
     listener: ?Listener = null,
     mouse_down_listener: ?Listener = null,
     mouse_up_listener: ?Listener = null,
@@ -263,6 +335,39 @@ pub const Frame = struct {
     /// Allocator for cold image work (file reads, decode dividends).
     /// Null drops path sources and uncached decodes.
     allocator: ?std.mem.Allocator = null,
+    /// Frame identity for transient-handle checks (gap §5A). Bumped by
+    /// every `reset()`; each `Element` stamps the generation it was built
+    /// in, so a handle that escapes its frame (used after `endFrame` or
+    /// after the next `reset`) fails predictably via `Element.isAlive`
+    /// instead of silently indexing a recycled node slot.
+    generation: u64 = 0,
+    /// Stable keys seen this frame (parallel to node slots; only keyed
+    /// nodes append). A second `keyed()` with an already-seen key counts
+    /// `duplicate_keys` and logs — duplicate keys would alias retained
+    /// state, focus, and semantics, so they are diagnosed, not ignored.
+    seen_keys: [max_nodes]u64 = undefined,
+    seen_key_count: usize = 0,
+    /// Duplicate stable keys diagnosed this frame. Observable; never reset
+    /// by anything except `reset()` (a new frame starts a new key scope).
+    duplicate_keys: u64 = 0,
+    /// Entity→owner registrations for this frame (gap §5A subscription
+    /// cleanup). `runtime` registers every listener/focus target it mints
+    /// while a frame is active (`trackOwner`, a no-op without one); the
+    /// painter resolves each emitted hit region's owner through this table
+    /// instead of dereferencing possibly-stale targets. Entries are
+    /// per-frame values: `reset()` clears them, so regions can never
+    /// outlive the registrations they were resolved from. 256 slots cover
+    /// ordinary frames (distinct listener owners per frame are usually a
+    /// handful); overflow counts `owner_overflows` and leaves the region
+    /// ungated rather than dropping input.
+    owner_targets: [max_owner_entries]*anyopaque = undefined,
+    owner_stores: [max_owner_entries]*anyopaque = undefined,
+    owner_ids: [max_owner_entries]u32 = undefined,
+    owner_generations: [max_owner_entries]u32 = undefined,
+    owner_count: usize = 0,
+    /// Owner registrations dropped while the table was full. Observable;
+    /// cleared by `reset()`.
+    owner_overflows: u64 = 0,
 
     pub fn reset(self: *Frame, window: *anyopaque, pointer: core.Point) void {
         // A new frame owns no retained layouts from the previous one: free
@@ -275,6 +380,12 @@ pub const Frame = struct {
         self.text_len = 0;
         self.window = window;
         self.pointer = pointer;
+        self.generation +%= 1;
+        if (self.generation == 0) self.generation = 1;
+        self.seen_key_count = 0;
+        self.duplicate_keys = 0;
+        self.owner_count = 0;
+        self.owner_overflows = 0;
         // New frame installs its own engine (`runtime.mountView` does it
         // right after reset): text without an install draws nothing.
         self.engine = null;
@@ -299,6 +410,66 @@ pub const Frame = struct {
         self.node_count += 1;
         self.nodes[index] = .{ .kind = kind };
         return index;
+    }
+
+    /// Allocate one node and stamp the handle with this frame's generation
+    /// so escaped handles fail predictably (see `Element.isAlive`).
+    fn makeElement(self: *Frame, kind: NodeKind) Element {
+        return .{ .index = self.createNode(kind), .generation = self.generation };
+    }
+
+    /// Record a stable key for duplicate diagnosis. Called by
+    /// `Element.keyed`; duplicates count `duplicate_keys` and log with the
+    /// frame generation so the offending frame is identifiable.
+    fn trackKey(self: *Frame, key: u64) void {
+        std.debug.assert(key != 0);
+        for (self.seen_keys[0..self.seen_key_count]) |seen| {
+            if (seen == key) {
+                self.duplicate_keys += 1;
+                zlog.log("element", "duplicate stable key {d} in frame {d}", .{ key, self.generation });
+                return;
+            }
+        }
+        if (self.seen_key_count < self.seen_keys.len) {
+            self.seen_keys[self.seen_key_count] = key;
+            self.seen_key_count += 1;
+        }
+    }
+
+    /// Register an entity-owned listener/focus target minted while this
+    /// frame is active. Called by `runtime` at mint time (the entity is
+    /// provably live there), so the painter can later resolve region owners
+    /// without touching possibly-destroyed targets. Re-registers refresh
+    /// the entry; a full table counts `owner_overflows` and leaves the
+    /// region ungated rather than dropping input.
+    pub fn trackOwner(self: *Frame, target: *anyopaque, store: *anyopaque, id: u32, generation: u32) void {
+        for (self.owner_targets[0..self.owner_count], 0..) |t, i| {
+            if (t == target) {
+                self.owner_stores[i] = store;
+                self.owner_ids[i] = id;
+                self.owner_generations[i] = generation;
+                return;
+            }
+        }
+        if (self.owner_count < self.owner_targets.len) {
+            self.owner_targets[self.owner_count] = target;
+            self.owner_stores[self.owner_count] = store;
+            self.owner_ids[self.owner_count] = id;
+            self.owner_generations[self.owner_count] = generation;
+            self.owner_count += 1;
+        } else {
+            self.owner_overflows += 1;
+        }
+    }
+
+    /// Resolve a region listener target to its (store, id, generation).
+    /// Returns null for hand-built targets and table overflow — those
+    /// regions dispatch ungated, exactly as before this feature.
+    pub fn lookupOwner(self: *const Frame, target: *anyopaque) ?OwnerRef {
+        for (self.owner_targets[0..self.owner_count], 0..) |t, i| {
+            if (t == target) return .{ .store = self.owner_stores[i], .id = self.owner_ids[i], .generation = self.owner_generations[i] };
+        }
+        return null;
     }
 
     pub fn copyText(self: *Frame, value: []const u8) []const u8 {
@@ -346,11 +517,55 @@ pub fn currentWindow() *anyopaque {
     return currentFrame().window orelse @panic("ZUI render frame has no window");
 }
 
+/// Register an entity-owned listener/focus target with the active frame's
+/// owner table (gap §5A). Called by `runtime` at mint time; a no-op when no
+/// frame is active (listeners minted outside render dispatch ungated, as
+/// before). Never touches the target — registration carries the live
+/// (store, id, generation) by value.
+pub fn trackEntityOwner(target: *anyopaque, store: *anyopaque, id: u32, generation: u32) void {
+    const frame = active_frame orelse return;
+    frame.trackOwner(target, store, id, generation);
+}
+
 pub const Element = struct {
     index: u16,
+    /// Frame generation this handle was built in (stamped by `Frame`).
+    /// Zero means "pre-generation" (hand-built); any handle whose
+    /// generation differs from the active frame's is an escaped handle and
+    /// fails predictably (panic in `node()`, false in `isAlive()`).
+    generation: u64 = 0,
 
     fn node(self: Element) *Node {
-        return &currentFrame().nodes[self.index];
+        const frame = currentFrame();
+        if (self.generation != frame.generation) @panic("ZUI element handle escaped its frame");
+        if (self.index >= frame.node_count) @panic("ZUI element handle out of range");
+        return &frame.nodes[self.index];
+    }
+
+    /// False when no frame is active, when this handle was built in an
+    /// older frame, or when its slot is not (or no longer) allocated — the
+    /// non-panicking probe for escaped-handle checks.
+    pub fn isAlive(self: Element) bool {
+        const frame = active_frame orelse return false;
+        return self.generation == frame.generation and self.index < frame.node_count;
+    }
+
+    /// Attach a stable key (gap §5A): a `platform.id` hash that identifies
+    /// this element across frames (e.g. per-row keys so state follows data
+    /// when a list reorders). The frame tracks seen keys and diagnoses
+    /// duplicates via `Frame.duplicate_keys`. Zero is reserved for unkeyed
+    /// nodes and panics (a real `platform.id` is never zero).
+    pub fn keyed(self: Element, key: u64) Element {
+        if (key == 0) @panic("ZUI stable key must be nonzero");
+        self.node().stable_key = key;
+        currentFrame().trackKey(key);
+        return self;
+    }
+
+    /// `keyed()` from a call-site source location plus an index extra
+    /// (row id, tab id, ...), using the collision-fixed `platform.id`.
+    pub fn keyedAuto(self: Element, parent: platform.Id, src: std.builtin.SourceLocation, extra: u64) Element {
+        return self.keyed(platform.id.fromSrc(parent, src, extra));
     }
 
     pub fn flex_row(self: Element) Element {
@@ -609,11 +824,13 @@ pub const Element = struct {
         else
             @compileError("unsupported ZUI child type: " ++ @typeName(T));
 
+        const frame = currentFrame();
+        if (!child_element.isAlive()) @panic("ZUI child element handle escaped its frame");
         const parent = self.node();
-        const child_node = &currentFrame().nodes[child_element.index];
+        const child_node = &frame.nodes[child_element.index];
         child_node.next_sibling = null;
         if (parent.last_child) |last| {
-            currentFrame().nodes[last].next_sibling = child_element.index;
+            frame.nodes[last].next_sibling = child_element.index;
         } else {
             parent.first_child = child_element.index;
         }
@@ -635,12 +852,12 @@ pub const Element = struct {
 
 pub fn div() Element {
     const frame = currentFrame();
-    return .{ .index = frame.createNode(.container) };
+    return frame.makeElement(.container);
 }
 
 pub fn spacer() Element {
     const frame = currentFrame();
-    const result = Element{ .index = frame.createNode(.spacer) };
+    const result = frame.makeElement(.spacer);
     return result.flex_1();
 }
 
@@ -732,7 +949,7 @@ pub fn svgPath(path: []const u8) Element {
 
 fn makeImage(source: ImageSource, is_svg: bool) Element {
     const frame = currentFrame();
-    const result = Element{ .index = frame.createNode(.image) };
+    const result = frame.makeElement(.image);
     const n = result.node();
     n.image.source = source;
     n.image.svg = is_svg;
@@ -744,7 +961,7 @@ fn makeImage(source: ImageSource, is_svg: bool) Element {
 
 pub fn text(value: []const u8, options: anytype) Element {
     const frame = currentFrame();
-    const result = Element{ .index = frame.createNode(.text) };
+    const result = frame.makeElement(.text);
     const n = result.node();
     n.text_value = value;
     const T = @TypeOf(options);
@@ -797,4 +1014,100 @@ pub fn progressTrack(value: f32) Element {
 
 pub fn formatToday() []const u8 {
     return "TODAY";
+}
+
+test "keyed elements track keys and diagnose duplicates" {
+    const t = std.testing;
+    const frame = try t.allocator.create(Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    beginFrame(frame);
+    defer endFrame();
+
+    const a = div().keyed(101);
+    try t.expect(a.isAlive());
+    try t.expectEqual(@as(u64, 101), frame.nodes[a.index].stable_key);
+    try t.expectEqual(@as(u64, 0), frame.duplicate_keys);
+
+    // Distinct keys are fine.
+    _ = div().keyed(102);
+    try t.expectEqual(@as(u64, 0), frame.duplicate_keys);
+
+    // A repeated key is diagnosed, not silently aliased.
+    _ = div().keyed(101);
+    try t.expectEqual(@as(u64, 1), frame.duplicate_keys);
+    try t.expectEqual(@as(usize, 2), frame.seen_key_count);
+}
+
+test "escaped element handles fail predictably" {
+    const t = std.testing;
+    const frame = try t.allocator.create(Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    beginFrame(frame);
+    const stale = div().keyed(7);
+    try t.expect(stale.isAlive());
+    endFrame();
+    // No active frame: every handle reads dead.
+    try t.expect(!stale.isAlive());
+    // Next frame recycles slot 0: the old handle stays dead while the new
+    // handle at the same index is alive — generations distinguish them.
+    frame.reset(@ptrFromInt(1), .{});
+    beginFrame(frame);
+    defer endFrame();
+    try t.expect(!stale.isAlive());
+    const fresh = div();
+    try t.expect(fresh.isAlive());
+    try t.expectEqual(stale.index, fresh.index);
+    try t.expect(stale.generation != fresh.generation);
+    // A fresh frame starts a fresh key scope.
+    try t.expectEqual(@as(u64, 0), frame.duplicate_keys);
+}
+
+test "keyedAuto derives stable ids from call-site identity" {
+    const t = std.testing;
+    const frame = try t.allocator.create(Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    beginFrame(frame);
+    defer endFrame();
+
+    const a = div().keyedAuto(platform.id.NO_PARENT, @src(), 3);
+    const b = div().keyedAuto(platform.id.NO_PARENT, @src(), 3);
+    // Same file but different columns => different keys (id.zig overlap
+    // regression would collide these).
+    try t.expect(frame.nodes[a.index].stable_key != frame.nodes[b.index].stable_key);
+    try t.expectEqual(@as(u64, 0), frame.duplicate_keys);
+}
+
+test "owner table registers mint-time owners without touching targets" {
+    const t = std.testing;
+    const frame = try t.allocator.create(Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    // No active frame: registration is a safe no-op.
+    var store_token: u8 = 0;
+    var target_token: u8 = 0;
+    trackEntityOwner(&target_token, &store_token, 9, 3);
+    try t.expectEqual(@as(usize, 0), frame.owner_count);
+
+    beginFrame(frame);
+    defer endFrame();
+    trackEntityOwner(&target_token, &store_token, 9, 3);
+    try t.expectEqual(@as(usize, 1), frame.owner_count);
+    const hit = frame.lookupOwner(&target_token) orelse return error.TestExpectedHit;
+    try t.expect(hit.store == @as(*anyopaque, &store_token));
+    try t.expectEqual(@as(u32, 9), hit.id);
+    try t.expectEqual(@as(u32, 3), hit.generation);
+    // Re-registering the same target refreshes instead of growing.
+    trackEntityOwner(&target_token, &store_token, 9, 4);
+    try t.expectEqual(@as(usize, 1), frame.owner_count);
+    try t.expectEqual(@as(u32, 4), frame.lookupOwner(&target_token).?.generation);
+    // Unknown targets miss (ungated dispatch, as before).
+    var stranger: u8 = 0;
+    try t.expect(frame.lookupOwner(&stranger) == null);
 }

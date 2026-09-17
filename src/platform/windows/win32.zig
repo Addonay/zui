@@ -218,7 +218,13 @@ pub const Win32Backend = struct {
         var gdi32 = dl.Library.open(&.{"gdi32.dll"}) orelse return error.LibraryNotFound;
         errdefer gdi32.close();
         var api = b.User32Api.load(user32) orelse return error.MissingSymbols;
-        api.GetDpiForWindow = user32.lookup(@FieldType(b.User32Api, "GetDpiForWindow"), "GetDpiForWindow");
+        // Optional (Win10+): the field type itself is already optional, so
+        // look up the non-optional payload and only assign on success.
+        // Looking up the optional field type would yield ??fn, which cannot
+        // convert to the ?fn field.
+        if (user32.lookup(*const fn (b.HWND) callconv(.c) c_uint, "GetDpiForWindow")) |dpi_fn| {
+            api.GetDpiForWindow = dpi_fn;
+        }
         const kernel = b.KernelApi.load(kernel32) orelse return error.MissingSymbols;
         const gdi = b.GdiApi.load(gdi32) orelse return error.MissingSymbols;
 
@@ -482,7 +488,10 @@ pub const Win32Backend = struct {
             },
             b.WM_MOUSEWHEEL, b.WM_MOUSEHWHEEL => {
                 if (self) |s| {
-                    const delta: i16 = @truncate(wparam >> 16);
+                    // High word is a signed 16-bit wheel delta; this
+                    // snapshot's @truncate rejects unsigned-to-signed, so
+                    // narrow to u16 first and reinterpret the bits.
+                    const delta: i16 = @bitCast(@as(u16, @truncate(wparam >> 16)));
                     s.wheel_remainder += delta;
                     const lines = @divTrunc(s.wheel_remainder, @as(i32, b.WHEEL_DELTA));
                     s.wheel_remainder -= lines * @as(i32, b.WHEEL_DELTA);
@@ -521,7 +530,19 @@ pub const Win32Backend = struct {
     }
 
     fn timeMs() i64 {
-        return @divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms);
+        // No clock_gettime on Windows; the performance counter needs no
+        // library handle (unlike the dlopened user32/kernel32 tables).
+        // (The old std.time.nanoTimestamp call never compiled — this
+        // snapshot's std.time carries only constants.)
+        var counter: std.os.windows.LARGE_INTEGER = undefined;
+        var freq: std.os.windows.LARGE_INTEGER = undefined;
+        if (std.os.windows.ntdll.RtlQueryPerformanceFrequency(&freq).toBool() and
+            std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() and
+            freq > 0)
+        {
+            return @divTrunc(counter * 1000, freq);
+        }
+        return 0;
     }
 
     /// Pure frameless border hit-test: 8px edges map to resize codes.

@@ -24,7 +24,7 @@ pub const NSRect = extern struct { origin: NSPoint, size: NSSize };
 pub const ObjcApi = struct {
     getClass: *const fn ([*:0]const u8) callconv(.c) Class,
     sel_registerName: *const fn ([*:0]const u8) callconv(.c) SEL,
-    allocateClassPair: *const fn (Class, [*:0]const u8, usize) callconv(.c) ?Class,
+    allocateClassPair: *const fn (Class, [*:0]const u8, usize) callconv(.c) Class,
     registerClassPair: *const fn (Class) callconv(.c) void,
     addMethod: *const fn (Class, SEL, IMP, [*:0]const u8) callconv(.c) BOOL,
     msg_send: *anyopaque,
@@ -32,7 +32,7 @@ pub const ObjcApi = struct {
     pub fn load(lib: @import("../dl.zig").Library) ?ObjcApi {
         const getClass = lib.lookup(*const fn ([*:0]const u8) callconv(.c) Class, "objc_getClass") orelse return null;
         const sel_registerName = lib.lookup(*const fn ([*:0]const u8) callconv(.c) SEL, "sel_registerName") orelse return null;
-        const allocateClassPair = lib.lookup(*const fn (Class, [*:0]const u8, usize) callconv(.c) ?Class, "objc_allocateClassPair") orelse return null;
+        const allocateClassPair = lib.lookup(@FieldType(ObjcApi, "allocateClassPair"), "objc_allocateClassPair") orelse return null;
         const registerClassPair = lib.lookup(*const fn (Class) callconv(.c) void, "objc_registerClassPair") orelse return null;
         const addMethod = lib.lookup(*const fn (Class, SEL, IMP, [*:0]const u8) callconv(.c) BOOL, "class_addMethod") orelse return null;
         const msg_send = lib.lookup(*anyopaque, "objc_msgSend") orelse return null;

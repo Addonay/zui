@@ -103,7 +103,9 @@ fn modifiersFromFlags(flags: b.NSUInteger) event.Modifiers {
 var msg_send_fn: ?*anyopaque = null;
 
 fn send(comptime Fn: type) Fn {
-    return @as(Fn, @ptrCast(msg_send_fn.?));
+    // Same alignment story as dl.Library.lookup: the dispatch pointer is
+    // *anyopaque (align 1) while concrete signatures need fn alignment.
+    return @as(Fn, @ptrCast(@alignCast(msg_send_fn.?)));
 }
 
 pub const CocoaBackend = struct {

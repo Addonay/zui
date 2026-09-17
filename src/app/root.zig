@@ -16,6 +16,7 @@ pub const KeyContext = keymap.ContextFrame;
 pub const Context = runtime.Context;
 pub const Entity = runtime.Entity;
 pub const EntityStore = runtime.EntityStore;
+pub const WeakEntity = runtime.WeakEntity;
 pub const FocusHandle = runtime.FocusHandle;
 pub const TestHarness = runtime.TestHarness;
 

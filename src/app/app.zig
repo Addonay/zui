@@ -43,6 +43,9 @@ pub const App = struct {
     /// Monotonic frame counter for `ZUI_LOG` diagnostics (a stalled
     /// counter in the log pinpoints event-loop starvation hangs).
     step_count: u64 = 0,
+    /// Frames rejected for scene overflow across all windows (each was
+    /// replaced by the diagnostic placeholder before present).
+    rejected_frames: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) !App {
         var instance = try platform.createAuto(allocator, "ZUI Application", 800, 600);
@@ -428,6 +431,14 @@ pub const App = struct {
                 if (win.dirty and !win.closed) {
                     win.frame_id = self.step_count;
                     win.render();
+                    if (win.frameRejected()) {
+                        // The scene was partial; Window.render already
+                        // substituted the complete diagnostic placeholder,
+                        // so this present is honest. Count it here too so a
+                        // log scan finds every rejection in one place.
+                        self.rejected_frames += 1;
+                        zlog.log("app", "step {d}: window {d} frame rejected for overflow ({d} dropped); presented placeholder", .{ self.step_count, win.id, win.scene.dropped_frame });
+                    }
                     self.backend.present(&win.scene, self.glyphPixels(), self.imagePixels());
                     presented += 1;
                 }
@@ -625,6 +636,33 @@ test "non-dirty window skips render and present" {
     try std.testing.expect(app.step());
     try std.testing.expectEqual(@as(u32, 1), renders);
     try std.testing.expectEqual(@as(u32, 1), app.getNullBackend().?.presents);
+}
+
+test "overflowed frame presents the placeholder and counts the rejection" {
+    var app = try App.initHeadless(std.testing.allocator);
+    defer app.deinit();
+
+    const S = struct {
+        fn draw(_: ?*anyopaque, _: *Window, sc: *gpu.Scene) void {
+            var i: usize = 0;
+            while (i < gpu.scene.MAX_COMMANDS_PER_FRAME + 5) : (i += 1) {
+                _ = sc.push(.{ .x = 0, .y = 0, .w = 1, .h = 1, .color = color.Color.white });
+            }
+        }
+    };
+    const win = try app.openWindow(.{
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 50, .h = 40 } },
+    }, Renderer{ .ptr = null, .render_fn = S.draw });
+
+    try std.testing.expect(app.step());
+    // Rejected at the window, counted at the app, and the backend still
+    // got exactly one COMPLETE frame (the 2-quad placeholder).
+    try std.testing.expect(win.frameRejected());
+    try std.testing.expectEqual(@as(u64, 1), win.rejected_frames);
+    try std.testing.expectEqual(@as(u64, 1), app.rejected_frames);
+    try std.testing.expectEqual(@as(u32, 1), app.getNullBackend().?.presents);
+    try std.testing.expectEqual(@as(usize, 2), win.scene.slice().len);
+    try std.testing.expectEqual(@as(f32, 50), win.scene.slice()[0].w);
 }
 
 test "close_requested event terminates frame loop when all windows closed" {
