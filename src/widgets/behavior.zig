@@ -19,6 +19,9 @@ const Window = @import("../app/window.zig").Window;
 /// disabled need explicit colors because the painter has no notion of them).
 pub const VisualState = enum { idle, hovered, pressed, disabled };
 
+/// Presentation-independent bounded offset, paging, and scrollbar geometry.
+pub const ScrollModel = @import("scroll_model.zig").ScrollModel;
+
 pub const Pressable = struct {
     pressed: bool = false,
     hovered: bool = false,

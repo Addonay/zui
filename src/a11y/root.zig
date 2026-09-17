@@ -3,11 +3,11 @@ const std = @import("std");
 const Rect = @import("../core/geometry.zig").Rect;
 const element = @import("../elements/element.zig");
 pub const capacity = 512;
-pub const Role = enum { group, button, checkbox, radio_group, radio, switch_control, slider, progress, text_input, label, dialog };
+pub const Role = enum { group, button, checkbox, radio_group, radio, switch_control, slider, progress, text_input, label, dialog, list, listitem };
 pub const Action = enum { activate, increment, decrement, set_value, focus };
 pub const Request = struct { action: Action, value: f64 = 0 };
 pub const Actions = packed struct { activate: bool = false, increment: bool = false, decrement: bool = false, set_value: bool = false, focus: bool = false };
-pub const States = struct { disabled: bool = false, checked: ?bool = null, selected: bool = false, focused: bool = false, read_only: bool = false, hidden: bool = false };
+pub const States = struct { disabled: bool = false, checked: ?bool = null, selected: bool = false, focused: bool = false, read_only: bool = false, hidden: bool = false, scrollable: bool = false };
 pub const Value = struct { current: f64, min: f64 = 0, max: f64 = 1, step: f64 = 0 };
 pub const Handler = struct {
     target: *anyopaque,
@@ -18,6 +18,9 @@ pub const Properties = struct {
     name: []const u8 = "",
     text_value: []const u8 = "",
     value: ?Value = null,
+    /// One-based virtual collection position and logical collection size.
+    position_in_set: ?usize = null,
+    set_size: ?usize = null,
     states: States = .{},
     actions: Actions = .{},
     /// Stable-key relationships, not transient element indices.

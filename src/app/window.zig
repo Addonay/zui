@@ -110,6 +110,8 @@ pub const Window = struct {
     /// Most recent scroll event delivered to this window, readable by the
     /// scroll listener that received it.
     last_scroll: platform.event.ScrollEvent = .{ .pos = .{ .x = 0, .y = 0 } },
+    /// Opt-in wheel remainder. Legacy listeners consume the entire event.
+    scroll_chain_requested: bool = false,
     focused: elements.FocusHandle = .{},
     /// Optional borrowed focus scope; host owns its ids until popScope.
     focus_scope: ?@import("../widgets/focus.zig").Scope = null,
@@ -278,6 +280,14 @@ pub const Window = struct {
     /// The scroll event that just reached a scroll listener.
     pub fn scrollEvent(self: *const Window) platform.event.ScrollEvent {
         return self.last_scroll;
+    }
+
+    /// Call only inside a scroll listener to pass unconsumed line deltas to
+    /// enclosing scroll regions. No call retains legacy consume-all behavior.
+    pub fn chainScroll(self: *Window, dx: f32, dy: f32) void {
+        self.last_scroll.dx = dx;
+        self.last_scroll.dy = dy;
+        self.scroll_chain_requested = dx != 0 or dy != 0;
     }
 
     pub fn markDirty(self: *Window) void {
@@ -604,6 +614,7 @@ pub const Window = struct {
                 // Scroll goes to the topmost scrollable container under the
                 // pointer; focused-element dispatch stays as the fallback.
                 var handled = false;
+                var inner_bounds: ?geometry.Rect = null;
                 var i = self.ui_frame.region_count;
                 while (i > 0) {
                     i -= 1;
@@ -611,9 +622,18 @@ pub const Window = struct {
                     if (!region.bounds.contains(scroll.pos)) continue;
                     if (!region.ownerAlive()) continue;
                     if (region.scroll_listener) |listener| {
+                        // Only chain outward, not into an overlapping smaller
+                        // sibling. Regions are painted parent-before-child.
+                        if (inner_bounds) |inner| {
+                            if (region.bounds.x > inner.x or region.bounds.y > inner.y or
+                                region.bounds.x + region.bounds.w < inner.x + inner.w or
+                                region.bounds.y + region.bounds.h < inner.y + inner.h) continue;
+                        }
+                        self.scroll_chain_requested = false;
                         listener.call(self);
                         handled = true;
-                        break;
+                        if (!self.scroll_chain_requested) break;
+                        inner_bounds = region.bounds;
                     }
                 }
                 if (!handled) {

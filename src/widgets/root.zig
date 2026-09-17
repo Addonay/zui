@@ -9,6 +9,8 @@ pub const Switch = @import("controls.zig").Switch;
 pub const Slider = @import("controls.zig").Slider;
 pub const Progress = @import("controls.zig").Progress;
 pub const RadioGroup = @import("radio_group.zig").RadioGroup;
+pub const ScrollArea = @import("scroll_area.zig").ScrollArea;
+pub const VirtualList = @import("virtual_list.zig").VirtualList;
 
 test {
     _ = @import("text_field.zig");
@@ -16,4 +18,6 @@ test {
     _ = focus;
     _ = theme;
     _ = @import("controls_test.zig");
+    _ = @import("scroll_test.zig");
+    _ = @import("scroll_model.zig");
 }
