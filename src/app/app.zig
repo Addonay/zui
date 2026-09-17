@@ -1102,6 +1102,7 @@ test "app auto probe initializes available backend" {
 }
 
 test "app drives two live x11 windows with targeted input" {
+    if (comptime !platform.is_linux) return;
     const x11 = platform.x11;
     if (!x11.X11Backend.isAvailable()) return;
     const t = std.testing;
