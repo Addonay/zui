@@ -12,6 +12,7 @@ const text_engine = @import("../fonts/text_engine.zig");
 const images = @import("../images/root.zig");
 const keymap = @import("keymap.zig");
 const zlog = @import("../core/log.zig");
+const a11y = @import("../a11y/root.zig");
 
 pub const Chrome = enum {
     system,
@@ -120,6 +121,9 @@ pub const Window = struct {
     scale_factor: f32 = 1,
     native_backend: ?platform.Backend = null,
     owns_native_window: bool = false,
+    /// AccessKit bridge (gap §5C): publishes the semantic tree to the OS.
+    /// Empty (no adapter) unless `-Daccesskit=true` built it in.
+    a11y_bridge: a11y.accesskit.Bridge = a11y.accesskit.Bridge.init(),
     focused: elements.FocusHandle = .{},
     /// Optional borrowed focus scope; host owns its ids until popScope.
     focus_scope: ?@import("../widgets/focus.zig").Scope = null,
@@ -335,6 +339,11 @@ pub const Window = struct {
         // Regions were rebuilt above; refresh the cursor for a stationary
         // pointer sitting over changed content.
         self.updateHoverCursor();
+        // AccessKit publish (gap §5C): snapshot the freshly built semantic
+        // tree, then let the platform adapter take it when an assistive
+        // technology is connected.
+        self.a11y_bridge.publish(self);
+        self.a11y_bridge.updateIfActive();
     }
 
     /// True when the last `render()` rejected its frame for overflow.
@@ -373,6 +382,7 @@ pub const Window = struct {
     /// (which normally clears them) must not leak them.
     pub fn deinit(self: *Window) void {
         self.ui_frame.clearCozmicLayouts();
+        self.a11y_bridge.deinit(self.allocator orelse std.heap.page_allocator);
         if (self.owns_native_window) {
             self.native_backend.?.destroyWindow();
             self.native_backend = null;

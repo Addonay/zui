@@ -517,6 +517,14 @@ pub const App = struct {
         // Destroy windows closed during render/callbacks; dispatch above
         // already finished using them.
         self.reapClosed();
+        // AccessKit action drain (gap §5C): AT requests (click/increment/
+        // set_value/focus) queued from platform threads run on the UI
+        // thread against each window's CURRENT semantic tree.
+        for (self.windows) |maybe_win| {
+            const win = maybe_win orelse continue;
+            if (win.closed) continue;
+            win.a11y_bridge.drain(win);
+        }
 
         self.step_count += 1;
         zlog.log("app", "step {d}: {d} queued events, {d} presented", .{ self.step_count, qlen, presented });

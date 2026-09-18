@@ -9,6 +9,13 @@ pub fn build(b: *std.Build) void {
     // switch any more: text is always cozmic.
     const build_options = b.addOptions();
 
+    // AccessKit accessibility bridge (gap report §5C / §7): vendored C-ABI
+    // library built from third_party/accesskit with cargo. Default OFF so
+    // plain `zig build` never requires a Rust toolchain; enable with
+    // -Daccesskit=true (see docs/A11Y_PLAN.md for the runtime story).
+    const enable_accesskit = b.option(bool, "accesskit", "Enable the AccessKit accessibility bridge (builds the vendored library with cargo)") orelse false;
+    build_options.addOption(bool, "accesskit", enable_accesskit);
+
     // Standalone layout-engine package, fetched from
     // https://github.com/Addonay/zlay (pinned by commit in build.zig.zon).
     // The `zlay` module is aliased to `layout` so every existing
@@ -66,6 +73,24 @@ pub fn build(b: *std.Build) void {
         .file = b.path("third_party/images.c"),
         .flags = &.{ "-O2", "-std=c99", "-fno-sanitize=all" },
     });
+
+    // AccessKit: the vendored C-ABI library is built with cargo from
+    // third_party/accesskit (Rust crate `accesskit-c`, static + shared);
+    // the header is translated to the `accesskit_c` import. Artifacts land
+    // under third_party/accesskit/target/release (gitignored). Only the
+    // `zui` module links it; consumers get it transitively.
+    if (enable_accesskit) {
+        const ak_translate_c = b.addTranslateC(.{
+            .root_source_file = b.path("third_party/accesskit/include/accesskit.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const ak_lib = b.addSystemCommand(&.{ "cargo", "build", "--release" });
+        ak_lib.setCwd(b.path("third_party/accesskit"));
+        mod.addImport("accesskit_c", ak_translate_c.createModule());
+        mod.addLibraryPath(b.path("third_party/accesskit/target/release"));
+        mod.linkSystemLibrary("accesskit", .{ .needed = false });
+    }
 
     const mod_tests = b.addTest(.{
         .root_module = mod,

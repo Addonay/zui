@@ -24,6 +24,15 @@ by ZUI's CPU build.
 Upstream: https://github.com/memononen/nanosvg,
 https://github.com/nothings/stb
 
+## Vendored third-party sources (distributed with this tree)
+
+- `third_party/accesskit/`: AccessKit C ABI (accesskit-c), upstream tag
+  `0.23.0`, dual MIT/Apache-2.0 (Copyright The AccessKit contributors;
+  includes a Chromium-derived notice in `LICENSE.chromium` — see
+  `LICENSE-APACHE`). The `Cargo.lock` pins the exact dependency set; the
+  library is built by cargo only when the `-Daccesskit=true` build option
+  is set. Upstream: https://github.com/AccessKit/accesskit-c
+
 ## In-tree ports and API references (reimplemented, not verbatim copies)
 
 - `src/core/limits.zig`: ported from Gooey

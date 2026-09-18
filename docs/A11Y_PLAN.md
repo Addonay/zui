@@ -64,7 +64,40 @@ and zero-candidate traversal, semantic parentage, numeric values, sibling reorde
 unmount removal, and focus-ring styling. This is headless evidence, not a native
 screen-reader or visual-contrast certification.
 
-## AccessKit C binding plan — not vendored
+## AccessKit C binding — vendored and wired (2026-09-18)
+
+Status update to the original plan below: the library is now **vendored and
+live**, following DVUI's `accesskit-c` architecture (not Gooey's — Gooey
+hand-implements AT-SPI over D-Bus; we follow the gap report's advice and use
+AccessKit's maintained platform adapters instead of reimplementing them).
+
+- **Vendored**: `third_party/accesskit/` — accesskit-c sources at upstream
+  tag `0.23.0` (Rust C-ABI crate + `include/accesskit.h` + licenses). Built
+  by `cargo build --release` as a `zig build` step; `-Daccesskit=true`
+  links it and exposes the `accesskit_c` translateC import. Default OFF:
+  plain `zig build` never needs Rust.
+- **`src/a11y/accesskit.zig`** implements the bridge: pure role/action
+  mapping tables (comptime-asserted against the vendored header), one
+  `Bridge` per window holding a mutex-protected node snapshot, per-frame
+  `publish()` after paint (UI thread), `update_if_active` factory (AT
+  thread, reads only the snapshot), and queued action requests drained on
+  the UI thread into `Tree.perform` — click/increment/decrement/set_value/
+  focus, owner-liveness and modal gating included.
+- **Identity**: ZUI stable keys are the AccessKit node ids. ZUI already
+  diagnoses duplicate and unkeyed nodes, preventing the duplicate-ID
+  dropped-nodes pitfall AccessKit's own README documents.
+- **Verified so far** (evidence levels per `docs/PLATFORM_MATRIX.md`):
+  compiles + links with the vendored library on Linux native and both
+  foreign targets compile without AccessKit; live X11 window creates the
+  unix adapter (logged) with clean exit and no protocol errors; 280/280
+  tests with AccessKit enabled.
+- **Not yet validated**: an actual screen reader driving the app (Orca on
+  this session has no AT running; VoiceOver/NVDA need native runners),
+  Windows (UIA) and macOS (NSAccessibility) adapters, adapter-owned
+  snapshot diffing (currently a full per-frame tree push like DVUI's
+  default), and text-run character offsets.
+
+## AccessKit C binding plan (original steps, for the remaining work)
 
 1. Pin an AccessKit-C release and its matching AccessKit schema. Package bindings
    behind an opt-in build flag; keep native adapter dependencies out of headless

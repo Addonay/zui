@@ -21,9 +21,10 @@ Source presence alone is never support evidence.
 | Target | source | compile | launch | behavior | validated |
 | ------ | :----: | :-----: | :----: | :------: | :-------: |
 | Linux Wayland | yes | yes (native) | yes (2026-09-18: todo app live on kwin_wayland, clean close; live multi-window protocol smoke) | partial (headless selftests; synthetic multi-window routing; live fractional-scale preferred_scale observed) | no |
-| Linux X11 | yes | yes (native) | yes (2026-09-18: todo app live, clean close exit; multi-window live tests; 2x DPI physical window observed) | partial (headless selftests; multiwindow ×5 synthetic; live targeted input) | no |
+| Linux X11 | yes | yes (native) | yes (2026-09-18: todo app live, clean close exit; multi-window live tests; 2x DPI physical window observed) | partial (headless selftests; multiwindow ×5 synthetic; live targeted input; AccessKit unix adapter created live, no AT validation yet) | no |
 | Windows (Win32) | yes | **yes** (`zig build check -Dtarget=x86_64-windows-gnu`, 13/13; never executed) | no | no | no |
 | macOS (Cocoa) | yes | **yes** (`zig build check -Dtarget=aarch64-macos-none`, 13/13; never executed) | no | no | no |
+| Accessibility bridge | yes (vendored accesskit-c 0.23.0, `-Daccesskit=true`) | yes (native + foreign targets compile without it) | yes (adapter created live on X11) | no (no screen reader in this environment; Orca/NVDA/VoiceOver pending native runners) | no |
 | GPU presentation (Vulkan/Metal/D3D12) | stubs only | n/a | no | no | no |
 | Headless (`ZUI_BACKEND=null`) | yes | yes (native) | yes | yes (`zig build test` runs todo + dashboard selftests; multiwindow ×5) | n/a (no native surface) |
 
