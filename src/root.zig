@@ -26,6 +26,7 @@ pub const atlas = @import("fonts/atlas.zig");
 pub const text_engine = @import("fonts/text_engine.zig");
 pub const images = @import("images/root.zig");
 pub const app = @import("app/root.zig");
+pub const a11y = @import("a11y/root.zig");
 pub const elements = @import("elements/root.zig");
 pub const widgets = @import("widgets/root.zig");
 pub const debug = @import("debug/root.zig");
@@ -110,6 +111,7 @@ test {
     _ = @import("fonts/text_engine.zig");
     _ = @import("images/root.zig");
     _ = @import("app/root.zig");
+    _ = @import("a11y/root.zig");
     _ = @import("elements/root.zig");
     _ = @import("widgets/root.zig");
     _ = @import("debug/root.zig");

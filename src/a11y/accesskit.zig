@@ -304,8 +304,14 @@ pub const Bridge = struct {
     /// Tree-update factory, called by the adapter from an AT thread when the
     /// platform wants a fresh tree. Builds FRESH accesskit nodes from the
     /// ZUI-owned snapshot and transfers ownership to AccessKit. A synthetic
-    /// WINDOW root (node 0) carries every top-level semantic child, so
+    /// WINDOW root (node 0) carries every top-level semantic child, and each
+    /// nested node is declared as a child of its snapshot parent, so
     /// annotated controls attach to the platform tree (gap report §5.1).
+    /// AccessKit declares children on the PARENT: pushing a nested node
+    /// without wiring its edge orphans it and the consumer rejects the whole
+    /// update, so edges are wired before any node is transferred. A node
+    /// whose parent is missing from the snapshot (or failed to build) falls
+    /// back to the synthetic root to keep every update a valid tree.
     fn updateFactory(userdata: ?*anyopaque) callconv(.c) ?*c.accesskit_tree_update {
         const self: *Bridge = @ptrCast(@alignCast(userdata.?));
         self.lock();
@@ -318,10 +324,35 @@ pub const Bridge = struct {
             c.accesskit_tree_update_free(update);
             return null;
         };
-        for (self.snapshot) |*node| {
-            const ak = buildAccesskitNode(node) orelse continue;
-            c.accesskit_tree_update_push_node(update, node.key, ak);
-            if (node.parent == 0) c.accesskit_node_push_child(root, node.key);
+        var built: [a11y.capacity]?*AccesskitNode = undefined;
+        @memset(&built, null);
+        for (self.snapshot, 0..) |*node, i| {
+            if (i >= built.len) break;
+            built[i] = buildAccesskitNode(node);
+        }
+        for (self.snapshot, 0..) |*node, i| {
+            if (i >= built.len or built[i] == null) continue;
+            if (node.parent == 0) {
+                c.accesskit_node_push_child(root, node.key);
+                continue;
+            }
+            var parent_built: ?*AccesskitNode = null;
+            for (self.snapshot, 0..) |*candidate, pi| {
+                if (pi >= built.len) break;
+                if (candidate.key == node.parent) {
+                    parent_built = built[pi];
+                    break;
+                }
+            }
+            if (parent_built) |parent| {
+                c.accesskit_node_push_child(parent, node.key);
+            } else {
+                c.accesskit_node_push_child(root, node.key);
+            }
+        }
+        for (self.snapshot, 0..) |*node, i| {
+            if (i >= built.len) break;
+            if (built[i]) |ak| c.accesskit_tree_update_push_node(update, node.key, ak);
         }
         c.accesskit_tree_update_push_node(update, 0, root);
         return update;
