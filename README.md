@@ -56,19 +56,27 @@ inspect or remove that checkout explicitly before rerunning it.
 
 ```text
 App / scheduler            owns entities, platform connection, text engine, image cache
-  Window                   one logical window (native window ownership: see Limits)
+  Window (n)               per-window native handle, focus/scale, renderer surface;
+                           multi-window on X11/Wayland/null (Win32/Cocoa guard explicitly)
     elements.Frame         transient nodes rebuilt each dirty render
-      elements.layout      flexbox measure/place for element trees (the
-                           packaged zlay engine is tested but NOT yet
-                           wired into element layout; adapter is plan M3)
+      elements.layout      flexbox measure/place; ZUI_LAYOUT=zlay routes real
+                           trees through the packaged zlay adapter (opt-in)
       elements.painter     nodes -> ordered gpu.Scene commands
                            (quads + glyphs + image blits, drawn in order)
-      gpu.vellz            Vello-derived CPU renderer; platform backends present
+      gpu.vellz            Vello-derived CPU renderer; per-window physical buffer
+      app/assets           asset service: loading/ready/failed, dedup, budgets
+      debug/               frame inspector (ZUI_INSPECT=1), stats, debug overlay
 fonts/                     text engine: cozmic shaping/layout, FreeType raster,
-                           swash image cache + the ZUI glyph atlas
+                           cross-frame layout cache, swash image cache + atlas
 images/                    stb/nanosvg decoders + decoded-pixel cache
+widgets/                   Button/Checkbox/Switch/Slider/Progress/RadioGroup,
+                           TextField with selection/undo/IME-preedit, ScrollArea,
+                           VirtualList, VirtualTable, Menu/Select, Tooltip,
+                           Popover/Modal, focus system, theme tokens
+a11y/                      per-frame semantic tree (roles/names/values/states/
+                           bounds/actions) keyed by stable element IDs
 zlay (package)             source-shaped Taffy port, standalone dependency;
-                           see PLATFORM_MATRIX/plan for wiring status
+                           adapter covers the element style subset (opt-in)
 gpu/device.zig             SDL-shaped device contract; software/null drivers
                            validate, Vulkan/Metal/D3D12 init is unsupported
 ```
@@ -77,28 +85,35 @@ Roadmap: `plan.md` (milestones M0–M7). Port ledger: `src/layout/port.md`.
 
 ## Supported / limitations
 
-- Backends: Linux Wayland + X11 (runtime-verified); macOS Cocoa and Windows
-  Win32 exist as source but are **not** runtime-validated here — and
-  foreign-target compilation currently fails (see `docs/PLATFORM_MATRIX.md`).
+- Backends: Linux Wayland + X11 (runtime-verified, live multi-window on both);
+  macOS Cocoa and Windows Win32 compile cross-target (`zig build check`) but
+  are **not** runtime-validated here (see `docs/PLATFORM_MATRIX.md`).
   Headless `null` backend for tests. `ZUI_BACKEND=wayland|x11|null` pins the choice.
-- One native window per process for now (`error.MultipleNativeWindowsNotSupported`
-  otherwise); headless supports up to `MAX_WINDOWS` logical windows.
-- Text: cozmic is the only text engine. Element measure and paint both run
-  one cozmic layout per text node (one shape, shared advances/fallback; a
-  node keeps its measured box if a glyph cannot be painted). `src/fonts/`
-  holds only the glyph atlas (`atlas.zig`) and the engine
-  (`text_engine.zig`); there is no legacy `-Dtext-engine` switch. When no
-  engine is installed in a frame, text draws nothing. TextField is
-  single-line with caret movement, insertion at the caret, deletion, and
-  codepoint-safe capacity clipping — but no selection, undo, or IME yet
-  (plan M3/M4).
+- Multi-window: X11 + Wayland support several native windows with targeted
+  event routing; Win32/Cocoa keep an explicit single-window guard.
+- DPI: complete logical/physical pipeline — layout and scene coordinates are
+  logical px; framebuffers, raster and input are physical at
+  `window.scale_factor`. Text re-rasterizes per density; Wayland wires
+  fractional-scale-v1, Win32 wires WM_DPICHANGED, Cocoa re-queries
+  backingScaleFactor; X11 acquires scale from `ZUI_SCALE`/`GDK_SCALE`
+  (per-monitor RandR detection is a documented next stage).
+- Text: cozmic is the only text engine. Measure→paint shares one shaped
+  layout, and the cross-frame layout cache re-uses unchanged shapes across
+  frames (bench: 256-sentence frame layout 8.46ms -> 0.063ms warm).
+  TextField is single-line with grapheme-aware caret/deletion, selection,
+  undo/redo, selection-aware clipboard, pointer caret placement, and an
+  IME composition protocol (preedit/commit/cancel) — multiline and native
+  IME wiring are deferred (docs/TEXT_ROADMAP.md).
 - Scene is an ordered command stream (`src/gpu/scene.zig`) consumed in
   paint order by the Vellz CPU path; cross-type overlap is preserved.
-  Commands are bounded (`MAX_RENDER_COMMANDS` 8192); overflow is reported
-  via `Scene.dropped`, not silently hidden. No per-window DPI scaling yet.
+  Commands are bounded (16K); an overflowed frame is REJECTED with a
+  diagnostic placeholder, never presented partial (`rejected_frames`).
+- Widgets ship as behavior + semantic + theme layers (`src/widgets/`);
+  the a11y tree (`src/a11y/`) is AccessKit-C ready per `docs/A11Y_PLAN.md`
+  (native bridges not wired yet).
 - `gpu/device` + Vulkan/Metal/D3D12 are skeletons returning
   `error.Unsupported`; presentation goes through `gpu/vellz` CPU rendering.
-- Hot structs (`Scene` ~5.9MB, element `Frame` ~2.5MB, all inline storage)
+- Hot structs (`Scene` ~5.9MB, element `Frame` ~3.5MB, all inline storage)
   must be heap-allocated or embedded in a heap owner — never stacked
   together in one function. The engine is heap-allocated for the same
   reason (its atlas is ~1MB inline).
