@@ -141,7 +141,7 @@ pub fn layout(frame: *element.Frame, root: element.Element, viewport: core.Rect)
             style.size.height = D.length(@min(n.style.height orelse n.style.square orelse viewport.h, viewport.h));
         }
         contexts[i] = .{ .frame = frame, .index = @intCast(i) };
-        if (n.kind == .text or n.kind == .image) {
+        if (n.kind == .text or n.kind == .image or n.kind == .custom) {
             _ = legacy.measure(frame, @intCast(i));
             ids[i] = try tree.new_leaf_with_context(style, &contexts[i]);
         } else ids[i] = try tree.new_leaf(style);
@@ -158,7 +158,7 @@ fn copyBounds(tree: *Tree, ids: []const NodeId, frame: *element.Frame, index: u1
     const box = try tree.layout(ids[index]);
     const n = &frame.nodes[index];
     n.bounds = .{ .x = origin.x + box.location.x, .y = origin.y + box.location.y, .w = box.size.width, .h = box.size.height };
-    if (n.kind != .text and n.kind != .image) n.measured = .{ .w = box.size.width, .h = box.size.height };
+    if (n.kind != .text and n.kind != .image and n.kind != .custom) n.measured = .{ .w = box.size.width, .h = box.size.height };
     var child = n.first_child;
     while (child) |c| : (child = frame.nodes[c].next_sibling) {
         const absolute = frame.nodes[c].style.absolute;

@@ -3,6 +3,7 @@ const core = @import("../core/root.zig");
 const platform = @import("../platform/root.zig");
 const fonts = @import("../fonts/text_engine.zig");
 const images = @import("../images/root.zig");
+const scene_mod = @import("../gpu/scene.zig");
 const zlog = @import("../core/log.zig");
 
 pub const max_nodes = core.limits.MAX_LAYOUT_ELEMENTS;
@@ -187,7 +188,39 @@ pub const TextStyle = struct {
     strike: bool = false,
 };
 
-pub const NodeKind = enum { container, text, spacer, image };
+pub const NodeKind = enum { container, text, spacer, image, custom };
+
+/// Public custom-element contract (gap report §6A): the vtable-backed escape
+/// hatch for external elements with their own retained state, intrinsic
+/// measurement, post-layout prepaint, and ordered scene emission.
+///
+/// Built-ins (`div`/`text`/`img`/...) stay static and efficient: only
+/// `NodeKind.custom` nodes pay for dynamic dispatch. ZUI holds the state
+/// pointer + vtable only; the STATE lives app-side (a struct, an entity
+/// payload, ...) and MUST outlive every frame it is used in. ZUI never frees
+/// it. `teardown` runs once per built custom node at `endFrame()` for
+/// per-frame retained resources — it is a release hook, not ownership
+/// transfer.
+///
+/// Lifecycle per frame:
+///   1. build: `custom(state, vtable)` (+ `keyed()` for stable identity,
+///      `on_click()`/etc. listeners and `.semantic()` like any node).
+///   2. measure: `measure` returns the intrinsic size (explicit `w()`/`h()`
+///      /square clamps still win, as for built-ins).
+///   3. prepaint (optional): runs for every custom node after layout with
+///      final bounds, BEFORE the semantic tree builds and before any paint.
+///      May adjust its own node's listeners/focus and append semantic
+///      bindings for its own index (viewport-dependent work).
+///   4. paint: runs in tree order with the node's clip; emit through the
+///      public `Scene` pushes (or `elements.Canvas`). Must not reset,
+///      rebuild, or otherwise invalidate the frame it is given.
+///   5. teardown (optional): runs at `endFrame()` for each custom node.
+pub const CustomVTable = struct {
+    measure: *const fn (state: *anyopaque, frame: *Frame) core.Size,
+    prepaint: ?*const fn (state: *anyopaque, frame: *Frame, index: u16, bounds: core.Rect, clip: core.Rect) void = null,
+    paint: *const fn (state: *anyopaque, frame: *Frame, index: u16, bounds: core.Rect, scene: *scene_mod.Scene, clip: core.Rect) void,
+    teardown: ?*const fn (state: *anyopaque) void = null,
+};
 
 /// Object-fit behavior for image nodes (GPUI `ObjectFit` parity).
 pub const ImageFit = enum { contain, cover, fill };
@@ -229,6 +262,12 @@ pub const Node = struct {
     next_sibling: ?u16 = null,
     bounds: core.Rect = .{},
     measured: core.Size = .{},
+    /// Custom-element payload (gap §6A). Only meaningful when
+    /// `kind == .custom`: `custom_state` is the app-owned state pointer
+    /// (must outlive the frame), `custom_vtable` its lifecycle. Other kinds
+    /// ignore both (never dispatched, never torn down).
+    custom_state: ?*anyopaque = null,
+    custom_vtable: ?*const CustomVTable = null,
     /// Optional stable identity for keyed elements (gap §5A). Zero means
     /// unkeyed; nonzero values are `platform.id` hashes that survive across
     /// frames so row state can follow data when reordered (`platform.id`
@@ -443,6 +482,20 @@ pub const Frame = struct {
         for (self.nodes[0..self.node_count]) |*node| node.clearCozmicLayout();
     }
 
+    /// Run every custom node's `teardown` hook (gap §6A step 5). State memory
+    /// stays app-owned; this only releases per-frame retained resources.
+    /// Nodes without a vtable/state/teardown are skipped silently (a custom
+    /// node with no teardown is an empty container, not an error).
+    pub fn teardownCustom(self: *Frame) void {
+        for (self.nodes[0..self.node_count]) |*node| {
+            if (node.kind != .custom) continue;
+            const vt = node.custom_vtable orelse continue;
+            const hook = vt.teardown orelse continue;
+            const state = node.custom_state orelse continue;
+            hook(state);
+        }
+    }
+
     /// Deinitialize the frame, freeing any retained cozmic layouts.
     /// Safe to call on a fresh frame (no-op beyond clearing layouts).
     pub fn deinit(self: *Frame) void {
@@ -614,7 +667,12 @@ pub fn endFrame() void {
     // retained (paint normally consumes it, see `painter.paint`). This
     // covers callers that measure and never paint; `Frame.reset` and the end
     // of `painter.paint` cover layout+paint loops driven outside begin/end.
-    if (active_frame) |frame| frame.clearCozmicLayouts();
+    // Custom teardown (gap §6A step 5) runs here too: per built custom node,
+    // once per frame.
+    if (active_frame) |frame| {
+        frame.clearCozmicLayouts();
+        frame.teardownCustom();
+    }
     active_frame = null;
 }
 
@@ -985,6 +1043,23 @@ pub fn spacer() Element {
     const frame = currentFrame();
     const result = frame.makeElement(.spacer);
     return result.flex_1();
+}
+
+/// Custom element (gap §6A escape hatch): `state` is app-owned and must
+/// outlive the frame; `vtable` is the lifecycle (usually a static table,
+/// e.g. from `elements.custom_ext.define`). Accepts `keyed()`, listeners,
+/// `.semantic()`, and style builders like any node; children are placed
+/// container-style (block layout), while the node itself sizes
+/// intrinsically (no column auto-stretch — use `w_full()`/`h_full()` to
+/// fill). Entity-owned states should register via `trackEntityOwner` at
+/// mint time so hit regions gate on liveness.
+pub fn custom(state: *anyopaque, vtable: *const CustomVTable) Element {
+    const frame = currentFrame();
+    const result = frame.makeElement(.custom);
+    const n = result.node();
+    n.custom_state = state;
+    n.custom_vtable = vtable;
+    return result;
 }
 
 /// Resolve a preloaded source identity. No I/O, probing, decoding or hashing.

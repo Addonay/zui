@@ -3,6 +3,7 @@ pub const layout = @import("layout.zig");
 pub const painter = @import("painter.zig");
 pub const text_engine = @import("text_engine.zig");
 pub const zlay_adapter = @import("zlay_adapter.zig");
+pub const custom_ext = @import("custom.zig");
 
 pub const Element = element.Element;
 pub const Frame = element.Frame;
@@ -15,8 +16,10 @@ pub const div = element.div;
 pub const text = element.text;
 pub const textFmt = element.textFmt;
 pub const spacer = element.spacer;
-pub const when = element.when;
-pub const img = element.img;
+pub const custom = element.custom;
+pub const CustomVTable = element.CustomVTable;
+pub const Canvas = custom_ext.Canvas;
+pub const when = element.when;pub const img = element.img;
 pub const imgPath = element.imgPath;
 pub const imgHandle = element.imgHandle;
 pub const imgAsset = element.imgAsset;
@@ -33,4 +36,5 @@ test {
     _ = @import("painter.zig");
     _ = @import("text_engine.zig");
     _ = @import("zlay_adapter.zig");
+    _ = @import("custom.zig");
 }

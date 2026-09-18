@@ -12,6 +12,16 @@ pub fn paint(frame: *element.Frame, root: element.Element, scene: *gpu.Scene) vo
     // Counters describe one paint: a second paint on the same frame (e.g. a
     // repaint without `reset`) must report that paint's values, not the sum
     // of both. Per-node counters are cleared in `paintText` likewise.
+    //
+    // Gap §6A step 3: custom prepaint runs with final layout bounds BEFORE
+    // the semantic tree builds and before any paint, so viewport-dependent
+    // hooks can install listeners and semantic bindings in time.
+    prepaintCustom(frame, root.index, .{
+        .x = -1e9,
+        .y = -1e9,
+        .w = 2e9,
+        .h = 2e9,
+    });
     @import("../a11y/root.zig").build(frame, root);
     frame.cozmic_painted_extent = 0;
     frame.cozmic_painted_glyphs = 0;
@@ -42,9 +52,11 @@ pub fn paint(frame: *element.Frame, root: element.Element, scene: *gpu.Scene) vo
         panel.style.width = state.rect.w;
         panel.style.height = state.rect.h;
         @import("layout.zig").layout(frame, portal.root, .{ .w = window.bounds.size.w, .h = window.bounds.size.h });
+        const portal_clip = core.Rect{ .x = 0, .y = 0, .w = window.bounds.size.w, .h = window.bounds.size.h };
+        prepaintCustom(frame, portal.root.index, portal_clip);
         @import("../a11y/root.zig").append(frame, portal.root);
         portal.region_start = frame.region_count;
-        paintNode(frame, portal.root.index, scene, core.Color.white, 1, .{ .x = 0, .y = 0, .w = window.bounds.size.w, .h = window.bounds.size.h });
+        paintNode(frame, portal.root.index, scene, core.Color.white, 1, portal_clip);
         portal.region_end = frame.region_count;
     }
     if (frame.portal_count > 0) if (frame.window) |raw| @import("../widgets/overlay.zig").sync(@ptrCast(@alignCast(raw)));
@@ -138,6 +150,39 @@ fn resolveRegionOwner(frame: *element.Frame, node: *const element.Node) ?element
     return null;
 }
 
+/// Gap §6A step 3: run every custom node's `prepaint` with final bounds
+/// BEFORE the semantic tree builds and before any paint. Hooks may adjust
+/// their own node's listeners/focus and append semantic bindings for their
+/// own index; the clip mirrors `paintNode`'s content-box nesting exactly.
+fn prepaintCustom(frame: *element.Frame, index: u16, clip: core.Rect) void {
+    const node = &frame.nodes[index];
+    const bounds = node.bounds;
+    if (node.kind == .custom) {
+        if (node.custom_vtable) |vt| {
+            if (vt.prepaint) |hook| {
+                if (node.custom_state) |state| hook(state, frame, index, bounds, clip);
+            }
+        }
+    }
+    const child_clip = intersect(clip, contentBox(node));
+    var child = node.first_child;
+    while (child) |child_index| : (child = frame.nodes[child_index].next_sibling) {
+        prepaintCustom(frame, child_index, child_clip);
+    }
+}
+
+/// Gap §6A step 4: ordered custom emission. Style background/border above
+/// still apply (cheap, consistent); the hook owns the rest. The region
+/// block below picks up listeners the hook (or prepaint) installed, so
+/// custom hit regions gate owners exactly like built-ins. A custom node
+/// with no vtable/state renders as an empty container, never a crash.
+fn paintCustom(frame: *element.Frame, index: u16, scene: *gpu.Scene, clip: core.Rect) void {
+    const node = &frame.nodes[index];
+    const vt = node.custom_vtable orelse return;
+    const state = node.custom_state orelse return;
+    vt.paint(state, frame, index, node.bounds, scene, clip);
+}
+
 fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_color: core.Color, inherited_opacity: f32, clip: core.Rect) void {
     const node = &frame.nodes[index];
     // Hover follows the effective clip like hit-testing does: a clipped-away
@@ -200,6 +245,7 @@ fn paintNode(frame: *element.Frame, index: u16, scene: *gpu.Scene, inherited_col
     const text_color = alpha(node.text_style.color orelse style.text_color orelse inherited_color, opacity);
     if (node.kind == .text) paintText(frame, scene, node, text_color, clip);
     if (node.kind == .image) paintImage(frame, scene, node, opacity, clip);
+    if (node.kind == .custom) paintCustom(frame, index, scene, clip);
 
     if (node.listener != null or node.mouse_down_listener != null or node.mouse_up_listener != null or node.mouse_move_listener != null or node.double_click_listener != null or node.scroll_listener != null or node.focus != null) {
         // Hit regions obey the same effective clip as paint: a clipped-away

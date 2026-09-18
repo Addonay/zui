@@ -52,6 +52,22 @@ pub fn measure(frame: *element.Frame, index: u16) core.Size {
             }
         },
         .spacer => {},
+        .custom => {
+            // Children are still measured (container-style placement needs
+            // valid child boxes), but the intrinsic callback owns this
+            // node's natural size — children never contribute to it. A
+            // missing vtable/state measures zero (an empty container, not
+            // an error); explicit w/h/square clamps below still apply.
+            var child = node.first_child;
+            while (child) |child_index| : (child = frame.nodes[child_index].next_sibling) {
+                _ = measure(frame, child_index);
+            }
+            if (node.custom_vtable) |vt| {
+                if (node.custom_state) |state| {
+                    natural = vt.measure(state, frame);
+                }
+            }
+        },
         .container => {
             var child = node.first_child;
             var normal_count: usize = 0;
@@ -157,7 +173,11 @@ fn place(frame: *element.Frame, index: u16, available: core.Rect, forced: bool) 
     const node = &frame.nodes[index];
     const size = resolveSize(node, available, forced);
     node.bounds = .{ .x = available.x, .y = available.y, .w = @max(0, size.w), .h = @max(0, size.h) };
-    if (node.kind != .container) return;
+    // Custom elements place children exactly like containers (block
+    // layout); only their intrinsic measurement differs. Unlike containers,
+    // custom nodes do NOT auto-stretch on the column cross axis: the
+    // intrinsic size is the contract (use w_full()/h_full() to fill).
+    if (node.kind != .container and node.kind != .custom) return;
 
     const padding = node.style.padding;
     // Scroll offset translates the content box the children are placed into;

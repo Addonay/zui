@@ -652,6 +652,7 @@ fn snapshotHeadless(gpa: std.mem.Allocator, path: []const u8) !void {
                         .text => 'T',
                         .spacer => 'S',
                         .image => 'I',
+                        .custom => 'X',
                     };
                     var line: [512]u8 = undefined;
                     const text_len = @min(n.text_value.len, 80);
