@@ -130,6 +130,16 @@ AccessKit's maintained platform adapters instead of reimplementing them).
 
 ## Explicit remaining gaps
 
+- Bridge teardown race (residual, documented 2026-09-18): the vendored C ABI
+  has no join/quiesce, so an assistive-technology thread inside a bridge
+  callback at window-teardown instant can touch the freed Bridge. Observed
+  once as a post-selftest segfault in a continuously-animating demo on a
+  machine with a live AT-SPI bus. Mitigations in place: the adapter only
+  starts on real native backends (headless runs never spawn AT threads, so
+  CI is deterministic), and callbacks hold no state past the call. Full
+  fix needs an upstream join API or immortal callback state. TextField
+  semantics, text selection/range semantics, IME accessibility and
+  native bridge publication are not connected here.
 - Focus-loss/unmount/window-teardown capture cancellation is not fully wired:
   Pressable exposes `cancel`, and generic controls reject releases without current
   bounds, but Window/App do not yet deliver all lifecycle cancellation events.

@@ -143,9 +143,15 @@ pub const Bridge = struct {
 
     /// Create the platform adapter. The unix adapter needs no window
     /// pointer (it talks to the AT-SPI bus).
+    /// Create the platform adapter. Only for REAL native backends: a
+    /// headless (null-backend) window has no screen reader attached, and
+    /// spawning the adapter's AT threads there only widens the teardown
+    /// race documented on `deinit` for zero benefit.
     pub fn start(self: *Bridge, win: *Window) void {
         if (!enabled) return;
         if (builtin.os.tag != .linux) return; // windows/macos adapters: next step
+        const backend = win.native_backend orelse return;
+        if (backend.kind() == .null) return;
         self.adapter = c.accesskit_unix_adapter_new(activationHandler, self, actionHandler, self, deactivationHandler, self) orelse {
             zlog.log("a11y", "accesskit adapter creation failed; accessibility stays off", .{});
             return;
@@ -155,6 +161,13 @@ pub const Bridge = struct {
 
     pub fn deinit(self: *Bridge, allocator: std.mem.Allocator) void {
         if (!enabled) return;
+        // RESIDUAL RACE (honest limitation, see docs/A11Y_PLAN.md): the
+        // vendored C ABI has no join/quiesce, so an assistive-technology
+        // thread inside a callback at this exact instant can touch this
+        // Bridge after it is freed. The adapter only ever starts on real
+        // native backends (see `start`), so headless runs never spawn AT
+        // threads; live, app exit races an almost-always-idle callback.
+        // Upstream fix: a join API, or immortal callback state (leaked).
         if (builtin.os.tag == .linux) {
             if (self.adapter) |adapter| c.accesskit_unix_adapter_free(adapter);
             self.adapter = null;

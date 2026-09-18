@@ -26,6 +26,7 @@ pub const atlas = @import("fonts/atlas.zig");
 pub const text_engine = @import("fonts/text_engine.zig");
 pub const images = @import("images/root.zig");
 pub const app = @import("app/root.zig");
+pub const animation = app.animation;
 pub const a11y = @import("a11y/root.zig");
 pub const elements = @import("elements/root.zig");
 pub const widgets = @import("widgets/root.zig");

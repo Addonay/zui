@@ -5,6 +5,7 @@ pub const window = @import("window.zig");
 pub const runtime = @import("runtime.zig");
 pub const tasks = @import("tasks.zig");
 pub const keymap = @import("keymap.zig");
+pub const animation = @import("animation.zig");
 
 pub const App = app.App;
 pub const Window = window.Window;
@@ -28,5 +29,6 @@ test {
     _ = @import("window.zig");
     _ = @import("runtime.zig");
     _ = @import("tasks.zig");
+    _ = @import("animation.zig");
     _ = @import("keymap.zig");
 }

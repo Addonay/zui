@@ -6,14 +6,13 @@
 //! the stepper preserves velocity — plus a draggable damping slider that
 //! retunes the spring live, and a 2s repeating eased spinner.
 //!
-//! Deliberate deviations from the GPUI original:
+//! Motion math lives in the framework (`zui.animation`: tweens, springs,
+//! keyframes, easings, phase interpolation); this file only wires it to
+//! elements. Deliberate deviations from the GPUI original:
 //!  - ZUI's scene has no transforms (see docs/RENDER_CONTRACT.md §5E), so
 //!    `Transformation::rotate` cannot be expressed. The spinner drives the
 //!    SAME `bounce(ease_in_out)` 2s clock into opacity instead of rotation.
 //!    When scene transforms land, wire the clock back to rotation.
-//!  - Spring/easing math lives here, not in the framework: ZUI has no
-//!    `spring.rs` equivalent yet. The integrator below is a line-for-line
-//!    transliteration of GPUI's analytic propagator, so behavior matches.
 //!  - `with_spring` element modifiers do not exist; the entity steps its
 //!    springs in `render` from the window clock and calls
 //!    `win.requestAnimation()` while anything is unsettled.
@@ -25,144 +24,15 @@
 const std = @import("std");
 const zui = @import("zui");
 
+const anim = zui.animation;
+const SpringConfig = anim.SpringConfig;
+const SpringState = anim.SpringState;
+
 const App = zui.App;
 const Context = zui.Context;
 const Window = zui.Window;
 const Entity = zui.Entity;
 const Element = zui.Element;
-
-// ---------------------------------------------------------------------------
-// Spring physics — transliterated from GPUI `crates/gpui/src/spring.rs`.
-// ---------------------------------------------------------------------------
-
-/// Damped harmonic oscillator parameters (GPUI `SpringConfig`).
-/// stiffness k, damping c, mass m; all finite, k/m positive, c >= 0.
-pub const SpringConfig = struct {
-    stiffness: f32,
-    damping: f32,
-    mass: f32,
-
-    pub fn init(stiffness: f32, damping: f32, mass: f32) SpringConfig {
-        std.debug.assert(std.math.isFinite(stiffness) and stiffness > 0);
-        std.debug.assert(std.math.isFinite(damping) and damping >= 0);
-        std.debug.assert(std.math.isFinite(mass) and mass > 0);
-        return .{ .stiffness = stiffness, .damping = damping, .mass = mass };
-    }
-
-    /// Natural angular frequency and damping ratio (ω₀, ζ).
-    pub fn canonical(self: SpringConfig) struct { omega: f32, zeta: f32 } {
-        return .{
-            .omega = @sqrt(self.stiffness / self.mass),
-            .zeta = self.damping / (2 * @sqrt(self.stiffness * self.mass)),
-        };
-    }
-
-    /// Analytic step toward a fixed target over `dt` seconds. Frame-rate
-    /// independent and velocity-preserving, so retargeting mid-flight
-    /// redirects momentum instead of restarting (the demo's rapid clicks).
-    pub fn step(self: SpringConfig, state: SpringState, target: f32, dt: f32) SpringState {
-        const p = self.propagator(dt);
-        const displacement = state.position - target;
-        return .{
-            .position = target + p[0][0] * displacement + p[0][1] * state.velocity,
-            .velocity = p[1][0] * displacement + p[1][1] * state.velocity,
-        };
-    }
-
-    /// Exact state-transition matrix for a constant target.
-    pub fn propagator(self: SpringConfig, dt: f32) [2][2]f32 {
-        const c = self.canonical();
-        const w0 = c.omega;
-        const zeta = c.zeta;
-        const tolerance: f32 = 1e-4;
-        if (zeta < 1 - tolerance) {
-            const decay = zeta * w0;
-            const wd = w0 * @sqrt(1 - zeta * zeta);
-            const e = @exp(-decay * dt);
-            const s = @sin(wd * dt);
-            const co = @cos(wd * dt);
-            const s_over_w = s / wd;
-            return .{
-                .{ e * (co + decay * s_over_w), e * s_over_w },
-                .{ -e * w0 * w0 * s_over_w, e * (co - decay * s_over_w) },
-            };
-        } else if (zeta > 1 + tolerance) {
-            const root = @sqrt(zeta * zeta - 1);
-            const root_sum = zeta + root;
-            const slow = -w0 / root_sum;
-            const fast = -w0 * root_sum;
-            const denom = slow - fast;
-            const slow_e = @exp(slow * dt);
-            const fast_e = @exp(fast * dt);
-            return .{
-                .{ (-fast * slow_e + slow * fast_e) / denom, (slow_e - fast_e) / denom },
-                .{ slow * fast * (fast_e - slow_e) / denom, (slow * slow_e - fast * fast_e) / denom },
-            };
-        } else {
-            const e = @exp(-w0 * dt);
-            return .{
-                .{ e * (1 + w0 * dt), e * dt },
-                .{ -e * w0 * w0 * dt, e * (1 - w0 * dt) },
-            };
-        }
-    }
-
-    /// Settled when displacement is within epsilon and velocity within
-    /// epsilon * ω₀ (same scale argument as GPUI).
-    pub fn isSettled(self: SpringConfig, state: SpringState, target: f32, epsilon: f32) bool {
-        const w0 = self.canonical().omega;
-        return std.math.isFinite(epsilon) and epsilon >= 0 and
-            @abs(state.position - target) <= epsilon and
-            @abs(state.velocity) <= epsilon * w0;
-    }
-};
-
-/// Instantaneous spring position/velocity (GPUI `SpringState`).
-pub const SpringState = struct {
-    position: f32 = 0,
-    velocity: f32 = 0,
-};
-
-/// Linear interpolation over an arbitrary phase range (GPUI
-/// `AnimationPhase::interpolate_between` / `_clamped`).
-pub fn interpolateBetween(from: f32, to: f32, start: f32, end: f32, phase: f32) f32 {
-    const t = if (start == end)
-        (if (phase < start) @as(f32, 0) else @as(f32, 1))
-    else
-        (phase - start) / (end - start);
-    return from + (to - from) * t;
-}
-
-pub fn interpolateBetweenClamped(from: f32, to: f32, start: f32, end: f32, phase: f32) f32 {
-    const t = if (start == end)
-        (if (phase < start) @as(f32, 0) else @as(f32, 1))
-    else
-        @min(1, @max(0, (phase - start) / (end - start)));
-    return from + (to - from) * t;
-}
-
-pub fn lerpRgba(from: zui.Color, to: zui.Color, t: f32) zui.Color {
-    return .{
-        .r = from.r + (to.r - from.r) * t,
-        .g = from.g + (to.g - from.g) * t,
-        .b = from.b + (to.b - from.b) * t,
-        .a = from.a + (to.a - from.a) * t,
-    };
-}
-
-/// Quadratic ease-in-out (GPUI `ease_in_out`).
-pub fn easeInOut(delta: f32) f32 {
-    if (delta < 0.5) return 2 * delta * delta;
-    const x = -2 * delta + 2;
-    return 1 - x * x / 2;
-}
-
-/// Forward-then-reverse wrapper (GPUI `bounce(easing)` with the easing
-/// baked in — Zig has no closure capture, so this names the composition
-/// `bounce(ease_in_out)` directly).
-pub fn bounceEaseInOut(delta: f32) f32 {
-    if (delta < 0.5) return easeInOut(delta * 2) else return easeInOut((1 - delta) * 2);
-}
 
 // ---------------------------------------------------------------------------
 // Demo constants — mirror the GPUI example's layout numbers.
@@ -319,13 +189,13 @@ const AnimationExample = struct {
         const phase = self.phase_spring.position;
         const bar_w, const bar_color = if (phase <= 1.0)
             .{
-                interpolateBetween(48, 224, 0, 1, phase),
-                lerpRgba(ORANGE, GREEN, interpolateBetweenClamped(0, 1, 0, 1, phase)),
+                anim.interpolateBetween(48, 224, 0, 1, phase),
+                anim.lerpRgba(ORANGE, GREEN, anim.interpolateBetweenClamped(0, 1, 0, 1, phase)),
             }
         else
             .{
-                interpolateBetween(224, 96, 1, 2, phase),
-                lerpRgba(GREEN, PURPLE, interpolateBetweenClamped(0, 1, 1, 2, phase)),
+                anim.interpolateBetween(224, 96, 1, 2, phase),
+                anim.lerpRgba(GREEN, PURPLE, anim.interpolateBetweenClamped(0, 1, 1, 2, phase)),
             };
 
         // 2s repeating clock through bounce(ease_in_out). GPUI rotates the
@@ -334,7 +204,7 @@ const AnimationExample = struct {
         const epoch = self.spin_epoch_ms orelse now_ms;
         self.spin_epoch_ms = epoch;
         const spin_t: f32 = @as(f32, @floatFromInt(@mod(now_ms - epoch, SPIN_PERIOD_MS))) / @as(f32, SPIN_PERIOD_MS);
-        const spin_eased = bounceEaseInOut(spin_t);
+        const spin_eased = anim.bounceEaseInOut(spin_t);
 
         var phase_text_buf: [32]u8 = undefined;
         const phase_text = std.fmt.bufPrint(&phase_text_buf, "Target phase {d}: click rapidly to redirect momentum", .{self.spring_phase}) catch "Target phase";
@@ -348,14 +218,14 @@ const AnimationExample = struct {
             .child(zui.div().flex_col().gap(4)
                 .child(zui.text(self.label_buf[0..self.label_len], .{ .size = 12, .color = zui.Color.black }))
                 .child(zui.div().h(20).w(SLIDER_WIDTH).cursor_pointer()
-                    .keyed(0xA11CE1).withFocus(cx.focusHandle())
-                    .semantic(.{ .role = .slider, .name = "Spring damping", .value = .{ .current = self.spring_damping, .min = MIN_DAMPING, .max = MAX_DAMPING, .step = 0.1 }, .actions = .{ .focus = true, .increment = true, .decrement = true, .set_value = true } })
-                    .on_mouse_down(cx.listener(@This(), sliderDown))
-                    .on_mouse_move(cx.listener(@This(), sliderMove))
-                    .on_mouse_up(cx.listener(@This(), sliderUp))
-                    .child(zui.div().absolute().top(8).h(4).w_full().rounded_full().bg(zui.Color.black.withAlpha(0.19)))
-                    .child(zui.div().absolute().top(8).h(4).w(SLIDER_WIDTH * damping_fraction).rounded_full().bg(BLUE))
-                    .child(zui.div().absolute().top(3).left(SLIDER_WIDTH * damping_fraction - 7).size(14).rounded_full().bg(BLUE_DARK))))
+                .keyed(0xA11CE1).withFocus(cx.focusHandle())
+                .semantic(.{ .role = .slider, .name = "Spring damping", .value = .{ .current = self.spring_damping, .min = MIN_DAMPING, .max = MAX_DAMPING, .step = 0.1 }, .actions = .{ .focus = true, .increment = true, .decrement = true, .set_value = true } })
+                .on_mouse_down(cx.listener(@This(), sliderDown))
+                .on_mouse_move(cx.listener(@This(), sliderMove))
+                .on_mouse_up(cx.listener(@This(), sliderUp))
+                .child(zui.div().absolute().top(8).h(4).w_full().rounded_full().bg(zui.Color.black.withAlpha(0.19)))
+                .child(zui.div().absolute().top(8).h(4).w(SLIDER_WIDTH * damping_fraction).rounded_full().bg(BLUE))
+                .child(zui.div().absolute().top(3).left(SLIDER_WIDTH * damping_fraction - 7).size(14).rounded_full().bg(BLUE_DARK))))
             .child(zui.div().h(32).w_full()
                 .child(zui.div().absolute().top(4).left(ball_x).size(BALL_SIZE).rounded_full().bg(BLUE)))
             .child(zui.div().h(24).w(bar_w).rounded(4).bg(bar_color));
@@ -370,8 +240,8 @@ const AnimationExample = struct {
                 .child(card)
                 .child(spinner))
             .child(zui.div().flex_row().h(64).w_full().p(8).justify_center().items_center()
-                .bg(zui.Color.black.withAlpha(0.05))
-                .child(zui.text("Other Panel", .{ .size = 13, .color = zui.Color.black })));
+            .bg(zui.Color.black.withAlpha(0.05))
+            .child(zui.text("Other Panel", .{ .size = 13, .color = zui.Color.black })));
     }
 };
 
@@ -541,51 +411,4 @@ fn selftestHeadless(gpa: std.mem.Allocator) !void {
         std.process.exit(1);
     }
     out("selftest: all checks passed\n", .{});
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests — spring math, interpolation, easings (GPUI spring.rs parity).
-// ---------------------------------------------------------------------------
-
-test "spring canonical frequency and damping ratio" {
-    const config = SpringConfig.init(170.0, 14.0, 1.0);
-    const c = config.canonical();
-    try std.testing.expectApproxEqAbs(@sqrt(@as(f32, 170)), c.omega, 1e-4);
-    try std.testing.expectApproxEqAbs(14.0 / (2 * @sqrt(@as(f32, 170))), c.zeta, 1e-4);
-}
-
-test "spring step composes like the analytic propagator (GPUI semigroup)" {
-    const config = SpringConfig.init(100.0, 10.0, 1.0);
-    const start = SpringState{ .position = -3, .velocity = 5 };
-    const stepped = config.step(config.step(start, 7.0, 0.013), 7.0, 0.021);
-    const direct = config.step(start, 7.0, 0.034);
-    try std.testing.expectApproxEqAbs(direct.position, stepped.position, 2e-4);
-    try std.testing.expectApproxEqAbs(direct.velocity, stepped.velocity, 2e-4);
-}
-
-test "spring settles and reports it" {
-    const config = SpringConfig.init(100.0, 10.0, 1.0);
-    try std.testing.expect(!config.isSettled(.{ .position = 1, .velocity = 1 }, 1.0, 0.01));
-    try std.testing.expect(config.isSettled(.{ .position = 1.005, .velocity = 0.05 }, 1.0, 0.01));
-    var state = SpringState{ .position = 0, .velocity = 0 };
-    var i: usize = 0;
-    while (i < 600) : (i += 1) state = config.step(state, 3.0, 1.0 / 60.0);
-    try std.testing.expect(config.isSettled(state, 3.0, 0.001));
-}
-
-test "phase interpolation over arbitrary ranges" {
-    try std.testing.expectEqual(@as(f32, 15), interpolateBetween(10, 20, 1, 2, 1.5));
-    try std.testing.expectEqual(@as(f32, 10), interpolateBetweenClamped(10, 20, 2, 3, 1.5));
-    try std.testing.expectEqual(@as(f32, 25), interpolateBetween(10, 20, 2, 3, 3.5));
-}
-
-test "easings match GPUI endpoints" {
-    try std.testing.expectEqual(@as(f32, 0), easeInOut(0));
-    try std.testing.expectEqual(@as(f32, 1), easeInOut(1));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), easeInOut(0.5), 1e-6);
-    try std.testing.expectEqual(@as(f32, 0), bounceEaseInOut(0));
-    try std.testing.expectEqual(@as(f32, 0), bounceEaseInOut(1));
-    try std.testing.expectEqual(@as(f32, 1), bounceEaseInOut(0.5));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), bounceEaseInOut(0.25), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), bounceEaseInOut(0.75), 1e-6);
 }
