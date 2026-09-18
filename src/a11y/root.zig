@@ -2,8 +2,9 @@
 const std = @import("std");
 const Rect = @import("../core/geometry.zig").Rect;
 const element = @import("../elements/element.zig");
+const limits = @import("../core/limits.zig");
 pub const accesskit = @import("accesskit.zig");
-pub const capacity = 512;
+pub const capacity = limits.MAX_A11Y_ELEMENTS;
 pub const Role = enum { group, button, checkbox, radio_group, radio, switch_control, slider, progress, text_input, label, dialog, list, listitem, menu, menuitem, menuitem_checkbox, tooltip, combobox, listbox, option, table, row, tableheader, cell };
 pub const Action = enum { activate, increment, decrement, set_value, focus };
 pub const Request = struct { action: Action, value: f64 = 0 };

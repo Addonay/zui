@@ -10,6 +10,7 @@ pub const max_regions = 512;
 pub const text_storage_len = 64 * 1024;
 /// Owner-registration slots per frame (see `Frame.owner_targets`).
 pub const max_owner_entries = 256;
+pub const max_overflow_entries = 64;
 
 pub const FontWeight = enum { normal, medium, semibold, bold };
 pub const Direction = enum { row, column };
@@ -368,16 +369,26 @@ pub const Frame = struct {
     /// per-frame values: `reset()` clears them, so regions can never
     /// outlive the registrations they were resolved from. 256 slots cover
     /// ordinary frames (distinct listener owners per frame are usually a
-    /// handful); overflow counts `owner_overflows` and leaves the region
-    /// ungated rather than dropping input.
+    /// handful). When full, NEW targets go into `overflow_targets`: those
+    /// regions resolve to a generation-0 owner, which every dispatch gate
+    /// treats as DEAD — overflow makes a region INERT, never ungated
+    /// (gap report §5.3). If even that set fills, the frame is marked
+    /// fatally overflowed and Window.render rejects it like a scene
+    /// overflow.
     owner_targets: [max_owner_entries]*anyopaque = undefined,
     owner_stores: [max_owner_entries]*anyopaque = undefined,
     owner_ids: [max_owner_entries]u32 = undefined,
     owner_generations: [max_owner_entries]u32 = undefined,
     owner_count: usize = 0,
-    /// Owner registrations dropped while the table was full. Observable;
-    /// cleared by `reset()`.
+    overflow_targets: [max_overflow_entries]*anyopaque = undefined,
+    overflow_count: usize = 0,
+    /// Owner registrations dropped while both tables were full. Observable;
+    /// cleared by `reset()`. Nonzero with `owner_overflow_fatal` also set
+    /// rejects the frame at render.
     owner_overflows: u64 = 0,
+    /// True when a target could not be tombstoned either (both tables
+    /// full): the frame MUST be rejected rather than dispatch ungated.
+    owner_overflow_fatal: bool = false,
 
     semantic_bindings: [@import("../a11y/root.zig").capacity]@import("../a11y/root.zig").Binding = undefined,
     /// Transient top-layer roots, laid out and painted after the main tree.
@@ -411,7 +422,9 @@ pub const Frame = struct {
         self.seen_key_count = 0;
         self.duplicate_keys = 0;
         self.owner_count = 0;
+        self.overflow_count = 0;
         self.owner_overflows = 0;
+        self.owner_overflow_fatal = false;
         // New frame installs its own engine (`runtime.mountView` does it
         // right after reset): text without an install draws nothing.
         self.engine = null;
@@ -459,6 +472,7 @@ pub const Frame = struct {
             .duplicate_keys = self.duplicate_keys,
             .owner_count = self.owner_count,
             .owner_overflows = self.owner_overflows,
+            .owner_overflow_fatal = self.owner_overflow_fatal,
             .cozmic_painted_extent = self.cozmic_painted_extent,
             .cozmic_painted_glyphs = self.cozmic_painted_glyphs,
             .cozmic_skipped_glyphs = self.cozmic_skipped_glyphs,
@@ -474,6 +488,8 @@ pub const Frame = struct {
         @memcpy(copy.text_storage[0..self.text_len], self.text_storage[0..self.text_len]);
         @memcpy(copy.seen_keys[0..self.seen_key_count], self.seen_keys[0..self.seen_key_count]);
         @memcpy(copy.owner_targets[0..self.owner_count], self.owner_targets[0..self.owner_count]);
+        copy.overflow_count = self.overflow_count;
+        @memcpy(copy.overflow_targets[0..self.overflow_count], self.overflow_targets[0..self.overflow_count]);
         @memcpy(copy.owner_stores[0..self.owner_count], self.owner_stores[0..self.owner_count]);
         @memcpy(copy.owner_ids[0..self.owner_count], self.owner_ids[0..self.owner_count]);
         @memcpy(copy.owner_generations[0..self.owner_count], self.owner_generations[0..self.owner_count]);
@@ -516,8 +532,10 @@ pub const Frame = struct {
     /// frame is active. Called by `runtime` at mint time (the entity is
     /// provably live there), so the painter can later resolve region owners
     /// without touching possibly-destroyed targets. Re-registers refresh
-    /// the entry; a full table counts `owner_overflows` and leaves the
-    /// region ungated rather than dropping input.
+    /// the entry. A full table tombstones new targets in `overflow_targets`
+    /// (their regions resolve DEAD, never ungated — gap report §5.3); if
+    /// even that set fills, `owner_overflow_fatal` marks the frame for
+    /// render rejection.
     pub fn trackOwner(self: *Frame, target: *anyopaque, store: *anyopaque, id: u32, generation: u32) void {
         for (self.owner_targets[0..self.owner_count], 0..) |t, i| {
             if (t == target) {
@@ -533,9 +551,19 @@ pub const Frame = struct {
             self.owner_ids[self.owner_count] = id;
             self.owner_generations[self.owner_count] = generation;
             self.owner_count += 1;
-        } else {
-            self.owner_overflows += 1;
+            return;
         }
+        // Table full: tombstone the target so its regions dispatch DEAD.
+        for (self.overflow_targets[0..self.overflow_count]) |t| {
+            if (t == target) return; // already tombstoned
+        }
+        if (self.overflow_count < self.overflow_targets.len) {
+            self.overflow_targets[self.overflow_count] = target;
+            self.overflow_count += 1;
+            return;
+        }
+        self.owner_overflows += 1;
+        self.owner_overflow_fatal = true;
     }
 
     /// Resolve a region listener target to its (store, id, generation).
@@ -544,6 +572,11 @@ pub const Frame = struct {
     pub fn lookupOwner(self: *const Frame, target: *anyopaque) ?OwnerRef {
         for (self.owner_targets[0..self.owner_count], 0..) |t, i| {
             if (t == target) return .{ .store = self.owner_stores[i], .id = self.owner_ids[i], .generation = self.owner_generations[i] };
+        }
+        // Tombstoned overflow target: generation 0 — every liveness gate
+        // treats that as DEAD (never dereferences the store pointer).
+        for (self.overflow_targets[0..self.overflow_count]) |t| {
+            if (t == target) return .{ .store = @constCast(@ptrCast(self)), .id = 0, .generation = 0 };
         }
         return null;
     }
@@ -1170,4 +1203,43 @@ test "owner table registers mint-time owners without touching targets" {
     // Unknown targets miss (ungated dispatch, as before).
     var stranger: u8 = 0;
     try t.expect(frame.lookupOwner(&stranger) == null);
+}
+
+test "owner-table overflow tombstones new targets instead of ungating (gap report §5.3)" {
+    const t = std.testing;
+    const frame = try t.allocator.create(Frame);
+    defer t.allocator.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    beginFrame(frame);
+    defer endFrame();
+
+    var store: u8 = 0;
+    // Fill the main table with distinct targets.
+    var tokens: [max_owner_entries + max_overflow_entries + 1]u8 = @splat(0);
+    for (0..max_owner_entries) |i| {
+        trackEntityOwner(&tokens[i], &store, @intCast(i + 1), 7);
+    }
+    try t.expectEqual(max_owner_entries, frame.owner_count);
+    try t.expectEqual(@as(u64, 0), frame.owner_overflows);
+    try t.expect(!frame.owner_overflow_fatal);
+
+    // Overflow targets tombstone: registered nowhere, but resolve DEAD.
+    for (max_owner_entries..max_owner_entries + max_overflow_entries) |i| {
+        trackEntityOwner(&tokens[i], &store, @intCast(i + 1), 7);
+    }
+    try t.expectEqual(max_overflow_entries, frame.overflow_count);
+    const tombstone = frame.lookupOwner(&tokens[max_owner_entries]) orelse return error.TestExpectedHit;
+    try t.expectEqual(@as(u32, 0), tombstone.generation);
+    // The liveness gate reads generation 0 as dead without dereferencing.
+    if (entity_is_alive_fn) |alive| try t.expect(!alive(tombstone.store, tombstone.id, tombstone.generation));
+
+    // Beyond the tombstone set: fatal — the frame must be rejected.
+    trackEntityOwner(&tokens[tokens.len - 1], &store, 999, 7);
+    try t.expect(frame.owner_overflow_fatal);
+    try t.expectEqual(@as(u64, 1), frame.owner_overflows);
+    // A second registration of the same fatal target does not re-fatal.
+    const overflows_before = frame.owner_overflows;
+    trackEntityOwner(&tokens[tokens.len - 1], &store, 999, 7);
+    try t.expectEqual(overflows_before + 1, frame.owner_overflows);
 }

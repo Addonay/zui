@@ -108,9 +108,12 @@ Roadmap: `plan.md` (milestones M0–M7). Port ledger: `src/layout/port.md`.
   paint order by the Vellz CPU path; cross-type overlap is preserved.
   Commands are bounded (16K); an overflowed frame is REJECTED with a
   diagnostic placeholder, never presented partial (`rejected_frames`).
-- Widgets ship as behavior + semantic + theme layers (`src/widgets/`);
-  the a11y tree (`src/a11y/`) is AccessKit-C ready per `docs/A11Y_PLAN.md`
-  (native bridges not wired yet).
+- Widgets ship as behavior + semantic + theme layers (`src/widgets/`).
+  The a11y tree (`src/a11y/`) publishes to platform accessibility through
+  the vendored AccessKit C ABI (`third_party/accesskit`, upstream 0.23.0)
+  with `-Daccesskit=true` — Linux unix adapter created live; screen-reader
+  (Orca/NVDA/VoiceOver) validation and Windows/macOS adapters are pending
+  (see `docs/A11Y_PLAN.md` for the evidence ledger).
 - `gpu/device` + Vulkan/Metal/D3D12 are skeletons returning
   `error.Unsupported`; presentation goes through `gpu/vellz` CPU rendering.
 - Hot structs (`Scene` ~5.9MB, element `Frame` ~3.5MB, all inline storage)

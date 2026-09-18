@@ -483,7 +483,13 @@ pub const CocoaBackend = struct {
 
     fn pushEvent(self: *CocoaBackend, ev: event.Event) void {
         if (self.target_queue) |q| {
-            _ = q.push(ev);
+            // Critical payloads (releases, close, focus) escalate loss
+            // unconditionally (gap report §5.4).
+            if (event.EventQueue.isCritical(ev)) {
+                q.pushCriticalEscalated(ev, "cocoa");
+            } else {
+                _ = q.push(ev);
+            }
         }
     }
 

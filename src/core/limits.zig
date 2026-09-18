@@ -181,7 +181,10 @@ pub const MAX_ATLAS_PIXELS: u32 = 1024 * 1024;
 // =============================================================================
 
 /// Maximum accessibility tree elements
-pub const MAX_A11Y_ELEMENTS: u32 = 1024;
+/// Semantic accessibility tree capacity per frame. Matches a11y.Tree.capacity;
+/// the frame stores this inline, so growth must be weighed against the hot
+/// Frame stack budget (see the painter's hot-frame test).
+pub const MAX_A11Y_ELEMENTS: u32 = 512;
 
 /// Maximum pending announcements
 pub const MAX_A11Y_ANNOUNCEMENTS: u32 = 16;

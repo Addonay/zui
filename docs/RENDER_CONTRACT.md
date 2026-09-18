@@ -33,10 +33,12 @@ Companion to the gap report §3 (overflow policy) and §5E (scene semantics).
 
 ## 3. Per-window surface
 
-- Today: one native window per connection is enforced (`App.openWindow`
-  returns `MultipleNativeWindowsNotSupported` for non-null backends);
-  headless keeps N logical windows for tests. Per-window native
-  surfaces/swapchains are future work (gap report §5G).
+- Today: Linux X11 and Wayland support MULTIPLE native windows — each
+  logical `Window` owns a window-scoped native handle (X11: own X window +
+  framebuffer; Wayland: own `wl_surface`/`xdg_toplevel` + buffers) and
+  input/resize/close/scale events route to their destination via targeted
+  envelopes. Win32 and Cocoa keep the explicit single-window guard
+  (`createWindow == null`); headless keeps N logical windows for tests.
 - The vellz `Renderer` is owned per presenting window; its context,
   resources, and pixmap persist across frames and are recreated on resize.
 

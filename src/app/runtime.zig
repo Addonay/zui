@@ -31,6 +31,11 @@ const EntityHeader = struct {
     alive: bool = true,
     value_ptr: *anyopaque,
     next: ?*EntityHeader = null,
+    /// Window scope (gap report §5.2): entities created with a window
+    /// attached (mountView root and every `create(.., win)` child) are
+    /// destroyed by `destroyWindowScope` when that window closes. Zero
+    /// means app-lifetime (created with `window = null`).
+    window_id: u32 = 0,
     destroy_fn: *const fn (*EntityHeader) void,
     /// The allocation this header lives in (the `Box`), carried explicitly:
     /// values with alignment above the header's (any stored `Listener`,
@@ -139,6 +144,26 @@ pub const EntityStore = struct {
         self.destroyById(header.id, header.generation);
     }
 
+    /// Destroy every entity scoped to a window (gap report §5.2): the
+    /// mountView root plus every entity created with that window attached.
+    /// Called by `App.reapClosed` before the Window itself is freed, so
+    /// subscriptions/listeners targeting the scope fail predictably and
+    /// entity counts/allocations return to baseline. Entities created with
+    /// `window = null` are never touched.
+    pub fn destroyWindowScope(self: *EntityStore, window_id: u32) void {
+        self.assertUiThread();
+        if (window_id == 0) return;
+        var current = self.head;
+        while (current) |h| {
+            const next = h.next;
+            if (h.window_id == window_id) {
+                // destroyById handles unlink + destroy; find its pair.
+                self.destroyById(h.id, h.generation);
+            }
+            current = next;
+        }
+    }
+
     pub fn deinit(self: *EntityStore) void {
         var current = self.head;
         while (current) |header| {
@@ -164,6 +189,7 @@ pub const EntityStore = struct {
             .alive = true,
             .value_ptr = &box.value,
             .next = self.head,
+            .window_id = if (window) |w| w.id else 0,
             .destroy_fn = struct {
                 fn destroy(raw: *EntityHeader) void {
                     const typed: *Box = @ptrCast(@alignCast(raw.destroy_ctx.?));
@@ -641,6 +667,52 @@ test "mount and unmount repeatedly has bounded memory" {
         doc.destroy();
     }
     try t.expectEqual(@as(usize, 0), harness.store.count());
+}
+
+test "window scope teardown releases the mounted tree (gap report §5.2)" {
+    const t = std.testing;
+    const App = @import("app.zig").App;
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, struct {
+        fn noop(_: *Window, _: *@import("../gpu/root.zig").Scene) void {}
+    }.noop);
+
+    const Scoped = struct {
+        pub const Options = struct {};
+        n: u32 = 0,
+        pub fn init(_: *Context(@This()), _: Options) @This() {
+            return .{};
+        }
+    };
+    const AppLifetime = struct {
+        pub const Options = struct {};
+        pub fn init(_: *Context(@This()), _: Options) @This() {
+            return .{};
+        }
+    };
+    // Window-attached entities (like mountView roots and widget children).
+    const scoped_a = app.entities.create(Scoped, .{}, win);
+    const scoped_b = app.entities.create(Scoped, .{}, win);
+    // App-lifetime entity (created with window = null) must survive.
+    const persistent = app.entities.create(AppLifetime, .{}, null);
+    const before = app.entities.count();
+    try t.expectEqual(@as(usize, 2 + 1), before);
+    try t.expect(scoped_a.isAlive() and scoped_b.isAlive());
+    // Strong handles read the header; after scope teardown only weak
+    // handles may be consulted (the documented contract).
+    const weak_a = scoped_a.weak();
+    const weak_b = scoped_b.weak();
+    const weak_persistent = persistent.weak();
+
+    win.close();
+    app.reapClosed();
+    try t.expectEqual(@as(usize, 1), app.entities.count());
+    try t.expect(!weak_a.isAlive());
+    try t.expect(!weak_b.isAlive());
+    try t.expect(weak_persistent.isAlive());
+    app.entities.destroyById(weak_persistent.id, weak_persistent.generation);
+    try t.expectEqual(@as(usize, 0), app.entities.count());
 }
 
 test "late completion cannot mutate a destroyed target" {

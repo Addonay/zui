@@ -31,6 +31,13 @@ pub fn log(comptime scope: []const u8, comptime fmt: []const u8, args: anytype) 
     std.debug.print("[zui:{s}] " ++ fmt ++ "\n", .{scope} ++ args);
 }
 
+/// Unconditional diagnostic for correctness events (gap report §5.4): a
+/// critical event a producer could not enqueue leaves a stuck pressed /
+/// focused / composing state, so it is printed regardless of `ZUI_LOG`.
+pub fn critical(comptime scope: []const u8, comptime fmt: []const u8, args: anytype) void {
+    std.debug.print("[zui:{s}] CRITICAL " ++ fmt ++ "\n", .{scope} ++ args);
+}
+
 test "log disabled by default has no output contract" {
     // Only asserts the accessor is cheap and deterministic, not the env.
     const a = enabled();

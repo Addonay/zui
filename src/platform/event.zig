@@ -416,6 +416,17 @@ pub const EventQueue = struct {
         return ev;
     }
 
+    /// Producer-side escalation (gap report §5.4): critical events (close,
+    /// key/button release, focus loss, composition commit) that could not
+    /// be enqueued — even after evicting coalescable motion — are printed
+    /// unconditionally and counted on the queue. Producers call this
+    /// instead of discarding the result; the failure is never silent.
+    pub fn pushCriticalEscalated(self: *@This(), ev: Event, where: []const u8) void {
+        self.pushCritical(ev) catch {
+            @import("../core/log.zig").critical("event", "{s} lost a critical event ({s}); input state may be stuck", .{ where, @tagName(ev.untargeted()) });
+        };
+    }
+
     pub fn clear(self: *@This()) void {
         self.head = 0;
         self.len = 0;

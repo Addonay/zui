@@ -352,6 +352,10 @@ pub const App = struct {
                         self.active_window_count -= 1;
                     }
                     self.retired_diagnostics.add(win.diagnosticTotals());
+                    // Window scope teardown (gap report §5.2): the mountView
+                    // root and every entity created with this window die
+                    // here, before the Window memory itself is freed.
+                    self.entities.destroyWindowScope(win.id);
                     win.deinit();
                     self.allocator.destroy(win);
                 }

@@ -986,13 +986,15 @@ pub const X11Backend = struct {
                     std.debug.print("x11 keycode={d} mapped={s} pressed={}\n", .{ k.keycode, @tagName(mapped_key), ev.type == KeyPress });
                 }
                 const mods = evdev.modifiersFromMask(k.state);
-                _ = out.push(.{
+                // Key releases are critical; the escalated push prints any
+                // loss unconditionally (gap report §5.4).
+                out.pushCriticalEscalated(.{
                     .key = .{
                         .key = mapped_key,
                         .pressed = (ev.type == KeyPress),
                         .modifiers = mods,
                     },
-                });
+                }, "x11");
                 // Printable text via the server keymap (shift-aware
                 // capitals, digits, punctuation, UTF-8 locales). Press
                 // only: releases carry no new text. A fuller XIC +
@@ -1015,7 +1017,8 @@ pub const X11Backend = struct {
                             var text_ev = event.TextEvent{};
                             @memcpy(text_ev.text[0..count], buf[0..count]);
                             text_ev.len = @intCast(count);
-                            _ = out.push(.{ .text = text_ev });
+                            // Composition commits are critical (§5.4).
+                            out.pushCriticalEscalated(.{ .text = text_ev }, "x11");
                         }
                     }
                 }
@@ -1038,8 +1041,16 @@ pub const X11Backend = struct {
     }
 
     /// Push one translated event as a targeted envelope for this window.
+    /// Critical payloads (close, focus, text) route through the escalated
+    /// critical push: failure is printed unconditionally and counted on the
+    /// queue, never silently lost (gap report §5.4).
     fn pushTargeted(owner: *X11Backend, out: *event.EventQueue, ev: event.EventPayload) void {
-        _ = out.push(.{ .targeted = .{ .window_id = owner.window_id, .payload = ev } });
+        const envelope: event.Event = .{ .targeted = .{ .window_id = owner.window_id, .payload = ev } };
+        if (event.EventQueue.isCritical(envelope)) {
+            out.pushCriticalEscalated(envelope, "x11");
+        } else {
+            _ = out.push(envelope);
+        }
     }
 
     fn waitFn(ptr: *anyopaque, ns: u64) void {

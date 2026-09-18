@@ -322,7 +322,15 @@ pub const Window = struct {
         // the rejection stays observable via `rejected_frames`,
         // `last_frame_rejected`, and the scene's own drop counters.
         self.last_frame_rejected = false;
-        if (self.scene.overflowed()) {
+        if (self.ui_frame.owner_overflow_fatal) {
+            // Owner-table overflow must never degrade dispatch into
+            // ungated raw callbacks (gap report §5.3): reject the frame
+            // like a scene overflow instead.
+            self.rejected_frames += 1;
+            self.last_frame_rejected = true;
+            zlog.log("window", "frame rejected: owner table overflowed fatally (window {d}); presenting overflow placeholder", .{self.id});
+            self.scene.renderOverflowPlaceholder(self.bounds.rect());
+        } else if (self.scene.overflowed()) {
             const drops = self.scene.dropped_frame;
             self.rejected_frames += 1;
             self.last_frame_rejected = true;

@@ -1242,7 +1242,14 @@ pub const WaylandBackend = struct {
         if (self.destroyed) return;
         const conn = self.connection();
         const q = conn.target_queue orelse &conn.pending_events;
-        _ = q.push(if (self.window_id == 0) ev else ev.forWindow(self.window_id));
+        const queued = if (self.window_id == 0) ev else ev.forWindow(self.window_id);
+        if (event.EventQueue.isCritical(queued)) {
+            // Releases, text and focus changes must never vanish silently
+            // (gap report §5.4).
+            q.pushCriticalEscalated(queued, "wayland");
+        } else {
+            _ = q.push(queued);
+        }
     }
 
     /// §5G DPI: targeted window-state event (scale_changed) from a
