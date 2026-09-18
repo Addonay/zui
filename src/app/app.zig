@@ -9,6 +9,7 @@ const gpu = @import("../gpu/root.zig");
 const text_engine = @import("../fonts/text_engine.zig");
 const window_mod = @import("window.zig");
 const runtime = @import("runtime.zig");
+const tasks = @import("tasks.zig");
 const zlog = @import("../core/log.zig");
 const images = @import("../images/root.zig");
 
@@ -40,6 +41,16 @@ pub const App = struct {
     event_queue: platform.EventQueue = .{},
     should_quit: bool = false,
     is_active: bool = false,
+    /// Scoped background executor (gap §6D): worker pool + UI-thread
+    /// completion queue. Heap-owned so the address workers and the asset
+    /// registry observe stays stable when an App value moves (init returns
+    /// by copy; only the final owner deinits). Null only when the box
+    /// allocation failed — the registry then stays synchronous-pending.
+    /// Drained at step start, joined in deinit before entity/cache teardown.
+    tasks: ?*tasks.TaskRuntime = null,
+    /// Heap-owned backend copy feeding the cross-thread task-completion
+    /// wakeup. Borrowed by `tasks` until tasks.deinit; freed here after.
+    task_wakeup_backend: ?*platform.Backend = null,
     /// Monotonic frame counter for `ZUI_LOG` diagnostics (a stalled
     /// counter in the log pinpoints event-loop starvation hangs).
     step_count: u64 = 0,
@@ -58,13 +69,26 @@ pub const App = struct {
         var instance = try platform.createAuto(allocator, "ZUI Application", 800, 600);
         errdefer instance.deinit(allocator);
         const cache = try images.Cache.init(allocator);
-        return .{
+        errdefer cache.deinit(allocator);
+        const rt = try allocator.create(tasks.TaskRuntime);
+        errdefer allocator.destroy(rt);
+        rt.* = tasks.TaskRuntime.init(allocator, .{});
+        rt.start();
+        const wakeup_box = try allocator.create(platform.Backend);
+        errdefer allocator.destroy(wakeup_box);
+        const app: App = .{
             .allocator = allocator,
             .backend = instance.handle(),
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = instance,
             .image_cache = cache,
+            .tasks = rt,
+            .task_wakeup_backend = wakeup_box,
         };
+        wakeup_box.* = app.backend;
+        rt.setWakeup(taskWakeup, wakeup_box);
+        cache.assets.bindRuntime(rt);
+        return app;
     }
 
     pub fn initHeadless(allocator: std.mem.Allocator) !App {
@@ -72,23 +96,59 @@ pub const App = struct {
         errdefer allocator.destroy(nb);
         nb.* = .{};
         const cache = try images.Cache.init(allocator);
-        return .{
+        errdefer cache.deinit(allocator);
+        const rt = try allocator.create(tasks.TaskRuntime);
+        errdefer allocator.destroy(rt);
+        rt.* = tasks.TaskRuntime.init(allocator, .{});
+        rt.start();
+        const wakeup_box = try allocator.create(platform.Backend);
+        errdefer allocator.destroy(wakeup_box);
+        const app: App = .{
             .allocator = allocator,
             .backend = nb.backendHandle(),
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = .{ .null_backend = nb },
             .image_cache = cache,
+            .tasks = rt,
+            .task_wakeup_backend = wakeup_box,
         };
+        wakeup_box.* = app.backend;
+        rt.setWakeup(taskWakeup, wakeup_box);
+        cache.assets.bindRuntime(rt);
+        return app;
     }
 
     pub fn initWithBackend(allocator: std.mem.Allocator, be: platform.Backend) App {
+        // Infallible constructor: allocation failures degrade instead of
+        // failing (a null image cache and/or null task runtime both have
+        // well-defined degraded behavior: sync-pending asset registry).
+        const cache = images.Cache.init(allocator) catch null;
+        const rt: ?*tasks.TaskRuntime = allocator.create(tasks.TaskRuntime) catch null;
+        var wakeup_box: ?*platform.Backend = null;
+        if (rt) |r| {
+            r.* = tasks.TaskRuntime.init(allocator, .{});
+            r.start();
+            if (cache) |c| c.assets.bindRuntime(r);
+            if (allocator.create(platform.Backend) catch null) |box| {
+                box.* = be;
+                wakeup_box = box;
+                r.setWakeup(taskWakeup, box);
+            }
+        }
         return .{
             .allocator = allocator,
             .backend = be,
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = null,
-            .image_cache = images.Cache.init(allocator) catch null,
+            .image_cache = cache,
+            .tasks = rt,
+            .task_wakeup_backend = wakeup_box,
         };
+    }
+
+    fn taskWakeup(raw: *anyopaque) void {
+        const be: *platform.Backend = @ptrCast(@alignCast(raw));
+        be.wakeup();
     }
 
     /// Lazily create (once) the App-owned cozmic engine. Returns null when
@@ -130,6 +190,20 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        // Task workers join here while entities and the image cache are
+        // still alive: finished completions deliver (stale targets no-op),
+        // unstarted jobs are destroyed without running. Must precede all
+        // teardown below; the runtime box and wakeup box free right after
+        // (no worker can signal once joined).
+        if (self.tasks) |rt| {
+            rt.deinit();
+            self.allocator.destroy(rt);
+            self.tasks = null;
+        }
+        if (self.task_wakeup_backend) |box| {
+            self.allocator.destroy(box);
+            self.task_wakeup_backend = null;
+        }
         @import("../debug/stats.zig").logExit(self);
         for (&self.windows) |*maybe_win| {
             if (maybe_win.*) |win| {
@@ -413,7 +487,8 @@ pub const App = struct {
     /// Null means indefinite idle; zero means work is already ready. This
     /// computation never introduces a periodic idle deadline.
     pub fn nextWaitNs(self: *const App, now_ms: i64) ?u64 {
-        if (self.should_quit or self.event_queue.len != 0 or self.entities.dirty or self.hasDirtyWindows()) return 0;
+        const tasks_ready = if (self.tasks) |rt| rt.hasReady() else false;
+        if (self.should_quit or self.event_queue.len != 0 or self.entities.dirty or self.hasDirtyWindows() or tasks_ready) return 0;
         var deadline: ?i64 = null;
         for (self.windows) |maybe_win| {
             const win = maybe_win orelse continue;
@@ -432,6 +507,11 @@ pub const App = struct {
 
     /// Explicit monotonic time for deterministic scheduler tests/embedding.
     pub fn stepAt(self: *App, now_ms: i64) bool {
+        // Task completions marshal here, before input: worker results apply
+        // to this frame's render, like drained events. Stamps the frame id
+        // used for async cache pinning first.
+        if (self.image_cache) |ic| ic.assets.completion_frame = self.step_count;
+        if (self.tasks) |rt| rt.drainCompletions();
         // Expire before input: late second keys must not complete a chord.
         for (self.windows) |maybe_win| {
             const win = maybe_win orelse continue;
@@ -1474,4 +1554,43 @@ test "requestRender during render schedules another frame" {
     try std.testing.expect(win.dirty);
     try std.testing.expect(app.step());
     try std.testing.expectEqual(@as(u32, 2), S.calls);
+}
+
+test "task runtime: close window mid-flight is safe" {
+    // Gap §6D: an async asset read in flight while its window closes must
+    // tear down without crashes or leaks (testing allocator enforces the
+    // latter). The asset registry is app-scoped, so the delivery still
+    // lands; only window-scoped entities are reaped.
+    const t = std.testing;
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const icon = "<svg width=\"4\" height=\"2\" xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"4\" height=\"2\" fill=\"red\"/></svg>";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "thumb.svg", .data = icon });
+    const path = try std.fs.path.join(t.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "thumb.svg" });
+    defer t.allocator.free(path);
+
+    // openWindow wired the runtime, so this spawns a real worker read.
+    const cache = app.image_cache.?;
+    const ticket = try cache.assets.requestPath(path);
+    _ = ticket;
+
+    win.close();
+    app.reapClosed();
+    try t.expectEqual(@as(usize, 0), app.liveWindowCount());
+
+    // Step until the worker's delivery lands (bounded liveness wait;
+    // correctness never depends on timing). step() returns false with no
+    // windows but still drains completions first.
+    var i: usize = 0;
+    while (app.tasks.?.inFlight() > 0 and i < 20_000_000) : (i += 1) {
+        _ = app.step();
+        std.Thread.yield() catch {};
+    }
+    try t.expectEqual(@as(usize, 0), app.tasks.?.inFlight());
 }

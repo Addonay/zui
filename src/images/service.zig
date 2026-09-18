@@ -1,12 +1,16 @@
 //! UI-thread asset registry, owned by the App's decoded cache.
-//! Request/complete/cancel are the future task-system boundary; requestPath
-//! queues no worker yet. Use preloadPath/preloadBytes outside render for now.
+//! requestPath() spawns a real worker-pool file read when a TaskRuntime is
+//! bound (App wires it in ensureTasksWired); decode+place still runs in the
+//! UI-thread completion through the existing complete()/completeFailure()
+//! boundary, so the cache is never touched off-thread. Use
+//! preloadPath/preloadBytes outside render for synchronous loads.
 //! Rendering only looks up metadata and validates ready pool references.
 const std = @import("std");
 const cache_mod = @import("cache.zig");
 const raster = @import("raster.zig");
 const svg = @import("svg.zig");
 const limits = @import("../core/limits.zig");
+const tasks = @import("../app/tasks.zig");
 const Color = @import("../core/color.zig").Color;
 const log = std.log.scoped(.assets);
 
@@ -41,6 +45,9 @@ const Entry = struct {
     bytes: ?[]u8 = null,
     metadata: Metadata = .{ .state = .loading },
     pixels: cache_mod.Handle = .invalid,
+    /// True once a worker read was spawned for the current loading
+    /// revision; dedups repeat requestPath calls into one flight.
+    worker_spawned: bool = false,
 };
 
 pub const Service = struct {
@@ -54,9 +61,30 @@ pub const Service = struct {
     /// Changes on completion/cancellation/reload; owners should request layout
     /// and redraw when it changes. Future UI-thread completion will do this.
     version: u64 = 0,
+    /// Worker pool for async path reads. Null keeps the original
+    /// synchronous-pending behavior (standalone use, existing tests, or a
+    /// degraded App whose runtime box failed to allocate). App binds its
+    /// heap-owned TaskRuntime at init.
+    task_runtime: ?*tasks.TaskRuntime = null,
+    /// Frame id stamped onto async completions for cache pinning. App sets
+    /// this to the current step before draining task completions.
+    completion_frame: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, cache: *cache_mod.Cache) Service {
         return .{ .allocator = allocator, .cache = cache };
+    }
+
+    /// Bind (or rebind) the worker pool used by requestPath/reload.
+    /// App binds its heap-owned runtime once at init; the address stays
+    /// stable across App moves (see App.tasks).
+    pub fn bindRuntime(self: *Service, rt: *tasks.TaskRuntime) void {
+        self.task_runtime = rt;
+    }
+
+    /// True while the ticket still owns its entry's loading revision:
+    /// the liveness probe for worker starts and completion dispatch.
+    pub fn isPending(self: *Service, ticket: Ticket) bool {
+        return self.pending(ticket) != null;
     }
 
     pub fn deinit(self: *Service) void {
@@ -130,8 +158,30 @@ pub const Service = struct {
         return entry.pixels;
     }
 
-    /// A bounded pending request; does NOT spawn a worker in this release.
+    /// Registry entry point. Without a bound runtime the ticket stays
+    /// pending until preload/complete, exactly as before. With a runtime
+    /// bound, a real worker job is spawned for the file read; decode+place
+    /// runs later in the UI-thread completion. A full task queue fails the
+    /// entry explicitly AND returns error.TaskQueueFull — never silent.
     pub fn requestPath(self: *Service, path: []const u8) !Ticket {
+        const ticket = try self.requestPending(path);
+        const rt = self.task_runtime orelse return ticket;
+        const entry = self.get(ticket.handle) orelse return ticket;
+        if (entry.metadata.state != .loading or entry.worker_spawned) return ticket;
+        self.spawnRead(rt, ticket) catch |err| {
+            if (err == error.TaskQueueFull) {
+                if (self.pending(ticket)) |e| self.fail(e, error.TaskQueueFull);
+                return error.TaskQueueFull;
+            }
+            return err;
+        };
+        self.get(ticket.handle).?.worker_spawned = true;
+        return ticket;
+    }
+
+    /// Synchronous registry insert shared by requestPath and preloadPath.
+    /// Never spawns: preloadPath stays fully synchronous.
+    fn requestPending(self: *Service, path: []const u8) !Ticket {
         if (path.len == 0 or path.len >= 4096 or std.mem.indexOfScalar(u8, path, 0) != null) return error.BadPath;
         if (self.findPath(path)) |handle| return .{ .handle = handle, .revision = self.get(handle).?.revision };
         const owned = try self.allocator.dupe(u8, path);
@@ -164,13 +214,26 @@ pub const Service = struct {
 
     /// Explicit invalidation policy: no automatic stat/watch or retry of failures.
     /// Stable handle survives reload; old completion tickets are rejected.
+    /// With a runtime bound, reload spawns a fresh worker read (same
+    /// over-limit policy as requestPath).
     pub fn reload(self: *Service, handle: Handle) !Ticket {
         const entry = self.get(handle) orelse return error.StaleAsset;
         entry.revision += 1;
         entry.metadata.state = .loading;
         entry.metadata.failure = null;
+        entry.worker_spawned = false;
         self.version += 1;
-        return .{ .handle = handle, .revision = entry.revision };
+        const ticket = Ticket{ .handle = handle, .revision = entry.revision };
+        const rt = self.task_runtime orelse return ticket;
+        self.spawnRead(rt, ticket) catch |err| {
+            if (err == error.TaskQueueFull) {
+                if (self.pending(ticket)) |e| self.fail(e, error.TaskQueueFull);
+                return error.TaskQueueFull;
+            }
+            return err;
+        };
+        self.get(handle).?.worker_spawned = true;
+        return ticket;
     }
 
     /// Explicit registry eviction, only between frames. Late tickets and retained
@@ -180,7 +243,7 @@ pub const Service = struct {
     }
 
     pub fn preloadPath(self: *Service, path: []const u8, frame: u64) !Handle {
-        const ticket = try self.requestPath(path);
+        const ticket = try self.requestPending(path);
         const entry = self.get(ticket.handle).?;
         if (entry.metadata.state != .loading) return ticket.handle;
         self.counters.reads += 1;
@@ -205,6 +268,86 @@ pub const Service = struct {
         const entry = self.pending(ticket) orelse return false;
         self.fail(entry, err);
         return true;
+    }
+
+    /// Worker-pool file read for one ticket. The worker touches only its
+    /// own job box (path dupe + libc-allocated file bytes); the registry
+    /// and cache are UI-thread-only. Cancellation composes through the
+    /// ticket: checked at worker start, re-checked before completion
+    /// dispatch, and re-checked inside complete() before decode.
+    const ImageJob = struct {
+        service: *Service,
+        ticket: Ticket,
+        path: []u8,
+        max_bytes: usize,
+        bytes: []u8 = &.{},
+        failure: ?anyerror = null,
+    };
+
+    fn spawnRead(self: *Service, rt: *tasks.TaskRuntime, ticket: Ticket) !void {
+        const entry = self.get(ticket.handle) orelse return;
+        const src = entry.path orelse return;
+        const box = try self.allocator.create(ImageJob);
+        errdefer self.allocator.destroy(box);
+        const owned = try self.allocator.dupe(u8, src);
+        errdefer self.allocator.free(owned);
+        box.* = .{
+            .service = self,
+            .ticket = ticket,
+            .path = owned,
+            .max_bytes = self.budget.source_bytes,
+        };
+        // spawnRaw owns `box` (and `owned` through it) only on success;
+        // the errdefers above free both on submission failure.
+        _ = try rt.spawnRaw(box, .{
+            .run = imageJobRun,
+            .complete = imageJobComplete,
+            .destroy = imageJobDestroy,
+            .alive = imageJobAlive,
+        });
+    }
+
+    fn imageJobRun(raw: *anyopaque, token: tasks.Cancel) void {
+        const job: *ImageJob = @ptrCast(@alignCast(raw));
+        if (token.isCancelled()) return;
+        // Ticket check at worker start: a cancel()/reload()/release() that
+        // landed after submit skips the read. Benign race with a
+        // concurrent UI-thread registry mutation — worst case a wasted
+        // read; delivery re-checks on the UI thread, which is authoritative.
+        if (!job.service.isPending(job.ticket)) return;
+        job.bytes = readPath(std.heap.c_allocator, job.path, job.max_bytes) catch |err| {
+            job.failure = err;
+            return;
+        };
+    }
+
+    fn imageJobComplete(raw: *anyopaque) void {
+        const job: *ImageJob = @ptrCast(@alignCast(raw));
+        const svc = job.service;
+        // Ticket check before completion dispatch: cancelled/stale tickets
+        // no-op here even when the worker already read the file.
+        if (!svc.isPending(job.ticket)) return;
+        svc.counters.reads += 1;
+        if (job.failure) |err| {
+            _ = svc.completeFailure(job.ticket, err);
+        } else {
+            // complete() re-checks the ticket before decode/alloc.
+            _ = svc.complete(job.ticket, job.bytes, svc.completion_frame);
+        }
+    }
+
+    fn imageJobAlive(raw: *anyopaque) bool {
+        const job: *ImageJob = @ptrCast(@alignCast(raw));
+        return job.service.isPending(job.ticket);
+    }
+
+    fn imageJobDestroy(raw: *anyopaque, alloc: std.mem.Allocator) void {
+        const job: *ImageJob = @ptrCast(@alignCast(raw));
+        // Worker-side bytes are libc-owned (read off-thread); the path dupe
+        // and box are service-allocator-owned (UI thread both ends).
+        if (job.bytes.len > 0) std.heap.c_allocator.free(job.bytes);
+        alloc.free(job.path);
+        alloc.destroy(job);
     }
 
     /// UI-thread completion boundary. Copies borrowed bytes; cancelled/stale

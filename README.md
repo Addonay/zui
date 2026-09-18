@@ -65,6 +65,11 @@ App / scheduler            owns entities, platform connection, text engine, imag
                            (quads + glyphs + image blits, drawn in order)
       gpu.vellz            Vello-derived CPU renderer; per-window physical buffer
       app/assets           asset service: loading/ready/failed, dedup, budgets
+                            path reads run on the task worker pool, decode+place
+                            completes on the UI thread (see app/tasks)
+      app/tasks            worker pool (default 2, ≤32 in flight) + UI-thread
+                            completion queue drained at step start; weak-target
+                            completions no-op after destroy, over-limit fails loud
       debug/               frame inspector (ZUI_INSPECT=1), stats, debug overlay
 fonts/                     text engine: cozmic shaping/layout, FreeType raster,
                            cross-frame layout cache, swash image cache + atlas
