@@ -245,6 +245,8 @@ const ElementSample = struct {
     /// `layout_shapes == cozmic_nodes` and `paint_shapes == 0`.
     layout_shapes: u64,
     paint_shapes: u64,
+    /// Cross-frame layout-cache hits observed in this row's run loop.
+    cache_hits: u64,
 };
 
 /// Warm up (atlas, allocator, engine caches) and then time `iters` frames:
@@ -301,6 +303,9 @@ fn timeElement(
         if (node.kind != .text) continue;
         if (node.cozmic_measured) cozmic_nodes += 1;
     }
+    // Cache hits across the whole timed+warmup loop: every layout after the
+    // first re-pins the retained entry instead of shaping.
+    const cache_hits = engine.layout_cache_hits;
 
     return .{
         .layout = Stats.from(layout_times),
@@ -314,6 +319,7 @@ fn timeElement(
         .cozmic_failures = frame.cozmic_paint_failures,
         .layout_shapes = layout_shapes,
         .paint_shapes = paint_shapes,
+        .cache_hits = cache_hits,
     };
 }
 
@@ -566,7 +572,7 @@ pub fn main(init: std.process.Init) !void {
             }
             if (opts.json) {
                 try w.print(
-                    "{{\"bench\":\"text-frame\",\"kind\":\"element\",\"engine\":\"{s}\",\"config\":\"{s}\",\"nodes\":{d},\"chars\":{d},\"iters\":{d},\"layout_mean_ns\":{d:.1},\"layout_median_ns\":{d:.1},\"paint_mean_ns\":{d:.1},\"paint_median_ns\":{d:.1},\"total_mean_ns\":{d:.1},\"total_median_ns\":{d:.1},\"ns_per_node\":{d:.1},\"ns_per_char\":{d:.2},\"scene_glyphs\":{d},\"scene_dropped\":{d},\"cozmic_nodes\":{d},\"cozmic_emitted\":{d},\"cozmic_skipped\":{d},\"cozmic_failures\":{d},\"layout_shapes\":{d},\"paint_shapes\":{d}}}\n",
+                    "{{\"bench\":\"text-frame\",\"kind\":\"element\",\"engine\":\"{s}\",\"config\":\"{s}\",\"nodes\":{d},\"chars\":{d},\"iters\":{d},\"layout_mean_ns\":{d:.1},\"layout_median_ns\":{d:.1},\"paint_mean_ns\":{d:.1},\"paint_median_ns\":{d:.1},\"total_mean_ns\":{d:.1},\"total_median_ns\":{d:.1},\"ns_per_node\":{d:.1},\"ns_per_char\":{d:.2},\"scene_glyphs\":{d},\"scene_dropped\":{d},\"cozmic_nodes\":{d},\"cozmic_emitted\":{d},\"cozmic_skipped\":{d},\"cozmic_failures\":{d},\"layout_shapes\":{d},\"paint_shapes\":{d},\"cache_hits\":{d}}}\n",
                     .{
                         engine_name,             cfg.name,               n,
                         chars,                   opts.iters,             sample.layout.mean_ns,
@@ -575,6 +581,7 @@ pub fn main(init: std.process.Init) !void {
                         ns_per_char,             sample.glyphs,          sample.dropped,
                         sample.cozmic_nodes,     sample.cozmic_emitted,  sample.cozmic_skipped,
                         sample.cozmic_failures,  sample.layout_shapes,   sample.paint_shapes,
+                        sample.cache_hits,
                     },
                 );
             } else {

@@ -158,6 +158,12 @@ pub const MAX_SHAPED_RUN_CACHE: u32 = 256;
 /// Maximum text length for single-line inputs
 pub const MAX_TEXT_LEN: u32 = 512;
 
+/// Cross-frame text layout cache entries per engine (gap report §3.4).
+/// Each entry owns its key bytes and one shaped `cozmic.Buffer`; nodes
+/// borrow while mounted. Eviction reclaims the oldest UNPINNED entry, so a
+/// layout referenced by the current frame's nodes is never dropped mid-use.
+pub const MAX_TEXT_LAYOUTS: u32 = 64;
+
 /// Maximum font file path length for a fontconfig match copy (init-time).
 pub const MAX_FONT_PATH_LEN: u32 = 512;
 

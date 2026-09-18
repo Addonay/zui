@@ -1522,7 +1522,7 @@ test "retained layout is invalidated by reset and re-measure" {
     try t.expect(frame.nodes[first_index].cozmic_layout == null);
 
     // Rebuilding into the reused slot measures fresh text through a fresh
-    // handoff.
+    // handoff ("third" was never cached, so it shapes exactly once).
     frame.engine = engine;
     frame.allocator = t.allocator;
     const root2 = element.div().w(300).h(100).flex_col()
@@ -1532,9 +1532,12 @@ test "retained layout is invalidated by reset and re-measure" {
     const third_index = frame.nodes[root2.index].first_child.?;
     try t.expect(frame.nodes[third_index].cozmic_layout != null);
 
-    // Re-measuring the same node replaces and frees the previous entry.
+    // Re-measuring the same node hits the cross-frame cache: identical
+    // inputs reuse the retained entry instead of re-shaping (gap §3.4),
+    // and the handoff re-installs on the node.
     @import("layout.zig").layout(frame, root2, .{ .w = 300, .h = 100 });
-    try t.expectEqual(shaped_first + 2, engine.layout_calls);
+    try t.expectEqual(shaped_first + 1, engine.layout_calls);
+    try t.expectEqual(@as(u64, 1), engine.layout_cache_hits);
     try t.expect(frame.nodes[third_index].cozmic_layout != null);
 }
 

@@ -76,6 +76,9 @@ pub const Snapshot = struct {
     atlas_evictions: u64 = 0,
     atlas_drops: u64 = 0,
     atlas_bytes: usize = 0,
+    text_layout_cache_hits: u64 = 0,
+    text_layout_cache_misses: u64 = 0,
+    text_layout_cache_evictions: u64 = 0,
     engine_failures: u64 = 0,
 };
 
@@ -107,6 +110,10 @@ pub fn capture(app: anytype) Snapshot {
         result.atlas_evictions = engine.glyphs.evictions;
         result.atlas_drops = engine.glyphs.overflow_drops;
         result.atlas_bytes = engine.glyphs.pixels_used;
+        // Cross-frame text layout cache (gap §3.4).
+        result.text_layout_cache_hits = engine.layout_cache_hits;
+        result.text_layout_cache_misses = engine.layout_cache_misses;
+        result.text_layout_cache_evictions = engine.layout_cache_evictions;
     }
     return result;
 }

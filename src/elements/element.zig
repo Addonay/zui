@@ -277,8 +277,18 @@ pub const Node = struct {
     /// Free and drop the retained measure→paint layout. Idempotent. Called
     /// before every re-measure of the node and for every live node by
     /// `Frame.clearCozmicLayouts` (frame reset / end of paint).
+    ///
+    /// Cache-owned entries (cross-frame layout cache, gap §3.4) are only
+    /// UNPINNED here — the cache owns their memory and frees them at
+    /// eviction or engine teardown. Never frees a pinned entry's buffer.
     pub fn clearCozmicLayout(self: *Node) void {
-        if (self.cozmic_layout) |cached| cached.deinit();
+        if (self.cozmic_layout) |cached| {
+            if (cached.cache_owned) {
+                cached.pinned -|= 1;
+            } else {
+                cached.deinit();
+            }
+        }
         self.cozmic_layout = null;
     }
 

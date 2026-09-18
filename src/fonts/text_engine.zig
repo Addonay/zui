@@ -44,6 +44,7 @@ const std = @import("std");
 const cozmic = @import("cozmic");
 const build_options = @import("build_options");
 const atlas = @import("atlas.zig");
+const limits = @import("../core/limits.zig");
 
 /// Atlas type the engine owns; re-exported so the element painter can type
 /// its renderer without importing the fonts package directly.
@@ -150,6 +151,16 @@ pub const Engine = struct {
     /// bench-text prove that a node is shaped once per frame); shaping reads
     /// nothing from it.
     layout_calls: u64 = 0,
+    /// Cross-frame text layout cache (gap report §3.4): shaped layouts that
+    /// survive frame boundaries so unchanged text does not re-shape. Entries
+    /// own their key bytes; nodes hold pins while mounted. Victims are the
+    /// oldest UNPINNED entries. The cache assumes one allocator per engine
+    /// lifetime (the App allocator every frame passes today).
+    layout_cache: [limits.MAX_TEXT_LAYOUTS]?*CachedLayout = @splat(null),
+    layout_cache_len: usize = 0,
+    layout_cache_hits: u64 = 0,
+    layout_cache_misses: u64 = 0,
+    layout_cache_evictions: u64 = 0,
 
     /// Load the vendored deterministic corpus; fall back to host system fonts
     /// only when no corpus candidate directory exists. A candidate directory
@@ -191,6 +202,12 @@ pub const Engine = struct {
         self.* = undefined;
         self.allocator = allocator;
         self.layout_calls = 0;
+        // Cross-frame layout cache starts empty (gap §3.4).
+        self.layout_cache = @splat(null);
+        self.layout_cache_len = 0;
+        self.layout_cache_hits = 0;
+        self.layout_cache_misses = 0;
+        self.layout_cache_evictions = 0;
         self.glyphs = .{};
 
         self.fs = try cozmic.FontSystem.init(allocator);
@@ -237,6 +254,16 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Engine) void {
         const allocator = self.allocator;
+        // Cache entries outlive frames; windows deinit before the engine
+        // (App.deinit order), so pins are all released by now. Free
+        // unconditionally and defensively clear pins.
+        for (self.layout_cache[0..self.layout_cache_len]) |maybe| {
+            if (maybe) |entry| {
+                entry.pinned = 0;
+                entry.deinit();
+            }
+        }
+        self.layout_cache_len = 0;
         self.glyphs.clear();
         self.cache.deinit();
         self.raster.deinit();
@@ -336,13 +363,81 @@ pub const Engine = struct {
         attrs: TextAttrs,
         width_opt: ?f32,
     ) !*CachedLayout {
+        // Cross-frame cache lookup (gap report §3.4). Collisions are
+        // rejected by content via `matches`, so hashing is advisory only.
+        const hash = layoutKeyHash(text, attrs, width_opt);
+        for (self.layout_cache[0..self.layout_cache_len]) |maybe| {
+            const entry = maybe orelse continue;
+            if (entry.hash == hash and entry.matches(self, text, attrs, width_opt)) {
+                self.layout_cache_hits += 1;
+                entry.pinned += 1;
+                return entry;
+            }
+        }
+        self.layout_cache_misses += 1;
+
+        const shaped = try self.layout(allocator, text, attrs, width_opt);
+        var shaped_mut = shaped;
+        errdefer shaped_mut.deinit();
         const cached = try allocator.create(CachedLayout);
         errdefer allocator.destroy(cached);
+        // Cross-frame stability: the key must not borrow transient node
+        // storage, so the entry owns duped text/family bytes.
+        const text_copy = try allocator.dupe(u8, text);
+        errdefer allocator.free(text_copy);
+        const family_copy: []u8 = if (attrs.family) |f| try allocator.dupe(u8, f) else &.{};
+        errdefer if (attrs.family != null) allocator.free(family_copy);
+        var entry_attrs = attrs;
+        entry_attrs.family = if (attrs.family != null) family_copy else null;
         cached.* = .{
-            .layout = try self.layout(allocator, text, attrs, width_opt),
-            .key = .{ .engine = self, .text = text, .attrs = attrs, .wrap_width = width_opt },
+            .layout = shaped_mut,
+            .key = .{ .engine = self, .text = text_copy, .attrs = entry_attrs, .wrap_width = width_opt },
+            .hash = hash,
+            .text_copy = text_copy,
+            .family_copy = family_copy,
+            .cache_owned = true,
+            .pinned = 1,
         };
+        self.cacheInsert(cached);
         return cached;
+    }
+
+    /// Test/tool helper: remove an entry from the cache and hand ownership
+    /// to the caller (it must `deinit` it). Used where a test asserts on a
+    /// single entry without cache-lifetime entanglement.
+    pub fn cacheDetach(self: *Engine, entry: *CachedLayout) void {
+        for (&self.layout_cache) |*maybe| {
+            if (maybe.* != entry) continue;
+            const last = self.layout_cache[self.layout_cache_len - 1];
+            maybe.* = last;
+            self.layout_cache[self.layout_cache_len - 1] = null;
+            self.layout_cache_len -= 1;
+            entry.cache_owned = false;
+            return;
+        }
+    }
+
+    /// Insert into the bounded cache; victims are the oldest UNPINNED
+    /// entries. A fully-pinned cache drops the insert (the fresh entry is
+    /// unowned by the cache and dies with its node link like pre-cache
+    /// behavior — nothing is ever freed under a live borrower).
+    fn cacheInsert(self: *Engine, entry: *CachedLayout) void {
+        if (self.layout_cache_len < self.layout_cache.len) {
+            self.layout_cache[self.layout_cache_len] = entry;
+            self.layout_cache_len += 1;
+            return;
+        }
+        for (&self.layout_cache) |*maybe| {
+            const victim = maybe.* orelse continue;
+            if (victim.pinned != 0) continue;
+            victim.deinit();
+            maybe.* = entry;
+            self.layout_cache_evictions += 1;
+            return;
+        }
+        // Fully pinned: leave the fresh entry cache-unowned so the node's
+        // frame clear deinits it exactly like the old per-frame behavior.
+        entry.cache_owned = false;
     }
 
     /// Shape once and render through `renderer`. Only the returned stats are
@@ -599,13 +694,27 @@ pub const LayoutKey = struct {
 pub const CachedLayout = struct {
     layout: Layout,
     key: LayoutKey,
+    /// Advisory hash over the key inputs; `matches` still verifies content.
+    hash: u64 = 0,
+    /// Owned key bytes (cache entries); freed with the entry.
+    text_copy: []u8 = &.{},
+    family_copy: []u8 = &.{},
+    /// Cache membership: cache-owned entries are unpinned on node clear and
+    /// freed by eviction/engine deinit; unowned entries (fully-pinned cache
+    /// insert fallback) die with the node's frame clear like pre-cache
+    /// per-frame entries.
+    cache_owned: bool = false,
+    /// Nodes holding this entry (mount time). Eviction never frees a pinned
+    /// entry, so a live borrower can never read freed memory.
+    pinned: u32 = 0,
 
-    /// Free the shaped buffer and this entry. Safe on any entry produced by
-    /// `Engine.layoutCached`; do not call twice (the node/frame setters clear
-    /// the pointer).
+    /// Free the shaped buffer, key bytes and this entry. Cache-owned entries
+    /// are freed by eviction/engine deinit instead (nodes only unpin).
     pub fn deinit(self: *CachedLayout) void {
         const allocator = self.layout.allocator;
         self.layout.deinit();
+        if (self.text_copy.len > 0) allocator.free(self.text_copy);
+        if (self.family_copy.len > 0) allocator.free(self.family_copy);
         allocator.destroy(self);
     }
 
@@ -643,6 +752,22 @@ fn optionalStrEqual(a: ?[]const u8, b: ?[]const u8) bool {
 fn optionalF32Equal(a: ?f32, b: ?f32) bool {
     if (a == null or b == null) return a == null and b == null;
     return a.? == b.?;
+}
+
+/// Advisory hash over the layout-key inputs. Collisions are rejected by
+/// content in the cache lookup (`matches`), so this only needs to be cheap
+/// and stable, never perfect.
+pub fn layoutKeyHash(text: []const u8, attrs: TextAttrs, width_opt: ?f32) u64 {
+    var h = std.hash.Wyhash.init(0x5eaf00d);
+    h.update(text);
+    h.update(std.mem.asBytes(&attrs.size));
+    h.update(std.mem.asBytes(&attrs.line_height));
+    h.update(std.mem.asBytes(&attrs.weight));
+    h.update(std.mem.asBytes(&attrs.tracking));
+    h.update(std.mem.asBytes(&attrs.wrap));
+    if (attrs.family) |f| h.update(f);
+    h.update(std.mem.asBytes(&width_opt));
+    return h.final();
 }
 
 const opaqueBlack = cozmic.Color{ .value = 0xFF00_0000 };
@@ -1089,6 +1214,85 @@ test "text engine: system fonts shape when available" {
     try testing.expect(layout.width > 0);
 }
 
+test "text engine: layout cache hits on unchanged inputs and evicts unpinned" {
+    const alloc = testing.allocator;
+    const engine = try testEngine();
+    defer engine.deinit();
+
+    const attrs = TextAttrs{ .family = "Inter", .size = 16, .line_height = 20 };
+    const calls_before = engine.layout_calls;
+    const first = try engine.layoutCached(alloc, "cache me", attrs, 200);
+    try testing.expectEqual(calls_before + 1, engine.layout_calls);
+    try testing.expectEqual(@as(u64, 0), engine.layout_cache_hits);
+    try testing.expectEqual(@as(u64, 1), engine.layout_cache_misses);
+    // Identical inputs across "frames" hit the cache: no re-shape, same entry.
+    const second = try engine.layoutCached(alloc, "cache me", attrs, 200);
+    try testing.expectEqual(first, second);
+    try testing.expectEqual(calls_before + 1, engine.layout_calls);
+    try testing.expectEqual(@as(u64, 1), engine.layout_cache_hits);
+    // The node's frame clear (unpin) is idempotent and never frees.
+    first.pinned -= 1;
+    first.pinned -|= 0;
+    try testing.expectEqual(@as(u32, 1), second.pinned);
+
+    // Any key-input change misses.
+    const miss = try engine.layoutCached(alloc, "cache me", attrs, 201);
+    try testing.expectEqual(calls_before + 2, engine.layout_calls);
+    try testing.expectEqual(@as(u64, 2), engine.layout_cache_misses);
+    miss.pinned = 0;
+
+    // Eviction: fill past the bound; unpinned victims are reclaimed, pinned
+    // entries survive.
+    var i: usize = 0;
+    while (i < limits.MAX_TEXT_LAYOUTS + 4) : (i += 1) {
+        var buf: [24]u8 = undefined;
+        const label = std.fmt.bufPrint(&buf, "entry-{d}", .{i}) catch unreachable;
+        const entry = try engine.layoutCached(alloc, label, attrs, null);
+        entry.pinned = 0; // unpinned: eligible victim on the next insert
+    }
+    try testing.expect(engine.layout_cache_evictions > 0);
+    try testing.expectEqual(limits.MAX_TEXT_LAYOUTS, @as(u32, @intCast(engine.layout_cache_len)));
+
+    // The pinned "cache me" entry survived eviction and still matches.
+    var still_cached = false;
+    for (engine.layout_cache[0..engine.layout_cache_len]) |maybe| {
+        if (maybe == first) still_cached = true;
+    }
+    try testing.expect(still_cached);
+    try testing.expect(first.matches(engine, "cache me", attrs, 200));
+}
+
+test "text engine: cache hit paints the same geometry as the miss path" {
+    // Regression: the cached handoff must not change glyph placement.
+    const alloc = testing.allocator;
+    const engine = try testEngine();
+    defer engine.deinit();
+    const attrs = TextAttrs{ .family = "Inter", .size = 14, .line_height = 18 };
+
+    var miss_layout = try engine.layout(alloc, "place me", attrs, null);
+    defer miss_layout.deinit();
+    const cached = try engine.layoutCached(alloc, "place me", attrs, null);
+    defer cached.deinit(); // runs LAST (LIFO): cacheDetach first, then free
+    engine.cacheDetach(cached);
+    try testing.expectEqual(@as(usize, miss_layout.glyph_count), cached.layout.glyph_count);
+    try testing.expectEqual(miss_layout.width, cached.layout.width);
+    try testing.expectEqual(miss_layout.height, cached.layout.height);
+    var miss_runs = miss_layout.runs();
+    var cached_runs = cached.layout.runs();
+    while (true) {
+        const m = miss_runs.next();
+        const c = cached_runs.next();
+        if (m == null and c == null) break;
+        try testing.expect(m != null and c != null);
+        try testing.expectEqual(m.?.glyphs.len, c.?.glyphs.len);
+        for (m.?.glyphs, c.?.glyphs) |mg, cg| {
+            try testing.expectEqual(mg.x, cg.x);
+            try testing.expectEqual(mg.y, cg.y);
+            try testing.expectEqual(mg.w, cg.w);
+        }
+    }
+}
+
 test "text engine: deinit is leak-free" {
     const engine = try testEngine();
     engine.deinit();
@@ -1253,6 +1457,9 @@ test "text engine: cached layout key rejects changed inputs and engines" {
     const attrs = TextAttrs{ .family = "Inter", .size = 16, .line_height = 20 };
     const calls_before = engine.layout_calls;
     const cached = try engine.layoutCached(alloc, "Hello", attrs, 100);
+    // Take the entry out of the cache so this test's deinit owns it (the
+    // engine deinit would otherwise free it again).
+    engine.cacheDetach(cached);
     defer cached.deinit();
     try testing.expectEqual(calls_before + 1, engine.layout_calls);
     try testing.expectEqual(@as(f32, 100), cached.key.wrap_width.?);
