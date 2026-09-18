@@ -170,6 +170,47 @@ pub fn build(b: *std.Build) void {
     const run_images_step = b.step("run-images", "Render the images demo to a PPM snapshot");
     run_images_step.dependOn(&run_images.step);
 
+    // Animation demo: transliteration of GPUI's animation.rs example
+    // (spring physics, damping slider, repeating eased spinner).
+    const animation = b.addExecutable(.{
+        .name = "animation",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/animation/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{
+                .name = "zui",
+                .module = mod,
+            }},
+        }),
+    });
+    const run_animation = b.addRunArtifact(animation);
+
+    const run_animation_step = b.step("run-animation", "Run the animation demo (spring physics + eased spinner)");
+    run_animation_step.dependOn(&run_animation.step);
+
+    // Embedded unit tests in the animation example (spring math, easings).
+    const animation_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/animation/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zui", .module = mod }},
+        }),
+    });
+    const run_animation_tests = b.addRunArtifact(animation_tests);
+    test_step.dependOn(&run_animation_tests.step);
+
+    // Headless integration: synthetic click/drag through the real event
+    // queue -> App -> Window -> hit-test -> listener path, asserting spring
+    // retarget, settle, damping retune, and the spinner clock.
+    const selftest_animation = b.addRunArtifact(animation);
+    selftest_animation.setEnvironmentVariable("ZUI_BACKEND", "null");
+    selftest_animation.setEnvironmentVariable("ZUI_SELFTEST", "1");
+    const selftest_animation_step = b.step("selftest-animation", "Run the animation headless integration selftest");
+    selftest_animation_step.dependOn(&selftest_animation.step);
+    test_step.dependOn(&selftest_animation.step);
+
     const dash = b.addExecutable(.{
         .name = "dash",
         .root_module = b.createModule(.{
@@ -265,6 +306,8 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&todo.step);
     check_step.dependOn(&dash.step);
     check_step.dependOn(&images_demo.step);
+    check_step.dependOn(&animation.step);
+    check_step.dependOn(&animation_tests.step);
     check_step.dependOn(&bench_text_exe.step);
 
     // External-consumer smoke test: builds the minimal out-of-tree package

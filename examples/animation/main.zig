@@ -1,0 +1,591 @@
+//! ZUI animation demo — a transliteration of GPUI's
+//! `crates/gpui/examples/animation.rs` into Zig.
+//!
+//! What it shows: two analytic springs (a position ball and a phase bar)
+//! retargeted by clicking the card — rapid clicks redirect momentum because
+//! the stepper preserves velocity — plus a draggable damping slider that
+//! retunes the spring live, and a 2s repeating eased spinner.
+//!
+//! Deliberate deviations from the GPUI original:
+//!  - ZUI's scene has no transforms (see docs/RENDER_CONTRACT.md §5E), so
+//!    `Transformation::rotate` cannot be expressed. The spinner drives the
+//!    SAME `bounce(ease_in_out)` 2s clock into opacity instead of rotation.
+//!    When scene transforms land, wire the clock back to rotation.
+//!  - Spring/easing math lives here, not in the framework: ZUI has no
+//!    `spring.rs` equivalent yet. The integrator below is a line-for-line
+//!    transliteration of GPUI's analytic propagator, so behavior matches.
+//!  - `with_spring` element modifiers do not exist; the entity steps its
+//!    springs in `render` from the window clock and calls
+//!    `win.requestAnimation()` while anything is unsettled.
+//!
+//! Run it live:   zig build run-animation
+//! Headless test: ZUI_SELFTEST=1 zig build run-animation
+//! Snapshot:      ZUI_SNAPSHOT=/tmp/animation.ppm zig build run-animation
+
+const std = @import("std");
+const zui = @import("zui");
+
+const App = zui.App;
+const Context = zui.Context;
+const Window = zui.Window;
+const Entity = zui.Entity;
+const Element = zui.Element;
+
+// ---------------------------------------------------------------------------
+// Spring physics — transliterated from GPUI `crates/gpui/src/spring.rs`.
+// ---------------------------------------------------------------------------
+
+/// Damped harmonic oscillator parameters (GPUI `SpringConfig`).
+/// stiffness k, damping c, mass m; all finite, k/m positive, c >= 0.
+pub const SpringConfig = struct {
+    stiffness: f32,
+    damping: f32,
+    mass: f32,
+
+    pub fn init(stiffness: f32, damping: f32, mass: f32) SpringConfig {
+        std.debug.assert(std.math.isFinite(stiffness) and stiffness > 0);
+        std.debug.assert(std.math.isFinite(damping) and damping >= 0);
+        std.debug.assert(std.math.isFinite(mass) and mass > 0);
+        return .{ .stiffness = stiffness, .damping = damping, .mass = mass };
+    }
+
+    /// Natural angular frequency and damping ratio (ω₀, ζ).
+    pub fn canonical(self: SpringConfig) struct { omega: f32, zeta: f32 } {
+        return .{
+            .omega = @sqrt(self.stiffness / self.mass),
+            .zeta = self.damping / (2 * @sqrt(self.stiffness * self.mass)),
+        };
+    }
+
+    /// Analytic step toward a fixed target over `dt` seconds. Frame-rate
+    /// independent and velocity-preserving, so retargeting mid-flight
+    /// redirects momentum instead of restarting (the demo's rapid clicks).
+    pub fn step(self: SpringConfig, state: SpringState, target: f32, dt: f32) SpringState {
+        const p = self.propagator(dt);
+        const displacement = state.position - target;
+        return .{
+            .position = target + p[0][0] * displacement + p[0][1] * state.velocity,
+            .velocity = p[1][0] * displacement + p[1][1] * state.velocity,
+        };
+    }
+
+    /// Exact state-transition matrix for a constant target.
+    pub fn propagator(self: SpringConfig, dt: f32) [2][2]f32 {
+        const c = self.canonical();
+        const w0 = c.omega;
+        const zeta = c.zeta;
+        const tolerance: f32 = 1e-4;
+        if (zeta < 1 - tolerance) {
+            const decay = zeta * w0;
+            const wd = w0 * @sqrt(1 - zeta * zeta);
+            const e = @exp(-decay * dt);
+            const s = @sin(wd * dt);
+            const co = @cos(wd * dt);
+            const s_over_w = s / wd;
+            return .{
+                .{ e * (co + decay * s_over_w), e * s_over_w },
+                .{ -e * w0 * w0 * s_over_w, e * (co - decay * s_over_w) },
+            };
+        } else if (zeta > 1 + tolerance) {
+            const root = @sqrt(zeta * zeta - 1);
+            const root_sum = zeta + root;
+            const slow = -w0 / root_sum;
+            const fast = -w0 * root_sum;
+            const denom = slow - fast;
+            const slow_e = @exp(slow * dt);
+            const fast_e = @exp(fast * dt);
+            return .{
+                .{ (-fast * slow_e + slow * fast_e) / denom, (slow_e - fast_e) / denom },
+                .{ slow * fast * (fast_e - slow_e) / denom, (slow * slow_e - fast * fast_e) / denom },
+            };
+        } else {
+            const e = @exp(-w0 * dt);
+            return .{
+                .{ e * (1 + w0 * dt), e * dt },
+                .{ -e * w0 * w0 * dt, e * (1 - w0 * dt) },
+            };
+        }
+    }
+
+    /// Settled when displacement is within epsilon and velocity within
+    /// epsilon * ω₀ (same scale argument as GPUI).
+    pub fn isSettled(self: SpringConfig, state: SpringState, target: f32, epsilon: f32) bool {
+        const w0 = self.canonical().omega;
+        return std.math.isFinite(epsilon) and epsilon >= 0 and
+            @abs(state.position - target) <= epsilon and
+            @abs(state.velocity) <= epsilon * w0;
+    }
+};
+
+/// Instantaneous spring position/velocity (GPUI `SpringState`).
+pub const SpringState = struct {
+    position: f32 = 0,
+    velocity: f32 = 0,
+};
+
+/// Linear interpolation over an arbitrary phase range (GPUI
+/// `AnimationPhase::interpolate_between` / `_clamped`).
+pub fn interpolateBetween(from: f32, to: f32, start: f32, end: f32, phase: f32) f32 {
+    const t = if (start == end)
+        (if (phase < start) @as(f32, 0) else @as(f32, 1))
+    else
+        (phase - start) / (end - start);
+    return from + (to - from) * t;
+}
+
+pub fn interpolateBetweenClamped(from: f32, to: f32, start: f32, end: f32, phase: f32) f32 {
+    const t = if (start == end)
+        (if (phase < start) @as(f32, 0) else @as(f32, 1))
+    else
+        @min(1, @max(0, (phase - start) / (end - start)));
+    return from + (to - from) * t;
+}
+
+pub fn lerpRgba(from: zui.Color, to: zui.Color, t: f32) zui.Color {
+    return .{
+        .r = from.r + (to.r - from.r) * t,
+        .g = from.g + (to.g - from.g) * t,
+        .b = from.b + (to.b - from.b) * t,
+        .a = from.a + (to.a - from.a) * t,
+    };
+}
+
+/// Quadratic ease-in-out (GPUI `ease_in_out`).
+pub fn easeInOut(delta: f32) f32 {
+    if (delta < 0.5) return 2 * delta * delta;
+    const x = -2 * delta + 2;
+    return 1 - x * x / 2;
+}
+
+/// Forward-then-reverse wrapper (GPUI `bounce(easing)` with the easing
+/// baked in — Zig has no closure capture, so this names the composition
+/// `bounce(ease_in_out)` directly).
+pub fn bounceEaseInOut(delta: f32) f32 {
+    if (delta < 0.5) return easeInOut(delta * 2) else return easeInOut((1 - delta) * 2);
+}
+
+// ---------------------------------------------------------------------------
+// Demo constants — mirror the GPUI example's layout numbers.
+// ---------------------------------------------------------------------------
+
+const MIN_DAMPING: f32 = 2.0;
+const MAX_DAMPING: f32 = 32.0;
+const SLIDER_WIDTH: f32 = 224.0;
+const BALL_TRAVEL: f32 = 98.0; // px per phase, like the GPUI example
+const BALL_SIZE: f32 = 24.0;
+const SPIN_PERIOD_MS: i64 = 2000;
+
+const ORANGE = zui.hex(0xf97316ff);
+const GREEN = zui.hex(0x22c55eff);
+const PURPLE = zui.hex(0xa855f7ff);
+const BLUE = zui.hex(0x3b82f6ff);
+const BLUE_DARK = zui.hex(0x2563ebff);
+
+const ARROW_CIRCLE_SVG: []const u8 =
+    \\<svg width="32" height="32" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    \\<path d="M3 8C3 6.67392 3.52678 5.40215 4.46446 4.46447C5.40214 3.52679 6.67391 3.00001 7.99999 3.00001C9.39779 3.00527 10.7394 3.55069 11.7444 4.52223L13 5.77778" stroke="black" stroke-linecap="round" stroke-linejoin="round"/>
+    \\<path d="M13 3.00001V5.77778H10.2222" stroke="black" stroke-linecap="round" stroke-linejoin="round"/>
+    \\<path d="M13 8C13 9.32608 12.4732 10.5978 11.5355 11.5355C10.5978 12.4732 9.32607 13 7.99999 13C6.60219 12.9947 5.26054 12.4493 4.25555 11.4778L3 10.2222" stroke="black" stroke-linecap="round" stroke-linejoin="round"/>
+    \\<path d="M5.77777 10.2222H3V13" stroke="black" stroke-linecap="round" stroke-linejoin="round"/>
+    \\</svg>
+;
+
+// ---------------------------------------------------------------------------
+// Demo entity — mirrors GPUI's `AnimationExample` struct fields.
+// ---------------------------------------------------------------------------
+
+const AnimationExample = struct {
+    pub const Options = struct {};
+
+    spring_phase: u8 = 0,
+    spring_damping: f32 = 14.0,
+    damping_drag: ?struct { start_x: f32, start_damping: f32 } = null,
+
+    // A newly mounted spring starts AT its target (GPUI behavior); only
+    // retargets move it, preserving velocity.
+    pos_spring: SpringState = .{},
+    phase_spring: SpringState = .{},
+    last_ms: ?i64 = null,
+    spin_epoch_ms: ?i64 = null,
+
+    label_buf: [96]u8 = undefined,
+    label_len: usize = 0,
+
+    pub fn init(_: *Context(@This()), _: Options) @This() {
+        return .{};
+    }
+
+    fn springConfig(self: *const @This()) SpringConfig {
+        return SpringConfig.init(170.0, self.spring_damping, 1.0);
+    }
+
+    fn posTarget(self: *const @This()) f32 {
+        return BALL_TRAVEL * @as(f32, @floatFromInt(self.spring_phase));
+    }
+
+    fn phaseTarget(self: *const @This()) f32 {
+        return @floatFromInt(self.spring_phase);
+    }
+
+    /// Step both springs from the window clock. Returns true while any
+    /// spring is still moving (caller keeps frames coming).
+    fn stepSprings(self: *@This(), now_ms: i64) bool {
+        const last = self.last_ms orelse now_ms;
+        // Clamp huge gaps (suspend/resume) so one step never explodes.
+        const dt: f32 = @min(0.1, @max(0, @as(f32, @floatFromInt(now_ms - last)) / 1000));
+        self.last_ms = now_ms;
+        const config = self.springConfig();
+        self.pos_spring = config.step(self.pos_spring, self.posTarget(), dt);
+        self.phase_spring = config.step(self.phase_spring, self.phaseTarget(), dt);
+        return !config.isSettled(self.pos_spring, self.posTarget(), 0.25) or
+            !config.isSettled(self.phase_spring, self.phaseTarget(), 0.001);
+    }
+
+    // -- interactions (same listener fires for mouse and keyboard) --------
+
+    fn advancePhase(self: *@This(), cx: *Context(@This())) void {
+        // Retarget only: velocity is preserved, so rapid clicks redirect
+        // momentum instead of restarting the motion.
+        self.spring_phase = (self.spring_phase + 1) % 3;
+        cx.notify();
+    }
+
+    fn cardClicked(self: *@This(), window: *Window, cx: *Context(@This())) void {
+        _ = window;
+        self.advancePhase(cx);
+    }
+
+    fn sliderDown(self: *@This(), window: *Window, cx: *Context(@This())) void {
+        self.damping_drag = .{ .start_x = window.pointer_position.x, .start_damping = self.spring_damping };
+        cx.notify();
+    }
+
+    fn sliderMove(self: *@This(), window: *Window, cx: *Context(@This())) void {
+        const drag = self.damping_drag orelse return;
+        const delta = (window.pointer_position.x - drag.start_x) / SLIDER_WIDTH;
+        self.spring_damping = @min(MAX_DAMPING, @max(MIN_DAMPING, drag.start_damping + delta * (MAX_DAMPING - MIN_DAMPING)));
+        cx.notify();
+    }
+
+    fn sliderUp(self: *@This(), window: *Window, cx: *Context(@This())) void {
+        _ = window;
+        self.damping_drag = null;
+        cx.notify();
+    }
+
+    fn adjustDamping(self: *@This(), delta: f32, cx: *Context(@This())) void {
+        self.spring_damping = @min(MAX_DAMPING, @max(MIN_DAMPING, self.spring_damping + delta));
+        cx.notify();
+    }
+
+    pub fn handleEvent(self: *@This(), event: zui.platform.Event, cx: *Context(@This())) bool {
+        if (event != .key or !event.key.pressed) return false;
+        if (event.key.modifiers.ctrl or event.key.modifiers.alt or event.key.modifiers.super) return false;
+        switch (event.key.key) {
+            .left => {
+                self.adjustDamping(-1, cx);
+                return true;
+            },
+            .right => {
+                self.adjustDamping(1, cx);
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    // -- render ------------------------------------------------------------
+
+    pub fn render(self: *@This(), window: *Window, cx: *Context(@This())) Element {
+        const now_ms = window.timeMs();
+        const moving = self.stepSprings(now_ms);
+        // The spinner repeats forever, so frames keep coming even after the
+        // springs settle — same as GPUI's `.repeat()` animation.
+        window.requestAnimation();
+
+        const config = self.springConfig();
+        const damping_ratio = config.canonical().zeta;
+        const damping_fraction = (self.spring_damping - MIN_DAMPING) / (MAX_DAMPING - MIN_DAMPING);
+
+        self.label_len = blk: {
+            const text = std.fmt.bufPrint(&self.label_buf, "Drag damping: {d:.1} (ζ {d:.2})", .{ self.spring_damping, damping_ratio }) catch {
+                @memcpy(self.label_buf[0.."damping".len], "damping");
+                break :blk "damping".len;
+            };
+            break :blk text.len;
+        };
+
+        const ball_x = self.pos_spring.position;
+        const phase = self.phase_spring.position;
+        const bar_w, const bar_color = if (phase <= 1.0)
+            .{
+                interpolateBetween(48, 224, 0, 1, phase),
+                lerpRgba(ORANGE, GREEN, interpolateBetweenClamped(0, 1, 0, 1, phase)),
+            }
+        else
+            .{
+                interpolateBetween(224, 96, 1, 2, phase),
+                lerpRgba(GREEN, PURPLE, interpolateBetweenClamped(0, 1, 1, 2, phase)),
+            };
+
+        // 2s repeating clock through bounce(ease_in_out). GPUI rotates the
+        // arrow by percentage(delta); ZUI has no scene transforms, so the
+        // same eased clock drives opacity instead (documented above).
+        const epoch = self.spin_epoch_ms orelse now_ms;
+        self.spin_epoch_ms = epoch;
+        const spin_t: f32 = @as(f32, @floatFromInt(@mod(now_ms - epoch, SPIN_PERIOD_MS))) / @as(f32, SPIN_PERIOD_MS);
+        const spin_eased = bounceEaseInOut(spin_t);
+
+        var phase_text_buf: [32]u8 = undefined;
+        const phase_text = std.fmt.bufPrint(&phase_text_buf, "Target phase {d}: click rapidly to redirect momentum", .{self.spring_phase}) catch "Target phase";
+
+        const card = zui.div().flex_col().gap(8).p(8).w(240)
+            .rounded(8).bg(zui.Color.black.withAlpha(0.06)).cursor_pointer()
+            .keyed(0xA11CE0).withFocus(cx.focusHandle())
+            .semantic(.{ .role = .button, .name = "Advance spring phase", .actions = .{ .activate = true, .focus = true } })
+            .on_mouse_down(cx.listener(@This(), cardClicked))
+            .child(zui.text(phase_text, .{ .size = 13, .color = zui.Color.black }))
+            .child(zui.div().flex_col().gap(4)
+                .child(zui.text(self.label_buf[0..self.label_len], .{ .size = 12, .color = zui.Color.black }))
+                .child(zui.div().h(20).w(SLIDER_WIDTH).cursor_pointer()
+                    .keyed(0xA11CE1).withFocus(cx.focusHandle())
+                    .semantic(.{ .role = .slider, .name = "Spring damping", .value = .{ .current = self.spring_damping, .min = MIN_DAMPING, .max = MAX_DAMPING, .step = 0.1 }, .actions = .{ .focus = true, .increment = true, .decrement = true, .set_value = true } })
+                    .on_mouse_down(cx.listener(@This(), sliderDown))
+                    .on_mouse_move(cx.listener(@This(), sliderMove))
+                    .on_mouse_up(cx.listener(@This(), sliderUp))
+                    .child(zui.div().absolute().top(8).h(4).w_full().rounded_full().bg(zui.Color.black.withAlpha(0.19)))
+                    .child(zui.div().absolute().top(8).h(4).w(SLIDER_WIDTH * damping_fraction).rounded_full().bg(BLUE))
+                    .child(zui.div().absolute().top(3).left(SLIDER_WIDTH * damping_fraction - 7).size(14).rounded_full().bg(BLUE_DARK))))
+            .child(zui.div().h(32).w_full()
+                .child(zui.div().absolute().top(4).left(ball_x).size(BALL_SIZE).rounded_full().bg(BLUE)))
+            .child(zui.div().h(24).w(bar_w).rounded(4).bg(bar_color));
+
+        const spinner = zui.div().flex_row().items_center().justify_center().p(8)
+            .child(zui.svg(ARROW_CIRCLE_SVG).w(32).h(32).opacity(0.3 + 0.7 * spin_eased));
+
+        _ = moving;
+        return zui.div().flex_col().size_full().justify_between().bg(zui.Color.white)
+            .child(zui.div().flex_col().justify_center().items_center().gap(16).p(16)
+                .child(zui.text("Hello Animation", .{ .size = 20, .color = zui.Color.black }))
+                .child(card)
+                .child(spinner))
+            .child(zui.div().flex_row().h(64).w_full().p(8).justify_center().items_center()
+                .bg(zui.Color.black.withAlpha(0.05))
+                .child(zui.text("Other Panel", .{ .size = 13, .color = zui.Color.black })));
+    }
+};
+
+// ---------------------------------------------------------------------------
+// App wiring.
+// ---------------------------------------------------------------------------
+
+fn buildRoot(window: *Window, vcx: *Context(AnimationExample)) Entity(AnimationExample) {
+    const view = vcx.new(AnimationExample, .{});
+    // Inline SVG bytes must be registered with the asset service before
+    // first paint (dash does the same in its buildRoot); otherwise the
+    // painter shows the image placeholder.
+    if (window.images) |cache| {
+        _ = cache.assets.preloadBytes(ARROW_CIRCLE_SVG, 0) catch |err| {
+            std.log.err("asset preload: {s}", .{@errorName(err)});
+        };
+    }
+    return view;
+}
+
+fn onOpen(cx: *App) void {
+    const bounds = zui.Bounds.centered(null, zui.size(300, 460), cx);
+    _ = cx.openWindow(.{ .bounds = bounds, .title = "Animation" }, buildRoot) catch |err| std.log.err("open window: {s}", .{@errorName(err)});
+    cx.activate(true);
+}
+
+fn snapshotHeadless(gpa: std.mem.Allocator, path: []const u8) !void {
+    var app = try App.initHeadless(gpa);
+    defer app.deinit();
+    const win = try app.openWindow(.{
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 300, .h = 460 } },
+        .title = "Animation",
+    }, buildRoot);
+    _ = app.step();
+
+    const width: u32 = 300;
+    const height: u32 = 460;
+    const pixels = try gpa.alloc(u8, @as(usize, width) * height * 4);
+    defer gpa.free(pixels);
+    var renderer = zui.gpu.vellz.Renderer.init(gpa);
+    defer renderer.deinit();
+    try renderer.render(pixels, width, height, .rgba32, zui.Color.white, &win.scene, app.glyphPixels(), app.imagePixels());
+
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const name: [*:0]const u8 = path_buf[0..path.len :0];
+    const file = std.c.fopen(name, "wb") orelse return error.CannotOpenSnapshot;
+    defer _ = std.c.fclose(file);
+    var header: [64]u8 = undefined;
+    const header_text = try std.fmt.bufPrint(&header, "P6\n{d} {d}\n255\n", .{ width, height });
+    if (std.c.fwrite(header_text.ptr, 1, header_text.len, file) != header_text.len) return error.SnapshotWriteFailed;
+    var i: usize = 0;
+    while (i < pixels.len) : (i += 4) {
+        if (std.c.fwrite(pixels.ptr + i, 1, 3, file) != 3) return error.SnapshotWriteFailed;
+    }
+    std.debug.print("animation snapshot: {d} quads {d} glyphs -> {s}\n", .{ win.scene.slice().len, win.scene.glyphSlice().len, path });
+}
+
+pub fn main(init: std.process.Init) !void {
+    if (std.c.getenv("ZUI_SNAPSHOT")) |raw| {
+        try snapshotHeadless(init.gpa, std.mem.span(raw));
+        return;
+    }
+    if (std.c.getenv("ZUI_SELFTEST") != null) {
+        try selftestHeadless(init.gpa);
+        return;
+    }
+    var app = try App.init(init.gpa);
+    defer app.deinit();
+    app.run(onOpen);
+}
+
+// ---------------------------------------------------------------------------
+// Headless selftest — mirrors GPUI's `clicking_spring_position_changes_
+// the_target` test plus damping/slider coverage.
+// ---------------------------------------------------------------------------
+
+var selftest_view: ?Entity(AnimationExample) = null;
+
+fn selftestBuildRoot(window: *Window, vcx: *Context(AnimationExample)) Entity(AnimationExample) {
+    const view = buildRoot(window, vcx);
+    selftest_view = view;
+    return view;
+}
+
+fn selftestHeadless(gpa: std.mem.Allocator) !void {
+    const out = std.debug.print;
+    var app = try App.initHeadless(gpa);
+    defer app.deinit();
+    const win = try app.openWindow(.{
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 300, .h = 460 } },
+        .title = "Animation",
+    }, selftestBuildRoot);
+    _ = app.step();
+    const null_backend = app.getNullBackend() orelse return error.SelftestNeedsNullBackend;
+    const view = selftest_view orelse return error.SelftestNoView;
+
+    var failures: u32 = 0;
+    const check = struct {
+        fn ok(cond: bool, count: *u32, comptime fmt: []const u8, args: anytype) void {
+            if (cond) {
+                out("selftest PASS: " ++ fmt ++ "\n", args);
+            } else {
+                out("selftest FAIL: " ++ fmt ++ "\n", args);
+                count.* += 1;
+            }
+        }
+    }.ok;
+
+    // -- 0. initial state mirrors the GPUI fixture --
+    check(view.read().spring_phase == 0, &failures, "phase starts at 0", .{});
+    check(view.read().spring_damping == 14.0, &failures, "damping starts at 14", .{});
+    check(view.read().pos_spring.position == 0, &failures, "ball starts at target", .{});
+
+    // -- 1. clicking the spring card advances the phase (GPUI's test) --
+    var clicked = false;
+    for (win.ui_frame.regions[0..win.ui_frame.region_count]) |region| {
+        if (region.bounds.w == 240 and region.bounds.h > 100) {
+            _ = null_backend.pushEvent(.{ .mouse = .{ .pos = .{ .x = region.bounds.x + 10, .y = region.bounds.y + 10 }, .button = .left, .pressed = true } });
+            _ = null_backend.pushEvent(.{ .mouse = .{ .pos = .{ .x = region.bounds.x + 10, .y = region.bounds.y + 10 }, .button = .left, .pressed = false } });
+            clicked = true;
+            break;
+        }
+    }
+    _ = app.step();
+    check(clicked, &failures, "found and clicked the spring card", .{});
+    check(view.read().spring_phase == 1, &failures, "click advances phase to 1 (got {d})", .{view.read().spring_phase});
+
+    // -- 2. stepping the spring converges on the new target --
+    {
+        const entity = view.readMut();
+        var i: usize = 0;
+        while (i < 600) : (i += 1) {
+            entity.pos_spring = entity.springConfig().step(entity.pos_spring, entity.posTarget(), 1.0 / 60.0);
+            entity.phase_spring = entity.springConfig().step(entity.phase_spring, entity.phaseTarget(), 1.0 / 60.0);
+        }
+        check(@abs(entity.pos_spring.position - BALL_TRAVEL) < 1.0, &failures, "ball settles at 98px (got {d:.1})", .{entity.pos_spring.position});
+        check(entity.springConfig().isSettled(entity.pos_spring, entity.posTarget(), 0.25), &failures, "position spring reports settled", .{});
+    }
+
+    // -- 3. damping drag retunes the spring --
+    {
+        const before = view.read().spring_damping;
+        const entity = view.readMut();
+        entity.damping_drag = .{ .start_x = 100, .start_damping = before };
+        win.pointer_position = .{ .x = 100 + SLIDER_WIDTH / 2, .y = 0 };
+        var cx = Context(AnimationExample){ .store = &app.entities, .current = view, .window = win };
+        entity.sliderMove(win, &cx);
+        entity.sliderUp(win, &cx);
+        const expect = @min(MAX_DAMPING, before + 0.5 * (MAX_DAMPING - MIN_DAMPING));
+        check(@abs(view.read().spring_damping - expect) < 0.01, &failures, "half-track drag retunes damping to {d:.1} (got {d:.1})", .{ expect, view.read().spring_damping });
+        check(view.read().damping_drag == null, &failures, "drag released on mouse up", .{});
+    }
+
+    // -- 4. spinner clock advances --
+    {
+        const e0 = view.read().spin_epoch_ms;
+        _ = app.step();
+        const e1 = view.read().spin_epoch_ms;
+        check(e0 != null and e1 != null and e0.? == e1.?, &failures, "spin epoch pinned on first frame", .{});
+    }
+
+    if (failures > 0) {
+        out("selftest: {d} FAILURES\n", .{failures});
+        std.process.exit(1);
+    }
+    out("selftest: all checks passed\n", .{});
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — spring math, interpolation, easings (GPUI spring.rs parity).
+// ---------------------------------------------------------------------------
+
+test "spring canonical frequency and damping ratio" {
+    const config = SpringConfig.init(170.0, 14.0, 1.0);
+    const c = config.canonical();
+    try std.testing.expectApproxEqAbs(@sqrt(@as(f32, 170)), c.omega, 1e-4);
+    try std.testing.expectApproxEqAbs(14.0 / (2 * @sqrt(@as(f32, 170))), c.zeta, 1e-4);
+}
+
+test "spring step composes like the analytic propagator (GPUI semigroup)" {
+    const config = SpringConfig.init(100.0, 10.0, 1.0);
+    const start = SpringState{ .position = -3, .velocity = 5 };
+    const stepped = config.step(config.step(start, 7.0, 0.013), 7.0, 0.021);
+    const direct = config.step(start, 7.0, 0.034);
+    try std.testing.expectApproxEqAbs(direct.position, stepped.position, 2e-4);
+    try std.testing.expectApproxEqAbs(direct.velocity, stepped.velocity, 2e-4);
+}
+
+test "spring settles and reports it" {
+    const config = SpringConfig.init(100.0, 10.0, 1.0);
+    try std.testing.expect(!config.isSettled(.{ .position = 1, .velocity = 1 }, 1.0, 0.01));
+    try std.testing.expect(config.isSettled(.{ .position = 1.005, .velocity = 0.05 }, 1.0, 0.01));
+    var state = SpringState{ .position = 0, .velocity = 0 };
+    var i: usize = 0;
+    while (i < 600) : (i += 1) state = config.step(state, 3.0, 1.0 / 60.0);
+    try std.testing.expect(config.isSettled(state, 3.0, 0.001));
+}
+
+test "phase interpolation over arbitrary ranges" {
+    try std.testing.expectEqual(@as(f32, 15), interpolateBetween(10, 20, 1, 2, 1.5));
+    try std.testing.expectEqual(@as(f32, 10), interpolateBetweenClamped(10, 20, 2, 3, 1.5));
+    try std.testing.expectEqual(@as(f32, 25), interpolateBetween(10, 20, 2, 3, 3.5));
+}
+
+test "easings match GPUI endpoints" {
+    try std.testing.expectEqual(@as(f32, 0), easeInOut(0));
+    try std.testing.expectEqual(@as(f32, 1), easeInOut(1));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), easeInOut(0.5), 1e-6);
+    try std.testing.expectEqual(@as(f32, 0), bounceEaseInOut(0));
+    try std.testing.expectEqual(@as(f32, 0), bounceEaseInOut(1));
+    try std.testing.expectEqual(@as(f32, 1), bounceEaseInOut(0.5));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), bounceEaseInOut(0.25), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), bounceEaseInOut(0.75), 1e-6);
+}
