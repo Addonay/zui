@@ -1,0 +1,18 @@
+.{
+    .name = .daybook,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0-dev.2085+5e36170b5",
+    .fingerprint = 0x3f5e95e4d2656e97,
+    .dependencies = .{
+        .zui = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "daybook.zig",
+        "daybook_tests.zig",
+        "theme.zig",
+        "model.zig",
+        "a11y.zig",
+    },
+}

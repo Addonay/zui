@@ -43,6 +43,7 @@ fetch_reference gpui "$GPUI_REPO" "$GPUI_REV" "$ROOT/.references/gpui"
 fetch_reference sdl3 "$SDL3_REPO" "$SDL3_REV" "$ROOT/.references/sdl3"
 fetch_reference dvui "$DVUI_REPO" "$DVUI_REV" "$ROOT/.references/dvui"
 fetch_reference taffy "$TAFFY_REPO" "$TAFFY_REV" "$ROOT/.references/taffy"
+fetch_reference shadcn-zui "$SHADCN_ZUI_REPO" "$SHADCN_ZUI_REV" "$ROOT/.references/shadcn-zui"
 
 bash "$ROOT/.ports/cozmic/tools/fetch-reference.sh"
 bash "$ROOT/.ports/wgpu/tools/fetch-reference.sh"

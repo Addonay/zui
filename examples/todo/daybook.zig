@@ -481,8 +481,23 @@ fn label(value: []const u8, size: f32, color: zui.Color) Element {
 // App wiring — mirrors gpui's `application().run(|cx| cx.open_window(...))`.
 // ---------------------------------------------------------------------------
 
+fn preloadShadcnIcons(cache: *zui.images.Cache) !void {
+    inline for (.{
+        shadcn.components.icon.semantic.plus,
+        shadcn.components.icon.semantic.check,
+        shadcn.components.icon.Name.list,
+        shadcn.components.icon.Name.circle,
+        shadcn.components.icon.semantic.trash,
+        shadcn.components.icon.semantic.chevron_left,
+        shadcn.components.icon.semantic.chevron_right,
+    }) |icon| {
+        _ = try cache.assets.preloadBytes(shadcn.components.icon.bytes(icon), 0);
+    }
+}
+
 fn buildRoot(window: *Window, vcx: *Context(TodoApp)) Entity(TodoApp) {
     const view = vcx.new(TodoApp, .{});
+    if (window.images) |cache| preloadShadcnIcons(cache) catch |err| std.log.err("shadcn icon preload: {s}", .{@errorName(err)});
     vcx.bindKeys(TodoApp, &.{
         .{ .key = "enter", .action = "add" },
         .{ .key = "space", .action = "toggle-selected" },
