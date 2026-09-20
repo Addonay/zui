@@ -6,11 +6,31 @@ const limits = @import("../core/limits.zig");
 pub const accesskit = @import("accesskit.zig");
 pub const capacity = limits.MAX_A11Y_ELEMENTS;
 pub const Role = enum { group, button, checkbox, radio_group, radio, switch_control, slider, progress, text_input, label, dialog, list, listitem, menu, menuitem, menuitem_checkbox, tooltip, combobox, listbox, option, table, row, tableheader, cell };
-pub const Action = enum { activate, increment, decrement, set_value, focus };
-pub const Request = struct { action: Action, value: f64 = 0 };
-pub const Actions = packed struct { activate: bool = false, increment: bool = false, decrement: bool = false, set_value: bool = false, focus: bool = false };
+pub const Action = enum { activate, increment, decrement, set_value, set_text_selection, focus };
+pub const Request = struct {
+    action: Action,
+    value: f64 = 0,
+    /// Bounded UTF-8 value for editable text actions. The slice is borrowed
+    /// for the synchronous Tree.perform call; native bridges copy it before
+    /// queueing.
+    text: []const u8 = "",
+    selection: ?TextSelection = null,
+};
+pub const Actions = packed struct { activate: bool = false, increment: bool = false, decrement: bool = false, set_value: bool = false, set_text_selection: bool = false, focus: bool = false };
 pub const States = struct { modal: bool = false, expanded: ?bool = null, disabled: bool = false, checked: ?bool = null, selected: bool = false, focused: bool = false, read_only: bool = false, hidden: bool = false, scrollable: bool = false };
 pub const Value = struct { current: f64, min: f64 = 0, max: f64 = 1, step: f64 = 0 };
+/// UTF-8 byte offsets converted to Unicode scalar character indices by the
+/// producer. AccessKit text positions use character indices, not byte offsets.
+pub const TextSelection = struct { anchor: u32 = 0, focus: u32 = 0 };
+pub const TextRange = struct { start: u32 = 0, end: u32 = 0 };
+/// Geometry is indexed by Unicode scalar character. Positions and widths are
+/// layout-local logical pixels; ranges retain the source UTF-8 byte span for
+/// each character so editing and AT actions can round-trip safely.
+pub const TextGeometry = struct {
+    positions: []const f32 = &.{},
+    widths: []const f32 = &.{},
+    ranges: []const TextRange = &.{},
+};
 pub const Handler = struct {
     target: *anyopaque,
     call_fn: *const fn (*anyopaque, Request, *anyopaque) void,
@@ -32,7 +52,7 @@ pub const Properties = struct {
     active_descendant: u64 = 0,
     handler: ?Handler = null,
 };
-pub const Binding = struct { index: u16, properties: Properties };
+pub const Binding = struct { index: u16, properties: Properties, text_selection_slot: u8 = 0, text_geometry_slot: u8 = 0 };
 pub const Node = struct {
     key: u64,
     parent: u64,
@@ -47,6 +67,7 @@ pub const Tree = struct {
     dropped: usize = 0,
     duplicate_keys: usize = 0,
     unkeyed: usize = 0,
+    invalid_utf8: usize = 0,
     generation: u64 = 0,
 
     pub fn find(self: *const Tree, key: u64) ?*const Node {
@@ -66,13 +87,15 @@ pub const Tree = struct {
             .increment => node.properties.actions.increment,
             .decrement => node.properties.actions.decrement,
             .set_value => node.properties.actions.set_value,
+            .set_text_selection => node.properties.actions.set_text_selection,
             .focus => node.properties.actions.focus,
         };
         if (!allowed) return false;
         if (request.action == .focus) {
             const handle = node.focus orelse return false;
             if (!handle.isLive()) return false;
-            window.focused = handle;
+            if (window.focus_scope) |scope| if (scope.modal and !scope.contains(handle.id)) return false;
+            window.setFocused(handle);
         } else {
             const handler = node.properties.handler orelse return false;
             handler.call_fn(handler.target, request, window);
@@ -116,6 +139,10 @@ fn visit(frame: *element.Frame, index: u16, parent: u64, clip: Rect) void {
             break;
         }
         var props = binding.properties;
+        if (!std.unicode.utf8ValidateSlice(props.name) or !std.unicode.utf8ValidateSlice(props.text_value)) {
+            tree.invalid_utf8 += 1;
+            break;
+        }
         props.states.hidden = props.states.hidden or bounds.w <= 0 or bounds.h <= 0;
         var owner: ?element.OwnerRef = null;
         if (props.handler) |handler| owner = frame.lookupOwner(handler.target);

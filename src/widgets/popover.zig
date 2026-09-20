@@ -29,19 +29,40 @@ pub fn Panel(comptime modal: bool) type {
         pub fn init(_: *runtime.Context(Self), options: Options) Self {
             return .{ .options = options, .overlay = .{ .modal = modal, .dismiss_outside = options.dismiss_outside } };
         }
-        pub fn popupKey(self: *const Self) u64 { return platform.id.fromSrc(self.options.key, @src(), 0); }
-        pub fn open(self: *Self, win: *Window) void { self.overlay.show(win); }
-        pub fn close(self: *Self, win: *Window) void { self.overlay.close(win); }
-        fn toggle(self: *Self, win: *Window) void { if (self.overlay.open) self.close(win) else self.open(win); }
-        fn down(self: *Self, _: *Window, _: *runtime.Context(Self)) void { self.pressable.pressBegin(); }
+        pub fn popupKey(self: *const Self) u64 {
+            return platform.id.fromSrc(self.options.key, @src(), 0);
+        }
+        pub fn open(self: *Self, win: *Window) void {
+            self.overlay.show(win);
+        }
+        pub fn close(self: *Self, win: *Window) void {
+            self.overlay.close(win);
+        }
+        fn toggle(self: *Self, win: *Window) void {
+            if (self.overlay.open) self.close(win) else self.open(win);
+        }
+        fn down(self: *Self, _: *Window, _: *runtime.Context(Self)) void {
+            self.pressable.pressBegin();
+        }
         fn up(self: *Self, win: *Window, _: *runtime.Context(Self)) void {
             if (self.pressable.pressEnd(behavior.releaseInside(win))) self.toggle(win);
         }
         pub fn handleEvent(self: *Self, event: platform.Event, cx: *runtime.Context(Self)) bool {
             const win = cx.window orelse return false;
+            if (event == .window) {
+                self.pressable.cancel();
+                return false;
+            }
             if (event != .key) return false;
-            if (event.key.pressed and event.key.key == .escape and self.overlay.open) { self.close(win); return true; }
-            if (!self.overlay.open and self.pressable.keyEvent(event.key.key, event.key.pressed, event.key.repeat)) { self.open(win); return true; }
+            if (event.key.pressed and event.key.key == .escape and self.overlay.open) {
+                self.close(win);
+                return true;
+            }
+            if (!self.overlay.open) {
+                const result = self.pressable.keyEventResult(event.key.key, event.key.pressed, event.key.repeat);
+                if (result == .activated) self.open(win);
+                return result != .ignored;
+            }
             return false;
         }
         fn semanticAction(raw: *anyopaque, _: @import("../a11y/root.zig").Request, raw_win: *anyopaque) void {
@@ -51,6 +72,7 @@ pub fn Panel(comptime modal: bool) type {
         pub fn render(self: *Self, win: *Window, cx: *runtime.Context(Self)) e.Element {
             const t = self.options.tokens orelse theme.current();
             const handle = cx.focusHandle();
+            if (!win.left_button_down or !win.focused.eql(handle)) self.pressable.cancel();
             if (handle.owner_store) |store| e.element.currentFrame().trackOwner(self, store, handle.id, handle.owner_generation);
             const trigger = e.div().keyed(self.options.key).w(self.options.trigger_width).h(t.button_h).bg(t.palette.surface).rounded(t.radii.md).withFocus(handle)
                 .on_mouse_down(cx.listener(Self, down)).on_mouse_up(cx.listener(Self, up))

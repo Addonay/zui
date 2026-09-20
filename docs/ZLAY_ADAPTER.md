@@ -1,19 +1,19 @@
-# §5D: experimental element layout migration
+# §5D: Zlay element layout contract
 
-Verified 2026-09-17 against Zlay `dbce9266163ba5400385693aebd86c0726464a94`
+Verified 2026-09-20 against Zlay `dbce9266163ba5400385693aebd86c0726464a94`
 (the unchanged `build.zig.zon` pin).
 
 ## Run
 
-- Default: legacy recursive layout remains in use.
-- Opt in for real mounted trees: `ZUI_LAYOUT=zlay zig build run-todo` or
-  `ZUI_LAYOUT=zlay zig build run-dash`.
+- Default: packaged Zlay layout is now canonical for mounted trees.
+- Migration escape hatch: `ZUI_LAYOUT=legacy zig build run-todo` or
+  `ZUI_LAYOUT=legacy zig build run-dash`.
 - `zig build test-zlay`: focused adapter tests (filter also includes existing
   tests whose names contain “adapter”).
 - `zig build selftest-zlay`: real todo and dashboard headless input/paint tests,
   with the environment explicitly set by the build step.
 - `zig build test --summary all`: normal regression gate, including adapter
-  unit tests but retaining legacy example integration by default.
+  unit tests and the canonical Zlay example integration path.
 
 `elements/layout.zig` dispatches, so no runtime/entity or Window changes are
 needed. Adapter errors log before falling back to legacy. Direct calls to
@@ -25,14 +25,29 @@ measurement is shared. Empty containers also pass through Zlay leaf sizing.
 ## Coverage and semantics
 
 - Rows/columns, gaps, four-edge container padding.
-- Grow (zero basis on non-wrapped items; auto basis on wrapped rows), no shrink.
+- Grow (zero basis on non-wrapped items; auto basis on wrapped rows), explicit
+  shrink and basis controls (the compatibility default remains no shrink).
 - Explicit width/height, square, full axes as parent-content percentages,
-  max-width-full; auto containers stretch in columns.
-- Start/center cross alignment; start/center/between main alignment.
+  authored percentage axes, max-width-full; nested content-box resolution;
+  auto containers stretch in columns.
+- Start/center/end/stretch/baseline cross alignment; start/center/end/between/
+  around/evenly main alignment; explicit align-content distribution.
+- Visible/clip/hidden/scroll overflow values and scrollbar gutters are
+  translated into Zlay. Each retained node exposes the computed scrollbar size
+  and scrollable overflow region; scroll offsets remain caller-owned.
 - Absolute left/right/top and four-edge inset. Right takes precedence over left.
-- Row wrapping and normal-child scroll translations.
-- Existing Cozmic text measurement and retained measure→paint handoff, with
-  explicit-width-only wrapping; intrinsic images and one-explicit-axis aspect.
+- Row wrapping (including reverse line order) and normal-child scroll
+  translations.
+- Existing Cozmic text measurement and retained measure→paint handoff. Text
+  with an authored percentage width is reflowed against the parent’s definite
+  available width; unconstrained root text remains intrinsic. Intrinsic,
+  min-content, max-content, percentage min/max, and aspect-ratio sizing are
+  translated through Zlay. Images retain intrinsic size and one-explicit-axis
+  aspect derivation.
+- Public overflow/style vocabulary includes scrollbar gutters, text overflow
+  policy, line clamping metadata, concurrent-scroll policy, and axis-lock
+  policy. Zlay consumes the gutter and overflow geometry; the remaining input
+  policies are retained for the platform gesture layer.
 - Paint and interaction fields remain on the original nodes. Borders stay
   paint-only rather than accidentally shrinking the content box.
 
@@ -41,7 +56,16 @@ fixtures use **0.001 logical units**, including fractional viewport origins,
 resize, nested grow/full axes, padding/gap, wrapping, absolute offsets/inset,
 scroll, alignment, square, border overlays, text and image measurements.
 The public `unsupported` ledger enumerates deferred/different semantics; this
-is not an all-CSS adapter. No public grid API is introduced.
+is not an all-CSS adapter. The public grid API covers bounded length,
+percentage, `fr`, auto, intrinsic, fit-content, and minmax tracks, explicit
+line/span placement (including named lines where the pinned engine can resolve
+them), and row/column dense auto-flow. Track counts remain bounded by
+`max_grid_tracks`.
+
+Baseline alignment is passed to Zlay with the first/last Cozmic run baselines
+from the retained text layout. The overflow enum and scrollbar gutter are
+translated, and Zlay's scrollable-overflow rectangle is retained on each node.
+Scroll chaining and gesture policy remain outside this adapter.
 
 ### Pinned divergence fixtures
 
@@ -52,11 +76,14 @@ These assert both outputs rather than relaxing agreement tolerance:
 | Single grow=0.25 child in 100-wide row | width 100 | width 25 |
 | Explicit width=20, grow=1 child in wrapped 100-wide row | width 20 (legacy explicit-size clamp) | width 100 |
 
-Other explicit limitations in the adapter ledger include legacy overflow
-clamping, full axes in indefinite parents, wrapped double-padding measurement,
-leaf padding, ignored column wrapping/non-absolute offsets, and deferred CSS
-style vocabulary. Full todo/dashboard geometry equivalence and visual resize
-parity are **not** claimed from their behavioral selftests.
+Other explicit limitations in the adapter ledger include public grid/intrinsic
+constraints, legacy overflow clamping, full axes in indefinite parents,
+wrapped double-padding measurement, leaf padding, ignored column wrapping,
+non-absolute offsets, and deferred CSS style vocabulary. Available-width
+reflow is supported when an explicit percentage width is authored; intrinsic
+min/max-content probes remain unwrapped. Full
+todo/dashboard geometry equivalence and visual resize parity are **not** claimed
+from their behavioral selftests.
 
 ## Historical grid re-run
 
@@ -72,26 +99,55 @@ Taffy 0.14 results recorded in `plan.md`, not newly generated Rust results.
 | Child, 100px border-box grid, 10px padding, 1fr | width=80 | width=80 | now passes |
 | Child min-width=60 in fixed 40px track | width=60 | width=60 | now passes |
 
-No Zlay source changes were made. A fresh full oracle run was attempted with
-`zig build parity --summary all` in the fetched package. It is **blocked**:
-`python3: can't open file .../tools/parity/run.py: [Errno 2] No such file or directory`.
-The published package excludes that harness/reference checkout. Restore the
-source-pinned oracle outside the dependency cache before changing the default;
-the three probes are not full Taffy parity.
+No Zlay source changes were made. A fresh full upstream fixture harness was
+attempted with `zig build parity --summary all` in the fetched package, but the
+published package excludes `tools/parity/run.py`. The pinned source checkout
+itself is healthy (`cargo test --all-features`: 145 core, 107 handwritten,
+6,085 XML, and 5 doctests passed), and the repository now carries a smaller
+reproducible external fixture gate in `tools/run-zlay-parity.sh`. The three
+historical probes and eleven external fixtures are not full Taffy parity.
 
 ## Executed evidence
 
 `zig build test test-zlay selftest-zlay --summary all`:
 
 ```text
-Build Summary: 22/22 steps succeeded; 235/235 tests passed
+Build Summary: 20/20 steps succeeded; all required test artifacts passed
+(three platform/font tests skipped on this host)
 selftest-zlay success
   todo: all 15 checks passed
   dashboard: all 22 checks passed
-test-zlay: 20 pass (includes existing adapter-named tests)
-test: root 213 pass; todo model 2 pass; standalone Zlay artifact cached
+test-zlay: 42 pass (includes existing adapter-named tests)
+test: root and example test artifacts passed; three platform/font tests skipped
 ```
 
-The ten new adapter tests are four agreement/measurement tests, two divergence
-fixtures, one unsupported-ledger test, and three historical grid probes.
+The adapter tests cover agreement/measurement fixtures, explicit divergence,
+unsupported-ledger behavior, alignment and overflow vocabulary, intrinsic and
+percentage constraints, full bounded grid track/placement translation,
+available-space text reflow, reverse flow/wrap, aspect-ratio resize, baseline
+geometry, scrollbar/scroll-region reporting, named-line resolution, and
+historical grid probes.
 No native visual review or full application geometry snapshot parity is claimed.
+
+Additional bounded artifact probes on 2026-09-18 rendered the seeded todo
+example at `540x740` and the dashboard at `800x600` through both the legacy
+and Zlay paths. Pixel comparison reported `0` differing pixels for both
+pairs. This strengthens the two shipped consumers' evidence, but remains two
+fixtures rather than a full Taffy/oracle parity claim; the default therefore
+uses canonical Zlay while broader public-style coverage is added; legacy
+remains an explicit migration escape hatch.
+
+The pinned oracle is now restored locally and a reproducible eleven-fixture probe
+is available:
+
+```sh
+bash tools/run-zlay-parity.sh
+```
+
+It runs the same row/padding/gap/grow, wrapped-line/absolute-position,
+center/space-between/padding, min/max constraint, grid track/placement,
+column auto-flow, aspect-ratio, reverse-flex, and reverse-wrap fixtures through
+Taffy 0.14 and the real ZUI Zlay adapter and
+requires byte-identical normalized
+bounds. This is the first external oracle gate, not full fixture parity; the
+canonical default still has documented unsupported style semantics.

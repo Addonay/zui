@@ -17,11 +17,10 @@
 //! bookkeeping would cost more than it saves at 1024 entries. Counters
 //! expose hits/misses/evictions/drops for tuning.
 //!
-//! The pool is single-channel coverage (mask) only. Color glyph bitmaps
-//! (COLR/CPAL, CBDT/sbx) cannot be represented here: `putBitmap` rejects
-//! them with `error.ColorUnsupported` and callers treat that as a miss
-//! (paint nothing) instead of copying RGBA bytes as if they were coverage.
-//! Mask rasterization is the production path.
+//! Coverage masks and RGBA color glyphs use separate bounded pools. The
+//! coverage API still rejects color input with `error.ColorUnsupported`, so
+//! callers cannot accidentally reinterpret RGBA bytes as a mask; color input
+//! enters only through `putColorBitmap`.
 //!
 //! Rows are copied top-down; `stride` is the source row pitch in bytes and
 //! must be at least `width`. All methods are heap-free.
@@ -83,9 +82,10 @@ pub const AtlasEntry = struct {
     /// Raster placement of the bitmap's top edge relative to the baseline,
     /// positive up (SwashCache `placement.top` / FreeType `bitmap_top`).
     bearing_y: i32,
+    content: BitmapContent = .mask,
 };
 
-/// Supported bitmap encodings for the single-channel pool.
+/// Supported bitmap encodings for the coverage API.
 pub const BitmapContent = enum {
     /// 8-bit coverage, one byte per pixel (`stride` bytes per row).
     mask,
@@ -95,10 +95,22 @@ pub const BitmapContent = enum {
 };
 
 pub const Atlas = struct {
+    const index_empty: u16 = std.math.maxInt(u16);
+    const index_capacity: usize = limits.MAX_ATLAS_GLYPHS * 2;
+    const index_mask: usize = index_capacity - 1;
+
     entries: [limits.MAX_ATLAS_GLYPHS]AtlasEntry = undefined,
+    /// Open-addressed key index for the fixed entry array. The old linear
+    /// scan made every warm glyph lookup O(entry_count); this keeps the same
+    /// allocation-free bounded storage while making the common lookup O(1).
+    index_slots: [index_capacity]u16 = @splat(index_empty),
     entry_count: usize = 0,
-    pixels: [limits.MAX_ATLAS_PIXELS]u8 = undefined,
+    /// Mask bytes occupy the first pool; color RGBA bytes use the second
+    /// half and are addressed by absolute offsets so the presenter still
+    /// receives one contiguous glyph byte slice.
+    pixels: [limits.MAX_ATLAS_PIXELS * 2]u8 = undefined,
     pixels_used: usize = 0,
+    color_pixels_used: usize = 0,
     hits: u64 = 0,
     misses: u64 = 0,
     evictions: u64 = 0,
@@ -112,23 +124,82 @@ pub const Atlas = struct {
 
     pub fn clear(self: *Atlas) void {
         self.entry_count = 0;
+        self.index_slots = @splat(index_empty);
         self.pixels_used = 0;
+        self.color_pixels_used = 0;
         self.pending_eviction = false;
     }
 
     pub fn get(self: *Atlas, key: AtlasKey) ?*const AtlasEntry {
-        for (self.entries[0..self.entry_count]) |*e| {
-            if (AtlasKey.eql(e.key, key)) {
+        if (self.entry_count == 0) {
+            self.misses += 1;
+            return null;
+        }
+        var slot = hashKey(key) & index_mask;
+        var probes: usize = 0;
+        while (probes < index_capacity) : ({
+            slot = (slot + 1) & index_mask;
+            probes += 1;
+        }) {
+            const raw = self.index_slots[slot];
+            if (raw == index_empty) break;
+            const entry_index: usize = @intCast(raw);
+            if (entry_index < self.entry_count and AtlasKey.eql(self.entries[entry_index].key, key)) {
                 self.hits += 1;
-                return e;
+                return &self.entries[entry_index];
             }
         }
         self.misses += 1;
         return null;
     }
 
+    fn hashKey(key: AtlasKey) u64 {
+        var hash: u64 = 14695981039346656037;
+        inline for ([_]u64{
+            key.face_id,
+            key.glyph_id,
+            key.size_px,
+            key.raster_size_bits,
+            @backingInt(key.x_bin),
+            @backingInt(key.y_bin),
+            key.font_weight,
+            key.flags.bits,
+            if (key.synthetic_bold) 1 else 0,
+        }) |value| {
+            hash = (hash ^ value) *% 1099511628211;
+        }
+        return hash;
+    }
+
+    fn indexInsert(self: *Atlas, key: AtlasKey, entry_index: usize) void {
+        var slot = hashKey(key) & index_mask;
+        var probes: usize = 0;
+        while (probes < index_capacity) : ({
+            slot = (slot + 1) & index_mask;
+            probes += 1;
+        }) {
+            const raw = self.index_slots[slot];
+            if (raw == index_empty) {
+                self.index_slots[slot] = @intCast(entry_index);
+                return;
+            }
+            const existing: usize = @intCast(raw);
+            if (existing < self.entry_count and AtlasKey.eql(self.entries[existing].key, key)) return;
+        }
+        // The index is twice the entry capacity, so this is unreachable under
+        // the bounded table contract. A future capacity change should still
+        // retain the existing storage rather than corrupting it.
+    }
+
     pub fn coverage(self: *const Atlas, entry: *const AtlasEntry) []const u8 {
+        std.debug.assert(entry.content == .mask);
         const bytes = @as(usize, entry.width) * entry.height;
+        return self.pixels[entry.offset..][0..bytes];
+    }
+
+    pub fn colorPixels(self: *const Atlas, entry: *const AtlasEntry) []const u8 {
+        std.debug.assert(entry.content == .color);
+        const bytes = @as(usize, entry.width) * entry.height * 4;
         return self.pixels[entry.offset..][0..bytes];
     }
 
@@ -150,8 +221,7 @@ pub const Atlas = struct {
     /// Callers must set `key.synthetic_bold` when passing `embolden = true`,
     /// so dilated and undilated entries stay distinct.
     /// `content == .color` returns `error.ColorUnsupported` without writing
-    /// pool bytes: the caller must treat it as a cache miss (paint nothing)
-    /// rather than emit garbage from RGBA bytes.
+    /// pool bytes; callers should use `putColorBitmap` for RGBA data.
     pub fn putBitmap(
         self: *Atlas,
         key: AtlasKey,
@@ -191,9 +261,60 @@ pub const Atlas = struct {
             .height = height,
             .bearing_x = bearing_x,
             .bearing_y = bearing_y,
+            .content = .mask,
         };
         self.entry_count += 1;
+        self.indexInsert(key, self.entry_count - 1);
         return slot;
+    }
+
+    /// Insert straight RGBA color glyph bytes into the separate color pool.
+    /// The absolute offset keeps mask and color entries in one presenter slice
+    /// without allowing either representation to alias the other.
+    pub fn putColorBitmap(
+        self: *Atlas,
+        key: AtlasKey,
+        width: u32,
+        height: u32,
+        data: [*]const u8,
+        bearing_x: i32,
+        bearing_y: i32,
+    ) !*const AtlasEntry {
+        const bytes = @as(usize, width) * height * 4;
+        if (bytes > limits.MAX_ATLAS_PIXELS) return error.GlyphTooLarge;
+        if (self.entry_count >= limits.MAX_ATLAS_GLYPHS or self.color_pixels_used + bytes > limits.MAX_ATLAS_PIXELS) {
+            if (self.entry_count == 0) {
+                self.clear();
+                self.evictions += 1;
+            } else {
+                self.pending_eviction = true;
+                self.overflow_drops += 1;
+                return error.AtlasFull;
+            }
+        }
+        const offset = @as(usize, limits.MAX_ATLAS_PIXELS) + self.color_pixels_used;
+        if (bytes > 0) @memcpy(self.pixels[offset..][0..bytes], data[0..bytes]);
+        self.color_pixels_used += bytes;
+        const slot = &self.entries[self.entry_count];
+        slot.* = .{
+            .key = key,
+            .offset = @intCast(offset),
+            .width = width,
+            .height = height,
+            .bearing_x = bearing_x,
+            .bearing_y = bearing_y,
+            .content = .color,
+        };
+        self.entry_count += 1;
+        self.indexInsert(key, self.entry_count - 1);
+        return slot;
+    }
+
+    pub fn storageUsed(self: *const Atlas) usize {
+        return if (self.color_pixels_used > 0)
+            @as(usize, limits.MAX_ATLAS_PIXELS) + self.color_pixels_used
+        else
+            self.pixels_used;
     }
 
     /// Frame boundary. Call once per window paint before any put: applies a
@@ -201,9 +322,7 @@ pub const Atlas = struct {
     /// Idempotent and cheap.
     pub fn beginFrame(self: *Atlas) void {
         if (self.pending_eviction) {
-            self.entry_count = 0;
-            self.pixels_used = 0;
-            self.pending_eviction = false;
+            self.clear();
             self.evictions += 1;
         }
     }
@@ -255,6 +374,18 @@ test "atlas putBitmap/get/coverage round-trip" {
     try t.expectEqual(@as(u64, 1), atlas.hits);
     try t.expectEqual(@as(u64, 1), atlas.misses);
     try t.expectEqual(@as(u64, 0), atlas.evictions);
+}
+
+test "atlas keeps color RGBA bytes in a separate pool" {
+    const t = std.testing;
+    var atlas = Atlas{};
+    const rgba = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 128 };
+    const key = AtlasKey{ .face_id = 2, .glyph_id = 77, .size_px = 24 };
+    const entry = try atlas.putColorBitmap(key, 2, 1, &rgba, 3, 11);
+    try t.expectEqual(BitmapContent.color, entry.content);
+    try t.expectEqual(@as(usize, limits.MAX_ATLAS_PIXELS), @as(usize, entry.offset));
+    try t.expectEqualSlices(u8, &rgba, atlas.colorPixels(entry));
+    try t.expectEqual(@as(usize, limits.MAX_ATLAS_PIXELS) + rgba.len, atlas.storageUsed());
 }
 
 test "atlas defers eviction past emitted entries" {

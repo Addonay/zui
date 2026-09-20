@@ -44,10 +44,24 @@ pub fn measure(frame: *element.Frame, index: u16) core.Size {
                     natural.w = size.w;
                     natural.h = size.h;
                     node.cozmic_measured = true;
+                    node.baseline = null;
+                    node.last_baseline = null;
+                    if (node.cozmic_layout) |cached| {
+                        var runs = cached.layout.runs();
+                        if (runs.next()) |first| {
+                            node.baseline = first.line_y;
+                            node.last_baseline = first.line_y;
+                            var last = first.line_y;
+                            while (runs.next()) |run| last = run.line_y;
+                            node.last_baseline = last;
+                        }
+                    }
                 } else |_| {
                     // Invalid metrics or OOM: the node keeps its zero natural
                     // size and paint counts the mismatch instead of drawing
                     // stale ink.
+                    node.baseline = null;
+                    node.last_baseline = null;
                 }
             }
         },
@@ -487,7 +501,9 @@ test "wrapped row packs children into lines" {
         .child(element.div().w(40).h(10))
         .child(element.div().w(40).h(10))
         .child(element.div().w(40).h(10));
-    layout(&frame, root, .{ .w = 100, .h = 200 });
+    // This is the legacy placer regression; canonical Zlay wrapping is
+    // covered by zlay_adapter_test and the external Taffy oracle.
+    layoutLegacy(&frame, root, .{ .w = 100, .h = 200 });
     const first = frame.nodes[root.index].first_child.?;
     const second = frame.nodes[first].next_sibling.?;
     const third = frame.nodes[second].next_sibling.?;

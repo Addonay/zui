@@ -10,6 +10,7 @@
 const std = @import("std");
 
 pub const HWND = ?*anyopaque;
+pub const HIMC = ?*anyopaque;
 pub const HINSTANCE = ?*anyopaque;
 pub const HICON = ?*anyopaque;
 pub const HCURSOR = ?*anyopaque;
@@ -22,6 +23,9 @@ pub const ATOM = u16;
 pub const BOOL = c_int;
 pub const UINT = c_uint;
 pub const DWORD = u32;
+pub const WAIT_TIMEOUT: DWORD = 0x00000102;
+pub const QS_ALLINPUT: DWORD = 0x04FF;
+pub const MWMO_INPUTAVAILABLE: DWORD = 0x0004;
 
 pub const WNDCLASSEXW = extern struct {
     cbSize: UINT,
@@ -59,6 +63,9 @@ pub const WM_CLOSE: UINT = 0x0010;
 pub const WM_KEYDOWN: UINT = 0x0100;
 pub const WM_KEYUP: UINT = 0x0101;
 pub const WM_CHAR: UINT = 0x0102;
+pub const WM_IME_STARTCOMPOSITION: UINT = 0x010D;
+pub const WM_IME_ENDCOMPOSITION: UINT = 0x010E;
+pub const WM_IME_COMPOSITION: UINT = 0x010F;
 pub const WM_SYSKEYDOWN: UINT = 0x0104;
 pub const WM_SYSKEYUP: UINT = 0x0105;
 pub const WM_MOUSEMOVE: UINT = 0x0200;
@@ -75,8 +82,17 @@ pub const WM_MOUSEHWHEEL: UINT = 0x020E;
 pub const WM_SIZE: UINT = 0x0005;
 pub const WM_SETFOCUS: UINT = 0x0007;
 pub const WM_KILLFOCUS: UINT = 0x0008;
+pub const WM_ACTIVATE: UINT = 0x0006;
+pub const WM_SETTINGCHANGE: UINT = 0x001A;
+pub const WM_INPUTLANGCHANGE: UINT = 0x0051;
+pub const WM_DISPLAYCHANGE: UINT = 0x007E;
 pub const WM_PAINT: UINT = 0x000F;
 pub const WM_SETCURSOR: UINT = 0x0020;
+pub const WM_APP: UINT = 0x8000;
+pub const WM_ZUI_WAKE: UINT = WM_APP + 1;
+pub const WA_INACTIVE: UINT = 0;
+pub const WA_ACTIVE: UINT = 1;
+pub const WA_CLICKACTIVE: UINT = 2;
 
 // Class styles, window styles, show commands (stable WinUser ABI).
 pub const CS_VREDRAW: UINT = 0x0001;
@@ -108,6 +124,13 @@ pub const IDC_HAND: u16 = 32649;
 pub const CF_UNICODETEXT: UINT = 13;
 pub const GMEM_MOVEABLE: UINT = 0x0002;
 
+// IMM32 composition flags and candidate-window ABI.
+pub const GCS_COMPSTR: DWORD = 0x0008;
+pub const GCS_CURSORPOS: DWORD = 0x0080;
+pub const GCS_RESULTSTR: DWORD = 0x0800;
+pub const CFS_CANDIDATEPOS: DWORD = 0x0040;
+pub const CFS_EXCLUDE: DWORD = 0x0080;
+
 // SetWindowPos flags (stable ABI).
 pub const SWP_NOSIZE: UINT = 0x0001;
 pub const SWP_NOMOVE: UINT = 0x0002;
@@ -137,6 +160,9 @@ pub const HTBOTTOM: LRESULT = 15;
 pub const HTBOTTOMLEFT: LRESULT = 16;
 pub const HTBOTTOMRIGHT: LRESULT = 17;
 
+pub const MONITOR_DEFAULTTONEAREST: DWORD = 2;
+pub const SPI_GETWORKAREA: UINT = 48;
+
 // GDI raster op + DIB constants (stable ABI).
 pub const SRCCOPY: DWORD = 0x00CC0020;
 pub const BI_RGB: DWORD = 0;
@@ -147,6 +173,13 @@ pub const RECT = extern struct {
     top: i32,
     right: i32,
     bottom: i32,
+};
+
+pub const CANDIDATEFORM = extern struct {
+    dwIndex: DWORD,
+    dwStyle: DWORD,
+    ptCurrentPos: POINT,
+    rcArea: RECT,
 };
 
 pub const BITMAPINFOHEADER = extern struct {
@@ -222,8 +255,15 @@ pub const User32Api = struct {
     SendMessageW: *const fn (HWND, UINT, WPARAM, LPARAM) callconv(.c) LRESULT,
     IsZoomed: *const fn (HWND) callconv(.c) BOOL,
     GetWindowRect: *const fn (HWND, *RECT) callconv(.c) BOOL,
+    /// Optional on older user32 implementations; lets the pump sleep until
+    /// either a message arrives or its timer deadline expires.
+    MsgWaitForMultipleObjectsEx: ?*const fn (DWORD, ?*const ?*anyopaque, DWORD, DWORD, DWORD) callconv(.c) DWORD = null,
+    PostMessageW: ?*const fn (HWND, UINT, WPARAM, LPARAM) callconv(.c) BOOL = null,
     /// Optional (Win10+): resolved separately, may stay null.
     GetDpiForWindow: ?*const fn (HWND) callconv(.c) c_uint = null,
+    GetDpiForSystem: ?*const fn () callconv(.c) c_uint = null,
+    GetCursorPos: ?*const fn (*POINT) callconv(.c) BOOL = null,
+    ShowCursor: ?*const fn (BOOL) callconv(.c) c_int = null,
 
     pub fn load(lib: @import("../dl.zig").Library) ?User32Api {
         return .{
@@ -257,6 +297,11 @@ pub const User32Api = struct {
             .SendMessageW = lib.lookup(@FieldType(User32Api, "SendMessageW"), "SendMessageW") orelse return null,
             .IsZoomed = lib.lookup(@FieldType(User32Api, "IsZoomed"), "IsZoomed") orelse return null,
             .GetWindowRect = lib.lookup(@FieldType(User32Api, "GetWindowRect"), "GetWindowRect") orelse return null,
+            .MsgWaitForMultipleObjectsEx = lib.lookup(*const fn (DWORD, ?*const ?*anyopaque, DWORD, DWORD, DWORD) callconv(.c) DWORD, "MsgWaitForMultipleObjectsEx"),
+            .PostMessageW = lib.lookup(*const fn (HWND, UINT, WPARAM, LPARAM) callconv(.c) BOOL, "PostMessageW"),
+            .GetDpiForSystem = lib.lookup(*const fn () callconv(.c) c_uint, "GetDpiForSystem"),
+            .GetCursorPos = lib.lookup(*const fn (*POINT) callconv(.c) BOOL, "GetCursorPos"),
+            .ShowCursor = lib.lookup(*const fn (BOOL) callconv(.c) c_int, "ShowCursor"),
         };
     }
 };
@@ -299,17 +344,44 @@ pub const GdiApi = struct {
     }
 };
 
+/// IMM32 is optional: Windows text controls and keyboard layouts can still
+/// deliver WM_CHAR when the DLL or a composition context is unavailable.
+pub const ImmApi = struct {
+    ImmGetContext: *const fn (HWND) callconv(.c) HIMC,
+    ImmReleaseContext: *const fn (HWND, HIMC) callconv(.c) BOOL,
+    ImmGetCompositionStringW: *const fn (HIMC, DWORD, ?*anyopaque, DWORD) callconv(.c) isize,
+    ImmSetOpenStatus: *const fn (HIMC, BOOL) callconv(.c) BOOL,
+    ImmSetCandidateWindow: *const fn (HIMC, *const CANDIDATEFORM) callconv(.c) BOOL,
+
+    pub fn load(lib: @import("../dl.zig").Library) ?ImmApi {
+        return .{
+            .ImmGetContext = lib.lookup(@FieldType(ImmApi, "ImmGetContext"), "ImmGetContext") orelse return null,
+            .ImmReleaseContext = lib.lookup(@FieldType(ImmApi, "ImmReleaseContext"), "ImmReleaseContext") orelse return null,
+            .ImmGetCompositionStringW = lib.lookup(@FieldType(ImmApi, "ImmGetCompositionStringW"), "ImmGetCompositionStringW") orelse return null,
+            .ImmSetOpenStatus = lib.lookup(@FieldType(ImmApi, "ImmSetOpenStatus"), "ImmSetOpenStatus") orelse return null,
+            .ImmSetCandidateWindow = lib.lookup(@FieldType(ImmApi, "ImmSetCandidateWindow"), "ImmSetCandidateWindow") orelse return null,
+        };
+    }
+};
+
 test "win32 message constants match the platform SDK" {
     // Spot-check against WinUser.h values so a typo can't silently remap
     // input. Core rationale: these numbers ARE the ABI.
     const t = std.testing;
     try t.expectEqual(@as(UINT, 0x0102), WM_CHAR);
+    try t.expectEqual(@as(UINT, 0x010F), WM_IME_COMPOSITION);
     try t.expectEqual(@as(UINT, 0x0201), WM_LBUTTONDOWN);
     try t.expectEqual(@as(UINT, 0x020A), WM_MOUSEWHEEL);
     try t.expectEqual(@as(UINT, 0x020E), WM_MOUSEHWHEEL);
     try t.expectEqual(@as(UINT, 0x0010), WM_CLOSE);
     try t.expectEqual(@as(UINT, 0x000F), WM_PAINT);
     try t.expectEqual(@as(UINT, 0x0020), WM_SETCURSOR);
+    try t.expectEqual(@as(UINT, 0x0006), WM_ACTIVATE);
+    try t.expectEqual(@as(UINT, 0x001A), WM_SETTINGCHANGE);
+    try t.expectEqual(@as(UINT, 0x0051), WM_INPUTLANGCHANGE);
+    try t.expectEqual(@as(UINT, 0x8001), WM_ZUI_WAKE);
+    try t.expectEqual(@as(DWORD, 0x0800), GCS_RESULTSTR);
+    try t.expectEqual(@as(DWORD, 0x04FF), QS_ALLINPUT);
     try t.expectEqual(@as(usize, @sizeOf(usize)), @sizeOf(WPARAM));
     try t.expectEqual(@as(usize, 40), @sizeOf(BITMAPINFOHEADER));
     try t.expectEqual(@as(DWORD, 0x00CC0020), SRCCOPY);

@@ -49,22 +49,26 @@ pub const RadioGroup = struct {
     pub fn handleEvent(self: *Self, event: platform.Event, cx: *runtime.Context(Self)) bool {
         if (event == .window) {
             self.pressable.cancel();
+            self.pending = null;
             return false;
         }
         if (event != .key or self.options.disabled) return false;
         const key = event.key;
         if (key.modifiers.ctrl or key.modifiers.alt or key.modifiers.super) return false;
         const win = cx.window orelse return false;
-        if (key.pressed) switch (key.key) {
+        if (key.key == .enter or key.key == .space) {
+            if (self.pressable.keyEventResult(key.key, key.pressed, key.repeat) == .activated) self.select(self.selected, win);
+            cx.notify();
+            return true;
+        }
+        if (!key.pressed) return false;
+        switch (key.key) {
             .left, .up => self.select((self.selected + self.options.items.len - 1) % self.options.items.len, win),
             .right, .down => self.select((self.selected + 1) % self.options.items.len, win),
             .home => self.select(0, win),
             .end => self.select(self.options.items.len - 1, win),
-            .enter, .space => {
-                if (self.pressable.keyEvent(key.key, key.pressed, key.repeat)) self.select(self.selected, win);
-            },
             else => return false,
-        } else return key.key == .space or key.key == .enter;
+        }
         cx.notify();
         return true;
     }
@@ -72,7 +76,7 @@ pub const RadioGroup = struct {
         const t = self.options.tokens orelse theme.current();
         const focus = cx.focusHandle();
         self.pressable.setEnabled(!self.options.disabled);
-        if (!win.left_button_down) self.pressable.cancel();
+        if (!win.left_button_down or !win.focused.eql(focus)) self.pressable.cancel();
         var root = e.div().keyed(self.options.key).w(180).gap(t.spacing.xs).withFocus(focus).semantic(.{ .role = .radio_group, .name = self.options.label, .states = .{ .disabled = self.options.disabled, .focused = win.focused.eql(focus) }, .actions = .{ .focus = true } });
         for (self.options.items, 0..) |item, i| {
             self.targets[i] = .{ .group = self, .index = i };

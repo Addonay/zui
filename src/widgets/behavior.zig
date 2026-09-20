@@ -26,6 +26,10 @@ pub const Pressable = struct {
     pressed: bool = false,
     hovered: bool = false,
     enabled: bool = true,
+    /// Space follows native button semantics: press arms, release activates.
+    /// Enter activates on its non-repeating press. This latch is cleared on
+    /// every cancellation path so a stale key-up can never click a new view.
+    keyboard_space: bool = false,
     /// Completed activations through every path (pointer + keyboard).
     /// Widgets mirror domain effects (clicks, toggles) off the `true`
     /// returns, not this counter; it exists for tests and diagnostics.
@@ -54,6 +58,7 @@ pub const Pressable = struct {
     /// with no activation.
     pub fn cancel(self: *Pressable) void {
         self.pressed = false;
+        self.keyboard_space = false;
     }
 
     pub fn setHovered(self: *Pressable, hovered: bool) void {
@@ -62,19 +67,42 @@ pub const Pressable = struct {
 
     pub fn setEnabled(self: *Pressable, enabled: bool) void {
         self.enabled = enabled;
-        if (!enabled) self.pressed = false;
+        if (!enabled) {
+            self.pressed = false;
+            self.keyboard_space = false;
+        }
     }
 
-    /// Keyboard half of the converged path: a non-repeat Enter/Space press
-    /// activates exactly like a pointer release-inside. Returns true when
-    /// the key was consumed as an activation.
-    pub fn keyEvent(self: *Pressable, key: platform.event.Key, pressed: bool, repeat: bool) bool {
-        if (!self.enabled) return false;
-        if (!pressed or repeat) return false;
-        if (key == .enter or key == .space) {
-            return self.activate();
+    pub const KeyResult = enum { ignored, consumed, activated };
+
+    /// Keyboard half of the converged path. Enter activates on its initial
+    /// press; Space arms on press and activates on release, matching native
+    /// button default actions while still consuming repeats and key-up.
+    pub fn keyEventResult(self: *Pressable, key: platform.event.Key, pressed: bool, repeat: bool) KeyResult {
+        if (!self.enabled) return .ignored;
+        switch (key) {
+            .enter => {
+                if (pressed and !repeat) return if (self.activate()) .activated else .consumed;
+                return .consumed;
+            },
+            .space => {
+                if (pressed) {
+                    if (!repeat) self.keyboard_space = true;
+                    return .consumed;
+                }
+                const armed = self.keyboard_space;
+                self.keyboard_space = false;
+                return if (armed and self.activate()) .activated else .consumed;
+            },
+            else => return .ignored,
         }
-        return false;
+    }
+
+    /// Backwards-compatible activation-only query. New event dispatchers that
+    /// must consume the Space key-down should use `keyEventResult` so they can
+    /// distinguish `.consumed` from `.activated`.
+    pub fn keyEvent(self: *Pressable, key: platform.event.Key, pressed: bool, repeat: bool) bool {
+        return self.keyEventResult(key, pressed, repeat) == .activated;
     }
 
     /// Single activation gate shared by pointer, keyboard and semantic actions.
@@ -123,7 +151,7 @@ test "disabled pressable ignores every path" {
     var p = Pressable{ .enabled = false };
     p.pressBegin();
     try t.expect(!p.pressEnd(true));
-    try t.expect(!p.keyEvent(.enter, true, false));
+    try t.expectEqual(Pressable.KeyResult.ignored, p.keyEventResult(.enter, true, false));
     try t.expectEqual(@as(u64, 0), p.activations);
     try t.expectEqual(VisualState.disabled, p.visual());
 }
@@ -131,12 +159,20 @@ test "disabled pressable ignores every path" {
 test "keyboard converges on the pointer activation path" {
     const t = std.testing;
     var p = Pressable{};
-    try t.expect(p.keyEvent(.enter, true, false));
-    try t.expect(p.keyEvent(.space, true, false));
-    try t.expect(!p.keyEvent(.space, true, true)); // repeat: no double fire
-    try t.expect(!p.keyEvent(.space, false, false)); // release: nothing
-    try t.expect(!p.keyEvent(.a, true, false));
+    try t.expectEqual(Pressable.KeyResult.activated, p.keyEventResult(.enter, true, false));
+    try t.expectEqual(Pressable.KeyResult.consumed, p.keyEventResult(.space, true, false));
+    try t.expectEqual(Pressable.KeyResult.consumed, p.keyEventResult(.space, true, true)); // repeat: no double fire
+    try t.expectEqual(Pressable.KeyResult.activated, p.keyEventResult(.space, false, false));
+    try t.expectEqual(Pressable.KeyResult.ignored, p.keyEventResult(.a, true, false));
     try t.expectEqual(@as(u64, 2), p.activations);
+}
+
+test "space release after cancellation cannot activate" {
+    var p = Pressable{};
+    try std.testing.expectEqual(Pressable.KeyResult.consumed, p.keyEventResult(.space, true, false));
+    p.cancel();
+    try std.testing.expectEqual(Pressable.KeyResult.consumed, p.keyEventResult(.space, false, false));
+    try std.testing.expectEqual(@as(u64, 0), p.activations);
 }
 
 test "cancel drops the latch without activating" {

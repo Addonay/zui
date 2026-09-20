@@ -93,6 +93,33 @@ test "select keyboard End virtualizes large list and pointer chooses option" {
     try t.expectEqual(@as(?usize, 0), select.read().selected);
     try t.expect(!select.read().overlay.open);
 }
+
+test "menu submenu opens with Right, navigates independently, and closes with Left" {
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, noop);
+    var children = [_]Item{.{ .key = 112, .label = "Child", .checked = false }};
+    var items = [_]Item{ .{ .key = 111, .label = "More", .children = &children }, .{ .key = 113, .label = "Other" } };
+    const menu = app.entities.create(w.Menu, .{ .key = 110, .label = "Menu", .items = &items }, win);
+    paint(win, .{menu});
+    click(win, 10, 10);
+    paint(win, .{menu});
+    key(win, .right);
+    paint(win, .{menu});
+    try t.expectEqual(@as(?usize, 0), menu.read().submenu_parent);
+    try t.expect(win.ui_frame.semantic_tree.find(112) != null);
+    key(win, .enter);
+    try t.expect(children[0].checked.?);
+    try t.expect(!menu.read().overlay.open);
+
+    click(win, 10, 10);
+    paint(win, .{menu});
+    key(win, .right);
+    key(win, .left);
+    try t.expect(menu.read().submenu_parent == null);
+    try t.expect(menu.read().overlay.open);
+    key(win, .escape);
+}
 test "popover and modal Escape restore with focus trap and inert background" {
     var app = try App.initHeadless(t.allocator);
     defer app.deinit();
@@ -106,9 +133,9 @@ test "popover and modal Escape restore with focus trap and inert background" {
     try t.expect(!pop.read().overlay.open);
     const modal = app.entities.create(w.Modal, .{ .key = 40, .label = "Confirm" }, win);
     const background = app.entities.create(w.Button, .{ .key = 50, .label = "Background" }, win);
-    paint(win, .{modal, background});
+    paint(win, .{ modal, background });
     click(win, 10, 10);
-    paint(win, .{modal, background});
+    paint(win, .{ modal, background });
     try t.expect(win.ui_frame.semantic_tree.find(modal.read().popupKey()).?.properties.states.modal);
     key(win, .tab);
     try t.expectEqual(modal.focusHandle(null).id, win.focused.id);
@@ -118,6 +145,26 @@ test "popover and modal Escape restore with focus trap and inert background" {
     key(win, .escape);
     try t.expect(!modal.read().overlay.open);
     try t.expectEqual(modal.focusHandle(null).id, win.focused.id);
+
+    // Closing a modal while its trigger is pressed cancels both the widget
+    // latch and Window capture before the old portal is replaced.
+    click(win, 10, 10);
+    paint(win, .{ modal, background });
+    modal.readMut().pressable.pressBegin();
+    win.captured_mouse_region = .{ .bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 } };
+    try t.expect(modal.read().pressable.pressed);
+    modal.readMut().close(win);
+    try t.expect(!modal.read().pressable.pressed);
+    try t.expect(win.captured_mouse_region == null);
+
+    // Removing an open modal without an explicit close must not leave a
+    // borrowed scope constraining the next frame.
+    click(win, 10, 10);
+    paint(win, .{ modal, background });
+    try t.expect(win.focus_scope != null);
+    modal.destroy();
+    paint(win, .{background});
+    try t.expect(win.focus_scope == null);
 }
 test "tooltip hover delay focus and passive portal regions" {
     var app = try App.initHeadless(t.allocator);

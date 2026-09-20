@@ -1,6 +1,10 @@
 //! Daybook: a small native task workspace built with ZUI.
 const std = @import("std");
 const zui = @import("zui");
+const shadcn = @import("shadcn-zui");
+const theme = @import("theme.zig");
+const model = @import("model.zig");
+const a11y = @import("a11y.zig");
 
 const App = zui.App;
 const Context = zui.Context;
@@ -9,114 +13,20 @@ const Entity = zui.Entity;
 const Element = zui.Element;
 const FocusHandle = zui.FocusHandle;
 
-const theme = struct {
-    const bg = zui.hex(0xeaf0f6);
-    const panel = zui.hex(0xf8fafc);
-    const card = zui.hex(0xffffff);
-    const card_hover = zui.hex(0xe4edf7);
-    const border = zui.hex(0xcbd6e3);
-    const text = zui.hex(0x20344a);
-    const muted = zui.hex(0x54677b);
-    const faint = zui.hex(0x64758a);
-    const accent = zui.hex(0x315fa4);
-    const good = zui.hex(0x277060);
-    const danger = zui.hex(0xa43643);
-    const font = struct {
-        const sans = "Noto Sans, sans-serif";
-        const display = "Noto Sans Display, Noto Sans, sans-serif";
-        const mono = "DejaVu Sans Mono, monospace";
-    };
-};
-
-const Todo = struct {
-    id: u32,
-    title: zui.SharedString,
-    done: bool,
-};
-
-const Filter = enum {
-    all,
-    active,
-    done,
-
-    fn label(self: @This()) []const u8 {
-        return switch (self) {
-            .all => "All",
-            .active => "Active",
-            .done => "Done",
-        };
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Accessibility annotations (gap report §5.1 / §9 stage 1).
-//
-// Every interactive control gets a stable nonzero key, a distinct focus id
-// (the key itself — all keys live above entity-id range so tab stops never
-// merge), a semantic role/name, and both a keyboard path (FocusHandle
-// Enter/Space) and a semantic path (Tree.perform activate/focus) into the
-// SAME listener the mouse click fires. One tab stop per control; disabled
-// controls publish `disabled` so traversal skips them.
-// ---------------------------------------------------------------------------
-
-const a11y_key = struct {
-    const composer: u64 = 0x110001;
-    const add: u64 = 0x110002;
-    const clear: u64 = 0x110003;
-    const prev: u64 = 0x110004;
-    const next: u64 = 0x110005;
-    const filter_all: u64 = 0x110011;
-    const filter_active: u64 = 0x110012;
-    const filter_done: u64 = 0x110013;
-    const empty: u64 = 0x110014;
-    const list: u64 = 0x110020;
-    const win_min: u64 = 0x110031;
-    const win_max: u64 = 0x110032;
-    const win_close: u64 = 0x110033;
-    fn row(id: u32) u64 {
-        return 0x120000 + id;
-    }
-    fn check(id: u32) u64 {
-        return 0x130000 + id;
-    }
-    fn del(id: u32) u64 {
-        return 0x140000 + id;
-    }
-};
-
-/// Per-control activation target. The stored listener is the same one the
-/// mouse click fires, so pointer, keyboard and screen-reader paths converge.
-/// Slots live in TodoApp state (stable entity storage); contents are
-/// rewritten every frame, like RadioGroup targets.
-const A11yTarget = struct {
-    listener: zui.Listener,
-};
-
-/// Focused Enter/Space activates the control; other keys fall through to
-/// window bindings (Delete still deletes the selection, Escape still blurs).
-fn a11yFocusDispatch(raw: *anyopaque, event: zui.platform.Event, raw_win: *anyopaque) bool {
-    const target: *const A11yTarget = @ptrCast(@alignCast(raw));
-    if (event != .key) return false;
-    const key = event.key;
-    if (key.modifiers.ctrl or key.modifiers.alt or key.modifiers.super) return false;
-    if (key.key != .enter and key.key != .space) return false;
-    if (key.pressed and !key.repeat) target.listener.call(raw_win);
-    return true;
-}
-
-/// Screen-reader / automation path: Tree.perform(activate) clicks the control.
-fn a11ySemanticActivate(raw: *anyopaque, request: zui.a11y.Request, raw_win: *anyopaque) void {
-    const target: *const A11yTarget = @ptrCast(@alignCast(raw));
-    if (request.action == .activate) target.listener.call(raw_win);
-}
+const Todo = model.Todo;
+const Filter = model.Filter;
+const page_size = model.page_size;
+const A11yTarget = a11y.Target;
+pub const a11y_key = a11y.key;
+const a11yFocusDispatch = a11y.focusDispatch;
+const a11ySemanticActivate = a11y.semanticActivate;
 
 // ---------------------------------------------------------------------------
 // Root view.
 // ---------------------------------------------------------------------------
 
-const TodoApp = struct {
+pub const TodoApp = struct {
     pub const Options = struct {};
-    const page_size = 4;
 
     alloc: std.mem.Allocator,
     todos: std.ArrayList(Todo),
@@ -126,7 +36,7 @@ const TodoApp = struct {
     page: usize = 0,
     input: Entity(zui.TextField),
     focus_root: FocusHandle,
-    a11y_targets: [64]A11yTarget = undefined,
+    a11y_targets: [64]A11yTarget = @splat(.{}),
     a11y_count: usize = 0,
 
     pub fn init(cx: *Context(@This()), _: Options) @This() {
@@ -163,7 +73,7 @@ const TodoApp = struct {
         cx.notify();
     }
 
-    fn add(self: *@This(), title: []const u8, cx: *Context(@This())) !void {
+    pub fn add(self: *@This(), title: []const u8, cx: *Context(@This())) !void {
         const owned_title = try zui.string(self.alloc, title);
         errdefer owned_title.release();
         try self.todos.append(self.alloc, .{ .id = self.next_id, .title = owned_title, .done = false });
@@ -172,7 +82,7 @@ const TodoApp = struct {
         cx.notify();
     }
 
-    fn toggle(self: *@This(), id: u32, cx: *Context(@This())) void {
+    pub fn toggle(self: *@This(), id: u32, cx: *Context(@This())) void {
         for (self.todos.items) |*t| {
             if (t.id == id) t.done = !t.done;
         }
@@ -194,13 +104,13 @@ const TodoApp = struct {
         cx.notify();
     }
 
-    fn setFilter(self: *@This(), f: Filter, cx: *Context(@This())) void {
+    pub fn setFilter(self: *@This(), f: Filter, cx: *Context(@This())) void {
         self.filter = f;
         self.page = 0;
         cx.notify();
     }
 
-    fn clearCompleted(self: *@This(), cx: *Context(@This())) void {
+    pub fn clearCompleted(self: *@This(), cx: *Context(@This())) void {
         var kept: usize = 0;
         for (self.todos.items) |t| {
             if (t.done) {
@@ -224,26 +134,12 @@ const TodoApp = struct {
 
     // -- derived --
 
-    fn counts(self: *const @This()) struct { total: usize, done: usize, left: usize } {
-        var done: usize = 0;
-        for (self.todos.items) |t| {
-            if (t.done) done += 1;
-        }
-        return .{ .total = self.todos.items.len, .done = done, .left = self.todos.items.len - done };
+    fn counts(self: *const @This()) model.Counts {
+        return model.counts(self.todos.items);
     }
 
-    fn isVisible(self: *const @This(), t: Todo) bool {
-        return switch (self.filter) {
-            .all => true,
-            .active => !t.done,
-            .done => t.done,
-        };
-    }
-
-    fn progress(self: *const @This()) f32 {
-        const c = self.counts();
-        if (c.total == 0) return 0;
-        return @as(f32, @floatFromInt(c.done)) / @as(f32, @floatFromInt(c.total));
+    pub fn isVisible(self: *const @This(), t: Todo) bool {
+        return model.visible(self.filter, t);
     }
 
     const A11ySlot = struct {
@@ -259,7 +155,9 @@ const TodoApp = struct {
         const owner = cx.focusHandle();
         const slot = &self.a11y_targets[self.a11y_count];
         self.a11y_count += 1;
-        slot.* = .{ .listener = listener };
+        if (slot.key != key) slot.space_pending = false;
+        slot.key = key;
+        slot.listener = listener;
         if (owner.owner_store) |store| zui.elements.element.currentFrame().trackOwner(slot, store, owner.id, owner.owner_generation);
         // Hand-built handle: the tab-stop id is the stable control key, NOT
         // an entity id, so it carries no owner gate (FocusHandle.isLive
@@ -305,8 +203,12 @@ const TodoApp = struct {
     fn uiButton(self: *@This(), window: *Window, cx: *Context(@This()), key: u64, value: []const u8, listener: zui.Listener, primary: bool, disabled: bool) Element {
         const slot = self.a11ySlot(cx, key, listener);
         const focused = isFocused(window, slot.handle);
-        return focusRing(zui.div().h(40).px(14).items_center().justify_center().rounded_lg().cursor_pointer()
-            .bg(if (primary) theme.accent else theme.panel).hover_bg(if (primary) theme.text else theme.card_hover)
+        var button = shadcn.Button.init(value)
+            .variant(if (primary) .primary else .outline)
+            .size(.md)
+            .disabled(disabled);
+        if (buttonIcon(value)) |icon| button = button.leadingIcon(icon);
+        return focusRing(zui.div().items_center().justify_center().cursor_pointer()
             .keyed(key)
             .withFocus(slot.handle)
             .semantic(.{
@@ -316,7 +218,16 @@ const TodoApp = struct {
                 .actions = .{ .activate = !disabled, .focus = true },
                 .handler = .{ .target = slot.target, .call_fn = a11ySemanticActivate },
             })
-            .on_click(listener), focused).child(label(value, 13, if (primary) zui.white() else theme.muted));
+            .on_click(listener), focused)
+            .child(button.render());
+    }
+
+    fn buttonIcon(value: []const u8) ?shadcn.components.icon.Name {
+        if (std.mem.eql(u8, value, "Add task")) return shadcn.components.icon.semantic.plus;
+        if (std.mem.eql(u8, value, "Clear completed")) return shadcn.components.icon.semantic.check;
+        if (std.mem.eql(u8, value, "Previous")) return shadcn.components.icon.semantic.chevron_left;
+        if (std.mem.eql(u8, value, "Next")) return shadcn.components.icon.semantic.chevron_right;
+        return null;
     }
 
     fn filterTab(self: *@This(), window: *Window, cx: *Context(@This()), filter: Filter, current: Filter, count: usize) Element {
@@ -328,8 +239,9 @@ const TodoApp = struct {
         const listener = cx.listenerWith(Filter, TodoApp, TodoApp.setFilter, filter);
         const slot = self.a11ySlot(cx, key, listener);
         const focused = isFocused(window, slot.handle);
+        const icon = filterIcon(filter);
         return focusRing(zui.div().flex_row().h(40).px(12).gap(10).items_center().rounded_lg().cursor_pointer()
-            .bg(if (filter == current) theme.card_hover else theme.panel).hover_bg(theme.card_hover)
+            .bg(if (filter == current) theme.moss_soft else theme.sidebar).hover_bg(theme.paper_hover)
             .keyed(key)
             .withFocus(slot.handle)
             .semantic(.{
@@ -340,8 +252,17 @@ const TodoApp = struct {
                 .handler = .{ .target = slot.target, .call_fn = a11ySemanticActivate },
             })
             .on_click(listener), focused)
+            .child(shadcn.components.icon.render(icon, 15, if (filter == current) theme.terracotta else theme.muted))
             .child(label(filter.label(), 13, if (filter == current) theme.accent else theme.muted))
-            .child(zui.textFmt("{d}", .{count}, .{ .font = theme.font.mono, .size = 12, .line_height = 18, .color = theme.muted }));
+            .child(zui.textFmt("{d}", .{count}, .{ .font = theme.font.body, .size = 12, .line_height = 18, .color = theme.muted }));
+    }
+
+    fn filterIcon(filter: Filter) shadcn.components.icon.Name {
+        return switch (filter) {
+            .all => shadcn.components.icon.Name.list,
+            .active => shadcn.components.icon.Name.circle,
+            .done => shadcn.components.icon.semantic.check,
+        };
     }
 
     fn winChrome(self: *@This(), window: *Window, cx: *Context(@This()), key: u64, value: []const u8, name: []const u8, comptime handler: anytype) Element {
@@ -368,58 +289,49 @@ const TodoApp = struct {
 
     pub fn render(self: *@This(), window: *Window, cx: *Context(@This())) Element {
         self.a11y_count = 0; // per-frame activation slots; see a11ySlot
-        const c = self.counts();
+        const c = model.counts(self.todos.items);
         const wide = window.bounds.size.w >= 800;
-        var body = zui.div().flex_row().flex_1().w_full();
-        if (wide) body = body.child(zui.div().flex_col().w(200).h(window.bounds.size.h - 48).p(24).gap(24).bg(theme.panel)
-            .child(label("MY WORKSPACE", 11, theme.muted))
-            .child(zui.div().flex_col().gap(8)
-                .child(self.filterTab(window, cx, .all, self.filter, c.total))
-                .child(self.filterTab(window, cx, .active, self.filter, c.left))
-                .child(self.filterTab(window, cx, .done, self.filter, c.done)))
-            .child(zui.spacer())
-            .child(label("A little more done.", 14, theme.text))
-            .child(label("One task at a time.", 12, theme.muted)));
-        var content = zui.div().flex_col().flex_1().p(if (wide) 32 else 20).gap(20);
-        content = content.child(zui.div().flex_row().items_center().justify_between()
-            .child(zui.div().flex_col().gap(6)
-                .child(zui.text("Your day, in order.", .{ .font = theme.font.display, .size = 28, .line_height = 36, .weight = .bold, .color = theme.text }))
-                .child(label("Make room for what matters next.", 14, theme.muted)))
-            .child(zui.div().flex_col().items_center().gap(4)
-            .child(zui.textFmt("{d}", .{c.left}, .{ .font = theme.font.mono, .size = 28, .line_height = 36, .color = theme.accent }))
-            .child(label("remaining", 11, theme.muted))));
+        const content_width = @min(720, @max(0, window.bounds.size.w - 40));
+        var content = zui.div().flex_col().w(content_width).p(if (wide) 40 else 20).gap(16);
+        content = content.child(zui.div().flex_row().items_end().justify_between()
+            .child(zui.div().flex_col().gap(4)
+                .child(theme.mono("TODAY / TASKS", 10, theme.terracotta))
+                .child(theme.display("Today", 32, theme.ink))
+                .child(theme.label("A small list for what matters next.", 14, theme.muted)))
+            .child(zui.textFmt("{d} open", .{c.left}, .{ .font = theme.font.body, .size = 15, .line_height = 20, .color = theme.terracotta })));
         content = content.child(zui.div().flex_col().gap(8)
-            .child(label("NEW TASK", 11, theme.muted))
-            .child(zui.div().flex_row().items_center().gap(8).p(6).rounded_lg().bg(theme.card).border_1().border_color(theme.border)
+            .child(theme.mono("ADD TO THE LIST", 10, theme.muted))
+            .child(zui.div().flex_row().items_center().gap(8).p(6).rounded_lg().bg(theme.paper).border_1().border_color(theme.line)
+            .child(zui.div().w(26).h(26).items_center().justify_center().rounded_lg().bg(theme.terracotta_soft)
+                .child(shadcn.components.icon.render(shadcn.components.icon.semantic.plus, 16, theme.terracotta)))
             .child(self.composer(window))
             .child(self.uiButton(window, cx, a11y_key.add, "Add task", cx.listener(@This(), addFromDraft), true, false))));
-        if (!wide) content = content.child(zui.div().flex_row().gap(8)
+        content = content.child(zui.div().flex_row().gap(8)
             .child(self.filterTab(window, cx, .all, self.filter, c.total))
             .child(self.filterTab(window, cx, .active, self.filter, c.left))
             .child(self.filterTab(window, cx, .done, self.filter, c.done)));
         content = content.child(zui.div().flex_row().items_center().justify_between()
-            .child(label(switch (self.filter) {
-                .all => "All tasks",
-                .active => "Still to do",
-                .done => "Completed",
-            }, 17, theme.text))
-            .child(zui.textFmt("{d} of {d} complete", .{ c.done, c.total }, .{ .font = theme.font.sans, .size = 12, .line_height = 18, .color = theme.muted })));
+            .child(theme.display(switch (self.filter) {
+                .all => "Tasks",
+                .active => "Open",
+                .done => "Done",
+            }, 20, theme.ink))
+            .child(zui.textFmt("{d} of {d} complete", .{ c.done, c.total }, .{ .font = theme.font.body, .size = 11, .line_height = 18, .color = theme.muted })));
         content = content.child(self.renderList(window, cx));
         content = content.child(zui.div().flex_row().items_center().justify_between()
-            .child(label("Select a task · Space to complete", 12, theme.muted))
+            .child(theme.label("Select a task · Space completes it", 12, theme.muted))
             .child(self.uiButton(window, cx, a11y_key.clear, "Clear completed", cx.listener(@This(), clearCompleted), false, false)));
-        body = body.child(content);
         return zui.div().flex_col().size_full().bg(theme.bg)
-            .child(zui.div().flex_row().items_center().h(48).px(20).gap(10).bg(theme.panel).border_b_1().border_color(theme.border)
+            .child(zui.div().flex_row().items_center().h(56).px(22).gap(10).bg(theme.sidebar).border_b_1().border_color(theme.line)
                 .on_mouse_down(cx.listener(@This(), beginDrag))
                 .on_double_click(cx.listener(@This(), toggleMaximize))
-                .child(zui.div().w(4).h(20).rounded_lg().bg(theme.accent))
-                .child(zui.text("daybook", .{ .font = theme.font.display, .size = 17, .line_height = 24, .weight = .bold, .color = theme.text }))
+                .child(zui.div().w(4).h(24).bg(theme.terracotta))
+                .child(theme.display("daybook", 18, theme.ink))
                 .child(zui.spacer())
                 .child(self.winChrome(window, cx, a11y_key.win_min, "—", "Minimize", minimizeWindow))
                 .child(self.winChrome(window, cx, a11y_key.win_max, if (window.isMaximized()) "▢" else "□", if (window.isMaximized()) "Restore" else "Maximize", toggleMaximize))
                 .child(self.winChrome(window, cx, a11y_key.win_close, "×", "Close", closeWindow)))
-            .child(body);
+            .child(zui.div().flex_1().w_full().items_center().child(content));
     }
 
     fn renderList(self: *@This(), window: *Window, cx: *Context(@This())) Element {
@@ -429,11 +341,11 @@ const TodoApp = struct {
                 count += 1;
             }
         }
-        if (count == 0) return zui.div().flex_col().h(220).items_center().justify_center().gap(12).rounded_lg().bg(theme.card)
+        if (count == 0) return zui.div().flex_col().h(240).items_center().justify_center().gap(10).rounded_lg().bg(theme.paper).border_1().border_color(theme.line)
             .keyed(a11y_key.empty)
             .semantic(.{ .role = .group, .name = "No tasks" })
-            .child(label(if (self.filter == .done) "Your finished tasks will appear here." else if (self.filter == .active) "Everything is checked off." else "Start with one small thing.", 18, theme.text))
-            .child(label(if (self.filter == .all) "Write a task above, then choose Add task." else "Choose All to see your whole list.", 13, theme.muted));
+            .child(theme.display(if (self.filter == .done) "Nothing finished yet." else if (self.filter == .active) "Everything is checked off." else "Start with one small thing.", 24, theme.ink))
+            .child(theme.label(if (self.filter == .all) "Write a task above and it will land here." else "Choose All to see your whole list.", 13, theme.muted));
         const current_page = @min(self.page, (count - 1) / page_size);
         const last_page = (count - 1) / page_size;
         var list = zui.div().flex_col().gap(8)
@@ -466,10 +378,12 @@ const TodoApp = struct {
         const row_focused = isFocused(window, row_slot.handle);
         const check_focused = isFocused(window, check_slot.handle);
         const del_focused = isFocused(window, del_slot.handle);
+        const checkbox = shadcn.Checkbox.init().checked(todo.done).size(26).onToggle(toggle_listener).render();
+        const delete_button = shadcn.IconButton.init(shadcn.components.icon.semantic.trash).variant(.ghost).size(32, 16).render();
         var del_name_buf: [128]u8 = undefined;
         const del_name = std.fmt.bufPrint(&del_name_buf, "Delete {s}", .{todo.title.slice()}) catch "Delete";
-        return zui.div().flex_row().items_center().gap(14).p(14).rounded_lg()
-            .bg(if (selected) theme.card_hover else theme.card)
+        return zui.div().flex_row().items_center().gap(12).p(12).rounded_lg()
+            .bg(if (selected) theme.terracotta_soft else theme.paper)
             .border_1().border_color(if (selected or row_focused) theme.accent else theme.border)
             .keyed(row_key)
             .withFocus(row_slot.handle)
@@ -480,11 +394,9 @@ const TodoApp = struct {
                 .actions = .{ .activate = true, .focus = true },
                 .handler = .{ .target = row_slot.target, .call_fn = a11ySemanticActivate },
             })
-            .hover_bg(theme.card_hover).cursor_pointer()
+            .hover_bg(theme.paper_hover).cursor_pointer()
             .on_click(select_listener)
-            .child(zui.div().size(24).rounded_lg().border_2()
-                .border_color(if (check_focused) theme.accent else if (todo.done) theme.good else theme.faint)
-                .bg(if (todo.done) theme.good else theme.card)
+            .child(zui.div().items_center().justify_center()
                 .keyed(check_key)
                 .withFocus(check_slot.handle)
                 .semantic(.{
@@ -496,7 +408,7 @@ const TodoApp = struct {
                 })
                 .items_center().justify_center().cursor_pointer()
                 .on_click(toggle_listener)
-                .child(zui.when(todo.done, zui.text("✓", .{ .size = 14, .color = zui.white() }))))
+                .child(checkbox))
             .child(zui.div().flex_1().child(zui.text(todo.title.slice(), .{
                 .font = theme.font.sans,
                 .size = 15,
@@ -504,25 +416,25 @@ const TodoApp = struct {
                 .color = if (todo.done) theme.muted else theme.text,
                 .strike = todo.done,
             })))
-            .child(focusRing(zui.div().px(8).h(30).items_center().justify_center().rounded_lg().hover_bg(theme.border).cursor_pointer()
-                .keyed(del_key)
-                .withFocus(del_slot.handle)
-                .semantic(.{
-                    .role = .button,
-                    .name = del_name,
-                    .states = .{ .focused = del_focused },
-                    .actions = .{ .activate = true, .focus = true },
-                    .handler = .{ .target = del_slot.target, .call_fn = a11ySemanticActivate },
-                })
-                .on_click(remove_listener), del_focused)
-            .child(label("Delete", 12, theme.muted)));
+            .child(focusRing(zui.div().items_center().justify_center().cursor_pointer()
+            .keyed(del_key)
+            .withFocus(del_slot.handle)
+            .semantic(.{
+                .role = .button,
+                .name = del_name,
+                .states = .{ .focused = del_focused },
+                .actions = .{ .activate = true, .focus = true },
+                .handler = .{ .target = del_slot.target, .call_fn = a11ySemanticActivate },
+            })
+            .on_click(remove_listener), del_focused)
+            .child(delete_button));
     }
 
-    fn previousPage(self: *@This(), cx: *Context(@This())) void {
+    pub fn previousPage(self: *@This(), cx: *Context(@This())) void {
         self.page -|= 1;
         cx.notify();
     }
-    fn nextPage(self: *@This(), cx: *Context(@This())) void {
+    pub fn nextPage(self: *@This(), cx: *Context(@This())) void {
         var count: usize = 0;
         for (self.todos.items) |todo| {
             if (self.isVisible(todo)) {
@@ -583,14 +495,14 @@ fn buildRoot(window: *Window, vcx: *Context(TodoApp)) Entity(TodoApp) {
     window.on_action("delete-selected", view, TodoApp.removeSelected);
     window.on_action("focus-composer", view, TodoApp.focusComposer);
     window.on_action("blur-composer", view, TodoApp.blurComposer);
-    seedDemo(view);
+    seedDemo(view, std.c.getenv("ZUI_TODO_DEMO") != null);
     return view;
 }
 
-/// Screenshot seed: ZUI_TODO_DEMO=1 starts with rows so empty state and
-/// populated list can both be verified visually.
-fn seedDemo(view: Entity(TodoApp)) void {
-    if (std.c.getenv("ZUI_TODO_DEMO") == null) return;
+/// Optional screenshot/selftest seed. A normal launch starts empty so the
+/// empty-state guidance is the first-run experience.
+fn seedDemo(view: Entity(TodoApp), enabled: bool) void {
+    if (!enabled) return;
     view.updateWith("Buy milk", TodoApp.add) catch {};
     view.updateWith("Write zig", TodoApp.add) catch {};
     view.updateWith("Ship the todo app", TodoApp.add) catch {};
@@ -605,6 +517,7 @@ fn onOpen(cx: *App) void {
         .bounds = bounds,
         .title = "Daybook",
         .min_size = zui.size(540, 740),
+
         // Native titlebar off: renderTitlebar above draws our own chrome
         // (icon, title, min/max/close) so the app looks identical on
         // Wayland, X11, Win32, and Cocoa.
@@ -791,6 +704,7 @@ fn selftestHeadless(gpa: std.mem.Allocator) !void {
     const selected_before = view.read().selected;
     const len_before = view.read().input.read().len;
     if (!null_backend.pushEvent(.{ .key = .{ .key = .space, .pressed = true } })) return error.SelftestQueueFull;
+    if (!null_backend.pushEvent(.{ .key = .{ .key = .space, .pressed = false } })) return error.SelftestQueueFull;
     _ = app.step();
     check(view.read().selected == selected_before, &failures, "space in field does not toggle", .{});
     check(view.read().input.read().len == len_before, &failures, "space key alone inserts nothing", .{});
@@ -846,6 +760,8 @@ fn selftestHeadless(gpa: std.mem.Allocator) !void {
     _ = app.step();
     if (!null_backend.pushEvent(.{ .key = .{ .key = .space, .pressed = true } })) return error.SelftestQueueFull;
     _ = app.step();
+    if (!null_backend.pushEvent(.{ .key = .{ .key = .space, .pressed = false } })) return error.SelftestQueueFull;
+    _ = app.step();
     check(view.read().todos.items.len == 3, &failures, "space on focused delete removes row (got {d})", .{view.read().todos.items.len});
     _ = null_backend.pushEvent(.{ .key = .{ .key = .escape, .pressed = true } });
     _ = app.step();
@@ -891,62 +807,7 @@ fn findCheckbox(win: *Window, title: []const u8) ?zui.Rect {
     return null;
 }
 
-// ---------------------------------------------------------------------------
-// Pure-model tests — no window needed, same as gpui would encourage.
-// ---------------------------------------------------------------------------
-
-test "toggle / filter / clear are pure" {
-    const t = std.testing;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-
-    // Note: ideal test harness gives us a headless Context for free,
-    // so entities + listeners can be driven without opening a window.
-    var harness = try zui.TestHarness.init(arena.allocator());
-    defer harness.deinit();
-
-    const view = harness.new(TodoApp, .{});
-    try view.updateWith("buy milk", TodoApp.add);
-    try view.updateWith("write zig", TodoApp.add);
-    try t.expectEqual(@as(usize, 2), view.read().todos.items.len);
-
-    const id = view.read().todos.items[0].id;
-    view.updateWith(id, TodoApp.toggle);
-    try t.expect(view.read().todos.items[0].done);
-
-    view.updateWith(.done, TodoApp.setFilter);
-    try t.expect(!view.read().isVisible(view.read().todos.items[1]));
-
-    view.update(TodoApp.clearCompleted);
-    try t.expectEqual(@as(usize, 1), view.read().todos.items.len);
-}
-
-test "pagination clamps at list ends and resets on filtering" {
-    var harness = try zui.TestHarness.init(std.testing.allocator);
-    defer harness.deinit();
-    const view = harness.new(TodoApp, .{});
-    for (0..12) |_| try view.updateWith("Task", TodoApp.add);
-    view.update(TodoApp.nextPage);
-    try std.testing.expectEqual(@as(usize, 1), view.read().page);
-    view.update(TodoApp.nextPage);
-    view.update(TodoApp.nextPage);
-    try std.testing.expectEqual(@as(usize, 2), view.read().page);
-    view.updateWith(.active, TodoApp.setFilter);
-    try std.testing.expectEqual(@as(usize, 0), view.read().page);
-    view.update(TodoApp.previousPage);
-    try std.testing.expectEqual(@as(usize, 0), view.read().page);
-}
-
-// ---------------------------------------------------------------------------
-// Accessibility selftests (gap report §5.1 exit gate, headless): the shipped
-// demo publishes an annotated, actionable semantic tree — composer as
-// text_input, rows as listitem/checkbox with checked state, buttons with the
-// activate action — and Tree.perform toggles a row. The bridge snapshot test
-// additionally proves the root-attachment invariant the AccessKit factory
-// relies on (top-level nodes carry parent 0).
-// ---------------------------------------------------------------------------
-
-fn a11yFixture() !struct {
+pub fn a11yFixture() !struct {
     app: App,
     win: *Window,
     view: Entity(TodoApp),
@@ -961,120 +822,10 @@ fn a11yFixture() !struct {
         .chrome = .custom,
     }, selftestBuildRoot);
     const view = selftest_view orelse return error.SelftestNoView;
+    seedDemo(view, true);
     try view.updateWith("Buy milk", TodoApp.add);
     try view.updateWith("Write zig", TodoApp.add);
     view.updateWith(view.read().todos.items[0].id, TodoApp.toggle);
     _ = app.step();
     return .{ .app = app, .win = win, .view = view };
-}
-
-test "annotated demo publishes actionable semantics" {
-    const t = std.testing;
-    var fixture = try a11yFixture();
-    defer fixture.app.deinit();
-    const win = fixture.win;
-    const view = fixture.view;
-    const tree = &win.ui_frame.semantic_tree;
-
-    // Composer: text_input role, top-level root for the bridge.
-    const composer = tree.find(a11y_key.composer) orelse return error.MissingComposer;
-    try t.expectEqual(zui.a11y.Role.text_input, composer.properties.role);
-    try t.expectEqual(@as(u64, 0), composer.parent);
-    try t.expectEqualStrings("New task", composer.properties.name);
-
-    // List with listitem rows; checkboxes carry checked state and sit under
-    // their row, deletes are buttons under their row.
-    const list = tree.find(a11y_key.list) orelse return error.MissingList;
-    try t.expectEqual(zui.a11y.Role.list, list.properties.role);
-    for (view.read().todos.items) |todo| {
-        const row = tree.find(a11y_key.row(todo.id)) orelse return error.MissingRow;
-        try t.expectEqual(zui.a11y.Role.listitem, row.properties.role);
-        try t.expectEqual(a11y_key.list, row.parent);
-        try t.expectEqualStrings(todo.title.slice(), row.properties.name);
-        const check_node = tree.find(a11y_key.check(todo.id)) orelse return error.MissingCheck;
-        try t.expectEqual(zui.a11y.Role.checkbox, check_node.properties.role);
-        try t.expectEqual(a11y_key.row(todo.id), check_node.parent);
-        try t.expectEqual(todo.done, check_node.properties.states.checked orelse false);
-        try t.expect(check_node.properties.actions.activate);
-        const del = tree.find(a11y_key.del(todo.id)) orelse return error.MissingDel;
-        try t.expectEqual(zui.a11y.Role.button, del.properties.role);
-        try t.expectEqual(a11y_key.row(todo.id), del.parent);
-        try t.expect(del.properties.actions.activate);
-    }
-
-    // Static buttons: button role, activate action, top-level roots.
-    for ([_]u64{ a11y_key.add, a11y_key.clear, a11y_key.filter_all, a11y_key.filter_active, a11y_key.filter_done, a11y_key.win_min, a11y_key.win_max, a11y_key.win_close }) |key| {
-        const node = tree.find(key) orelse return error.MissingButton;
-        try t.expectEqual(zui.a11y.Role.button, node.properties.role);
-        try t.expect(node.properties.actions.activate);
-        try t.expectEqual(@as(u64, 0), node.parent);
-    }
-
-    // Root-attachment invariant (what accesskit.zig updateFactory attaches
-    // under node 0): every parent is 0 or another live node key.
-    for (tree.nodes[0..tree.count]) |*node| {
-        if (node.parent == 0) continue;
-        try t.expect(tree.find(node.parent) != null);
-    }
-    try t.expect(tree.count > 10);
-
-    // Semantic activation toggles the row and the next frame reflects it.
-    const first = view.read().todos.items[0].id;
-    const was = view.read().todos.items[0].done;
-    try t.expect(tree.perform(a11y_key.check(first), .{ .action = .activate }, win));
-    try t.expect(view.read().todos.items[0].done != was);
-    _ = fixture.app.step();
-    const refreshed = tree.find(a11y_key.check(first)) orelse return error.MissingCheck;
-    try t.expectEqual(!was, refreshed.properties.states.checked orelse true);
-
-    // Semantic focus reaches a control; Space on the focused control acts.
-    try t.expect(tree.perform(a11y_key.del(first), .{ .action = .focus }, win));
-    try t.expectEqual(a11y_key.del(first), @as(u64, win.focused.id));
-    win.handleEvent(.{ .key = .{ .key = .space, .pressed = true } });
-    try t.expectEqual(@as(usize, 1), view.read().todos.items.len);
-}
-
-test "bridge snapshot carries annotated roots" {
-    const t = std.testing;
-    if (!zui.a11y.accesskit.enabled) return error.SkipZigTest;
-    var fixture = try a11yFixture();
-    defer fixture.app.deinit();
-    const win = fixture.win;
-    const view = fixture.view;
-
-    var bridge = zui.a11y.accesskit.Bridge.init();
-    const alloc = win.allocator orelse t.allocator;
-    defer bridge.deinit(alloc);
-    // Focus the composer so the snapshot records a focused key.
-    win.focused = view.read().input.focusHandle(null);
-    bridge.publish(win);
-
-    try t.expect(bridge.snapshot.len > 0);
-    var saw_input = false;
-    var saw_button = false;
-    var saw_check = false;
-    var saw_item = false;
-    var saw_list = false;
-    var top_level: usize = 0;
-    for (bridge.snapshot) |*node| {
-        if (node.parent == 0) top_level += 1 else {
-            var parent_found = false;
-            for (bridge.snapshot) |*other| if (other.key == node.parent) {
-                parent_found = true;
-                break;
-            };
-            try t.expect(parent_found);
-        }
-        switch (node.role) {
-            .text_input => saw_input = true,
-            .button => saw_button = true,
-            .checkbox => saw_check = true,
-            .listitem => saw_item = true,
-            .list => saw_list = true,
-            else => {},
-        }
-    }
-    try t.expect(saw_input and saw_button and saw_check and saw_item and saw_list);
-    try t.expect(top_level > 0);
-    try t.expectEqual(a11y_key.composer, bridge.focused_key);
 }

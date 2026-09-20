@@ -323,6 +323,65 @@ pub const KeyBinding = struct {
     predicate: Predicate = .{},
 };
 
+/// GPUI dispatch has a distinct capture/bubble path followed by a default
+/// action when no listener consumes the key. Keeping these phases explicit
+/// lets platform adapters and tests agree on ordering without changing the
+/// existing action-name keymap API.
+pub const KeyDispatchPhase = enum { capture, target, bubble, default_action };
+pub const DefaultKeyAction = enum { tab_forward, tab_backward, activate, dismiss, move_left, move_right, move_up, move_down };
+pub const KeyDispatchTrace = struct {
+    phases: [8]KeyDispatchPhase = undefined,
+    len: u8 = 0,
+
+    pub fn push(self: *@This(), phase: KeyDispatchPhase) void {
+        if (self.len < self.phases.len) {
+            self.phases[self.len] = phase;
+            self.len += 1;
+        }
+    }
+};
+
+pub const KeyDispatchResult = struct {
+    action: ?[]const u8 = null,
+    default_action: ?DefaultKeyAction = null,
+    consumed: bool = false,
+    trace: KeyDispatchTrace = .{},
+};
+
+/// Resolve a pressed key after listeners have had their capture, target, and
+/// bubble opportunities. `listener_consumed` models `stopPropagation` or a
+/// handled event; default behavior is never run in that case.
+pub fn dispatchWithDefault(self: *Keymap, ev: event.KeyEvent, stack: []const ContextFrame, now_ms: i64, listener_consumed: bool) KeyDispatchResult {
+    var result = KeyDispatchResult{};
+    result.trace.push(.capture);
+    result.trace.push(.target);
+    result.trace.push(.bubble);
+    if (!ev.pressed) return result;
+    result.action = self.dispatchAt(Keystroke.fromKeyEvent(ev), stack, now_ms);
+    if (result.action != null or listener_consumed) {
+        result.consumed = true;
+        return result;
+    }
+    result.trace.push(.default_action);
+    result.default_action = defaultAction(ev);
+    result.consumed = result.default_action != null;
+    return result;
+}
+
+pub fn defaultAction(ev: event.KeyEvent) ?DefaultKeyAction {
+    if (!ev.pressed or ev.repeat) return null;
+    return switch (ev.key) {
+        .tab => if (ev.modifiers.shift) .tab_backward else .tab_forward,
+        .enter, .space => .activate,
+        .escape => .dismiss,
+        .left => .move_left,
+        .right => .move_right,
+        .up => .move_up,
+        .down => .move_down,
+        else => null,
+    };
+}
+
 pub const Keymap = struct {
     bindings: [limits.MAX_KEYMAP_BINDINGS]KeyBinding = undefined,
     count: u8 = 0,
@@ -537,6 +596,27 @@ test "key sequence deadline uses elapsed milliseconds not dispatch count" {
     // Even a direct caller cannot finish a stale sequence.
     try t.expect(map.dispatchAt(g, &.{}, 10_000) == null);
     try t.expectEqual(@as(?i64, 10_750), map.nextDeadlineMs());
+}
+
+test "default keyboard phases run only after unconsumed capture target bubble" {
+    var map = Keymap{};
+    const tab = dispatchWithDefault(&map, .{ .key = .tab, .pressed = true }, &.{}, 0, false);
+    try std.testing.expectEqual(DefaultKeyAction.tab_forward, tab.default_action.?);
+    try std.testing.expectEqual(@as(u8, 4), tab.trace.len);
+    try std.testing.expectEqual(KeyDispatchPhase.default_action, tab.trace.phases[3]);
+
+    const consumed = dispatchWithDefault(&map, .{ .key = .enter, .pressed = true }, &.{}, 0, true);
+    try std.testing.expect(consumed.consumed);
+    try std.testing.expect(consumed.default_action == null);
+    try std.testing.expectEqual(@as(u8, 3), consumed.trace.len);
+}
+
+test "key binding wins before default action" {
+    var map = Keymap{};
+    try std.testing.expect(map.bind("enter", "submit", null));
+    const result = dispatchWithDefault(&map, .{ .key = .enter, .pressed = true }, &.{}, 1, false);
+    try std.testing.expectEqualStrings("submit", result.action.?);
+    try std.testing.expect(result.default_action == null);
 }
 
 test "keymap sequences pend, complete, expire, and reset" {

@@ -110,13 +110,14 @@ pub fn Control(comptime role: a11y.Role) type {
                 .increment => if (role == .slider) self.setValue(self.value + self.options.step, win),
                 .decrement => if (role == .slider) self.setValue(self.value - self.options.step, win),
                 .set_value => if (role == .slider) self.setValue(request.value, win),
+                .set_text_selection => {},
                 .focus => {},
             }
         }
         pub fn handleEvent(self: *Self, event: platform.Event, cx: *runtime.Context(Self)) bool {
             self.pressable.setEnabled(!self.options.disabled);
             if (event == .window) {
-                if (event.window == .unfocused or event.window == .close_requested) self.pressable.cancel();
+                if (event.window == .unfocused or event.window == .close_requested or event.window == .cancelled) self.pressable.cancel();
                 return false;
             }
             if (event != .key or self.options.disabled or role == .progress) return false;
@@ -135,11 +136,12 @@ pub fn Control(comptime role: a11y.Role) type {
                 cx.notify();
                 return true;
             }
-            if (self.pressable.keyEvent(key.key, key.pressed, key.repeat)) {
+            const key_result = self.pressable.keyEventResult(key.key, key.pressed, key.repeat);
+            if (key_result == .activated) {
                 self.activate(win);
                 cx.notify();
             }
-            return key.key == .enter or key.key == .space;
+            return key_result != .ignored;
         }
         pub fn render(self: *Self, win: *Window, cx: *runtime.Context(Self)) e.Element {
             const t = self.options.tokens orelse theme.current();
@@ -147,8 +149,8 @@ pub fn Control(comptime role: a11y.Role) type {
             self.updateBounds(win, cx);
             self.pressable.setEnabled(!self.options.disabled);
             self.pressable.setHovered(self.bounds.contains(win.pointer_position));
-            if (!win.left_button_down) self.pressable.cancel();
             const focused = win.focused.eql(focus);
+            if (!win.left_button_down or !focused) self.pressable.cancel();
             var root = e.div().keyed(self.options.key).w(self.options.width).h(t.button_h).flex_row().gap(t.spacing.sm).items_center().px(t.spacing.sm).rounded(t.radii.md)
                 .bg(theme.stateBg(t, t.palette.surface, self.pressable.visual())).border_color(if (focused) t.palette.focus_ring else t.palette.border);
             e.element.currentFrame().nodes[root.index].style.border_width = if (focused) t.focus_ring_width else 1;

@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "reference_root": ".references/gpui",
+  "fixtures": [
+    {
+      "id": "layout.flex-padding",
+      "domain": "layout_geometry",
+      "source": ".references/gpui/crates/gpui/src/taffy.rs",
+      "tolerance": {"x": 0.01, "y": 0.01, "width": 0.01, "height": 0.01},
+      "cases": ["row_gap_padding", "percentage_nested", "wrap_absolute"]
+    },
+    {
+      "id": "animation.spring-step",
+      "domain": "animation_values",
+      "source": ".references/gpui/crates/gpui/src/spring.rs",
+      "tolerance": {"position": 0.0001, "velocity": 0.0001},
+      "cases": ["underdamped", "critical", "overdamped", "retarget"]
+    },
+    {
+      "id": "input.capture-target-bubble",
+      "domain": "input_traces",
+      "source": ".references/gpui/crates/gpui/src/window.rs",
+      "tolerance": {},
+      "cases": ["capture-target-bubble-default", "capture-stop"]
+    },
+    {
+      "id": "text.utf8-ranges",
+      "domain": "text_ranges",
+      "source": ".references/gpui/crates/gpui/src/text_system/line_layout.rs",
+      "tolerance": {"start": 0, "end": 0},
+      "cases": ["ascii", "combining-mark", "emoji-sequence"]
+    },
+    {
+      "id": "scene.command-digest",
+      "domain": "scene_digests",
+      "source": ".references/gpui/crates/gpui/src/scene.rs",
+      "tolerance": {},
+      "cases": ["ordered-quads", "clipped-command", "path-transform"]
+    },
+    {
+      "id": "list.uniform-large",
+      "domain": "virtualized_large_lists",
+      "source": ".references/gpui/crates/gpui/src/elements/uniform_list.rs",
+      "tolerance": {"start": 0, "end": 0, "built": 0},
+      "cases": ["one-million-top", "one-million-middle", "one-million-end"]
+    }
+  ]
+}

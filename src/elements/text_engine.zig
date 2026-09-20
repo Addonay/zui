@@ -76,7 +76,12 @@ pub fn measureCached(
 ) !core.Size {
     const cached = try engine.layoutCached(alloc, node.text_value, attrs(node), wrapWidth(node));
     node.setCozmicLayout(cached);
-    return .{ .w = cached.layout.width, .h = cached.layout.height };
+    var height = cached.layout.height;
+    if (node.text_style.line_clamp) |lines| {
+        const line_height = node.text_style.line_height orelse node.text_style.size * 1.25;
+        height = @min(height, line_height * @as(f32, @floatFromInt(lines)));
+    }
+    return .{ .w = cached.layout.width, .h = height };
 }
 
 /// The node's retained layout when it is valid for the exact shape inputs
@@ -388,6 +393,56 @@ test "element parity: measured width equals painted scene extent" {
             case.tracking,
             case.wrap_width,
         );
+    }
+}
+
+test "line clamp limits measured text and emitted glyph lines" {
+    const alloc = testing.allocator;
+    const engine = try parityEngine(alloc);
+    defer engine.deinit();
+    const frame = try alloc.create(element.Frame);
+    defer alloc.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = alloc;
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const text_el = element.text("one two three four five six seven eight", .{ .size = 16, .line_height = 20, .line_clamp = 1 }).w(100);
+    const root = element.div().w(100).h(100).child(text_el);
+    layout_mod.layout(frame, root, .{ .w = 100, .h = 100 });
+    const text_index = frame.nodes[root.index].first_child.?;
+    try testing.expect(frame.nodes[text_index].measured.h <= 20.01);
+    const scene = try alloc.create(gpu.Scene);
+    defer alloc.destroy(scene);
+    scene.* = .{};
+    painter.paint(frame, root, scene);
+    for (scene.glyphSlice()) |glyph| try testing.expect(glyph.y < 20.01);
+}
+
+test "ellipsis text overflow keeps emitted glyphs inside the authored width" {
+    const alloc = testing.allocator;
+    const engine = try parityEngine(alloc);
+    defer engine.deinit();
+    const frame = try alloc.create(element.Frame);
+    defer alloc.destroy(frame);
+    frame.* = .{};
+    frame.reset(@ptrFromInt(1), .{});
+    frame.engine = engine;
+    frame.allocator = alloc;
+    element.beginFrame(frame);
+    defer element.endFrame();
+    const text_el = element.text("a very long single line that must truncate", .{ .size = 16, .line_height = 20, .text_overflow = .ellipsis }).w(90);
+    const root = element.div().w(90).h(40).child(text_el);
+    layout_mod.layout(frame, root, .{ .w = 90, .h = 40 });
+    const text_index = frame.nodes[root.index].first_child.?;
+    const node = &frame.nodes[text_index];
+    const scene = try alloc.create(gpu.Scene);
+    defer alloc.destroy(scene);
+    scene.* = .{};
+    painter.paint(frame, root, scene);
+    for (scene.glyphSlice()) |glyph| {
+        try testing.expect(glyph.x + @as(f32, @floatFromInt(glyph.w)) <= node.bounds.x + node.bounds.w + 1);
     }
 }
 

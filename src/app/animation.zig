@@ -9,9 +9,9 @@
 //! API is ZUI's own (Zig has no closure capture, so easings are function
 //! pointers and animated outputs are computed inline by the caller).
 //!
-//! Deliberately absent: transforms (rotate/scale/shear). The scene has no
-//! transform support (see docs/RENDER_CONTRACT.md §5E), so there is nothing
-//! for a transform animation to emit into yet.
+//! Image/SVG rotation, scale, and translation are emitted through the scene's
+//! image-blit transform; arbitrary nested transforms and shear remain separate
+//! work.
 
 const std = @import("std");
 
@@ -124,6 +124,104 @@ pub const Tween = struct {
     /// Map the eased delta onto a scalar range.
     pub fn value(self: *const Tween, from: f32, to: f32) f32 {
         return from + (to - from) * self.delta();
+    }
+};
+
+// ---------------------------------------------------------------------------
+// GPUI Animation/AnimationElement policy without heap closures.
+// ---------------------------------------------------------------------------
+
+/// Declarative animation policy matching the source-level behavior of GPUI's
+/// `Animation`: one-shot or repeating, optional shared-clock phase, easing,
+/// and a render-rate cap. The element/view layer owns the property mapping;
+/// this value owns only timing policy.
+pub const Animation = struct {
+    duration_s: f32,
+    oneshot: bool = true,
+    synced: bool = false,
+    max_fps: ?f32 = null,
+    easing: *const fn (f32) f32 = &linear,
+
+    pub fn init(duration_s: f32) Animation {
+        std.debug.assert(std.math.isFinite(duration_s) and duration_s >= 0);
+        return .{ .duration_s = duration_s };
+    }
+
+    pub fn repeat(self: Animation) Animation {
+        var out = self;
+        out.oneshot = false;
+        return out;
+    }
+
+    pub fn repeatSynced(self: Animation) Animation {
+        var out = self.repeat();
+        out.synced = true;
+        return out;
+    }
+
+    pub fn withEasing(self: Animation, easing: *const fn (f32) f32) Animation {
+        var out = self;
+        out.easing = easing;
+        return out;
+    }
+
+    pub fn withMaxFps(self: Animation, fps: f32) Animation {
+        var out = self;
+        out.max_fps = if (std.math.isFinite(fps) and fps > 0) fps else null;
+        return out;
+    }
+};
+
+/// Retained animation clock. Callers sample `phase()` while building an
+/// element and request a new Window frame while `advance()` returns true.
+/// `synced` tracks an externally supplied absolute clock through `setTime`,
+/// avoiding a hidden global clock in headless tests.
+pub const AnimationTrack = struct {
+    animation: Animation,
+    elapsed_s: f32 = 0,
+    last_time_s: ?f32 = null,
+
+    pub fn init(animation: Animation) AnimationTrack {
+        return .{ .animation = animation };
+    }
+
+    pub fn reset(self: *AnimationTrack) void {
+        self.elapsed_s = 0;
+        self.last_time_s = null;
+    }
+
+    pub fn advance(self: *AnimationTrack, dt_s: f32) bool {
+        if (dt_s > 0 and std.math.isFinite(dt_s)) self.elapsed_s += dt_s;
+        return !self.done();
+    }
+
+    pub fn setTime(self: *AnimationTrack, absolute_s: f32) bool {
+        if (!std.math.isFinite(absolute_s)) return !self.done();
+        const previous = self.last_time_s orelse absolute_s;
+        self.last_time_s = absolute_s;
+        return self.advance(@max(0, absolute_s - previous));
+    }
+
+    pub fn cycles(self: *const AnimationTrack) u32 {
+        if (self.animation.duration_s <= 0) return 1;
+        return @intFromFloat(@floor(self.elapsed_s / self.animation.duration_s));
+    }
+
+    pub fn done(self: *const AnimationTrack) bool {
+        return self.animation.oneshot and self.animation.duration_s > 0 and self.elapsed_s >= self.animation.duration_s;
+    }
+
+    pub fn phase(self: *const AnimationTrack) f32 {
+        if (self.animation.duration_s <= 0) return 1;
+        if (self.animation.oneshot) return self.animation.easing(@min(1, self.elapsed_s / self.animation.duration_s));
+        const cycle = @as(f32, @floatFromInt(self.cycles()));
+        return self.animation.easing((self.elapsed_s / self.animation.duration_s) - cycle);
+    }
+
+    pub fn nextFrameDelay(self: *const AnimationTrack) ?f32 {
+        if (self.done()) return null;
+        if (self.animation.max_fps) |fps| return 1 / fps;
+        return 0;
     }
 };
 
@@ -684,6 +782,20 @@ test "tween delay, repeat, pingpong, and done" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), pingpong.delta(), 1e-6);
     pingpong.advance(1.0); // 1.25 total: odd cycle, reversed
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), pingpong.delta(), 1e-6);
+}
+
+test "animation track repeats, throttles, syncs, and completes" {
+    var track = AnimationTrack.init(Animation.init(2).repeat().withMaxFps(30));
+    try std.testing.expect(track.advance(0.5));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), track.phase(), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 30.0), track.nextFrameDelay().?, 1e-6);
+    try std.testing.expect(track.setTime(2.5));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), track.phase(), 1e-6);
+
+    var once = AnimationTrack.init(Animation.init(1));
+    try std.testing.expect(!once.advance(1.1));
+    try std.testing.expectEqual(@as(f32, 1), once.phase());
+    try std.testing.expect(once.nextFrameDelay() == null);
 }
 
 test "keyframes evaluate segments with easing and clamp ends" {

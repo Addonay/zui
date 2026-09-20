@@ -20,7 +20,8 @@
 //! ## Canvas scope
 //!
 //! `Canvas` is one checked `Scene` push per method with the hook's clip
-//! attached — fills, gradients, rings, and a raw glyph escape. It is not a
+//! attached — fills, gradients, rings, one-segment strokes, and a raw glyph
+//! escape. It is not a
 //! renderer: overflow stays a counted drop + frame rejection, exactly like
 //! built-in paint. Shaped text should compose a `text()` child element;
 //! `glyph()` exists only for pre-rasterized marks whose atlas entry the
@@ -48,6 +49,21 @@ pub const Canvas = struct {
         return right > x and bottom > y;
     }
 
+    fn visibleStroke(self: *const Canvas, from: core.Point, to: core.Point, width: f32) bool {
+        if (width <= 0 or !std.math.isFinite(width) or
+            !std.math.isFinite(from.x) or !std.math.isFinite(from.y) or
+            !std.math.isFinite(to.x) or !std.math.isFinite(to.y)) return false;
+        if (from.eql(to)) return false;
+        const half = width / 2;
+        const bounds = core.Rect{
+            .x = @min(from.x, to.x) - half,
+            .y = @min(from.y, to.y) - half,
+            .w = @max(from.x, to.x) - @min(from.x, to.x) + width,
+            .h = @max(from.y, to.y) - @min(from.y, to.y) + width,
+        };
+        return self.visible(bounds);
+    }
+
     /// Solid rounded rect. Skips empty, transparent, and fully-clipped
     /// draws like the built-in painter.
     pub fn fillRect(self: *Canvas, bounds: core.Rect, color: core.Color, radius: f32) void {
@@ -68,6 +84,44 @@ pub const Canvas = struct {
         _ = self.scene.push(.{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = bounds.h, .color = color, .radius = radius, .border_width = width, .clip = self.clip });
     }
 
+    /// Stroke one visible line segment. The scene keeps the endpoints and
+    /// clip intact so the CPU/GPU renderers preserve paint order and apply
+    /// clipping in their own path APIs. Degenerate, transparent, invalid,
+    /// zero-width, and fully clipped lines are skipped.
+    pub fn strokeLine(self: *Canvas, from: core.Point, to: core.Point, color: core.Color, width: f32) void {
+        if (color.a <= 0 or !self.visibleStroke(from, to, width)) return;
+        _ = self.scene.pushStroke(.{ .from = from, .to = to, .color = color, .width = width, .clip = self.clip });
+    }
+
+    /// Start a retained compositing group. Groups are bounded scene commands;
+    /// they may be nested and affect every primitive emitted until popGroup.
+    pub fn pushGroup(self: *Canvas, opacity: f32, transform: [6]f32, clip: ?scene_mod.ClipShape) bool {
+        return self.scene.pushGroup(.{ .opacity = opacity, .transform = transform, .clip = clip });
+    }
+
+    pub fn popGroup(self: *Canvas) bool {
+        return self.scene.popGroup();
+    }
+
+    /// Fill a bounded multi-segment path. The caller supplies a fully built
+    /// path so no hidden allocation or unbounded builder state is introduced.
+    pub fn fillPath(self: *Canvas, path: scene_mod.Path) bool {
+        if (path.segment_len == 0 or path.color.a <= 0 or !self.visible(pathBounds(path))) return false;
+        var clipped = path;
+        clipped.clip = self.clip;
+        return self.scene.pushPath(clipped);
+    }
+
+    pub fn strokePath(self: *Canvas, path: scene_mod.Path, width: f32, join: scene_mod.Stroke.Join, cap: scene_mod.Stroke.Cap) bool {
+        if (path.segment_len == 0 or width <= 0 or path.color.a <= 0 or !self.visible(pathBounds(path))) return false;
+        var stroked = path;
+        stroked.stroke_width = width;
+        stroked.join = join;
+        stroked.cap = cap;
+        stroked.clip = self.clip;
+        return self.scene.pushPath(stroked);
+    }
+
     /// Raw glyph escape for pre-rasterized marks: pushes one scene glyph at
     /// the caller's atlas entry. For shaped text, compose a `text()` child
     /// instead — this performs no shaping, fallback, or rasterization.
@@ -76,6 +130,36 @@ pub const Canvas = struct {
         _ = self.scene.pushGlyph(.{ .x = x, .y = y, .w = w, .h = h, .color = color, .atlas_offset = atlas_offset, .clip = self.clip });
     }
 };
+
+fn pathBounds(path: scene_mod.Path) core.Rect {
+    var min_x: f32 = std.math.inf(f32);
+    var min_y: f32 = std.math.inf(f32);
+    var max_x: f32 = -std.math.inf(f32);
+    var max_y: f32 = -std.math.inf(f32);
+    for (path.segments[0..path.segment_len]) |segment| switch (segment) {
+        .move_to, .line_to => |p| {
+            min_x = @min(min_x, p.x);
+            min_y = @min(min_y, p.y);
+            max_x = @max(max_x, p.x);
+            max_y = @max(max_y, p.y);
+        },
+        .quad_to => |q| {
+            min_x = @min(min_x, @min(q.ctrl.x, q.to.x));
+            min_y = @min(min_y, @min(q.ctrl.y, q.to.y));
+            max_x = @max(max_x, @max(q.ctrl.x, q.to.x));
+            max_y = @max(max_y, @max(q.ctrl.y, q.to.y));
+        },
+        .cubic_to => |c| {
+            min_x = @min(min_x, @min(c.ctrl1.x, @min(c.ctrl2.x, c.to.x)));
+            min_y = @min(min_y, @min(c.ctrl1.y, @min(c.ctrl2.y, c.to.y)));
+            max_x = @max(max_x, @max(c.ctrl1.x, @max(c.ctrl2.x, c.to.x)));
+            max_y = @max(max_y, @max(c.ctrl1.y, @max(c.ctrl2.y, c.to.y)));
+        },
+        .close => {},
+    };
+    if (!std.math.isFinite(min_x) or max_x <= min_x or max_y <= min_y) return .{};
+    return .{ .x = min_x, .y = min_y, .w = max_x - min_x, .h = max_y - min_y };
+}
 
 /// Typed vtable constructor. `Impl` declares:
 ///   `measure(*State, *element.Frame) core.Size`
@@ -328,6 +412,8 @@ test "custom canvas primitives push checked quads with the hook clip" {
     const scene = try t.allocator.create(gpu.Scene);
     defer t.allocator.destroy(scene);
     scene.* = .{};
+    var stroke_storage: gpu.StrokeStorage = undefined;
+    scene.attachStrokeStorage(&stroke_storage);
     var canvas = Canvas.init(scene, .{ .x = 0, .y = 0, .w = 10, .h = 10 });
     canvas.fillRect(.{ .x = 0, .y = 0, .w = 5, .h = 5 }, core.Color.hex(0xffffff), 2);
     canvas.gradientRect(.{ .x = 0, .y = 0, .w = 5, .h = 5 }, core.Color.hex(0x000000), core.Color.hex(0xffffff), 0);
@@ -341,4 +427,57 @@ test "custom canvas primitives push checked quads with the hook clip" {
     try t.expect(scene.slice()[1].gradient_to != null);
     try t.expectApproxEqAbs(@as(f32, 1), scene.slice()[2].border_width, 0.001);
     try t.expect(!scene.overflowed());
+}
+
+test "custom canvas line strokes honor clip and degenerate handling" {
+    const t = std.testing;
+    const gpu = @import("../gpu/root.zig");
+    const scene = try t.allocator.create(gpu.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    var stroke_storage: gpu.StrokeStorage = undefined;
+    scene.attachStrokeStorage(&stroke_storage);
+    var canvas = Canvas.init(scene, .{ .x = 0, .y = 0, .w = 10, .h = 10 });
+    canvas.strokeLine(.{ .x = -2, .y = 5 }, .{ .x = 12, .y = 5 }, core.Color.hex(0xffffff), 2);
+    canvas.strokeLine(.{ .x = 2, .y = 2 }, .{ .x = 2, .y = 2 }, core.Color.hex(0xffffff), 2);
+    canvas.strokeLine(.{ .x = 2, .y = 2 }, .{ .x = 8, .y = 2 }, core.Color.hex(0xffffff), 0);
+    canvas.strokeLine(.{ .x = 20, .y = 2 }, .{ .x = 25, .y = 2 }, core.Color.hex(0xffffff), 2);
+    canvas.strokeLine(.{ .x = 2, .y = 2 }, .{ .x = 8, .y = 2 }, core.Color.transparent, 2);
+    try t.expectEqual(@as(usize, 1), scene.strokeSlice().len);
+    try t.expectEqual(core.Point{ .x = -2, .y = 5 }, scene.strokeSlice()[0].from);
+    try t.expectEqual(core.Point{ .x = 12, .y = 5 }, scene.strokeSlice()[0].to);
+    try t.expectEqual(core.Rect{ .x = 0, .y = 0, .w = 10, .h = 10 }, scene.strokeSlice()[0].clip);
+    try t.expectEqual(scene_mod.CommandKind.stroke, scene.commandSlice()[0].kind);
+    try t.expect(!scene.overflowed());
+}
+
+test "custom canvas emits bounded paths, groups, joins, caps, and clip geometry" {
+    const t = std.testing;
+    const gpu = @import("../gpu/root.zig");
+    var scene = gpu.Scene{};
+    var paths: gpu.PathStorage = undefined;
+    scene.attachPathStorage(&paths);
+    var canvas = Canvas.init(&scene, .{ .x = 0, .y = 0, .w = 100, .h = 100 });
+
+    var path = gpu.Path{};
+    path.segments[0] = .{ .move_to = .{ .x = 5, .y = 5 } };
+    path.segments[1] = .{ .line_to = .{ .x = 40, .y = 5 } };
+    path.segments[2] = .{ .quad_to = .{ .ctrl = .{ .x = 50, .y = 20 }, .to = .{ .x = 40, .y = 40 } } };
+    path.segments[3] = .{ .close = {} };
+    path.segment_len = 4;
+    path.color = core.Color.hex(0xff0000);
+
+    try t.expect(canvas.pushGroup(0.5, .{ 1, 0, 0, 1, 3, 4 }, .{ .rounded = .{ .rect = .{ .x = 0, .y = 0, .w = 80, .h = 80 }, .radius = 8 } }));
+    try t.expect(canvas.fillPath(path));
+    try t.expect(canvas.strokePath(path, 2, .bevel, .butt));
+    try t.expect(canvas.popGroup());
+
+    try t.expectEqual(@as(usize, 2), scene.pathSlice().len);
+    try t.expectEqual(gpu.Stroke.Join.bevel, scene.pathSlice()[1].join);
+    try t.expectEqual(gpu.Stroke.Cap.butt, scene.pathSlice()[1].cap);
+    try t.expectEqual(@as(usize, 4), scene.commandSlice().len);
+    try t.expectEqual(scene_mod.CommandKind.begin_group, scene.commandSlice()[0].kind);
+    try t.expectEqual(scene_mod.CommandKind.path, scene.commandSlice()[1].kind);
+    try t.expectEqual(scene_mod.CommandKind.path, scene.commandSlice()[2].kind);
+    try t.expectEqual(scene_mod.CommandKind.end_group, scene.commandSlice()[3].kind);
 }

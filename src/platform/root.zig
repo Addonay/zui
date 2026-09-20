@@ -15,6 +15,9 @@ pub const event = @import("event.zig");
 pub const id = @import("id.zig");
 pub const null_backend = @import("null.zig");
 pub const dl = @import("dl.zig");
+pub const services = @import("services.zig");
+pub const mobile = @import("mobile.zig");
+pub const native_window_services = @import("native_window_services.zig");
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -171,6 +174,9 @@ test {
     _ = @import("id.zig");
     _ = @import("null.zig");
     _ = @import("dl.zig");
+    _ = @import("services.zig");
+    _ = @import("mobile.zig");
+    _ = @import("native_window_services.zig");
     // Only the native backend module is compiled in: foreign modules carry
     // OS-specific bodies (and ABI pins) that must not be analyzed here.
     if (is_linux) _ = @import("linux/mod.zig");

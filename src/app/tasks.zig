@@ -74,9 +74,37 @@ pub const JobFns = struct {
     alive: ?*const fn (*anyopaque) bool = null,
 };
 
+pub const TimerId = u64;
+
+pub const TimerCallback = *const fn (*anyopaque) void;
+
+const Timer = struct {
+    id: TimerId,
+    due_ms: i64,
+    callback: TimerCallback,
+    ctx: *anyopaque,
+    cancelled: bool = false,
+};
+
 pub const Options = struct {
     workers: usize = DEFAULT_WORKERS,
     max_in_flight: usize = DEFAULT_MAX_IN_FLIGHT,
+
+    /// Read optional deployment tuning without making the public App
+    /// constructor platform-specific. Invalid values retain safe defaults;
+    /// `workers=0` is intentional and selects deterministic inline execution.
+    pub fn fromEnv() @This() {
+        var result = @This(){};
+        if (!builtin.link_libc) return result;
+        if (std.c.getenv("ZUI_TASK_WORKERS")) |raw| {
+            result.workers = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch result.workers;
+        }
+        if (std.c.getenv("ZUI_TASK_MAX_IN_FLIGHT")) |raw| {
+            const value = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch result.max_in_flight;
+            result.max_in_flight = @max(value, 1);
+        }
+        return result;
+    }
 };
 
 pub const TaskRuntime = struct {
@@ -96,6 +124,9 @@ pub const TaskRuntime = struct {
     in_flight: usize = 0,
     workers: std.ArrayList(std.Thread) = .empty,
     started: bool = false,
+    /// Stable tokens outlive individual Window allocations and are freed
+    /// only when this TaskRuntime shuts down.
+    window_tokens: std.ArrayList(*window_mod.WindowLivenessToken) = .empty,
     shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Optional wakeup signalled by workers after publishing a completion
     /// (lets a blocked event loop return promptly; delivery still happens
@@ -108,6 +139,10 @@ pub const TaskRuntime = struct {
     dropped_cancelled: u64 = 0,
     dropped_stale: u64 = 0,
     rejected_full: u64 = 0,
+    /// UI-thread one-shot timers. Keeping these in the executor gives timer
+    /// callbacks the same lifetime/shutdown boundary as async completions.
+    timers: std.ArrayList(Timer) = .empty,
+    next_timer_id: TimerId = 1,
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) TaskRuntime {
         return .{
@@ -116,6 +151,28 @@ pub const TaskRuntime = struct {
             .max_in_flight = @max(opts.max_in_flight, 1),
             .num_workers = opts.workers,
         };
+    }
+
+    pub fn createWindowToken(self: *TaskRuntime) !*window_mod.WindowLivenessToken {
+        self.assertUiThread();
+        const token = try self.allocator.create(window_mod.WindowLivenessToken);
+        errdefer self.allocator.destroy(token);
+        token.* = .{};
+        try self.window_tokens.append(self.allocator, token);
+        return token;
+    }
+
+    /// Roll back a token when openWindow fails before ownership is published.
+    pub fn discardWindowToken(self: *TaskRuntime, token: *window_mod.WindowLivenessToken) void {
+        self.assertUiThread();
+        for (self.window_tokens.items, 0..) |candidate, i| {
+            if (candidate == token) {
+                _ = self.window_tokens.swapRemove(i);
+                token.invalidate();
+                self.allocator.destroy(token);
+                return;
+            }
+        }
     }
 
     fn assertUiThread(self: *const TaskRuntime) void {
@@ -215,6 +272,61 @@ pub const TaskRuntime = struct {
         return self.in_flight;
     }
 
+    /// Schedule a one-shot callback on the UI thread. The callback must not
+    /// retain `ctx` beyond its own execution; use cancelTimer to discard a
+    /// timer before it fires. Timers are deliberately monotonic-millisecond
+    /// based so App.stepAt remains deterministic in tests and embeddings.
+    pub fn scheduleAt(self: *TaskRuntime, due_ms: i64, callback: TimerCallback, ctx: *anyopaque) !TimerId {
+        self.assertUiThread();
+        const id = self.next_timer_id;
+        self.next_timer_id +%= 1;
+        if (self.next_timer_id == 0) self.next_timer_id = 1;
+        try self.timers.append(self.allocator, .{ .id = id, .due_ms = due_ms, .callback = callback, .ctx = ctx });
+        return id;
+    }
+
+    pub fn scheduleAfter(self: *TaskRuntime, now_ms: i64, delay_ms: i64, callback: TimerCallback, ctx: *anyopaque) !TimerId {
+        return self.scheduleAt(std.math.add(i64, now_ms, @max(delay_ms, 0)) catch std.math.maxInt(i64), callback, ctx);
+    }
+
+    /// Cancel a pending one-shot timer. Returns false for an already-fired or
+    /// unknown timer id. Cancellation is idempotent at the caller boundary.
+    pub fn cancelTimer(self: *TaskRuntime, id: TimerId) bool {
+        self.assertUiThread();
+        for (self.timers.items, 0..) |*timer, i| {
+            if (timer.id == id and !timer.cancelled) {
+                _ = self.timers.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn nextTimerDeadlineMs(self: *const TaskRuntime) ?i64 {
+        var result: ?i64 = null;
+        for (self.timers.items) |timer| {
+            if (timer.cancelled) continue;
+            result = if (result) |old| @min(old, timer.due_ms) else timer.due_ms;
+        }
+        return result;
+    }
+
+    /// Run every timer due at `now_ms`. Removing before invoking the callback
+    /// makes re-entrant schedule/cancel calls safe and gives each timer
+    /// exactly-once semantics even when the callback schedules another timer.
+    pub fn drainTimers(self: *TaskRuntime, now_ms: i64) void {
+        self.assertUiThread();
+        var i: usize = 0;
+        while (i < self.timers.items.len) {
+            if (self.timers.items[i].cancelled or self.timers.items[i].due_ms <= now_ms) {
+                const timer = self.timers.orderedRemove(i);
+                if (!timer.cancelled and timer.due_ms <= now_ms) timer.callback(timer.ctx);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
     /// Type-erased submit. Takes ownership of `ctx` (via `fns.destroy`)
     /// only on success; on `TaskQueueFull`/`OutOfMemory` the caller keeps
     /// `ctx` and must destroy it.
@@ -267,11 +379,21 @@ pub const TaskRuntime = struct {
         const Box = struct {
             weak: runtime.WeakEntity(T),
             window: ?*window_mod.Window,
+            window_token: ?*window_mod.WindowLivenessToken,
+            window_epoch: ?u64,
             state: Ctx,
         };
+        const window_token = if (window) |win| win.livenessToken() else null;
+        const window_epoch = if (window_token) |token| token.snapshot() else null;
         const box = try self.allocator.create(Box);
         errdefer self.allocator.destroy(box);
-        box.* = .{ .weak = weak, .window = window, .state = user };
+        box.* = .{
+            .weak = weak,
+            .window = window,
+            .window_token = window_token,
+            .window_epoch = window_epoch,
+            .state = user,
+        };
         const fns = JobFns{
             .run = struct {
                 fn runFn(raw: *anyopaque, cancel: Cancel) void {
@@ -282,6 +404,13 @@ pub const TaskRuntime = struct {
             .complete = struct {
                 fn completeFn(raw: *anyopaque) void {
                     const b: *Box = @ptrCast(@alignCast(raw));
+                    // Never construct a Context containing a Window whose
+                    // allocation may already have been reaped.
+                    if (b.window != null) {
+                        const token = b.window_token orelse return;
+                        const epoch = b.window_epoch orelse return;
+                        if (!token.isAliveAt(epoch)) return;
+                    }
                     // Double-gated: drain already checked liveness on this
                     // same thread, so upgrade cannot fail here; the check
                     // keeps completeFn safe if ever invoked directly.
@@ -299,6 +428,11 @@ pub const TaskRuntime = struct {
             .alive = struct {
                 fn aliveFn(raw: *anyopaque) bool {
                     const b: *Box = @ptrCast(@alignCast(raw));
+                    if (b.window != null) {
+                        const token = b.window_token orelse return false;
+                        const epoch = b.window_epoch orelse return false;
+                        if (!token.isAliveAt(epoch)) return false;
+                    }
                     return b.weak.isAlive();
                 }
             }.aliveFn,
@@ -393,6 +527,13 @@ pub const TaskRuntime = struct {
         if (self.ready_buf.len > 0) self.allocator.free(self.ready_buf);
         self.pending_buf = &.{};
         self.ready_buf = &.{};
+        self.timers.clearRetainingCapacity();
+        self.timers.deinit(self.allocator);
+        for (self.window_tokens.items) |token| {
+            token.invalidate();
+            self.allocator.destroy(token);
+        }
+        self.window_tokens.deinit(self.allocator);
         // wakeup_ctx is borrowed (see setWakeup); the owner frees it.
         self.wakeup_fn = null;
         self.wakeup_ctx = null;
@@ -484,7 +625,8 @@ test "task completion marshals to the UI thread" {
     // Direct spawnRaw with a minimal entity-targeted job, asserting the
     // worker/UI thread boundary explicitly. spawnForEntity wraps this same
     // path and is covered by the test below.
-    const Box = struct {        weak: runtime.WeakEntity(Counter),
+    const Box = struct {
+        weak: runtime.WeakEntity(Counter),
         st: *State,
     };
     const box = try t.allocator.create(Box);
@@ -778,6 +920,95 @@ test "over-limit submissions fail explicitly" {
     box2.* = .{};
     try t.expectError(error.TaskQueueFull, rt.spawnRaw(box2, fns));
     try t.expectEqual(@as(u64, 1), rt.rejected_full);
+    // The worker may still be executing the first job when the rejection is
+    // observed. Wait for publication rather than assuming a scheduler order;
+    // otherwise optimized builds can reach the drain before the ready queue.
+    const Ready = struct {
+        fn ready(raw: *anyopaque) bool {
+            return @as(*TaskRuntime, @ptrCast(@alignCast(raw))).readyCount() > 0;
+        }
+    };
+    if (rt.workerCount() > 0) try t.expect(spinUntil(Ready.ready, &rt));
     rt.drainCompletions();
     try t.expectEqual(@as(usize, 0), rt.inFlight());
+}
+
+test "executor timers order due callbacks and support cancellation" {
+    const t = std.testing;
+    var rt = TaskRuntime.init(t.allocator, .{ .workers = 0 });
+    defer rt.deinit();
+
+    const Probe = struct {
+        values: [4]u8 = .{ 0, 0, 0, 0 },
+        len: usize = 0,
+        rt: *TaskRuntime,
+        chained: bool = false,
+
+        fn record(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.values[self.len] += 1;
+            self.len += 1;
+            if (!self.chained) {
+                self.chained = true;
+                _ = self.rt.scheduleAt(15, record, raw) catch unreachable;
+            }
+        }
+
+        fn cancelled(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.values[3] = 99;
+        }
+    };
+
+    var probe = Probe{ .rt = &rt };
+    _ = try rt.scheduleAt(30, Probe.record, &probe);
+    _ = try rt.scheduleAt(10, Probe.record, &probe);
+    const doomed = try rt.scheduleAt(10, Probe.cancelled, &probe);
+    try t.expect(rt.cancelTimer(doomed));
+    try t.expect(!rt.cancelTimer(doomed));
+    try t.expectEqual(@as(?i64, 10), rt.nextTimerDeadlineMs());
+
+    rt.drainTimers(9);
+    try t.expectEqual(@as(usize, 0), probe.len);
+    rt.drainTimers(10);
+    try t.expectEqual(@as(usize, 1), probe.len);
+    try t.expectEqual(@as(?i64, 15), rt.nextTimerDeadlineMs());
+    rt.drainTimers(15);
+    try t.expectEqual(@as(usize, 2), probe.len);
+    rt.drainTimers(100);
+    try t.expectEqual(@as(usize, 3), probe.len);
+    try t.expectEqual(@as(u8, 0), probe.values[3]);
+}
+
+test "executor timer clock is deterministic and preserves equal-deadline order" {
+    const t = std.testing;
+    var rt = TaskRuntime.init(t.allocator, .{ .workers = 0 });
+    defer rt.deinit();
+
+    const Probe = struct {
+        order: [2]u8 = .{ 0, 0 },
+        len: usize = 0,
+
+        fn first(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.order[self.len] = 1;
+            self.len += 1;
+        }
+
+        fn second(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.order[self.len] = 2;
+            self.len += 1;
+        }
+    };
+
+    var probe = Probe{};
+    _ = try rt.scheduleAfter(100, 20, Probe.first, &probe);
+    _ = try rt.scheduleAt(120, Probe.second, &probe);
+    try t.expectEqual(@as(?i64, 120), rt.nextTimerDeadlineMs());
+    rt.drainTimers(119);
+    try t.expectEqual(@as(usize, 0), probe.len);
+    rt.drainTimers(120);
+    try t.expectEqual(@as(usize, 2), probe.len);
+    try t.expectEqual(@as([2]u8, .{ 1, 2 }), probe.order);
 }

@@ -23,12 +23,17 @@
             .url = "git+https://github.com/Addonay/vellz.git#d5aa45e7eda4d3924b64c2b9dfabf1c4f3412916",
             .hash = "vellz-0.1.0-VcH-R2VsPQBqbVwTgiWE82P4bz6fK8tx1hpBnF7zj2tg",
         },
+        .wgpu = .{
+            .url = "git+https://github.com/Addonay/wgpu.git#efd94fed85abcf4891aa7b055d9d9f5c4757b4b6",
+            .hash = "wgpu-0.1.0-hZv3miibBgCXbQKA1jAytJ_0pnhdPKd3LahA3ivmuGSE",
+            .lazy = true,
+        },
     },
     .paths = .{
         "src",
         "examples",
         "third_party",
-        "tools/smoke_consumer",
+        "tools",
         "docs/PLATFORM_MATRIX.md",
         "build.zig",
         "build.zig.zon",

@@ -99,6 +99,17 @@ pub fn sizeToPx(size: f32) u16 {
 /// generic sans-serif family (cozmic's configured default), and cozmic still
 /// applies per-script fallback when the selected face lacks a codepoint.
 pub const TextAttrs = struct {
+    pub const MAX_FONT_FEATURES: usize = 16;
+    pub const MAX_FALLBACK_FAMILIES: usize = 8;
+
+    /// One OpenType feature setting. Tags are four ASCII bytes (for example
+    /// `liga`); values follow HarfBuzz conventions (`0` disables a boolean
+    /// feature, `1` enables it, and larger values select a stylistic value).
+    pub const FontFeature = struct {
+        tag: [4]u8,
+        value: u32,
+    };
+
     /// Named font family (e.g. "Inter", "Noto Sans Arabic"), or `null` for
     /// the generic sans-serif family.
     family: ?[]const u8 = null,
@@ -117,7 +128,64 @@ pub const TextAttrs = struct {
     tracking: f32 = 0,
     /// Wrapping mode used by the layout.
     wrap: cozmic.Wrap = .word_or_glyph,
+    /// Ordered OpenType feature settings applied to every shaped run.
+    features: [MAX_FONT_FEATURES]FontFeature = @splat(.{ .tag = .{ 0, 0, 0, 0 }, .value = 0 }),
+    feature_count: u8 = 0,
+    /// Ordered fallback-family preference list. Cozmic still performs the
+    /// script-aware fallback search; these names are exposed to callers and
+    /// are used by `fallbackCandidates` for deterministic policy decisions.
+    fallback_families: [MAX_FALLBACK_FAMILIES]?[]const u8 = @splat(null),
+    fallback_count: u8 = 0,
+
+    /// Append an OpenType feature, bounded so style data remains frame-safe.
+    pub fn withFeature(self: *TextAttrs, tag: [4]u8, value: u32) void {
+        if (self.feature_count >= MAX_FONT_FEATURES) return;
+        self.features[self.feature_count] = .{ .tag = tag, .value = value };
+        self.feature_count += 1;
+    }
+
+    pub fn withFallbackFamily(self: *TextAttrs, family: []const u8) void {
+        if (self.fallback_count >= MAX_FALLBACK_FAMILIES or family.len == 0) return;
+        self.fallback_families[self.fallback_count] = family;
+        self.fallback_count += 1;
+    }
 };
+
+/// GPUI/Cosmic-style script buckets used for deterministic fallback policy.
+pub const FallbackScript = enum {
+    common,
+    arabic,
+    bengali,
+    cyrillic,
+    devanagari,
+    ethiopic,
+    hebrew,
+    han,
+    hangul,
+    japanese,
+    thai,
+    tibetan,
+    emoji,
+};
+
+/// Bounded platform-neutral fallback family candidates. These are policy
+/// names, not claims that a host has installed every family.
+pub fn fallbackCandidates(script: FallbackScript) []const []const u8 {
+    return switch (script) {
+        .arabic => &.{ "Noto Sans Arabic", "Noto Sans" },
+        .bengali => &.{ "Noto Sans Bengali", "Noto Sans" },
+        .devanagari => &.{ "Noto Sans Devanagari", "Noto Sans" },
+        .ethiopic => &.{ "Noto Sans Ethiopic", "Noto Sans" },
+        .hebrew => &.{ "Noto Sans Hebrew", "Noto Sans" },
+        .han => &.{ "Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans" },
+        .hangul => &.{ "Noto Sans CJK KR", "Noto Sans" },
+        .japanese => &.{ "Noto Sans CJK JP", "Noto Sans" },
+        .thai => &.{ "Noto Sans Thai", "Noto Sans" },
+        .tibetan => &.{ "Noto Serif Tibetan", "Noto Sans" },
+        .emoji => &.{ "Noto Color Emoji", "Noto Sans Symbols2" },
+        else => &.{ "Noto Sans", "DejaVu Sans", "FreeSans" },
+    };
+}
 
 /// What one `Layout.render` delivered to the caller's renderer.
 pub const PaintStats = struct {
@@ -309,6 +377,12 @@ pub const Engine = struct {
         if (attrs.tracking != 0) {
             _ = cozmic_attrs.with_letter_spacing(attrs.tracking / size);
         }
+        if (attrs.feature_count != 0) {
+            const FeatureTag = @TypeOf(cozmic.Attrs.init(allocator).font_features.features.items[0].tag);
+            for (attrs.features[0..attrs.feature_count]) |feature| {
+                _ = try cozmic_attrs.font_features.set(FeatureTag.new(&feature.tag), feature.value);
+            }
+        }
 
         try buffer.setText(text, &cozmic_attrs, .advanced, null);
         // Single shaping pass; `Layout` and all its readers (render, hit,
@@ -325,6 +399,8 @@ pub const Engine = struct {
             glyph_count += run.glyphs.len;
         }
 
+        const source_copy = try allocator.dupe(u8, text);
+
         return .{
             .allocator = allocator,
             .font_system = &self.fs,
@@ -332,6 +408,7 @@ pub const Engine = struct {
             .width = width,
             .height = height,
             .glyph_count = glyph_count,
+            .source_text = source_copy,
         };
     }
 
@@ -468,7 +545,6 @@ pub const Engine = struct {
     pub fn scaleScene(self: *Engine, scene: *@import("../gpu/scene.zig").Scene, scale: f32) void {
         if (scale == 1) return;
         for (scene.glyphs[0..scene.glyph_len]) |*g| {
-            g.density = scale;
             // Identify the 1x entry by its stable (offset, size) pair, the
             // only scene-side link back to the painter atlas.
             var original: ?AtlasEntry = null;
@@ -479,6 +555,11 @@ pub const Engine = struct {
                 }
             }
             const old = original orelse continue;
+            // Color glyphs are already RGBA images; keep their density at 1
+            // so Vellz scales the color bitmap at present time. The mask
+            // upgrade path below only knows how to rerasterize coverage.
+            if (old.content == .color) continue;
+            g.density = scale;
             const key = old.key;
             const size: f32 = @as(f32, @floatFromInt(key.size_px)) * scale;
             var scaled_key = key;
@@ -542,10 +623,152 @@ pub const Layout = struct {
     /// Sum of all run line heights: the total painted height.
     height: f32,
     glyph_count: usize,
+    /// Owned source bytes make logical line/word ranges available even after
+    /// the caller's transient text buffer changes.
+    source_text: []u8,
 
     pub fn deinit(self: *Layout) void {
+        self.allocator.free(self.source_text);
         self.buffer.deinit();
         self.* = undefined;
+    }
+
+    pub const ByteRange = struct { start: usize, end: usize };
+    pub const CharacterGeometry = struct {
+        line: usize,
+        start: usize,
+        end: usize,
+        x: f32,
+        width: f32,
+        y: f32,
+        height: f32,
+    };
+
+    pub const AccessibilityGeometry = struct {
+        positions: []f32,
+        widths: []f32,
+        ranges: []ByteRange,
+
+        pub fn deinit(self: *AccessibilityGeometry, alloc: std.mem.Allocator) void {
+            alloc.free(self.positions);
+            alloc.free(self.widths);
+            alloc.free(self.ranges);
+            self.* = undefined;
+        }
+    };
+
+    /// Expand grapheme geometry into Unicode-scalar geometry for AccessKit.
+    /// A shaped grapheme keeps one visual span, divided deterministically
+    /// among its scalars; this preserves ligature/combining safety while
+    /// matching AccessKit's character-indexed arrays.
+    pub fn accessibilityGeometry(self: *const Layout, alloc: std.mem.Allocator) !AccessibilityGeometry {
+        const graphemes = try self.characterGeometry(alloc);
+        defer alloc.free(graphemes);
+        var count: usize = 0;
+        for (graphemes) |item| count += std.unicode.utf8CountCodepoints(self.source_text[item.start..item.end]) catch 0;
+        var positions = try alloc.alloc(f32, count);
+        errdefer alloc.free(positions);
+        var widths = try alloc.alloc(f32, count);
+        errdefer alloc.free(widths);
+        var ranges = try alloc.alloc(ByteRange, count);
+        errdefer alloc.free(ranges);
+        var out: usize = 0;
+        for (graphemes) |item| {
+            const scalar_count = @max(1, std.unicode.utf8CountCodepoints(self.source_text[item.start..item.end]) catch 1);
+            const each = item.width / @as(f32, @floatFromInt(scalar_count));
+            var byte = item.start;
+            var ordinal: usize = 0;
+            while (byte < item.end) : (ordinal += 1) {
+                const next = byte + (std.unicode.utf8ByteSequenceLength(self.source_text[byte]) catch 1);
+                positions[out] = item.x + each * @as(f32, @floatFromInt(ordinal));
+                widths[out] = each;
+                ranges[out] = .{ .start = byte, .end = @min(next, item.end) };
+                out += 1;
+                byte = next;
+            }
+        }
+        return .{ .positions = positions, .widths = widths, .ranges = ranges };
+    }
+
+    /// Source logical line range. Wrapped visual runs retain the same line
+    /// index, matching GPUI's line/word APIs.
+    pub fn lineRange(self: *const Layout, line: usize) ?ByteRange {
+        var current: usize = 0;
+        var start: usize = 0;
+        for (self.source_text, 0..) |byte, i| {
+            if (byte != '\n') continue;
+            if (current == line) return .{ .start = start, .end = i };
+            current += 1;
+            start = i + 1;
+        }
+        if (current == line) return .{ .start = start, .end = self.source_text.len };
+        return null;
+    }
+
+    /// UAX#29 word ranges, filtered exactly like Cosmic Text's word motion.
+    pub fn wordRanges(self: *const Layout, alloc: std.mem.Allocator) ![]ByteRange {
+        var out: std.ArrayList(ByteRange) = .empty;
+        errdefer out.deinit(alloc);
+        var words = cozmic.unicode.wordBounds(self.source_text);
+        while (words.next()) |range| {
+            if (cozmic.unicode.isWordRange(self.source_text, range)) {
+                try out.append(alloc, .{ .start = range.start, .end = range.end });
+            }
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// Glyph-derived character positions and widths. Each grapheme in a
+    /// shaping cluster receives its proportional visual span; ligatures and
+    /// combining sequences therefore remain safe byte ranges rather than
+    /// guessed scalar advances.
+    pub fn characterGeometry(self: *const Layout, alloc: std.mem.Allocator) ![]CharacterGeometry {
+        var out: std.ArrayList(CharacterGeometry) = .empty;
+        errdefer out.deinit(alloc);
+        var run_iter = self.runs();
+        while (run_iter.next()) |run| {
+            for (run.glyphs) |glyph| {
+                const cluster = run.text[glyph.start..glyph.end];
+                const count = @max(1, cozmic.unicode.countGraphemes(cluster));
+                const each = glyph.w / @as(f32, @floatFromInt(count));
+                var it = cozmic.unicode.graphemeIndices(cluster);
+                var ordinal: usize = 0;
+                while (it.next()) |relative| {
+                    const end = it.pos;
+                    const x = if (glyph.level & 1 == 1)
+                        glyph.x + glyph.w - each * @as(f32, @floatFromInt(ordinal + 1))
+                    else
+                        glyph.x + each * @as(f32, @floatFromInt(ordinal));
+                    try out.append(alloc, .{
+                        .line = run.line_i,
+                        .start = glyph.start + relative,
+                        .end = glyph.start + end,
+                        .x = x,
+                        .width = each,
+                        .y = run.line_top,
+                        .height = run.line_height,
+                    });
+                    ordinal += 1;
+                }
+            }
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    pub fn characterPositions(self: *const Layout, alloc: std.mem.Allocator) ![]f32 {
+        const geometry = try self.characterGeometry(alloc);
+        defer alloc.free(geometry);
+        const result = try alloc.alloc(f32, geometry.len);
+        for (geometry, result) |item, *x| x.* = item.x;
+        return result;
+    }
+
+    pub fn characterWidths(self: *const Layout, alloc: std.mem.Allocator) ![]f32 {
+        const geometry = try self.characterGeometry(alloc);
+        defer alloc.free(geometry);
+        const result = try alloc.alloc(f32, geometry.len);
+        for (geometry, result) |item, *width| width.* = item.width;
+        return result;
     }
 
     /// Visible runs from the one shaping pass. Valid until `deinit`.
@@ -741,7 +964,15 @@ pub const CachedLayout = struct {
 fn attrsEqual(a: TextAttrs, b: TextAttrs) bool {
     if (a.size != b.size or a.line_height != b.line_height) return false;
     if (a.weight != b.weight or a.tracking != b.tracking or a.wrap != b.wrap) return false;
-    return optionalStrEqual(a.family, b.family);
+    if (!optionalStrEqual(a.family, b.family)) return false;
+    if (a.feature_count != b.feature_count or a.fallback_count != b.fallback_count) return false;
+    for (a.features[0..a.feature_count], b.features[0..b.feature_count]) |x, y| {
+        if (!std.mem.eql(u8, &x.tag, &y.tag) or x.value != y.value) return false;
+    }
+    for (a.fallback_families[0..a.fallback_count], b.fallback_families[0..b.fallback_count]) |x, y| {
+        if (!optionalStrEqual(x, y)) return false;
+    }
+    return true;
 }
 
 fn optionalStrEqual(a: ?[]const u8, b: ?[]const u8) bool {
@@ -766,6 +997,13 @@ pub fn layoutKeyHash(text: []const u8, attrs: TextAttrs, width_opt: ?f32) u64 {
     h.update(std.mem.asBytes(&attrs.tracking));
     h.update(std.mem.asBytes(&attrs.wrap));
     if (attrs.family) |f| h.update(f);
+    h.update(std.mem.asBytes(&attrs.feature_count));
+    for (attrs.features[0..attrs.feature_count]) |feature| {
+        h.update(&feature.tag);
+        h.update(std.mem.asBytes(&feature.value));
+    }
+    h.update(std.mem.asBytes(&attrs.fallback_count));
+    for (attrs.fallback_families[0..attrs.fallback_count]) |family| if (family) |f| h.update(f);
     h.update(std.mem.asBytes(&width_opt));
     return h.final();
 }
@@ -790,7 +1028,7 @@ fn runExtent(run: cozmic.buffer.LayoutRun) f32 {
 /// Forwards every callback to the wrapped renderer and counts them.
 // ---------------------------------------------------------------------------
 // Color glyph spike: does rasterization already deliver color ink, and does
-// the coverage-only atlas reject it without corrupting the pool? (see
+// the separate color pool preserve it without corrupting the mask pool? (see
 // docs/TEXT_ROADMAP.md)
 // ---------------------------------------------------------------------------
 
@@ -924,8 +1162,8 @@ test "color spike: engine rasterizes emoji as color ink the atlas rejects" {
     // environment case is pinned by the dedicated COLRv1 test below.
     if (!saw_color) return error.SkipZigTest;
 
-    // The coverage-only atlas contract holds: color ink is rejected without
-    // entering the pool, and cannot be read back as a mask entry.
+    // The mask API remains strict: color ink is rejected by putBitmap without
+    // entering the mask pool; the explicit color API is tested separately.
     var probe = Atlas{};
     const fake_key = AtlasKey{ .face_id = font_id, .glyph_id = 99, .size_px = 16 };
     const rgba = [_]u8{ 255, 0, 0, 255 };
@@ -1108,6 +1346,49 @@ test "text engine: measure equals paint extent" {
     while (runs.next()) |_| count += 1;
     try testing.expect(count > 1);
     try testing.expect(wrapped.height > wrapped.width);
+}
+
+test "text system: OpenType features are shaped and cache-keyed" {
+    const t = testing;
+    var attrs = test_attrs;
+    attrs.withFeature("liga".*, 0);
+    const disabled = layoutKeyHash("office", attrs, null);
+    attrs.features[0].value = 1;
+    const enabled = layoutKeyHash("office", attrs, null);
+    try t.expect(disabled != enabled);
+    try t.expectEqual(@as(usize, 2), fallbackCandidates(.arabic).len);
+    try t.expectEqualStrings("Noto Sans Arabic", fallbackCandidates(.arabic)[0]);
+}
+
+test "text system: line word and accessible character geometry are deterministic" {
+    const t = testing;
+    const alloc = testing.allocator;
+    const engine = try testEngine();
+    defer engine.deinit();
+    var layout = try engine.layout(alloc, "hello world\nffi", test_attrs, null);
+    defer layout.deinit();
+
+    try t.expectEqual(Layout.ByteRange{ .start = 0, .end = 11 }, layout.lineRange(0).?);
+    try t.expectEqual(Layout.ByteRange{ .start = 12, .end = 15 }, layout.lineRange(1).?);
+    const words = try layout.wordRanges(alloc);
+    defer alloc.free(words);
+    try t.expectEqual(@as(usize, 3), words.len);
+    try t.expectEqualStrings("hello", layout.source_text[words[0].start..words[0].end]);
+
+    const geometry = try layout.characterGeometry(alloc);
+    defer alloc.free(geometry);
+    try t.expect(geometry.len >= 12);
+    for (geometry) |item| {
+        try t.expect(item.end > item.start);
+        try t.expect(item.width >= 0);
+        try t.expect(item.x >= -0.01);
+    }
+    const positions = try layout.characterPositions(alloc);
+    defer alloc.free(positions);
+    const widths = try layout.characterWidths(alloc);
+    defer alloc.free(widths);
+    try t.expectEqual(geometry.len, positions.len);
+    try t.expectEqual(geometry.len, widths.len);
 }
 
 test "text engine: caret round-trip stays on grapheme boundaries" {

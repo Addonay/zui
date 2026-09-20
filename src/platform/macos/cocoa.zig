@@ -14,6 +14,7 @@ const geometry = @import("../../core/geometry.zig");
 const limits = @import("../../core/limits.zig");
 const gpu = @import("../../gpu/root.zig");
 const dl = @import("../dl.zig");
+const platform_services = @import("services.zig");
 
 const b = bindings;
 
@@ -144,6 +145,10 @@ pub const CocoaBackend = struct {
     /// Events pumped by wait() surface here on the next poll.
     stash: event.EventQueue = .{},
     debug_events: bool = false,
+    /// Window-scoped GPUI service state. Native delegate routing still uses
+    /// the legacy active pointer until the full registry migration lands.
+    window_registry: platform_services.WindowRegistry = .{},
+    window_services: ?platform_services.PlatformServices = null,
 
     const Sels = struct {
         sharedApplication: b.SEL,
@@ -416,6 +421,8 @@ pub const CocoaBackend = struct {
             .debug_events = getenv("ZUI_DEBUG_EVENTS") != null,
             .renderer = gpu.vellz.Renderer.init(allocator),
         };
+        const handle = self.window_registry.register(@intFromPtr(window)) catch unreachable;
+        self.window_services = .{ .handle = handle, .lifecycle = .active };
         active = self;
         self.recreateBitmap();
         return self;
@@ -423,6 +430,7 @@ pub const CocoaBackend = struct {
 
     pub fn deinit(self: *CocoaBackend) void {
         self.renderer.deinit();
+        if (self.window_services) |state| _ = self.window_registry.unregister(state.handle);
         if (active == self) {
             active = null;
             msg_send_fn = null;

@@ -18,12 +18,89 @@ pub const Scope = struct {
     ids: []const u32 = &.{},
     modal: bool = false,
     restore_to: elements.FocusHandle = .{},
+    /// Optional owner for portal-backed scopes. A nonzero owner lets Window
+    /// clear the scope safely when the overlay entity is destroyed or absent
+    /// from a later frame, without dereferencing stale `ids` storage.
+    owner: elements.FocusHandle = .{},
 
     pub fn contains(self: Scope, id: u32) bool {
         for (self.ids) |candidate| if (candidate == id) return true;
         return false;
     }
 };
+
+/// Stable tab-stop description mirroring GPUI's grouped tab-stop ordering.
+/// Lower indices come first; insertion order breaks ties deterministically.
+pub const TabStop = struct { id: u32, tab_index: i32 = 0, insertion: usize = 0 };
+pub const TraversalEvent = enum { begin, candidate, skipped, focused, wrapped, end };
+pub const TraversalTrace = struct {
+    events: [128]TraversalEvent = undefined,
+    ids: [128]u32 = undefined,
+    len: usize = 0,
+    pub fn record(self: *@This(), event: TraversalEvent, id: u32) void {
+        if (self.len >= self.events.len) return;
+        self.events[self.len] = event;
+        self.ids[self.len] = id;
+        self.len += 1;
+    }
+};
+
+/// Sort an explicit tab-stop list without allocation. Negative indices are
+/// intentionally placed after ordinary stops, matching GPUI's “not in the
+/// normal tab order” convention while retaining deterministic traversal.
+pub fn orderTabStops(stops: []TabStop) void {
+    var i: usize = 1;
+    while (i < stops.len) : (i += 1) {
+        const value = stops[i];
+        var j = i;
+        while (j > 0 and tabBefore(value, stops[j - 1])) : (j -= 1) stops[j] = stops[j - 1];
+        stops[j] = value;
+    }
+}
+
+fn tabBefore(a: TabStop, b: TabStop) bool {
+    const ai: i64 = if (a.tab_index < 0) std.math.maxInt(i32) else a.tab_index;
+    const bi: i64 = if (b.tab_index < 0) std.math.maxInt(i32) else b.tab_index;
+    return ai < bi or (ai == bi and a.insertion < b.insertion);
+}
+
+pub fn traverseTabStops(stops: []TabStop, current: ?u32, backwards: bool, trace: ?*TraversalTrace) ?u32 {
+    if (stops.len == 0) return null;
+    orderTabStops(stops);
+    if (trace) |out| out.record(.begin, current orelse 0);
+    var index: usize = if (current) |id| blk: {
+        for (stops, 0..) |stop, i| if (stop.id == id) break :blk i;
+        break :blk if (backwards) 0 else stops.len - 1;
+    } else if (backwards) stops.len else 0;
+    const start = index;
+    while (true) {
+        if (backwards) {
+            if (index == 0) index = stops.len - 1 else index -= 1;
+        } else index = (index + 1) % stops.len;
+        if (trace) |out| out.record(.candidate, stops[index].id);
+        if (stops[index].tab_index >= 0) {
+            if (index == start and current != null) {
+                if (trace) |out| out.record(.wrapped, stops[index].id);
+            }
+            if (trace) |out| {
+                out.record(.focused, stops[index].id);
+                out.record(.end, stops[index].id);
+            }
+            return stops[index].id;
+        }
+        if (trace) |out| out.record(.skipped, stops[index].id);
+        if (index == start) break;
+    }
+    if (trace) |out| out.record(.end, 0);
+    return null;
+}
+
+pub fn moveFocusTraced(win: *Window, scope: ?Scope, delta: i2, trace: *TraversalTrace) bool {
+    trace.record(.begin, win.focused.id);
+    const moved = moveFocus(win, scope, delta);
+    trace.record(if (moved) .focused else .end, if (moved) win.focused.id else 0);
+    return moved;
+}
 
 /// Collect focusable ids in paint order: regions carrying a focus handle
 /// whose owner is still live, deduplicated (one control may own several
@@ -94,7 +171,7 @@ pub fn focusId(win: *Window, id: u32) bool {
         if (handle.id != id) continue;
         if (!region.ownerAlive()) continue;
         if (!handle.isLive()) continue;
-        win.focused = handle;
+        win.setFocused(handle);
         win.requestRender();
         return true;
     }
@@ -113,13 +190,13 @@ pub const ScopeToken = struct { previous: ?Scope, restore_to: elements.FocusHand
 pub fn pushScope(win: *Window, ids: []const u32, modal: bool) ScopeToken {
     const token = ScopeToken{ .previous = win.focus_scope, .restore_to = win.focused };
     win.focus_scope = .{ .ids = ids, .modal = modal, .restore_to = win.focused };
-    if (!focusNext(win, win.focus_scope)) win.focused = .{};
+    if (!focusNext(win, win.focus_scope)) win.setFocused(.{});
     return token;
 }
 pub fn popScope(win: *Window, token: ScopeToken) void {
     win.focus_scope = token.previous;
     if (!focusId(win, token.restore_to.id)) {
-        win.focused = .{};
+        win.setFocused(.{});
         _ = focusNext(win, win.focus_scope);
     }
     win.requestRender();
@@ -228,4 +305,22 @@ test "modal scope traps and restores" {
     // Closing restores the pre-dialog focus.
     try t.expect(restore(win, scope));
     try t.expectEqual(@as(u32, 1), win.focused.id);
+}
+
+test "tab stops sort by index and emit deterministic traversal trace" {
+    var stops = [_]TabStop{
+        .{ .id = 30, .tab_index = 2, .insertion = 2 },
+        .{ .id = 10, .tab_index = 0, .insertion = 1 },
+        .{ .id = 20, .tab_index = -1, .insertion = 0 },
+        .{ .id = 11, .tab_index = 0, .insertion = 3 },
+    };
+    var trace = TraversalTrace{};
+    try std.testing.expectEqual(@as(?u32, 11), traverseTabStops(&stops, 10, false, &trace));
+    try std.testing.expectEqual(@as(u32, 10), stops[0].id);
+    try std.testing.expectEqual(@as(u32, 11), stops[1].id);
+    try std.testing.expectEqual(@as(u32, 30), stops[2].id);
+    try std.testing.expectEqual(@as(u32, 20), stops[3].id);
+    try std.testing.expectEqual(TraversalEvent.begin, trace.events[0]);
+    try std.testing.expectEqual(TraversalEvent.focused, trace.events[2]);
+    try std.testing.expectEqual(TraversalEvent.end, trace.events[3]);
 }

@@ -1,6 +1,7 @@
 //! Application orchestration, window management, and frame loop.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const geometry = @import("../core/geometry.zig");
 const limits = @import("../core/limits.zig");
 const color = @import("../core/color.zig");
@@ -16,6 +17,7 @@ const images = @import("../images/root.zig");
 pub const Window = window_mod.Window;
 pub const WindowOptions = window_mod.WindowOptions;
 pub const Renderer = window_mod.Renderer;
+pub const TimerId = tasks.TimerId;
 
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -41,6 +43,12 @@ pub const App = struct {
     event_queue: platform.EventQueue = .{},
     should_quit: bool = false,
     is_active: bool = false,
+    /// Accessibility/user preference: decorative motion snaps to its target
+    /// and does not request animation frames when enabled.
+    reduce_motion: bool = false,
+    /// Optional embedding override used by native integrations and tests;
+    /// environment selection remains the default public behavior.
+    renderer_mode_override: ?gpu.render_backend.Mode = null,
     /// Scoped background executor (gap §6D): worker pool + UI-thread
     /// completion queue. Heap-owned so the address workers and the asset
     /// registry observe stays stable when an App value moves (init returns
@@ -72,7 +80,7 @@ pub const App = struct {
         errdefer cache.deinit(allocator);
         const rt = try allocator.create(tasks.TaskRuntime);
         errdefer allocator.destroy(rt);
-        rt.* = tasks.TaskRuntime.init(allocator, .{});
+        rt.* = tasks.TaskRuntime.init(allocator, tasks.Options.fromEnv());
         rt.start();
         const wakeup_box = try allocator.create(platform.Backend);
         errdefer allocator.destroy(wakeup_box);
@@ -82,6 +90,7 @@ pub const App = struct {
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = instance,
             .image_cache = cache,
+            .reduce_motion = reduceMotionFromEnv(),
             .tasks = rt,
             .task_wakeup_backend = wakeup_box,
         };
@@ -99,7 +108,7 @@ pub const App = struct {
         errdefer cache.deinit(allocator);
         const rt = try allocator.create(tasks.TaskRuntime);
         errdefer allocator.destroy(rt);
-        rt.* = tasks.TaskRuntime.init(allocator, .{});
+        rt.* = tasks.TaskRuntime.init(allocator, tasks.Options.fromEnv());
         rt.start();
         const wakeup_box = try allocator.create(platform.Backend);
         errdefer allocator.destroy(wakeup_box);
@@ -109,6 +118,7 @@ pub const App = struct {
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = .{ .null_backend = nb },
             .image_cache = cache,
+            .reduce_motion = reduceMotionFromEnv(),
             .tasks = rt,
             .task_wakeup_backend = wakeup_box,
         };
@@ -126,7 +136,7 @@ pub const App = struct {
         const rt: ?*tasks.TaskRuntime = allocator.create(tasks.TaskRuntime) catch null;
         var wakeup_box: ?*platform.Backend = null;
         if (rt) |r| {
-            r.* = tasks.TaskRuntime.init(allocator, .{});
+            r.* = tasks.TaskRuntime.init(allocator, tasks.Options.fromEnv());
             r.start();
             if (cache) |c| c.assets.bindRuntime(r);
             if (allocator.create(platform.Backend) catch null) |box| {
@@ -141,6 +151,7 @@ pub const App = struct {
             .entities = runtime.EntityStore.init(allocator),
             .owned_backend = null,
             .image_cache = cache,
+            .reduce_motion = reduceMotionFromEnv(),
             .tasks = rt,
             .task_wakeup_backend = wakeup_box,
         };
@@ -149,6 +160,26 @@ pub const App = struct {
     fn taskWakeup(raw: *anyopaque) void {
         const be: *platform.Backend = @ptrCast(@alignCast(raw));
         be.wakeup();
+    }
+
+    fn reduceMotionFromEnv() bool {
+        if (!builtin.link_libc) return false;
+        const raw = std.c.getenv("ZUI_REDUCE_MOTION") orelse return false;
+        const value = std.mem.span(raw);
+        return value.len > 0 and !std.mem.eql(u8, value, "0");
+    }
+
+    /// Update the motion policy for all live windows and redraw them once so
+    /// animated values snap visibly when the setting changes.
+    pub fn setReduceMotion(self: *App, enabled: bool) void {
+        self.reduce_motion = enabled;
+        for (self.windows) |maybe_win| {
+            if (maybe_win) |win| if (!win.closed) win.setReduceMotion(enabled);
+        }
+    }
+
+    pub fn setRendererMode(self: *App, mode: gpu.render_backend.Mode) void {
+        self.renderer_mode_override = mode;
     }
 
     /// Lazily create (once) the App-owned cozmic engine. Returns null when
@@ -178,7 +209,7 @@ pub const App = struct {
     /// before the lazy engine init or after an init failure). Valid only
     /// until the next render mutates the atlas.
     pub fn glyphPixels(self: *App) []const u8 {
-        if (self.cozmic_engine) |engine| return engine.glyphs.pixels[0..engine.glyphs.pixels_used];
+        if (self.cozmic_engine) |engine| return engine.glyphs.pixels[0..engine.glyphs.storageUsed()];
         return &.{};
     }
 
@@ -190,6 +221,17 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        // TaskRuntime owns the token allocations, while Window teardown is
+        // intentionally below. Detach first so Window.deinit cannot touch a
+        // token after the runtime releases it.
+        if (self.tasks != null) {
+            for (&self.windows) |*maybe_win| {
+                if (maybe_win.*) |win| {
+                    win.invalidateLiveness();
+                    win.detachLivenessToken();
+                }
+            }
+        }
         // Task workers join here while entities and the image cache are
         // still alive: finished completions deliver (stale targets no-op),
         // unstarted jobs are destroyed without running. Must precede all
@@ -246,6 +288,22 @@ pub const App = struct {
         self.backend.wakeup();
     }
 
+    /// Schedule a one-shot application callback on the UI thread. This is
+    /// the runtime-level timer primitive; window animation deadlines remain
+    /// separate because they are compositor/frame-source driven.
+    pub fn scheduleAt(self: *App, due_ms: i64, callback: tasks.TimerCallback, ctx: *anyopaque) !TimerId {
+        return (self.tasks orelse return error.TaskRuntimeUnavailable).scheduleAt(due_ms, callback, ctx);
+    }
+
+    /// Schedule relative to the same monotonic clock used by `stepAt`.
+    pub fn scheduleAfter(self: *App, delay_ms: i64, callback: tasks.TimerCallback, ctx: *anyopaque) !TimerId {
+        return (self.tasks orelse return error.TaskRuntimeUnavailable).scheduleAfter(Window.monotonicMs(), delay_ms, callback, ctx);
+    }
+
+    pub fn cancelTimer(self: *App, id: TimerId) bool {
+        return if (self.tasks) |rt| rt.cancelTimer(id) else false;
+    }
+
     fn osBackend(raw: *anyopaque) platform.Backend {
         const win: *Window = @ptrCast(@alignCast(raw));
         return win.native_backend.?;
@@ -300,6 +358,12 @@ pub const App = struct {
         }
         const idx = slot orelse return error.TooManyWindows;
 
+        var liveness_token: ?*window_mod.WindowLivenessToken = null;
+        if (self.tasks) |rt| {
+            liveness_token = try rt.createWindowToken();
+            errdefer rt.discardWindowToken(liveness_token.?);
+        }
+
         const win = try self.allocator.create(Window);
         errdefer self.allocator.destroy(win);
 
@@ -323,6 +387,7 @@ pub const App = struct {
             .owns_native_window = owns_native,
             .native_focused = native.windowInfo().focused,
             .scale_factor = native.windowInfo().scale_factor,
+            .reduce_motion = self.reduce_motion,
             .id = self.next_window_id,
             .app = self,
             .allocator = self.allocator,
@@ -356,11 +421,43 @@ pub const App = struct {
             .closed = false,
             .scene = .{},
             .renderer = null,
+            .render_backend = gpu.render_backend.Controller.init(
+                gpu.render_backend.select(
+                    self.renderer_mode_override orelse gpu.render_backend.modeFromEnvironment(),
+                    @import("build_options").gpu,
+                    native.kind() == .wayland,
+                    false,
+                ),
+                @intFromFloat(bounds.size.w),
+                @intFromFloat(bounds.size.h),
+            ),
             .images = self.image_cache,
             .cozmic_engine_fn = provideCozmicEngine,
             .cozmic_engine_ctx = self,
+            .task_liveness = liveness_token,
         };
+        win.scene.attachStrokeStorage(&win.stroke_storage);
         self.next_window_id += 1;
+
+        // The environment only requests WGPU; activation requires a real
+        // native surface and the optional GPU build. If either proof is
+        // absent, the Window remains on its CPU backend without error.
+        if (comptime @import("build_options").gpu) {
+            if (win.render_backend.selection.requested == .wgpu) {
+                if (native.nativeSurface()) |surface| {
+                    if (gpu.app_bridge.Bridge.create(self.allocator, surface, @intFromFloat(bounds.size.w), @intFromFloat(bounds.size.h))) |gpu_bridge| {
+                        if (!win.installGpuBridge(gpu_bridge, gpu_bridge.hooks(), gpu.app_bridge.Bridge.destroy)) {
+                            gpu.app_bridge.Bridge.destroy(gpu_bridge, self.allocator);
+                        }
+                    } else |_| {
+                        // A missing adapter, surface format, or native WGPU
+                        // runtime is a supported CPU fallback, not a window
+                        // creation failure.
+                        zlog.log("gpu", "WGPU requested for window {d}, activation unavailable; using CPU", .{win.id});
+                    }
+                }
+            }
+        }
 
         win.inspector.enabled = @import("../debug/inspector.zig").environmentEnabled();
         win.setTitle(options.title);
@@ -392,6 +489,7 @@ pub const App = struct {
         // event listener: use win.close() so dispatch can keep using self.
         for (&self.windows) |*maybe_win| {
             if (maybe_win.* == win) {
+                win.invalidateLiveness();
                 maybe_win.* = null;
                 if (self.active_window_count > 0) {
                     self.active_window_count -= 1;
@@ -421,6 +519,7 @@ pub const App = struct {
         for (&self.windows) |*maybe_win| {
             if (maybe_win.*) |win| {
                 if (win.closed) {
+                    win.invalidateLiveness();
                     maybe_win.* = null;
                     if (self.active_window_count > 0) {
                         self.active_window_count -= 1;
@@ -465,9 +564,11 @@ pub const App = struct {
                         const info = win.native_backend.?.windowInfo();
                         win.bounds.size = info.size;
                         win.scale_factor = info.scale_factor;
+                        win.render_backend.resize(@intFromFloat(@max(1, info.size.w)), @intFromFloat(@max(1, info.size.h)));
                         win.requestRender();
                     },
-                    .focused, .unfocused => win.handleEvent(payload),
+                    .frame_ready => win.animationFrameReady(),
+                    .focused, .unfocused, .cancelled => win.handleEvent(payload),
                 },
                 else => win.handleEvent(payload),
             }
@@ -490,6 +591,9 @@ pub const App = struct {
         const tasks_ready = if (self.tasks) |rt| rt.hasReady() else false;
         if (self.should_quit or self.event_queue.len != 0 or self.entities.dirty or self.hasDirtyWindows() or tasks_ready) return 0;
         var deadline: ?i64 = null;
+        if (self.tasks) |rt| {
+            if (rt.nextTimerDeadlineMs()) |value| deadline = value;
+        }
         for (self.windows) |maybe_win| {
             const win = maybe_win orelse continue;
             if (win.closed) return 0;
@@ -511,6 +615,7 @@ pub const App = struct {
         // to this frame's render, like drained events. Stamps the frame id
         // used for async cache pinning first.
         if (self.image_cache) |ic| ic.assets.completion_frame = self.step_count;
+        if (self.tasks) |rt| rt.drainTimers(now_ms);
         if (self.tasks) |rt| rt.drainCompletions();
         // Expire before input: late second keys must not complete a chord.
         for (self.windows) |maybe_win| {
@@ -593,7 +698,7 @@ pub const App = struct {
                             engine.scaleScene(&win.scene, win.scale_factor);
                         }
                     }
-                    win.native_backend.?.present(&win.scene, self.glyphPixels(), self.imagePixels());
+                    win.present(self.glyphPixels(), self.imagePixels());
                     presented += 1;
                 }
             }
@@ -631,13 +736,11 @@ pub const App = struct {
             // Null has no blocking primitive. Return to the embedding host,
             // which can advance stepAt at the reported deadline; never spin.
             if (self.backend.kind() == .null) break;
-            // Request an unbounded wait when idle. Existing backend limits
-            // degrade this explicitly: X11/Wayland/Cocoa clamp to 1 s, Win32
-            // has only a 4 ms Sleep (not an event wait). Linux also adds 4 ms
-            // and wakeup only flushes. Removing those limits / supplying real
-            // completion wake handles requires backend changes, out of scope
-            // here. No refresh feedback exists yet: Window's cadence hook
-            // defaults to 60 Hz, not a claim of native vsync synchronization.
+            // Request an unbounded wait when idle. Display backends clamp
+            // pathological values defensively; native message/socket waits
+            // still wake for input and task notifications. No refresh
+            // feedback exists yet: Window's cadence hook defaults to 60 Hz,
+            // not a claim of native vsync synchronization.
             self.backend.waitTimeoutNs(wait_ns orelse std.math.maxInt(u64));
             if (wait_ns == null) {
                 idle_wakes += 1;
@@ -672,6 +775,47 @@ test "scheduler idle has no deadline and queued input is immediately ready" {
     try t.expect(app.stepAt(300));
     try t.expectEqual(@as(u32, 3), app.getNullBackend().?.presents);
     try t.expect(app.nextWaitNs(300) == null);
+}
+
+test "headless renderer override keeps CPU fallback when WGPU is unavailable" {
+    const t = std.testing;
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+    app.setRendererMode(.wgpu);
+    const win = try app.openWindow(.{}, struct {
+        fn draw(_: *Window, _: *gpu.Scene) void {}
+    }.draw);
+    try t.expectEqual(gpu.render_backend.Mode.wgpu, win.renderBackend().selection.requested);
+    try t.expect(win.renderBackend().usingCpu());
+    try t.expectEqual(gpu.render_backend.Selection.Reason.gpu_not_compiled, win.renderBackend().selection.reason);
+}
+
+test "app timer wakes the event loop and fires on the UI step" {
+    const t = std.testing;
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+    _ = try app.openWindow(.{}, struct {
+        fn draw(_: *Window, _: *gpu.Scene) void {}
+    }.draw);
+    // Opening a window intentionally marks its first frame dirty. Consume
+    // that initial presentation before asserting the timer-only deadline;
+    // nextWaitNs must still return zero while a frame is pending.
+    try t.expect(app.stepAt(100));
+
+    var fired: u32 = 0;
+    const callback = struct {
+        fn call(raw: *anyopaque) void {
+            const count: *u32 = @ptrCast(@alignCast(raw));
+            count.* += 1;
+        }
+    }.call;
+    _ = try app.scheduleAt(250, callback, &fired);
+    try t.expectEqual(@as(?u64, 150_000_000), app.nextWaitNs(100));
+    try t.expect(app.stepAt(249));
+    try t.expectEqual(@as(u32, 0), fired);
+    try t.expect(app.stepAt(250));
+    try t.expectEqual(@as(u32, 1), fired);
+    try t.expect(app.nextWaitNs(250) == null);
 }
 
 test "key expiry participates in earliest deadline and fires once without frames" {
@@ -1359,7 +1503,7 @@ test "window at scale renders physical-density text and quads end to end" {
     var renderer = gpu.vellz.Renderer.init(t.allocator);
     defer renderer.deinit();
     renderer.scale_factor = 2;
-    try renderer.render(&pixels, 400, 200, .rgba32, color.Color.black, &win.scene, engine.glyphs.pixels[0..engine.glyphs.pixels_used], &.{});
+    try renderer.render(&pixels, 400, 200, .rgba32, color.Color.black, &win.scene, engine.glyphs.pixels[0..engine.glyphs.storageUsed()], &.{});
     // Physical ink at the scaled rect: 40x20 == 800 px, all opaque.
     // The upgraded glyph mask (physical box at 2x over density 2) is also
     // in the scene; pixels inside its physical box are skipped rather than
@@ -1554,6 +1698,89 @@ test "requestRender during render schedules another frame" {
     try std.testing.expect(win.dirty);
     try std.testing.expect(app.step());
     try std.testing.expectEqual(@as(u32, 2), S.calls);
+}
+
+test "task completion drops a window target after close and reap" {
+    const t = std.testing;
+    var app = try App.initHeadless(t.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, struct {
+        fn noop(_: *Window, _: *gpu.Scene) void {}
+    }.noop);
+    const rt = app.tasks orelse return error.TestUnexpectedResult;
+    if (rt.workerCount() == 0) return error.SkipZigTest;
+
+    const Counter = struct {
+        pub const Options = struct {};
+        n: u32 = 0,
+        pub fn init(_: *runtime.Context(@This()), _: Options) @This() {
+            return .{};
+        }
+    };
+    // App-lifetime entity: it survives the window-scope reap, making the
+    // window token (rather than the weak entity) the decisive gate.
+    const entity = app.entities.create(Counter, .{}, null);
+    const Gate = struct {
+        started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        completions: u32 = 0,
+    };
+    var gate = Gate{};
+    const State = struct { gate: *Gate };
+
+    _ = try rt.spawnForEntity(
+        Counter,
+        entity.weak(),
+        win,
+        State{ .gate = &gate },
+        struct {
+            fn run(s: *State, _: tasks.Cancel) void {
+                s.gate.started.store(true, .seq_cst);
+                while (!s.gate.release.load(.seq_cst)) std.Thread.yield() catch {};
+            }
+        }.run,
+        struct {
+            fn done(_: *Counter, _: *runtime.Context(Counter), s: *State) void {
+                s.gate.completions += 1;
+            }
+        }.done,
+    );
+
+    const Started = struct {
+        fn ready(raw: *anyopaque) bool {
+            const g: *Gate = @ptrCast(@alignCast(raw));
+            return g.started.load(.seq_cst);
+        }
+    };
+    var spin: usize = 0;
+    while (!Started.ready(&gate) and spin < 20_000_000) : (spin += 1) {
+        std.Thread.yield() catch {};
+    }
+    try t.expect(Started.ready(&gate));
+
+    // The queued job still retains the old Window address, but close/reap
+    // invalidates its stable token before that allocation is freed.
+    win.close();
+    app.reapClosed();
+    try t.expectEqual(@as(usize, 0), app.active_window_count);
+    gate.release.store(true, .seq_cst);
+
+    const Ready = struct {
+        fn ready(raw: *anyopaque) bool {
+            return @as(*tasks.TaskRuntime, @ptrCast(@alignCast(raw))).readyCount() > 0;
+        }
+    };
+    spin = 0;
+    while (!Ready.ready(rt) and spin < 20_000_000) : (spin += 1) {
+        std.Thread.yield() catch {};
+    }
+    try t.expect(Ready.ready(rt));
+    rt.drainCompletions();
+
+    try t.expectEqual(@as(u32, 0), gate.completions);
+    try t.expectEqual(@as(u32, 0), entity.read().n);
+    try t.expectEqual(@as(u64, 1), rt.dropped_stale);
+    try t.expectEqual(@as(u64, 0), rt.delivered);
 }
 
 test "task runtime: close window mid-flight is safe" {

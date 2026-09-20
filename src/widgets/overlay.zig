@@ -14,11 +14,27 @@ pub fn position(anchor: g.Rect, size: g.Size, viewport: g.Size, placement: Place
     var x = anchor.x;
     var y = anchor.y + anchor.h + gap;
     switch (placement) {
-        .bottom => { if (y + h > viewport.h and anchor.y - gap - h >= 0) y = anchor.y - gap - h; },
-        .top => { y = anchor.y - gap - h; if (y < 0) y = anchor.y + anchor.h + gap; },
-        .left => { x = anchor.x - w - gap; y = anchor.y; if (x < 0) x = anchor.x + anchor.w + gap; },
-        .right => { x = anchor.x + anchor.w + gap; y = anchor.y; if (x + w > viewport.w) x = anchor.x - w - gap; },
-        .center => { x = (viewport.w - w) / 2; y = (viewport.h - h) / 2; },
+        .bottom => {
+            if (y + h > viewport.h and anchor.y - gap - h >= 0) y = anchor.y - gap - h;
+        },
+        .top => {
+            y = anchor.y - gap - h;
+            if (y < 0) y = anchor.y + anchor.h + gap;
+        },
+        .left => {
+            x = anchor.x - w - gap;
+            y = anchor.y;
+            if (x < 0) x = anchor.x + anchor.w + gap;
+        },
+        .right => {
+            x = anchor.x + anchor.w + gap;
+            y = anchor.y;
+            if (x + w > viewport.w) x = anchor.x - w - gap;
+        },
+        .center => {
+            x = (viewport.w - w) / 2;
+            y = (viewport.h - h) / 2;
+        },
     }
     return .{ .x = std.math.clamp(x, 0, @max(0, viewport.w - w)), .y = std.math.clamp(y, 0, @max(0, viewport.h - h)), .w = w, .h = h };
 }
@@ -50,6 +66,7 @@ pub const State = struct {
     pub fn close(self: *State, win: *Window) void {
         if (!self.open) return;
         self.open = false;
+        win.cancelInteraction(.cancelled);
         if (self.token) |token| focus.popScope(win, token);
         self.token = null;
         win.requestRender();
@@ -76,14 +93,23 @@ pub fn sync(win: *Window) void {
         state.id_count = 0;
         for (frame.regions[portal.region_start..portal.region_end]) |region| if (region.focus) |handle| {
             var duplicate = false;
-            for (state.ids[0..state.id_count]) |id| { if (id == handle.id) duplicate = true; }
-            if (!duplicate and state.id_count < state.ids.len) { state.ids[state.id_count] = handle.id; state.id_count += 1; }
+            for (state.ids[0..state.id_count]) |id| {
+                if (id == handle.id) duplicate = true;
+            }
+            if (!duplicate and state.id_count < state.ids.len) {
+                state.ids[state.id_count] = handle.id;
+                state.id_count += 1;
+            }
         };
         if (state.token == null) {
             state.token = focus.pushScope(win, state.ids[0..state.id_count], state.modal);
             state.token.?.restore_to = state.restore;
+            if (win.focus_scope) |*scope| scope.owner = portal.owner;
         } else if (win.focus_scope) |scope| {
-            if (scope.ids.ptr == &state.ids) win.focus_scope.?.ids = state.ids[0..state.id_count];
+            if (scope.ids.ptr == &state.ids) {
+                win.focus_scope.?.ids = state.ids[0..state.id_count];
+                win.focus_scope.?.owner = portal.owner;
+            }
         }
     }
 }
@@ -95,7 +121,10 @@ pub fn intercept(win: *Window, event: platform.Event) bool {
         if (!portal.owner.isLive()) continue;
         const state = portal.state;
         if (!state.open or !state.capture_focus) continue;
-        if (event == .key and event.key.pressed and event.key.key == .escape and state.dismiss_escape) { state.close(win); return true; }
+        if (event == .key and event.key.pressed and event.key.key == .escape and state.dismiss_escape) {
+            state.close(win);
+            return true;
+        }
         if (event == .mouse and !event.mouse.motion and event.mouse.pressed and !state.rect.contains(event.mouse.pos)) {
             if (state.dismiss_outside) state.close(win);
             return true; // Never click through a dismissed surface.

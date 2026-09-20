@@ -126,7 +126,8 @@ test "content dedup across paths and bytes plus explicit reload" {
     try t.expectEqual(@as(u64, 1), cache.assets.counters.decodes);
 }
 
-test "small budgets reject sources and dimensions before decode and reclaim registry" {    const cache = try images.Cache.init(t.allocator);
+test "small budgets reject sources and dimensions before decode and reclaim registry" {
+    const cache = try images.Cache.init(t.allocator);
     defer cache.deinit(t.allocator);
     const service = &cache.assets;
     service.budget.count = 1;

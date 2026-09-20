@@ -116,6 +116,19 @@ pub const VTable = struct {
     /// Backends forward both to the software rasterizer; the null backend
     /// ignores them.
     present: *const fn (*anyopaque, *const gpu.Scene, []const u8, []const u8) void,
+    /// Request a compositor/native animation frame. Backends without a
+    /// native frame source leave this unset and Window uses its timer path.
+    requestFrame: ?*const fn (*anyopaque) void = null,
+    /// Enable or disable the native text-input session for the focused
+    /// editable element. Backends without native IME support leave this unset.
+    setTextInput: ?*const fn (*anyopaque, bool) void = null,
+    /// Update the logical window-local caret rectangle used by native IME
+    /// candidate placement. Backends without native IME support leave this unset.
+    setImeCursorRect: ?*const fn (*anyopaque, geometry.Rect) void = null,
+    /// Return the native compositor surface when this backend can hand it to
+    /// an optional GPU bridge. Null means CPU presentation is the only safe
+    /// path for this window.
+    nativeSurface: ?*const fn (*anyopaque) ?gpu.render_backend.NativeSurface = null,
 };
 
 pub const Backend = struct {
@@ -193,6 +206,35 @@ pub const Backend = struct {
 
     pub fn present(self: @This(), scene: *const gpu.Scene, glyph_pixels: []const u8, image_pixels: []const u8) void {
         self.vtable.present(self.ptr, scene, glyph_pixels, image_pixels);
+    }
+
+    pub fn requestFrame(self: @This()) bool {
+        if (self.vtable.requestFrame) |request| {
+            request(self.ptr);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn setTextInput(self: @This(), enabled: bool) bool {
+        if (self.vtable.setTextInput) |set| {
+            set(self.ptr, enabled);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn setImeCursorRect(self: @This(), rect: geometry.Rect) bool {
+        if (self.vtable.setImeCursorRect) |set| {
+            set(self.ptr, rect);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn nativeSurface(self: @This()) ?gpu.render_backend.NativeSurface {
+        if (self.vtable.nativeSurface) |get| return get(self.ptr);
+        return null;
     }
 };
 

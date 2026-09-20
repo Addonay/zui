@@ -9,6 +9,10 @@ Companion to the gap report §3 (overflow policy) and §5E (scene semantics).
 - One `gpu.Scene` per window per frame, owned by `Window` (`src/app/window.zig`).
 - The producer is the window's `Renderer` callback: for entity views,
   `runtime.mountView` installs layout → `elements.painter.paint` → scene.
+- Window-owned scenes attach a bounded out-of-line stroke storage so custom
+  line primitives do not enlarge the hot `Frame + Scene` stack pair. A
+  standalone `Scene{}` retains quad/glyph/blit compatibility; callers that
+  emit strokes must attach `StrokeStorage` first.
 - `Window.render()` clears the scene, runs the producer, then enforces the
   overflow policy (§4). Emission order is paint order; the rasterizer
   (`gpu.vellz.Renderer`) and any future GPU driver must draw
@@ -31,6 +35,14 @@ Companion to the gap report §3 (overflow policy) and §5E (scene semantics).
   later window's render could otherwise evict pool bytes a previous window
   still references.
 
+The presentation seam is `Window.present()`. CPU remains the default. An
+optional `gpu.render_backend.Controller` may be activated with explicit
+WGPU/Vellz hooks; it rejects incomplete selection (missing build, surface, or
+runtime), skips minimized frames, invalidates in-flight work on resize, and
+keeps bounded retirement records for persistent backend resources. A device
+loss gets one injected recreation attempt; a failed recreation or second loss
+switches the same window to CPU presentation.
+
 ## 3. Per-window surface
 
 - Today: Linux X11 and Wayland support MULTIPLE native windows — each
@@ -41,6 +53,18 @@ Companion to the gap report §3 (overflow policy) and §5E (scene semantics).
   (`createWindow == null`); headless keeps N logical windows for tests.
 - The vellz `Renderer` is owned per presenting window; its context,
   resources, and pixmap persist across frames and are recreated on resize.
+- An optional WGPU/Vellz backend is compiled and device-probed with
+  `zig build gpu-check -Dgpu=true -Dwgpu-native-prefix=...`; it currently
+  supports device/resource work. On Linux/Wayland,
+  `gpu-wayland-smoke` additionally creates/configures a native surface and
+  presents diagnostic/solid/gradient frames. The fixed ZUI scene/resource
+  bridge is still partial; the opt-in bridge test covers ordered
+  solid/gradient/border/rounded quads, bounded line strokes, rectangular clips,
+  pool-validated atlas images, and mask/color glyph uploads. A bounded bridge
+  glyph/image-resource cache now reuses and retires uploaded IDs; default App
+  resource handoff and full font/COLR coverage remain separate evidence. The
+  App/Window boundary now exposes explicit backend selection and fallback
+  policy, while native WGPU object creation remains opt-in through hooks.
 
 ## 4. Scale (logical/physical pipeline)
 
@@ -116,28 +140,29 @@ The contract (gap report §5G stage 2):
 
 Documented limitations — stated here so nobody re-discovers them as bugs:
 
-- **Nested clips** are one intersected RECTANGLE per draw, not a clip
-  stack. Rectangular nesting is exact; there is no save/restore depth, no
-  transforms, and no rounded-rect descendant clip: a rounded background
-  does not round its children (report §5E). Menus/popovers must paint
-  outside the clipping ancestor, not as its child.
-- **Group opacity** multiplies alpha down the tree (0.5 × 0.5 = 0.25).
-  True isolated group compositing needs an offscreen buffer; the product
-  differs from isolation exactly when semi-transparent siblings overlap.
-  Covered by the painter test at 0.25-over-black (≈64).
+- **Nested clips and groups** are now bounded retained commands. CPU Vellz
+  and the optional WGPU bridge support nested affine transforms, rectangular
+  and rounded/path group clips, and opacity layers in emission order. The
+  fixed group depth is 64; malformed underflow/overflow is rejected.
+- **Group opacity** is isolated by the Vellz layer path, so overlapping
+  semi-transparent siblings are composited as a group rather than merely
+  multiplying each primitive's alpha.
 - **Blur** is 8 concentric expanding quads (soft falloff), not a blur
   kernel: it approximates glow, never blurs content behind the node.
 - **Shadows** are two offset quads (halo + contact layer), not a blurred
   silhouette: no kernel, no light direction, no content-aware shape beyond
   the rounded rect.
-- **Color glyphs** (emoji, color faces) are skipped and counted
-  (`cozmic_skipped_glyphs`): the atlas is single-channel coverage, and a
-  mask reinterpretation would be garbage, not a fallback.
+- **Color glyphs** (emoji, color faces) use the separate RGBA atlas pool and
+  image path; hosts without usable color raster data still skip them and count
+  the miss (`cozmic_skipped_glyphs`): unsupported raster content still skips
+  safely; color glyphs use the separate RGBA pool and do not corrupt mask
+  bytes.
 - **Gradients** are single-quad horizontal lerps with exact rounded
   corners; no multi-stop, radial, or rotated gradients in the scene.
-- **Paths/strokes/canvas**: no custom path emission in the public scene
-  yet — charts/diagrams/editors need the custom-element + canvas protocol
-  (gap report §5A2) before this contract can cover them.
+- **Paths/strokes/canvas**: custom Canvas emits bounded Bezier paths and
+  groups, with CPU/WGPU stroke joins (`miter`, `round`, `bevel`) and caps
+  (`butt`, `round`, `square`). Unsupported resource payloads still fail
+  explicitly; the fixed path segment and group capacities remain enforced.
 - **Glyph scene-full** counts into per-node `skipped` alongside spaces and
   missing ink; the frame-level `overflowed()` signal is what distinguishes
   "no ink by nature" from "ink lost to overflow".

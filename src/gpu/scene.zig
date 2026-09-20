@@ -54,6 +54,134 @@ pub const Quad = struct {
     clip: ?geometry.Rect = null,
 };
 
+/// One bounded custom-canvas line stroke. Endpoints and width are logical
+/// pixels; the renderer applies the window scale exactly once. The payload is
+/// deliberately limited to a single segment; multi-segment geometry is carried
+/// by `Path`, while this payload remains the cheap line fast path.
+pub const Stroke = struct {
+    pub const Join = enum(u8) { miter, round, bevel };
+    pub const Cap = enum(u8) { butt, round, square };
+    from: geometry.Point,
+    to: geometry.Point,
+    color: color.Color,
+    width: f32,
+    join: Join = .round,
+    cap: Cap = .round,
+    miter_limit: f32 = 4,
+    /// Painter clip at emission. A zero-area clip is not drawable; Canvas
+    /// always supplies its non-empty hook clip.
+    clip: geometry.Rect = .{},
+};
+
+/// Caller-owned storage for bounded custom line strokes. Window scenes attach
+/// one from their heap-owned Window; standalone Scene{} values retain the
+/// existing quad/glyph/blit behavior until a caller attaches storage.
+pub const StrokeStorage = [limits.MAX_STROKES_PER_FRAME]Stroke;
+
+/// A deliberately bounded path vocabulary.  This is the scene-side subset of
+/// GPUI's path primitive: move/line/quad/cubic/close, with a single fill or
+/// stroke paint.  The storage is out-of-line for the same hot-frame reason as
+/// strokes; arbitrary path builders and retained layers remain higher-level
+/// work.
+pub const MAX_PATH_SEGMENTS: usize = 32;
+pub const PathSegment = union(enum) {
+    move_to: geometry.Point,
+    line_to: geometry.Point,
+    quad_to: struct { ctrl: geometry.Point, to: geometry.Point },
+    cubic_to: struct { ctrl1: geometry.Point, ctrl2: geometry.Point, to: geometry.Point },
+    close,
+};
+
+pub const Path = struct {
+    segments: [MAX_PATH_SEGMENTS]PathSegment = undefined,
+    segment_len: usize = 0,
+    color: color.Color = .white,
+    stroke_width: f32 = 0,
+    join: Stroke.Join = .round,
+    cap: Stroke.Cap = .round,
+    miter_limit: f32 = 4,
+    clip: geometry.Rect = .{},
+    /// Affine coefficients in kurbo order: [a, b, c, d, e, f].
+    transform: [6]f32 = .{ 1, 0, 0, 1, 0, 0 },
+
+    pub fn isStroke(self: *const @This()) bool {
+        return self.stroke_width > 0;
+    }
+};
+
+/// A bounded clip geometry. Path clips use the same segment vocabulary as a
+/// draw path, which keeps clipping deterministic and lets CPU/WGPU share the
+/// exact command payload instead of inventing backend-specific clip objects.
+pub const ClipShape = union(enum) {
+    rect: geometry.Rect,
+    rounded: struct { rect: geometry.Rect, radius: f32 },
+    path: Path,
+};
+
+pub const Group = struct {
+    opacity: f32 = 1,
+    /// Affine coefficients in kurbo order: [a, b, c, d, e, f].
+    transform: [6]f32 = .{ 1, 0, 0, 1, 0, 0 },
+    clip: ?ClipShape = null,
+};
+
+pub const GroupStorage = [64]Group;
+
+pub const PathStorage = [limits.MAX_PATHS_PER_FRAME]Path;
+
+/// GPUI-style rounded rectangle shadow primitive.  Vellz owns the actual
+/// Gaussian filter; the scene only carries the bounded declarative payload.
+pub const Shadow = struct {
+    bounds: geometry.Rect,
+    radius: f32 = 0,
+    offset_x: f32 = 0,
+    offset_y: f32 = 0,
+    spread: f32 = 0,
+    blur_radius: f32 = 0,
+    color: color.Color = .black,
+    inset: bool = false,
+    clip: ?geometry.Rect = null,
+};
+
+pub const ShadowStorage = [limits.MAX_SHADOWS_PER_FRAME]Shadow;
+
+/// Fixed-capacity invalidation accumulator.  GPUI tracks primitive bounds and
+/// can repaint only changed regions; this small contract is renderer-neutral
+/// and safe for CPU, WGPU, and headless producers.
+pub const DamageSet = struct {
+    pub const max_rects: usize = 64;
+    rects: [max_rects]geometry.Rect = undefined,
+    len: usize = 0,
+    full: bool = false,
+
+    pub fn clear(self: *@This()) void {
+        self.len = 0;
+        self.full = false;
+    }
+
+    pub fn invalidate(self: *@This(), rect: geometry.Rect) void {
+        if (rect.w <= 0 or rect.h <= 0 or self.full) return;
+        if (self.len >= self.rects.len) {
+            self.full = true;
+            self.len = 0;
+            return;
+        }
+        self.rects[self.len] = rect;
+        self.len += 1;
+    }
+
+    pub fn invalidateFull(self: *@This(), viewport: geometry.Rect) void {
+        self.clear();
+        self.full = true;
+        self.rects[0] = viewport;
+        self.len = 1;
+    }
+
+    pub fn slice(self: *const @This()) []const geometry.Rect {
+        return self.rects[0..self.len];
+    }
+};
+
 /// Total draw cap per frame. Every push records one command, so this also
 /// bounds total pushes. Sized >= MAX_SCENE_GLYPHS (see limits.zig) so a
 /// glyph-only frame is bound by the payload arrays, never by the command
@@ -71,12 +199,18 @@ pub const Command = struct {
 };
 
 pub const CommandKind = enum(u8) {
+    begin_group,
+    end_group,
     quad,
     glyph,
     blit,
+    stroke,
+    path,
+    shadow,
 };
 
-/// Ordered draw payload for one frame (quads + glyph runs + image blits).
+/// Ordered draw payload for one frame (quads + glyph runs + image blits +
+/// bounded line strokes).
 /// Multi-MB inline storage (~5.9MB: quads carry their clip): heap-allocate
 /// or embed in a heap owner (e.g. `Window`). Never hold more than one of
 /// Scene/Frame/Engine on a single stack — combined Debug frames force
@@ -90,6 +224,17 @@ pub const Scene = struct {
     glyph_len: usize = 0,
     blits: [limits.MAX_IMAGE_BLITS_PER_FRAME]ImageBlit = undefined,
     blit_len: usize = 0,
+    /// Out-of-line so adding bounded custom strokes does not enlarge the hot
+    /// Frame + Scene stack pair. The storage must outlive this Scene.
+    strokes: []Stroke = &.{},
+    stroke_len: usize = 0,
+    paths: []Path = &.{},
+    path_len: usize = 0,
+    shadows: []Shadow = &.{},
+    shadow_len: usize = 0,
+    groups: GroupStorage = undefined,
+    group_len: usize = 0,
+    group_depth: usize = 0,
     commands: [MAX_COMMANDS_PER_FRAME]Command = undefined,
     command_len: usize = 0,
     /// Cumulative push failures (payload OR command stream full). The
@@ -105,8 +250,60 @@ pub const Scene = struct {
         self.len = 0;
         self.glyph_len = 0;
         self.blit_len = 0;
+        self.stroke_len = 0;
+        self.path_len = 0;
+        self.shadow_len = 0;
+        self.group_len = 0;
+        self.group_depth = 0;
         self.command_len = 0;
         self.dropped_frame = 0;
+    }
+
+    /// Attach caller-owned fixed stroke storage before emitting strokes.
+    /// Existing Scene{} callers that do not use strokes need no setup.
+    pub fn attachStrokeStorage(self: *@This(), storage: []Stroke) void {
+        self.strokes = storage;
+        self.stroke_len = 0;
+    }
+
+    pub fn attachPathStorage(self: *@This(), storage: []Path) void {
+        self.paths = storage;
+        self.path_len = 0;
+    }
+
+    pub fn attachShadowStorage(self: *@This(), storage: []Shadow) void {
+        self.shadows = storage;
+        self.shadow_len = 0;
+    }
+
+    pub fn pushGroup(self: *@This(), group: Group) bool {
+        if (self.group_len >= self.groups.len or self.command_len >= self.commands.len or
+            !std.math.isFinite(group.opacity) or group.opacity < 0 or group.opacity > 1)
+        {
+            self.dropped += 1;
+            self.dropped_frame += 1;
+            return false;
+        }
+        self.groups[self.group_len] = group;
+        self.group_len += 1;
+        self.group_depth += 1;
+        _ = self.pushCommand(.begin_group, @intCast(self.group_len - 1));
+        return true;
+    }
+
+    pub fn popGroup(self: *@This()) bool {
+        if (self.group_depth == 0 or self.command_len >= self.commands.len) {
+            self.dropped += 1;
+            self.dropped_frame += 1;
+            return false;
+        }
+        self.group_depth -= 1;
+        _ = self.pushCommand(.end_group, @intCast(self.group_depth));
+        return true;
+    }
+
+    pub fn groupSlice(self: *const @This()) []const Group {
+        return self.groups[0..self.group_len];
     }
 
     /// True when any push failed since the last `clear()`. A true frame
@@ -221,6 +418,58 @@ pub const Scene = struct {
         return self.blits[0..self.blit_len];
     }
 
+    /// Returns false when full so callers drop instead of growing.
+    pub fn pushStroke(self: *@This(), stroke: Stroke) bool {
+        std.debug.assert(stroke.width >= 0);
+        if (self.stroke_len >= self.strokes.len or self.command_len >= self.commands.len) {
+            self.dropped += 1;
+            self.dropped_frame += 1;
+            return false;
+        }
+        self.strokes[self.stroke_len] = stroke;
+        self.stroke_len += 1;
+        _ = self.pushCommand(.stroke, @intCast(self.stroke_len - 1));
+        return true;
+    }
+
+    pub fn strokeSlice(self: *const @This()) []const Stroke {
+        return self.strokes[0..self.stroke_len];
+    }
+
+    pub fn pushPath(self: *@This(), path: Path) bool {
+        if (path.segment_len == 0 or path.segment_len > MAX_PATH_SEGMENTS or
+            self.path_len >= self.paths.len or self.command_len >= self.commands.len)
+        {
+            self.dropped += 1;
+            self.dropped_frame += 1;
+            return false;
+        }
+        self.paths[self.path_len] = path;
+        self.path_len += 1;
+        _ = self.pushCommand(.path, @intCast(self.path_len - 1));
+        return true;
+    }
+
+    pub fn pathSlice(self: *const @This()) []const Path {
+        return self.paths[0..self.path_len];
+    }
+
+    pub fn pushShadow(self: *@This(), shadow: Shadow) bool {
+        if (self.shadow_len >= self.shadows.len or self.command_len >= self.commands.len) {
+            self.dropped += 1;
+            self.dropped_frame += 1;
+            return false;
+        }
+        self.shadows[self.shadow_len] = shadow;
+        self.shadow_len += 1;
+        _ = self.pushCommand(.shadow, @intCast(self.shadow_len - 1));
+        return true;
+    }
+
+    pub fn shadowSlice(self: *const @This()) []const Shadow {
+        return self.shadows[0..self.shadow_len];
+    }
+
     /// Paint-order stream for renderers. Payload slices stay available for
     /// tests/debug, but drawing MUST follow this order.
     pub fn commandSlice(self: *const @This()) []const Command {
@@ -252,6 +501,14 @@ pub const ImageBlit = struct {
     src_crop_h: f32 = 0, // 0 = full src_h
     /// Multiply tint; white is identity.
     tint: color.Color = .white,
+    /// Clockwise rotation in radians around the destination rect's center.
+    rotation: f32 = 0,
+    /// Centered image transform. Translation is in logical pixels before the
+    /// renderer applies the window's physical scale.
+    scale_x: f32 = 1,
+    scale_y: f32 = 1,
+    translate_x: f32 = 0,
+    translate_y: f32 = 0,
     /// Grayscale (luma) conversion, GPUI `img().grayscale()`.
     gray: bool = false,
     radius: f32 = 0,
@@ -285,6 +542,10 @@ pub const Glyph = struct {
     density: f32 = 1,
     /// Painter clip at emission; the blit honors it per pixel.
     clip: geometry.Rect,
+
+    pub fn isColor(self: Glyph) bool {
+        return self.atlas_offset >= limits.MAX_ATLAS_PIXELS;
+    }
 };
 
 test "scene pushes in order and reports overflow" {
@@ -351,6 +612,51 @@ test "scene pushes blits and reports overflow" {
     }));
 }
 
+test "scene pushes bounded strokes and records paint order" {
+    var s = Scene{};
+    var storage: StrokeStorage = undefined;
+    s.attachStrokeStorage(&storage);
+    try std.testing.expect(s.push(.{ .x = 0, .y = 0, .w = 1, .h = 1, .color = .white }));
+    try std.testing.expect(s.pushStroke(.{
+        .from = .{ .x = 1, .y = 2 },
+        .to = .{ .x = 8, .y = 9 },
+        .color = .black,
+        .width = 2,
+        .clip = .{ .x = 0, .y = 0, .w = 10, .h = 10 },
+    }));
+    try std.testing.expect(s.pushGlyph(.{
+        .x = 0,
+        .y = 0,
+        .w = 1,
+        .h = 1,
+        .color = .white,
+        .atlas_offset = 0,
+        .clip = .{},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), s.strokeSlice().len);
+    try std.testing.expectEqual(CommandKind.quad, s.commandSlice()[0].kind);
+    try std.testing.expectEqual(CommandKind.stroke, s.commandSlice()[1].kind);
+    try std.testing.expectEqual(@as(u32, 0), s.commandSlice()[1].index);
+    try std.testing.expectEqual(CommandKind.glyph, s.commandSlice()[2].kind);
+}
+
+test "stroke overflow is atomic and counted" {
+    var s = Scene{};
+    var storage: StrokeStorage = undefined;
+    s.attachStrokeStorage(&storage);
+    s.stroke_len = s.strokes.len;
+    try std.testing.expect(!s.pushStroke(.{
+        .from = .{},
+        .to = .{ .x = 1, .y = 1 },
+        .color = .white,
+        .width = 1,
+    }));
+    try std.testing.expectEqual(@as(usize, s.strokes.len), s.stroke_len);
+    try std.testing.expectEqual(@as(usize, 0), s.commandSlice().len);
+    try std.testing.expectEqual(@as(u64, 1), s.dropped);
+    try std.testing.expect(s.overflowed());
+}
+
 test "scene records paint order across kinds" {
     var s = Scene{};
     try std.testing.expect(s.push(.{ .x = 0, .y = 0, .w = 1, .h = 1, .color = .white }));
@@ -385,6 +691,45 @@ test "scene records paint order across kinds" {
     try std.testing.expectEqual(@as(u32, 1), cmds[3].index);
     s.clear();
     try std.testing.expectEqual(@as(usize, 0), s.commandSlice().len);
+}
+
+test "scene retains nested groups and preserves explicit command order" {
+    var s = Scene{};
+    var clip_path = Path{};
+    clip_path.segments[0] = .{ .move_to = .{ .x = 0, .y = 0 } };
+    clip_path.segments[1] = .{ .line_to = .{ .x = 10, .y = 0 } };
+    clip_path.segments[2] = .{ .line_to = .{ .x = 0, .y = 10 } };
+    clip_path.segments[3] = .close;
+    clip_path.segment_len = 4;
+    try std.testing.expect(s.pushGroup(.{
+        .opacity = 0.5,
+        .transform = .{ 1, 0, 0, 1, 10, 20 },
+        .clip = .{ .rounded = .{ .rect = .{ .x = 0, .y = 0, .w = 40, .h = 40 }, .radius = 6 } },
+    }));
+    try std.testing.expect(s.push(.{ .x = 0, .y = 0, .w = 4, .h = 4, .color = .white }));
+    try std.testing.expect(s.pushGroup(.{
+        .opacity = 1,
+        .transform = .{ 0, 1, -1, 0, 4, 5 },
+        .clip = .{ .path = clip_path },
+    }));
+    try std.testing.expect(s.pushGlyph(.{ .x = 1, .y = 1, .w = 1, .h = 1, .color = .white, .atlas_offset = 0, .clip = .{} }));
+    try std.testing.expect(s.popGroup());
+    try std.testing.expect(s.popGroup());
+    try std.testing.expectEqual(@as(usize, 2), s.groupSlice().len);
+    try std.testing.expectEqual(@as(usize, 6), s.commandSlice().len);
+    try std.testing.expectEqual(CommandKind.begin_group, s.commandSlice()[0].kind);
+    try std.testing.expectEqual(CommandKind.quad, s.commandSlice()[1].kind);
+    try std.testing.expectEqual(CommandKind.begin_group, s.commandSlice()[2].kind);
+    try std.testing.expectEqual(CommandKind.glyph, s.commandSlice()[3].kind);
+    try std.testing.expectEqual(CommandKind.end_group, s.commandSlice()[4].kind);
+    try std.testing.expectEqual(CommandKind.end_group, s.commandSlice()[5].kind);
+    try std.testing.expectEqual(@as(usize, 0), s.group_depth);
+}
+
+test "scene rejects unbalanced group pops" {
+    var s = Scene{};
+    try std.testing.expect(!s.popGroup());
+    try std.testing.expect(s.overflowed());
 }
 
 test "scene command overflow drops atomically and counts" {
@@ -435,4 +780,31 @@ test "command capacity covers a glyph-only frame" {
     // before the glyph payload does, or glyph-heavy frames drop while
     // payload space sits empty.
     try std.testing.expect(MAX_COMMANDS_PER_FRAME >= limits.MAX_SCENE_GLYPHS);
+}
+
+test "bounded paths and shadows remain ordered scene primitives" {
+    var s = Scene{};
+    var paths: PathStorage = undefined;
+    var shadows: ShadowStorage = undefined;
+    s.attachPathStorage(&paths);
+    s.attachShadowStorage(&shadows);
+    var path = Path{ .color = .white, .clip = .{ .x = 0, .y = 0, .w = 20, .h = 20 } };
+    path.segments[0] = .{ .move_to = .{ .x = 1, .y = 1 } };
+    path.segments[1] = .{ .line_to = .{ .x = 10, .y = 1 } };
+    path.segments[2] = .close;
+    path.segment_len = 3;
+    try std.testing.expect(s.pushPath(path));
+    try std.testing.expect(s.pushShadow(.{ .bounds = .{ .x = 1, .y = 1, .w = 10, .h = 10 }, .blur_radius = 2 }));
+    try std.testing.expectEqual(CommandKind.path, s.commandSlice()[0].kind);
+    try std.testing.expectEqual(CommandKind.shadow, s.commandSlice()[1].kind);
+}
+
+test "damage set falls back to full repaint at its fixed bound" {
+    var damage = DamageSet{};
+    var i: usize = 0;
+    while (i < DamageSet.max_rects + 1) : (i += 1) {
+        damage.invalidate(.{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 });
+    }
+    try std.testing.expect(damage.full);
+    try std.testing.expectEqual(@as(usize, 0), damage.slice().len);
 }

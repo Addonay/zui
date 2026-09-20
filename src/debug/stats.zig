@@ -109,7 +109,7 @@ pub fn capture(app: anytype) Snapshot {
         result.atlas_misses = engine.glyphs.misses;
         result.atlas_evictions = engine.glyphs.evictions;
         result.atlas_drops = engine.glyphs.overflow_drops;
-        result.atlas_bytes = engine.glyphs.pixels_used;
+        result.atlas_bytes = engine.glyphs.storageUsed();
         // Cross-frame text layout cache (gap §3.4).
         result.text_layout_cache_hits = engine.layout_cache_hits;
         result.text_layout_cache_misses = engine.layout_cache_misses;

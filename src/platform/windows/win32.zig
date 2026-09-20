@@ -15,6 +15,7 @@ const geometry = @import("../../core/geometry.zig");
 const limits = @import("../../core/limits.zig");
 const gpu = @import("../../gpu/root.zig");
 const dl = @import("../dl.zig");
+const platform_services = @import("services.zig");
 
 const b = bindings;
 
@@ -152,9 +153,11 @@ pub const Win32Backend = struct {
     user32: dl.Library,
     kernel32: dl.Library,
     gdi32: dl.Library,
+    imm32: ?dl.Library = null,
     api: b.User32Api,
     kernel: b.KernelApi,
     gdi: b.GdiApi,
+    imm: ?b.ImmApi = null,
     hwnd: b.HWND,
     class_atom: b.ATOM,
     instance: b.HINSTANCE,
@@ -176,6 +179,10 @@ pub const Win32Backend = struct {
     title_utf16: [256]u16 = std.mem.zeroes([256]u16),
     target_queue: ?*event.EventQueue = null,
     debug_events: bool = false,
+    /// Window-scoped GPUI service state. Native callback routing still uses
+    /// the legacy active pointer until the full registry migration lands.
+    window_registry: platform_services.WindowRegistry = .{},
+    window_services: ?platform_services.PlatformServices = null,
 
     const vtable: backend.VTable = .{
         .kind = kindFn,
@@ -193,6 +200,8 @@ pub const Win32Backend = struct {
         .setCursor = cursorFn,
         .setClipboardText = setClipboardFn,
         .clipboardText = getClipboardFn,
+        .setTextInput = @This().setTextInputFn,
+        .setImeCursorRect = @This().setImeCursorRectFn,
         .present = presentFn,
     };
 
@@ -227,6 +236,18 @@ pub const Win32Backend = struct {
         }
         const kernel = b.KernelApi.load(kernel32) orelse return error.MissingSymbols;
         const gdi = b.GdiApi.load(gdi32) orelse return error.MissingSymbols;
+        var imm32: ?dl.Library = null;
+        var imm: ?b.ImmApi = null;
+        if (dl.Library.open(&.{"imm32.dll"})) |lib| {
+            if (b.ImmApi.load(lib)) |loaded| {
+                imm32 = lib;
+                imm = loaded;
+            } else {
+                var owned = lib;
+                owned.close();
+            }
+        }
+        errdefer if (imm32) |*lib| lib.close();
 
         const instance = api.GetModuleHandleW(null);
         const class_name = [_:0]u16{ 'Z', 'U', 'I', 'W', 'i', 'n', 'd', 'o', 'w', 0 };
@@ -262,9 +283,11 @@ pub const Win32Backend = struct {
             .user32 = user32,
             .kernel32 = kernel32,
             .gdi32 = gdi32,
+            .imm32 = imm32,
             .api = api,
             .kernel = kernel,
             .gdi = gdi,
+            .imm = imm,
             .hwnd = null,
             .class_atom = atom,
             .instance = instance,
@@ -280,6 +303,8 @@ pub const Win32Backend = struct {
             return error.CreateWindowFailed;
         }
         self.hwnd = hwnd;
+        const handle = self.window_registry.register(@intFromPtr(hwnd)) catch unreachable;
+        self.window_services = .{ .handle = handle, .lifecycle = .active };
         _ = api.SetWindowLongPtrW(hwnd, b.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
         _ = api.ShowWindow(hwnd, b.SW_SHOW);
         // Per-monitor DPI when available (Win10+); 96 → scale 1 otherwise.
@@ -296,6 +321,7 @@ pub const Win32Backend = struct {
 
     pub fn deinit(self: *Win32Backend) void {
         self.renderer.deinit();
+        if (self.window_services) |state| _ = self.window_registry.unregister(state.handle);
         if (active == self) active = null;
         self.destroyDib();
         if (self.hwnd) |hwnd| {
@@ -307,6 +333,7 @@ pub const Win32Backend = struct {
         self.user32.close();
         self.kernel32.close();
         self.gdi32.close();
+        if (self.imm32) |*lib| lib.close();
         self.allocator.destroy(self);
     }
 
@@ -520,6 +547,22 @@ pub const Win32Backend = struct {
                 }
                 return 0;
             },
+            b.WM_IME_COMPOSITION => {
+                if (self) |s| {
+                    const flags: usize = @bitCast(lparam);
+                    if (flags & b.GCS_RESULTSTR != 0) {
+                        if (s.readImeText(b.GCS_RESULTSTR)) |text| s.pushEvent(.{ .composition = .{ .commit = text } });
+                    }
+                    if (flags & b.GCS_COMPSTR != 0) {
+                        if (s.readImeText(b.GCS_COMPSTR)) |text| s.pushEvent(.{ .composition = .{ .preedit = text } });
+                    }
+                }
+                return 0;
+            },
+            b.WM_IME_ENDCOMPOSITION => {
+                if (self) |s| s.pushEvent(.{ .composition = .cancel });
+                return 0;
+            },
             b.WM_LBUTTONDOWN => {
                 if (self) |s| {
                     _ = s.api.SetCapture(s.hwnd);
@@ -693,15 +736,24 @@ pub const Win32Backend = struct {
 
     fn waitFn(ptr: *anyopaque, ns: u64) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        // Sleep until input; without MsgWaitForMultipleObjects linked, a
-        // bounded sleep keeps idle near zero (same tradeoff as the yield
-        // guards on Wayland/X11).
-        self.kernel.Sleep(@intCast(@min(ns / 1_000_000, 4)));
+        const timeout_ms: u32 = @intCast(@min(ns / std.time.ns_per_ms, std.math.maxInt(u32)));
+        if (self.api.MsgWaitForMultipleObjectsEx) |wait| {
+            // Wake for posted input, paint, close, or the executor wake
+            // message. This is the Win32 equivalent of polling the native
+            // display fd and avoids the old unconditional 4 ms spin.
+            _ = wait(0, null, timeout_ms, b.QS_ALLINPUT, b.MWMO_INPUTAVAILABLE);
+        } else {
+            // Keep compatibility with unusually old user32 implementations.
+            self.kernel.Sleep(timeout_ms);
+        }
     }
 
     fn wakeupFn(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.wakeups += 1;
+        if (self.hwnd) |hwnd| {
+            if (self.api.PostMessageW) |post| _ = post(hwnd, b.WM_ZUI_WAKE, 0, 0);
+        }
     }
 
     fn infoFn(ptr: *anyopaque) backend.WindowInfo {
@@ -781,6 +833,63 @@ pub const Win32Backend = struct {
         } else {
             _ = self.api.ShowWindow(hwnd, b.SW_MAXIMIZE);
         }
+    }
+
+    fn readImeText(self: *@This(), kind: b.DWORD) ?event.CompositionText {
+        const imm = self.imm orelse return null;
+        const hwnd = self.hwnd orelse return null;
+        const himc = imm.ImmGetContext(hwnd);
+        if (himc == null) return null;
+        defer _ = imm.ImmReleaseContext(hwnd, himc);
+
+        const byte_count = imm.ImmGetCompositionStringW(himc, kind, null, 0);
+        if (byte_count <= 0) return null;
+        const bounded: usize = @min(@as(usize, @intCast(byte_count)), 256 * @sizeOf(u16));
+        var utf16: [256]u16 = undefined;
+        const copied = imm.ImmGetCompositionStringW(himc, kind, @ptrCast(&utf16), @intCast(bounded));
+        if (copied <= 0) return null;
+        const units = @min(@as(usize, @intCast(copied)) / @sizeOf(u16), utf16.len);
+        var result = event.CompositionText{};
+        var lead: ?u16 = null;
+        var out_len: usize = 0;
+        for (utf16[0..units]) |unit| {
+            if (out_len >= result.bytes.len) break;
+            const n = utf16UnitToUtf8(unit, &lead, result.bytes[out_len..]);
+            out_len += @min(n, result.bytes.len - out_len);
+        }
+        if (out_len == 0) return null;
+        result.len = @intCast(out_len);
+        result.marked = .{ .start = out_len, .end = out_len };
+        return result;
+    }
+
+    fn setTextInputFn(ptr: *anyopaque, enabled: bool) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const imm = self.imm orelse return;
+        const hwnd = self.hwnd orelse return;
+        const himc = imm.ImmGetContext(hwnd);
+        if (himc == null) return;
+        defer _ = imm.ImmReleaseContext(hwnd, himc);
+        _ = imm.ImmSetOpenStatus(himc, if (enabled) 1 else 0);
+    }
+
+    fn setImeCursorRectFn(ptr: *anyopaque, rect: geometry.Rect) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const imm = self.imm orelse return;
+        const hwnd = self.hwnd orelse return;
+        const himc = imm.ImmGetContext(hwnd);
+        if (himc == null) return;
+        defer _ = imm.ImmReleaseContext(hwnd, himc);
+        const scale = @max(self.scale_factor, 0.001);
+        const x: i32 = @intFromFloat(@round(rect.x * scale));
+        const y: i32 = @intFromFloat(@round((rect.y + rect.h) * scale));
+        const form = b.CANDIDATEFORM{
+            .dwIndex = 0,
+            .dwStyle = b.CFS_CANDIDATEPOS,
+            .ptCurrentPos = .{ .x = x, .y = y },
+            .rcArea = .{ .left = x, .top = y, .right = x, .bottom = y },
+        };
+        _ = imm.ImmSetCandidateWindow(himc, &form);
     }
 
     fn setClipboardFn(ptr: *anyopaque, text: []const u8) bool {

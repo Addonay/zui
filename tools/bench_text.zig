@@ -9,6 +9,7 @@
 //! Text rendering is always cozmic; there is no engine switch any more:
 //!   zig build bench-text
 //!   zig build bench-text -- --format json --iter 9 --warmup 3
+//!   zig build bench-text -- --element-only --quick
 //!
 //! The engine is created once from the vendored corpus so runs are
 //! host-independent, with the same host-system-font fallback the App's lazy
@@ -94,6 +95,9 @@ const Options = struct {
     /// and characterize their overflow instead of skipping them. Standard
     /// rows are gated either way.
     allow_overflow: bool = false,
+    /// Skip the intentionally uncached raw reference rows when profiling the
+    /// real warm element path with callgrind or another instruction profiler.
+    element_only: bool = false,
 };
 
 fn truthy(value: []const u8) bool {
@@ -109,6 +113,7 @@ fn parseArgs(args: []const []const u8, environ: *const std.process.Environ.Map) 
     var json = false;
     var quick = false;
     var allow_overflow = false;
+    var element_only = false;
     var i: usize = 1; // args[0] is the program path.
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -127,6 +132,8 @@ fn parseArgs(args: []const []const u8, environ: *const std.process.Environ.Map) 
             quick = true;
         } else if (std.mem.eql(u8, arg, "--allow-overflow")) {
             allow_overflow = true;
+        } else if (std.mem.eql(u8, arg, "--element-only")) {
+            element_only = true;
         }
     }
     const env_quick = if (environ.get("ZUI_BENCH_QUICK")) |v| truthy(v) else false;
@@ -136,6 +143,7 @@ fn parseArgs(args: []const []const u8, environ: *const std.process.Environ.Map) 
         .warmup = warmup orelse if (use_quick) quick_warmup else default_warmup,
         .json = json,
         .allow_overflow = allow_overflow,
+        .element_only = element_only,
     };
 }
 
@@ -247,6 +255,8 @@ const ElementSample = struct {
     paint_shapes: u64,
     /// Cross-frame layout-cache hits observed in this row's run loop.
     cache_hits: u64,
+    atlas_hits: u64,
+    atlas_misses: u64,
 };
 
 /// Warm up (atlas, allocator, engine caches) and then time `iters` frames:
@@ -320,6 +330,8 @@ fn timeElement(
         .layout_shapes = layout_shapes,
         .paint_shapes = paint_shapes,
         .cache_hits = cache_hits,
+        .atlas_hits = engine.glyphs.hits,
+        .atlas_misses = engine.glyphs.misses,
     };
 }
 
@@ -510,6 +522,9 @@ pub fn main(init: std.process.Init) !void {
     } else {
         try note(w, opts.json, "cozmic engine: host system fonts (host-dependent)", .{});
     }
+    if (opts.element_only) {
+        try note(w, opts.json, "element-only profiling mode: uncached raw reference rows and their accounting gates are skipped", .{});
+    }
 
     const frame = try gpa.create(element.Frame);
     defer gpa.destroy(frame);
@@ -572,7 +587,7 @@ pub fn main(init: std.process.Init) !void {
             }
             if (opts.json) {
                 try w.print(
-                    "{{\"bench\":\"text-frame\",\"kind\":\"element\",\"engine\":\"{s}\",\"config\":\"{s}\",\"nodes\":{d},\"chars\":{d},\"iters\":{d},\"layout_mean_ns\":{d:.1},\"layout_median_ns\":{d:.1},\"paint_mean_ns\":{d:.1},\"paint_median_ns\":{d:.1},\"total_mean_ns\":{d:.1},\"total_median_ns\":{d:.1},\"ns_per_node\":{d:.1},\"ns_per_char\":{d:.2},\"scene_glyphs\":{d},\"scene_dropped\":{d},\"cozmic_nodes\":{d},\"cozmic_emitted\":{d},\"cozmic_skipped\":{d},\"cozmic_failures\":{d},\"layout_shapes\":{d},\"paint_shapes\":{d},\"cache_hits\":{d}}}\n",
+                    "{{\"bench\":\"text-frame\",\"kind\":\"element\",\"engine\":\"{s}\",\"config\":\"{s}\",\"nodes\":{d},\"chars\":{d},\"iters\":{d},\"layout_mean_ns\":{d:.1},\"layout_median_ns\":{d:.1},\"paint_mean_ns\":{d:.1},\"paint_median_ns\":{d:.1},\"total_mean_ns\":{d:.1},\"total_median_ns\":{d:.1},\"ns_per_node\":{d:.1},\"ns_per_char\":{d:.2},\"scene_glyphs\":{d},\"scene_dropped\":{d},\"cozmic_nodes\":{d},\"cozmic_emitted\":{d},\"cozmic_skipped\":{d},\"cozmic_failures\":{d},\"layout_shapes\":{d},\"paint_shapes\":{d},\"cache_hits\":{d},\"atlas_hits\":{d},\"atlas_misses\":{d}}}\n",
                     .{
                         engine_name,             cfg.name,               n,
                         chars,                   opts.iters,             sample.layout.mean_ns,
@@ -581,7 +596,7 @@ pub fn main(init: std.process.Init) !void {
                         ns_per_char,             sample.glyphs,          sample.dropped,
                         sample.cozmic_nodes,     sample.cozmic_emitted,  sample.cozmic_skipped,
                         sample.cozmic_failures,  sample.layout_shapes,   sample.paint_shapes,
-                        sample.cache_hits,
+                        sample.cache_hits,       sample.atlas_hits,      sample.atlas_misses,
                     },
                 );
             } else {
@@ -599,8 +614,11 @@ pub fn main(init: std.process.Init) !void {
                 if (sample.dropped > 0) try w.print(" dropped={d}", .{sample.dropped});
                 if (sample.cozmic_failures > 0) try w.print(" failures={d}", .{sample.cozmic_failures});
                 if (sample.cozmic_skipped > 0) try w.print(" no-ink={d}", .{sample.cozmic_skipped});
+                try w.print(" atlas={d}/{d}", .{ sample.atlas_hits, sample.atlas_misses });
                 try w.print("\n", .{});
             }
+
+            if (opts.element_only) continue;
 
             const raw_sample = try timeRaw(arena, io, engine.?, gpa, frame, opts.iters, opts.warmup);
             const sum_shape = raw_sample.shape.median_ns;

@@ -57,9 +57,7 @@ pub const NullBackend = struct {
         for (&self.windows) |*slot| {
             if (slot.* != null) continue;
             const child = try allocator.create(NullBackend);
-            child.* = .{ .parent = self, .allocator = allocator, .window_id = options.id,
-                .size = .{ .w = @floatFromInt(options.width), .h = @floatFromInt(options.height) },
-                .decorated = options.decorated };
+            child.* = .{ .parent = self, .allocator = allocator, .window_id = options.id, .size = .{ .w = @floatFromInt(options.width), .h = @floatFromInt(options.height) }, .decorated = options.decorated };
             child.backendHandle().setTitle(options.title);
             slot.* = child;
             return child.backendHandle();
@@ -92,12 +90,20 @@ pub const NullBackend = struct {
     fn pollFn(ptr: *anyopaque, out: *event.EventQueue) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         while (self.queue.pop()) |ev| {
-            _ = out.push(ev);
+            pushToQueue(out, ev, "null");
         }
         for (self.windows) |slot| {
             if (slot) |child| while (child.queue.pop()) |ev| {
-                _ = out.push(ev.forWindow(child.window_id));
+                pushToQueue(out, ev.forWindow(child.window_id), "null child");
             };
+        }
+    }
+
+    fn pushToQueue(out: *event.EventQueue, ev: event.Event, where: []const u8) void {
+        if (event.EventQueue.isCritical(ev)) {
+            out.pushCriticalEscalated(ev, where);
+        } else {
+            _ = out.push(ev);
         }
     }
 

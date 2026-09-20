@@ -4,11 +4,13 @@
 //! `win32.zig` and `bindings.zig` for the mapped surface.
 
 pub const bindings = @import("bindings.zig");
+pub const services = @import("services.zig");
 pub const win32 = @import("win32.zig");
 
 pub const Win32Backend = win32.Win32Backend;
 
 test {
     _ = @import("bindings.zig");
+    _ = @import("services.zig");
     _ = @import("win32.zig");
 }

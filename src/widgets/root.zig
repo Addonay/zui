@@ -21,6 +21,15 @@ pub const Tooltip = @import("tooltip.zig").Tooltip;
 pub const Popover = @import("popover.zig").Popover;
 pub const Modal = @import("popover.zig").Modal;
 pub const Dialog = @import("popover.zig").Dialog;
+pub const Editor = @import("editor.zig").Editor;
+pub const TextArea = @import("text_area.zig").TextArea;
+pub const Tabs = @import("tabs.zig").Tabs;
+pub const Tab = @import("tabs.zig").Tab;
+pub const TreeView = @import("tree_view.zig").TreeView;
+pub const TreeNode = @import("tree_view.zig").Node;
+pub const SplitPane = @import("split_pane.zig").SplitPane;
+pub const CommandPalette = @import("command_palette.zig").CommandPalette;
+pub const Command = @import("command_palette.zig").Command;
 
 test {
     _ = @import("text_field.zig");
@@ -33,4 +42,5 @@ test {
     _ = @import("scroll_model.zig");
     _ = @import("virtual_table.zig");
     _ = @import("virtual_table_test.zig");
+    _ = @import("widget_ecosystem_test.zig");
 }

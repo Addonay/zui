@@ -25,6 +25,7 @@ const Region = opaque {};
 const Shm = opaque {};
 const ShmPool = opaque {};
 const Buffer = opaque {};
+const Callback = opaque {};
 const Seat = opaque {};
 const Pointer = opaque {};
 const Keyboard = opaque {};
@@ -38,6 +39,8 @@ const DataSource = opaque {};
 const DecorationManager = opaque {};
 const Decoration = opaque {};
 const CursorTheme = opaque {};
+const TextInputManager = opaque {};
+const TextInput = opaque {};
 /// Cursor entry: image array layout verified against wayland-cursor.h
 /// (image_count, then images pointer; name follows and is unread).
 const CursorHandle = extern struct {
@@ -76,6 +79,10 @@ const WlBufferListener = extern struct {
     release: ?*const fn (?*anyopaque, *Buffer) callconv(.c) void = null,
 };
 
+const WlCallbackListener = extern struct {
+    done: ?*const fn (?*anyopaque, *Callback, u32) callconv(.c) void = null,
+};
+
 const Interface = extern struct {
     name: [*:0]const u8,
     version: c_int,
@@ -89,6 +96,22 @@ const Message = extern struct {
     name: [*:0]const u8,
     signature: [*:0]const u8,
     types: ?[*]const ?*const anyopaque,
+};
+
+// wl_surface.frame creates a one-shot wl_callback that fires when the
+// compositor has displayed the committed surface. The core library exports
+// wl_callback_interface, but keeping this tiny event table local avoids
+// another mandatory dynamic symbol lookup.
+const wl_callback_events = [_]Message{
+    .{ .name = "done", .signature = "u", .types = null },
+};
+const wl_callback_interface: Interface = .{
+    .name = "wl_callback",
+    .version = 1,
+    .method_count = 0,
+    .methods = null,
+    .event_count = 1,
+    .events = @ptrCast(&wl_callback_events),
 };
 
 // Listeners
@@ -122,6 +145,17 @@ const DecorationListener = extern struct {
 /// §5G DPI: fractional-scale-v1 preferred_scale. Wire value is scale*120.
 const FractionalScaleListener = extern struct {
     preferred_scale: ?*const fn (?*anyopaque, *anyopaque, u32) callconv(.c) void = null,
+};
+
+/// zwp_text_input_v3 is optional. Keep its wire description local so the
+/// backend remains usable on compositors that do not advertise the global.
+const TextInputListener = extern struct {
+    enter: ?*const fn (?*anyopaque, *TextInput, *Surface) callconv(.c) void = null,
+    leave: ?*const fn (?*anyopaque, *TextInput, *Surface) callconv(.c) void = null,
+    preedit_string: ?*const fn (?*anyopaque, *TextInput, ?[*:0]const u8, i32, i32) callconv(.c) void = null,
+    commit_string: ?*const fn (?*anyopaque, *TextInput, ?[*:0]const u8) callconv(.c) void = null,
+    delete_surrounding_text: ?*const fn (?*anyopaque, *TextInput, u32, u32) callconv(.c) void = null,
+    done: ?*const fn (?*anyopaque, *TextInput, u32) callconv(.c) void = null,
 };
 
 const DECOR_MODE_CLIENT_SIDE: u32 = 1;
@@ -436,6 +470,45 @@ const fractional_scale_manager_interface: Interface = .{
     .events = null,
 };
 
+const text_input_events = [_]Message{
+    .{ .name = "enter", .signature = "o", .types = &[_]?*const anyopaque{null} },
+    .{ .name = "leave", .signature = "o", .types = &[_]?*const anyopaque{null} },
+    .{ .name = "preedit_string", .signature = "?sii", .types = null },
+    .{ .name = "commit_string", .signature = "?s", .types = null },
+    .{ .name = "delete_surrounding_text", .signature = "uu", .types = null },
+    .{ .name = "done", .signature = "u", .types = null },
+};
+const text_input_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "enable", .signature = "", .types = null },
+    .{ .name = "disable", .signature = "", .types = null },
+    .{ .name = "set_surrounding_text", .signature = "sii", .types = null },
+    .{ .name = "set_text_change_cause", .signature = "u", .types = null },
+    .{ .name = "set_content_type", .signature = "uu", .types = null },
+    .{ .name = "set_cursor_rectangle", .signature = "iiii", .types = null },
+    .{ .name = "commit", .signature = "", .types = null },
+};
+const text_input_interface: Interface = .{
+    .name = "zwp_text_input_v3",
+    .version = 1,
+    .method_count = 8,
+    .methods = @ptrCast(&text_input_methods),
+    .event_count = 6,
+    .events = @ptrCast(&text_input_events),
+};
+const text_input_manager_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "get_text_input", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&text_input_interface), null } },
+};
+const text_input_manager_interface: Interface = .{
+    .name = "zwp_text_input_manager_v3",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&text_input_manager_methods),
+    .event_count = 0,
+    .events = null,
+};
+
 const xdg_wm_base_events = [_]Message{
     .{ .name = "ping", .signature = "u", .types = null },
 };
@@ -558,6 +631,8 @@ pub const WaylandBackend = struct {
     seat: ?*Seat = null,
     pointer: ?*Pointer = null,
     keyboard: ?*Keyboard = null,
+    /// Optional text-input-v3 manager advertised by the compositor.
+    text_input_manager: ?*TextInputManager = null,
     seat_caps: u32 = 0,
     mods_mask: u32 = 0,
     pointer_x: f32 = 0,
@@ -590,6 +665,14 @@ pub const WaylandBackend = struct {
     xdg_surface: ?*XdgSurface = null,
     xdg_toplevel: ?*XdgToplevel = null,
     opaque_region: ?*Region = null,
+    /// Per-surface text-input-v3 object. The listener userdata is this
+    /// window, whose address remains stable until teardown.
+    text_input: ?*TextInput = null,
+    text_input_enabled: bool = false,
+    pending_preedit: ?event.CompositionText = null,
+    pending_commit: ?event.CompositionText = null,
+    pending_preedit_cancel: bool = false,
+    text_input_has_preedit: bool = false,
 
     size: geometry.Size = .{ .w = 800, .h = 600 },
     scale_factor: f32 = 1.0,
@@ -604,6 +687,8 @@ pub const WaylandBackend = struct {
     // faults connection handling. Two entries let us render the next
     // frame while the compositor still scans out the previous one.
     bufs: [2]ShmBuffer = .{ .{}, .{} },
+    /// One-shot wl_surface.frame callback for animation scheduling.
+    frame_callback: ?*Callback = null,
     target_queue: ?*event.EventQueue = null,
     /// Gated `ZUI_DEBUG_EVENTS` input logging (read once at init).
     debug_events: bool = false,
@@ -673,6 +758,10 @@ pub const WaylandBackend = struct {
         .setClipboardText = setClipboardFn,
         .clipboardText = getClipboardFn,
         .present = presentFn,
+        .requestFrame = requestFrameFn,
+        .setTextInput = setTextInputFn,
+        .setImeCursorRect = setImeCursorRectFn,
+        .nativeSurface = nativeSurfaceFn,
     };
 
     fn getenv(name: [*:0]const u8) ?[*:0]const u8 {
@@ -782,6 +871,26 @@ pub const WaylandBackend = struct {
         const surf_raw = api.wl_proxy_marshal_flags(@ptrCast(compositor), 0, api.wl_surface_interface, api.wl_proxy_get_version(@ptrCast(compositor)), 0, @as(?*anyopaque, null));
         self.surface = @ptrCast(surf_raw orelse return error.CannotCreateSurface);
 
+        // zwp_text_input_v3 is optional. If the manager was not advertised,
+        // leave this object absent and retain the ordinary wl_keyboard path.
+        if (self.text_input_manager) |manager| {
+            if (self.seat) |seat| {
+                const raw = api.wl_proxy_marshal_flags(
+                    @ptrCast(manager),
+                    1, // zwp_text_input_manager_v3.get_text_input
+                    &text_input_interface,
+                    1,
+                    0,
+                    @as(?*anyopaque, null),
+                    @as(*anyopaque, @ptrCast(seat)),
+                );
+                if (raw) |obj| {
+                    self.text_input = @ptrCast(obj);
+                    _ = api.wl_proxy_add_listener(@ptrCast(obj), &default_text_input_listener, self);
+                }
+            }
+        }
+
         // Tell the compositor every pixel is opaque. Without an opaque
         // region KWin treats the surface as translucent (translucency/blur/
         // contrast pipelines engage) — XWayland always sets one, which is
@@ -888,6 +997,8 @@ pub const WaylandBackend = struct {
             .compositor = self.compositor,
             .shm = self.shm,
             .wm_base = self.wm_base,
+            .seat = self.seat,
+            .text_input_manager = self.text_input_manager,
             .dec_manager = self.dec_manager,
             .parent = self,
             .window_id = options.id,
@@ -947,6 +1058,12 @@ pub const WaylandBackend = struct {
         self.xdg_toplevel = null;
         if (self.xdg_surface) |xs| self.destroyProxy(@ptrCast(xs), 0);
         self.xdg_surface = null;
+        if (self.text_input) |ti| self.destroyProxy(@ptrCast(ti), 0);
+        self.text_input = null;
+        if (self.frame_callback) |callback| {
+            self.api.wl_proxy_destroy(@ptrCast(callback));
+            self.frame_callback = null;
+        }
         if (self.surface) |s| self.destroyProxy(@ptrCast(s), 0);
         self.surface = null;
         if (self.opaque_region) |r| self.destroyProxy(@ptrCast(r), 0);
@@ -971,6 +1088,10 @@ pub const WaylandBackend = struct {
         if (self.dec_manager) |dm| {
             self.api.wl_proxy_destroy(@ptrCast(dm));
             self.dec_manager = null;
+        }
+        if (self.text_input_manager) |tm| {
+            self.api.wl_proxy_destroy(@ptrCast(tm));
+            self.text_input_manager = null;
         }
 
         if (self.data_source) |ds| {
@@ -1025,6 +1146,12 @@ pub const WaylandBackend = struct {
 
     pub fn backendHandle(self: *WaylandBackend) backend.Backend {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn nativeSurfaceFn(ptr: *anyopaque) ?gpu.render_backend.NativeSurface {
+        const self: *WaylandBackend = @ptrCast(@alignCast(ptr));
+        const surface = self.surface orelse return null;
+        return .{ .kind = .wayland, .display = @ptrCast(self.display), .surface = @ptrCast(surface) };
     }
 
     /// §5G DPI: PHYSICAL framebuffer dimensions for the current logical
@@ -1144,6 +1271,37 @@ pub const WaylandBackend = struct {
         zlog.log("wayland", "release for unknown buffer (already destroyed?)", .{});
     }
 
+    fn frameDone(data: ?*anyopaque, callback: *Callback, _: u32) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.frame_callback == callback) self.frame_callback = null;
+        if (self.target_queue) |out| {
+            out.pushCriticalEscalated(.{ .targeted = .{
+                .window_id = self.window_id,
+                .payload = .{ .window = .frame_ready },
+            } }, "wayland frame callback");
+        }
+    }
+
+    fn requestFrameFn(ptr: *anyopaque) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(ptr));
+        if (self.destroyed or self.surface == null or self.frame_callback != null) return;
+        const surface = self.surface.?;
+        const raw = self.api.wl_proxy_marshal_flags(
+            @ptrCast(surface),
+            3, // wl_surface::frame
+            &wl_callback_interface,
+            self.api.wl_proxy_get_version(@ptrCast(surface)),
+            0,
+        ) orelse return;
+        const callback: *Callback = @ptrCast(raw);
+        if (self.api.wl_proxy_add_listener(@ptrCast(callback), &default_callback_listener, self) != 0) {
+            self.api.wl_proxy_destroy(@ptrCast(callback));
+            return;
+        }
+        self.frame_callback = callback;
+        _ = self.api.wl_display_flush(self.display);
+    }
+
     fn destroyBuffer(self: *WaylandBackend) void {
         for (&self.bufs) |*e| self.destroyEntry(e);
     }
@@ -1186,6 +1344,10 @@ pub const WaylandBackend = struct {
             const one: u32 = 1;
             const fm = self.api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &fractional_scale_manager_interface, one, 0, name, fractional_scale_manager_interface.name, one, &fractional_scale_manager_interface);
             self.frac_manager = @ptrCast(fm);
+        } else if (std.mem.eql(u8, iface_name, "zwp_text_input_manager_v3")) {
+            const one: u32 = 1;
+            const tm = self.api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &text_input_manager_interface, one, 0, name, text_input_manager_interface.name, one, &text_input_manager_interface);
+            self.text_input_manager = @ptrCast(tm);
         }
     }
 
@@ -1255,7 +1417,12 @@ pub const WaylandBackend = struct {
     /// §5G DPI: targeted window-state event (scale_changed) from a
     /// compositor callback outside the normal input path.
     fn pushTargeted(self: *WaylandBackend, out: *event.EventQueue, payload: event.EventPayload) void {
-        _ = out.push(.{ .targeted = .{ .window_id = self.window_id, .payload = payload } });
+        const envelope: event.Event = .{ .targeted = .{ .window_id = self.window_id, .payload = payload } };
+        if (event.EventQueue.isCritical(envelope)) {
+            out.pushCriticalEscalated(envelope, "wayland");
+        } else {
+            _ = out.push(envelope);
+        }
     }
 
     fn clearAxes(self: *WaylandBackend) void {
@@ -1576,6 +1743,116 @@ pub const WaylandBackend = struct {
         const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
         self.mods_mask = depressed | latched;
         if (self.xkb) |*x| x.syncModifiers(depressed, latched, locked, group);
+    }
+
+    fn preeditPayload(text: [*:0]const u8, begin: i32, end: i32) ?event.CompositionText {
+        if (begin < 0 or end < begin) return null;
+        const bytes = std.mem.span(text);
+        var payload = event.CompositionText.init(bytes) catch return null;
+        const start: usize = @intCast(begin);
+        const finish: usize = @intCast(end);
+        if (finish > bytes.len) return null;
+        payload.marked = .{ .start = start, .end = finish };
+        return payload;
+    }
+
+    fn textInputClearPending(self: *WaylandBackend) void {
+        self.pending_preedit = null;
+        self.pending_commit = null;
+        self.pending_preedit_cancel = false;
+    }
+
+    fn textInputEnter(data: ?*anyopaque, _: *TextInput, _: *Surface) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        self.text_input_enabled = true;
+    }
+
+    fn textInputLeave(data: ?*anyopaque, _: *TextInput, _: *Surface) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.text_input_has_preedit or self.pending_preedit != null or self.pending_preedit_cancel) {
+            self.pushInputEvent(.{ .composition = .cancel });
+        }
+        self.textInputClearPending();
+        self.text_input_has_preedit = false;
+        self.text_input_enabled = false;
+    }
+
+    fn textInputPreedit(data: ?*anyopaque, _: *TextInput, text: ?[*:0]const u8, begin: i32, end: i32) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        const bytes = if (text) |value| std.mem.span(value) else "";
+        if (bytes.len == 0) {
+            self.pending_preedit = null;
+            self.pending_preedit_cancel = true;
+            return;
+        }
+        self.pending_preedit = preeditPayload(text.?, begin, end);
+        self.pending_preedit_cancel = self.pending_preedit == null;
+    }
+
+    fn textInputCommit(data: ?*anyopaque, _: *TextInput, text: ?[*:0]const u8) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        self.pending_commit = if (text) |value| event.CompositionText.init(std.mem.span(value)) catch null else null;
+    }
+
+    fn textInputDeleteSurrounding(_: ?*anyopaque, _: *TextInput, _: u32, _: u32) callconv(.c) void {
+        // The current normalized protocol has no delete-surrounding event.
+        // Keep this callback installed so v3 compositors cannot abort on the
+        // event; native editing remains correct for preedit/commit traffic.
+    }
+
+    fn textInputDone(data: ?*anyopaque, _: *TextInput, _: u32) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.pending_preedit_cancel) {
+            self.pushInputEvent(.{ .composition = .cancel });
+            self.text_input_has_preedit = false;
+        } else if (self.pending_preedit) |payload| {
+            self.pushInputEvent(.{ .composition = .{ .preedit = payload } });
+            self.text_input_has_preedit = true;
+        }
+        if (self.pending_commit) |payload| {
+            self.pushInputEvent(.{ .composition = .{ .commit = payload } });
+            self.text_input_has_preedit = false;
+        }
+        self.textInputClearPending();
+    }
+
+    fn setTextInputFn(ptr: *anyopaque, enabled: bool) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(ptr));
+        const text_input = self.text_input orelse return;
+        if (self.text_input_enabled == enabled) return;
+        if (!enabled and (self.text_input_has_preedit or self.pending_preedit != null or self.pending_preedit_cancel)) {
+            self.pushInputEvent(.{ .composition = .cancel });
+            self.textInputClearPending();
+            self.text_input_has_preedit = false;
+        }
+        const opcode: u32 = if (enabled) 1 else 2; // enable / disable
+        _ = self.api.wl_proxy_marshal_flags(@ptrCast(text_input), opcode, null, 1, 0);
+        if (enabled) {
+            // hint=none, purpose=normal; callers can extend this once the
+            // normalized text-input configuration carries those semantics.
+            _ = self.api.wl_proxy_marshal_flags(@ptrCast(text_input), 5, null, 1, 0, @as(u32, 0), @as(u32, 0));
+        }
+        _ = self.api.wl_proxy_marshal_flags(@ptrCast(text_input), 7, null, 1, 0);
+        self.text_input_enabled = enabled;
+        _ = self.api.wl_display_flush(self.display);
+    }
+
+    fn setImeCursorRectFn(ptr: *anyopaque, rect: geometry.Rect) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(ptr));
+        const text_input = self.text_input orelse return;
+        _ = self.api.wl_proxy_marshal_flags(
+            @ptrCast(text_input),
+            6, // set_cursor_rectangle
+            null,
+            1,
+            0,
+            @as(i32, @intFromFloat(@round(rect.x))),
+            @as(i32, @intFromFloat(@round(rect.y))),
+            @as(i32, @intFromFloat(@max(0, @round(rect.w)))),
+            @as(i32, @intFromFloat(@max(0, @round(rect.h)))),
+        );
+        _ = self.api.wl_proxy_marshal_flags(@ptrCast(text_input), 7, null, 1, 0);
+        _ = self.api.wl_display_flush(self.display);
     }
 
     // -- clipboard (data-device) -----------------------------------------
@@ -2009,6 +2286,15 @@ pub const WaylandBackend = struct {
         .repeat_info = keyboardRepeatInfo,
     };
 
+    const default_text_input_listener = TextInputListener{
+        .enter = textInputEnter,
+        .leave = textInputLeave,
+        .preedit_string = textInputPreedit,
+        .commit_string = textInputCommit,
+        .delete_surrounding_text = textInputDeleteSurrounding,
+        .done = textInputDone,
+    };
+
     const default_data_offer_listener = DataOfferListener{
         .offer = dataOfferOffer,
     };
@@ -2021,6 +2307,10 @@ pub const WaylandBackend = struct {
 
     const default_buffer_listener = WlBufferListener{
         .release = bufferRelease,
+    };
+
+    const default_callback_listener = WlCallbackListener{
+        .done = frameDone,
     };
 
     const default_data_device_listener = DataDeviceListener{
@@ -2394,6 +2684,86 @@ test "wayland key emission and repeat bookkeeping" {
         if (b.xkb) |*bx| bx.deinit();
         b.xkb = null;
     }
+}
+
+test "wayland text input v3 batches preedit and commit at done" {
+    const t = std.testing;
+    var b = WaylandBackend{
+        .allocator = t.allocator,
+        .lib = undefined,
+        .api = undefined,
+        .renderer = gpu.vellz.Renderer.init(t.allocator),
+        .display = @ptrFromInt(1),
+        .registry = @ptrFromInt(2),
+    };
+    defer b.renderer.deinit();
+    var q = event.EventQueue{};
+    b.target_queue = &q;
+    const text_input: *TextInput = @ptrFromInt(4);
+
+    WaylandBackend.textInputPreedit(@ptrCast(&b), text_input, "nihon", 0, 2);
+    WaylandBackend.textInputCommit(@ptrCast(&b), text_input, "日本");
+    try t.expect(q.pop() == null);
+    WaylandBackend.textInputDone(@ptrCast(&b), text_input, 1);
+
+    const preedit = q.pop().?.composition.preedit;
+    try t.expectEqualStrings("nihon", preedit.slice().?);
+    try t.expectEqual(@as(usize, 0), preedit.marked.start);
+    try t.expectEqual(@as(usize, 2), preedit.marked.end);
+    const commit = q.pop().?.composition.commit;
+    try t.expectEqualStrings("日本", commit.slice().?);
+    try t.expect(q.pop() == null);
+}
+
+test "wayland text input v3 rejects invalid preedit wire ranges" {
+    try std.testing.expect(WaylandBackend.preeditPayload("abc", -1, 1) == null);
+    try std.testing.expect(WaylandBackend.preeditPayload("abc", 2, 1) == null);
+    try std.testing.expect(WaylandBackend.preeditPayload("abc", 0, 4) == null);
+    try std.testing.expect(WaylandBackend.preeditPayload("abc", 1, 3) != null);
+}
+
+test "wayland text input v3 null preedit becomes cancellation" {
+    const t = std.testing;
+    var b = WaylandBackend{
+        .allocator = t.allocator,
+        .lib = undefined,
+        .api = undefined,
+        .renderer = gpu.vellz.Renderer.init(t.allocator),
+        .display = @ptrFromInt(1),
+        .registry = @ptrFromInt(2),
+    };
+    defer b.renderer.deinit();
+    var q = event.EventQueue{};
+    b.target_queue = &q;
+    const text_input: *TextInput = @ptrFromInt(4);
+    WaylandBackend.textInputPreedit(@ptrCast(&b), text_input, null, 0, 0);
+    WaylandBackend.textInputDone(@ptrCast(&b), text_input, 1);
+    try t.expectEqual(event.Event{ .composition = .cancel }, q.pop().?);
+    try t.expect(q.pop() == null);
+}
+
+test "wayland text input v3 cancels committed preedit on leave" {
+    const t = std.testing;
+    var b = WaylandBackend{
+        .allocator = t.allocator,
+        .lib = undefined,
+        .api = undefined,
+        .renderer = gpu.vellz.Renderer.init(t.allocator),
+        .display = @ptrFromInt(1),
+        .registry = @ptrFromInt(2),
+    };
+    defer b.renderer.deinit();
+    var q = event.EventQueue{};
+    b.target_queue = &q;
+    const text_input: *TextInput = @ptrFromInt(4);
+    const surface: *Surface = @ptrFromInt(5);
+    WaylandBackend.textInputPreedit(@ptrCast(&b), text_input, "kana", 0, 4);
+    WaylandBackend.textInputDone(@ptrCast(&b), text_input, 1);
+    _ = q.pop();
+    try t.expect(b.text_input_has_preedit);
+    WaylandBackend.textInputLeave(@ptrCast(&b), text_input, surface);
+    try t.expectEqual(event.Event{ .composition = .cancel }, q.pop().?);
+    try t.expect(!b.text_input_has_preedit);
 }
 
 test "wayland wire keycodes translate reported letters and editing keys" {

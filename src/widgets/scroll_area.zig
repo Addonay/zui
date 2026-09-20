@@ -46,7 +46,7 @@ pub const ScrollArea = struct {
     }
     pub fn event(self: *ScrollArea, ev: platform.Event, win: *Window) bool {
         if (ev == .window) {
-            if (ev.window == .unfocused or ev.window == .close_requested) self.dragging = false;
+            if (ev.window == .unfocused or ev.window == .close_requested or ev.window == .cancelled) self.dragging = false;
             return false;
         }
         if (ev != .key or !ev.key.pressed) return false;
@@ -129,7 +129,7 @@ pub const ScrollArea = struct {
     /// already viewport-local; no giant logical offset enters f32 layout.
     pub fn renderViewport(self: *ScrollArea, win: *Window, focus: e.FocusHandle, viewport: e.Element, role: a11y.Role) e.Element {
         const t = self.options.tokens orelse theme.current();
-        if (!win.left_button_down) self.dragging = false;
+        if (!win.left_button_down or !win.focused.eql(focus)) self.dragging = false;
         const frame = e.element.currentFrame();
         if (focus.owner_store) |store| frame.trackOwner(self, store, focus.id, focus.owner_generation);
         var root = e.div().keyed(self.options.key).w(self.options.width).h(self.options.height)

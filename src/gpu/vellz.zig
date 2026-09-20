@@ -20,6 +20,7 @@ const kurbo = vellz.kurbo;
 const peniko = vellz.peniko;
 const common = vellz.common;
 const cpu = vellz.cpu;
+const filter_effects = common.filter_effects;
 
 const scene_mod = @import("scene.zig");
 const color_mod = @import("../core/color.zig");
@@ -38,6 +39,7 @@ const GlyphEntry = struct {
     /// Content hash of the coverage bytes, so a reused atlas slot with new
     /// pixels invalidates the cached mask without an atlas generation API.
     hash: u64,
+    is_color: bool = false,
     id: common.paint.ImageId,
 };
 
@@ -65,6 +67,30 @@ const ClipState = struct {
     keys: [2]ClipKey = undefined,
     len: usize = 0,
 };
+
+fn pathBounds(path: scene_mod.Path) geometry.Rect {
+    var min_x: f32 = std.math.inf(f32);
+    var min_y: f32 = std.math.inf(f32);
+    var max_x: f32 = -std.math.inf(f32);
+    var max_y: f32 = -std.math.inf(f32);
+    for (path.segments[0..path.segment_len]) |segment| {
+        const points: [3]geometry.Point = switch (segment) {
+            .move_to => |p| .{ p, p, p },
+            .line_to => |p| .{ p, p, p },
+            .quad_to => |q| .{ q.ctrl, q.to, q.to },
+            .cubic_to => |c| .{ c.ctrl1, c.ctrl2, c.to },
+            .close => continue,
+        };
+        for (points) |p| {
+            min_x = @min(min_x, p.x);
+            min_y = @min(min_y, p.y);
+            max_x = @max(max_x, p.x);
+            max_y = @max(max_y, p.y);
+        }
+    }
+    if (!std.math.isFinite(min_x)) return .{};
+    return .{ .x = min_x, .y = min_y, .w = @max(0, max_x - min_x), .h = @max(0, max_y - min_y) };
+}
 
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
@@ -142,8 +168,43 @@ pub const Renderer = struct {
         self.destroyFrameImages();
 
         var clip_buf: [2]ClipKey = undefined;
+        const GroupState = struct { transform: kurbo.Affine, layered: bool };
+        var group_stack: [64]GroupState = undefined;
+        var group_len: usize = 0;
         for (scene.commandSlice()) |cmd| {
             switch (cmd.kind) {
+                .begin_group => {
+                    if (group_len >= group_stack.len or cmd.index >= scene.groupSlice().len) return error.SceneGroupOverflow;
+                    const group = scene.groupSlice()[cmd.index];
+                    const previous = ctx.transform();
+                    const local = kurbo.Affine.new(.{
+                        @floatCast(group.transform[0]),                     @floatCast(group.transform[1]),
+                        @floatCast(group.transform[2]),                     @floatCast(group.transform[3]),
+                        @floatCast(group.transform[4] * self.scale_factor), @floatCast(group.transform[5] * self.scale_factor),
+                    });
+                    const combined = previous.compose(local);
+                    ctx.setTransform(combined);
+                    var layered = false;
+                    if (group.opacity < 1 or group.clip != null) {
+                        var clip_elements: ?std.ArrayListUnmanaged(kurbo.PathEl) = null;
+                        defer if (clip_elements) |*path| path.deinit(self.allocator);
+                        if (group.clip) |shape| {
+                            clip_elements = .empty;
+                            try appendClipShape(&clip_elements.?, self.allocator, shape);
+                        }
+                        try ctx.pushLayer(self.allocator, if (clip_elements) |*path| path.items else null, null, group.opacity, null, null);
+                        layered = true;
+                    }
+                    group_stack[group_len] = .{ .transform = previous, .layered = layered };
+                    group_len += 1;
+                },
+                .end_group => {
+                    if (group_len == 0) return error.SceneGroupUnderflow;
+                    group_len -= 1;
+                    const state = group_stack[group_len];
+                    if (state.layered) ctx.popLayer();
+                    ctx.setTransform(state.transform);
+                },
                 .quad => {
                     var q = scene.slice()[cmd.index];
                     q.x *= self.scale_factor;
@@ -186,6 +247,8 @@ pub const Renderer = struct {
                     b.y *= self.scale_factor;
                     b.w *= self.scale_factor;
                     b.h *= self.scale_factor;
+                    b.translate_x *= self.scale_factor;
+                    b.translate_y *= self.scale_factor;
                     b.radius *= self.scale_factor;
                     b.clip = scaledRect(b.clip, self.scale_factor);
                     if (b.w <= 0 or b.h <= 0 or b.src_w == 0 or b.src_h == 0) continue;
@@ -193,6 +256,54 @@ pub const Renderer = struct {
                     const keys = clipKeysFor(b.x, b.y, b.w, b.h, b.clip, b.radius, &clip_buf);
                     try self.updateClip(keys);
                     try self.drawBlit(b, image_pixels);
+                },
+                .stroke => {
+                    var stroke = scene.strokeSlice()[cmd.index];
+                    stroke.from.x *= self.scale_factor;
+                    stroke.from.y *= self.scale_factor;
+                    stroke.to.x *= self.scale_factor;
+                    stroke.to.y *= self.scale_factor;
+                    stroke.width *= self.scale_factor;
+                    stroke.clip = scaledRect(stroke.clip, self.scale_factor);
+                    if (stroke.width <= 0 or stroke.color.a <= 0 or
+                        !std.math.isFinite(stroke.width) or
+                        !std.math.isFinite(stroke.from.x) or !std.math.isFinite(stroke.from.y) or
+                        !std.math.isFinite(stroke.to.x) or !std.math.isFinite(stroke.to.y) or
+                        stroke.from.eql(stroke.to)) continue;
+                    if (stroke.clip.w <= 0 or stroke.clip.h <= 0) continue;
+                    const half = stroke.width / 2;
+                    const min_x = @min(stroke.from.x, stroke.to.x) - half;
+                    const min_y = @min(stroke.from.y, stroke.to.y) - half;
+                    const line_w = @max(stroke.from.x, stroke.to.x) - @min(stroke.from.x, stroke.to.x) + stroke.width;
+                    const line_h = @max(stroke.from.y, stroke.to.y) - @min(stroke.from.y, stroke.to.y) + stroke.width;
+                    const keys = clipKeysFor(min_x, min_y, line_w, line_h, @as(?geometry.Rect, stroke.clip), 0, &clip_buf);
+                    try self.updateClip(keys);
+                    try self.drawStroke(stroke);
+                },
+                .path => {
+                    var path = scene.pathSlice()[cmd.index];
+                    path.clip = scaledRect(path.clip, self.scale_factor);
+                    if (path.clip.w <= 0 or path.clip.h <= 0 or path.segment_len == 0 or path.color.a <= 0) continue;
+                    var bounds = pathBounds(path);
+                    bounds = scaledRect(bounds, self.scale_factor);
+                    const keys = clipKeysFor(bounds.x, bounds.y, bounds.w, bounds.h, path.clip, 0, &clip_buf);
+                    try self.updateClip(keys);
+                    try self.drawPath(path);
+                },
+                .shadow => {
+                    var shadow = scene.shadowSlice()[cmd.index];
+                    if (shadow.bounds.w <= 0 or shadow.bounds.h <= 0 or shadow.color.a <= 0) continue;
+                    shadow.bounds = scaledRect(shadow.bounds, self.scale_factor);
+                    shadow.offset_x *= self.scale_factor;
+                    shadow.offset_y *= self.scale_factor;
+                    shadow.spread *= self.scale_factor;
+                    shadow.radius *= self.scale_factor;
+                    shadow.blur_radius *= self.scale_factor;
+                    if (shadow.clip) |clip| shadow.clip = scaledRect(clip, self.scale_factor);
+                    if (shadow.clip) |clip| if (clip.w <= 0 or clip.h <= 0) continue;
+                    const keys = clipKeysFor(shadow.bounds.x + shadow.offset_x - shadow.spread - shadow.blur_radius * 3, shadow.bounds.y + shadow.offset_y - shadow.spread - shadow.blur_radius * 3, shadow.bounds.w + shadow.spread * 2 + shadow.blur_radius * 6, shadow.bounds.h + shadow.spread * 2 + shadow.blur_radius * 6, shadow.clip, 0, &clip_buf);
+                    try self.updateClip(keys);
+                    try self.drawShadow(shadow);
                 },
             }
         }
@@ -288,7 +399,7 @@ pub const Renderer = struct {
     fn drawGlyph(self: *Renderer, g: scene_mod.Glyph, gx: f32, gy: f32, glyph_pixels: []const u8, ratio: f32) !void {
         const id = try self.glyphImage(g, glyph_pixels);
         const ctx = &self.ctx.?;
-        ctx.setTint(.{ .color = penikoColor(g.color), .mode = .alpha_mask });
+        if (!g.isColor()) ctx.setTint(.{ .color = penikoColor(g.color), .mode = .alpha_mask });
         self.setImagePaint(id, .low);
         // Image paints live in image pixel space; place the mask at the
         // glyph origin, stretched by the target scale over the mask's own
@@ -318,6 +429,16 @@ pub const Renderer = struct {
         const sy = b.h / crop_h;
         const tx = b.x - crop_x * sx;
         const ty = b.y - crop_y * sy;
+        const transformed = b.rotation != 0 or b.scale_x != 1 or b.scale_y != 1 or b.translate_x != 0 or b.translate_y != 0;
+        const previous_transform = ctx.transform();
+        if (transformed) {
+            const center = kurbo.Point.new(b.x + b.w / 2, b.y + b.h / 2);
+            const image_transform = kurbo.Affine.translate(kurbo.Vec2.new(center.x + b.translate_x, center.y + b.translate_y))
+                .compose(kurbo.Affine.rotate(b.rotation))
+                .compose(kurbo.Affine.scaleNonUniform(b.scale_x, b.scale_y))
+                .compose(kurbo.Affine.translate(kurbo.Vec2.new(-center.x, -center.y)));
+            ctx.setTransform(previous_transform.compose(image_transform));
+        }
         ctx.setPaintTransform(kurbo.Affine.new(.{ sx, 0, 0, sy, tx, ty }));
 
         if (b.tint.r < 1 or b.tint.g < 1 or b.tint.b < 1 or b.tint.a < 1) {
@@ -327,6 +448,97 @@ pub const Renderer = struct {
         try ctx.fillRect(self.allocator, kurbo.Rect.new(b.x, b.y, b.x + b.w, b.y + b.h));
         ctx.setTint(null);
         ctx.resetPaintTransform();
+        if (transformed) ctx.setTransform(previous_transform);
+    }
+
+    fn drawStroke(self: *Renderer, stroke: scene_mod.Stroke) !void {
+        const ctx = &self.ctx.?;
+        ctx.setPaint(penikoColor(stroke.color));
+        var style = kurbo.Stroke.new(@as(f64, stroke.width));
+        style = style.withJoin(switch (stroke.join) {
+            .miter => .miter,
+            .round => .round,
+            .bevel => .bevel,
+        });
+        style = style.withMiterLimit(@as(f64, stroke.miter_limit));
+        style = style.withCaps(switch (stroke.cap) {
+            .butt => .butt,
+            .round => .round,
+            .square => .square,
+        });
+        ctx.setStroke(style);
+        self.path.clearRetainingCapacity();
+        try self.path.append(self.allocator, kurbo.PathEl.moveTo(kurbo.Point.new(stroke.from.x, stroke.from.y)));
+        try self.path.append(self.allocator, kurbo.PathEl.lineTo(kurbo.Point.new(stroke.to.x, stroke.to.y)));
+        try ctx.strokePath(self.allocator, self.path.items);
+    }
+
+    fn drawPath(self: *Renderer, path: scene_mod.Path) !void {
+        const ctx = &self.ctx.?;
+        self.path.clearRetainingCapacity();
+        for (path.segments[0..path.segment_len]) |segment| switch (segment) {
+            .move_to => |p| try self.path.append(self.allocator, kurbo.PathEl.moveTo(kurbo.Point.new(p.x, p.y))),
+            .line_to => |p| try self.path.append(self.allocator, kurbo.PathEl.lineTo(kurbo.Point.new(p.x, p.y))),
+            .quad_to => |q| try self.path.append(self.allocator, kurbo.PathEl.quadTo(kurbo.Point.new(q.ctrl.x, q.ctrl.y), kurbo.Point.new(q.to.x, q.to.y))),
+            .cubic_to => |c| try self.path.append(self.allocator, kurbo.PathEl.curveTo(kurbo.Point.new(c.ctrl1.x, c.ctrl1.y), kurbo.Point.new(c.ctrl2.x, c.ctrl2.y), kurbo.Point.new(c.to.x, c.to.y))),
+            .close => try self.path.append(self.allocator, kurbo.PathEl.closePath()),
+        };
+        ctx.setPaint(penikoColor(path.color));
+        const previous_transform = ctx.transform();
+        const path_transform = kurbo.Affine.new(.{
+            @floatCast(path.transform[0] * self.scale_factor),
+            @floatCast(path.transform[1] * self.scale_factor),
+            @floatCast(path.transform[2] * self.scale_factor),
+            @floatCast(path.transform[3] * self.scale_factor),
+            @floatCast(path.transform[4] * self.scale_factor),
+            @floatCast(path.transform[5] * self.scale_factor),
+        });
+        ctx.setTransform(previous_transform.compose(path_transform));
+        if (path.isStroke()) {
+            var style = kurbo.Stroke.new(@as(f64, path.stroke_width));
+            style = style.withJoin(switch (path.join) {
+                .miter => .miter,
+                .round => .round,
+                .bevel => .bevel,
+            });
+            style = style.withMiterLimit(@as(f64, path.miter_limit));
+            style = style.withCaps(switch (path.cap) {
+                .butt => .butt,
+                .round => .round,
+                .square => .square,
+            });
+            ctx.setStroke(style);
+            try ctx.strokePath(self.allocator, self.path.items);
+        } else try ctx.fillPath(self.allocator, self.path.items);
+        ctx.setTransform(previous_transform);
+    }
+
+    fn drawShadow(self: *Renderer, shadow: scene_mod.Shadow) !void {
+        const ctx = &self.ctx.?;
+        const rect = kurbo.Rect.new(
+            shadow.bounds.x + shadow.offset_x - shadow.spread,
+            shadow.bounds.y + shadow.offset_y - shadow.spread,
+            shadow.bounds.x + shadow.bounds.w + shadow.offset_x + shadow.spread,
+            shadow.bounds.y + shadow.bounds.h + shadow.offset_y + shadow.spread,
+        );
+        ctx.setPaint(penikoColor(shadow.color));
+        if (shadow.inset) {
+            try ctx.fillBlurredRoundedRect(self.allocator, rect, shadow.radius, @max(0, shadow.blur_radius), true);
+            return;
+        }
+        var filter = try filter_effects.Filter.fromPrimitive(self.allocator, .{ .drop_shadow = .{
+            .dx = 0,
+            .dy = 0,
+            .std_deviation = @max(0, shadow.blur_radius),
+            .color = penikoColor(shadow.color),
+            .edge_mode = .default,
+        } });
+        defer filter.deinit(self.allocator);
+        ctx.setFilterEffect(filter.clone());
+        defer ctx.resetFilterEffect();
+        self.path.clearRetainingCapacity();
+        try appendRoundedRect(&self.path, self.allocator, @floatCast(rect.x0), @floatCast(rect.y0), @floatCast(rect.width()), @floatCast(rect.height()), shadow.radius);
+        try ctx.fillPath(self.allocator, self.path.items);
     }
 
     fn setGradientPaint(self: *Renderer, q: scene_mod.Quad, end: Color) !void {
@@ -359,31 +571,40 @@ pub const Renderer = struct {
 
     fn glyphImage(self: *Renderer, g: scene_mod.Glyph, glyph_pixels: []const u8) !common.paint.ImageId {
         const count = @as(usize, g.w) * g.h;
-        const hash = coverageHash(glyph_pixels, g.atlas_offset, count);
+        const pixel_stride: usize = if (g.isColor()) 4 else 1;
+        const source_bytes = count * pixel_stride;
+        const hash = coverageHash(glyph_pixels, g.atlas_offset, source_bytes);
         if (self.glyph_images.get(g.atlas_offset)) |entry| {
-            if (entry.w == g.w and entry.h == g.h and entry.hash == hash) return entry.id;
+            if (entry.w == g.w and entry.h == g.h and entry.hash == hash and entry.is_color == g.isColor()) return entry.id;
             _ = self.resources.destroyImage(self.allocator, entry.id);
             _ = self.glyph_images.remove(g.atlas_offset);
         }
 
         const bytes = try self.allocator.alloc(u8, count * 4);
         defer self.allocator.free(bytes);
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            const src = @as(usize, g.atlas_offset) + i;
-            const coverage: u8 = if (src < glyph_pixels.len) glyph_pixels[src] else 0;
-            bytes[i * 4 + 0] = coverage;
-            bytes[i * 4 + 1] = coverage;
-            bytes[i * 4 + 2] = coverage;
-            bytes[i * 4 + 3] = coverage;
+        if (g.isColor()) {
+            const start = @as(usize, g.atlas_offset);
+            const available = @min(source_bytes, glyph_pixels.len -| start);
+            if (available > 0) @memcpy(bytes[0..available], glyph_pixels[start..][0..available]);
+            if (available < source_bytes) @memset(bytes[available..source_bytes], 0);
+        } else {
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const src = @as(usize, g.atlas_offset) + i;
+                const coverage: u8 = if (src < glyph_pixels.len) glyph_pixels[src] else 0;
+                bytes[i * 4 + 0] = coverage;
+                bytes[i * 4 + 1] = coverage;
+                bytes[i * 4 + 2] = coverage;
+                bytes[i * 4 + 3] = coverage;
+            }
         }
         const pixmap = try common.pixmap.Pixmap.fromParts(self.allocator, bytes, @intCast(g.w), @intCast(g.h), .{
             .may_have_transparency = true,
-            .alpha_type = .alpha_premultiplied,
+            .alpha_type = if (g.isColor()) .alpha else .alpha_premultiplied,
         });
         const id = try self.registerPixmap(pixmap);
         errdefer _ = self.resources.destroyImage(self.allocator, id);
-        try self.glyph_images.put(self.allocator, g.atlas_offset, .{ .w = g.w, .h = g.h, .hash = hash, .id = id });
+        try self.glyph_images.put(self.allocator, g.atlas_offset, .{ .w = g.w, .h = g.h, .hash = hash, .is_color = g.isColor(), .id = id });
         return id;
     }
 
@@ -613,6 +834,22 @@ fn appendRect(list: *std.ArrayListUnmanaged(kurbo.PathEl), allocator: std.mem.Al
     try list.append(allocator, kurbo.PathEl.ClosePath);
 }
 
+fn appendClipShape(list: *std.ArrayListUnmanaged(kurbo.PathEl), allocator: std.mem.Allocator, shape: scene_mod.ClipShape) !void {
+    switch (shape) {
+        .rect => |rect| try appendRect(list, allocator, rect.x, rect.y, rect.w, rect.h),
+        .rounded => |rounded| try appendRoundedRect(list, allocator, rounded.rect.x, rounded.rect.y, rounded.rect.w, rounded.rect.h, rounded.radius),
+        .path => |path| {
+            for (path.segments[0..path.segment_len]) |segment| switch (segment) {
+                .move_to => |p| try list.append(allocator, kurbo.PathEl.moveTo(kurbo.Point.new(p.x, p.y))),
+                .line_to => |p| try list.append(allocator, kurbo.PathEl.lineTo(kurbo.Point.new(p.x, p.y))),
+                .quad_to => |q| try list.append(allocator, kurbo.PathEl.quadTo(kurbo.Point.new(q.ctrl.x, q.ctrl.y), kurbo.Point.new(q.to.x, q.to.y))),
+                .cubic_to => |c| try list.append(allocator, kurbo.PathEl.curveTo(kurbo.Point.new(c.ctrl1.x, c.ctrl1.y), kurbo.Point.new(c.ctrl2.x, c.ctrl2.y), kurbo.Point.new(c.to.x, c.to.y))),
+                .close => try list.append(allocator, kurbo.PathEl.closePath()),
+            };
+        },
+    }
+}
+
 /// Rounded rectangle as a cubic path (circle approximation constant). The
 /// radius is clamped to half the smaller side, matching the old rasterizer.
 fn appendRoundedRect(
@@ -659,6 +896,36 @@ fn appendCubic(
 }
 
 // ------------------------------------------------------------------ tests
+
+test "color glyph uses RGBA atlas bytes instead of a tint mask" {
+    const t = std.testing;
+    const scene = try t.allocator.create(scene_mod.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    const color_base: usize = @import("../core/limits.zig").MAX_ATLAS_PIXELS;
+    const pool = try t.allocator.alloc(u8, color_base + 4);
+    defer t.allocator.free(pool);
+    pool[color_base + 0] = 0;
+    pool[color_base + 1] = 255;
+    pool[color_base + 2] = 0;
+    pool[color_base + 3] = 255;
+    try t.expect(scene.pushGlyph(.{
+        .x = 0,
+        .y = 0,
+        .w = 1,
+        .h = 1,
+        .color = Color.white,
+        .atlas_offset = @intCast(color_base),
+        .clip = .{ .x = 0, .y = 0, .w = 4, .h = 4 },
+    }));
+    var renderer = Renderer.init(t.allocator);
+    defer renderer.deinit();
+    const pixels = try t.allocator.alloc(u8, 4 * 4 * 4);
+    defer t.allocator.free(pixels);
+    try renderer.render(pixels, 4, 4, .rgba32, Color.black, scene, pool, &.{});
+    try t.expect(pixels[1] > pixels[0]);
+    try t.expect(pixels[1] > pixels[2]);
+}
 
 test "vellz renders a rounded quad with antialiased corners" {
     var renderer = Renderer.init(std.testing.allocator);
@@ -716,6 +983,41 @@ test "vellz clips draws to the payload clip rect" {
     const outside = (8 * 16 + 12) * 4;
     try std.testing.expectEqual(@as(u8, 255), buf[inside + 1]);
     try std.testing.expectEqual(@as(u8, 0), buf[outside + 1]);
+}
+
+test "vellz strokes logical lines with physical scaling and clipping" {
+    const t = std.testing;
+    const scene = try t.allocator.create(scene_mod.Scene);
+    defer t.allocator.destroy(scene);
+    scene.* = .{};
+    var stroke_storage: scene_mod.StrokeStorage = undefined;
+    scene.attachStrokeStorage(&stroke_storage);
+    try t.expect(scene.pushStroke(.{
+        .from = .{ .x = 0, .y = 5 },
+        .to = .{ .x = 10, .y = 5 },
+        .color = Color.white,
+        .width = 2,
+        .clip = .{ .x = 3, .y = 0, .w = 4, .h = 10 },
+    }));
+
+    var renderer = Renderer.init(t.allocator);
+    defer renderer.deinit();
+    renderer.scale_factor = 2;
+    var pixels: [40 * 24 * 4]u8 = undefined;
+    try renderer.render(&pixels, 40, 24, .rgba32, Color.black, scene, &.{}, &.{});
+
+    var inside_ink = false;
+    for (0..24) |y| {
+        for (0..40) |x| {
+            const red = pixels[(y * 40 + x) * 4];
+            if (red != 0) {
+                // Logical clip x=[3,7] becomes physical x=[6,14].
+                try t.expect(x >= 6 and x < 14);
+                inside_ink = true;
+            }
+        }
+    }
+    try t.expect(inside_ink);
 }
 
 test "vellz tints cached glyph masks per draw color" {

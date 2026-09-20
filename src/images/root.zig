@@ -11,6 +11,11 @@ pub const svg = @import("svg.zig");
 pub const cache = @import("cache.zig");
 
 pub const service = @import("service.zig");
+pub const asset_cache = @import("asset_cache.zig");
+pub const GenericAssetCache = asset_cache.AssetCache;
+pub const SourceKey = asset_cache.SourceKey;
+pub const AssetState = asset_cache.State;
+pub const AssetFailure = asset_cache.Failure;
 pub const Service = service.Service;
 pub const AssetHandle = service.Handle;
 pub const Cache = cache.Cache;
@@ -24,4 +29,5 @@ test {
     _ = @import("svg.zig");
     _ = @import("cache.zig");
     _ = @import("service_test.zig");
+    _ = @import("asset_cache_image_test.zig");
 }

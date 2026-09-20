@@ -148,6 +148,35 @@ pub const SubmitError = error{
     Unsupported,
 };
 
+/// Backend-neutral recovery policy: a lost device gets one recreate attempt,
+/// then rendering deterministically falls back to the software device.
+pub const RecoveryState = enum { healthy, recreate, software_fallback };
+
+pub const RecoveryPolicy = struct {
+    state: RecoveryState = .healthy,
+    losses: u32 = 0,
+
+    pub fn observe(self: *@This(), result: SubmitError!void) void {
+        if (result) |_| {
+            self.state = .healthy;
+        } else |err| switch (err) {
+            error.DeviceLost => {
+                self.losses += 1;
+                self.state = if (self.losses == 1) .recreate else .software_fallback;
+            },
+            else => self.state = .software_fallback,
+        }
+    }
+
+    pub fn markRecreated(self: *@This()) void {
+        self.state = .healthy;
+    }
+
+    pub fn usingSoftware(self: *const @This()) bool {
+        return self.state == .software_fallback;
+    }
+};
+
 // ============================================================================
 // Enums (ordinals match SDL_gpu.h order for cross-reading traces)
 // ============================================================================
@@ -2181,6 +2210,18 @@ test "premultiplied alpha blend matches the 2D pipeline" {
     try std.testing.expectEqual(BlendFactor.one, b.src_color_blendfactor);
     try std.testing.expectEqual(BlendFactor.one_minus_src_alpha, b.dst_color_blendfactor);
     try std.testing.expectEqual(BlendOp.add, b.color_blend_op);
+}
+
+test "GPU recovery escalates loss to deterministic software fallback" {
+    var policy = RecoveryPolicy{};
+    policy.observe(error.DeviceLost);
+    try std.testing.expectEqual(RecoveryState.recreate, policy.state);
+    policy.markRecreated();
+    try std.testing.expectEqual(RecoveryState.healthy, policy.state);
+    policy.observe(error.DeviceLost);
+    policy.observe(error.DeviceLost);
+    try std.testing.expect(policy.usingSoftware());
+    try std.testing.expectEqual(@as(u32, 3), policy.losses);
 }
 
 test "stub tracker enforces pool caps and detects double free" {

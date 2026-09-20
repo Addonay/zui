@@ -44,9 +44,117 @@ const EntityHeader = struct {
     destroy_ctx: ?*anyopaque = null,
 };
 
-fn typeTag(comptime T: type) u64 {
+pub fn typeTag(comptime T: type) u64 {
     return std.hash.Wyhash.hash(0, @typeName(T));
 }
+
+pub const GlobalError = error{ GlobalAlreadySet, GlobalCapacityExceeded, GlobalNotSet, InvalidReservation };
+
+const GlobalSlot = struct {
+    type_tag: u64,
+    value_ptr: ?*anyopaque = null,
+    destroy_fn: ?*const fn (*anyopaque, std.mem.Allocator) void = null,
+};
+
+pub const SubscriptionError = error{SubscriptionCapacityExceeded};
+
+const SubscriptionSlot = struct {
+    id: u64,
+    entity_id: u32,
+    generation: u32,
+    owner_id: u32 = 0,
+    owner_generation: u32 = 0,
+    active: bool = true,
+    callback: *const fn (*const anyopaque, *anyopaque) void,
+    ctx: *anyopaque,
+};
+
+pub const InvalidationScope = struct {
+    store: *EntityStore,
+    generation: u64,
+    window: ?*Window,
+
+    pub fn isValid(self: @This()) bool {
+        return self.store.invalidation_generation == self.generation;
+    }
+
+    pub fn invalidate(self: @This()) void {
+        self.store.invalidate();
+    }
+
+    pub fn windowTarget(self: @This()) ?*Window {
+        return self.window;
+    }
+};
+
+pub fn GlobalReservation(comptime T: type) type {
+    return struct {
+        store: *EntityStore,
+        slot_index: usize,
+        active: bool = true,
+
+        pub fn set(self: *@This(), value: T) GlobalError!void {
+            if (!self.active) return error.InvalidReservation;
+            try self.store.installReservedGlobal(self.slot_index, T, value);
+            self.active = false;
+        }
+
+        pub fn cancel(self: *@This()) void {
+            if (!self.active) return;
+            self.store.cancelGlobalReservation(self.slot_index);
+            self.active = false;
+        }
+    };
+}
+
+pub const EntityReservationError = error{InvalidReservation};
+
+/// A typed identity reservation matching GPUI's Reservation contract. The
+/// id/generation are minted immediately, so weak references can be handed to
+/// other state before the value is inserted; the slot remains non-live until
+/// `insert` succeeds.
+pub fn EntityReservation(comptime T: type) type {
+    return struct {
+        store: *EntityStore,
+        id_value: u32,
+        generation_value: u32,
+        active: bool = true,
+
+        pub fn id(self: @This()) u32 {
+            return self.id_value;
+        }
+
+        pub fn generation(self: @This()) u32 {
+            return self.generation_value;
+        }
+
+        pub fn insert(self: *@This(), options: T.Options, window: ?*Window) EntityReservationError!Entity(T) {
+            if (!self.active) return error.InvalidReservation;
+            self.active = false;
+            return self.store.createWithIdentity(T, options, window, self.id_value, self.generation_value);
+        }
+
+        pub fn cancel(self: *@This()) void {
+            self.active = false;
+        }
+    };
+}
+
+pub const Subscription = struct {
+    store: *EntityStore,
+    id: u64,
+    active: bool = true,
+
+    pub fn cancel(self: *@This()) void {
+        if (!self.active) return;
+        self.store.cancelSubscription(self.id);
+        self.active = false;
+    }
+
+    pub fn isActive(self: @This()) bool {
+        return self.active and self.store.subscriptionIsActive(self.id);
+    }
+};
 
 pub const EntityStore = struct {
     allocator: std.mem.Allocator,
@@ -58,12 +166,185 @@ pub const EntityStore = struct {
     /// UI-thread ownership (gap §5A): captured at init; every create /
     /// destroy / update asserts the calling thread in debug builds.
     owner_thread: std.Thread.Id,
+    globals: std.ArrayList(GlobalSlot) = .empty,
+    subscriptions: std.ArrayList(SubscriptionSlot) = .empty,
+    next_subscription_id: u64 = 1,
+    invalidation_generation: u64 = 1,
 
     pub fn init(allocator: std.mem.Allocator) EntityStore {
         // Wire the single subscription-liveness probe the element layer
         // consults (idempotent: every store wires the same function).
         elements.element.entity_is_alive_fn = entityAlive;
         return .{ .allocator = allocator, .owner_thread = std.Thread.getCurrentId() };
+    }
+
+    pub fn invalidate(self: *EntityStore) void {
+        self.assertUiThread();
+        self.invalidation_generation +%= 1;
+        if (self.invalidation_generation == 0) self.invalidation_generation = 1;
+        self.dirty = true;
+    }
+
+    pub fn scope(self: *EntityStore, window: ?*Window) InvalidationScope {
+        self.assertUiThread();
+        return .{ .store = self, .generation = self.invalidation_generation, .window = window };
+    }
+
+    fn destroyGlobalSlot(self: *EntityStore, slot: *GlobalSlot) void {
+        if (slot.value_ptr) |value| if (slot.destroy_fn) |destroy| destroy(value, self.allocator);
+        slot.* = .{ .type_tag = 0 };
+    }
+
+    fn installGlobalValue(self: *EntityStore, slot: *GlobalSlot, comptime T: type, value: T) GlobalError!void {
+        const Box = struct { value: T };
+        const box = self.allocator.create(Box) catch return error.GlobalCapacityExceeded;
+        box.* = .{ .value = value };
+        slot.value_ptr = @ptrCast(box);
+        slot.destroy_fn = struct {
+            fn destroy(raw: *anyopaque, allocator: std.mem.Allocator) void {
+                const typed: *Box = @ptrCast(@alignCast(raw));
+                if (@hasDecl(T, "deinit")) typed.value.deinit();
+                allocator.destroy(typed);
+            }
+        }.destroy;
+    }
+
+    pub fn setGlobal(self: *EntityStore, comptime T: type, value: T) GlobalError!void {
+        self.assertUiThread();
+        const tag = typeTag(T);
+        for (self.globals.items) |*slot| {
+            if (slot.type_tag != tag) continue;
+            if (slot.value_ptr) |old| if (slot.destroy_fn) |destroy| destroy(old, self.allocator);
+            slot.value_ptr = null;
+            slot.destroy_fn = null;
+            return self.installGlobalValue(slot, T, value);
+        }
+        self.globals.append(self.allocator, .{ .type_tag = tag }) catch return error.GlobalCapacityExceeded;
+        return self.installGlobalValue(&self.globals.items[self.globals.items.len - 1], T, value);
+    }
+
+    pub fn global(self: *const EntityStore, comptime T: type) ?*const T {
+        const tag = typeTag(T);
+        for (self.globals.items) |slot| {
+            if (slot.type_tag == tag) {
+                const raw = slot.value_ptr orelse return null;
+                return @ptrCast(@alignCast(raw));
+            }
+        }
+        return null;
+    }
+
+    pub fn globalMut(self: *EntityStore, comptime T: type) ?*T {
+        return if (self.global(T)) |value| @constCast(value) else null;
+    }
+
+    /// Mutate a typed global through the same UI-thread/invalidation boundary
+    /// as entity updates. Callers receive an explicit error instead of
+    /// silently creating a value with an accidental default.
+    pub fn updateGlobal(self: *EntityStore, comptime T: type, callback: *const fn (*T, *EntityStore) void) GlobalError!void {
+        self.assertUiThread();
+        const value = self.globalMut(T) orelse return error.GlobalNotSet;
+        callback(value, self);
+        self.invalidate();
+    }
+
+    pub fn removeGlobal(self: *EntityStore, comptime T: type) bool {
+        self.assertUiThread();
+        const tag = typeTag(T);
+        for (self.globals.items) |*slot| {
+            if (slot.type_tag == tag) {
+                self.destroyGlobalSlot(slot);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn reserveGlobal(self: *EntityStore, comptime T: type) GlobalError!GlobalReservation(T) {
+        self.assertUiThread();
+        const tag = typeTag(T);
+        for (self.globals.items) |slot| if (slot.type_tag == tag) return error.GlobalAlreadySet;
+        self.globals.append(self.allocator, .{ .type_tag = tag }) catch return error.GlobalCapacityExceeded;
+        return .{ .store = self, .slot_index = self.globals.items.len - 1 };
+    }
+
+    fn installReservedGlobal(self: *EntityStore, index: usize, comptime T: type, value: T) GlobalError!void {
+        self.assertUiThread();
+        if (index >= self.globals.items.len) return error.InvalidReservation;
+        const slot = &self.globals.items[index];
+        if (slot.type_tag != typeTag(T) or slot.value_ptr != null) return error.InvalidReservation;
+        try self.installGlobalValue(slot, T, value);
+    }
+
+    fn cancelGlobalReservation(self: *EntityStore, index: usize) void {
+        self.assertUiThread();
+        if (index < self.globals.items.len and self.globals.items[index].value_ptr == null) self.globals.items[index].type_tag = 0;
+    }
+
+    pub fn subscribe(self: *EntityStore, comptime T: type, entity: WeakEntity(T), ctx: *anyopaque, callback: *const fn (*const T, *anyopaque) void) SubscriptionError!Subscription {
+        return self.subscribeOwned(T, entity, null, ctx, callback);
+    }
+
+    fn subscribeOwned(self: *EntityStore, comptime T: type, entity: WeakEntity(T), owner: ?*EntityHeader, ctx: *anyopaque, callback: *const fn (*const T, *anyopaque) void) SubscriptionError!Subscription {
+        self.assertUiThread();
+        const id = self.next_subscription_id;
+        self.next_subscription_id +%= 1;
+        if (self.next_subscription_id == 0) self.next_subscription_id = 1;
+        self.subscriptions.append(self.allocator, .{
+            .id = id,
+            .entity_id = entity.id,
+            .generation = entity.generation,
+            .owner_id = if (owner) |value| value.id else 0,
+            .owner_generation = if (owner) |value| value.generation else 0,
+            .callback = @ptrCast(callback),
+            .ctx = ctx,
+        }) catch return error.SubscriptionCapacityExceeded;
+        return .{ .store = self, .id = id };
+    }
+
+    fn cancelSubscription(self: *EntityStore, id: u64) void {
+        self.assertUiThread();
+        for (self.subscriptions.items) |*subscription| {
+            if (subscription.id == id) subscription.active = false;
+        }
+    }
+
+    /// Tear down subscriptions at the same lifetime boundary as their
+    /// entity. This is deterministic even when no later notification occurs.
+    pub fn cancelSubscriptionsFor(self: *EntityStore, id: u32, generation: u32) void {
+        self.assertUiThread();
+        for (self.subscriptions.items) |*subscription| {
+            if ((subscription.entity_id == id and subscription.generation == generation) or
+                (subscription.owner_id == id and subscription.owner_generation == generation))
+            {
+                subscription.active = false;
+            }
+        }
+        var i: usize = 0;
+        while (i < self.subscriptions.items.len) {
+            if (!self.subscriptions.items[i].active) _ = self.subscriptions.swapRemove(i) else i += 1;
+        }
+    }
+
+    fn subscriptionIsActive(self: *const EntityStore, id: u64) bool {
+        for (self.subscriptions.items) |subscription| if (subscription.id == id) return subscription.active;
+        return false;
+    }
+
+    fn emitEntity(self: *EntityStore, comptime T: type, entity: Entity(T)) void {
+        self.assertUiThread();
+        for (self.subscriptions.items) |*subscription| {
+            if (!subscription.active or subscription.entity_id != entity.header.id or subscription.generation != entity.header.generation) continue;
+            subscription.callback(@ptrCast(entity.value), subscription.ctx);
+        }
+        var i: usize = 0;
+        while (i < self.subscriptions.items.len) {
+            if (!self.subscriptions.items[i].active) {
+                _ = self.subscriptions.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     fn assertUiThread(self: *const EntityStore) void {
@@ -121,6 +402,7 @@ pub const EntityStore = struct {
         var current = self.head;
         while (current) |h| {
             if (h.id == id and h.generation == generation and h.alive) {
+                self.cancelSubscriptionsFor(id, generation);
                 if (prev) |p| {
                     p.next = h.next;
                 } else {
@@ -172,9 +454,37 @@ pub const EntityStore = struct {
             current = next;
         }
         self.head = null;
+        for (self.globals.items) |*slot| self.destroyGlobalSlot(slot);
+        self.globals.deinit(self.allocator);
+        self.subscriptions.deinit(self.allocator);
+    }
+
+    pub fn reserveEntity(self: *EntityStore, comptime T: type) EntityReservation(T) {
+        self.assertUiThread();
+        const id = self.next_id;
+        self.next_id +%= 1;
+        const generation = self.next_generation;
+        self.next_generation +%= 1;
+        if (self.next_generation == 0) self.next_generation = 1;
+        return .{ .store = self, .id_value = id, .generation_value = generation };
+    }
+
+    pub fn insertEntity(self: *EntityStore, comptime T: type, reservation: *EntityReservation(T), options: T.Options, window: ?*Window) EntityReservationError!Entity(T) {
+        if (reservation.store != self) return error.InvalidReservation;
+        return reservation.insert(options, window);
     }
 
     pub fn create(self: *EntityStore, comptime T: type, options: T.Options, window: ?*Window) Entity(T) {
+        self.assertUiThread();
+        const id = self.next_id;
+        self.next_id += 1;
+        const generation = self.next_generation;
+        self.next_generation +%= 1;
+        if (self.next_generation == 0) self.next_generation = 1;
+        return self.createWithIdentity(T, options, window, id, generation);
+    }
+
+    fn createWithIdentity(self: *EntityStore, comptime T: type, options: T.Options, window: ?*Window, id: u32, generation: u32) Entity(T) {
         self.assertUiThread();
         const Box = struct {
             header: EntityHeader,
@@ -183,8 +493,8 @@ pub const EntityStore = struct {
         const box = self.allocator.create(Box) catch @panic("out of memory creating ZUI entity");
         box.header = .{
             .store = self,
-            .id = self.next_id,
-            .generation = self.next_generation,
+            .id = id,
+            .generation = generation,
             .type_tag = typeTag(T),
             .alive = true,
             .value_ptr = &box.value,
@@ -199,9 +509,6 @@ pub const EntityStore = struct {
             }.destroy,
             .destroy_ctx = @ptrCast(box),
         };
-        self.next_id += 1;
-        self.next_generation +%= 1;
-        if (self.next_generation == 0) self.next_generation = 1;
         self.head = &box.header;
 
         const entity = Entity(T){ .header = &box.header, .value = &box.value };
@@ -278,6 +585,14 @@ pub fn Entity(comptime T: type) type {
             return .{ .store = self.header.store, .id = self.header.id, .generation = self.header.generation };
         }
 
+        pub fn id(self: @This()) u32 {
+            return self.header.id;
+        }
+
+        pub fn generation(self: @This()) u32 {
+            return self.header.generation;
+        }
+
         /// Individual release (gap §5A): unlinks and frees this entity,
         /// retires its generation, and invalidates weak handles plus all
         /// listeners/focus handles minted from it. The owned `Entity`
@@ -296,6 +611,7 @@ pub fn Entity(comptime T: type) type {
             else
                 callback(self.value, &cx);
             self.header.store.dirty = true;
+            self.header.store.emitEntity(T, self);
             return result;
         }
 
@@ -308,6 +624,7 @@ pub fn Entity(comptime T: type) type {
             else
                 callback(self.value, payload, &cx);
             self.header.store.dirty = true;
+            self.header.store.emitEntity(T, self);
             return result;
         }
 
@@ -344,8 +661,28 @@ pub fn Context(comptime T: type) type {
             return self.store.allocator;
         }
 
+        pub fn entity(self: *@This()) Entity(T) {
+            return self.current orelse @panic("context has no entity");
+        }
+
+        pub fn weakEntity(self: *@This()) WeakEntity(T) {
+            return self.entity().weak();
+        }
+
+        pub fn entityId(self: *@This()) u32 {
+            return self.entity().id();
+        }
+
         pub fn new(self: *@This(), comptime U: type, options: U.Options) Entity(U) {
             return self.store.create(U, options, self.window);
+        }
+
+        pub fn reserve(self: *@This(), comptime U: type) EntityReservation(U) {
+            return self.store.reserveEntity(U);
+        }
+
+        pub fn insert(self: *@This(), comptime U: type, reservation: *EntityReservation(U), options: U.Options) EntityReservationError!Entity(U) {
+            return self.store.insertEntity(U, reservation, options, self.window);
         }
 
         pub fn focusHandle(self: *@This()) FocusHandle {
@@ -354,7 +691,55 @@ pub fn Context(comptime T: type) type {
 
         pub fn notify(self: *@This()) void {
             self.store.dirty = true;
+            self.store.invalidate();
+            if (self.current) |current_entity| self.store.emitEntity(T, current_entity);
             if (self.window) |window| window.requestRender();
+        }
+
+        pub fn invalidate(self: *@This()) void {
+            self.store.invalidate();
+            if (self.window) |window| window.requestRender();
+        }
+
+        pub fn scope(self: *@This()) InvalidationScope {
+            return self.store.scope(self.window);
+        }
+
+        pub fn global(self: *@This(), comptime U: type) ?*const U {
+            return self.store.global(U);
+        }
+
+        pub fn globalMut(self: *@This(), comptime U: type) ?*U {
+            return self.store.globalMut(U);
+        }
+
+        pub fn updateGlobal(self: *@This(), comptime U: type, callback: *const fn (*U, *@This()) void) GlobalError!void {
+            const value = self.store.globalMut(U) orelse return error.GlobalNotSet;
+            callback(value, self);
+            self.notify();
+        }
+
+        pub fn setGlobal(self: *@This(), comptime U: type, value: U) GlobalError!void {
+            return self.store.setGlobal(U, value);
+        }
+
+        pub fn reserveGlobal(self: *@This(), comptime U: type) GlobalError!GlobalReservation(U) {
+            return self.store.reserveGlobal(U);
+        }
+
+        pub fn subscribe(self: *@This(), comptime U: type, target_entity: Entity(U), ctx: *anyopaque, callback: *const fn (*const U, *anyopaque) void) SubscriptionError!Subscription {
+            return self.store.subscribeOwned(U, target_entity.weak(), if (self.current) |current| current.header else null, ctx, callback);
+        }
+
+        pub fn subscribeSelf(self: *@This(), ctx: *anyopaque, callback: *const fn (*const T, *anyopaque) void) SubscriptionError!Subscription {
+            const current = self.current orelse return error.SubscriptionCapacityExceeded;
+            return self.store.subscribeOwned(T, current.weak(), current.header, ctx, callback);
+        }
+
+        /// Spawn entity-scoped work on an app-owned TaskRuntime. The runtime
+        /// type is generic here to keep runtime.zig independent of tasks.zig.
+        pub fn spawn(self: *@This(), task_runtime: anytype, user: anytype, comptime run: anytype, comptime done: anytype) @TypeOf(task_runtime.spawnForEntity(T, self.weakEntity(), self.window, user, run, done)) {
+            return task_runtime.spawnForEntity(T, self.weakEntity(), self.window, user, run, done);
         }
 
         pub fn listener(self: *@This(), comptime Owner: type, comptime callback: anytype) Listener {
@@ -454,6 +839,16 @@ pub fn mountView(store: *EntityStore, window: *Window, build_fn: anytype) void {
     const T = Return.Value;
     var cx = Context(T){ .store = store, .current = null, .window = window };
     const root = build_fn(window, &cx);
+    mountEntity(store, window, root);
+}
+
+/// Mount an already-created typed view entity. This is the source-backed
+/// counterpart of GPUI's `Window::open_view`: the entity remains the stable
+/// identity while each frame calls its typed render method.
+pub fn mountEntity(store: *EntityStore, window: *Window, root: anytype) void {
+    _ = store;
+    _ = store;
+    const T = @TypeOf(root).Value;
     window.setRenderer(.{
         .ptr = root.header,
         .render_fn = struct {
@@ -529,6 +924,59 @@ test "entities can hold over-aligned values" {
     defer harness.deinit();
     const entity = harness.new(Over, .{});
     try t.expect(@intFromPtr(entity.value) % 16 == 0);
+}
+
+test "typed globals reservations and scoped subscriptions are deterministic" {
+    const t = std.testing;
+    var harness = try TestHarness.init(t.allocator);
+    defer harness.deinit();
+
+    const Global = struct { value: u32 };
+    var reservation = try harness.store.reserveGlobal(Global);
+    try t.expect(harness.store.global(Global) == null);
+    try reservation.set(.{ .value = 7 });
+    try t.expectEqual(@as(u32, 7), harness.store.global(Global).?.value);
+    try harness.store.updateGlobal(Global, struct {
+        fn bump(value: *Global, store: *EntityStore) void {
+            value.value += 5;
+            _ = store;
+        }
+    }.bump);
+    try t.expectEqual(@as(u32, 12), harness.store.global(Global).?.value);
+    try t.expectError(error.GlobalAlreadySet, harness.store.reserveGlobal(Global));
+
+    const Counter = struct {
+        pub const Options = struct {};
+        value: u32 = 0,
+        pub fn init(_: *Context(@This()), _: Options) @This() {
+            return .{};
+        }
+    };
+    var entity = harness.new(Counter, .{});
+    var observed: u32 = 0;
+    const Observer = struct {
+        fn call(value: *const Counter, raw: *anyopaque) void {
+            const count: *u32 = @ptrCast(@alignCast(raw));
+            count.* += value.value;
+        }
+    };
+    var subscription = try harness.store.subscribe(Counter, entity.weak(), &observed, Observer.call);
+    var cx = Context(Counter){ .store = &harness.store, .current = entity, .window = null };
+    var self_subscription = try cx.subscribeSelf(&observed, Observer.call);
+    self_subscription.cancel();
+    const scope = harness.store.scope(null);
+    try t.expect(scope.isValid());
+    _ = entity.update(struct {
+        fn update(value: *Counter) void {
+            value.value = 3;
+        }
+    }.update);
+    try t.expectEqual(@as(u32, 3), observed);
+    try t.expect(subscription.isActive());
+    scope.invalidate();
+    try t.expect(!scope.isValid());
+    subscription.cancel();
+    try t.expect(!subscription.isActive());
 }
 
 test "element frames install the provider's engine" {
@@ -822,4 +1270,68 @@ test "subscriptions die with their entity" {
     var token: usize = 0;
     try t.expect(!focus.dispatch(.{ .window = .close_requested }, @ptrCast(&token)));
     try t.expect(!focus.isLive());
+}
+
+test "owned subscriptions tear down with the observing view" {
+    const t = std.testing;
+    const Model = struct {
+        pub const Options = struct {};
+        value: u32 = 0,
+        pub fn init(_: *Context(@This()), _: Options) @This() {
+            return .{};
+        }
+    };
+    const Observer = struct {
+        pub const Options = struct {};
+        pub fn init(_: *Context(@This()), _: Options) @This() {
+            return .{};
+        }
+    };
+    var harness = try TestHarness.init(t.allocator);
+    defer harness.deinit();
+    const model = harness.new(Model, .{});
+    const observer = harness.new(Observer, .{});
+    var cx = Context(Observer){ .store = &harness.store, .current = observer, .window = null };
+    var fired: u32 = 0;
+    const Callback = struct {
+        fn call(_: *const Model, raw: *anyopaque) void {
+            const count: *u32 = @ptrCast(@alignCast(raw));
+            count.* += 1;
+        }
+    };
+    var subscription = try cx.subscribe(Model, model, &fired, Callback.call);
+    try t.expect(subscription.isActive());
+    observer.destroy();
+    try t.expect(!subscription.isActive());
+    _ = model.update(struct {
+        fn update(value: *Model) void {
+            value.value += 1;
+        }
+    }.update);
+    try t.expectEqual(@as(u32, 0), fired);
+}
+
+test "entity reservations expose identity before insertion" {
+    const t = std.testing;
+    const Model = struct {
+        pub const Options = struct { value: u32 = 0 };
+        value: u32 = 0,
+        pub fn init(_: *Context(@This()), options: Options) @This() {
+            return .{ .value = options.value };
+        }
+    };
+    var harness = try TestHarness.init(t.allocator);
+    defer harness.deinit();
+    var reservation = harness.store.reserveEntity(Model);
+    const reserved_id = reservation.id();
+    const reserved_generation = reservation.generation();
+    try t.expect(reserved_id != 0 and reserved_generation != 0);
+    try t.expect(!harness.store.isAlive(reserved_id, reserved_generation));
+    const entity = try harness.store.insertEntity(Model, &reservation, .{ .value = 7 }, null);
+    try t.expectEqual(reserved_id, entity.id());
+    try t.expectEqual(reserved_generation, entity.generation());
+    try t.expectEqual(@as(u32, 7), entity.read().value);
+    try t.expect(harness.store.isAlive(reserved_id, reserved_generation));
+    try t.expectError(error.InvalidReservation, reservation.insert(.{ .value = 8 }, null));
+    entity.destroy();
 }

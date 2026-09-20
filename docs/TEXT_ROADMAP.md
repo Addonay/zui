@@ -1,16 +1,19 @@
 # Text roadmap: gap §5B status and the color-glyph blocker
 
-Updated 2026-09-17. Tracks gap-report §5B (text editing + internationalization).
+Updated 2026-09-20. Tracks gap-report §5B (text editing + internationalization).
 Shading: **done** · _partial_ · deferred (with owner).
 
 ## What landed this round
 
-- **Editing model** (`src/widgets/editing.zig`): bounded single-line model,
+- **Editing model** (`src/widgets/editing.zig`): bounded model with an
+  opt-in multiline mode,
   offsets are UTF-8 bytes, UAX#29 grapheme segmentation via cozmic (`ezi-code`
   tables). Selection (anchor/active), shift-extension, word/line movement,
-  select-all, one-transaction paste (`insert`), grapheme delete, bounded
+  vertical movement with a retained grapheme column, select-all,
+  one-transaction paste (`insert`), grapheme delete, bounded
   undo/redo (16 entries, fixed-capacity stack copies, no allocator), horizontal
-  `scroll_x`. `TextField` (`src/widgets/text_field.zig`) now delegates editing
+  and multiline `scroll_y`. `TextField` (`src/widgets/text_field.zig`) now
+  delegates editing, including an opt-in multiline layout/viewport,
   to it; the field keeps the legacy `buffer`/`len`/`caret` views read-only.
 - **IME protocol** (`src/platform/event.zig`): `CompositionEvent`
   (preedit/commit/cancel), owned 256-byte `CompositionText` with a `marked`
@@ -19,7 +22,9 @@ Shading: **done** · _partial_ · deferred (with owner).
   unchanged; commit/cancel are critical, preedit is droppable. App/window
   dispatch the new variant to the focused element. The field holds preedit
   state, renders preedit inline with underline + selection highlight, and
-  cancels on blur/Escape. Native IME wiring is the next round.
+  cancels on blur/Escape. Wayland `zwp_text_input_v3` and optional X11 XIM
+  source integrations now feed this protocol and update the IME cursor path;
+  live compositor/IBus/Fcitx/XIM validation and the Win32/Cocoa adapters remain.
 - **Shaped geometry** (`src/fonts/text_engine.zig`, `src/elements/text_engine.zig`):
   `Layout.visualMove` (distinct visual grapheme caret, bidi-aware),
   `Layout.selectionRects` (wrapped + mixed-direction highlight rects),
@@ -28,25 +33,24 @@ Shading: **done** · _partial_ · deferred (with owner).
   pointer hit-testing (click + drag), selection rects, caret placement and
   scroll clamping. `caretX` remains for the old caret-only path.
 
-Deferred inside the model, structured as extensions: multiline (cursor `line`
-fields already flow through the model), split-caret affinity, virtual cursor
-column for Up/Down, binding tables per layout direction, and
+Deferred inside the model, structured as extensions: split-caret affinity,
+binding tables per layout direction, large/dynamic document storage, and
 UTF-16 conversion at platform boundaries (protocol types already document the
-offset convention).
+offset convention). Native IME delivery remains a platform gap even though
+the normalized composition protocol and multiline consumer now exist.
 
-## Color glyphs: status and the blocker (spike-verified)
+## Color glyphs: bounded RGBA path and remaining evidence
 
 Two tests in `src/fonts/text_engine.zig` ("color spike") carry executable
 evidence from this host:
 
-- **CBDT/sbix bitmap emoji works end to end today** (`/usr/share/fonts/twemoji/Twemoji.ttf`):
+- **CBDT/sbix bitmap emoji produces RGBA data** (`/usr/share/fonts/twemoji/Twemoji.ttf`):
   shaping resolves the flag sequence to one ligature glyph, per-script
   fallback picks the emoji face, `SwashCache.getImage` returns
   `content == .color` RGBA (76×72 at the 48px strike, non-zero-alpha ink, 4
-  bytes/pixel), and the coverage-only atlas rejects it exactly per contract
-  (`error.ColorUnsupported`, zero pool bytes, no readable mask key). The same
-  result was cross-checked below the engine with an independent raw-FreeType C
-  probe: `FT_PIXEL_MODE_BGRA`, 76×72, straight from `FT_Load_Glyph`.
+  bytes/pixel). The ZUI atlas now stores that data in a separate bounded color
+  pool, emits a content-tagged scene glyph, and Vellz renders it as an RGBA
+  image; synthetic atlas/Vellz tests cover pool separation and non-gray output.
 - **COLRv1 is blocked in the host FreeType build, not in cozmic's flags**
   (`google-noto-color-emoji-fonts/Noto-COLRv1.ttf`, FreeType 2.14.3): the
   shaped flag ligature (gid 3773) and the lone regional indicator load as
@@ -63,12 +67,18 @@ needs BOTH `FontSystem.addFontData` (HarfBuzz backend; `db.addFaceFromBytes`
 is family-matching metadata only) and `Raster.addFromFontSystem` (the FreeType
 registry snapshots at `Engine.init`).
 
-**ZUI-side work (next round, does not require the COLRv1 fix):** give the
-atlas a second RGBA pool with a color key bit so color and coverage entries
-cannot alias (vellz's sentinel `subpixel_x` design in
-`vellz/src/glifo/atlas/key.zig` is the proven pattern), extend the painter to
-switch on `view.content`, and emit color quads. CBDT emoji paints then; COLRv1
-starts painting on hosts/builds whose FreeType traverses the paint graph (or
-once cozmic vendors a build that does), with no further ZUI change. The
-coverage-only contract stays intact: `putBitmap(.color, ...)` keeps rejecting,
-the new pool is a separate, explicit path.
+Remaining color work is live/native evidence: run the shipped text path with a
+color emoji font on a compositor and validate high-DPI/color-font cache
+eviction. COLRv1 remains host/FreeType dependent: the current host's spike
+still returns an empty bitmap, while hosts whose FreeType traverses the paint
+graph should use the same RGBA path without another ZUI-side representation
+change. The mask API remains strict: `putBitmap(.color, ...)` still rejects;
+color bytes enter only through the explicit color-pool API.
+
+## Current verification note
+
+The aggregate test step reports 22/22 build steps, and the AccessKit-enabled
+aggregate reports 23/23, both from cached artifacts. The fresh focused
+`zig build test-text --summary all` gate is currently blocked by the existing
+declaration-order error at `src/gpu/scene.zig:66`; native IME and live color
+font presentation remain unverified independently.

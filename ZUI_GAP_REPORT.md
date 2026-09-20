@@ -1,538 +1,653 @@
-# ZUI: gap analysis and a route beyond GPUI
+# ZUI has closed many foundation gaps; the remaining path beyond GPUI is integration and proof
 
-**Assessment date:** 2026-09-16
-**Scope:** the current ZUI working tree, the local GPUI reference, selected Gooey source/docs, and current upstream documentation. This is a research report, not a feature-parity certification.
+**Assessment date:** 2026-09-20
 
-## Executive verdict
+**Code baseline:** current working tree, including uncommitted changes
+**Scope:** the current ZUI tree, its pinned local references, executable local checks, limited live Linux probes, and primary upstream documentation. This is an engineering assessment, not a production-readiness certificate.
 
-**ZUI has a credible architecture and working vertical slices, but is not yet a production-general-purpose UI toolkit. Its biggest deficit is not the choice of programming language or renderer: it is the integration and completeness of application-facing behavior.**
+## Executive summary
 
-The retained `App`/`Entity` state plus transient element tree is a reasonable foundation. Keep it. The independently packaged Cozmic, Zlay, and Vellz stack is also an asset. However:
+ZUI changed substantially after the first gap report. The current working tree
+closes or materially advances many of the original recommendations:
 
-- Zlay is imported and tested but does not lay out ordinary ZUI elements.
-- Vellz CPU rendering is integrated; its GPU functionality is not connected to ZUI's native presentation path.
-- Cozmic shapes text, but ZUI still has a limited text field and cannot display color glyph bitmaps through its coverage-only atlas.
-- Dashboard checkboxes, tables, dragging, and scrolling demonstrate useful behavior, but do not constitute a reusable, keyboard-accessible widget system.
-- The framework lacks the stable identity, semantic tree, task lifecycle, and native-window boundaries needed by larger applications.
+- Entities now have generations, explicit destruction, weak handles, UI-thread assertions, and liveness-gated callbacks.
+- Elements have frame generations and stable keys; the source-column ID collision is fixed.
+- Overflowed scenes are rejected and replaced by a diagnostic frame rather than presented partially.
+- The event queue distinguishes critical, coalescable, and droppable input.
+- Zlay is now the canonical layout dispatcher and runs the real todo/dashboard selftests.
+- Text editing now includes grapheme-aware selection, undo/redo, bidi visual movement, shaped hit geometry, and an IME protocol.
+- ZUI now has semantic nodes, focus scopes, core controls, portals, menus, overlays, scrolling, bounded fixed/variable-height list virtualization, a virtual table, themes, inspector data, and an optional Linux AccessKit bridge.
+- Linux X11 and Wayland have per-window native handles, targeted events, and multi-window support. A logical/physical DPI pipeline now exists across the platform sources.
+- Cross-frame text-layout caching reduced warm text-frame cost by roughly an order of magnitude in the current benchmark.
+- The 2026-09-20 performance pass removed character-geometry work from
+  non-semantic text, skipped empty semantic-tree traversals, and replaced
+  linear glyph-atlas lookup with a bounded open-addressed index. On the same
+  host and benchmark settings, 256 sentence nodes measured 1.24ms -> 0.62ms
+  and 64 wrapped paragraphs 1.61ms -> 0.47ms per warm frame.
+- The warm-path element-only callgrind profile attributes about 65% of
+  instructions to glyph paint/raster lookup and about 30% to canonical Zlay;
+  the remaining cost is in the active text/raster/layout engines rather than
+  an unprofiled framework loop. Massif peaks at about 15.0 MiB for the
+  benchmark harness, dominated by its fixed Frame/Scene storage and one
+  engine allocation, with no unbounded per-frame growth observed.
+- A root license, notice, CI workflow, platform matrix, smoke consumer, and packaged documentation now exist.
 
-**The strongest positioning is: a dependable, internationalized, accessible desktop application toolkit for Zig, with explicit ownership, excellent diagnostics, and measured performance.** Merely reproducing GPUI's fluent builder syntax or making a dashboard look similar will not achieve that.
+That progress changes the verdict. ZUI is no longer merely a promising rendering nucleus with one widget. It is now an early application framework with meaningful vertical slices.
 
-There are two different competitors:
+It is still not ready to claim parity with GPUI. The most important remaining problems are narrower and more concrete:
 
-1. **GPUI core:** rendering, element lifecycle, layout, entities, actions, input, tasks, window/platform services.
-2. **GPUI's application ecosystem:** notably GPUI Kit / GPUI Component, which supplies the polished controls and data-oriented behavior developers actually ship.
+1. The AccessKit bridge now builds a ZUI-owned snapshot with fresh root/child nodes per update; a live Wayland PyAT-SPI probe observes the todo semantic tree and actionable nodes, but screen-reader speech and native Windows/macOS adapters remain unverified.
+2. Mounted view entities are now scoped to window lifetime; lifecycle soak and cross-window teardown evidence remain incomplete.
+3. The custom-element/canvas protocol now includes bounded ordered line and
+   path primitives, rounded shadows, damage tracking, and a documented device
+   recovery policy; arbitrary retained layers, richer transforms, and full
+   differential rendering evidence remain incomplete.
+4. Zlay is now canonical, but still supports only a documented subset.
+5. Wayland text-input-v3 and optional X11 XIM source paths now exist, but live IME composition is still unverified; Win32/Cocoa adapters and richer native text-range publication remain incomplete. Character positions/widths are now exported from shaped layouts. Color glyphs now have an explicit RGBA atlas/Vellz path. Bounded multiline editing is implemented, but larger-document behavior is not.
+6. The optional Vellz/WGPU path now compiles, acquires a real Vulkan
+   adapter/device, and presents three diagnostic frames through a native
+   Wayland surface on this host. An opt-in bridge now translates ordered
+   solid/gradient/border/rounded ZUI quads, rectangular clips, pool-validated
+   atlas images with crop/tint/transform/grayscale, mask/color glyphs, and
+   bounded line strokes;
+   bounded glyph/image-resource reuse, paths, shadows, and recovery policy
+   source tests are now covered; CPU remains the default and pixel-differential
+   equivalence plus live loss injection remain open.
+7. A worker-pool task runtime and UI-thread completion boundary now exist; window-targeted completions now invalidate safely before close/reap, while broader task composition and asset/file-watch integration remain incomplete.
+8. Windows/macOS compile by default but remain native-runtime unverified, single-window, and unable to compile with AccessKit enabled.
+9. Linux/native event producers now route critical queue failures through escalation and owner-table overflow rejects unsafe frames; cross-target producer validation and CI/docs consistency remain incomplete.
 
-Compete with both deliberately. Do not count the ecosystem's widgets as GPUI-core features, but do not ignore them when asking why a developer would choose ZUI.
+The architecture should still be kept. The next phase should harden and integrate what now exists, not start another broad subsystem expansion.
+
+### Continuation checkpoint: animation and native frame pacing (2026-09-18)
+
+- The GPUI-style animation demo now emits clockwise SVG/image rotation through
+  the ordered scene and Vellz renderer instead of substituting opacity.
+- The same image/SVG transform path now carries centered scale and logical
+  translation, with compact per-frame transform slots so ordinary Node/Frame
+  storage stays within its hot-frame budget; arbitrary nested transforms and
+  shear remain unimplemented.
+- The demo uses the GPUI `300x300` window, lifetime-safe formatted text with
+  wrapping, and a selftest that verifies a half-turn reaches the scene image
+  payload.
+- `Window.springValue` now owns bounded retained scalar springs, deduplicates
+  reads within a render, preserves retarget velocity, and requests the next
+  native/timer frame while unsettled; the window regression covers this
+  contract.
+- Reduced-motion policy is now app/window scoped (`ZUI_REDUCE_MOTION=1` or
+  `App.setReduceMotion`): retained springs snap to target and decorative frame
+  requests are suppressed, with a headless regression.
+- Public `AlignContent` values now translate through the Zlay adapter, with
+  Taffy’s stretch default and an external eleven-fixture oracle gate; the
+  adapter test suite and consumer selftests remain green.
+- Public cross-axis end alignment and main-axis end/around/evenly distribution
+  now translate through the same Zlay path; legacy layout remains deliberately
+  start/center/between-compatible until the adapter becomes canonical.
+- Pointer down/up and motion now have an element-tree capture/bubble phase with
+  explicit `Window.stopPropagation()`, retained in compact interaction
+  extensions so the hot-frame budget remains green. Scroll target/bubble
+  dispatch now follows retained ancestry when a child chains an unconsumed
+  remainder; touch/gesture propagation remains separate.
+- Button, radio, popover, and annotated todo controls now use native keyboard
+  default-action timing: Enter activates on the initial non-repeat press, while
+  Space arms on press and activates only on key-up; cancellation clears the
+  pending Space latch. Focused-control regressions and the todo selftest cover
+  the release path.
+- Window lifecycle cancellation now dispatches a framework-internal
+  `cancelled` event on focus changes, focused unmount, modal close and close;
+  native focus loss also reaches the focused widget before clearing capture.
+  Controls, text fields, scroll areas, menus, virtual tables and popovers clear
+  their private latches; non-focusable custom captured owners still need an
+  explicit cancellation hook.
+- Text editing now has an opt-in bounded multiline TextField path: newline
+  insertion, line-local Home/End, vertical grapheme-column movement, wrapped
+  shaped selection/caret geometry, and vertical scroll state are covered by
+  focused model/consumer tests; native IME remains separate.
+- Public flex shrink and authored flex-basis controls now translate through
+  Zlay, with translation coverage and the hot-frame budget still passing.
+- Compact public min/max width and height constraints now translate through
+  Zlay without inflating ordinary node storage; adapter coverage verifies the
+  emitted Taffy dimensions.
+- Public aspect-ratio sizing now uses the same compact style-extension path and
+  translates to Zlay/Taffy without changing legacy layout behavior.
+- The external Zlay/Taffy gate is now a required CI job, so the matched
+  fixture evidence is checked on every change rather than only locally.
+- Wayland animation requests use one-shot `wl_surface.frame` callbacks when
+  available; timer cadence remains the fallback for backends without a native
+  frame source. A three-second Wayland probe recorded compositor frames with
+  zero timer frames and zero busy-buffer skips.
+- X11 button, motion, key, and text events now route through the owning
+  targeted-window helper, and null/Wayland producer paths apply the queue's
+  critical-event policy.
+- `zig build test --summary all` reports **22/22 steps succeeded** in the
+  current cached aggregate build, with the
+  animation integration checks passing. This proves the implemented slice and
+  headless behavior; it does not prove full GPUI parity or native
+  screen-reader, Windows/macOS, GPU, or visual-regression coverage.
 
 ---
 
-## 1. Evidence and limitations
+## 1. Evidence, methods, and limits
 
-### What was inspected
+### What was reviewed
 
-- ZUI build configuration, package manifest, public exports, runtime, window dispatch, layout, painter, scene, text engine, atlas, text field, limits, and selected platform paths.
-- GPUI's local README, element lifecycle, Taffy adapter, accessibility guide, input interfaces, context API references, platform manifests, and module inventory.
-- Gooey's local README and selected animation/table implementation references.
-- Current upstream primary documentation for DVUI, GPUI Kit, AccessKit, Vello, Xilem/Masonry, egui, Slint, and SDL3.
-
-`tools/references.env` records GPUI revision `33375c34b9301dd850b0e6d9781fd00acace6953`, DVUI `a11cd712d48f08a7f8bb934e6f0f210f8b91603c`, Gooey `32ed73441c7c85940955da64532bdde3c9ee6c2a`, and Taffy `1b918bafcab101dd234ebeb27da0443e24fd9de2`. These are the repository's recorded reference pins; this assessment did not independently validate every checkout against its pin. Live web documentation can describe a newer baseline.
-
-The local conclusions were established by direct inspection and executable checks. Three bounded Luna reviews then independently covered GPUI architecture, platform/rendering quality, and the current competitive landscape. Their findings were treated as leads and retained here only where the source tree or a primary upstream source supported them.
+- Git history and the complete source delta from report baseline `5dbbbb26` through `aa159aa1`.
+- Runtime/entity ownership, window lifecycle, event routing, element identity, layout dispatch, Zlay adapter, focus/interaction, semantic tree, widgets, assets, debugging, scene/rendering, DPI, and platform backends.
+- `README.md`, `docs/A11Y_PLAN.md`, `docs/DEBUGGING.md`, `docs/PLATFORM_MATRIX.md`, `docs/RENDER_CONTRACT.md`, `docs/TEXT_ROADMAP.md`, and `docs/ZLAY_ADAPTER.md`.
+- The local pinned GPUI, DVUI, Gooey, and Taffy references used by the repository.
+- Three independent Luna passes focused on runtime/layout, rendering/platform, and public API/widgets. Their conclusions were retained only when supported by current source or executable evidence.
 
 ### Executed checks
 
-| Check                                                                              | Observed result                                                                        |
-| ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `zig version`                                                                      | `0.17.0-dev.2131+d08989840`                                                            |
-| `zig build test --summary all`                                                     | **16/16 build steps succeeded**                                                        |
-| Todo integration run within that command                                           | **15 checks passed**, including focus, typing, add/toggle, and final-page reachability |
-| Dashboard integration run within that command                                      | **22 checks passed**, including navigation, row dragging, scrolling, and search typing |
-| Unit-test run artifacts                                                            | **Cached**; no fresh unit-test count claimed                                           |
-| `zig build bench-text -Doptimize=ReleaseFast -- --format json`                   | Executed successfully with nine measured iterations and three warmups; exposed draw-capacity overflow |
-| `zig build run-todo -Dtarget=x86_64-windows-gnu --summary all`                    | Compilation failed with two errors: X11 target leakage and Win32 optional-function handling |
-| `zig build run-todo -Dtarget=aarch64-macos-none --summary all`                    | Compilation failed with 65 errors: dynamic-loader alignment, Linux target leakage, and Cocoa ABI/type issues |
+| Check | Result | What it establishes |
+| --- | --- | --- |
+| `zig version` | `0.17.0-dev.2151+2ec5523d5` | Current local toolchain |
+| `zig build test --summary all` | **24/24 steps succeeded; 450/454 tests passed (4 skipped)** | Aggregate headless build is green; skipped cases are host/platform/font boundaries |
+| `zig build test -Daccesskit=true --summary all` | **25/25 steps succeeded; 454/454 tests passed** | Vendored AccessKit C ABI path builds and links on native Linux; live AT-SPI semantic/action probing also passes, but this is not screen-reader speech validation |
+| `zig build test-text --summary all` | **54/54 tests passed** | Focused text, fallback, range, geometry, and bounded-document tests pass; native IME remains separate |
+| `zig build test-zlay --summary all` | **42/42 tests passed** | Focused Zlay adapter/oracle fixtures pass |
+| `zig build smoke --summary all` | **2/2 steps succeeded** | External path-dependency consumer builds |
+| `bash tools/run-zlay-parity.sh` | **PASS** | External pinned Taffy fixture matched |
+| `zig build selftest-zlay --summary all` | **10/10 steps succeeded** | Real todo/dashboard behavior runs through canonical Zlay |
+| `zig build check -Dtarget=x86_64-windows-gnu --summary all` | **15/15 succeeded** | Default configuration compiles for Windows; it was not executed |
+| `zig build check -Dtarget=aarch64-macos-none --summary all` | **15/15 succeeded** | Default configuration compiles for macOS; it was not executed |
+| Same Windows check with `-Daccesskit=true` | Failed in Translate-C with 44 AVX builtin errors | Optional accessibility configuration is not cross-target ready |
+| Same macOS check with `-Daccesskit=true` | Failed at `src/a11y/accesskit.zig:103` | Bridge is hard-coded around the Unix adapter type |
+| `zig build bench-text -Doptimize=fast -- --format json --iter 9 --warmup 3` | 11 standard rows, zero gate failures; 256 sentence nodes 0.62ms median and 64 wrapped paragraphs 0.47ms median | Warm cached text/layout/paint path and non-overflow standard workloads |
+| `zig build bench-text -Doptimize=fast -- --element-only --quick --format json` plus callgrind/massif | Warm element-only profile; ~65% paint/glyph, ~30% Zlay; ~15.0 MiB peak massif footprint | Focused warm-path CPU and allocation evidence; uncached raw reference rows remain separately measured |
+| Benchmark with `--allow-overflow --iter 3 --warmup 1` | 256-paragraph stress frame rejected after 23,040 dropped pushes | Stress capacity remains finite; incomplete content is now explicitly rejected |
+| `zig build gpu-check -Dgpu=true -Dwgpu-native-prefix=.ports/wgpu/.reference/artifacts/prebuilt --summary all` | **5/5 steps succeeded**; Mesa RADV Vulkan adapter/device acquired, 8192 max texture dimension | Optional WGPU/Vellz device boundary is live on this host; it is still not the default UI presentation path |
+| `zig build gpu-wayland-smoke -Dgpu=true -Dwgpu-native-prefix=.ports/wgpu/.reference/artifacts/prebuilt --summary all` | **9/9 steps succeeded**; three bridged scene frames presented, format 23 | Native Wayland surface configure/acquire/render/present/teardown works for the tested scene subset |
+| `zig build gpu-wayland-test -Dgpu=true -Dwgpu-native-prefix=.ports/wgpu/.reference/artifacts/prebuilt --summary all` | **9/9 steps succeeded; 5/5 bridge tests passed** | Ordered solid/gradient/rounded/border quads, bounded line/path primitives, rectangular clips, rounded shadows, cached image/glyph uploads, crop/tint/transform/grayscale, mask/color glyph resources, damage planning, and recovery policy translate or validate explicitly |
 
-No fresh live native GUI interaction, cross-OS runtime validation, GPU execution, external-consumer package smoke test, allocation profiling, or GPUI benchmark was performed. A 1600 x 1000 headless dashboard snapshot was rendered and visually inspected, but one snapshot does not establish native presentation, interaction quality, or visual parity.
+Live Linux probes performed during the review successfully launched and presented the todo app on X11 and Wayland. The AccessKit-enabled X11 probe created its Unix adapter. That earlier probe predates the current annotated Daybook fixture; current semantic/action coverage is headless and source-backed, while a real screen-reader workflow remains unverified.
 
-Existing modifications in `README.md`, `src/app/runtime.zig`, and `src/elements/element.zig` were treated as user work and left untouched. The README review marker was pre-existing; no repository instruction requiring it was found. No implementation change is part of this report.
+### Evidence limits
 
-### Size is context, not a score
+- Normal unit-test artifacts were cached. The example selftests and focused Zlay run executed, but this was not a from-empty-cache rebuild.
+- Windows and macOS checks were compile-only. No Win32/Cocoa launch, input, DPI, IME, accessibility, multi-window, suspend/resume, or teardown was observed.
+- No full ZUI scene renderer ran on Vulkan/Metal/D3D12. The optional WGPU/Vellz
+  device probe and a native Wayland surface smoke ran against Mesa RADV; the
+  root GPU path currently translates the tested quad/clip/border/image/glyph
+  subset, not default App handoff, fence-based retirement, injected device
+  loss, or the complete scene vocabulary.
+- No Orca, NVDA, or VoiceOver workflow was successfully completed against semantically annotated ZUI controls.
+- The text benchmark excludes Vellz rasterization, native presentation, application work, and input-to-frame latency.
+- No controlled GPUI/DVUI comparison was executed.
 
-ZUI currently has approximately **20,768 lines of Zig under `src/`**, including tests/comments, excluding its major packaged dependencies:
+### Current size
 
-| Module      | Lines |
-| ----------- | ----: |
-| `platform/` | 6,959 |
-| `gpu/`      | 4,366 |
-| `elements/` | 3,372 |
-| `app/`      | 2,582 |
-| `fonts/`    | 1,460 |
-| `images/`   |   854 |
-| `core/`     |   718 |
-| `widgets/`  |   345 |
+ZUI now contains approximately **29,799 Zig lines under `src/`** and **440 named test declarations** across `src/` and `examples/`. This declaration count is not a claim that all cases ran in every build configuration; the executable gates above are the authority for verification. Size is context, not evidence of quality.
 
-The locally available GPUI reference contains roughly 129,293 Rust lines across 206 files. It is a selected checkout, not a complete dependency accounting. These counts do **not** establish relative complexity, binary size, memory use, or speed.
-
----
-
-## 2. What is already better than the old roadmap suggests
-
-Do not restart work already present in the current tree.
-
-| Historical gap                                       | Current  evidence                                                                                                                                                          |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Cross-type drawing order lost                        | `src/gpu/scene.zig:42–55` defines an ordered command stream; `src/gpu/vellz.zig:139–169` consumes it in order.                                                            |
-| Close during a callback immediately frees the window | `src/app/window.zig:209–215` marks closed; `src/app/app.zig:322–337` reaps at safe points.                                                                                |
-| Entity updates outside a window fail to redraw       | `src/app/app.zig:399–409` fans entity dirtiness out to live windows.                                                                                                      |
-| Render-time invalidation gets erased                 | `src/app/window.zig:179–185` clears dirty **before** invoking rendering.                                                                                                  |
-| Text shaping repeated by ordinary measure and paint  | Measured Cozmic layouts are handed to paint; the benchmark reports `paint_shapes: 0` on element rows. This is per-frame reuse, not persistent cross-frame layout caching. |
-| Text field is append-only and can split UTF-8        | `src/widgets/text_field.zig:119–184` implements caret movement, insertion at the caret, deletion, validation, and codepoint-safe capacity clipping.                       |
-| No pointer capture or pointer-targeted scrolling     | `src/app/window.zig` contains capture/motion/release handling and scroll-listener hit testing.                                                                            |
-| Disappearing focus target retains keyboard focus     | `src/app/window.zig:357–369` clears missing focused handles.                                                                                                              |
-| Mid-frame atlas overwrite                            | `src/fonts/atlas.zig:11–18` defers eviction and reports overflow rather than overwriting referenced glyph storage.                                                        |
-| Image handles have no stale check                    | `src/elements/painter.zig:203–209` validates retained handles before drawing.                                                                                             |
-| No example integration coverage                      | `build.zig:114–123,161–168` runs todo and dashboard selftests from the normal test target.                                                                                |
-
-These are valuable improvements, but several are deliberately interim policies. Deferred atlas eviction still permits missing glyphs on overflow; a safe single-window restriction is not multi-window support.
-
-The README and `plan.md` need a status refresh. In particular, the README still describes unordered painting and append-only input, and references an old local layout directory. Its minimum compiler statement also differs from `build.zig.zon`.
+| Module | Zig lines |
+| --- | ---: |
+| `platform/` | 8,644 |
+| `gpu/` | 4,599 |
+| `elements/` | 4,200 |
+| `app/` | 3,971 |
+| `widgets/` | 3,226 |
+| `fonts/` | 1,998 |
+| `images/` | 1,349 |
+| `core/` | 779 |
+| `a11y/` | 460 |
+| `debug/` | 457 |
 
 ---
 
-## 3. The most actionable finding: the text benchmark already drops content
+## 2. What the recent work genuinely closed
 
-**Machine:** AMD Ryzen 5 5625U, Linux x86_64.
-**Build:** ReleaseFast, deterministic packaged font corpus.
-**Sampling:** nine measured iterations, three warmups. Treat this as diagnostic evidence, not a statistically robust performance publication.
+The report should not keep presenting these as wholly missing.
 
-The benchmark measures layout plus scene emission. It does **not** include Vellz frame rasterization, native presentation, or end-to-end input latency.
+| Former gap | Current evidence | Honest status |
+| --- | --- | --- |
+| No explicit entity release or weak handles | `src/app/runtime.zig:46–219,222–304` | **Implemented at entity level**; mounted window-tree ownership remains open |
+| Raw late callbacks can target freed entities | Generation-aware listener/focus owner checks in runtime and elements | **Substantially addressed**; owner-table overflow weakens the guarantee |
+| Escaped elements are unchecked indices | `Element.generation`, `node()` validation, `isAlive()` in `src/elements/element.zig:606–627` | **Implemented** |
+| Stable ID column collision | 16-byte encoding plus regression at `src/platform/id.zig:22–59` | **Fixed** |
+| Partial scenes are silently presented | `Scene.overflowed`, placeholder frame, rejection counters in `scene.zig` and `window.zig` | **Fixed policy**; capacity still requires virtualization |
+| Event overflow has no policy | Critical/coalescable/droppable policy in `src/platform/event.zig:229–409` | **Implemented in queue**; native producers do not consistently act on failure |
+| Zlay is completely disconnected | Dispatcher plus adapter, focused tests and real-tree selftests | **Integrated and canonical; experimental style gaps remain** |
+| Text field is codepoint-only | Grapheme model, selection, undo/redo, bidi geometry, pointer hit testing, composition model, opt-in multiline editing | **Substantially implemented**; native IME/a11y text and large-document behavior remain |
+| No persistent text-layout reuse | Engine cross-frame cache and benchmark cache-hit reporting | **Implemented for current key/model** |
+| Asset I/O occurs in paint | `src/images/service.zig` and asset-handle resolution | **Removed from paint**; loading is still synchronous without a task runtime |
+| Only `TextField` exists | Controls, radio group, scrolling, lists/tables, menus, select/combo, tooltip/popover/modal/dialog | **First widget layer exists** |
+| No focus or semantic foundation | `widgets/focus.zig`, `a11y/root.zig`, semantic actions and focus scopes | **Implemented foundation**; lifecycle/modal/native details remain |
+| No native accessibility bridge | Vendored AccessKit C ABI and Linux Unix adapter | **Wired but not yet correct/validated enough to claim support** |
+| No virtualization | Fixed/variable-height `VirtualList` and bounded variable-height `VirtualTable` | **Implemented subset**; richer table behavior remains |
+| No inspector/profiler surface | `src/debug/inspector.zig`, `stats.zig`, overlay and documentation | **Implemented diagnostics foundation** |
+| One native window only everywhere | X11, Wayland, and null backends now route per-window handles/events | **Implemented on Linux/headless**; Win32/Cocoa remain single-window |
+| DPI is only a reported float | Logical/physical scaling, fractional Wayland path, Win32/Cocoa source handling, null pixel tests | **Substantially implemented**; native cross-monitor evidence incomplete |
+| Windows/macOS fail basic compilation | Default compile-only checks now pass 15/15 | **Fixed for default build**; AccessKit configuration still fails |
+| No license/CI/package smoke test | `LICENSE`, `NOTICE.md`, `.github/workflows/ci.yml`, smoke consumer, manifest paths | **Implemented baseline**, with stale CI policy/comments |
 
-| Workload               | Reported median layout + paint | Emitted scene glyphs | Dropped scene pushes |
-| ---------------------- | -----------------------------: | -------------------: | -------------------: |
-| 64 short labels        |                       0.544 ms |                  424 |                    0 |
-| 256 short labels       |                       2.122 ms |                1,696 |                    0 |
-| 64 sentences           |                       2.379 ms |                2,080 |                    0 |
-| 256 sentences          |                       9.648 ms |                8,192 |              **128** |
-| 16 wrapped paragraphs  |                       2.531 ms |                2,464 |                    0 |
-| 64 wrapped paragraphs  |                      10.527 ms |                8,192 |            **1,664** |
-| 256 wrapped paragraphs |                      43.487 ms |                8,192 |           **31,232** |
-
-The cold 16-label row was approximately 14.98 ms, including 11.82 ms of engine initialization. That is **not application startup time**. The glyph payload ceiling remains 16,384, while the ordered command ceiling is reached first at 8,192.
-
-### Why this matters
-
-`src/core/limits.zig` allows 65,536 quad payloads and 16,384 scene-glyph payloads, but only **8,192 ordered commands total**. Every emitted glyph uses a command. The command stream becomes the effective ceiling before those payload arrays fill.
-
-The comment in `src/gpu/scene.zig:36–39` assumes this cap is comfortably large. The existing benchmark disproves that assumption. `Scene.dropped` makes loss observable to instrumentation, but does not make a partially rendered application acceptable.
-
-**Recommended response:**
-
-1. Establish a frame overflow policy: reserve/grow at safe boundaries, reject incomplete frames explicitly, or use a documented constrained profile. Do not silently present missing content.
-2. Make command and payload capacities coherent; consider glyph-run commands referencing contiguous payload ranges.
-3. Add correctness gates for emitted counts and overflow to benchmark runs. Keep an intentional overflow suite separate from performance-success results.
-4. Cache unchanged text layouts across frames, with keys that include text, font instance/fallback configuration, size, width, tracking, and other shaping inputs.
-5. Virtualize large lists and paragraphs; avoid shaping invisible content just to discard its pixels.
-6. Measure allocations and dependency-level shaping before changing Cozmic algorithms.
-
-### Additional concrete defects found during this review
-
-These are smaller than the architectural gaps, but they affect foundations the future design will depend on:
-
-- `src/platform/id.zig:22–30` writes the source column to bytes 4–7 and then overwrites those bytes with the low half of `extra`. Two call sites on the same file and line can therefore collide even when their columns differ. Stable IDs underpin focus, retained state, accessibility, automation, and inspector data; repair the representation and add collision regressions before using it broadly.
-- `src/images/cache.zig:73–77` exposes `Cache.pixels(handle)` without validating the handle generation. Internal painter paths validate first, but the public operation is unsafe to call directly with a stale handle. Make stale validation inseparable from resolution.
-- `EventQueue` is a fixed 256-entry ring and `push()` reports failure, but backend producers commonly ignore that result. Motion and resize may be coalesced; key/button releases, close, composition commits, and focus loss must not disappear. Define priority and overflow behavior before broadening input support.
-- Element-node and text-storage exhaustion still panic, while scene and hit-region overflow can produce incomplete output. A single documented capacity policy should distinguish recoverable growth, rejected frames, diagnostic placeholders, and preserved critical events.
-
-A larger command cap would remove this particular sentence-workload failure, but is not the architectural solution: it increases memory, leaves payload ceilings, and does not reduce shaping time. GPU acceleration also does not eliminate CPU-side layout cost.
+This work is real. It should be credited without confusing source integration and headless tests with native production validation.
 
 ---
 
-## 4. Gap matrix against GPUI
+## 3. Current architecture and capability matrix
 
-GPUI paths below are relative to `.references/gpui/crates/`.
-
-| Area                       | ZUI today                                                                   | GPUI/reference capability                                                                   | Missing work                                                                |
-| -------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| State and ownership        | Typed entity wrappers around app-lifetime allocations                       | Entity/weak-handle model, subscriptions, observations, release handling                     | Explicit entity release, stale-safe handles, teardown, mutation policy      |
-| Element lifecycle          | Fixed node kinds; recursive measure/place/paint; TLS frame                  | `gpui/src/element.rs`: request-layout, prepaint, paint, global IDs, custom elements         | Stable keyed identity and a supported custom-element lifecycle              |
-| Layout                     | Custom row/column/grow/wrap/absolute subset                                 | `gpui/src/taffy.rs`: real Taffy adapter with measurement and scale-aware rounding           | Connect Zlay, define style semantics, integrate grid/intrinsic sizing       |
-| Text rendering             | Cozmic layout, FreeType-backed masks, measure→paint handoff                 | Platform text systems, shaped-line APIs, separate glyph/emoji painting                      | Color glyphs, fractional sizing/DPI quality, richer text runs and reuse     |
-| Text editing               | Single-line, 512-byte buffer, codepoint caret/delete, whole-field clipboard | `gpui/src/input.rs`: marked/selected ranges, replacement, IME-facing protocol               | Selection, grapheme and bidi navigation, undo, composition, multiline       |
-| Interaction                | Hover, focus handle, keymap, basic capture, hit-tested scrolling            | Dispatch tree, tab stops, interaction primitives, gestures                                  | Correct activation/release, focus scopes, propagation, capture cancellation |
-| Accessibility              | No connected semantic-tree/bridge implementation found                      | AccessKit documented in `gpui/src/_accessibility.rs`; native adapters in platform manifests | Stable semantics plus AT-SPI/UIA/NSAccessibility integration                |
-| Graphics                   | Ordered quads, mask glyphs, images, limited gradients and effects           | Paths, shadows, sprites, text decorations, GPU platform renderers                           | Native GPU path and richer scene operations with identical CPU semantics    |
-| Native windows             | One native window explicitly enforced                                       | Per-window platform abstractions and window services                                        | Native ownership/event targeting, per-window surfaces, scaling              |
-| Async/application services | No general task/subscription layer in inspected runtime                     | Executors, cancellable tasks, subscriptions, asset services                                 | UI-thread completion queue, cancellation, lifetime-safe async updates       |
-| Virtualization             | Example-specific paging/scrolling; no reusable virtual list export          | `elements/list.rs`, `uniform_list.rs`                                                       | Fixed/variable-height lists, anchor preservation, virtual table             |
-| Motion                     | `requestAnimationFrame()` and monotonic clock helper                        | `elements/animation.rs`, `spring.rs`                                                        | Timeline/springs, interruption policy, reduced motion, deadline scheduling  |
-| Debugging                  | Logging, counters, headless tests, text benchmark                           | Inspector, debug overlay, profiler, test contexts                                           | Integrated geometry/identity/focus/semantic/resource inspector              |
-| Components/themes          | One widget export (`TextField`); demo-local visuals                         | Core primitives plus external GPUI Kit component system                                     | Behavior primitives, tokenized themes, accessible reusable controls         |
-
-### GPUI details worth copying, not blindly porting
-
-- **Separate layout, prepaint, and paint.** Prepaint is a useful place to establish hit regions, deferred overlays, and viewport-dependent work after geometry is known. A custom chart/editor should not require modifying ZUI's central `NodeKind` switch.
-- **Stable global identity.** GPUI composes element IDs through ancestors. ZUI's `Element` currently holds only a `u16` index resolved through the active TLS frame (`element.zig:325–353`). That index is not a persistent identity.
-- **One logical interaction dispatch model.** Keyboard, pointer, and accessibility activation should converge on the same control behavior.
-- **Task ownership is explicit.** Adopt cancellation and weak-target semantics, not necessarily Rust futures or the exact GPUI executor design.
-- **Keep platform and renderer responsibilities distinct.** The inspected Linux manifest uses `gpui_wgpu`; macOS documentation specifies Metal; Windows has DirectX/DirectWrite modules. Do not design against outdated claims that GPUI universally uses Blade.
-
-There are also opportunities to improve on GPUI. Its local README explicitly warns of pre-1.0 breaking changes and recommends reading Zed source for learning. Its accessibility guide documents duplicate source-derived IDs causing dropped nodes in release builds (`_accessibility.rs:109–164`). ZUI can offer better diagnostics and more predictable public APIs here. This is not evidence that GPUI lacks documentation entirely or that ZUI is already easier to use.
+| Area | Current ZUI state | Remaining distance from a production GPUI-class framework |
+| --- | --- | --- |
+| State/ownership | Typed entities, explicit destroy, `WeakEntity`, generations, UI-thread assertions, liveness-gated listeners, window scopes | Subscription/task teardown, stronger owned-handle misuse protection, lifecycle soak evidence |
+| Element model | Transient keyed elements with frame-generation checks, custom measure/prepaint/paint, and bounded Canvas scene pushes | Broader paths/layers/transforms and retained keyed custom state |
+| Layout | Zlay canonical default; real-tree selftests and external oracle | Expand style vocabulary; restore full upstream differential oracle |
+| Text layout | Cozmic shaping/fallback/bidi/wrap, cross-frame layout cache, shaped selection/hit geometry, RGBA color-glyph path | Rich text runs, broader color-font/scale evidence, stronger cache budget/eviction evidence |
+| Text editing | Grapheme-aware editing, selection, undo/redo, bidi movement, composition model, opt-in multiline TextField, Wayland text-input-v3 and optional X11 XIM source paths | Live IME validation, Win32/Cocoa adapters, UTF-16 OS conversion, accessible text ranges, larger/dynamic document model |
+| Interaction | Pointer capture, element-tree capture/bubble for pointer/motion/scroll, release-based `Pressable`, focus traversal/scopes, portals, targeted scrolling | Touch/pen/gesture/drag-drop, explicit tab order, broader default-action coverage |
+| Accessibility | Stable semantic tree, annotated Daybook fixture, roles/states/actions, ZUI-owned AccessKit snapshots with synthetic root publication, keyed TextField value/selection actions and character-length metadata | AT validation, Win/mac adapters, richer text-run geometry, incremental updates |
+| Widgets | Meaningful first set of controls, overlays, variable-height virtual list/table, bounded column resize/order, themes | Editable combo, submenus, tree/tabs/split panes, textarea, command palette, docking, rich text, reorder animations, polish and native validation |
+| Assets | Stable handles, loading/ready/failed states, tickets, budgets, cancellation/reload, worker-pool reads, UI completion, no paint-time I/O | Broader task composition, deduplicated async fetch/decode, file/watch policy |
+| Windows | Linux X11/Wayland/null multi-window and targeted events | Win32/Cocoa multi-window and native runtime proof |
+| DPI | Logical scene units and physical raster pipeline; fractional Wayland source path | Real per-monitor transitions on all OSes, X11 RandR per-monitor detection, native evidence |
+| Rendering | Ordered CPU Vellz rendering with overflow rejection, scale-aware glyph handling, Canvas quad/ring/line pushes, image/SVG rotation, and opt-in WGPU device/surface plus solid/gradient/rounded/clip/image/glyph/border/line bridge paths with bounded resource caches | Public arbitrary paths/layers, nested transforms, true effects/group opacity; default App GPU handoff; device loss/fallback evidence |
+| Scheduling | Monotonic deadlines, UI-thread one-shot executor timers with cancellation, task wakeups, and Wayland compositor frame callbacks with timer fallback | Cross-backend display pacing, lower idle-wakeup evidence, repeating/async timer composition and broader task cancellation |
+| Tooling | Headless backend, selftests, smoke consumer, inspector/stats, platform ledger | Visual regression suite, interaction trace/replay, native runners, docs site/gallery, benchmark comparison harness |
 
 ---
 
-## 5. Highest-priority missing systems
+## 4. Performance status after text caching and overflow repair
 
-### A. Stable identity, ownership, and application lifetime
+The old report’s 8,192-command table is obsolete. `MAX_RENDER_COMMANDS` and `MAX_SCENE_GLYPHS` are now both 16,384. Standard benchmark rows reject unexpected overflow, and the 256-paragraph capacity stress is skipped unless explicitly enabled.
 
-**Evidence:** `src/app/runtime.zig:22–75` stores allocations in an app-lifetime linked list; `Entity` exposes raw value pointers, including `readMut()`. Listeners borrow entity headers. There is no ordinary individual release path in this API.
+**Machine:** AMD Ryzen 5 5625U, Linux x86_64
 
-Before adding general background tasks, implement:
+**Build:** ReleaseFast, deterministic packaged fonts
+**Sampling:** nine measured iterations, three warmups
 
-- Explicit owned and weak/generation-checked entity handles, or an equally well-specified scoped ownership model.
-- Root/child entity lifetime and subscription cleanup.
-- Checked callback resolution after unmount and window close.
-- A mutation API with reliable invalidation; unrestricted `readMut()` should not silently bypass it.
-- Stable keyed element IDs, duplicate detection, and frame-generation checks for transient handles.
-- UI-thread ownership assertions and a safe completion queue for worker results.
+| Warm element workload | Median layout + paint | Scene glyphs | Drops | Cache behavior |
+| --- | ---: | ---: | ---: | --- |
+| 256 short labels | **0.150 ms** | 1,696 | 0 | `layout_shapes=0`, cross-frame hits |
+| 256 sentences | **1.073 ms** | 8,320 | 0 | `layout_shapes=0`, cross-frame hits |
+| 64 wrapped paragraphs | **1.542 ms** | 9,856 | 0 | `layout_shapes=0`, cross-frame hits |
 
-**Acceptance:** repeatedly open/close documents without growing retained entities; late completions cannot mutate destroyed targets; keyed row state follows data when reordered; escaped element handles fail predictably.
+The previous equivalents were approximately 2.12 ms, 9.65 ms, and 10.53 ms respectively. These runs are not a formal before/after experiment—the code, cache state, and compiler date differ—but they demonstrate that the new cache changes the warm-path order of magnitude.
 
-### A2. A supported custom-element lifecycle
+The cold 16-label row remained about **16.0 ms**, including approximately **13.1 ms** of engine initialization. That is not application startup time.
 
-ZUI's public `Element` is a concrete index into the active frame, and `NodeKind` is closed over container, text, spacer, and image. Consumers can compose those primitives, but cannot implement an element that owns custom layout state, performs viewport-aware prepaint, establishes its own hit/semantic nodes, or emits custom scene content without changing framework switches.
+With `--allow-overflow --iter 3 --warmup 1`, 256 wrapped paragraphs took about **6.24 ms** for cached element layout/paint, emitted 16,384 glyphs, and dropped 23,040 pushes. The benchmark labels this an intentional overflow stress and the application would reject the frame rather than present partial text.
 
-Add an extensible element protocol with explicit phases:
+### Interpretation
+
+- The old correctness defect—presenting plausible but missing output—is fixed.
+- The stress case still proves fixed scene capacity is finite. Virtualization remains mandatory for large content.
+- Warm text shaping is now dramatically cheaper, but paint still scales with visible glyph count.
+- The benchmark still omits CPU rasterization and native presentation, so it cannot support a 120 Hz framework claim.
+- A real performance program still needs startup, full-frame raster/present, input latency, idle wakeups, allocations, RSS, tail latency, virtualized 100k-row behavior, and matched GPUI/DVUI output.
+
+---
+
+## 5. Immediate correctness and integration blockers
+
+These deserve priority over adding more widget names.
+
+### 5.1 AccessKit publication is wired but not screen-reader proven
+
+The semantic model is valuable, and the Linux adapter is genuinely created with
+`-Daccesskit=true`. The current bridge stores a ZUI-owned snapshot, constructs
+fresh AccessKit nodes per update, transfers each node exactly once, and emits a
+synthetic window root with top-level semantic children. The ownership/root
+implementation is covered by the AccessKit-enabled build and snapshot design,
+but no real screen-reader workflow has passed yet.
+
+An earlier live todo AT-SPI probe saw an application frame with zero semantic
+children, before the annotated Daybook path and its semantic selftests landed.
+The current headless fixture publishes actionable roots and the AccessKit
+snapshot test covers their parentage, but no live screen-reader workflow has
+yet passed, so native accessibility is still unverified.
+
+Additional gaps:
+
+- Only the Unix adapter is instantiated (`accesskit.zig:111–120`).
+- Windows/macOS AccessKit-enabled cross-target builds fail.
+- Full snapshots are rebuilt instead of diffed.
+- Text input exposes selection actions and AccessKit character-length metadata;
+  full accessible text ranges and rich text-run geometry remain open.
+- The 64-entry action queue rejects and logs overflow, but has no retry or
+  coalescing policy.
+- Semantic capacity is 512 (`MAX_A11Y_ELEMENTS`); larger trees are rejected
+  rather than published partially.
+- No Orca/NVDA/VoiceOver workflow has passed.
+
+**Exit gate:** an annotated controls demo is navigable and actionable in Orca, NVDA, and VoiceOver; root/child/focus updates pass adapter-level tests; node ownership survives repeated update callbacks under an allocator checker.
+
+### 5.2 Mounted entity scopes are implemented; soak evidence remains
+
+`EntityHeader.window_id` and `EntityStore.destroyWindowScope()` now cover
+`mountView()` roots and window-attached child entities. `App.reapClosed()` runs
+the scope teardown before freeing the `Window`, and runtime tests verify scoped
+entities die while app-lifetime entities survive. A longer lifecycle/allocation
+soak across repeated native close/reopen cycles remains unverified.
+
+### 5.3 Owner-table overflow is now fail-safe
+
+The frame owner table is capped at 256. New targets first enter a tombstone
+table whose regions dispatch as dead; if that table also fills,
+`owner_overflow_fatal` rejects the frame before presentation. Regression tests
+cover both tombstoning and fatal rejection. Larger-frame usability and capacity
+budget tuning remain separate work.
+
+### 5.4 Native event producers now escalate critical loss
+
+The queue has explicit critical/coalescable/droppable policy. X11 input now
+routes through the targeted helper; Wayland, Win32, Cocoa, and null paths use
+critical escalation for releases, close, focus, text, and frame events. Ordinary
+motion/scroll drops remain counted by the queue, and complete cross-target
+runtime stress is still unverified.
+
+### 5.5 CI and documentation are now mostly aligned
+
+Default Windows/macOS compile checks are green and required in
+`.github/workflows/ci.yml`. The platform matrix records compile-only evidence,
+while native launch/behavior/validation remain explicitly open. Remaining
+documentation work is maintenance: keep new renderer, accessibility, and
+animation evidence synchronized as more platform gates land.
+
+---
+
+## 6. Remaining architectural gaps
+
+### A. Extend the public custom-element and canvas protocol
+
+The public custom-element lifecycle now exists: external code can provide
+stable state, intrinsic measurement, prepaint, ordered Canvas/Scene emission,
+semantic bindings, hit regions, and teardown. `tools/smoke_consumer` exercises
+that contract out of tree without core edits.
+
+The next extension is broader scene vocabulary:
 
 1. Stable identity and optional retained element state.
-2. Layout request plus intrinsic measurement callback.
-3. Prepaint after geometry is known, including hit regions, clipping, focus and semantic nodes.
-4. Ordered paint into a public canvas/scene interface.
-5. Teardown for retained resources and subscriptions.
+2. Layout request and intrinsic measurement.
+3. Prepaint after geometry is known.
+4. Ordered paint through public canvas/scene primitives.
+5. Semantic nodes and interaction regions using the same focus/owner model.
+6. Teardown for retained resources.
 
-Keep `div()`, `text()`, and images as optimized built-ins. The protocol is an escape hatch for editors, charts, terminals, canvases, virtual lists, and third-party widgets; it should not force every ordinary control into dynamic dispatch.
+Add arbitrary paths beyond the bounded line stroke, layers, rounded clip
+stacks, richer transforms, and more canvas primitives. Keep ordinary `div()`
+composition static and efficient;
+custom elements should not force everything through heap-allocated dynamic
+dispatch.
 
-**Acceptance:** an external package implements a virtualized custom element and a canvas/chart without modifying ZUI, reaches the same input/accessibility systems as built-ins, and is covered by headless layout/paint tests.
+**Exit gate:** an external package implements a chart, terminal/editor surface, and variable-height virtual list without modifying ZUI.
 
-### B. Text editing and internationalization
+### B. Make Zlay canonical while its supported contract continues to expand
 
-Codepoint-safe editing is progress, not complete Unicode editing. An accented grapheme or emoji family can contain multiple codepoints. Byte-order left/right movement is not visual bidi navigation.
+Zlay is now the default dispatcher for real trees, and the todo/dashboard
+selftests pass through it. `ZUI_LAYOUT=legacy` remains an explicit migration
+escape hatch for consumers auditing unsupported style differences.
 
-Build a shared editing model with:
+The adapter explicitly defers or differs on
+advanced grid/intrinsic constraints, baselines, reverse flow, CSS overflow,
+available-width text reflow, some percentage behavior, and legacy overflow
+semantics (`src/elements/zlay_adapter.zig:43–53`). It rebuilds the Zlay tree
+every dirty frame and has no stable-node cache.
 
-- Selection anchor/active end, pointer hit testing, shift-selection, word/line movement, select-all.
-- Grapheme-aware deletion and visual caret movement using shaped clusters.
-- Selection-aware clipboard, undo/redo, and configurable input limits.
-- Horizontal scrolling, caret visibility/blinking, multiline editing.
-- IME preedit/marked range, commit, cancellation, surrounding-text queries, replacement ranges, and caret rectangle reporting.
-- Explicit UTF-8 ↔ native UTF-16/range conversion at platform boundaries.
-- Locale-aware key behavior and an eventual localization/direction API.
+The three historical grid disagreements now pass, and the repository has a
+small external Taffy oracle gate covering flex growth/padding/gaps, wrapped
+absolute positioning, center/space-between/padding, min/max constraints, basic
+grid tracks/placement, column auto-flow, aspect-ratio sizing, and reverse flex
+flow. The published dependency still
+excludes the full fixture harness, so canonical status does not imply full CSS
+or Taffy parity.
 
-`platform/event.zig:123–146` only has a fixed 32-byte text commit event and no composition protocol. Correct IME cannot be added solely inside `TextField`.
+**Remaining exit gate:** broader public style coverage and full application
+geometry/pixel fixtures pass at resize/fractional coordinates; unsupported
+styles fail explicitly; the legacy escape hatch can then be removed.
 
-The coverage-only atlas explicitly rejects color glyphs (`fonts/atlas.zig:20–24`). Cozmic or Vellz supporting a font feature does not automatically expose that feature through ZUI.
+### C. Complete input, focus, and text integration
 
-**Acceptance:** edit Latin combining marks, Arabic/Hebrew mixed with Latin, CJK composition, emoji sequences, pasted long text, and wrapped selections; validate candidate placement and cancellation on real OS input methods.
+The internal editing model is now strong for bounded single- and multiline
+fields. Remaining work is at system boundaries:
 
-### C. Interaction and accessibility as foundations
+- Validate the new Wayland text-input-v3 preedit/commit/cancel and caret path
+  with a real compositor/IBus or Fcitx session; then add X11, Win32, and Cocoa
+  native adapters.
+- Convert native UTF-16/ranges explicitly at Windows/macOS boundaries.
+- Add line/word selection refinements, native multiline IME integration, and
+  large-document storage beyond the bounded model.
+- Keyed `TextField` now publishes focus, bounded editable-value, and text
+  selection actions in addition to selection/value state; character-length
+  metadata is generated and tested, while full accessible ranges, richer
+  text-run geometry, and native IME accessibility remain open.
+- Cancel armed press/capture on focus loss, unmount, disable, modal replacement,
+  and window close. The Window cancellation boundary and owner-tagged portal
+  scope cleanup now cover the focused/widget paths; non-focusable custom owners
+  still need an explicit cancellation hook.
+- Move Space activation to conventional key-up behavior where appropriate.
+- Keyboard events now follow the focused element ancestry through explicit
+  capture and bubble listeners, matching GPUI's key dispatch order. Remaining
+  propagation/default-action work includes modifiers-changed observers and
+  extension beyond pointer/motion/scroll/keyboard to touch/pen/gesture,
+  drag/drop, and touchpad phases.
 
-`window.zig:409` invokes the click listener on **press**. Existing capture handles drag motion/release but does not establish conventional button activation semantics.
+Color bitmap glyphs now use a separate bounded RGBA atlas pool and Vellz image path. The color spike, atlas separation, and synthetic Vellz pixel test are covered; live emoji rendering and COLRv1 behavior remain host/font dependent.
 
-Required:
+### D. Extend the task/runtime and async asset layer
 
-- Press/release/click distinction; press-inside/release-outside cancellation.
-- Capture cancellation on focus loss, unmount, and window teardown.
-- Capture/bubble propagation and default-action rules.
-- Tab/shift-tab traversal, focus scopes, modal focus trapping/restoration, visible focus indicators.
-- Nested scrolling with defined delta units, consumption/chaining, and touchpad phases where available.
-- Accessible roles, names, values, states, bounds, relationships, and actions.
-- Reduced-motion, text-scale, contrast, and theme integration.
+`images.Service` now has stable handles, states, tickets, stale completion
+rejection, cancellation, reload, budgets, and worker-pool reads through the
+App-owned `TaskRuntime`. Decode/place completions remain marshalled to the UI
+thread, and ready assets do not perform paint-time I/O.
 
-The todo's Tab shortcut is not a general focus traversal system. Constants named `MAX_A11Y_ELEMENTS` are not an accessibility implementation.
+ZUI still needs:
 
-**Recommendation:** use AccessKit's C API initially rather than independently reproducing three desktop accessibility bridges. Keep ZUI's semantic model independent of that binding. AccessKit still needs correct widget semantics and native screen-reader tests.
+- Foreground and background executors integrated with the event loop.
+- Scoped tasks tied to entity/window lifetime.
+- Cancellation and weak-target completion.
+- UI-thread completion queue and invalidation.
+- Deterministic clocks/executors for tests.
+- Async HTTP/file asset sources without blocking typing or paint.
 
-### D. One real layout engine
+**Exit gate:** a resizable virtualized image browser loads thumbnails in workers, closes safely during work, and performs no ready-asset I/O or decode on the UI frame path.
 
-`runtime.mountView()` calls `elements.layout.layout()`, which uses its own recursive algorithm; the file does not import Zlay. Exporting `zui.layout` and testing the dependency separately does not integrate it.
+### E. Finish the renderer boundary with one GPU backend
 
-Add a narrow adapter for the current styles, then extend to flex shrink/basis, min/max/intrinsic sizes, percentages, alignment/baselines, grid, aspect ratio, and explicit overflow semantics. Define box sizing and fractional rounding rather than copying CSS names without their behavior.
+The CPU Vellz renderer is the working oracle. The root now exposes opt-in
+Vellz/WGPU device, native Wayland surface, and solid/gradient/rounded/clip/image/
+glyph/border scene-bridge gates; on this host they acquired the Mesa RADV Vulkan adapter with
+`maxTextureDimension2D=8192`, presented three frames, and passed the bridge
+test. The App now owns an explicit opt-in WGPU/Vellz bridge and passes the
+Window scene plus glyph/image pools through its renderer controller; CPU
+presentation remains the default compatibility mode. `gpu.render_backend.Controller` now owns the
+explicit App/Window selection seam: CPU is selected by default, WGPU requires
+compiled support plus a native surface and installed submit hooks, resize and
+minimize invalidate or skip frames, and injected loss exercises one recreate
+attempt before CPU fallback. `renderer-test` covers this policy headlessly;
+the Wayland smoke wraps its real bridge frames with the same lifecycle state.
+`gpu-offscreen-diff` now compares 4096 CPU/WGPU pixels for a retained
+alpha/gradient/rounded/path/nearest-image scene fixture with zero mismatches
+(maximum delta 2); the current host timing sample is CPU 5.29ms, bridge
+3.52ms, render submission 5.69ms, and readback 0.47ms. Native device-loss
+injection and backend hook installation in the default platform backends remain
+unverified.
+`vulkan.zig`, `metal.zig`, and `d3d12.zig` still return `error.Unsupported`.
 
-The old plan's three grid disagreements are historical findings, not freshly reproduced defects in the current dependency. Re-run those regressions and the current Zlay oracle before migration; do not assume the old failures remain.
+Do not finish three low-level drivers in parallel. First connect one Vellz/WGPU path through a small UI renderer contract:
 
-**Acceptance:** real todo/dashboard trees go through Zlay, resize correctly, and agree with pinned fixtures. Advertise grid only after public element tests exercise it.
+- Per-window surface, scale and resize/minimize handling.
+- Scene/resource submission and explicit completion.
+- Glyph/image upload and persistent caching.
+- In-flight frame resource retirement.
+- Device loss and deterministic CPU fallback.
+- Same overlap, clip, opacity and image semantics as CPU.
 
-### E. Rendering, GPU integration, and resource completeness
+The renderer still lacks arbitrary public custom paths, arbitrary nested
+transforms, isolated group opacity, and real blur/shadow semantics. The
+bounded line stroke and color-glyph paths are now scene-backed. These
+remaining scene semantics should be defined before becoming GPU-specific
+accidents.
 
-ZUI currently translates its small scene into `vellz.cpu.RenderContext`. Native presentation remains CPU-backed; `vulkan.zig`, `metal.zig`, and `d3d12.zig` initializers still return `error.Unsupported`.
+### F. Broaden widgets after behavior contracts stabilize
 
-Do not implement an entire SDL-like GPU API merely to draw UI. First evaluate the already packaged Vellz GPU interface against ZUI's real resource/surface needs and verify its current behavior independently.
+Current exports are a legitimate first component library: `TextField`, Button, Checkbox, Switch, Slider, Progress, RadioGroup, ScrollArea, VirtualList, VirtualTable, Menu, ContextMenu, Select, ComboBox, Tooltip, Popover, Modal, and Dialog.
 
-Create a small contract around scene submission, resource resolution, per-window surface, scale, completion, and failure. Prove one GPU/native vertical slice before expanding backends.
+Remaining depth matters more than count:
 
-The scene also needs stronger semantics:
+- VirtualList now supports an opt-in bounded `HeightProvider`; very large jumps use an estimated extent until nearby rows are probed.
+- VirtualTable now supports bounded variable row heights, retained column resize,
+  and pointer/programmatic column reorder; richer reorder animations remain deferred.
+- ComboBox is select-like rather than editable/filtering.
+- Menu submenus are visual placeholders without full tree/keyboard behavior.
+- ScrollArea still builds/measures arbitrary children; only virtual paths bound large content.
+- Theme state is global mutable state, not per-window/system-aware.
+- Callback and option slices often have borrowed lifetime contracts rather than scoped subscriptions.
+- Reduced motion, high contrast, text scale, loading/error states, contrast audits, and native visual QA remain.
+- The current component layer includes TextArea, TreeView, Tabs, SplitPane,
+  command palette, docking, and editor primitives as bounded contracts. Missing
+  depth still includes rich text/Markdown, date/time/color pickers, completion,
+  diagnostics, minimap, persistent multi-level docking, and polished native
+  behavior.
 
-- Paths/strokes and custom canvas rendering for charts, diagrams, and editors.
-- Nested clips, transforms, stacking/overlays, and explicit overflow.
-- True isolated group opacity: multiplying alpha per child gives different overlap results.
-- Real blur/shadows where advertised. `painter.zig:98–125` currently uses layered approximations.
-- Color glyphs and richer gradients through the public scene.
-- Persistent image resources and safe retirement for in-flight GPU frames.
+Do not add those as painted shells. Every component needs keyboard behavior, semantics, focus rules, disabled/loading/error states, and headless/native tests.
 
-`painter.zig:155–162` clips every child to the parent's rectangular content box. A rounded background is not automatically a rounded descendant clip. Menus/popovers need deliberate escape/overlay behavior.
+### G. Finish platform proof, not just platform source
 
-**Acceptance:** CPU/GPU comparisons cover text-image-quad overlap, nested clips/layers, resize/minimize, missing resources, and device loss; surface creation errors are not disguised as successful support.
+The default project now compiles for Windows and macOS. Linux X11/Wayland multi-window and DPI source paths are substantially implemented. Evidence is still uneven:
 
-### F. Scheduling, frame pacing, and assets
+| Target | Current evidence | Remaining proof |
+| --- | --- | --- |
+| Linux X11 | Native compile/launch, multi-window routing, env scale, optional XIM source path, partial live checks | XIM server/composition validation, RandR per-monitor scale, AT-SPI annotated controls, lifecycle soak |
+| Linux Wayland | Native compile/launch, per-surface windows, fractional-scale protocol, optional text-input-v3 source path, live AT-SPI semantic/action probe | Real monitor migration, live IBus/Fcitx IME, clipboard/drag-drop soak, screen-reader speech validation |
+| Windows | Default compile-only 15/15 | Native launch/input/DPI/clipboard/IME/a11y; multi-window; AccessKit-enabled build |
+| macOS | Default compile-only 15/15 | Native launch/input/DPI/clipboard/IME/a11y; multi-window; AccessKit-enabled build |
+| Headless | Unit/selftests, multi-window routing, snapshots | Visual golden suite and trace/replay |
+| GPU | Opt-in WGPU/Wayland bridge with App/Window handoff; direct Vulkan/Metal/D3D12 drivers remain stubs | Pixel-differential proof, live device-loss injection, non-Wayland backend support |
 
-`App.run()` waits up to 16 ms after each native step (`app.zig:451–459`); key sequences expire by ticks (`app.zig:424–426`). This is not a display-aware timing policy. Backend wake behavior can affect actual timing, so the source alone does not establish a measured frame-rate cap.
-
-Replace this with input/completion/deadline-driven wakeups and native frame pacing. Idle windows should not wake periodically merely to discover there is no work. Animated windows should follow display timing; timers must use monotonic deadlines.
-
-Path images are read for intrinsic size during element construction (`element.zig:651–666`) and read again on the painting path (`painter.zig:203–209`). Move loading/probing/decoding out of frame construction into an asset service with loading/ready/failed states, placeholders, deduplication, cancellation, and UI-thread completion.
-
-**Acceptance:** ready assets incur no repeated file I/O; background loading does not block typing; idle wakeups and animation pacing are measured; closing a view cancels its owned work.
-
-### G. Real native windows and DPI
-
-`App` owns one backend and explicitly rejects a second live native window (`app.zig:208–213`). Events have no destination window ID. The platform reports scale factors, but `Window` and the element/render contract do not implement a complete per-window logical/physical pipeline.
-
-Required:
-
-- Shared application connection, independent native windows and renderer surfaces.
-- Window-targeted input, focus, resize, close, and scale events.
-- Distinct logical layout units, native window coordinates, framebuffer pixels, and content scale.
-- Fractional-scale font/atlas invalidation and input normalization.
-- Native dialogs, drag/drop interop, richer clipboard formats, URL/file opening, and platform menu integration as support grows.
-
-**Acceptance:** two windows on differently scaled monitors stay independent; moving either window preserves text sharpness and hit alignment. Run actual Windows/macOS tests before advertising parity. Source presence and Linux tests of `UnsupportedPlatform` are not platform support evidence.
-
-### H. Portability and platform correctness are current build blockers
-
-The Windows and macOS sources are not merely unverified; with the current compiler, representative foreign-target builds do not compile:
-
-- `x86_64-windows-gnu` fails because `src/platform/linux/x11.zig:203` performs a target-invalid `XEvent` size assertion and `src/platform/windows/win32.zig:221` mishandles the optional `GetDpiForWindow` lookup type.
-- `aarch64-macos-none` fails with 65 diagnostics. The dominant classes are alignment-increasing function-pointer casts in `src/platform/dl.zig:56`, Linux Wayland/X11 modules being instantiated for the macOS target, similar Objective-C message-send alignment casts, and a nested-optional Objective-C ABI type.
-
-This means the accurate support vocabulary is currently:
-
-- Linux Wayland/X11: source plus local tests and prior runtime use, but this review did not perform live interaction.
-- Windows/macOS: source present, foreign-target compilation failing, native runtime unverified.
-- GPU: API and stub sources present, no operational ZUI GPU presentation path.
-- Headless: exercised by integration tests and snapshot output.
-
-Create compile-only build steps that do not attempt to execute foreign binaries, and run them in CI for every supported target. Native runners must separately prove launch, input, clipboard, IME, DPI, accessibility, multi-window, suspend/resume, renderer fallback, and teardown.
-
-**Acceptance:** the published platform matrix distinguishes source presence, compile, launch, automated behavior, and manual native validation; no platform is called supported solely because its file exists.
+Win32 and Cocoa still lack the per-window `createWindow` implementation used by Linux. Cocoa also retains global backend state. Default cross-target success must not be advertised as runtime support.
 
 ---
 
-## 6. A widget library, not a collection of attractive demos
+## 7. Comparison with GPUI and the Zig ecosystem
 
-`src/widgets/root.zig` exports only `TextField`. Primitive composition is useful, but consumers should not rebuild button semantics, dropdown dismissal, tab navigation, and table selection themselves.
+### GPUI remains the application-framework benchmark
 
-Use three logical layers; they need not be separate repositories initially:
+Current GPUI provides typed/weak entities, subscriptions, custom element phases, Taffy integration, virtual lists, async executors, animations, capture/bubble input, tab stops, AccessKit, native services, multi-window platform backends, test contexts, profiler and inspector infrastructure. Its official README still describes it as pre-1.0 with frequent breaking changes and a source-led learning experience: https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md
 
-1. **Foundation:** runtime, identity, layout, scene, input, semantics, platform, tasks/assets.
-2. **Behavior primitives:** pressable, selectable, focus scope, scroll model, overlay manager, editing model, virtualization.
-3. **Styled components:** controls using semantic tokens and replaceable presentation.
+ZUI has now matched parts of that list: weak entities, stable semantic IDs, bounded variable-height virtualization, focus scopes, initial widgets, multi-window Linux, inspector stats, and a text cache. The remaining gap is no longer “everything around rendering”; it is extensibility, task/runtime integration, native validation, accessibility correctness, and product depth.
 
-### First component set
+GPUI’s component ecosystem remains a second benchmark. GPUI Kit/GPUI Component supplies the polished controls, editing, tables, docking and themes developers actually consume. ZUI’s current widgets are foundation implementations, not yet an equivalent application system.
 
-- Button/IconButton, Checkbox, RadioGroup, Switch.
-- TextInput/TextArea, Label, form validation/helper/error text.
-- ScrollArea, fixed-height virtual list, then variable-height virtual list.
-- Menu/ContextMenu, Tooltip, Popover, Modal/Dialog, Select/ComboBox.
-- Tabs, Slider, Progress, SplitPane, TreeView.
+### DVUI remains the strongest immediate Zig usability baseline
 
-### Application-grade set after the foundations
+DVUI documents a broad widget catalog, multiple backends, animations, themes, dialogs and AccessKit, but also acknowledges simple LTR/codepoint text and incomplete grapheme/bidi behavior: https://github.com/david-vanderson/dvui
 
-- Virtual table with sorting, selection, resizing, sticky headers, keyboard movement, and async data.
-- Command palette and searchable lists.
-- Docking/split layouts with persisted state.
-- Rich text/Markdown and chart primitives where supported by real consumers.
+ZUI’s most credible technical advantage is Cozmic-backed international text plus retained app state. DVUI remains ahead in breadth, embedding maturity, examples, and established widget behavior.
 
-Theme tokens should cover colors, typography, spacing, radii, focus rings, elevation, density, disabled/hover/pressed/loading/error states, and motion. Light/dark mode must not just swap a background color.
+### Capy, zgui, Mach and zigui occupy adjacent positions
 
-Move demo-specific progress/date helpers out of foundational elements over time (`element.zig:773–798`). Keep a supported custom-element/canvas escape hatch so extending the library does not require a core fork.
+- Capy’s native controls offer inherited platform behavior but uneven control parity: https://github.com/capy-ui/capy
+- zgui is excellent Dear ImGui tooling rather than a retained application framework: https://github.com/zig-gamedev/zgui
+- Mach is a graphics/game ecosystem and possible interop target, not a complete accessible app toolkit: https://github.com/hexops/mach
+- The young `ddalcu/zigui` validates demand for pure-Zig declarative UI with software/GPU fallback, so fluent Zig syntax alone is not a durable moat: https://github.com/ddalcu/zigui
 
----
+### Specialization is the right architecture
 
-## 7. Ecosystem research: what matters now
+Zlay, Cozmic, Vellz and AccessKit should remain independently testable subsystems behind narrow contracts. Xilem/Masonry follows a similar specialist-stack strategy, and AccessKit is explicitly designed for transient/immediate toolkits with stable IDs and incremental updates: https://github.com/linebender/xilem and https://github.com/AccessKit/accesskit
 
-These are upstream documentation claims unless explicitly tied to inspected source or executed checks.
-
-### DVUI: a strong Zig usability benchmark
-
-DVUI documents a substantial widget catalog, multiple backends, touch selection, animations, themes, native file dialogs, AccessKit, and input-aware wait scheduling. It also explicitly documents simple left-to-right, one-glyph-per-codepoint text, no grapheme support, and no bidi text in its current README.
-
-**Lesson:** ZUI can differentiate with high-quality international text and retained application state, but DVUI already sets a higher baseline for widgets, accessibility plumbing, examples, and embedding. Do not call those empty territory.
-
-### Capy: native controls expose a different parity problem
-
-Capy advertises declarative Zig UI, native operating-system controls, accessibility, cross-compilation, small executables, and desktop/web coverage. Its own component matrix is also candid: controls vary substantially by backend, with macOS and mobile missing many canvas, scrolling, selection, and editing features, and the project remains pre-production with breaking changes.
-
-**Lesson:** native widgets can inherit platform accessibility and appearance, but a library then owns a persistent cross-platform behavior-parity problem. ZUI's custom-rendered approach can offer one semantic and visual model everywhere, provided it builds real accessibility adapters and platform integration rather than assuming custom drawing is portable by itself.
-
-### zgui and Mach: adjacent tooling and rendering ecosystems
-
-`zgui` provides strong Dear ImGui bindings plus plotting, gizmos, node editing, and test-engine support. It is a compelling game/editor tooling solution, not a complete retained desktop-application framework. Mach is a prominent Zig graphics/game toolkit and a possible interop or renderer target, but its official documentation still characterizes the project as experimental and evolving.
-
-**Lesson:** ZUI should interoperate with game/rendering ecosystems where useful, but its differentiation is application semantics: durable state, Unicode editing, accessibility, native services, structured layout, automation, and production widgets.
-
-### zigui: a young direct competitor worth tracking
-
-The newer `ddalcu/zigui` project is explicitly pre-alpha, but its direction validates demand for a pure-Zig declarative/value-tree API, software rendering with SDL3 GPU fallback, multiple theme families, and editor primitives. Its published deferred work includes accessibility, HiDPI, navigation, tabs, modals, grids, materials, and animation.
-
-**Lesson:** “pure Zig plus a fluent tree” will not remain a unique pitch. ZUI should win through verified semantics, international text, accessibility, diagnostics, package stability, and real applications rather than syntax resemblance.
-
-### Gooey: a direct architectural competitor
-
-The local README advertises GPU rendering, dynamic entity cleanup, animations, IME, accessibility, virtual lists, and tables. Selected source includes an animation store and virtualized table implementation. These claims were not native-runtime validated here.
-
-**Lesson:** the differentiator cannot simply be “GPUI-like, but Zig.” Demonstrate correctness, portability, diagnostics, and application completeness. Borrow API lessons without assuming another framework's feature list proves parity.
-
-### GPUI Kit: the real application-level bar
-
-Current GPUI Kit documentation describes an unstyled behavior foundation plus a styled component system, 60+ controls, virtual lists/tables, docking, editing, charts, and theming. Its 120 FPS and large-document claims are vendor claims, not a comparable benchmark measured in this session.
-
-**Lesson:** behavior/presentation separation and a searchable component gallery are central product features. Your `examples/dash-gpui` uses `gpui-kit = "0.6.1"`, not just raw GPUI. It is a useful paired consumer, **not yet a controlled benchmark harness**.
-
-### Xilem/Masonry and AccessKit: specialization pays
-
-Xilem/Masonry documents separate framework/widget layers and specialized windowing, renderer, text, and accessibility dependencies. AccessKit provides schema, incremental tree updates, platform adapters, and C bindings; stable IDs are fundamental. Its own README notes remaining limitations, including rich/hypertext support.
-
-**Lesson:** maintain narrow interfaces between Zlay, Cozmic, Vellz, and semantics. Dependency integration is not a compromise to hide; it is the architecture to verify.
-
-AccessKit's released adapters cover Windows UI Automation, macOS NSAccessibility, Unix AT-SPI, Android, and iOS, and its C bindings make a Zig integration feasible. Its schema is built around stable node IDs, roles, properties, actions, and incremental tree updates, which fits ZUI's transient-tree architecture. It still does not remove the need for correct widget semantics, text-range mapping, focus synchronization, and real assistive-technology testing.
-
-### Vello: distinguish the renderer families
-
-Current Vello docs distinguish CPU Sparse Strips, CPU-preprocessed GPU rasterization/compositing, and an experimental compute-centric renderer. CPU is described as more mature overall; the GPU family targets broad compatibility without requiring compute shaders.
-
-**Lesson:** Vellz's CPU-first direction is reasonable. Do not assume the name “Vello” implies one compute-only architecture or universal production maturity. Verify exactly which Vellz implementation is pinned and consumed.
-
-### egui and Slint: ergonomics and tooling are competitive features
-
-Egui emphasizes easy integration, small APIs, custom painting, accessible controls, and on-demand repaint. Its text about typical frame cost is not a controlled comparison to ZUI. Slint emphasizes stable 1.x APIs, live preview, LSP integration, and separate UI design workflows.
-
-**Lesson:** build a tiny external-consumer starter, excellent errors, an inspector, a gallery, and migration guidance. Consider preview/hot reload later; do not begin by inventing a new UI language.
-
-### SDL3: copy the platform contracts, not all of SDL
-
-SDL's high-DPI documentation explicitly separates window size, pixel size/density, and content/display scale. `SDL_SetTextInputArea` documents caret-adjacent native candidate placement.
-
-**Lesson:** DPI and IME are multi-layer protocols, not a float named `scale_factor` and a text-event callback. SDL's contracts are useful even if ZUI keeps native backends.
+The risk is not using dependencies. The risk is claiming the feature of a dependency before ZUI’s adapter, lifecycle and native validation are complete.
 
 ---
 
-## 8. A credible definition of “better than GPUI”
+## 8. A measurable definition of “better than GPUI”
 
-Choose measurable wins instead of an unqualified superiority claim:
+Do not reduce this to raw FPS. ZUI wins only if ordinary developers can ship a complete application more predictably.
 
-1. **Adoption:** an external user creates a working application from a small documented package recipe, without reading backend source.
-2. **Predictability:** explicit allocator/lifetime contracts; no silent missing content; stale handles and duplicate IDs are diagnosed.
-3. **International usability:** real CJK IME, grapheme/bidi editing, font fallback, and color emoji work together.
-4. **Accessibility:** core workflows pass VoiceOver, NVDA, and Orca testing, not just semantic-tree unit tests.
-5. **Performance:** equal-output workloads show lower overhead, good tail latency, and low idle power on specified machines.
-6. **Extensibility:** custom widgets and rendering do not require core changes.
-7. **Stability:** versioned public API, migration notes, pinned supported Zig versions, and a documented feature/platform matrix.
+1. **Adoption:** an external user builds a substantial app from the documented package without private framework changes.
+2. **Safety:** stale entities, callbacks, semantic actions, asset completions and tasks fail predictably; window close releases its mounted scope.
+3. **Extensibility:** charts, editors, terminals and custom virtualization use a public element/canvas contract.
+4. **International text:** graphemes, bidi, fallback, variable/color fonts, IME, selection and accessible text work together.
+5. **Accessibility:** core flows pass Orca, NVDA and VoiceOver, not only semantic unit tests.
+6. **Portability:** every advertised platform has compile, launch, behavior and manual-validation evidence.
+7. **Rendering:** CPU and GPU produce equivalent complete scenes, with device-loss fallback and no silent overflow.
+8. **Performance:** matched-output benchmarks report startup, p50/p95/p99 frame time, input latency, allocations, RSS, idle wakeups and dropped/rejected frames.
+9. **Developer experience:** stable package recipe, searchable docs, gallery, inspector, actionable diagnostics and migration notes.
+10. **Stability:** versioned public contracts, supported Zig revisions, changelog and compatibility policy.
 
-Potential Zig advantages—comptime validation, explicit allocators, compact representation, straightforward C interop—are opportunities, not automatic speed or safety proofs. Zig has no borrow checker to make the entity and callback lifetime problem disappear.
-
-Start with desktop productivity apps, editors, and data-heavy tools. Web/mobile/embedded can be deliberate later profiles. Trying to win every deployment target immediately would dilute the necessary work.
-
-### Performance acceptance framework
-
-At 60 Hz a frame interval is 16.67 ms; at 120 Hz it is 8.33 ms; at 144 Hz it is 6.94 ms. These are deadlines, not guaranteed framework budgets. Application work and presentation also need time.
-
-For a declared 120 Hz target, a reasonable _initial engineering target_ is ordinary UI CPU work below roughly 4 ms at p95 on a named midrange machine, then validate end-to-end pacing. This is a proposed target, not a GPUI measurement or universal industry standard.
-
-Benchmark paired workloads with the same fonts, data, viewport, scale, visible items, effects, and interaction trace. Record:
-
-- Build revision, optimization, compiler, machine, OS, backend, renderer, adapter and power state.
-- Build time: clean and incremental, separately from runtime.
-- Startup to first useful frame; cold/warm resource loading.
-- View construction, layout/shaping, scene emission, raster/GPU work, upload, present.
-- Input-to-frame latency, dropped frames, p50/p95/p99 distributions.
-- Idle CPU/wakeups, RSS, per-window memory, allocations, atlas/resource high-water marks.
-- Emitted/missing content and output differences.
-
-Do not compare an overflowing or simplified ZUI scene against a complete GPUI scene. Do not include readback in one renderer's timing but exclude its counterpart. The existing dashboard pair is a good starting point after equivalence is established.
+Potential Zig advantages—comptime validation, explicit allocators, compact layouts and C interop—are opportunities, not automatic proof of speed or safety.
 
 ---
 
-## 9. Recommended delivery order and exit gates
+## 9. Revised delivery order
 
-No speculative dates: the scope and verification gates matter more than an unsupported estimate.
+The old stages should be updated because much of Stage 0–3 now exists.
 
-| Stage                                    | Main work                                                                                                                                                                    | Exit gate                                                                                                                                  |
-| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| **0. Truthful baseline**                 | Refresh docs; establish current platform/feature ledger; add native and compile-only cross-target CI; classify scene overflow as failure; external package smoke test; resolve licensing | Clean consumer build and reproducible checks distinguish cached, skipped, compile-only, headless, pixel, and native evidence               |
-| **1. Runtime/identity contract**         | Collision-free stable IDs, entity ownership/release, weak callbacks, safe worker completion, custom-element protocol, explicit capacity policies                                | Repeated mount/unmount has bounded memory; stale handles/capture/tasks cannot target removed UI; external custom element works; benchmark emits complete content |
-| **2. Layout + text foundation**          | Integrate Zlay; retain text layouts safely; expose shaped hit/caret/selection geometry; color-glyph path                                                                     | Real examples use Zlay; resize/intrinsic/grid fixtures pass; selected scripts render and edit consistently                                 |
-| **3. Interaction + semantic foundation** | Correct press/release, focus traversal/scopes, selection/undo, semantic tree and initial AccessKit bridge; begin native IME                                                  | Keyboard-only forms and modal flow pass; screen reader can identify/activate controls; composition protocol is testable                    |
-| **4. Window/render/scale boundary**      | Per-window native IDs/surfaces, logical/physical coordinates, scheduler/deadlines, CPU contract                                                                              | Two independently scaled windows work; idle/animation behavior measured; software output remains correct                                   |
-| **5. First integrated GPU path**         | Vellz GPU integration where verified, resource retirement, resize/device-loss/fallback                                                                                       | Native GPU renders the same complete scenes as CPU with documented differences and measured benefits                                       |
-| **6. Productive widget layer**           | Theme tokens, accessible core controls, overlays, virtual lists/table, async assets                                                                                          | Todo/dashboard use reusable controls; a second realistic consumer needs no private framework patches                                       |
-| **7. Competitive release**               | Finish per-OS IME/accessibility validation; inspector/gallery/tutorials; stable release policy; fair GPUI comparison                                                         | Published support matrix, reproducible performance results, and independent external users                                                 |
+| Stage | Main work | Exit gate |
+| --- | --- | --- |
+| **0. Consolidate the new baseline** | Maintain AccessKit snapshot/root ownership; window-owned entity teardown; owner overflow; producer queue errors; capacity/docs/CI contradictions | Repeated windows/entities/a11y updates are leak/UAF-free; default cross checks are required CI jobs; capability docs agree |
+| **1. Expand current integrations** | Broaden the supported Zlay style contract and oracle; move remaining demos to reusable widgets/semantics; validate Linux AccessKit with annotated controls | Supported styles have resize/fractional fixtures; demos are keyboard/screen-reader operable; legacy layout/press-time controls are no longer the primary examples |
+| **2. Extensibility and task runtime** | Extend custom Canvas/scene vocabulary; scoped executor/tasks; async asset pipeline; trace/replay tests | External chart/editor/image-browser consumers need no core patch and close safely during work |
+| **3. Native text and interaction** | Platform IME adapters, multiline text, accessible ranges, lifecycle capture cancellation, propagation, drag/drop/touch | Multilingual editing and modal/forms pass native keyboard, pointer, IME and a11y scenarios |
+| **4. Renderer completion** | One Vellz GPU backend, persistent resources, retirement, device loss, CPU fallback, richer scene semantics | CPU/GPU differential fixtures pass; resize/minimize/device-loss soak is stable |
+| **5. Platform and product depth** | Win/mac multi-window/native validation; variable virtualization; deep widgets/themes; docs/gallery | Published support matrix and component behavior specs match real native evidence |
+| **6. Competitive proof** | External applications, fair GPUI/DVUI benchmark suite, release policy and migration guidance | Independent users ship without private patches; performance and support claims are reproducible |
 
-Accessibility schema design begins with stable identity, not at the end. Similarly, DPI contracts must inform text and renderer design before all platform implementations are complete. Stages describe dependency order, not a requirement to work serially on unrelated tasks.
+### Sensible parallel ownership
 
-### Sensible parallel work boundaries
+Once shared identity/event/scene contracts are frozen, work can proceed in parallel:
 
-Once canonical identity/event/scene contracts are agreed:
+- Runtime owner: mount scopes, tasks, cancellation, invalidation.
+- Layout owner: Zlay contract, fixtures and migration.
+- Text/input owner: native IME, multiline and accessibility ranges.
+- Accessibility owner: bridge ownership/root/diffs and native AT validation.
+- Renderer owner: public scene/canvas and one GPU backend.
+- Platform owners: implementation behind agreed window/input/scale contracts.
+- Widget/tooling owner: components, semantics, gallery, inspector and visual tests.
 
-- Runtime owner: entities, task cancellation, invalidation.
-- Layout owner: Zlay adapter and fixtures.
-- Input/text owner: editing model and composition protocol.
-- Renderer owner: scene semantics, CPU/GPU integration and resource retirement.
-- Platform owners: implementations behind agreed window/input/scale interfaces.
-- Widget/tooling owner: controls, themes, semantic tests, inspector.
-
-Do not assign six agents to invent their own IDs, caches, event types, or render contracts. Require integration tests at every boundary.
+Do not allow each workstream to invent separate IDs, ownership rules, event propagation, task cancellation or resource handles.
 
 ---
 
-## 10. Release blockers beyond code features
+## 10. Documentation and release hygiene
 
-- **License:** no root license file was present in the inspected root listing. Choose and publish the project's license and preserve dependency/reference notices. Attribution comments alone do not communicate a complete distribution policy.
-- **CI:** no root `.github` directory was present. Add an actual supported-toolchain/native-platform matrix and artifact checks; absence here does not rule out private external CI.
-- **Toolchain policy:** the working compiler is newer than the documented tested revision. Pin exact tested versions, distinguish minimum from supported, and maintain upgrade notes.
-- **Package consumption:** `build.zig.zon` includes source, examples, C code, and build files, but excludes the README, roadmap, and any root license. Test from outside the checkout, including font fixtures, C sources, and optional GPU dependencies. Avoid reliance on ignored references/caches.
-- **Public synchronization:** the public GitHub README observed during this review still described the older software renderer and stale limitations, while the local tree uses Vellz and contains fixes not reflected in that page. Keep the repository default branch, published Zlay/Cozmic/Vellz pins, documentation, examples, and claimed test revision synchronized before soliciting users.
-- **Security/failure testing:** fuzz malformed images/SVG/fonts where applicable, Unicode edit sequences, layout mutations, stale handles, and event saturation. Review the `-fno-sanitize=all` C codec build flag and provide instrumented testing separately.
-- **Native prerequisites:** a text-engine failure currently produces no text (`app.zig:88–99`). Ship actionable diagnostics and a supported font/dependency story rather than an unreadable app.
-- **Documentation:** beginner guide, ownership guide, custom-widget tutorial, style/layout semantics, component gallery, platform capabilities, and upgrade instructions.
+Recent work fixed many previous release blockers:
+
+- Root license and notice exist.
+- Package paths include README, plan, report, platform matrix, license and smoke consumer.
+- A consumer smoke build exists.
+- CI and a platform evidence matrix exist.
+- README architecture and capability descriptions are substantially fresher.
+
+Remaining cleanup:
+
+- Make now-green default Windows/macOS checks required, not `continue-on-error`.
+- Add separate optional-feature jobs, especially `-Daccesskit=true`, and keep them red until supported rather than hiding them behind the default-off configuration.
+- Correct stale one-window, partial-overflow and accessibility statements across README/docs/source comments.
+- Run a clean-cache release verification periodically; cached green tests are not sufficient release evidence.
+- Add sanitizers/fuzzing for AccessKit ownership, images/SVG/fonts, Unicode edits, event saturation, layout mutation and stale handles.
+- Add a semantically annotated component gallery and pixel/semantic golden tests.
+- Record native validation with OS, compositor, scale, screen reader and backend versions.
+- Keep public repository state and published Zlay/Cozmic/Vellz pins synchronized.
+
+---
 
 ## Final recommendation
 
-**Do not replace the architecture. Make its contracts complete.**
+The recent work was well targeted. It addressed the earlier report’s highest-value foundations instead of merely expanding GPU stubs or visual demos. ZUI now has enough architecture to justify building real applications against it.
 
-The immediate leverage is in stable identity/lifetimes, coherent capacity handling, Zlay integration, persistent text reuse, and a real input/semantic model. Then connect the GPU path and build reusable components on those foundations.
+The next step is consolidation. Fix the AccessKit bridge and mount lifetime, deepen the now-canonical Zlay and semantic-widget paths, add a public custom-element/task model, then prove native text/accessibility/platform behavior. Those steps will produce more competitive value than another batch of surface-level controls.
 
-ZUI can become substantially more compelling than “GPUI translated to Zig.” To get there, its flagship claim should eventually be backed by this sentence: **ordinary developers can ship a fast, accessible, internationalized application with predictable ownership and no private patches to the UI framework.**
+The credible long-term position remains:
+
+> A pure-Zig application UI framework with explicit ownership, excellent international text, accessibility and automation by default, deterministic CPU/GPU rendering, and unusually strong diagnostics.
+
+That position is now more plausible than it was two days ago. It is not yet proven.
 
 ---
 
-## Primary sources consulted
+## Primary sources
 
-Live sources were consulted on 2026-09-16; upstream documentation claims are not independent runtime verification.
+Live upstream sources were consulted during the original 2026-09-16 assessment; current local conclusions were refreshed from the 2026-09-18 tree.
 
-1. GPUI local reference: `.references/gpui/crates/gpui/README.md`, `src/element.rs`, `src/taffy.rs`, `src/_accessibility.rs`, `src/input.rs`, `src/app/context.rs`, and platform manifests. Upstream: https://github.com/zed-industries/zed/tree/main/crates/gpui
-2. GPUI Kit architecture, features, usage, and components: https://github.com/longbridge/gpui-kit and https://gpui-kit.com/
-3. DVUI features, scheduling, widgets, and stated text/accessibility limitations: https://github.com/david-vanderson/dvui
-4. Gooey local reference: `.references/gooey/readme.md`, `src/animation/store.zig`, `src/widgets/data_table.zig`. Upstream: https://github.com/duanebester/gooey
-5. AccessKit architecture, platform coverage/limitations, and bindings: https://github.com/AccessKit/accesskit and https://github.com/AccessKit/accesskit-c
-6. Vello renderer families and maturity: https://github.com/linebender/vello
-7. Xilem/Masonry architecture and stack: https://github.com/linebender/xilem
-8. egui integration, usability, repaint policy, and feature goals: https://github.com/emilk/egui
-9. Slint stability, live preview, editor integration, and layering: https://github.com/slint-ui/slint
-10. SDL3 DPI contract: https://wiki.libsdl.org/SDL3/README-highdpi
-11. SDL3 native input area: https://wiki.libsdl.org/SDL3/SDL_SetTextInputArea
-12. Capy feature and component matrix: https://github.com/capy-ui/capy
-13. zgui Dear ImGui bindings and extensions: https://github.com/zig-gamedev/zgui
-14. Mach project status and architecture: https://machengine.org/docs/ and https://github.com/hexops/mach
-15. zigui project direction and deferred work: https://github.com/ddalcu/zigui
-16. Unicode grapheme segmentation: https://www.unicode.org/reports/tr29/
-17. HarfBuzz shaping concepts: https://harfbuzz.github.io/shaping-concepts.html
-18. Local reproducibility: `build.zig`, `build.zig.zon`, `tools/references.env`, `tools/bench_text.zig`, `examples/dash-gpui/Cargo.toml`.
+1. GPUI: https://github.com/zed-industries/zed/tree/main/crates/gpui
+2. GPUI accessibility guide: https://raw.githubusercontent.com/zed-industries/zed/main/crates/gpui/src/_accessibility.rs
+3. GPUI Kit: https://github.com/longbridge/gpui-kit
+4. DVUI: https://github.com/david-vanderson/dvui
+5. Capy: https://github.com/capy-ui/capy
+6. AccessKit and C bindings: https://github.com/AccessKit/accesskit and https://github.com/AccessKit/accesskit-c
+7. Xilem/Masonry: https://github.com/linebender/xilem
+8. Vello: https://github.com/linebender/vello
+9. Slint: https://github.com/slint-ui/slint
+10. SDL3 high DPI and IME area contracts: https://wiki.libsdl.org/SDL3/README-highdpi and https://wiki.libsdl.org/SDL3/SDL_SetTextInputArea
+11. Unicode grapheme segmentation: https://www.unicode.org/reports/tr29/
+12. HarfBuzz shaping concepts: https://harfbuzz.github.io/shaping-concepts.html
+13. Local evidence: `build.zig`, `build.zig.zon`, `.github/workflows/ci.yml`, `docs/`, `tools/bench_text.zig`, `tools/smoke_consumer/`, `tools/references.env`, and the source paths cited above.

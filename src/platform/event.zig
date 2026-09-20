@@ -166,6 +166,195 @@ pub const CompositionEvent = union(enum) {
     commit: CompositionText,
     cancel,
 };
+
+/// GPUI-compatible phases for direct contacts. A contact is hit-tested on
+/// `started`; subsequent phases retain that target until ended/cancelled.
+pub const TouchPhase = enum { started, moved, ended, cancelled };
+pub const TouchId = u64;
+pub const PointerKind = enum { finger, pen, eraser };
+
+pub const TouchEvent = struct {
+    id: TouchId,
+    phase: TouchPhase,
+    pos: geometry.Point,
+    predicted_pos: ?geometry.Point = null,
+    force: ?f32 = null,
+    kind: PointerKind = .finger,
+};
+
+pub const PenEvent = struct {
+    id: TouchId,
+    phase: TouchPhase,
+    pos: geometry.Point,
+    pressure: f32 = 0,
+    tilt_x: f32 = 0,
+    tilt_y: f32 = 0,
+    twist: f32 = 0,
+    buttons: u8 = 0,
+    modifiers: Modifiers = .{},
+};
+
+pub const PressureStage = enum { zero, normal, force };
+pub const PressureEvent = struct {
+    pos: geometry.Point,
+    pressure: f32,
+    stage: PressureStage = .normal,
+    modifiers: Modifiers = .{},
+};
+
+pub const PinchEvent = struct {
+    pos: geometry.Point,
+    delta: f32,
+    phase: TouchPhase,
+    modifiers: Modifiers = .{},
+};
+
+/// File paths are copied into the event envelope; platform adapters never
+/// put borrowed OS strings into the queue. This keeps drag/drop delivery
+/// deterministic and bounded in headless tests.
+pub const ExternalPath = struct { bytes: [256]u8 = std.mem.zeroes([256]u8), len: u16 = 0 };
+pub const DragDropKind = enum { entered, over, dropped, exited, ended };
+pub const DragDropEvent = struct {
+    kind: DragDropKind,
+    pos: geometry.Point = .{},
+    paths: [8]ExternalPath = undefined,
+    path_count: u8 = 0,
+
+    pub fn addPath(self: *@This(), path_bytes: []const u8) !void {
+        if (self.path_count >= self.paths.len) return error.TooManyPaths;
+        if (path_bytes.len > self.paths[0].bytes.len) return error.PathTooLong;
+        if (std.mem.indexOfScalar(u8, path_bytes, 0) != null) return error.InvalidPath;
+        const slot = &self.paths[self.path_count];
+        @memcpy(slot.bytes[0..path_bytes.len], path_bytes);
+        slot.len = @intCast(path_bytes.len);
+        self.path_count += 1;
+    }
+
+    pub fn path(self: *const @This(), index: usize) ?[]const u8 {
+        if (index >= self.path_count) return null;
+        const slot = &self.paths[index];
+        return slot.bytes[0..slot.len];
+    }
+};
+
+/// Additive rich input envelope. The legacy `Event` union below intentionally
+/// remains stable; platform adapters can translate this envelope at the
+/// window boundary once a consumer opts in.
+pub const InputEvent = union(enum) {
+    touch: TouchEvent,
+    pen: PenEvent,
+    pressure: PressureEvent,
+    pinch: PinchEvent,
+    drag_drop: DragDropEvent,
+};
+
+pub const GestureKind = enum { none, tap, long_press, pan, pinch };
+pub const GestureTuning = struct {
+    touch_slop: f32 = 8,
+    long_press_ms: i64 = 500,
+    multi_tap_ms: i64 = 400,
+    multi_tap_slop: f32 = 16,
+};
+
+pub const GestureOutput = union(enum) {
+    none,
+    tap: struct { pos: geometry.Point, count: u8, long_press: bool },
+    pan: struct { pos: geometry.Point, delta: geometry.Point, phase: TouchPhase },
+    pinch: struct { pos: geometry.Point, scale_delta: f32, phase: TouchPhase },
+};
+
+/// Small, allocation-free recognizer for two contacts. It models GPUI’s
+/// target-retention and tap/pan/pinch competition, while leaving scrolling
+/// physics to scroll containers.
+pub const GestureRecognizer = struct {
+    tuning: GestureTuning = .{},
+    first: ?Contact = null,
+    second: ?Contact = null,
+    last_tap_pos: geometry.Point = .{},
+    last_tap_ms: i64 = std.math.minInt(i64),
+    tap_count: u8 = 0,
+    kind: GestureKind = .none,
+
+    const Contact = struct { id: TouchId, start: geometry.Point, pos: geometry.Point, start_ms: i64 };
+
+    pub fn update(self: *@This(), ev: TouchEvent, now_ms: i64) GestureOutput {
+        switch (ev.phase) {
+            .started => return self.start(ev, now_ms),
+            .moved => {},
+            .ended, .cancelled => return self.finish(ev, now_ms),
+        }
+        const contact = self.find(ev.id) orelse return .none;
+        const previous = contact.pos;
+        if (self.second != null) {
+            self.kind = .pinch;
+            const old_a = self.first.?.pos;
+            const old_b = self.second.?.pos;
+            const a: geometry.Point = if (self.first.?.id == ev.id) ev.pos else old_a;
+            const b: geometry.Point = if (self.second.?.id == ev.id) ev.pos else old_b;
+            const old_dist = distance(old_a, old_b);
+            const new_dist = distance(a, b);
+            const center: geometry.Point = .{ .x = (a.x + b.x) / 2, .y = (a.y + b.y) / 2 };
+            if (self.first.?.id == ev.id) self.first.?.pos = ev.pos else self.second.?.pos = ev.pos;
+            return .{ .pinch = .{ .pos = center, .scale_delta = if (old_dist == 0) 0 else new_dist / old_dist - 1, .phase = .moved } };
+        }
+        if (self.kind == .none and distance(contact.start, ev.pos) > self.tuning.touch_slop) self.kind = .pan;
+        if (self.first.?.id == ev.id) self.first.?.pos = ev.pos else self.second.?.pos = ev.pos;
+        if (self.kind == .pan) return .{ .pan = .{ .pos = ev.pos, .delta = .{ .x = ev.pos.x - previous.x, .y = ev.pos.y - previous.y }, .phase = .moved } };
+        return .none;
+    }
+
+    fn start(self: *@This(), ev: TouchEvent, now_ms: i64) GestureOutput {
+        const c = Contact{ .id = ev.id, .start = ev.pos, .pos = ev.pos, .start_ms = now_ms };
+        if (self.first == null) self.first = c else if (self.second == null) {
+            self.second = c;
+            self.kind = .pinch;
+        } else return .none;
+        return .none;
+    }
+
+    fn finish(self: *@This(), ev: TouchEvent, now_ms: i64) GestureOutput {
+        const c = self.find(ev.id) orelse return .none;
+        const elapsed = now_ms - c.start_ms;
+        const was_pinch = self.second != null;
+        const was_pan = self.kind == .pan;
+        self.remove(ev.id);
+        if (was_pinch) {
+            self.kind = if (self.first != null) .pan else .none;
+            return .{ .pinch = .{ .pos = ev.pos, .scale_delta = 0, .phase = ev.phase } };
+        }
+        if (was_pan) {
+            self.kind = .none;
+            return .{ .pan = .{ .pos = ev.pos, .delta = .{}, .phase = ev.phase } };
+        }
+        if (ev.phase == .ended) {
+            const long = elapsed >= self.tuning.long_press_ms;
+            const repeated = self.last_tap_ms != std.math.minInt(i64) and now_ms >= self.last_tap_ms and now_ms - self.last_tap_ms <= self.tuning.multi_tap_ms and distance(self.last_tap_pos, ev.pos) <= self.tuning.multi_tap_slop;
+            if (repeated) self.tap_count +|= 1 else self.tap_count = 1;
+            self.last_tap_pos = ev.pos;
+            self.last_tap_ms = now_ms;
+            return .{ .tap = .{ .pos = ev.pos, .count = self.tap_count, .long_press = long } };
+        }
+        self.kind = .none;
+        return .none;
+    }
+
+    fn find(self: *@This(), id: TouchId) ?*Contact {
+        if (self.first) |*c| if (c.id == id) return c;
+        if (self.second) |*c| if (c.id == id) return c;
+        return null;
+    }
+    fn remove(self: *@This(), id: TouchId) void {
+        if (self.first != null and self.first.?.id == id) {
+            self.first = self.second;
+            self.second = null;
+        } else if (self.second != null and self.second.?.id == id) self.second = null;
+    }
+    fn distance(a: geometry.Point, b: geometry.Point) f32 {
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+        return @sqrt(dx * dx + dy * dy);
+    }
+};
 /// Consumer supplies window-local logical pixels; backend converts to native
 /// screen coordinates/DPI. Optional and headless-safe, called after placement.
 pub const CaretReporter = struct {
@@ -181,7 +370,12 @@ pub const WindowEvent = enum {
     resized,
     focused,
     unfocused,
+    /// Framework-internal cancellation for an unmounted/modal-replaced
+    /// interaction. Native backends never emit this event.
+    cancelled,
     scale_changed,
+    /// Compositor-delivered animation frame aligned with native presentation.
+    frame_ready,
 };
 
 pub const EventPayload = union(enum) {
@@ -271,7 +465,7 @@ pub const EventQueue = struct {
             },
             .scroll => false,
             .window => |w| switch (w) {
-                .close_requested, .unfocused => true,
+                .close_requested, .unfocused, .cancelled, .frame_ready => true,
                 .resized, .focused, .scale_changed => false,
             },
         };
@@ -562,4 +756,32 @@ test "composition protocol validates payloads, owns bytes and retains queue poli
     }.report };
     reporter.update(.{ .x = 12, .y = 20, .w = 1, .h = 18 });
     try t.expectEqual(@as(f32, 12), rect.x);
+}
+
+test "rich pointer vocabulary preserves touch target and recognizes gestures" {
+    const t = std.testing;
+    var recognizer = GestureRecognizer{};
+    try t.expect(recognizer.update(.{ .id = 7, .phase = .started, .pos = .{ .x = 10, .y = 10 } }, 0) == .none);
+    const pan = recognizer.update(.{ .id = 7, .phase = .moved, .pos = .{ .x = 30, .y = 10 } }, 10);
+    try t.expect(pan == .pan);
+    try t.expectEqual(@as(f32, 20), pan.pan.delta.x);
+    const end = recognizer.update(.{ .id = 7, .phase = .ended, .pos = .{ .x = 30, .y = 10 } }, 20);
+    try t.expect(end.pan.phase == .ended);
+
+    var taps = GestureRecognizer{};
+    _ = taps.update(.{ .id = 1, .phase = .started, .pos = .{ .x = 2, .y = 2 } }, 100);
+    const tap = taps.update(.{ .id = 1, .phase = .ended, .pos = .{ .x = 2, .y = 2 } }, 120);
+    try t.expectEqual(@as(u8, 1), tap.tap.count);
+    _ = taps.update(.{ .id = 2, .phase = .started, .pos = .{ .x = 3, .y = 2 } }, 200);
+    const tap2 = taps.update(.{ .id = 2, .phase = .ended, .pos = .{ .x = 3, .y = 2 } }, 220);
+    try t.expectEqual(@as(u8, 2), tap2.tap.count);
+}
+
+test "drag drop paths are owned and bounded" {
+    var ev = DragDropEvent{ .kind = .entered };
+    try ev.addPath("/tmp/a.txt");
+    try std.testing.expectEqualStrings("/tmp/a.txt", ev.path(0).?);
+    var long_path: [257]u8 = undefined;
+    @memset(&long_path, 'x');
+    try std.testing.expectError(error.PathTooLong, ev.addPath(&long_path));
 }

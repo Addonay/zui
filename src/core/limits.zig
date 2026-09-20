@@ -63,7 +63,8 @@
 //! ```
 //! ┌─────────────────────────────────────────────────────────────────────────┐
 //! │ Per-frame scene limits (gpu/scene.zig)                                  │
-//! │ - MAX_QUADS_PER_FRAME / MAX_SCENE_GLYPHS / MAX_IMAGE_BLITS_PER_FRAME    │
+//! │ - MAX_QUADS_PER_FRAME / MAX_STROKES_PER_FRAME / MAX_SCENE_GLYPHS        │
+//! │ - MAX_IMAGE_BLITS_PER_FRAME                                             │
 //! │ Purpose: Bound GPU upload size, fail fast on runaway rendering          │
 //! └─────────────────────────────────────────────────────────────────────────┘
 //!                                    │
@@ -91,8 +92,20 @@ const std = @import("std");
 /// Maximum quads per frame (rectangles, backgrounds)
 pub const MAX_QUADS_PER_FRAME: u32 = 65536;
 
+/// Maximum bounded line strokes per frame. Arbitrary path geometry remains
+/// outside the scene contract; a line consumes one fixed-size payload slot.
+pub const MAX_STROKES_PER_FRAME: u32 = 64;
+
 /// Maximum glyphs per frame (text characters)
 pub const MAX_GLYPHS_PER_FRAME: u32 = 65536;
+
+/// Maximum accessible text characters retained per frame. Text geometry is
+/// copied into the frame so the accessibility bridge never borrows a layout
+/// that has already been released.
+pub const MAX_A11Y_TEXT_CHARS: usize = 4096;
+
+/// Maximum line/word ranges retained for one accessible text node.
+pub const MAX_A11Y_TEXT_RANGES: usize = 512;
 
 /// Maximum shaped glyphs collected into one `Scene`. Separate from the
 /// shaping-run cap: a frame holds many runs. Each entry is ~52 bytes.

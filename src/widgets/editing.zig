@@ -1,5 +1,7 @@
-//! Renderer-independent, bounded single-line editing. Offsets are UTF-8 bytes.
+//! Renderer-independent, bounded editing. Offsets are UTF-8 bytes; newline
+//! storage and vertical movement are opt-in for multiline fields.
 const std = @import("std");
+const cozmic = @import("cozmic");
 const unicode = @import("cozmic").unicode;
 pub const Model = struct {
     pub const capacity = @import("../core/limits.zig").MAX_TEXT_LEN;
@@ -24,6 +26,11 @@ pub const Model = struct {
     undo_len: usize = 0,
     redo_len: usize = 0,
     scroll_x: f32 = 0,
+    scroll_y: f32 = 0,
+    /// Newline-aware editing is opt-in so existing single-line fields retain
+    /// their historical control filtering.
+    allow_newlines: bool = false,
+    preferred_column: ?usize = null,
 
     pub fn text(self: *const Model) []const u8 {
         return self.buffer[0..self.len];
@@ -70,21 +77,94 @@ pub const Model = struct {
     pub fn place(self: *Model, index: usize, extend: bool) void {
         self.selection.active = self.snap(index);
         if (!extend) self.selection.anchor = self.selection.active;
+        self.preferred_column = null;
     }
     pub fn selectAll(self: *Model) void {
         self.selection = .{ .active = self.len };
     }
-    pub const Motion = enum { previous, next, word_previous, word_next, line_start, line_end };
+    pub const Motion = enum { previous, next, word_previous, word_next, line_start, line_end, up, down };
     pub fn move(self: *Model, motion: Motion, extend: bool) void {
         const i = self.selection.active;
         const target = switch (motion) {
             .previous => if (!extend and self.selected().len > 0) self.selection.start() else unicode.prevGraphemeStart(self.text(), i),
             .next => if (!extend and self.selected().len > 0) self.selection.end() else unicode.nextGraphemeEnd(self.text(), i),
             .word_previous, .word_next => self.wordBoundary(i, motion == .word_next),
-            .line_start => 0,
-            .line_end => self.len,
+            .line_start => self.lineStart(i),
+            .line_end => self.lineEnd(i),
+            .up, .down => return self.moveVertical(motion == .down, extend),
         };
         self.place(target, extend);
+    }
+    fn lineStart(self: *const Model, index: usize) usize {
+        var i = @min(index, self.len);
+        while (i > 0 and self.buffer[i - 1] != '\n') : (i -= 1) {}
+        return i;
+    }
+    fn lineEnd(self: *const Model, index: usize) usize {
+        var i = @min(index, self.len);
+        while (i < self.len and self.buffer[i] != '\n') : (i += 1) {}
+        return i;
+    }
+    fn lineNumber(self: *const Model, index: usize) usize {
+        var line: usize = 0;
+        for (self.buffer[0..@min(index, self.len)]) |byte| {
+            if (byte == '\n') line += 1;
+        }
+        return line;
+    }
+    fn lineStartForNumber(self: *const Model, wanted: usize) usize {
+        if (wanted == 0) return 0;
+        var line: usize = 0;
+        for (self.buffer[0..self.len], 0..) |byte, i| {
+            if (byte == '\n') {
+                line += 1;
+                if (line == wanted) return i + 1;
+            }
+        }
+        return self.len;
+    }
+    fn graphemeColumn(self: *const Model, index: usize) usize {
+        const start = self.lineStart(index);
+        var count: usize = 0;
+        var it = unicode.graphemeIndices(self.text()[start..@min(index, self.lineEnd(index))]);
+        while (it.next()) |_| count += 1;
+        return count;
+    }
+    fn indexAtColumn(self: *const Model, start: usize, column: usize) usize {
+        const end = self.lineEnd(start);
+        var it = unicode.graphemeIndices(self.text()[start..end]);
+        var count: usize = 0;
+        var offset: usize = start;
+        while (count < column) : (count += 1) {
+            _ = it.next() orelse return end;
+            offset = start + it.pos;
+        }
+        return offset;
+    }
+    fn moveVertical(self: *Model, down: bool, extend: bool) void {
+        if (!self.allow_newlines) return;
+        const current_line = self.lineNumber(self.selection.active);
+        const target_line = if (down) current_line + 1 else current_line -| 1;
+        if (!down and current_line == 0) return;
+        if (down and target_line == current_line) return;
+        const column = self.preferred_column orelse self.graphemeColumn(self.selection.active);
+        self.preferred_column = column;
+        self.place(self.indexAtColumn(self.lineStartForNumber(target_line), column), extend);
+        self.preferred_column = column;
+    }
+    pub fn cursor(self: *const Model, index: usize) cozmic.Cursor {
+        const clamped = self.snap(index);
+        return .{ .line = @intCast(self.lineNumber(clamped)), .index = clamped - self.lineStart(clamped) };
+    }
+    pub fn indexOfCursor(self: *const Model, position: cozmic.Cursor) usize {
+        return self.snap(self.lineStartForNumber(position.line) + position.index);
+    }
+    pub fn lineCount(self: *const Model) usize {
+        var count: usize = 1;
+        for (self.text()) |byte| {
+            if (byte == '\n') count += 1;
+        }
+        return count;
     }
     fn wordBoundary(self: *const Model, i: usize, forward: bool) usize {
         var it = unicode.wordBounds(self.text());
@@ -107,7 +187,8 @@ pub const Model = struct {
         const available = @min(self.input_limit, capacity) -| (self.len - self.selected().len);
         while (it.next()) |start| {
             const cluster = bytes[start..it.pos];
-            if (cluster[0] < 0x20 or cluster[0] == 0x7f) continue;
+            const is_newline = cluster.len == 1 and cluster[0] == '\n';
+            if ((cluster[0] < 0x20 and (!self.allow_newlines or !is_newline)) or cluster[0] == 0x7f) continue;
             if (cluster.len > available - n) break;
             @memcpy(clean[n..][0..cluster.len], cluster);
             n += cluster.len;
@@ -142,6 +223,11 @@ pub const Model = struct {
         if (x < self.scroll_x) self.scroll_x = x;
         if (x > self.scroll_x + @max(0, width - 1)) self.scroll_x = x - @max(0, width - 1);
         self.scroll_x = @max(0, self.scroll_x);
+    }
+    pub fn ensureCaretVisibleVertical(self: *Model, y: f32, height: f32) void {
+        if (y < self.scroll_y) self.scroll_y = y;
+        if (y > self.scroll_y + @max(0, height - 1)) self.scroll_y = y - @max(0, height - 1);
+        self.scroll_y = @max(0, self.scroll_y);
     }
 };
 
@@ -184,4 +270,22 @@ test "selection replacement undo redo bounded history and long paste" {
     try std.testing.expectEqual(@as(f32, 401), m.scroll_x);
     m.ensureCaretVisible(0, 100);
     try std.testing.expectEqual(@as(f32, 0), m.scroll_x);
+}
+
+test "multiline mode preserves newlines and moves by grapheme column" {
+    var m = Model{ .allow_newlines = true };
+    m.insert("one\ntwo\nthree");
+    try std.testing.expectEqual(@as(usize, 3), m.lineCount());
+    m.place(m.len, false);
+    m.move(.line_start, false);
+    try std.testing.expectEqual(@as(usize, 8), m.selection.active);
+    m.place(m.len, false);
+    m.move(.up, false);
+    try std.testing.expectEqual(@as(usize, 7), m.selection.active);
+    m.move(.up, false);
+    try std.testing.expectEqual(@as(usize, 3), m.selection.active);
+    m.place(3, false);
+    m.move(.down, false);
+    try std.testing.expectEqual(@as(usize, 7), m.selection.active);
+    try std.testing.expectEqual(@as(usize, 1), m.cursor(m.selection.active).line);
 }

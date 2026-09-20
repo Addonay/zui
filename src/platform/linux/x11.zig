@@ -23,9 +23,12 @@ const limits = @import("../../core/limits.zig");
 const zlog = @import("../../core/log.zig");
 const gpu = @import("../../gpu/root.zig");
 const dl = @import("../dl.zig");
+const xim_helpers = @import("x11_ime.zig");
 
 // X11 Types
 const Display = opaque {};
+const XIM = opaque {};
+const XIC = opaque {};
 const Visual = opaque {};
 const GC = ?*anyopaque;
 const Window = c_ulong;
@@ -35,6 +38,35 @@ const Bool = c_int;
 const Status = c_int;
 const Cursor = c_ulong;
 const Time = c_ulong;
+const XPointer = ?*anyopaque;
+const XIMStyle = c_ulong;
+
+const XIMProc = *const fn (?*XIM, XPointer, XPointer) callconv(.c) void;
+const XICProc = *const fn (?*XIC, XPointer, XPointer) callconv(.c) Bool;
+const XIMCallback = extern struct {
+    client_data: XPointer,
+    callback: XIMProc,
+};
+const XICCallback = extern struct {
+    client_data: XPointer,
+    callback: XICProc,
+};
+const XIMText = extern struct {
+    length: c_ushort,
+    feedback: ?[*]XIMFeedback,
+    encoding_is_wchar: Bool,
+    string: extern union {
+        multi_byte: ?[*]u8,
+        wide_char: ?[*]u32,
+    },
+};
+const XIMFeedback = c_ulong;
+const XIMPreeditDrawCallbackStruct = extern struct {
+    caret: c_int,
+    chg_first: c_int,
+    chg_length: c_int,
+    text: ?*XIMText,
+};
 
 const XImage = extern struct {
     width: c_int,
@@ -218,6 +250,12 @@ fn x11ErrorHandler(dpy: ?*Display, err: ?*anyopaque) callconv(.c) c_int {
     return 0;
 }
 
+const XimPending = union(enum) {
+    preedit: event.CompositionText,
+    commit: event.CompositionText,
+    cancel,
+};
+
 const XEvent = extern union {
     type: c_int,
     xany: XAnyEvent,
@@ -285,6 +323,16 @@ const XA_STRING: Atom = 31;
 const XA_ANY_PROPERTY_TYPE: Atom = 0;
 const PROP_MODE_REPLACE: c_int = 0;
 const CURRENT_TIME: Time = 0;
+const XIMPreeditCallbacks: XIMStyle = 0x0002;
+const XIMStatusNothing: XIMStyle = 0x0400;
+const XBufferOverflow: c_int = -1;
+const XNInputStyle = "inputStyle";
+const XNClientWindow = "clientWindow";
+const XNFocusWindow = "focusWindow";
+const XNPreeditAttributes = "preeditAttributes";
+const XNPreeditStartCallback = "preeditStartCallback";
+const XNPreeditDoneCallback = "preeditDoneCallback";
+const XNPreeditDrawCallback = "preeditDrawCallback";
 
 // Cursor-font glyphs (verified against /usr/include/X11/cursorfont.h).
 // No extra library: these live in libX11 itself.
@@ -325,10 +373,20 @@ const X11Api = struct {
     XFlush: *const fn (*Display) callconv(.c) c_int,
     XConnectionNumber: *const fn (*Display) callconv(.c) c_int,
     XLookupString: *const fn (*XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int,
+    XOpenIM: ?*const fn (*Display, ?*anyopaque, ?[*:0]u8, ?[*:0]u8) callconv(.c) ?*XIM,
+    XCloseIM: ?*const fn (*XIM) callconv(.c) Status,
+    XCreateIC: ?*const fn (*XIM, ...) callconv(.c) ?*XIC,
+    XDestroyIC: ?*const fn (*XIC) callconv(.c) void,
+    XSetICFocus: ?*const fn (*XIC) callconv(.c) void,
+    XUnsetICFocus: ?*const fn (*XIC) callconv(.c) void,
+    Xutf8LookupString: ?*const fn (*XIC, *XKeyEvent, [*]u8, c_int, ?*c_ulong, *Status) callconv(.c) c_int,
+    Xutf8ResetIC: ?*const fn (*XIC) callconv(.c) ?[*]u8,
+    XFilterEvent: ?*const fn (*XEvent, Window) callconv(.c) Bool,
+    XVaCreateNestedList: ?*const fn (c_int, ...) callconv(.c) ?*anyopaque,
+    XFree: *const fn (*anyopaque) callconv(.c) c_int,
     XChangeProperty: *const fn (*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int,
     XDeleteProperty: *const fn (*Display, Window, Atom) callconv(.c) c_int,
     XGetWindowProperty: *const fn (*Display, Window, Atom, c_long, c_long, Bool, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *[*]u8) callconv(.c) c_int,
-    XFree: *const fn (*anyopaque) callconv(.c) c_int,
     XConvertSelection: *const fn (*Display, Atom, Atom, Atom, Window, Time) callconv(.c) c_int,
     XSetSelectionOwner: *const fn (*Display, Atom, Window, Time) callconv(.c) c_int,
     XGetSelectionOwner: *const fn (*Display, Atom) callconv(.c) Window,
@@ -364,6 +422,16 @@ const X11Api = struct {
             .XFlush = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XFlush") orelse return null,
             .XConnectionNumber = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XConnectionNumber") orelse return null,
             .XLookupString = lib.lookup(*const fn (*XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int, "XLookupString") orelse return null,
+            .XOpenIM = lib.lookup(*const fn (*Display, ?*anyopaque, ?[*:0]u8, ?[*:0]u8) callconv(.c) ?*XIM, "XOpenIM"),
+            .XCloseIM = lib.lookup(*const fn (*XIM) callconv(.c) Status, "XCloseIM"),
+            .XCreateIC = lib.lookup(*const fn (*XIM, ...) callconv(.c) ?*XIC, "XCreateIC"),
+            .XDestroyIC = lib.lookup(*const fn (*XIC) callconv(.c) void, "XDestroyIC"),
+            .XSetICFocus = lib.lookup(*const fn (*XIC) callconv(.c) void, "XSetICFocus"),
+            .XUnsetICFocus = lib.lookup(*const fn (*XIC) callconv(.c) void, "XUnsetICFocus"),
+            .Xutf8LookupString = lib.lookup(*const fn (*XIC, *XKeyEvent, [*]u8, c_int, ?*c_ulong, *Status) callconv(.c) c_int, "Xutf8LookupString"),
+            .Xutf8ResetIC = lib.lookup(*const fn (*XIC) callconv(.c) ?[*]u8, "Xutf8ResetIC"),
+            .XFilterEvent = lib.lookup(*const fn (*XEvent, Window) callconv(.c) Bool, "XFilterEvent"),
+            .XVaCreateNestedList = lib.lookup(*const fn (c_int, ...) callconv(.c) ?*anyopaque, "XVaCreateNestedList"),
             .XChangeProperty = lib.lookup(*const fn (*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int, "XChangeProperty") orelse return null,
             .XDeleteProperty = lib.lookup(*const fn (*Display, Window, Atom) callconv(.c) c_int, "XDeleteProperty") orelse return null,
             .XGetWindowProperty = lib.lookup(*const fn (*Display, Window, Atom, c_long, c_long, Bool, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *[*]u8) callconv(.c) c_int, "XGetWindowProperty") orelse return null,
@@ -441,6 +509,17 @@ pub const X11Backend = struct {
     raw_stash_len: usize = 0,
     /// Cached font cursors indexed by CursorShape ordinal (0 = unset).
     cursors: [3]Cursor = .{ 0, 0, 0 },
+    /// Optional XIM connection shared by all window-scoped handles on this
+    /// display. XIC remains per native window so focus and callback routing
+    /// cannot cross the multi-window boundary.
+    xim: ?*XIM = null,
+    xic: ?*XIC = null,
+    xim_owner: bool = false,
+    xim_preedit: [256]u8 = @splat(0),
+    xim_preedit_len: usize = 0,
+    xim_preedit_active: bool = false,
+    xim_pending: [8]?XimPending = @splat(null),
+    xim_pending_len: usize = 0,
 
     const vtable: backend.VTable = .{
         .createWindow = createWindowFn,
@@ -474,6 +553,170 @@ pub const X11Backend = struct {
         var lib = dl.Library.open(&.{ "libX11.so.6", "libX11.so" }) orelse return false;
         defer lib.close();
         return X11Api.load(lib) != null;
+    }
+
+    fn setupXim(self: *@This(), input_method: *XIM) void {
+        const make_nested = self.api.XVaCreateNestedList orelse return;
+        const create_ic = self.api.XCreateIC orelse return;
+        const start_cb: XICCallback = .{ .client_data = self, .callback = ximPreeditStart };
+        const draw_cb: XIMCallback = .{ .client_data = self, .callback = ximPreeditDraw };
+        const done_cb: XIMCallback = .{ .client_data = self, .callback = ximPreeditDone };
+        const nested = make_nested(
+            0,
+            XNPreeditStartCallback.ptr,
+            &start_cb,
+            XNPreeditDrawCallback.ptr,
+            &draw_cb,
+            XNPreeditDoneCallback.ptr,
+            &done_cb,
+            @as(?*anyopaque, null),
+        ) orelse return;
+        defer _ = self.api.XFree(nested);
+        const style = XIMPreeditCallbacks | XIMStatusNothing;
+        self.xic = create_ic(
+            input_method,
+            XNInputStyle.ptr,
+            style,
+            XNClientWindow.ptr,
+            self.window,
+            XNFocusWindow.ptr,
+            self.window,
+            XNPreeditAttributes.ptr,
+            nested,
+            @as(?*anyopaque, null),
+        );
+        if (self.xic == null) {
+            zlog.log("x11", "XCreateIC failed; retaining XLookupString fallback", .{});
+        } else if (self.focused) {
+            if (self.api.XSetICFocus) |set_focus| set_focus(self.xic.?);
+        }
+    }
+
+    fn setupOptionalXim(self: *@This()) void {
+        const open_im = self.api.XOpenIM orelse return;
+        const close_im = self.api.XCloseIM orelse return;
+        if (self.api.XCreateIC == null or self.api.XVaCreateNestedList == null or self.api.XDestroyIC == null or self.api.Xutf8LookupString == null or self.api.Xutf8ResetIC == null or self.api.XFilterEvent == null or self.api.XSetICFocus == null or self.api.XUnsetICFocus == null) return;
+        const input_method = open_im(self.display, null, null, null) orelse {
+            zlog.log("x11", "XOpenIM unavailable; retaining XLookupString fallback", .{});
+            return;
+        };
+        self.xim = input_method;
+        self.xim_owner = true;
+        self.setupXim(input_method);
+        if (self.xic == null) {
+            _ = close_im(input_method);
+            self.xim = null;
+            self.xim_owner = false;
+        }
+    }
+
+    fn setupWindowXic(self: *@This(), input_method: ?*XIM) void {
+        if (input_method) |im| {
+            self.xim = im;
+            self.setupXim(im);
+        }
+    }
+
+    fn destroyXic(self: *@This()) void {
+        if (self.xic) |ic| {
+            if (self.api.Xutf8ResetIC) |reset| {
+                if (reset(ic)) |text| {
+                    _ = self.api.XFree(text);
+                }
+            }
+            if (self.api.XDestroyIC) |destroy| destroy(ic);
+            self.xic = null;
+        }
+    }
+
+    fn queueXim(self: *@This(), pending: XimPending) void {
+        if (self.xim_pending_len < self.xim_pending.len) {
+            self.xim_pending[self.xim_pending_len] = pending;
+            self.xim_pending_len += 1;
+        } else {
+            // A callback burst must never make the native event loop fail;
+            // retain the latest cancellation state if the tiny ring fills.
+            self.xim_pending[self.xim_pending.len - 1] = .{ .cancel = {} };
+        }
+    }
+
+    fn compositionText(bytes: []const u8, marked_start: usize, marked_end: usize) ?event.CompositionText {
+        var result = event.CompositionText.init(bytes) catch return null;
+        if (marked_start > marked_end or marked_end > bytes.len) return null;
+        result.marked = .{ .start = marked_start, .end = marked_end };
+        return result;
+    }
+
+    fn ximPreeditStart(_: ?*XIC, client_data: XPointer, _: XPointer) callconv(.c) Bool {
+        const self: *@This() = @ptrCast(@alignCast(client_data.?));
+        self.xim_preedit_active = true;
+        return 1;
+    }
+
+    fn ximPreeditDraw(_: ?*XIM, client_data: XPointer, call_data: XPointer) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(client_data.?));
+        const draw = call_data orelse return;
+        const payload: *XIMPreeditDrawCallbackStruct = @ptrCast(@alignCast(draw));
+        var replacement: []const u8 = &[_]u8{};
+        if (payload.text) |text| {
+            if (text.encoding_is_wchar != 0 or text.length > 256) return;
+            if (text.string.multi_byte) |bytes| replacement = bytes[0..text.length];
+        }
+        var next: [256]u8 = undefined;
+        const next_len = xim_helpers.applyPreeditChange(
+            &next,
+            self.xim_preedit[0..self.xim_preedit_len],
+            payload.chg_first,
+            payload.chg_length,
+            replacement,
+        ) orelse return;
+        @memcpy(self.xim_preedit[0..next_len], next[0..next_len]);
+        self.xim_preedit_len = next_len;
+        self.xim_preedit_active = true;
+        const caret_chars: usize = if (payload.caret < 0) 0 else @intCast(payload.caret);
+        const caret = xim_helpers.utf8ByteOffsetForChars(self.xim_preedit[0..next_len], caret_chars) orelse next_len;
+        if (compositionText(self.xim_preedit[0..next_len], caret, caret)) |composition| {
+            self.queueXim(.{ .preedit = composition });
+        }
+    }
+
+    fn ximPreeditDone(_: ?*XIM, client_data: XPointer, _: XPointer) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(client_data.?));
+        if (self.xim_preedit_active and self.xim_preedit_len != 0) self.queueXim(.cancel);
+        self.xim_preedit_len = 0;
+        self.xim_preedit_active = false;
+    }
+
+    fn flushXim(self: *@This(), owner: *X11Backend, out: *event.EventQueue) void {
+        while (self.xim_pending_len > 0) {
+            const pending = self.xim_pending[0].?;
+            var i: usize = 1;
+            while (i < self.xim_pending_len) : (i += 1) self.xim_pending[i - 1] = self.xim_pending[i];
+            self.xim_pending_len -= 1;
+            self.xim_pending[self.xim_pending_len] = null;
+            switch (pending) {
+                .preedit => |text| owner.pushTargeted(out, .{ .composition = .{ .preedit = text } }),
+                .commit => |text| owner.pushTargeted(out, .{ .composition = .{ .commit = text } }),
+                .cancel => owner.pushTargeted(out, .{ .composition = .cancel }),
+            }
+        }
+    }
+
+    fn resetXim(self: *@This(), owner: *X11Backend, out: *event.EventQueue) void {
+        if (self.xic) |ic| {
+            if (self.api.XUnsetICFocus) |unset_focus| unset_focus(ic);
+            if (self.api.Xutf8ResetIC) |reset| {
+                if (reset(ic)) |text| {
+                    _ = self.api.XFree(text);
+                }
+            }
+        }
+        if (self.xim_preedit_active or self.xim_preedit_len != 0) {
+            self.queueXim(.cancel);
+            self.xim_preedit_len = 0;
+            self.xim_preedit_active = false;
+        }
+        self.flushXim(owner, out);
     }
 
     pub fn init(allocator: std.mem.Allocator, title: [*:0]const u8, width: u32, height: u32) !*X11Backend {
@@ -583,6 +826,7 @@ pub const X11Backend = struct {
         };
 
         self.recreateImage();
+        self.setupOptionalXim();
         return self;
     }
 
@@ -596,6 +840,7 @@ pub const X11Backend = struct {
             }
         }
         self.renderer.deinit();
+        self.destroyXic();
         self.destroyImage();
         for (self.cursors) |c| {
             if (c != 0) _ = self.api.XFreeCursor(self.display, c);
@@ -604,6 +849,11 @@ pub const X11Backend = struct {
         // Primary window may also have been destroyed externally.
         if (!self.destroyed_by_server) {
             _ = self.api.XDestroyWindow(self.display, self.window);
+        }
+        if (self.xim_owner) {
+            if (self.api.XCloseIM) |close| _ = close(self.xim.?);
+            self.xim = null;
+            self.xim_owner = false;
         }
         _ = self.api.XCloseDisplay(self.display);
         self.lib.close();
@@ -753,6 +1003,7 @@ pub const X11Backend = struct {
             .paste_prop = connection.paste_prop,
         };
         child.recreateImage();
+        child.setupWindowXic(connection.xim);
         return child;
     }
 
@@ -781,6 +1032,7 @@ pub const X11Backend = struct {
     /// Release per-window resources but keep the shared connection alive.
     fn teardownWindow(self: *X11Backend) void {
         self.renderer.deinit();
+        self.destroyXic();
         self.destroyImage();
         self.allocator.free(self.pixels);
         // The server already destroyed this window (DestroyNotify): a
@@ -858,6 +1110,13 @@ pub const X11Backend = struct {
             else => ev.xany.window,
         };
         const owner: *X11Backend = self.lookupWindow(native) orelse return;
+        defer owner.flushXim(owner, out);
+        if (owner.xic != null) {
+            if (owner.api.XFilterEvent) |filter| {
+                var filter_event = ev;
+                if (filter(&filter_event, owner.window) != 0) return;
+            }
+        }
         switch (ev.type) {
             DestroyNotify => {
                 // Someone else destroyed our window. Mark the handle dead,
@@ -902,10 +1161,12 @@ pub const X11Backend = struct {
             },
             FocusIn => {
                 owner.focused = true;
+                if (owner.xic) |ic| if (owner.api.XSetICFocus) |set_focus| set_focus(ic);
                 owner.pushTargeted(out, .{ .window = .focused });
             },
             FocusOut => {
                 owner.focused = false;
+                owner.resetXim(owner, out);
                 owner.pushTargeted(out, .{ .window = .unfocused });
             },
             SelectionRequest => {
@@ -951,28 +1212,24 @@ pub const X11Backend = struct {
                     9 => .forward,
                     else => return,
                 };
-                _ = out.push(.{
-                    .mouse = .{
-                        .pos = .{ .x = @floatFromInt(b.x), .y = @floatFromInt(b.y) },
-                        .button = btn,
-                        .pressed = (ev.type == ButtonPress),
-                        .modifiers = evdev.modifiersFromMask(b.state),
-                        .time_ms = @intCast(b.time),
-                    },
-                });
+                owner.pushTargeted(out, .{ .mouse = .{
+                    .pos = .{ .x = @floatFromInt(b.x), .y = @floatFromInt(b.y) },
+                    .button = btn,
+                    .pressed = (ev.type == ButtonPress),
+                    .modifiers = evdev.modifiersFromMask(b.state),
+                    .time_ms = @intCast(b.time),
+                } });
             },
             MotionNotify => {
                 const m = ev.xmotion;
-                _ = out.push(.{
-                    .mouse = .{
-                        .pos = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) },
-                        .button = .left,
-                        .pressed = false,
-                        .motion = true,
-                        .modifiers = evdev.modifiersFromMask(m.state),
-                        .time_ms = @intCast(m.time),
-                    },
-                });
+                owner.pushTargeted(out, .{ .mouse = .{
+                    .pos = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) },
+                    .button = .left,
+                    .pressed = false,
+                    .motion = true,
+                    .modifiers = evdev.modifiersFromMask(m.state),
+                    .time_ms = @intCast(m.time),
+                } });
             },
             KeyPress, KeyRelease => {
                 var k = ev.xkey;
@@ -988,24 +1245,33 @@ pub const X11Backend = struct {
                 const mods = evdev.modifiersFromMask(k.state);
                 // Key releases are critical; the escalated push prints any
                 // loss unconditionally (gap report §5.4).
-                out.pushCriticalEscalated(.{
-                    .key = .{
-                        .key = mapped_key,
-                        .pressed = (ev.type == KeyPress),
-                        .modifiers = mods,
-                    },
-                }, "x11");
-                // Printable text via the server keymap (shift-aware
-                // capitals, digits, punctuation, UTF-8 locales). Press
-                // only: releases carry no new text. A fuller XIC +
-                // Xutf8LookupString path can replace this later.
+                owner.pushTargeted(out, .{ .key = .{
+                    .key = mapped_key,
+                    .pressed = (ev.type == KeyPress),
+                    .modifiers = mods,
+                } });
+                // XIM owns committed text when an input context is active;
+                // otherwise preserve the long-standing XLookupString path.
                 if (ev.type == KeyPress) {
-                    var buf: [32]u8 = undefined;
-                    const n = self.api.XLookupString(&k, &buf, buf.len, null, null);
+                    var buf: [256]u8 = undefined;
+                    var lookup_status: Status = 0;
+                    const n = if (owner.xic) |ic| blk: {
+                        if (owner.api.Xutf8LookupString) |lookup| {
+                            const result = lookup(ic, &k, &buf, buf.len, null, &lookup_status);
+                            if (result != XBufferOverflow) break :blk result;
+                            // The normalized composition payload is bounded
+                            // at 256 bytes. If XIM reports a larger commit,
+                            // retain the old keymap path rather than losing
+                            // all printable input.
+                            lookup_status = 0;
+                            break :blk owner.api.XLookupString(&k, &buf, buf.len, null, null);
+                        }
+                        break :blk owner.api.XLookupString(&k, &buf, buf.len, null, null);
+                    } else owner.api.XLookupString(&k, &buf, buf.len, null, null);
                     if (n > 0) {
                         // Control characters (e.g. \r from Enter) are
                         // actions, not text — the .key event covers them.
-                        const count: usize = @intCast(@min(n, 31));
+                        const count: usize = @intCast(@min(n, @as(c_int, @intCast(buf.len))));
                         var printable = true;
                         for (buf[0..count]) |byte| {
                             if (byte < 0x20 and byte != '\t') {
@@ -1014,11 +1280,18 @@ pub const X11Backend = struct {
                             }
                         }
                         if (printable) {
-                            var text_ev = event.TextEvent{};
-                            @memcpy(text_ev.text[0..count], buf[0..count]);
-                            text_ev.len = @intCast(count);
-                            // Composition commits are critical (§5.4).
-                            out.pushCriticalEscalated(.{ .text = text_ev }, "x11");
+                            if (owner.xic != null and xim_helpers.lookupHasText(lookup_status)) {
+                                if (compositionText(buf[0..count], count, count)) |composition| {
+                                    owner.queueXim(.{ .commit = composition });
+                                }
+                            } else {
+                                const text_count = @min(count, @as(usize, 31));
+                                var text_ev = event.TextEvent{};
+                                @memcpy(text_ev.text[0..text_count], buf[0..text_count]);
+                                text_ev.len = @intCast(text_count);
+                                // Composition commits are critical (§5.4).
+                                owner.pushTargeted(out, .{ .text = text_ev });
+                            }
                         }
                     }
                 }

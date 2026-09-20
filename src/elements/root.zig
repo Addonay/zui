@@ -4,6 +4,13 @@ pub const painter = @import("painter.zig");
 pub const text_engine = @import("text_engine.zig");
 pub const zlay_adapter = @import("zlay_adapter.zig");
 pub const custom_ext = @import("custom.zig");
+pub const anchored = @import("anchored.zig");
+pub const container_query = @import("container_query.zig");
+pub const deferred = @import("deferred.zig");
+pub const surface = @import("surface.zig");
+pub const image_cache = @import("image_cache.zig");
+pub const uniform_list = @import("uniform_list.zig");
+pub const composition = @import("composition.zig");
 
 pub const Element = element.Element;
 pub const Frame = element.Frame;
@@ -19,16 +26,38 @@ pub const spacer = element.spacer;
 pub const custom = element.custom;
 pub const CustomVTable = element.CustomVTable;
 pub const Canvas = custom_ext.Canvas;
-pub const when = element.when;pub const img = element.img;
+pub const when = element.when;
+pub const img = element.img;
 pub const imgPath = element.imgPath;
 pub const imgHandle = element.imgHandle;
 pub const imgAsset = element.imgAsset;
+pub const withImageCache = element.withImageCache;
 pub const svg = element.svg;
 pub const svgPath = element.svgPath;
 pub const ImageFit = element.ImageFit;
 pub const progressBar = element.progressBar;
 pub const progressTrack = element.progressTrack;
 pub const formatToday = element.formatToday;
+
+pub const Anchored = anchored.Anchored;
+pub const ContainerQuery = container_query.Query;
+pub const DeferredQueue = deferred.Queue;
+pub const Surface = surface.Surface;
+pub const ImageCache = image_cache.Cache;
+pub const UniformList = uniform_list.UniformList;
+pub const containerQuery = container_query.containerQuery;
+pub const surfaceElement = surface.surface;
+pub const imageCache = image_cache.imageCache;
+pub const uniformList = uniform_list.uniformList;
+pub const Composition = composition;
+pub const ElementFrame = composition.Frame;
+pub const CompositionScope = composition.Scope;
+pub const ElementContext = composition.Context;
+pub const RetainedElementState = composition.RetainedStore;
+pub const compose = composition.intoElement;
+pub const renderView = composition.renderView;
+pub const renderOnce = composition.renderOnceView;
+pub const view = composition.viewElement;
 
 test {
     _ = @import("element.zig");
@@ -37,4 +66,11 @@ test {
     _ = @import("text_engine.zig");
     _ = @import("zlay_adapter.zig");
     _ = @import("custom.zig");
+    _ = @import("anchored.zig");
+    _ = @import("container_query.zig");
+    _ = @import("deferred.zig");
+    _ = @import("surface.zig");
+    _ = @import("image_cache.zig");
+    _ = @import("uniform_list.zig");
+    _ = @import("composition.zig");
 }

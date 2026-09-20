@@ -11,11 +11,19 @@ pub const Tooltip = struct {
     overlay: ov.State = .{ .capture_focus = false },
     hovered: bool = false,
     deadline: ?i64 = null,
-    pub fn init(_: *runtime.Context(Tooltip), options: Options) Tooltip { return .{ .options = options }; }
-    pub fn tooltipKey(self: *const Tooltip) u64 { return platform.id.fromSrc(self.options.key, @src(), 0); }
+    pub fn init(_: *runtime.Context(Tooltip), options: Options) Tooltip {
+        return .{ .options = options };
+    }
+    pub fn tooltipKey(self: *const Tooltip) u64 {
+        return platform.id.fromSrc(self.options.key, @src(), 0);
+    }
     /// Deterministic clock seam, also used by render with the monotonic clock.
     pub fn updateAt(self: *Tooltip, win: *Window, active: bool, now: i64) void {
-        if (!active) { self.deadline = null; self.overlay.close(win); return; }
+        if (!active) {
+            self.deadline = null;
+            self.overlay.close(win);
+            return;
+        }
         if (self.deadline == null) self.deadline = now + @max(0, self.options.delay_ms);
         if (now >= self.deadline.?) self.overlay.open = true else win.requestRenderAt(self.deadline.?);
     }
@@ -25,14 +33,20 @@ pub const Tooltip = struct {
             self.hovered = ov.bounds(win, self.options.key).contains(event.mouse.pos);
             if (!self.hovered) self.updateAt(win, false, win.timeMs());
         }
-        if (event == .key and event.key.key == .escape) { self.overlay.close(win); self.deadline = null; }
+        if (event == .key and event.key.key == .escape) {
+            self.overlay.close(win);
+            self.deadline = null;
+        }
         return false;
     }
     pub fn render(self: *Tooltip, win: *Window, cx: *runtime.Context(Tooltip)) e.Element {
         const t = theme.current();
         const handle = cx.focusHandle();
         const frame = e.element.currentFrame();
-        if (frame.observer_count < frame.observers.len) { frame.observers[frame.observer_count] = handle; frame.observer_count += 1; }
+        if (frame.observer_count < frame.observers.len) {
+            frame.observers[frame.observer_count] = handle;
+            frame.observer_count += 1;
+        }
         self.updateAt(win, self.hovered or win.focused.eql(handle), win.timeMs());
         const trigger = e.div().keyed(self.options.key).w(self.options.width).h(t.button_h).withFocus(handle)
             .semantic(.{ .role = .label, .name = self.options.label, .described_by = if (self.overlay.open) self.tooltipKey() else 0 })

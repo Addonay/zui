@@ -8,14 +8,8 @@
 //!
 //! Motion math lives in the framework (`zui.animation`: tweens, springs,
 //! keyframes, easings, phase interpolation); this file only wires it to
-//! elements. Deliberate deviations from the GPUI original:
-//!  - ZUI's scene has no transforms (see docs/RENDER_CONTRACT.md §5E), so
-//!    `Transformation::rotate` cannot be expressed. The spinner drives the
-//!    SAME `bounce(ease_in_out)` 2s clock into opacity instead of rotation.
-//!    When scene transforms land, wire the clock back to rotation.
-//!  - `with_spring` element modifiers do not exist; the entity steps its
-//!    springs in `render` from the window clock and calls
-//!    `win.requestAnimation()` while anything is unsettled.
+//! elements. `Window.springValue` provides the retained, velocity-preserving
+//! scalar spring state that GPUI's `with_spring` element modifier supplies.
 //!
 //! Run it live:   zig build run-animation
 //! Headless test: ZUI_SELFTEST=1 zig build run-animation
@@ -26,7 +20,6 @@ const zui = @import("zui");
 
 const anim = zui.animation;
 const SpringConfig = anim.SpringConfig;
-const SpringState = anim.SpringState;
 
 const App = zui.App;
 const Context = zui.Context;
@@ -71,11 +64,6 @@ const AnimationExample = struct {
     spring_damping: f32 = 14.0,
     damping_drag: ?struct { start_x: f32, start_damping: f32 } = null,
 
-    // A newly mounted spring starts AT its target (GPUI behavior); only
-    // retargets move it, preserving velocity.
-    pos_spring: SpringState = .{},
-    phase_spring: SpringState = .{},
-    last_ms: ?i64 = null,
     spin_epoch_ms: ?i64 = null,
 
     label_buf: [96]u8 = undefined,
@@ -95,20 +83,6 @@ const AnimationExample = struct {
 
     fn phaseTarget(self: *const @This()) f32 {
         return @floatFromInt(self.spring_phase);
-    }
-
-    /// Step both springs from the window clock. Returns true while any
-    /// spring is still moving (caller keeps frames coming).
-    fn stepSprings(self: *@This(), now_ms: i64) bool {
-        const last = self.last_ms orelse now_ms;
-        // Clamp huge gaps (suspend/resume) so one step never explodes.
-        const dt: f32 = @min(0.1, @max(0, @as(f32, @floatFromInt(now_ms - last)) / 1000));
-        self.last_ms = now_ms;
-        const config = self.springConfig();
-        self.pos_spring = config.step(self.pos_spring, self.posTarget(), dt);
-        self.phase_spring = config.step(self.phase_spring, self.phaseTarget(), dt);
-        return !config.isSettled(self.pos_spring, self.posTarget(), 0.25) or
-            !config.isSettled(self.phase_spring, self.phaseTarget(), 0.001);
     }
 
     // -- interactions (same listener fires for mouse and keyboard) --------
@@ -168,7 +142,6 @@ const AnimationExample = struct {
 
     pub fn render(self: *@This(), window: *Window, cx: *Context(@This())) Element {
         const now_ms = window.timeMs();
-        const moving = self.stepSprings(now_ms);
         // The spinner repeats forever, so frames keep coming even after the
         // springs settle — same as GPUI's `.repeat()` animation.
         window.requestAnimation();
@@ -176,6 +149,8 @@ const AnimationExample = struct {
         const config = self.springConfig();
         const damping_ratio = config.canonical().zeta;
         const damping_fraction = (self.spring_damping - MIN_DAMPING) / (MAX_DAMPING - MIN_DAMPING);
+        const ball_x = window.springValue(0xA11CE2, config, self.posTarget(), 0.25);
+        const phase = window.springValue(0xA11CE3, config, self.phaseTarget(), 0.001);
 
         self.label_len = blk: {
             const text = std.fmt.bufPrint(&self.label_buf, "Drag damping: {d:.1} (ζ {d:.2})", .{ self.spring_damping, damping_ratio }) catch {
@@ -185,8 +160,6 @@ const AnimationExample = struct {
             break :blk text.len;
         };
 
-        const ball_x = self.pos_spring.position;
-        const phase = self.phase_spring.position;
         const bar_w, const bar_color = if (phase <= 1.0)
             .{
                 anim.interpolateBetween(48, 224, 0, 1, phase),
@@ -198,23 +171,19 @@ const AnimationExample = struct {
                 anim.lerpRgba(GREEN, PURPLE, anim.interpolateBetweenClamped(0, 1, 1, 2, phase)),
             };
 
-        // 2s repeating clock through bounce(ease_in_out). GPUI rotates the
-        // arrow by percentage(delta); ZUI has no scene transforms, so the
-        // same eased clock drives opacity instead (documented above).
+        // 2s repeating clock through bounce(ease_in_out), matching GPUI's
+        // `Transformation::rotate(percentage(delta))`.
         const epoch = self.spin_epoch_ms orelse now_ms;
         self.spin_epoch_ms = epoch;
         const spin_t: f32 = @as(f32, @floatFromInt(@mod(now_ms - epoch, SPIN_PERIOD_MS))) / @as(f32, SPIN_PERIOD_MS);
         const spin_eased = anim.bounceEaseInOut(spin_t);
-
-        var phase_text_buf: [32]u8 = undefined;
-        const phase_text = std.fmt.bufPrint(&phase_text_buf, "Target phase {d}: click rapidly to redirect momentum", .{self.spring_phase}) catch "Target phase";
 
         const card = zui.div().flex_col().gap(8).p(8).w(240)
             .rounded(8).bg(zui.Color.black.withAlpha(0.06)).cursor_pointer()
             .keyed(0xA11CE0).withFocus(cx.focusHandle())
             .semantic(.{ .role = .button, .name = "Advance spring phase", .actions = .{ .activate = true, .focus = true } })
             .on_mouse_down(cx.listener(@This(), cardClicked))
-            .child(zui.text(phase_text, .{ .size = 13, .color = zui.Color.black }))
+            .child(zui.textFmt("Target phase {d}: click rapidly to redirect momentum", .{self.spring_phase}, .{ .size = 13, .color = zui.Color.black }).w(224))
             .child(zui.div().flex_col().gap(4)
                 .child(zui.text(self.label_buf[0..self.label_len], .{ .size = 12, .color = zui.Color.black }))
                 .child(zui.div().h(20).w(SLIDER_WIDTH).cursor_pointer()
@@ -231,11 +200,10 @@ const AnimationExample = struct {
             .child(zui.div().h(24).w(bar_w).rounded(4).bg(bar_color));
 
         const spinner = zui.div().flex_row().items_center().justify_center().p(8)
-            .child(zui.svg(ARROW_CIRCLE_SVG).w(32).h(32).opacity(0.3 + 0.7 * spin_eased));
+            .child(zui.svg(ARROW_CIRCLE_SVG).w(32).h(32).rotate(spin_eased * 2 * std.math.pi));
 
-        _ = moving;
         return zui.div().flex_col().size_full().justify_between().bg(zui.Color.white)
-            .child(zui.div().flex_col().justify_center().items_center().gap(16).p(16)
+            .child(zui.div().flex_col().flex_1().justify_center().items_center().gap(16).p(16)
                 .child(zui.text("Hello Animation", .{ .size = 20, .color = zui.Color.black }))
                 .child(card)
                 .child(spinner))
@@ -263,22 +231,22 @@ fn buildRoot(window: *Window, vcx: *Context(AnimationExample)) Entity(AnimationE
 }
 
 fn onOpen(cx: *App) void {
-    const bounds = zui.Bounds.centered(null, zui.size(300, 460), cx);
+    const bounds = zui.Bounds.centered(null, zui.size(300, 300), cx);
     _ = cx.openWindow(.{ .bounds = bounds, .title = "Animation" }, buildRoot) catch |err| std.log.err("open window: {s}", .{@errorName(err)});
-    cx.activate(true);
+    cx.activate(false);
 }
 
 fn snapshotHeadless(gpa: std.mem.Allocator, path: []const u8) !void {
     var app = try App.initHeadless(gpa);
     defer app.deinit();
     const win = try app.openWindow(.{
-        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 300, .h = 460 } },
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 300, .h = 300 } },
         .title = "Animation",
     }, buildRoot);
     _ = app.step();
 
     const width: u32 = 300;
-    const height: u32 = 460;
+    const height: u32 = 300;
     const pixels = try gpa.alloc(u8, @as(usize, width) * height * 4);
     defer gpa.free(pixels);
     var renderer = zui.gpu.vellz.Renderer.init(gpa);
@@ -334,7 +302,7 @@ fn selftestHeadless(gpa: std.mem.Allocator) !void {
     var app = try App.initHeadless(gpa);
     defer app.deinit();
     const win = try app.openWindow(.{
-        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 300, .h = 460 } },
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .w = 300, .h = 300 } },
         .title = "Animation",
     }, selftestBuildRoot);
     _ = app.step();
@@ -356,7 +324,7 @@ fn selftestHeadless(gpa: std.mem.Allocator) !void {
     // -- 0. initial state mirrors the GPUI fixture --
     check(view.read().spring_phase == 0, &failures, "phase starts at 0", .{});
     check(view.read().spring_damping == 14.0, &failures, "damping starts at 14", .{});
-    check(view.read().pos_spring.position == 0, &failures, "ball starts at target", .{});
+    check(win.scene.slice().len >= 7, &failures, "initial animation frame rendered", .{});
 
     // -- 1. clicking the spring card advances the phase (GPUI's test) --
     var clicked = false;
@@ -374,14 +342,16 @@ fn selftestHeadless(gpa: std.mem.Allocator) !void {
 
     // -- 2. stepping the spring converges on the new target --
     {
-        const entity = view.readMut();
+        var position_spring = anim.Spring.init(view.read().springConfig(), 0);
+        position_spring.epsilon = 0.25;
+        _ = position_spring.advance(0);
+        position_spring.retarget(BALL_TRAVEL);
         var i: usize = 0;
         while (i < 600) : (i += 1) {
-            entity.pos_spring = entity.springConfig().step(entity.pos_spring, entity.posTarget(), 1.0 / 60.0);
-            entity.phase_spring = entity.springConfig().step(entity.phase_spring, entity.phaseTarget(), 1.0 / 60.0);
+            _ = position_spring.advance(1.0 / 60.0);
         }
-        check(@abs(entity.pos_spring.position - BALL_TRAVEL) < 1.0, &failures, "ball settles at 98px (got {d:.1})", .{entity.pos_spring.position});
-        check(entity.springConfig().isSettled(entity.pos_spring, entity.posTarget(), 0.25), &failures, "position spring reports settled", .{});
+        check(@abs(position_spring.state.position - BALL_TRAVEL) < 1.0, &failures, "ball settles at 98px (got {d:.1})", .{position_spring.state.position});
+        check(position_spring.settled(), &failures, "position spring reports settled", .{});
     }
 
     // -- 3. damping drag retunes the spring --
@@ -404,6 +374,18 @@ fn selftestHeadless(gpa: std.mem.Allocator) !void {
         _ = app.step();
         const e1 = view.read().spin_epoch_ms;
         check(e0 != null and e1 != null and e0.? == e1.?, &failures, "spin epoch pinned on first frame", .{});
+
+        // Halfway through the bounce clock is a half-turn. Verify the value
+        // survives the element -> scene -> image blit path, not just the
+        // scalar animation helper.
+        view.readMut().spin_epoch_ms = win.timeMs() - SPIN_PERIOD_MS / 4;
+        win.requestRender();
+        _ = app.step();
+        var half_turn = false;
+        for (win.scene.imageSlice()) |image| {
+            if (@abs(image.rotation - std.math.pi) < 0.15) half_turn = true;
+        }
+        check(half_turn, &failures, "spinner emits a half-turn image transform", .{});
     }
 
     if (failures > 0) {

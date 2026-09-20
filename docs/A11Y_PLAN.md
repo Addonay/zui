@@ -3,8 +3,9 @@
 ## Implemented seam (2026-09-17)
 
 - `widgets.behavior.Pressable`: pointer down arms, captured release inside activates,
-  release outside cancels. Enter/Space non-repeat key-down and semantic activation
-  share `activate()`. Existing `on_click` remains press-time for compatibility.
+  release outside cancels. Enter activates on its initial non-repeat press; Space
+  arms on press and activates on key-up. Semantic activation shares `activate()`.
+  Existing `on_click` remains press-time for compatibility.
 - `widgets.focus`: paint-order, deduplicated Tab/Shift-Tab traversal; excludes dead,
   disabled and hidden semantic handles. Bounded scanning handles zero candidates.
   `pushScope(window, ids, modal)` returns a token for nested `popScope` restoration.
@@ -24,8 +25,9 @@
   targets in the existing owner table. Custom targets must be registered too, or
   outlive the frame. Native workers must never retain these raw target pointers.
 - Snapshot capacity is 512; `semantic_dropped`, tree `dropped`, `duplicate_keys`
-  and `unkeyed` are observable. Native publication must reject incomplete snapshots
-  rather than publishing them as complete. Snapshots and strings expire at reset;
+  and `unkeyed` are observable. Native publication rejects incomplete snapshots,
+  retains the last known-good snapshot, and increments a rejection counter rather
+  than publishing them as complete. Snapshots and strings expire at reset;
   clone follows the existing borrowed-string contract and requires its source
   frame to stay alive. No asynchronous snapshot ownership is implied.
 
@@ -89,13 +91,39 @@ AccessKit's maintained platform adapters instead of reimplementing them).
 - **Verified so far** (evidence levels per `docs/PLATFORM_MATRIX.md`):
   compiles + links with the vendored library on Linux native and both
   foreign targets compile without AccessKit; live X11 window creates the
-  unix adapter (logged) with clean exit and no protocol errors; 280/280
-  tests with AccessKit enabled.
-- **Not yet validated**: an actual screen reader driving the app (Orca on
+  unix adapter (logged) with clean exit and no protocol errors; the current
+  cached AccessKit aggregate gate reports 23/23 build steps succeeded; keyed
+  TextField selection now maps to AccessKit text-selection positions. The
+  build summary does not emit a repository-wide test-case total, so no
+  aggregate case count is claimed here.
+- **Not yet validated**: an actual screen reader speech workflow (Orca on
   this session has no AT running; VoiceOver/NVDA need native runners),
   Windows (UIA) and macOS (NSAccessibility) adapters, adapter-owned
   snapshot diffing (currently a full per-frame tree push like DVUI's
-  default), and text-run character offsets.
+  default), richer text-run offsets/geometry, and IME-driven accessibility
+  updates.
+
+## Native validation
+
+`tools/native_linux_probe.sh` performs a reproducible host check for the
+AT-SPI session bus. While the todo app was running on Wayland, PyAT-SPI also
+observed its frame, entry, and actionable button nodes; the `Active` button's
+AT-SPI `click` action returned success. Re-run that semantic
+publication probe with:
+
+```sh
+python3 tools/atspi_tree_probe.py todo
+```
+
+The probe is native semantic-tree evidence; it does not claim screen-reader
+speech, which still requires Orca/NVDA/VoiceOver driving the application.
+
+`tools/native_linux_fixture.zig` covers the event ordering and UTF-8 caret
+boundaries used by the checked-in Wayland text-input-v3 and X11 XIM paths.
+The current run passes 3/3 fixtures. These are contract fixtures, not native
+success claims. Run them with
+`zig test tools/native_linux_fixture.zig`; use the host probe for native
+capability status.
 
 ## AccessKit C binding plan (original steps, for the remaining work)
 
@@ -137,22 +165,30 @@ AccessKit's maintained platform adapters instead of reimplementing them).
   machine with a live AT-SPI bus. Mitigations in place: the adapter only
   starts on real native backends (headless runs never spawn AT threads, so
   CI is deterministic), and callbacks hold no state past the call. Full
-  fix needs an upstream join API or immortal callback state. TextField
-  semantics, text selection/range semantics, IME accessibility and
-  native bridge publication are not connected here.
-- Focus-loss/unmount/window-teardown capture cancellation is not fully wired:
-  Pressable exposes `cancel`, and generic controls reject releases without current
-  bounds, but Window/App do not yet deliver all lifecycle cancellation events.
-  Keyboard activation currently happens on key-down, not Space key-up.
-- Full capture/bubble/default-action propagation, nested scroll consumption,
+  fix needs an upstream join API or immortal callback state. Text selection/
+  range semantics, IME accessibility and native bridge publication remain
+  incomplete.
+- Window now has a lifecycle cancellation boundary: focus changes, native focus
+  loss, close, live focused-element unmount, and modal close dispatch a
+  cancellation event before dropping capture. Controls, text fields, scroll
+  areas, menus, tables and popovers clear their private latches there. A
+  captured non-focusable custom owner still needs an explicit cancellation
+  callback if it remains alive while unmounted.
+- Pointer down/up and motion capture/bubble propagation now follow retained
+  element ancestry and can stop explicitly. Scroll target/bubble dispatch
+  follows the same ancestry when a child chains an unconsumed remainder;
   touchpad phases, overlay dismissal and a complete modal event barrier remain.
-- Disabled pointer hits can still adopt focus under legacy Window dispatch;
-  traversal and semantic actions exclude disabled controls. Scope lists do not
-  automatically update as dialog content changes. General programmatic focus and
-  semantic focus are not yet constrained by the modal scope.
-- TextField semantics, text selection/range semantics, IME accessibility and
-  native bridge publication are not connected here. TextField belongs to a
-  concurrent editing workstream and was not changed.
+- Disabled pointer hits, traversal, and semantic actions exclude disabled
+  controls. Modal scope checks
+  now gate Window and semantic/programmatic focus, and owner-tagged portal
+  scopes are cleared when their host disappears; dynamic scope content and
+  legacy hand-built regions still need broader coverage.
+- Keyed TextField nodes now publish a `text_input` semantic role with label,
+  committed value, focus/set-value/text-selection actions, and basic AccessKit
+  text selection (Unicode scalar indices derived from UTF-8 offsets). Synthetic
+  richer text-run geometry, IME accessibility, and native screen
+  reader validation remain; unkeyed fields preserve their historical
+  unannotated mode.
 - Hover/pressed presentation is basic; controls lack polished loading/error,
   reduced-motion/text-scale/high-contrast policies and full theme contrast audits.
   RadioGroup needs a clearer pressed/disabled presentation and roving option focus

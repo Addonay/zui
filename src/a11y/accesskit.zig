@@ -43,6 +43,7 @@ const Window = @import("../app/window.zig").Window;
 const zlog = @import("../core/log.zig");
 
 const max_action_requests = 64;
+const max_action_text = 1024;
 
 /// ZUI role → AccessKit role. Pure mapping, compiled when enabled.
 pub fn roleFromZui(role: a11y.Role) u8 {
@@ -83,6 +84,7 @@ pub fn actionFromZui(action: a11y.Action) u8 {
         .increment => c.ACCESSKIT_ACTION_INCREMENT,
         .decrement => c.ACCESSKIT_ACTION_DECREMENT,
         .set_value => c.ACCESSKIT_ACTION_SET_VALUE,
+        .set_text_selection => c.ACCESSKIT_ACTION_SET_TEXT_SELECTION,
         .focus => c.ACCESSKIT_ACTION_FOCUS,
     };
 }
@@ -96,8 +98,25 @@ pub const SnapshotNode = struct {
     bounds: @import("../core/geometry.zig").Rect,
     name: []u8 = &.{},
     text_value: []u8 = &.{},
+    /// UTF-8 byte length for each Unicode scalar in text_value.
+    character_lengths: []u8 = &.{},
+    character_positions: []f32 = &.{},
+    character_widths: []f32 = &.{},
+    /// Source byte ranges for the character-indexed geometry. AccessKit
+    /// consumes positions/widths; ZUI retains ranges for richer framework
+    /// consumers and deterministic editing diagnostics.
+    text_ranges: []a11y.TextRange = &.{},
     states: a11y.States = .{},
     value: ?a11y.Value = null,
+    text_selection: ?a11y.TextSelection = null,
+    /// Stable semantic relationships carried through to AccessKit. A zero
+    /// id means that the relationship is absent, matching Properties.
+    labelled_by: u64 = 0,
+    described_by: u64 = 0,
+    controls: u64 = 0,
+    active_descendant: u64 = 0,
+    position_in_set: ?usize = null,
+    set_size: ?usize = null,
     actions: a11y.Actions = .{},
 };
 
@@ -107,6 +126,9 @@ pub const QueuedAction = struct {
     action: u8,
     target: u64,
     numeric_value: f64 = 0,
+    text: [max_action_text]u8 = undefined,
+    text_len: u16 = 0,
+    selection: ?a11y.TextSelection = null,
 };
 
 const AccesskitNode = if (enabled) c.accesskit_node else anyopaque;
@@ -122,6 +144,9 @@ pub const Bridge = struct {
     requests: [max_action_requests]QueuedAction = undefined,
     request_count: usize = 0,
     request_drops: u64 = 0,
+    /// Number of semantic frames rejected because the producer reported an
+    /// incomplete tree. The last known-good snapshot remains published.
+    snapshot_rejections: u64 = 0,
     status: enum { off, starting, on } = .off,
     /// Cross-thread lock for the snapshot/actions queue. AccessKit's
     /// handlers arrive on assistive-technology threads, publish/drain run
@@ -181,6 +206,10 @@ pub const Bridge = struct {
         for (self.snapshot) |*node| {
             if (node.name.len > 0) allocator.free(node.name);
             if (node.text_value.len > 0) allocator.free(node.text_value);
+            if (node.character_lengths.len > 0) allocator.free(node.character_lengths);
+            if (node.character_positions.len > 0) allocator.free(node.character_positions);
+            if (node.character_widths.len > 0) allocator.free(node.character_widths);
+            if (node.text_ranges.len > 0) allocator.free(node.text_ranges);
         }
         if (self.snapshot.len > 0) allocator.free(self.snapshot);
         self.snapshot = &.{};
@@ -198,12 +227,21 @@ pub const Bridge = struct {
         const tree = &win.ui_frame.semantic_tree;
         self.lock();
         defer self.unlock();
+        if (tree.dropped != 0 or tree.duplicate_keys != 0 or tree.unkeyed != 0 or tree.invalid_utf8 != 0) {
+            self.snapshot_rejections += 1;
+            zlog.log("a11y", "semantic snapshot rejected: incomplete tree (dropped={d}, duplicate_keys={d}, unkeyed={d}, invalid_utf8={d})", .{ tree.dropped, tree.duplicate_keys, tree.unkeyed, tree.invalid_utf8 });
+            return;
+        }
         // The snapshot is refreshed even while .off so activation (which can
         // happen at any moment) always publishes the CURRENT tree next
         // factory call.
         for (self.snapshot) |*old| {
             if (old.name.len > 0) allocator.free(old.name);
             if (old.text_value.len > 0) allocator.free(old.text_value);
+            if (old.character_lengths.len > 0) allocator.free(old.character_lengths);
+            if (old.character_positions.len > 0) allocator.free(old.character_positions);
+            if (old.character_widths.len > 0) allocator.free(old.character_widths);
+            if (old.text_ranges.len > 0) allocator.free(old.text_ranges);
         }
         if (self.snapshot.len != tree.count) {
             if (self.snapshot.len > 0) allocator.free(self.snapshot);
@@ -213,6 +251,22 @@ pub const Bridge = struct {
         for (tree.nodes[0..tree.count], 0..) |*node, i| {
             const name: []u8 = allocator.dupe(u8, node.properties.name) catch &.{};
             const text_value: []u8 = allocator.dupe(u8, node.properties.text_value) catch &.{};
+            const character_lengths: []u8 = makeCharacterLengths(allocator, text_value) catch &.{};
+            var character_positions: []f32 = &.{};
+            var character_widths: []f32 = &.{};
+            var text_ranges: []a11y.TextRange = &.{};
+            var text_selection: ?a11y.TextSelection = null;
+            for (win.ui_frame.nodes[0..win.ui_frame.node_count], 0..) |frame_node, frame_index| {
+                if (frame_node.stable_key == node.key) {
+                    text_selection = win.ui_frame.textSelectionForNode(@intCast(frame_index));
+                    if (win.ui_frame.textGeometryForNode(@intCast(frame_index))) |geometry| {
+                        character_positions = allocator.dupe(f32, geometry.positions) catch &.{};
+                        character_widths = allocator.dupe(f32, geometry.widths) catch &.{};
+                        text_ranges = allocator.dupe(a11y.TextRange, geometry.ranges) catch &.{};
+                    }
+                    break;
+                }
+            }
             self.snapshot[i] = .{
                 .key = node.key,
                 .parent = node.parent,
@@ -220,17 +274,33 @@ pub const Bridge = struct {
                 .bounds = node.bounds,
                 .name = name,
                 .text_value = text_value,
+                .character_lengths = character_lengths,
+                .character_positions = character_positions,
+                .character_widths = character_widths,
+                .text_ranges = text_ranges,
                 .states = node.properties.states,
                 .value = node.properties.value,
+                .text_selection = text_selection,
+                .labelled_by = node.properties.labelled_by,
+                .described_by = node.properties.described_by,
+                .controls = node.properties.controls,
+                .active_descendant = node.properties.active_descendant,
+                .position_in_set = node.properties.position_in_set,
+                .set_size = node.properties.set_size,
                 .actions = node.properties.actions,
             };
         }
         // Focused semantic node: the semantic node whose focus handle is the
-        // window's focused handle. Zero when none (root focus).
+        // window's focused handle. GPUI reports an active descendant as the
+        // platform focus when the focused container claims one of its actual
+        // descendants, so apply the same rule here.
         self.focused_key = 0;
         for (tree.nodes[0..tree.count]) |*node| {
             if (node.focus) |handle| if (win.focused.eql(handle)) {
                 self.focused_key = node.key;
+                if (node.properties.active_descendant != 0 and
+                    snapshotContainsDescendant(self.snapshot, node.key, node.properties.active_descendant))
+                    self.focused_key = node.properties.active_descendant;
             };
         }
     }
@@ -255,7 +325,8 @@ pub const Bridge = struct {
             c.ACCESSKIT_ACTION_CLICK => _ = tree.perform(key, .{ .action = .activate }, win),
             c.ACCESSKIT_ACTION_INCREMENT => _ = tree.perform(key, .{ .action = .increment }, win),
             c.ACCESSKIT_ACTION_DECREMENT => _ = tree.perform(key, .{ .action = .decrement }, win),
-            c.ACCESSKIT_ACTION_SET_VALUE => _ = tree.perform(key, .{ .action = .set_value, .value = request.numeric_value }, win),
+            c.ACCESSKIT_ACTION_SET_VALUE => _ = tree.perform(key, .{ .action = .set_value, .value = request.numeric_value, .text = request.text[0..request.text_len] }, win),
+            c.ACCESSKIT_ACTION_SET_TEXT_SELECTION => _ = tree.perform(key, .{ .action = .set_text_selection, .selection = request.selection }, win),
             c.ACCESSKIT_ACTION_FOCUS => _ = tree.perform(key, .{ .action = .focus }, win),
             else => {},
         }
@@ -286,7 +357,7 @@ pub const Bridge = struct {
         const request = raw_request orelse return;
         // Extract everything we need NOW; the C request is freed above, so
         // queued copies must not reference its memory.
-        const queued: QueuedAction = .{
+        var queued: QueuedAction = .{
             .action = request.action,
             .target = request.target_node,
             .numeric_value = if (request.data.has_value and
@@ -295,6 +366,21 @@ pub const Bridge = struct {
             else
                 0,
         };
+        if (request.data.has_value and request.data.value.tag == c.ACCESSKIT_ACTION_DATA_VALUE) {
+            if (request.data.value.unnamed_0.unnamed_1.value) |value| {
+                const bytes = std.mem.span(value);
+                const len = @min(bytes.len, max_action_text);
+                @memcpy(queued.text[0..len], bytes[0..len]);
+                queued.text_len = @intCast(len);
+            }
+        }
+        if (request.data.has_value and request.data.value.tag == c.ACCESSKIT_ACTION_DATA_SET_TEXT_SELECTION) {
+            const selection = request.data.value.unnamed_0.unnamed_7.set_text_selection;
+            queued.selection = .{
+                .anchor = @intCast(selection.anchor.character_index),
+                .focus = @intCast(selection.focus.character_index),
+            };
+        }
         self.lock();
         defer self.unlock();
         if (self.request_count < max_action_requests) {
@@ -380,6 +466,58 @@ pub const Bridge = struct {
     }
 };
 
+fn makeCharacterLengths(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (text.len == 0) return &.{};
+    var count: usize = 0;
+    var byte: usize = 0;
+    while (byte < text.len) : (count += 1) {
+        byte += std.unicode.utf8ByteSequenceLength(text[byte]) catch 1;
+    }
+    const lengths = try allocator.alloc(u8, count);
+    byte = 0;
+    var index: usize = 0;
+    while (byte < text.len) : (index += 1) {
+        const length = std.unicode.utf8ByteSequenceLength(text[byte]) catch 1;
+        lengths[index] = length;
+        byte += length;
+    }
+    return lengths;
+}
+
+fn snapshotContainsDescendant(snapshot: []const SnapshotNode, ancestor: u64, candidate: u64) bool {
+    if (ancestor == candidate or candidate == 0) return false;
+    var current = candidate;
+    var steps: usize = 0;
+    while (current != 0 and steps < snapshot.len) : (steps += 1) {
+        var parent: ?u64 = null;
+        for (snapshot) |node| if (node.key == current) {
+            parent = node.parent;
+            break;
+        };
+        const p = parent orelse return false;
+        if (p == ancestor) return true;
+        current = p;
+    }
+    return false;
+}
+
+fn scalarCount(text: []const u8) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) : (count += 1) {
+        index += std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
+    }
+    return count;
+}
+
+fn clampSelection(selection: a11y.TextSelection, text: []const u8) a11y.TextSelection {
+    const count = scalarCount(text);
+    return .{
+        .anchor = @intCast(@min(@as(usize, selection.anchor), count)),
+        .focus = @intCast(@min(@as(usize, selection.focus), count)),
+    };
+}
+
 /// Build one fresh accesskit node from a snapshot entry. Ownership
 /// transfers to `accesskit_tree_update_push_node`.
 fn buildAccesskitNode(node: *const SnapshotNode) ?*AccesskitNode {
@@ -392,6 +530,27 @@ fn buildAccesskitNode(node: *const SnapshotNode) ?*AccesskitNode {
     });
     if (node.name.len > 0) c.accesskit_node_set_label_with_length(ak, node.name.ptr, node.name.len);
     if (node.text_value.len > 0) c.accesskit_node_set_value_with_length(ak, node.text_value.ptr, node.text_value.len);
+    if (node.character_lengths.len > 0) c.accesskit_node_set_character_lengths(ak, node.character_lengths.len, node.character_lengths.ptr);
+    if (node.character_positions.len > 0 and node.character_positions.len == node.character_widths.len) {
+        c.accesskit_node_set_character_positions(ak, node.character_positions.len, node.character_positions.ptr);
+        c.accesskit_node_set_character_widths(ak, node.character_widths.len, node.character_widths.ptr);
+    }
+    if (node.text_selection) |selection| {
+        const safe_selection = clampSelection(selection, node.text_value);
+        c.accesskit_node_set_text_selection(ak, .{
+            .anchor = .{ .node = node.key, .character_index = safe_selection.anchor },
+            .focus = .{ .node = node.key, .character_index = safe_selection.focus },
+        });
+    }
+    if (node.labelled_by != 0) c.accesskit_node_push_labelled_by(ak, node.labelled_by);
+    if (node.described_by != 0) c.accesskit_node_push_described_by(ak, node.described_by);
+    if (node.controls != 0) {
+        const ids = [_]c.accesskit_node_id{node.controls};
+        c.accesskit_node_set_controls(ak, ids.len, &ids);
+    }
+    if (node.active_descendant != 0) c.accesskit_node_set_active_descendant(ak, node.active_descendant);
+    if (node.position_in_set) |position| c.accesskit_node_set_position_in_set(ak, position);
+    if (node.set_size) |size| c.accesskit_node_set_size_of_set(ak, size);
     const s = node.states;
     if (s.disabled) c.accesskit_node_set_disabled(ak);
     if (s.hidden) c.accesskit_node_set_hidden(ak);
@@ -410,6 +569,7 @@ fn buildAccesskitNode(node: *const SnapshotNode) ?*AccesskitNode {
     if (node.actions.increment) c.accesskit_node_add_action(ak, c.ACCESSKIT_ACTION_INCREMENT);
     if (node.actions.decrement) c.accesskit_node_add_action(ak, c.ACCESSKIT_ACTION_DECREMENT);
     if (node.actions.set_value) c.accesskit_node_add_action(ak, c.ACCESSKIT_ACTION_SET_VALUE);
+    if (node.actions.set_text_selection) c.accesskit_node_add_action(ak, c.ACCESSKIT_ACTION_SET_TEXT_SELECTION);
     if (node.actions.focus) c.accesskit_node_add_action(ak, c.ACCESSKIT_ACTION_FOCUS);
     return ak;
 }
@@ -428,7 +588,31 @@ test "role and action mappings compile against the vendored header" {
     _ = roleFromZui(.cell);
     _ = actionFromZui(.activate);
     _ = actionFromZui(.set_value);
+    _ = actionFromZui(.set_text_selection);
     _ = actionFromZui(.focus);
+}
+
+test "accesskit character lengths preserve UTF-8 scalar byte widths" {
+    const lengths = try makeCharacterLengths(std.testing.allocator, "Aé你");
+    defer std.testing.allocator.free(lengths);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, lengths);
+}
+
+test "accesskit selection clamps to UTF-8 scalar boundaries" {
+    const selection = clampSelection(.{ .anchor = 99, .focus = 2 }, "Aé你");
+    try std.testing.expectEqual(@as(u32, 3), selection.anchor);
+    try std.testing.expectEqual(@as(u32, 2), selection.focus);
+}
+
+test "active descendant focus only accepts a real descendant" {
+    const bounds = @import("../core/geometry.zig").Rect{};
+    const snapshot = [_]SnapshotNode{
+        .{ .key = 10, .parent = 0, .role = .listbox, .bounds = bounds },
+        .{ .key = 11, .parent = 10, .role = .option, .bounds = bounds },
+        .{ .key = 12, .parent = 0, .role = .option, .bounds = bounds },
+    };
+    try std.testing.expect(snapshotContainsDescendant(&snapshot, 10, 11));
+    try std.testing.expect(!snapshotContainsDescendant(&snapshot, 10, 12));
 }
 
 test "bridge snapshot lifecycle is ownership-clean" {
@@ -439,4 +623,48 @@ test "bridge snapshot lifecycle is ownership-clean" {
     // (deinit frees nothing borrowed).
     bridge.deinit(t.allocator);
     try t.expectEqual(@as(usize, 0), bridge.snapshot.len);
+}
+
+test "bridge rejects incomplete semantic snapshots without replacing the last good one" {
+    if (!enabled) return error.SkipZigTest;
+    const t = std.testing;
+    const TestApp = @import("../app/app.zig").App;
+    var app = try TestApp.initHeadless(t.allocator);
+    defer app.deinit();
+
+    const win = try app.openWindow(.{}, struct {
+        fn draw(_: *Window, _: *@import("../gpu/scene.zig").Scene) void {}
+    }.draw);
+    const tree = &win.ui_frame.semantic_tree;
+    tree.* = .{};
+    tree.nodes[0] = .{
+        .key = 7,
+        .parent = 0,
+        .bounds = .{ .x = 0, .y = 0, .w = 20, .h = 20 },
+        .properties = .{ .role = .button, .name = "last-good" },
+    };
+    tree.count = 1;
+
+    win.a11y_bridge.publish(win);
+    try t.expectEqual(@as(u64, 0), win.a11y_bridge.snapshot_rejections);
+    try t.expectEqualStrings("last-good", win.a11y_bridge.snapshot[0].name);
+
+    tree.nodes[0].properties.name = "rejected-dropped";
+    tree.dropped = 1;
+    win.a11y_bridge.publish(win);
+    tree.dropped = 0;
+
+    tree.nodes[0].properties.name = "rejected-duplicate";
+    tree.duplicate_keys = 1;
+    win.a11y_bridge.publish(win);
+    tree.duplicate_keys = 0;
+
+    tree.nodes[0].properties.name = "rejected-unkeyed";
+    tree.unkeyed = 1;
+    win.a11y_bridge.publish(win);
+    tree.unkeyed = 0;
+
+    try t.expectEqual(@as(u64, 3), win.a11y_bridge.snapshot_rejections);
+    try t.expectEqual(@as(usize, 1), win.a11y_bridge.snapshot.len);
+    try t.expectEqualStrings("last-good", win.a11y_bridge.snapshot[0].name);
 }

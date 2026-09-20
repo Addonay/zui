@@ -21,6 +21,7 @@ fn paint(win: *Window, entities: anytype) void {
 }
 fn key(win: *Window, k: @import("../platform/root.zig").event.Key, shift: bool) void {
     win.handleEvent(.{ .key = .{ .key = k, .pressed = true, .modifiers = .{ .shift = shift } } });
+    if (k == .space) win.handleEvent(.{ .key = .{ .key = k, .pressed = false, .modifiers = .{ .shift = shift } } });
 }
 fn click(win: *Window, bounds: @import("../core/geometry.zig").Rect) void {
     const pos = @import("../core/geometry.zig").Point{ .x = bounds.x + 10, .y = bounds.y + 10 };
@@ -47,6 +48,8 @@ test "keyboard-only form traversal, scopes, disabled controls and all semantic r
     try std.testing.expectEqual(@as(usize, 9), tree.count);
     try std.testing.expectEqual(@as(u64, 600), tree.find(601).?.parent);
     try std.testing.expectEqual(@import("../a11y/root.zig").Role.switch_control, tree.find(300).?.properties.role);
+    click(win, tree.find(700).?.bounds);
+    try std.testing.expectEqual(@as(u32, 0), win.focused.id);
     inline for (.{ button, checkbox, toggle, slider, progress, radio }) |entity| {
         key(win, .tab, false);
         try std.testing.expectEqual(entity.focusHandle(null).id, win.focused.id);
@@ -140,8 +143,65 @@ test "rendered button pointer keyboard and semantic actions converge" {
     win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 10, .y = 10 }, .button = .left, .pressed = false } });
     win.handleEvent(.{ .key = .{ .key = .enter, .pressed = true } });
     win.handleEvent(.{ .key = .{ .key = .space, .pressed = true } });
+    win.handleEvent(.{ .key = .{ .key = .space, .pressed = false } });
     try std.testing.expect(frame.semantic_tree.perform(10, .{ .action = .activate }, win));
     try std.testing.expectEqual(@as(u64, 4), button.read().pressable.activations);
     button.destroy();
     try std.testing.expect(!frame.semantic_tree.perform(10, .{ .action = .activate }, win));
+}
+
+test "focus loss, unmount, and close cancel retained control interaction" {
+    var app = try App.initHeadless(std.testing.allocator);
+    defer app.deinit();
+    const win = try app.openWindow(.{}, struct {
+        fn noop(_: *Window, _: *@import("../gpu/root.zig").Scene) void {}
+    }.noop);
+    const button = app.entities.create(c.Button, .{ .key = 10, .label = "Save" }, win);
+
+    paint(win, .{button});
+    try std.testing.expect(win.ui_frame.semantic_tree.perform(10, .{ .action = .focus }, win));
+    win.handleEvent(.{ .key = .{ .key = .space, .pressed = true } });
+    try std.testing.expect(button.read().pressable.keyboard_space);
+
+    // OS focus loss reaches the focused entity before Window clears its
+    // capture state; a late key-up cannot activate the control.
+    win.handleEvent(.{ .window = .unfocused });
+    try std.testing.expect(!button.read().pressable.keyboard_space);
+    try std.testing.expect(!button.read().pressable.pressed);
+    try std.testing.expect(win.ui_frame.semantic_tree.perform(10, .{ .action = .focus }, win));
+    win.handleEvent(.{ .key = .{ .key = .space, .pressed = false } });
+    try std.testing.expectEqual(@as(u64, 0), button.read().pressable.activations);
+
+    // Destroying a captured owner clears Window capture on the next motion;
+    // it is not left waiting for a release that may never arrive.
+    const captured = app.entities.create(c.Button, .{ .key = 20, .label = "Drag" }, win);
+    paint(win, .{captured});
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 10, .y = 10 }, .button = .left, .pressed = true } });
+    try std.testing.expect(win.captured_mouse_region != null);
+    captured.destroy();
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 900, .y = 900 }, .button = .left, .pressed = false, .motion = true } });
+    try std.testing.expect(win.captured_mouse_region == null);
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 900, .y = 900 }, .button = .left, .pressed = false } });
+
+    // A frame that removes the still-live entity is an unmount cancellation,
+    // not permission to preserve its private press latch for remount.
+    paint(win, .{button});
+    try std.testing.expect(win.ui_frame.semantic_tree.perform(10, .{ .action = .focus }, win));
+    win.handleEvent(.{ .key = .{ .key = .space, .pressed = true } });
+    try std.testing.expect(button.read().pressable.keyboard_space);
+    paint(win, .{});
+    try std.testing.expect(!button.read().pressable.keyboard_space);
+    try std.testing.expect(!button.read().pressable.pressed);
+
+    // Close dispatches the lifecycle cancellation before the Window is
+    // reaped, so pointer capture and the widget latch cannot survive close.
+    paint(win, .{button});
+    try std.testing.expect(win.ui_frame.semantic_tree.perform(10, .{ .action = .focus }, win));
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 10, .y = 10 }, .button = .left, .pressed = true } });
+    try std.testing.expect(button.read().pressable.pressed);
+    win.close();
+    try std.testing.expect(!button.read().pressable.pressed);
+    try std.testing.expect(win.captured_mouse_region == null);
+    win.handleEvent(.{ .mouse = .{ .pos = .{ .x = 10, .y = 10 }, .button = .left, .pressed = false } });
+    try std.testing.expectEqual(@as(u64, 0), button.read().pressable.activations);
 }

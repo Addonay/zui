@@ -105,12 +105,31 @@ pub const NS_EVENT_KEY_DOWN: NSInteger = 10;
 pub const NS_EVENT_KEY_UP: NSInteger = 11;
 pub const NS_EVENT_FLAGS_CHANGED: NSInteger = 12;
 pub const NS_EVENT_SCROLL_WHEEL: NSInteger = 22;
+pub const NS_EVENT_APP_DEFINED: NSInteger = 15;
 
 // NSEventModifierFlags (AppKit ABI).
 pub const NS_MOD_SHIFT: NSUInteger = 1 << 17;
 pub const NS_MOD_CONTROL: NSUInteger = 1 << 18;
 pub const NS_MOD_OPTION: NSUInteger = 1 << 19;
 pub const NS_MOD_COMMAND: NSUInteger = 1 << 20;
+
+// Window lifecycle and backing-scale notifications/selectors. Keeping these
+// names in the binding layer lets the Cocoa adapter attach per-window
+// observers without inventing string literals in event translation code.
+pub const NS_WINDOW_DID_RESIZE_NOTIFICATION: [*:0]const u8 = "NSWindowDidResizeNotification";
+pub const NS_WINDOW_DID_MOVE_NOTIFICATION: [*:0]const u8 = "NSWindowDidMoveNotification";
+pub const NS_WINDOW_DID_BECOME_KEY_NOTIFICATION: [*:0]const u8 = "NSWindowDidBecomeKeyNotification";
+pub const NS_WINDOW_DID_RESIGN_KEY_NOTIFICATION: [*:0]const u8 = "NSWindowDidResignKeyNotification";
+pub const NS_WINDOW_DID_CHANGE_BACKING_PROPERTIES_NOTIFICATION: [*:0]const u8 = "NSWindowDidChangeBackingPropertiesNotification";
+pub const NS_WINDOW_DID_CHANGE_SCREEN_NOTIFICATION: [*:0]const u8 = "NSWindowDidChangeScreenNotification";
+pub const NS_VIEW_DID_END_LIVE_RESIZE_NOTIFICATION: [*:0]const u8 = "NSViewDidEndLiveResizeNotification";
+
+pub const NS_CURSOR_ARROW: [*:0]const u8 = "arrowCursor";
+pub const NS_CURSOR_IBEAM: [*:0]const u8 = "IBeamCursor";
+pub const NS_CURSOR_POINTING_HAND: [*:0]const u8 = "pointingHandCursor";
+
+pub const NS_TEXT_INPUT_CONTEXT: [*:0]const u8 = "NSTextInputContext";
+pub const NS_IMK_CLIENT: [*:0]const u8 = "IMKTextInput";
 
 // Pasteboard + cursor string constants.
 pub const NS_STRING_PBOARD_TYPE: [*:0]const u8 = "NSStringPboardType";
@@ -119,3 +138,10 @@ pub const NS_DEFAULT_RUN_LOOP_MODE: [*:0]const u8 = "kCFRunLoopDefaultMode";
 // CoreGraphics bitmap constants (stable ABI).
 pub const CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
 pub const CG_BITMAP_BYTE_ORDER_32_BIG: u32 = 4 << 12;
+
+test "Cocoa lifecycle and text-input binding names are stable" {
+    const std = @import("std");
+    try std.testing.expectEqualStrings("NSWindowDidChangeBackingPropertiesNotification", std.mem.span(NS_WINDOW_DID_CHANGE_BACKING_PROPERTIES_NOTIFICATION));
+    try std.testing.expectEqualStrings("NSTextInputContext", std.mem.span(NS_TEXT_INPUT_CONTEXT));
+    try std.testing.expectEqual(@as(NSInteger, 22), NS_EVENT_SCROLL_WHEEL);
+}

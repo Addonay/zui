@@ -16,6 +16,32 @@ pub fn build(b: *std.Build) void {
     const enable_accesskit = b.option(bool, "accesskit", "Enable the AccessKit accessibility bridge (builds the vendored library with cargo)") orelse false;
     build_options.addOption(bool, "accesskit", enable_accesskit);
 
+    // Optional Vellz/WGPU backend compilation. Default CPU builds never
+    // resolve wgpu-native; the GPU steps are explicit source/link and native
+    // Wayland-surface gates for the partial bridge.
+    const enable_gpu = b.option(bool, "gpu", "Compile the optional Vellz/WGPU backend") orelse false;
+    build_options.addOption(bool, "gpu", enable_gpu);
+    const gpu_native_prefix = b.option(
+        []const u8,
+        "wgpu-native-prefix",
+        "Prefix containing the matching wgpu-native include/ and lib/ directories",
+    );
+    const gpu_native_lib = b.option(
+        []const u8,
+        "wgpu-native-lib",
+        "Exact path to the matching wgpu-native library",
+    );
+    const gpu_native_linkage = b.option(
+        []const u8,
+        "wgpu-native-linkage",
+        "Link wgpu-native dynamically or statically",
+    );
+    const gpu_native_link = b.option(
+        bool,
+        "wgpu-native-link",
+        "Link wgpu-native through the optional GPU dependency",
+    );
+
     // Standalone layout-engine package, fetched from
     // https://github.com/Addonay/zlay (pinned by commit in build.zig.zon).
     // The `zlay` module is aliased to `layout` so every existing
@@ -51,7 +77,26 @@ pub fn build(b: *std.Build) void {
     const vellz_dep = b.dependency("vellz", .{
         .target = target,
         .optimize = optimize,
+        .gpu = enable_gpu,
+        .@"wgpu-native-prefix" = gpu_native_prefix,
+        .@"wgpu-native-lib" = gpu_native_lib,
+        .@"wgpu-native-linkage" = gpu_native_linkage,
+        .@"wgpu-native-link" = gpu_native_link,
     });
+
+    var wgpu_mod: ?*std.Build.Module = null;
+    if (enable_gpu) {
+        if (b.lazyDependency("wgpu", .{
+            .target = target,
+            .optimize = optimize,
+            .@"wgpu-native-prefix" = gpu_native_prefix,
+            .@"wgpu-native-lib" = gpu_native_lib,
+            .@"wgpu-native-linkage" = gpu_native_linkage,
+            .@"wgpu-native-link" = gpu_native_link,
+        })) |dep| {
+            wgpu_mod = dep.module("wgpu");
+        }
+    }
 
     const mod = b.addModule("zui", .{
         .root_source_file = b.path("src/root.zig"),
@@ -63,9 +108,94 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zlay", .module = layout_mod },
             .{ .name = "cozmic", .module = cozmic_dep.module("cozmic") },
             .{ .name = "vellz", .module = vellz_dep.module("vellz") },
+            .{ .name = "wgpu", .module = wgpu_mod orelse layout_mod },
             .{ .name = "build_options", .module = build_options.createModule() },
         },
     });
+
+    // shadcn-zui component layer used by the native examples. The checkout is
+    // fetched from Addonay/shadcn-zui into the ignored `.references` area;
+    // loading its source module directly lets it share this worktree's newer
+    // zui API while the upstream package's development path is repaired.
+    const shadcn_mod = b.createModule(.{
+        .root_source_file = b.path(".references/shadcn-zui/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zui", .module = mod }},
+    });
+    const ShadcnIconsPreset = enum { lucide, tabler, phosphor, heroicons, hugeicons };
+    const shadcn_options = b.addOptions();
+    shadcn_options.addOption(ShadcnIconsPreset, "icons_preset", .lucide);
+    shadcn_mod.addOptions("build_options", shadcn_options);
+
+    if (enable_gpu) {
+        const gpu_probe = b.addExecutable(.{
+            .name = "zui-gpu-probe",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/gpu_probe.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "vellz", .module = vellz_dep.module("vellz") }},
+            }),
+        });
+        const gpu_compile = b.step("gpu-compile", "Compile the real Vellz/WGPU backend boundary");
+        gpu_compile.dependOn(&gpu_probe.step);
+        const run_gpu_probe = b.addRunArtifact(gpu_probe);
+        const gpu_check = b.step("gpu-check", "Acquire a real WGPU adapter and device through Vellz");
+        gpu_check.dependOn(&run_gpu_probe.step);
+
+        const gpu_offscreen_diff = b.addExecutable(.{
+            .name = "zui-gpu-offscreen-diff",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/gpu_offscreen_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "zui", .module = mod },
+                    .{ .name = "vellz", .module = vellz_dep.module("vellz") },
+                    .{ .name = "wgpu", .module = wgpu_mod.? },
+                },
+            }),
+        });
+        const run_gpu_offscreen_diff = b.addRunArtifact(gpu_offscreen_diff);
+        const gpu_offscreen_diff_step = b.step("gpu-offscreen-diff", "Compare CPU and WGPU pixels for a retained ZUI scene");
+        gpu_offscreen_diff_step.dependOn(&run_gpu_offscreen_diff.step);
+
+        if (target.result.os.tag == .linux) {
+            const wayland_smoke = b.addExecutable(.{
+                .name = "zui-gpu-wayland-smoke",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tools/gpu_wayland_smoke.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "zui", .module = mod },
+                        .{ .name = "vellz", .module = vellz_dep.module("vellz") },
+                        .{ .name = "wgpu", .module = wgpu_mod.? },
+                    },
+                }),
+            });
+            const run_wayland_smoke = b.addRunArtifact(wayland_smoke);
+            const wayland_smoke_step = b.step("gpu-wayland-smoke", "Present diagnostic frames through a native Wayland WGPU surface");
+            wayland_smoke_step.dependOn(&run_wayland_smoke.step);
+
+            const wayland_bridge_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tools/gpu_wayland_smoke.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "zui", .module = mod },
+                        .{ .name = "vellz", .module = vellz_dep.module("vellz") },
+                        .{ .name = "wgpu", .module = wgpu_mod.? },
+                    },
+                }),
+            });
+            const run_wayland_bridge_tests = b.addRunArtifact(wayland_bridge_tests);
+            const wayland_bridge_test_step = b.step("gpu-wayland-test", "Test the ZUI-to-Vellz GPU scene bridge");
+            wayland_bridge_test_step.dependOn(&run_wayland_bridge_tests.step);
+        }
+    }
 
     // Vendored C image backends (nanosvg + stb_image, zero deps).
     mod.addIncludePath(b.path("third_party"));
@@ -97,6 +227,21 @@ pub fn build(b: *std.Build) void {
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    // Compile a consumer root against only the public zui module. This is the
+    // source-backed IntoElement/Render smoke gate; it must not gain imports
+    // of src/elements internals as the composition API evolves.
+    const composition_consumer_mod = b.createModule(.{
+        .root_source_file = b.path("src/elements/composition_consumer_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "zui", .module = mod }},
+    });
+    const composition_consumer_tests = b.addTest(.{ .root_module = composition_consumer_mod });
+    const run_composition_consumer_tests = b.addRunArtifact(composition_consumer_tests);
+    const composition_consumer_step = b.step("test-element-composition", "Run the external typed-element composition consumer smoke test");
+    composition_consumer_step.dependOn(&run_composition_consumer_tests.step);
+
     const adapter_tests = b.addTest(.{ .root_module = mod, .filters = &.{"adapter"} });
     const run_adapter_tests = b.addRunArtifact(adapter_tests);
     const adapter_test_step = b.step("test-zlay", "Run focused adapter agreement and grid regression tests");
@@ -110,18 +255,143 @@ pub fn build(b: *std.Build) void {
     });
     const run_layout_tests = b.addRunArtifact(layout_tests);
 
+    // Focused text-system parity gate. Keeping this root separate from the
+    // application/widget test graph lets font shaping and geometry tests run
+    // even while unrelated widget experiments are being edited.
+    const text_mod = b.createModule(.{
+        .root_source_file = b.path("src/text_system_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "cozmic", .module = cozmic_dep.module("cozmic") },
+            .{ .name = "build_options", .module = build_options.createModule() },
+        },
+    });
+    const text_tests = b.addTest(.{ .root_module = text_mod });
+    const run_text_tests = b.addRunArtifact(text_tests);
+    const text_test_step = b.step("test-text", "Run focused GPUI text-system parity tests");
+    text_test_step.dependOn(&run_text_tests.step);
+
     const test_step = b.step("test", "Run zui unit tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_composition_consumer_tests.step);
     test_step.dependOn(&run_layout_tests.step);
+
+    const renderer_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/render_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_renderer_tests = b.addRunArtifact(renderer_tests);
+    const renderer_test_step = b.step("renderer-test", "Run the headless renderer-selection and recovery tests");
+    renderer_test_step.dependOn(&run_renderer_tests.step);
+    test_step.dependOn(&run_renderer_tests.step);
+
+    const renderer_probe = b.addExecutable(.{ .name = "zui-render-backend-probe", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/render_backend_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "render_backend", .module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/render_backend.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) }},
+    }) });
+    const run_renderer_probe = b.addRunArtifact(renderer_probe);
+    const renderer_probe_step = b.step("renderer-probe", "Run the headless explicit renderer-selection probe");
+    renderer_probe_step.dependOn(&run_renderer_probe.step);
+
+    // Keep the GPUI source-ledger check available through the same build
+    // interface as the behavioral gates. It intentionally reads the pinned
+    // reference source and the Markdown matrix; it does not compile or alter
+    // any framework implementation lane.
+    const gpui_parity_check = b.addSystemCommand(&.{ "python3", "tools/check-gpui-parity-matrix.py" });
+    const gpui_parity_step = b.step("gpui-parity", "Check GPUI public API inventory and parity-matrix evidence syntax");
+    gpui_parity_step.dependOn(&gpui_parity_check.step);
+
+    const legacy_mod_tests = b.addTest(.{ .root_module = mod });
+    const run_legacy_mod_tests = b.addRunArtifact(legacy_mod_tests);
+    run_legacy_mod_tests.setEnvironmentVariable("ZUI_LAYOUT", "legacy");
+    const legacy_test_step = b.step("test-legacy", "Run the ZUI unit suite through the legacy layout migration path");
+    legacy_test_step.dependOn(&run_legacy_mod_tests.step);
+
+    const debug_probe = b.addExecutable(.{
+        .name = "zui-headless-debug-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/headless_debug_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "debug_trace", .module = b.createModule(.{ .root_source_file = b.path("src/debug/trace.zig"), .target = target, .optimize = optimize }) },
+                .{ .name = "debug_profiler", .module = b.createModule(.{ .root_source_file = b.path("src/debug/profiler.zig"), .target = target, .optimize = optimize }) },
+            },
+        }),
+    });
+    const run_debug_probe = b.addRunArtifact(debug_probe);
+    const debug_probe_step = b.step("debug-probe", "Run deterministic trace/profiler/scene snapshot diagnostics");
+    debug_probe_step.dependOn(&run_debug_probe.step);
+
+    const debug_probe_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/headless_debug_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "debug_trace", .module = b.createModule(.{ .root_source_file = b.path("src/debug/trace.zig"), .target = target, .optimize = optimize }) },
+                .{ .name = "debug_profiler", .module = b.createModule(.{ .root_source_file = b.path("src/debug/profiler.zig"), .target = target, .optimize = optimize }) },
+            },
+        }),
+    });
+    const run_debug_probe_tests = b.addRunArtifact(debug_probe_tests);
+    const debug_test_step = b.step("debug-test", "Test deterministic headless debug artifacts");
+    debug_test_step.dependOn(&run_debug_probe_tests.step);
+
+    const visual_probe = b.addExecutable(.{
+        .name = "zui-visual-test-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/visual_test_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zui", .module = mod }},
+        }),
+    });
+    const run_visual_probe = b.addRunArtifact(visual_probe);
+    const visual_probe_step = b.step("visual-test-probe", "Run the reusable offscreen TestContext smoke command");
+    visual_probe_step.dependOn(&run_visual_probe.step);
+
+    const visual_probe_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/visual_test_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "zui", .module = mod }},
+    }) });
+    const run_visual_probe_tests = b.addRunArtifact(visual_probe_tests);
+    const visual_test_step = b.step("visual-test", "Test the reusable headless TestContext and visual golden harness");
+    visual_test_step.dependOn(&run_visual_probe_tests.step);
+
+    const context_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/test_context_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }) });
+    const run_context_tests = b.addRunArtifact(context_tests);
+    const context_test_step = b.step("test-context", "Run focused deterministic TestContext and visual snapshot tests");
+    context_test_step.dependOn(&run_context_tests.step);
 
     const use_llvm = b.option(bool, "use-llvm", "use llvm for compilation");
 
     const todo = b.addExecutable(.{
         .name = "todo",
-        .root_module = b.createModule(.{ .root_source_file = b.path("examples/todo/daybook.zig"), .target = target, .optimize = optimize, .imports = &.{.{
-            .name = "zui",
-            .module = mod,
-        }}, .strip = true }),
+        .root_module = b.createModule(.{ .root_source_file = b.path("examples/todo/daybook.zig"), .target = target, .optimize = optimize, .imports = &.{
+            .{ .name = "zui", .module = mod },
+            .{ .name = "shadcn-zui", .module = shadcn_mod },
+        },
+        .strip = true
+        }),
         .use_llvm = use_llvm,
     });
     const run_todo = b.addRunArtifact(todo);
@@ -133,10 +403,13 @@ pub fn build(b: *std.Build) void {
     // this, `zig build test` silently skips them.
     const todo_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/todo/daybook.zig"),
+            .root_source_file = b.path("examples/todo/daybook_tests.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zui", .module = mod }},
+            .imports = &.{
+                .{ .name = "zui", .module = mod },
+                .{ .name = "shadcn-zui", .module = shadcn_mod },
+            },
         }),
     });
     const run_todo_tests = b.addRunArtifact(todo_tests);
@@ -239,8 +512,8 @@ pub fn build(b: *std.Build) void {
     selftest_dash_step.dependOn(&selftest_dash.step);
     test_step.dependOn(&selftest_dash.step);
 
-    // Opt-in migration gate uses the real mounted trees; default tests above
-    // intentionally retain legacy layout until geometry parity is broader.
+    // Keep an explicit mounted-tree parity gate even though Zlay is now the
+    // canonical default; ZUI_LAYOUT=legacy remains the migration escape hatch.
     const zlay_todo = b.addRunArtifact(todo);
     zlay_todo.setEnvironmentVariable("ZUI_LAYOUT", "zlay");
     zlay_todo.setEnvironmentVariable("ZUI_BACKEND", "null");
@@ -253,6 +526,42 @@ pub fn build(b: *std.Build) void {
     const zlay_step = b.step("selftest-zlay", "Run real todo/dashboard trees through experimental Zlay layout");
     zlay_step.dependOn(&zlay_todo.step);
     zlay_step.dependOn(&zlay_dash.step);
+
+    // Small external-oracle fixture probe. The Rust side lives in
+    // `tools/taffy_oracle` and remains separate from the packaged dependency;
+    // compare its line output with `cargo run --manifest-path
+    // tools/taffy_oracle/Cargo.toml`.
+    const zlay_probe = b.addExecutable(.{
+        .name = "zlay-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/zlay_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zui", .module = mod }},
+        }),
+    });
+    const run_zlay_probe = b.addRunArtifact(zlay_probe);
+    run_zlay_probe.setEnvironmentVariable("ZUI_LAYOUT", "zlay");
+    const zlay_probe_step = b.step("zlay-probe", "Print a matched Zlay/Taffy oracle fixture");
+    zlay_probe_step.dependOn(&run_zlay_probe.step);
+
+    // Cross-implementation differential records. The Rust side is a small
+    // probe against the pinned GPUI source contract; the Zig side exercises
+    // the public ZUI animation API and emits the same stable JSONL schema.
+    // Comparison is intentionally kept in tools/differential so this gate
+    // cannot silently become a framework implementation dependency.
+    const differential_zui = b.addExecutable(.{
+        .name = "zui-differential-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/differential/zui_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zui", .module = mod }},
+        }),
+    });
+    const run_differential_zui = b.addRunArtifact(differential_zui);
+    const differential_zui_step = b.step("differential-zui", "Emit deterministic ZUI records for GPUI differential fixtures");
+    differential_zui_step.dependOn(&run_differential_zui.step);
 
     // The Rust + gpui-kit take on the same dashboard lives in
     // `examples/dash-gpui`. Cargo owns that build; this step just forwards to

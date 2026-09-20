@@ -126,3 +126,26 @@ zig build test --summary all
 This is a snapshot inspector and debug overlay, not an interactive tree editor,
 native accessibility bridge, GPU profiler, or complete beginner/custom-widget
 curriculum. Those broader documentation and tooling gaps remain separate work.
+
+## Reusable visual test context
+
+For renderer-independent GPUI-style visual tests, use
+`zui.debug.test_context.TestContext` (also exported as
+`VisualTestContext`). The caller supplies a `Scene`; the context supplies a
+deterministic viewport, injected timestamps, frame/event traces, input replay,
+scene golden capture/comparison, profiler records, and a compact inspector
+snapshot. It never creates a native window or claims pixel/GPU equivalence.
+
+Focused and external-consumer gates:
+
+```sh
+zig build test-context --summary all
+zig build visual-test --summary all
+zig build visual-test-probe
+```
+
+`test-context` is the focused 30-test contract gate. `visual-test-probe` is an
+external `zui` consumer smoke command; it remains subject to the repository's
+normal public-module compilation prerequisites. The inspector snapshot JSON is
+stable apart from intentionally injected time fields, while golden digests and
+replayed event digests omit timestamps.
