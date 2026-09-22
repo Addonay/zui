@@ -102,6 +102,10 @@ fn modifiersFromFlags(flags: b.NSUInteger) event.Modifiers {
 /// pointer comes from the loaded libobjc table (never a link-time extern,
 /// which would force the test binary to link AppKit on Linux).
 var msg_send_fn: ?*anyopaque = null;
+/// Number of live backends that published `msg_send_fn`. It is cleared only
+/// when the last one goes away: `send()` unwraps `msg_send_fn`, so nulling it
+/// while another window is still alive panics in that window's callbacks.
+var msg_send_users: u32 = 0;
 
 fn send(comptime Fn: type) Fn {
     // Same alignment story as dl.Library.lookup: the dispatch pointer is
@@ -326,6 +330,11 @@ pub const CocoaBackend = struct {
         const objc = b.ObjcApi.load(objc_lib) orelse return error.MissingSymbols;
         const cg = b.CoreGraphicsApi.load(coregraphics) orelse return error.MissingSymbols;
         msg_send_fn = objc.msg_send;
+        msg_send_users += 1;
+        errdefer {
+            msg_send_users -= 1;
+            if (msg_send_users == 0) msg_send_fn = null;
+        }
 
         const sel = registerSels(&objc);
         const ns_app = objc.getClass(b.NSApplication) orelse return error.MissingClasses;
@@ -421,7 +430,16 @@ pub const CocoaBackend = struct {
             .debug_events = getenv("ZUI_DEBUG_EVENTS") != null,
             .renderer = gpu.vellz.Renderer.init(allocator),
         };
-        const handle = self.window_registry.register(@intFromPtr(window)) catch unreachable;
+        const handle = self.window_registry.register(@intFromPtr(window)) catch |err| {
+            // Fixed-capacity registry rejection (window limit / duplicate
+            // native id). Unwind the ObjC side the same way deinit does —
+            // drain the pool, let native objects be reclaimed at process
+            // scope — and let the errdefers free the Zig side. `active` is
+            // published only after a successful register, so any other live
+            // window keeps its routing.
+            _ = send(*const fn (b.id, b.SEL) callconv(.c) void)(self.pool, self.sel.drain);
+            return err;
+        };
         self.window_services = .{ .handle = handle, .lifecycle = .active };
         active = self;
         self.recreateBitmap();
@@ -431,10 +449,7 @@ pub const CocoaBackend = struct {
     pub fn deinit(self: *CocoaBackend) void {
         self.renderer.deinit();
         if (self.window_services) |state| _ = self.window_registry.unregister(state.handle);
-        if (active == self) {
-            active = null;
-            msg_send_fn = null;
-        }
+        if (active == self) active = null;
         if (self.image) |img| {
             self.cg.imageRelease(img);
             self.image = null;
@@ -451,6 +466,11 @@ pub const CocoaBackend = struct {
         self.coregraphics.close();
         self.objc_lib.close();
         self.allocator.destroy(self);
+        // Deliberately last: every `send()` above unwraps `msg_send_fn`, so
+        // clearing it before the pool drain panicked on the active backend's
+        // own deinit. Only the final backend may clear the dispatch pointer.
+        msg_send_users -= 1;
+        if (msg_send_users == 0) msg_send_fn = null;
     }
 
     pub fn backendHandle(self: *CocoaBackend) backend.Backend {

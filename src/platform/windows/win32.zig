@@ -303,7 +303,16 @@ pub const Win32Backend = struct {
             return error.CreateWindowFailed;
         }
         self.hwnd = hwnd;
-        const handle = self.window_registry.register(@intFromPtr(hwnd)) catch unreachable;
+        const handle = self.window_registry.register(@intFromPtr(hwnd)) catch |err| {
+            // Fixed-capacity registry rejection (window limit / duplicate
+            // native id). Drop `active` first so the WM_DESTROY traffic from
+            // the DestroyWindow below observes a torn-down backend; the
+            // errdefers then free `self` and the pixel buffer.
+            active = null;
+            _ = api.DestroyWindow(hwnd);
+            self.hwnd = null;
+            return err;
+        };
         self.window_services = .{ .handle = handle, .lifecycle = .active };
         _ = api.SetWindowLongPtrW(hwnd, b.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
         _ = api.ShowWindow(hwnd, b.SW_SHOW);
@@ -444,8 +453,20 @@ pub const Win32Backend = struct {
 
     // -- window procedure ----------------------------------------------
 
+    /// Per-window routing for the window procedure. GWLP_USERDATA carries the
+    /// backend that created the window, so messages for a second window never
+    /// land on whatever backend happened to be created last. The slot is still
+    /// empty only while CreateWindowExW is running, where `active` (the
+    /// backend under construction) is the correct owner.
+    fn backendForHwnd(hwnd: b.HWND) ?*Win32Backend {
+        const owner = active orelse return null;
+        const stored = owner.api.GetWindowLongPtrW(hwnd, b.GWLP_USERDATA);
+        if (stored == 0) return active;
+        return @as(*Win32Backend, @ptrFromInt(@as(usize, @bitCast(stored))));
+    }
+
     fn wndProc(hwnd: b.HWND, msg: b.UINT, wparam: b.WPARAM, lparam: b.LPARAM) callconv(.c) b.LRESULT {
-        const self = active;
+        const self = backendForHwnd(hwnd);
         // Route to the backend before any translation; DefWindowProc owns
         // everything we don't explicitly handle.
         switch (msg) {
