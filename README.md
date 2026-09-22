@@ -9,7 +9,8 @@ while CPU presentation remains the compatibility path.
 
 ## Toolchain
 
-- Tested with `zig version 0.17.0-dev.2151+2ec5523d5` on Linux.
+- Tested with `zig version 0.17.0-dev.2163+89ff10d56` on Linux (all gates in
+  `docs/GPUI_PARITY_MATRIX.md` re-run on this revision, 2026-09-22).
 - `build.zig.zon` declares `minimum_zig_version 0.17.0-dev.2085+5e36170b5`
   (a floor, not the tested revision). Bump it deliberately and note the
   tested revision here when upgrading. See `docs/PLATFORM_MATRIX.md`
@@ -64,6 +65,15 @@ bash tools/run-zlay-parity.sh                             # Zlay vs pinned Taffy
 python3 tools/check-gpui-parity-matrix.py                  # GPUI source-ledger gate
 bash tools/run-differential.sh                             # 18-record differential gate
 zig build debug-test                                      # trace/profiler/snapshot gate
+
+# Remaining steps (`zig build --help` lists all of them).
+zig build check                           # compile every test root + example, run nothing
+zig build renderer-probe                  # headless explicit renderer-selection probe
+zig build debug-probe                     # deterministic trace/profiler/scene snapshot dump
+zig build selftest-animation selftest-dash  # headless integration selftests for those examples
+zig build zlay-probe                      # print a matched Zlay/Taffy oracle fixture
+zig build run-dash-kit                    # Rust gpui-kit dashboard (needs cargo on PATH)
+zig build gpu-compile -Dgpu=true          # compile the Vellz/WGPU boundary (no device needed)
 ```
 
 ## Reconstructing source references

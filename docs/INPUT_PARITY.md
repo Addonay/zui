@@ -36,10 +36,10 @@ Native touch/pen/gesture delivery and live compositor drag/drop remain backend
 integration work; this slice provides the portable contract and deterministic
 core behavior those adapters target.
 
-## Current gate note (2026-09-20)
+## Current gate note (2026-09-22)
 
 The source-ledger gate passes with 7 public modules, 45 public re-exports, and
-47 source families. The aggregate headless build reports 22/22 steps (23/23
-with AccessKit) from cached artifacts. These counts do not establish native
-touch, pen, gesture, or drag/drop delivery; those remain unverified until an
-external compositor/client drives them.
+47 source families. The aggregate headless build reports 25/25 steps (26/26
+with AccessKit), 541/545 tests passed and 4 skipped on a fresh run. These
+counts do not establish native touch, pen, gesture, or drag/drop delivery;
+those remain unverified until an external compositor/client drives them.

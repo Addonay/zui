@@ -16,12 +16,12 @@ ZUI now exposes the source-backed text contracts used by this workstream:
 The deterministic tests cover feature/cache invalidation, shaping geometry,
 fallback policy, grapheme-safe ranges, and bounded large-document reflow.
 
-Verification boundary: the aggregate `zig build test` and AccessKit-enabled
-build currently report 22/22 and 23/23 build steps respectively from cached
-artifacts. A fresh `zig build test-text --summary all` run is currently
-blocked by the declaration-order error at `src/gpu/scene.zig:66`; therefore
-this document records the text APIs and prior focused evidence without
-claiming a fresh text-gate pass in the current tree.
+Verification boundary: refreshed 2026-09-22. The aggregate
+`zig build test --summary all` reports 25/25 build steps succeeded
+(541/545 tests passed, 4 skipped) and `zig build test-text --summary all`
+reports 6/6 steps succeeded (54/54 tests passed). The declaration-order
+error previously recorded at `src/gpu/scene.zig:66` no longer exists in the
+tree, so the focused text gate is no longer blocked.
 
 Native IME remains explicitly unverified here. Wayland text-input-v3, XIM,
 Windows IME, and macOS IME adapters require live compositor/platform drivers;

@@ -1,6 +1,6 @@
 # ZUI has closed many foundation gaps; the remaining path beyond GPUI is integration and proof
 
-**Assessment date:** 2026-09-20
+**Assessment date:** 2026-09-20 (gate evidence in "Executed checks" refreshed 2026-09-22)
 
 **Code baseline:** current working tree, including uncommitted changes
 **Scope:** the current ZUI tree, its pinned local references, executable local checks, limited live Linux probes, and primary upstream documentation. This is an engineering assessment, not a production-readiness certificate.
@@ -119,8 +119,8 @@ The architecture should still be kept. The next phase should harden and integrat
 - X11 button, motion, key, and text events now route through the owning
   targeted-window helper, and null/Wayland producer paths apply the queue's
   critical-event policy.
-- `zig build test --summary all` reports **22/22 steps succeeded** in the
-  current cached aggregate build, with the
+- `zig build test --summary all` reports **25/25 steps succeeded**
+  (541/545 tests passed, 4 skipped; refreshed 2026-09-22), with the
   animation integration checks passing. This proves the implemented slice and
   headless behavior; it does not prove full GPUI parity or native
   screen-reader, Windows/macOS, GPU, or visual-regression coverage.
@@ -141,16 +141,16 @@ The architecture should still be kept. The next phase should harden and integrat
 
 | Check | Result | What it establishes |
 | --- | --- | --- |
-| `zig version` | `0.17.0-dev.2151+2ec5523d5` | Current local toolchain |
-| `zig build test --summary all` | **24/24 steps succeeded; 450/454 tests passed (4 skipped)** | Aggregate headless build is green; skipped cases are host/platform/font boundaries |
-| `zig build test -Daccesskit=true --summary all` | **25/25 steps succeeded; 454/454 tests passed** | Vendored AccessKit C ABI path builds and links on native Linux; live AT-SPI semantic/action probing also passes, but this is not screen-reader speech validation |
-| `zig build test-text --summary all` | **54/54 tests passed** | Focused text, fallback, range, geometry, and bounded-document tests pass; native IME remains separate |
-| `zig build test-zlay --summary all` | **42/42 tests passed** | Focused Zlay adapter/oracle fixtures pass |
+| `zig version` | `0.17.0-dev.2163+89ff10d56` | Current local toolchain (refreshed 2026-09-22) |
+| `zig build test --summary all` | **25/25 steps succeeded; 541/545 tests passed (4 skipped)** | Aggregate headless build is green; skipped cases are host/platform/font boundaries |
+| `zig build test -Daccesskit=true --summary all` | **26/26 steps succeeded; 455/455 tests passed** | Vendored AccessKit C ABI path builds and links on native Linux; live AT-SPI semantic/action probing also passes, but this is not screen-reader speech validation |
+| `zig build test-text --summary all` | **6/6 steps succeeded; 54/54 tests passed** | Focused text, fallback, range, geometry, and bounded-document tests pass; native IME remains separate |
+| `zig build test-zlay --summary all` | **8/8 steps succeeded; 43/43 tests passed** | Focused Zlay adapter/oracle fixtures pass |
 | `zig build smoke --summary all` | **2/2 steps succeeded** | External path-dependency consumer builds |
 | `bash tools/run-zlay-parity.sh` | **PASS** | External pinned Taffy fixture matched |
-| `zig build selftest-zlay --summary all` | **10/10 steps succeeded** | Real todo/dashboard behavior runs through canonical Zlay |
-| `zig build check -Dtarget=x86_64-windows-gnu --summary all` | **15/15 succeeded** | Default configuration compiles for Windows; it was not executed |
-| `zig build check -Dtarget=aarch64-macos-none --summary all` | **15/15 succeeded** | Default configuration compiles for macOS; it was not executed |
+| `zig build selftest-zlay --summary all` | **11/11 steps succeeded** | Real todo/dashboard behavior runs through canonical Zlay |
+| `zig build check -Dtarget=x86_64-windows-gnu --summary all` | **16/16 succeeded** | Default configuration compiles for Windows; it was not executed |
+| `zig build check -Dtarget=aarch64-macos-none --summary all` | **16/16 succeeded** | Default configuration compiles for macOS; it was not executed |
 | Same Windows check with `-Daccesskit=true` | Failed in Translate-C with 44 AVX builtin errors | Optional accessibility configuration is not cross-target ready |
 | Same macOS check with `-Daccesskit=true` | Failed at `src/a11y/accesskit.zig:103` | Bridge is hard-coded around the Unix adapter type |
 | `zig build bench-text -Doptimize=fast -- --format json --iter 9 --warmup 3` | 11 standard rows, zero gate failures; 256 sentence nodes 0.62ms median and 64 wrapped paragraphs 0.47ms median | Warm cached text/layout/paint path and non-overflow standard workloads |
@@ -217,7 +217,7 @@ The report should not keep presenting these as wholly missing.
 | No inspector/profiler surface | `src/debug/inspector.zig`, `stats.zig`, overlay and documentation | **Implemented diagnostics foundation** |
 | One native window only everywhere | X11, Wayland, and null backends now route per-window handles/events | **Implemented on Linux/headless**; Win32/Cocoa remain single-window |
 | DPI is only a reported float | Logical/physical scaling, fractional Wayland path, Win32/Cocoa source handling, null pixel tests | **Substantially implemented**; native cross-monitor evidence incomplete |
-| Windows/macOS fail basic compilation | Default compile-only checks now pass 15/15 | **Fixed for default build**; AccessKit configuration still fails |
+| Windows/macOS fail basic compilation | Default compile-only checks now pass 16/16 (2026-09-22) | **Fixed for default build**; AccessKit configuration still fails |
 | No license/CI/package smoke test | `LICENSE`, `NOTICE.md`, `.github/workflows/ci.yml`, smoke consumer, manifest paths | **Implemented baseline**, with stale CI policy/comments |
 
 This work is real. It should be credited without confusing source integration and headless tests with native production validation.
@@ -508,8 +508,8 @@ The default project now compiles for Windows and macOS. Linux X11/Wayland multi-
 | --- | --- | --- |
 | Linux X11 | Native compile/launch, multi-window routing, env scale, optional XIM source path, partial live checks | XIM server/composition validation, RandR per-monitor scale, AT-SPI annotated controls, lifecycle soak |
 | Linux Wayland | Native compile/launch, per-surface windows, fractional-scale protocol, optional text-input-v3 source path, live AT-SPI semantic/action probe | Real monitor migration, live IBus/Fcitx IME, clipboard/drag-drop soak, screen-reader speech validation |
-| Windows | Default compile-only 15/15 | Native launch/input/DPI/clipboard/IME/a11y; multi-window; AccessKit-enabled build |
-| macOS | Default compile-only 15/15 | Native launch/input/DPI/clipboard/IME/a11y; multi-window; AccessKit-enabled build |
+| Windows | Default compile-only 16/16 (2026-09-22) | Native launch/input/DPI/clipboard/IME/a11y; multi-window; AccessKit-enabled build |
+| macOS | Default compile-only 16/16 (2026-09-22) | Native launch/input/DPI/clipboard/IME/a11y; multi-window; AccessKit-enabled build |
 | Headless | Unit/selftests, multi-window routing, snapshots | Visual golden suite and trace/replay |
 | GPU | Opt-in WGPU/Wayland bridge with App/Window handoff; direct Vulkan/Metal/D3D12 drivers remain stubs | Pixel-differential proof, live device-loss injection, non-Wayland backend support |
 

@@ -109,17 +109,23 @@ historical probes and eleven external fixtures are not full Taffy parity.
 
 ## Executed evidence
 
-`zig build test test-zlay selftest-zlay --summary all`:
+Refreshed 2026-09-22 — `zig build test test-zlay selftest-zlay --summary all`:
 
 ```text
-Build Summary: 20/20 steps succeeded; all required test artifacts passed
-(three platform/font tests skipped on this host)
+Build Summary: 31/31 steps succeeded; 3/4 tests passed (1 skipped)
+test success
+test-zlay success
 selftest-zlay success
-  todo: all 15 checks passed
-  dashboard: all 22 checks passed
-test-zlay: 42 pass (includes existing adapter-named tests)
-test: root and example test artifacts passed; three platform/font tests skipped
+  todo: all checks passed
+  dashboard: all checks passed
 ```
+
+The single skip is `examples/todo/daybook_tests.zig`'s
+"bridge snapshot carries annotated roots", which is gated on
+`zui.a11y.accesskit.enabled` and only runs under `-Daccesskit=true`.
+Focused gates, fresh 2026-09-22: `zig build test` **25/25 steps;
+541/545 tests passed (4 skipped)**, `zig build test-zlay` **8/8 steps;
+43/43 tests passed**, `zig build selftest-zlay` **11/11 steps** — all green.
 
 The adapter tests cover agreement/measurement fixtures, explicit divergence,
 unsupported-ledger behavior, alignment and overflow vocabulary, intrinsic and

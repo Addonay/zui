@@ -1,6 +1,6 @@
 # ZUI architecture and forward plan
 
-Status: initial architecture review, 2026-09-10. Written and revised during exploration of the current working tree. Existing uncommitted implementation changes are the baseline, not changes proposed by this review. Milestones below are proposed work, not completed implementation.
+Status: written 2026-09-10 as an architecture review of the then-current tree, and retained as historical intent. Most milestones below have since been implemented; the authoritative current status, evidence, and remaining gaps live in `ZUI_GAP_REPORT.md` (assessment 2026-09-20) and the gate snapshot in `docs/GPUI_PARITY_MATRIX.md`. Treat this document as the original plan, not a live statement of what is or is not done. Existing uncommitted implementation changes are the baseline, not changes proposed by this review.
 
 ## Direction
 
@@ -187,9 +187,15 @@ This was a targeted architecture exploration of the current, substantially modif
 - Not performed: GUI screenshots/live native interaction, cross-OS compilation/runtime tests, fresh Taffy fixture conformance, GPU execution, package smoke test, performance/allocation profiling, or exhaustive ABI/security review. Those remain explicit work above, not implied successes.
 - The root `TODO.md` is removed in favor of this plan. The todo example and its README remain; its stale README is maintenance work, not a reason to remove the example.
 
-## Deeper review in progress
+## Second-pass review (completed)
 
-A second pass is reviewing runtime/core, native platform backends, rendering/assets/text, and standalone layout/build coverage separately. The earlier findings are hypotheses to recheck, not a fixed specification. This section will be replaced with the consolidated findings, executable evidence where practical, and an explicit coverage ledger.
+The second pass reviewed runtime/core, native platform backends,
+rendering/assets/text, and standalone layout/build coverage. Its findings were
+folded into `ZUI_GAP_REPORT.md`; the layout-defect regressions it called for
+(tree mutation/reparent staleness and the three Taffy grid disagreements)
+have since been reproduced and fixed, and Zlay is now the default layout path
+with `ZUI_LAYOUT=legacy` as the escape hatch. The section that follows is the
+original second-pass checkpoint, kept for provenance.
 
 ### Second-pass checkpoint: layout integration now has a prerequisite
 

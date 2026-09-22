@@ -1,7 +1,9 @@
 # ZUI platform support matrix
 
 Assessment baseline: updated 2026-09-20, `zig version 0.17.0-dev.2151+2ec5523d5`
-on Linux x86_64. See `ZUI_GAP_REPORT.md` sections 5G/5H for the full analysis.
+on Linux x86_64; cross-target compile rows refreshed 2026-09-22 on
+`zig version 0.17.0-dev.2163+89ff10d56`. See `ZUI_GAP_REPORT.md` sections
+5G/5H for the full analysis.
 
 ## Platform-service contract boundary
 
@@ -92,8 +94,8 @@ Source presence alone is never support evidence.
 | ------ | :----: | :-----: | :----: | :------: | :-------: |
 | Linux Wayland | yes | yes (native) | yes (2026-09-18: todo app live on kwin_wayland, clean close; live multi-window protocol smoke) | partial (headless selftests; synthetic multi-window routing; live fractional-scale preferred_scale observed; `tools/native_linux_probe.sh` sees text-input-v3 and data-device globals here, but preedit/commit/cancel/caret and clipboard/drag-drop remain UNVERIFIED without external protocol drivers) | no |
 | Linux X11 | yes | yes (native) | yes (2026-09-18: todo app live, clean close exit; multi-window live tests; 2x DPI physical window observed) | partial (headless selftests; multiwindow ×5 synthetic; live targeted input; optional XIM source path with live fallback smoke; an IBus live attempt reached `XCreateIC` failure and fell back to `XLookupString`; XIM transaction and clipboard/Xdnd exchange remain UNVERIFIED) | no |
-| Windows (Win32) | yes | **yes** (`zig build check -Dtarget=x86_64-windows-gnu`, 15/15; never executed) | no | no | no |
-| macOS (Cocoa) | yes | **yes** (`zig build check -Dtarget=aarch64-macos-none`, 15/15; never executed) | no | no | no |
+| Windows (Win32) | yes | **yes** (`zig build check -Dtarget=x86_64-windows-gnu`, 16/16 as of 2026-09-22; never executed) | no | no | no |
+| macOS (Cocoa) | yes | **yes** (`zig build check -Dtarget=aarch64-macos-none`, 16/16 as of 2026-09-22; never executed) | no | no | no |
 | Accessibility bridge | yes (vendored accesskit-c 0.23.0, `-Daccesskit=true`) | yes (native + foreign targets compile without it) | yes (adapter created live on X11) | partial (live Wayland PyAT-SPI probe observes 12 semantic nodes and a successful click action; Orca/NVDA/VoiceOver speech remains unverified) | no |
 | GPU device boundary (Vellz/WGPU) | yes (opt-in) | yes (`gpu-check` with pinned wgpu-native) | yes (offscreen adapter/device probe on Mesa RADV) | partial (device limits/error path; not the default UI surface) | no |
 | Native Wayland WGPU surface smoke | yes (opt-in Linux) | yes (`gpu-wayland-smoke`) | yes (3 diagnostic frames on Mesa RADV) | partial (surface configure/acquire/present; quads/clips/images/glyphs) | no |
@@ -177,12 +179,14 @@ Observed 2026-09-17: both targets failed (X11 target leakage, Win32
 optional-function handling; alignment casts, Linux module leakage on
 macOS, nested-optional ABI type). **Fixed 2026-09-18**: both targets now
 compile 15/15 (see the git history for the gating/ABI fixes), and the CI jobs
-are required. Compile evidence exists; native runner launch/behavior
+are required. Refreshed 2026-09-22 on `0.17.0-dev.2163+89ff10d56`: both
+targets compile 16/16. Compile evidence exists; native runner launch/behavior
 validation is still open work before any parity claim.
 
 ## Toolchain policy
 
-- Tested revision: `0.17.0-dev.2151+2ec5523d5` (this machine).
+- Tested revision: `0.17.0-dev.2163+89ff10d56` (this machine, refreshed
+  2026-09-22; previously `0.17.0-dev.2151+2ec5523d5`).
 - `build.zig.zon` `minimum_zig_version`: `0.17.0-dev.2085+5e36170b5`
   (floor, not the tested revision).
 - CI installs the exact tested revision from the Zig download index.

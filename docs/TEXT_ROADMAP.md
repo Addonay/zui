@@ -77,8 +77,9 @@ color bytes enter only through the explicit color-pool API.
 
 ## Current verification note
 
-The aggregate test step reports 22/22 build steps, and the AccessKit-enabled
-aggregate reports 23/23, both from cached artifacts. The fresh focused
-`zig build test-text --summary all` gate is currently blocked by the existing
-declaration-order error at `src/gpu/scene.zig:66`; native IME and live color
-font presentation remain unverified independently.
+Refreshed 2026-09-22: the aggregate `zig build test --summary all` reports
+25/25 build steps succeeded (541/545 tests passed, 4 skipped) and the
+focused `zig build test-text --summary all` gate reports 6/6 steps
+succeeded (54/54 tests passed). The `src/gpu/scene.zig:66`
+declaration-order error that previously blocked that gate is resolved. Native
+IME and live color font presentation remain unverified independently.

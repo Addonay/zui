@@ -38,7 +38,7 @@ the advertised platform/backend validation has run. “Implemented” without
 The matrix deliberately records the checked-in GPUI source surface rather than
 claiming that a passing ZUI unit suite proves framework parity.
 
-## Current gate snapshot (2026-09-20)
+## Current gate snapshot (2026-09-22)
 
 These are the gates actually run during this reconciliation. The aggregate
 `test` results are cached build artifacts; Zig's build summary reports build
@@ -48,14 +48,14 @@ count is claimed here.
 | Gate | Current result | Status interpretation |
 | --- | --- | --- |
 | `python3 tools/check-gpui-parity-matrix.py` | **PASS: 7 modules, 45 re-exports, 47 source families, 2 executable gates** | Source inventory is synchronized with the pinned GPUI file. |
-| `zig build test --summary all` | **24/24 steps succeeded; 447/451 tests passed (4 skipped)** | Aggregate headless run is green; skipped cases are the existing host/platform/font boundaries. |
-| `zig build test -Daccesskit=true --summary all` | **25/25 steps succeeded; 451/451 tests passed** | AccessKit-enabled aggregate path is green; no native screen-reader speech behavior is implied. |
-| `zig build test-text --summary all` | **54/54 tests passed** | Focused text features, fallback, ranges, geometry, and bounded document tests pass. Native IME remains separate. |
-| `zig build test-zlay --summary all` | **42/42 tests passed** | Focused layout adapter/oracle fixtures pass. |
+| `zig build test --summary all` | **25/25 steps succeeded; 541/545 tests passed (4 skipped)** | Aggregate headless run is green; the 4 skips are host/platform/font boundaries (AccessKit-gated example test, platform/font-dependent cases). |
+| `zig build test -Daccesskit=true --summary all` | **26/26 steps succeeded; 455/455 tests passed** | AccessKit-enabled aggregate path is green; no native screen-reader speech behavior is implied. |
+| `zig build test-text --summary all` | **6/6 steps succeeded; 54/54 tests passed** | Focused text features, fallback, ranges, geometry, and bounded document tests pass. Native IME remains separate. |
+| `zig build test-zlay --summary all` | **8/8 steps succeeded; 43/43 tests passed** | Focused layout adapter/oracle fixtures pass. |
 | `bash tools/run-differential.sh` | **PASS: 18 matched records** | Contract/differential records only; not full family parity. |
-| `bash tools/run-zlay-parity.sh` | **PASS** | External Taffy fixture matched; this is separate from the blocked focused ZUI test root. |
-| `zig build check -Dtarget=x86_64-windows-gnu --summary all` | **15/15 succeeded** | Compile-only evidence. |
-| `zig build check -Dtarget=aarch64-macos-none --summary all` | **15/15 succeeded** | Compile-only evidence. |
+| `bash tools/run-zlay-parity.sh` | **PASS** | External Taffy fixture matched; the focused `test-zlay` root is green as well. |
+| `zig build check -Dtarget=x86_64-windows-gnu --summary all` | **16/16 succeeded** | Compile-only evidence. |
+| `zig build check -Dtarget=aarch64-macos-none --summary all` | **16/16 succeeded** | Compile-only evidence. |
 | `zig build debug-test --summary all` | **3/3 succeeded** | Headless trace/profiler/snapshot contract gate. |
 | `zig build test-context --summary all` | **30/30 passed** | Reusable deterministic TestContext, visual golden, replay, profiler, and inspector contract gate. |
 | `zig build gpu-wayland-test -Dgpu=true -Dwgpu-native-prefix=.ports/wgpu/.reference/artifacts/prebuilt --summary all` | **5/5 bridge tests passed** | Optional WGPU bridge evidence on this host. |

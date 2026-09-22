@@ -91,11 +91,10 @@ AccessKit's maintained platform adapters instead of reimplementing them).
 - **Verified so far** (evidence levels per `docs/PLATFORM_MATRIX.md`):
   compiles + links with the vendored library on Linux native and both
   foreign targets compile without AccessKit; live X11 window creates the
-  unix adapter (logged) with clean exit and no protocol errors; the current
-  cached AccessKit aggregate gate reports 23/23 build steps succeeded; keyed
-  TextField selection now maps to AccessKit text-selection positions. The
-  build summary does not emit a repository-wide test-case total, so no
-  aggregate case count is claimed here.
+  unix adapter (logged) with clean exit and no protocol errors; the
+  AccessKit-enabled aggregate gate reports **26/26 build steps succeeded;
+  455/455 tests passed** (fresh run 2026-09-22); keyed
+  TextField selection now maps to AccessKit text-selection positions.
 - **Not yet validated**: an actual screen reader speech workflow (Orca on
   this session has no AT running; VoiceOver/NVDA need native runners),
   Windows (UIA) and macOS (NSAccessibility) adapters, adapter-owned
