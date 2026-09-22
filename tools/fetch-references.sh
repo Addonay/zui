@@ -45,7 +45,18 @@ fetch_reference dvui "$DVUI_REPO" "$DVUI_REV" "$ROOT/.references/dvui"
 fetch_reference taffy "$TAFFY_REPO" "$TAFFY_REV" "$ROOT/.references/taffy"
 fetch_reference shadcn-zui "$SHADCN_ZUI_REPO" "$SHADCN_ZUI_REV" "$ROOT/.references/shadcn-zui"
 
-bash "$ROOT/.ports/cozmic/tools/fetch-reference.sh"
+# The cozmic port now lives in its own repository (github.com/Addonay/cozmic);
+# older checkouts kept it vendored under .ports/cozmic. Restore cozmic's
+# references from whichever location this machine has, and report a skip
+# instead of aborting when neither exists.
+if [[ -f "$ROOT/.ports/cozmic/tools/fetch-reference.sh" ]]; then
+    bash "$ROOT/.ports/cozmic/tools/fetch-reference.sh"
+elif [[ -f "$ROOT/../cozmic/tools/fetch-reference.sh" ]]; then
+    bash "$ROOT/../cozmic/tools/fetch-reference.sh"
+else
+    echo "skip: cozmic fetcher not found (looked in .ports/cozmic and ../cozmic);"
+    echo "      clone https://github.com/Addonay/cozmic next to this checkout to restore them"
+fi
 bash "$ROOT/.ports/wgpu/tools/fetch-reference.sh"
 bash "$ROOT/.ports/vellz/tools/fetch-reference.sh"
 echo "all references restored"

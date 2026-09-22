@@ -9,6 +9,10 @@
 /.ports/**/zig-pkg/
 /.ports/**/target/
 
+# Buildable binaries that happen to match a step's output name are never
+# source: a9MB `root` ELF was committed from .ports/vellz before this rule.
+/.ports/**/root
+
 # Root build products and local tool state.
 /zig-out/
 /zig-pkg/
