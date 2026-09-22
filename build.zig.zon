@@ -8,8 +8,8 @@
     .fingerprint = 0xc00160dbcf146dfd,
     .dependencies = .{
         .cozmic = .{
-            .url = "git+https://github.com/Addonay/cozmic.git#83e791d1752a1d86d7eadb19987a10fcd44307a8",
-            .hash = "cozmic-0.0.1-wv6CLXwXdACzzBiH7DZ0nw4RpxnyTkxVGwxxk6s6pc8u",
+            .url = "git+https://github.com/Addonay/cozmic.git#0f3dfd810bb8eb12289c54394362f239655ea012",
+            .hash = "cozmic-0.0.1-wv6CLQRhdABKdv8OgdfHoiXGRUcHHvZSdfuAcuqSZNQ1",
         },
         .zlay = .{
             .url = "git+https://github.com/Addonay/zlay.git#dbce9266163ba5400385693aebd86c0726464a94",
