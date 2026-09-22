@@ -154,6 +154,10 @@ pub const Atlas = struct {
     }
 
     fn hashKey(key: AtlasKey) u64 {
+        // Nine-round FNV-1a over every key field. A packed-word splitmix
+        // variant was measured with callgrind and cost ~900K *more*
+        // instructions per warm frame (the packing shifts + extensions
+        // outweigh the saved multiplies), so this chain stays.
         var hash: u64 = 14695981039346656037;
         inline for ([_]u64{
             key.face_id,

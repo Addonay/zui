@@ -699,7 +699,7 @@ fn paintLayoutCozmic(
         .origin_y = v_offset,
         .max_x = if (ellipsis_width > 0) node.bounds.x + node.bounds.w - ellipsis_width else null,
     };
-    if (layout.render(sink.renderer(), cozmic.Color{ .value = 0xFF00_0000 })) |_| {} else |_| {
+    if (layout.renderQuiet(sink.renderer(), cozmic.Color{ .value = 0xFF00_0000 })) |_| {} else |_| {
         // Resource failure: the scene may hold partial ink, so keep the
         // sink's counts and make the node observable as failed.
         node.cozmic_paint_failures += 1;
@@ -716,7 +716,7 @@ fn paintLayoutCozmic(
             .origin_x = node.bounds.x + node.bounds.w - ellipsis.width,
             .origin_y = node.bounds.y,
         };
-        _ = ellipsis.render(ellipsis_sink.renderer(), cozmic.Color{ .value = 0xFF00_0000 }) catch {
+        _ = ellipsis.renderQuiet(ellipsis_sink.renderer(), cozmic.Color{ .value = 0xFF00_0000 }) catch {
             node.cozmic_paint_failures += 1;
             frame.cozmic_paint_failures += 1;
         };

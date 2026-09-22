@@ -867,6 +867,18 @@ pub const Layout = struct {
         return ids;
     }
 
+    /// Render this exact layout through `renderer` with no statistics
+    /// bookkeeping. The per-frame painter uses this: it discards
+    /// `PaintStats`, so the counting wrapper and the second run pass that
+    /// computes `x_extent` were pure per-glyph/per-run overhead every frame.
+    pub fn renderQuiet(
+        self: *Layout,
+        renderer: cozmic.render.Renderer,
+        color: cozmic.Color,
+    ) cozmic.buffer.Error!void {
+        try self.buffer.render(self.font_system, renderer, color);
+    }
+
     /// Render this exact layout through `renderer` and report the callbacks
     /// and the painted extent. `rects` counts rectangle callbacks that reach
     /// the wrapped renderer (text decorations).
