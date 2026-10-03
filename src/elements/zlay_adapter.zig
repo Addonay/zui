@@ -159,7 +159,9 @@ fn translateStyleWithExtras(node: *const element.Node, parent: ?*const element.N
     // Keep measured leaves intrinsic in a column cross axis. Stretching text,
     // images, or custom content changes strike decorations, hit regions, and
     // sibling spacing compared with ZUI's established layout contract.
-    if (node.kind == .text or node.kind == .image or node.kind == .custom) {
+    if ((node.kind == .text or node.kind == .image or node.kind == .custom) and
+        (parent == null or parent.?.style.alignment == .stretch))
+    {
         out.align_self = .flex_start;
     }
     if (s.absolute) {

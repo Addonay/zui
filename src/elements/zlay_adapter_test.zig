@@ -6,6 +6,26 @@ const legacy = @import("layout.zig");
 const core = @import("../core/root.zig");
 const z = @import("layout");
 
+test "text and icon leaves honor explicit parent cross-axis alignment" {
+    const f = try t.allocator.create(e.Frame);
+    defer t.allocator.destroy(f);
+    f.* = .{};
+    f.allocator = t.allocator;
+    e.beginFrame(f);
+    defer e.endFrame();
+    const caption = e.text("Label", .{}).w(40).h(20);
+    const icon = e.svg("<svg width=\"16\" height=\"16\"/>").size(16);
+    const root = e.div().flex_row().items_center().w(160).h(40).gap(8)
+        .child(icon).child(caption);
+    try a.layout(f, root, .{ .w = 160, .h = 40 });
+    try t.expectApproxEqAbs(@as(f32, 12), f.nodes[icon.index].bounds.y, 0.001);
+    try t.expectApproxEqAbs(@as(f32, 10), f.nodes[caption.index].bounds.y, 0.001);
+    _ = root.items_end();
+    try a.layout(f, root, .{ .w = 160, .h = 40 });
+    try t.expectApproxEqAbs(@as(f32, 24), f.nodes[icon.index].bounds.y, 0.001);
+    try t.expectApproxEqAbs(@as(f32, 20), f.nodes[caption.index].bounds.y, 0.001);
+}
+
 fn agree(frame: *e.Frame, root: e.Element, viewport: core.Rect) !void {
     legacy.layoutLegacy(frame, root, viewport);
     const expected = try t.allocator.alloc(core.Rect, frame.node_count);

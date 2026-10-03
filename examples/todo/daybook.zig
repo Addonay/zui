@@ -204,7 +204,7 @@ pub const TodoApp = struct {
         const slot = self.a11ySlot(cx, key, listener);
         const focused = isFocused(window, slot.handle);
         var button = shadcn.Button.init(value)
-            .variant(if (primary) .primary else .outline)
+            .variant(if (primary) .primary else .ghost)
             .size(.md)
             .disabled(disabled);
         if (buttonIcon(value)) |icon| button = button.leadingIcon(icon);
@@ -288,45 +288,37 @@ pub const TodoApp = struct {
     // -----------------------------------------------------------------------
 
     pub fn render(self: *@This(), window: *Window, cx: *Context(@This())) Element {
-        self.a11y_count = 0; // per-frame activation slots; see a11ySlot
+        self.a11y_count = 0;
         const c = model.counts(self.todos.items);
-        const wide = window.bounds.size.w >= 800;
-        const content_width = @min(720, @max(0, window.bounds.size.w - 40));
-        var content = zui.div().flex_col().w(content_width).p(if (wide) 40 else 20).gap(16);
-        content = content.child(zui.div().flex_row().items_end().justify_between()
-            .child(zui.div().flex_col().gap(4)
-                .child(theme.mono("TODAY / TASKS", 10, theme.terracotta))
-                .child(theme.display("Today", 32, theme.ink))
-                .child(theme.label("A small list for what matters next.", 14, theme.muted)))
-            .child(zui.textFmt("{d} open", .{c.left}, .{ .font = theme.font.body, .size = 15, .line_height = 20, .color = theme.terracotta })));
-        content = content.child(zui.div().flex_col().gap(8)
-            .child(theme.mono("ADD TO THE LIST", 10, theme.muted))
-            .child(zui.div().flex_row().items_center().gap(8).p(6).rounded_lg().bg(theme.paper).border_1().border_color(theme.line)
-            .child(zui.div().w(26).h(26).items_center().justify_center().rounded_lg().bg(theme.terracotta_soft)
-                .child(shadcn.components.icon.render(shadcn.components.icon.semantic.plus, 16, theme.terracotta)))
-            .child(self.composer(window))
-            .child(self.uiButton(window, cx, a11y_key.add, "Add task", cx.listener(@This(), addFromDraft), true, false))));
-        content = content.child(zui.div().flex_row().gap(8)
-            .child(self.filterTab(window, cx, .all, self.filter, c.total))
-            .child(self.filterTab(window, cx, .active, self.filter, c.left))
-            .child(self.filterTab(window, cx, .done, self.filter, c.done)));
-        content = content.child(zui.div().flex_row().items_center().justify_between()
-            .child(theme.display(switch (self.filter) {
-                .all => "Tasks",
-                .active => "Open",
-                .done => "Done",
-            }, 20, theme.ink))
-            .child(zui.textFmt("{d} of {d} complete", .{ c.done, c.total }, .{ .font = theme.font.body, .size = 11, .line_height = 18, .color = theme.muted })));
-        content = content.child(self.renderList(window, cx));
-        content = content.child(zui.div().flex_row().items_center().justify_between()
-            .child(theme.label("Select a task · Space completes it", 12, theme.muted))
-            .child(self.uiButton(window, cx, a11y_key.clear, "Clear completed", cx.listener(@This(), clearCompleted), false, false)));
+        const width = @min(640, @max(0, window.bounds.size.w - 48));
+        const content = zui.div().flex_col().w(width).pt(28).gap(20)
+            .child(zui.div().flex_col().gap(8)
+                .child(zui.div().flex_row().items_center().gap(12)
+                    .child(shadcn.Icon.init(.list_checks).size(28).color(theme.accent).render())
+                    .child(theme.display("Your tasks", 30, theme.ink)))
+                .child(label("A little less to keep in your head.", 14, theme.muted)))
+            .child(zui.div().flex_col().gap(8)
+                .child(label("New task", 12, theme.muted))
+                .child(zui.div().flex_row().items_center().gap(8).p(8).rounded(12)
+                .bg(theme.paper).border_1().border_color(if (window.focused.eql(self.input.focusHandle(null))) theme.accent else shadcn.theme.input_border)
+                .child(self.composer(window))
+                .child(self.uiButton(window, cx, a11y_key.add, "Add task", cx.listener(@This(), addFromDraft), true, false))))
+            .child(zui.div().flex_col().gap(16)
+                .child(zui.div().flex_row().items_center().gap(4)
+                    .child(self.filterTab(window, cx, .all, self.filter, c.total))
+                    .child(self.filterTab(window, cx, .active, self.filter, c.left))
+                    .child(self.filterTab(window, cx, .done, self.filter, c.done)))
+                .child(self.renderList(window, cx))
+                .child(zui.div().flex_row().items_center().justify_between()
+                .child(zui.textFmt("{d} remaining", .{c.left}, .{ .font = theme.font.body, .size = 12, .line_height = 18, .color = theme.muted }))
+                .child(self.uiButton(window, cx, a11y_key.clear, "Clear completed", cx.listener(@This(), clearCompleted), false, false))))
+            .child(label("Enter to add  ·  Space to complete  ·  Delete to remove", 12, theme.muted));
         return zui.div().flex_col().size_full().bg(theme.bg)
-            .child(zui.div().flex_row().items_center().h(56).px(22).gap(10).bg(theme.sidebar).border_b_1().border_color(theme.line)
+            .child(zui.div().flex_row().items_center().h(44).px(16).gap(8).border_b_1().border_color(theme.line)
                 .on_mouse_down(cx.listener(@This(), beginDrag))
                 .on_double_click(cx.listener(@This(), toggleMaximize))
-                .child(zui.div().w(4).h(24).bg(theme.terracotta))
-                .child(theme.display("daybook", 18, theme.ink))
+                .child(shadcn.Icon.init(.list_checks).size(16).color(theme.muted).render())
+                .child(label("Daybook", 13, theme.muted))
                 .child(zui.spacer())
                 .child(self.winChrome(window, cx, a11y_key.win_min, "—", "Minimize", minimizeWindow))
                 .child(self.winChrome(window, cx, a11y_key.win_max, if (window.isMaximized()) "▢" else "□", if (window.isMaximized()) "Restore" else "Maximize", toggleMaximize))
@@ -348,7 +340,7 @@ pub const TodoApp = struct {
             .child(theme.label(if (self.filter == .all) "Write a task above and it will land here." else "Choose All to see your whole list.", 13, theme.muted));
         const current_page = @min(self.page, (count - 1) / page_size);
         const last_page = (count - 1) / page_size;
-        var list = zui.div().flex_col().gap(8)
+        var list = zui.div().flex_col().gap(1).p(1).rounded(12).bg(theme.line)
             .keyed(a11y_key.list)
             .semantic(.{ .role = .list, .name = "Tasks" });
         var index: usize = 0;
@@ -382,9 +374,9 @@ pub const TodoApp = struct {
         const delete_button = shadcn.IconButton.init(shadcn.components.icon.semantic.trash).variant(.ghost).size(32, 16).render();
         var del_name_buf: [128]u8 = undefined;
         const del_name = std.fmt.bufPrint(&del_name_buf, "Delete {s}", .{todo.title.slice()}) catch "Delete";
-        return zui.div().flex_row().items_center().gap(12).p(12).rounded_lg()
+        return zui.div().flex_row().items_center().gap(14).px(16).h(56).rounded(8)
             .bg(if (selected) theme.terracotta_soft else theme.paper)
-            .border_1().border_color(if (selected or row_focused) theme.accent else theme.border)
+            .border_1().border_color(if (selected or row_focused) theme.accent else zui.transparent())
             .keyed(row_key)
             .withFocus(row_slot.handle)
             .semantic(.{
@@ -484,6 +476,7 @@ fn label(value: []const u8, size: f32, color: zui.Color) Element {
 fn preloadShadcnIcons(cache: *zui.images.Cache) !void {
     inline for (.{
         shadcn.components.icon.semantic.plus,
+        shadcn.components.icon.Name.list_checks,
         shadcn.components.icon.semantic.check,
         shadcn.components.icon.Name.list,
         shadcn.components.icon.Name.circle,
@@ -524,10 +517,11 @@ fn seedDemo(view: Entity(TodoApp), enabled: bool) void {
     if (view.read().todos.items.len > 0) {
         view.updateWith(view.read().todos.items[0].id, TodoApp.toggle);
     }
+    view.readMut().selected = null;
 }
 
 fn onOpen(cx: *App) void {
-    const bounds = zui.Bounds.centered(null, zui.size(960, 800), cx);
+    const bounds = zui.Bounds.centered(null, zui.size(760, 640), cx);
     _ = cx.openWindow(.{
         .bounds = bounds,
         .title = "Daybook",
