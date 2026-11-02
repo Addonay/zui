@@ -8,6 +8,11 @@
             .url = "git+https://github.com/Addonay/cozmic.git#bbc0f4f282acd024d1dc0b5e4d16fc4b08fcb6b0",
             .hash = "cozmic-0.2.0-wv6CLdHadgCZDgNzVIZ0hrEahjAznoWRePQaKF444Q4p",
         },
+        .zicr = .{
+            .url = "git+https://github.com/Addonay/zicr.git#87fe62228af2b69527ccd503da035c86b490ef42",
+            .hash = "zicr-0.0.1-HkxCrMMFQQBKOBbLswueqTQ6J4MspWkauSpOXQvZ5JEp",
+            .lazy = true,
+        },
         .zafi = .{
             .url = "git+https://github.com/Addonay/zafi.git#04086f7a21f120a5ea52f921fb2034d75e10264f",
             .hash = "zafi-0.4.1-gvFdNm2TFABhWk0z8IvfPUm8cq1RoQ_mztSiQ5IoZyyr",
