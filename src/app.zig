@@ -12,6 +12,9 @@ const text_system_mod = @import("text_system.zig");
 const executor_mod = @import("executor.zig");
 const keymap_mod = @import("keymap.zig");
 const action_mod = @import("action.zig");
+const assets_mod = @import("assets.zig");
+const uniform_list_mod = @import("elements/uniform_list.zig");
+const list_mod = @import("elements/list.zig");
 
 const Window = window_mod.Window;
 const WindowOptions = window_mod.WindowOptions;
@@ -293,6 +296,32 @@ pub fn Context(comptime T: type) type {
             return .{ .ctx = cap, .func = S.call };
         }
 
+        /// Wraps `f(this, range, window, cx) []AnyElement` into a range renderer for `uniform_list` (GPUI `processor`).
+        pub fn processor(self: *const Self, comptime f: anytype) uniform_list_mod.RangeRenderer {
+            const S = struct {
+                fn call(ctx: *anyopaque, range: uniform_list_mod.Range, window: *Window, app: *App) []element_mod.AnyElement {
+                    const id = EntityId.from_u64(@intFromPtr(ctx));
+                    const state = app.entities.get(id) orelse return &.{};
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    return f(@as(*T, @ptrCast(@alignCast(state))), range, window, &c);
+                }
+            };
+            return .{ .ctx = @ptrFromInt(@as(usize, @intCast(self.entity_id_.as_u64()))), .func = S.call };
+        }
+
+        /// Wraps `f(this, ix, window, cx) AnyElement` into an item renderer for `list` (GPUI `processor`).
+        pub fn item_processor(self: *const Self, comptime f: anytype) list_mod.ItemRenderer {
+            const S = struct {
+                fn call(ctx: *anyopaque, ix: usize, window: *Window, app: *App) element_mod.AnyElement {
+                    const id = EntityId.from_u64(@intFromPtr(ctx));
+                    const state = app.entities.get(id) orelse @panic("list item rendered for a released entity");
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    return f(@as(*T, @ptrCast(@alignCast(state))), ix, window, &c);
+                }
+            };
+            return .{ .ctx = @ptrFromInt(@as(usize, @intCast(self.entity_id_.as_u64()))), .func = S.call };
+        }
+
         /// Observes `observed`: `f(this, observed, cx)` runs whenever it notifies.
         pub fn observe(self: *Self, observed: anytype, comptime f: anytype) Subscription {
             const E = @TypeOf(observed);
@@ -540,6 +569,10 @@ pub const App = struct {
     /// Arena for effect payloads; reset after each flush.
     effect_arena: std.heap.ArenaAllocator,
     text_system_: *text_system_mod.TextSystem,
+    /// Named assets for `img()` and `svg()` (set with `Application.with_assets`).
+    asset_source: assets_mod.AssetSource = assets_mod.AssetSource.empty,
+    /// Decoded images, decoded once per source.
+    asset_cache: assets_mod.AssetCache,
     background_executor_: executor_mod.BackgroundExecutor,
     foreground_executor_: executor_mod.ForegroundExecutor,
     keymap: keymap_mod.Keymap,
@@ -557,6 +590,7 @@ pub const App = struct {
             .platform = platform,
             .effect_arena = .init(allocator),
             .text_system_ = try text_system_mod.TextSystem.create(allocator),
+            .asset_cache = assets_mod.AssetCache.init(allocator),
             .background_executor_ = executor_mod.BackgroundExecutor.init(allocator, platform),
             .foreground_executor_ = executor_mod.ForegroundExecutor.init(allocator, platform),
             .keymap = keymap_mod.Keymap.init(allocator),
@@ -582,6 +616,7 @@ pub const App = struct {
         self.pending_effects.deinit(self.allocator);
         self.effect_arena.deinit();
         self.text_system_.destroy();
+        self.asset_cache.deinit();
         self.background_executor_.deinit();
         self.foreground_executor_.deinit();
         self.keymap.deinit();
@@ -1109,14 +1144,19 @@ pub const Application = struct {
         return .{ .allocator = allocator, .platform = platform, .app = app };
     }
 
+    /// Sets the source of named assets (GPUI `with_assets`). `source` is a pointer to a type with
+    /// `load(path) ?[]const u8`, or an `assets.AssetSource`; it must outlive the app.
+    pub fn with_assets(self: Application, source: anytype) Application {
+        self.app.asset_source = if (@TypeOf(source) == assets_mod.AssetSource) source else assets_mod.AssetSource.from(source);
+        return self;
+    }
+
     /// Starts the event loop. `on_finish_launching(cx)` runs once the platform is ready.
     pub fn run(self: Application, comptime on_finish_launching: fn (*App) void) void {
         const S = struct {
             fn launched(ctx: *anyopaque) void {
                 const app: *App = @ptrCast(@alignCast(ctx));
-                app.pending_updates += 1;
                 on_finish_launching(app);
-                app.pending_updates -= 1;
                 app.flush_effects();
             }
         };

@@ -118,3 +118,49 @@ pub fn Canvas(comptime Ctx: type, comptime Callbacks: type) type {
         }
     };
 }
+
+const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+const div_mod = @import("div.zig");
+const std = @import("std");
+
+/// Records what the canvas callbacks received during the last frame.
+const CanvasRecord = struct {
+    var prepaint_context: u32 = 0;
+    var painted_bounds: ?Bounds(Pixels) = null;
+    var painted_state: f32 = 0;
+};
+
+fn canvas_prepaint(context: u32, bounds: Bounds(Pixels), _: *Window, _: *App) f32 {
+    CanvasRecord.prepaint_context = context;
+    return bounds.size.width + 0.5;
+}
+
+fn canvas_paint(_: u32, bounds: Bounds(Pixels), state: *f32, _: *Window, _: *App) void {
+    CanvasRecord.painted_bounds = bounds;
+    CanvasRecord.painted_state = state.*;
+}
+
+/// A root view containing a 300x200 canvas.
+const CanvasTestView = struct {
+    pub fn render(_: *CanvasTestView, _: *Window, _: *app_mod.Context(CanvasTestView)) *div_mod.Div {
+        return div_mod.div().size_full().child(
+            canvas(@as(u32, 7), canvas_prepaint, canvas_paint).w(geometry.px(300)).h(geometry.px(200)),
+        );
+    }
+
+    fn build(_: *Window, app: *App) app_mod.Entity(CanvasTestView) {
+        return app.new(CanvasTestView{});
+    }
+};
+
+test "canvas: prepaint state flows into paint with the styled bounds" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, _ = cx.add_window_view(CanvasTestView.build);
+
+    try std.testing.expectEqual(@as(u32, 7), CanvasRecord.prepaint_context);
+    const painted = CanvasRecord.painted_bounds orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(Pixels, 300), painted.size.width);
+    try std.testing.expectEqual(@as(Pixels, 200), painted.size.height);
+    try std.testing.expectEqual(@as(f32, 300.5), CanvasRecord.painted_state);
+}

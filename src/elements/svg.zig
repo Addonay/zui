@@ -194,9 +194,9 @@ const SvgTile = struct {
             .asset => |p| self.source.load(p) orelse return null,
         };
         const renderer = try self.cache.svg_renderer();
-        const svg = renderer.parse_svg(arena, bytes) catch return null;
-        defer svg.deinit();
-        const mask = renderer.render_alpha_mask(arena, svg, .{ .size = self.size }) catch return null;
+        const parsed = renderer.parse_svg(arena, bytes) catch return null;
+        defer parsed.deinit();
+        const mask = renderer.render_alpha_mask(arena, parsed, .{ .size = self.size }) catch return null;
         return .{
             .size = .{ .width = @intCast(mask.width), .height = @intCast(mask.height) },
             .bytes = mask.pixels,
@@ -217,6 +217,16 @@ test "svg key depends on source and size" {
     const c = svg_key(.{ .asset = "b.svg" }, .{ .width = 16, .height = 16 });
     try std.testing.expect(a != b);
     try std.testing.expect(a != c);
+}
+
+test "element protocol instantiates the svg hooks" {
+    _ = &Svg.request_layout;
+    _ = &Svg.prepaint;
+    _ = &Svg.paint;
+    _ = &Svg.path;
+    _ = &Svg.external_path;
+    _ = &Svg.data;
+    _ = &Svg.with_transformation;
 }
 
 test {

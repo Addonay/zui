@@ -1233,7 +1233,7 @@ pub const Window = struct {
             const d = self.next_frame.deferred_draws.items[i];
             const saved = self.text_style_stack.items.len;
             self.text_style_stack.appendSlice(self.allocator, d.text_style_stack) catch oom();
-            _ = d.element.layout_as_root(.{ .width = .max_content, .height = .max_content }, self, cx);
+            // The deferred child was laid out by `Deferred.request_layout`; GPUI only prepaints it here.
             d.element.prepaint_at(d.absolute_offset, self, cx);
             self.text_style_stack.shrinkRetainingCapacity(saved);
         }

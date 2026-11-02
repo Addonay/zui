@@ -295,6 +295,8 @@ pub fn into_any_element(value: anytype) AnyElement {
         .@"struct", .@"union" => {
             if (@hasDecl(T, "into_any_element")) return value.into_any_element();
             if (@hasDecl(T, "into_element")) return into_any_element(value.into_element());
+            // A bare element value (GPUI `impl Element` is also `IntoElement`).
+            if (@hasDecl(T, "request_layout")) return AnyElement.new(value);
         },
         else => {},
     }

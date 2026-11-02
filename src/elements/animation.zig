@@ -429,3 +429,81 @@ test "reduce motion renders a single static frame" {
     const repeated = advance_animation(&repeating, &state, 10, true);
     try std.testing.expectEqual(@as(f32, 0.0), repeated.delta);
 }
+
+// -- window tests -------------------------------------------------------------
+
+const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+const div_mod = @import("div.zig");
+const Div = div_mod.Div;
+const Context = app_mod.Context;
+
+/// The first spring value the animator received in the current test.
+var test_spring_first: ?f32 = null;
+
+fn grow_box(element: *Div, delta: f32) *Div {
+    return element.w(geometry.px(10 + delta));
+}
+
+fn record_spring(element: *Div, value: f32) *Div {
+    if (test_spring_first == null) test_spring_first = value;
+    return element;
+}
+
+/// A view whose box is animated with a repeating animation.
+const AnimationTestView = struct {
+    pub fn render(_: *AnimationTestView, _: *Window, _: *Context(AnimationTestView)) *Div {
+        return div_mod.div().size_full().child(with_animation(
+            div_mod.div().id("box").w(geometry.px(10)).h(geometry.px(10)),
+            "box-animation",
+            Animation.new(60 * std.time.ns_per_s).repeat(),
+            grow_box,
+        ));
+    }
+
+    fn build(_: *Window, app: *App) app_mod.Entity(AnimationTestView) {
+        return app.new(AnimationTestView{});
+    }
+};
+
+/// A view whose box follows a spring from 0 towards 100.
+const SpringTestView = struct {
+    pub fn render(_: *SpringTestView, _: *Window, _: *Context(SpringTestView)) *Div {
+        const animation = spring.SpringAnimation.new(spring.SpringConfig.new(100, 2, 1))
+            .to(@as(f32, 100))
+            .from(@as(f32, 0));
+        return div_mod.div().size_full().child(with_spring(
+            div_mod.div().id("spring-box").w(geometry.px(10)).h(geometry.px(10)),
+            "spring-animation",
+            animation,
+            record_spring,
+        ));
+    }
+
+    fn build(_: *Window, app: *App) app_mod.Entity(SpringTestView) {
+        return app.new(SpringTestView{});
+    }
+};
+
+test "with_animation requests animation frames while it runs" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(AnimationTestView.build);
+    try std.testing.expect(vcx.window.animation_requested);
+}
+
+test "with_animation renders a single static frame under reduce motion" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.set_reduce_motion(true);
+    _, const vcx = cx.add_window_view(AnimationTestView.build);
+    try std.testing.expect(!vcx.window.animation_requested);
+}
+
+test "with_spring drives the element from its initial value and keeps animating" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    test_spring_first = null;
+    _, const vcx = cx.add_window_view(SpringTestView.build);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), test_spring_first orelse return error.TestExpectedEqual, 1e-6);
+    try std.testing.expect(vcx.window.animation_requested);
+}

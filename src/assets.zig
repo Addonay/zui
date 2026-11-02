@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const geometry = @import("geometry.zig");
-const svg_renderer = @import("svg_renderer.zig");
+const svg_mod = @import("svg_renderer.zig");
 
 const Pixels = geometry.Pixels;
 const DevicePixels = geometry.DevicePixels;
@@ -54,16 +54,16 @@ pub const AssetSource = struct {
     pub fn from(pointer: anytype) AssetSource {
         const T = @typeInfo(@TypeOf(pointer)).pointer.child;
         const S = struct {
-            fn load(ptr: *anyopaque, path: []const u8) ?[]const u8 {
+            fn load_fn(ptr: *anyopaque, path: []const u8) ?[]const u8 {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return self.load(path);
             }
-            fn list(ptr: *anyopaque, allocator: std.mem.Allocator, path: []const u8) error{OutOfMemory}![]const []const u8 {
+            fn list_fn(ptr: *anyopaque, allocator: std.mem.Allocator, path: []const u8) error{OutOfMemory}![]const []const u8 {
                 if (!@hasDecl(T, "list")) return &.{};
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return self.list(allocator, path);
             }
-            const vtable: VTable = .{ .load = load, .list = list };
+            const vtable: VTable = .{ .load = load_fn, .list = list_fn };
         };
         return .{ .ptr = @ptrCast(pointer), .vtable = &S.vtable };
     }
@@ -266,7 +266,7 @@ fn frame_from_rgba_copy(allocator: std.mem.Allocator, rgba: []const u8, width: u
 
 /// Decodes `bytes` as `format` into a new `RenderImage` (GPUI `Image::to_image_data`).
 /// SVG documents are rasterized by `renderer`.
-pub fn decode(allocator: std.mem.Allocator, renderer: *svg_renderer.SvgRenderer, format: ImageFormat, bytes: []const u8) ImageCacheError!*RenderImage {
+pub fn decode(allocator: std.mem.Allocator, renderer: *svg_mod.SvgRenderer, format: ImageFormat, bytes: []const u8) ImageCacheError!*RenderImage {
     if (format == .svg) return renderer.render_single_frame(allocator, bytes, 1.0) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidSvg,
@@ -324,8 +324,9 @@ fn decode_gif(allocator: std.mem.Allocator, bytes: []const u8) ImageCacheError![
 
 /// Reads a whole file into `allocator`-owned memory.
 pub fn read_file(allocator: std.mem.Allocator, path: []const u8) ImageCacheError![]u8 {
-    const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+    const path_z = allocator.allocSentinel(u8, path.len, 0) catch return error.OutOfMemory;
     defer allocator.free(path_z);
+    @memcpy(path_z[0..path.len], path);
     const file = std.c.fopen(path_z.ptr, "rb") orelse return error.ReadFailed;
     defer _ = std.c.fclose(file);
     var out: std.ArrayList(u8) = .empty;
@@ -344,7 +345,7 @@ pub fn read_file(allocator: std.mem.Allocator, path: []const u8) ImageCacheError
 pub const AssetCache = struct {
     allocator: std.mem.Allocator,
     images: std.AutoHashMapUnmanaged(u64, ImageCacheError!*RenderImage) = .empty,
-    svg: ?svg_renderer.SvgRenderer = null,
+    svg: ?svg_mod.SvgRenderer = null,
 
     pub fn init(allocator: std.mem.Allocator) AssetCache {
         return .{ .allocator = allocator };
@@ -360,8 +361,8 @@ pub const AssetCache = struct {
     }
 
     /// The app's SVG rasterizer, created on first use.
-    pub fn svg_renderer(self: *AssetCache) ImageCacheError!*svg_renderer.SvgRenderer {
-        if (self.svg == null) self.svg = svg_renderer.SvgRenderer.init() catch return error.OutOfMemory;
+    pub fn svg_renderer(self: *AssetCache) ImageCacheError!*svg_mod.SvgRenderer {
+        if (self.svg == null) self.svg = svg_mod.SvgRenderer.init() catch return error.OutOfMemory;
         return &self.svg.?;
     }
 
@@ -526,41 +527,62 @@ test "guess_format recognizes magic numbers" {
 test "png decodes to BGRA with straight alpha" {
     const png = try make_test_png();
     defer testing.allocator.free(png);
-    var renderer = try svg_renderer.SvgRenderer.init();
+    var renderer = try svg_mod.SvgRenderer.init();
     defer renderer.deinit();
 
     const img = try decode(testing.allocator, &renderer, .png, png);
     defer img.deinit();
     try testing.expectEqual(@as(usize, 1), img.frame_count());
-    try testing.expectEqual(DevicePixels{ .width = 2, .height = 1 }, img.size(0));
+    try testing.expectEqual(@as(DevicePixels, 2), img.size(0).width);
+    try testing.expectEqual(@as(DevicePixels, 1), img.size(0).height);
     try testing.expectEqualSlices(u8, &.{
         0, 0, 255, 255, // red -> BGRA
         0, 255, 0, 128, // green, half alpha
     }, img.as_bytes(0).?);
 }
 
+fn append_le(list: *std.ArrayList(u8), comptime T: type, v: T) !void {
+    var buf: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &buf, v, .little);
+    try list.appendSlice(testing.allocator, &buf);
+}
+
 test "bmp decodes 24-bit rows with padding" {
-    // 2x1, 24-bit, bottom-up. Row data is 6 bytes padded to 8.
-    const bmp = [_]u8{
-        'B', 'M', 58, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, // file header, pixel offset 54
-        40, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0, 24, 0, // DIB header: 2x1, 1 plane, 24 bpp
-        0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // compression, size, resolution, palette
-        0, 0, 255, 0, 255, 0, 0, 0, // red (BGR), green (BGR), padding
-    };
-    var renderer = try svg_renderer.SvgRenderer.init();
+    // 2x1, 24-bit, bottom-up. Each row is 6 bytes of pixels padded to 8.
+    var bmp: std.ArrayList(u8) = .empty;
+    defer bmp.deinit(testing.allocator);
+    try bmp.appendSlice(testing.allocator, "BM");
+    try append_le(&bmp, u32, 54 + 8); // file size
+    try append_le(&bmp, u32, 0); // reserved
+    try append_le(&bmp, u32, 54); // pixel data offset
+    try append_le(&bmp, u32, 40); // BITMAPINFOHEADER size
+    try append_le(&bmp, i32, 2); // width
+    try append_le(&bmp, i32, 1); // height (positive: bottom-up)
+    try append_le(&bmp, u16, 1); // planes
+    try append_le(&bmp, u16, 24); // bits per pixel
+    try append_le(&bmp, u32, 0); // compression
+    try append_le(&bmp, u32, 8); // image size
+    try append_le(&bmp, i32, 2835); // x pixels per meter
+    try append_le(&bmp, i32, 2835); // y pixels per meter
+    try append_le(&bmp, u32, 0); // colors used
+    try append_le(&bmp, u32, 0); // important colors
+    try bmp.appendSlice(testing.allocator, &.{ 0, 0, 255, 0, 255, 0, 0, 0 }); // red, green (BGR), padding
+
+    var renderer = try svg_mod.SvgRenderer.init();
     defer renderer.deinit();
 
-    const img = try decode(testing.allocator, &renderer, .bmp, &bmp);
+    const img = try decode(testing.allocator, &renderer, .bmp, bmp.items);
     defer img.deinit();
-    try testing.expectEqual(DevicePixels{ .width = 2, .height = 1 }, img.size(0));
+    try testing.expectEqual(@as(DevicePixels, 2), img.size(0).width);
+    try testing.expectEqual(@as(DevicePixels, 1), img.size(0).height);
     try testing.expectEqualSlices(u8, &.{
-        0, 0, 255, 255,
-        0, 255, 0, 255,
+        0, 0,   255, 255,
+        0, 255, 0,   255,
     }, img.as_bytes(0).?);
 }
 
 test "unsupported formats are reported, not decoded" {
-    var renderer = try svg_renderer.SvgRenderer.init();
+    var renderer = try svg_mod.SvgRenderer.init();
     defer renderer.deinit();
     try testing.expectError(error.UnsupportedFormat, decode(testing.allocator, &renderer, .webp, "RIFF....WEBP"));
 }

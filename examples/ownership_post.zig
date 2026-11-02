@@ -1,4 +1,7 @@
 //! Port of GPUI's `examples/ownership_post.rs`.
+//!
+//! Zig initializers cannot capture `counter`, so the subscriber is created first and
+//! then subscribes and reads the counter inside `update` (the same state as the Rust closure).
 
 const std = @import("std");
 const gpui = @import("zui");
@@ -23,16 +26,21 @@ fn run_example(cx: *App) void {
         }
     }.init);
     const subscriber = cx.new(struct {
-        fn init(cx2: *Context(Counter)) Counter {
-            _ = cx2.subscribe(counter, struct {
+        fn init(_: *Context(Counter)) Counter {
+            return .{ .count = 0 };
+        }
+    }.init);
+    subscriber.update(cx, struct {
+        fn update(s: *Counter, counter_: Entity(Counter), cx2: *Context(Counter)) void {
+            _ = cx2.subscribe(counter_, struct {
                 fn on_change(subscriber_: *Counter, _: Entity(Counter), event: *const Change, _: *Context(Counter)) void {
                     subscriber_.count += event.increment * 2;
                 }
             }.on_change).detach();
 
-            return .{ .count = counter.read(cx2).count * 2 };
+            s.count = counter_.read(cx2).count * 2;
         }
-    }.init);
+    }.update, .{counter});
 
     counter.update(cx, struct {
         fn update(c: *Counter, cx2: *Context(Counter)) void {

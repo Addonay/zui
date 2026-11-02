@@ -52,7 +52,13 @@ pub const elements = struct {
     pub const deferred = @import("elements/deferred.zig");
     pub const canvas = @import("elements/canvas.zig");
     pub const animation = @import("elements/animation.zig");
+    pub const img = @import("elements/img.zig");
+    pub const svg = @import("elements/svg.zig");
+    pub const uniform_list = @import("elements/uniform_list.zig");
+    pub const list = @import("elements/list.zig");
 };
+pub const assets = @import("assets.zig");
+pub const svg_renderer = @import("svg_renderer.zig");
 pub const spring = @import("spring.zig");
 
 // -- geometry ---------------------------------------------------------------
@@ -71,6 +77,7 @@ pub const Corners = geometry.Corners;
 pub const Corner = geometry.Corner;
 pub const Axis = geometry.Axis;
 pub const px = geometry.px;
+pub const half = geometry.half;
 pub const rems = geometry.rems;
 pub const relative = geometry.relative;
 pub const phi = geometry.phi;
@@ -186,6 +193,21 @@ pub const div = elements.div.div;
 pub const style_refinement = elements.div.style;
 pub const StyledText = elements.text.StyledText;
 pub const empty = elements.empty.empty;
+pub const Img = elements.img.Img;
+/// Creates an image element (GPUI `img`).
+pub const img = elements.img.img;
+pub const Svg = elements.svg.Svg;
+/// Creates an SVG element (GPUI `svg`).
+pub const svg = elements.svg.svg;
+pub const Transformation = elements.svg.Transformation;
+pub const ImageSource = assets.ImageSource;
+pub const Image = assets.Image;
+pub const ImageFormat = assets.ImageFormat;
+pub const RenderImage = assets.RenderImage;
+pub const AssetSource = assets.AssetSource;
+pub const Resource = assets.Resource;
+pub const ImageCacheError = assets.ImageCacheError;
+pub const SvgRenderer = svg_renderer.SvgRenderer;
 
 // -- anchored / deferred / canvas -------------------------------------------
 pub const Anchored = elements.anchored.Anchored;
@@ -197,6 +219,27 @@ pub const deferred = elements.deferred.deferred;
 pub const Canvas = elements.canvas.Canvas;
 pub const canvas = elements.canvas.canvas;
 pub const canvas_fn = elements.canvas.canvas_fn;
+
+// -- uniform_list / list ----------------------------------------------------
+pub const uniform_list = elements.uniform_list.uniform_list;
+pub const UniformList = elements.uniform_list.UniformList;
+pub const UniformListScrollHandle = elements.uniform_list.UniformListScrollHandle;
+pub const UniformListScrollState = elements.uniform_list.UniformListScrollState;
+pub const UniformListDecoration = elements.uniform_list.UniformListDecoration;
+pub const ScrollStrategy = elements.uniform_list.ScrollStrategy;
+pub const RangeRenderer = elements.uniform_list.RangeRenderer;
+pub const Range = elements.uniform_list.Range;
+pub const list = elements.list.list;
+pub const List = elements.list.List;
+pub const ListState = elements.list.ListState;
+pub const ListAlignment = elements.list.ListAlignment;
+pub const ListOffset = elements.list.ListOffset;
+pub const ListScrollEvent = elements.list.ListScrollEvent;
+pub const ListSizingBehavior = elements.list.ListSizingBehavior;
+pub const ListHorizontalSizingBehavior = elements.list.ListHorizontalSizingBehavior;
+pub const ListMeasuringBehavior = elements.list.ListMeasuringBehavior;
+pub const FollowMode = elements.list.FollowMode;
+pub const ItemRenderer = elements.list.ItemRenderer;
 
 // -- animation / spring -------------------------------------------------------
 pub const Animation = elements.animation.Animation;
@@ -256,4 +299,9 @@ pub const prelude = struct {
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("spring.zig");
+    _ = @import("elements/anchored.zig");
+    _ = @import("elements/deferred.zig");
+    _ = @import("elements/canvas.zig");
+    _ = @import("elements/animation.zig");
 }

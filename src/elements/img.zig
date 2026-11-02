@@ -112,9 +112,9 @@ pub const ImgExt = struct {
             if (visible.size.width <= 0 or visible.size.height <= 0) return;
             if (new_bounds.size.width <= 0 or new_bounds.size.height <= 0) return;
 
-            const builder = ImageTile{ .image = data, .frame = frame };
+            var builder = ImageTile{ .image = data, .frame = frame };
             const key = atlas.AtlasKey{ .image = image_key(data.id, frame) };
-            const tile = (window.sprite_atlas.get_or_insert_with(key, .{ .context = @constCast(&builder), .build_fn = ImageTile.build }) catch return) orelse return;
+            const tile = (window.sprite_atlas.get_or_insert_with(key, .{ .context = &builder, .build_fn = ImageTile.build }) catch return) orelse return;
 
             const radii = s.corner_radii.to_pixels(window.rem_size()).clamp_radii_for_quad_size(visible.size);
             window.paint_polychrome_tile(visible, radii, sub_tile(tile, new_bounds, visible), e.grayscale_);
@@ -213,6 +213,16 @@ test "sub_tile crops the atlas tile to the visible part" {
     const sub = sub_tile(tile, image, visible);
     try std.testing.expectEqual(@as(DevicePixels, 50), sub.bounds.origin.x);
     try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.size.width);
+}
+
+test "element protocol instantiates the image hooks" {
+    // Referencing the protocol functions instantiates `StyledElement(ImgExt)` and type-checks the hooks.
+    _ = &Img.request_layout;
+    _ = &Img.prepaint;
+    _ = &Img.paint;
+    _ = &Img.object_fit;
+    _ = &Img.grayscale;
+    _ = &Img.with_fallback;
 }
 
 test {

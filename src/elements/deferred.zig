@@ -57,3 +57,34 @@ test "deferred stores its child and priority" {
     try std.testing.expectEqual(@as(usize, 3), element.priority_value);
     try std.testing.expect(element.child == null);
 }
+
+const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+const div_mod = @import("div.zig");
+
+/// A root view whose only child is a deferred element.
+const DeferredTestView = struct {
+    pub fn render(_: *DeferredTestView, _: *Window, _: *app_mod.Context(DeferredTestView)) *div_mod.Div {
+        return div_mod.div().size_full().child(
+            deferred(div_mod.div().id("deferred-child").w(geometry.px(50)).h(geometry.px(40))).with_priority(2),
+        );
+    }
+
+    fn build(_: *Window, app: *app_mod.App) app_mod.Entity(DeferredTestView) {
+        return app.new(DeferredTestView{});
+    }
+};
+
+test "deferred: the child is laid out and drawn in its place" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(DeferredTestView.build);
+
+    for (vcx.window.rendered_frame.hitboxes.items) |hitbox| {
+        if (hitbox.bounds.size.width == 50 and hitbox.bounds.size.height == 40) {
+            try std.testing.expectEqual(@as(Pixels, 0), hitbox.bounds.origin.x);
+            try std.testing.expectEqual(@as(Pixels, 0), hitbox.bounds.origin.y);
+            return;
+        }
+    }
+    return error.TestExpectedEqual;
+}

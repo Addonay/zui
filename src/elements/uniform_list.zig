@@ -317,14 +317,14 @@ pub const UniformList = struct {
         item_count: usize,
 
         fn measure(ctx: *anyopaque, known: Size(?Pixels), available: Size(AvailableSpace), _: *Window, _: *App) Size(Pixels) {
-            const m: *const MeasuredSize = @ptrCast(@alignCast(ctx));
-            const desired_height = m.item.height * @as(f32, @floatFromInt(m.item_count));
+            const measured_size: *const MeasuredSize = @ptrCast(@alignCast(ctx));
+            const desired_height = measured_size.item.height * @as(f32, @floatFromInt(measured_size.item_count));
             const width = known.width orelse switch (available.width) {
-                .definite => |w| w,
-                .min_content, .max_content => m.item.width,
+                .definite => |avail_w| avail_w,
+                .min_content, .max_content => measured_size.item.width,
             };
             const height = switch (available.height) {
-                .definite => |h| @min(desired_height, h),
+                .definite => |avail_h| @min(desired_height, avail_h),
                 .min_content, .max_content => desired_height,
             };
             return .{ .width = width, .height = height };
@@ -341,15 +341,15 @@ pub const UniformList = struct {
         const style_ = &pp.style;
 
         const rem = window.rem_size();
-        const border = style_.border_widths.to_pixels(.{rem});
+        const border_px = style_.border_widths.to_pixels(.{rem});
         const padding = style_.padding.to_pixels(.{
-            Size(style_mod.AbsoluteLength){ .width = .{ .pixels = bounds.size.width }, .height = .{ .pixels = bounds.size.height } },
+            Size(geometry.AbsoluteLength){ .width = .{ .pixels = bounds.size.width }, .height = .{ .pixels = bounds.size.height } },
             rem,
         });
 
         const padded_bounds = Bounds(Pixels).from_corners(
-            bounds.origin.add(point(border.left + padding.left, border.top + padding.top)),
-            bounds.bottom_right().sub(point(border.right + padding.right, border.bottom + padding.bottom)),
+            bounds.origin.add(point(border_px.left + padding.left, border_px.top + padding.top)),
+            bounds.bottom_right().sub(point(border_px.right + padding.right, border_px.bottom + padding.bottom)),
         );
 
         const can_scroll_horizontally = self.horizontal_sizing_behavior == .unconstrained;
@@ -374,7 +374,7 @@ pub const UniformList = struct {
         else
             .{};
 
-        const y_flipped = if (self.scroll_handle) |handle| handle.state.y_flipped else false;
+        const is_flipped = if (self.scroll_handle) |handle| handle.state.y_flipped else false;
         const item_height = longest_item_size.height;
         const item_count_f: f32 = @floatFromInt(self.item_count);
 
@@ -396,7 +396,7 @@ pub const UniformList = struct {
             if (shared_scroll_to_item) |deferred| {
                 var item_index = deferred.item_index;
                 var strategy = deferred.strategy;
-                if (y_flipped) {
+                if (is_flipped) {
                     item_index = self.item_count -| (item_index +| 1);
                 }
                 const list_height = padded_bounds.size.height;
@@ -442,7 +442,7 @@ pub const UniformList = struct {
                 .end = @max(first_visible_ix, @min(last_visible_ix, self.item_count)),
             };
 
-            const items: []AnyElement = if (y_flipped) blk: {
+            const items: []AnyElement = if (is_flipped) blk: {
                 const flipped_range: Range = .{
                     .start = self.item_count -| visible_range.end,
                     .end = self.item_count -| visible_range.start,
@@ -3812,4 +3812,183 @@ pub fn uniform_list(id: anytype, item_count: usize, render_items: RangeRenderer)
         },
     };
     return list;
+}
+
+const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+const Action = @import("../action.zig").Action;
+const Context = app_mod.Context;
+const Entity = app_mod.Entity;
+const Div = div.Div;
+
+test "uniform_list: scroll strategy nearest only scrolls when the selection leaves the viewport" {
+    const SelectNext = Action("example", "SelectNext");
+    const SelectPrev = Action("example", "SelectPrev");
+
+    const TestView = struct {
+        const Self = @This();
+        index: usize = 0,
+        length: usize = 47,
+        scroll_handle: UniformListScrollHandle,
+        focus_handle: window_mod.FocusHandle,
+        visible_range: Range = .{},
+
+        fn build(window: *Window, app: *App) Entity(Self) {
+            const focus = app.focus_handle();
+            window.focus(focus);
+            return app.new(Self{ .scroll_handle = UniformListScrollHandle.new(), .focus_handle = focus });
+        }
+
+        fn select_next(self: *Self, _: *const SelectNext, window: *Window, _: *Context(Self)) void {
+            self.index = if (self.index + 1 == self.length) 0 else self.index + 1;
+            self.scroll_handle.scroll_to_item(self.index, .nearest);
+            window.refresh();
+        }
+
+        fn select_previous(self: *Self, _: *const SelectPrev, window: *Window, _: *Context(Self)) void {
+            self.index = if (self.index == 0) self.length - 1 else self.index - 1;
+            self.scroll_handle.scroll_to_item(self.index, .nearest);
+            window.refresh();
+        }
+
+        fn render_items(self: *Self, range: Range, window: *Window, cx: *Context(Self)) []AnyElement {
+            _ = window;
+            _ = cx;
+            self.visible_range = range;
+            const items = window_mod.frame_arena().alloc(AnyElement, range.len()) catch oom();
+            for (range.start..range.end, 0..) |ix, i| {
+                items[i] = div.div().id(ix).h(geometry.px(20)).child(window_mod.format("Item {d}", .{ix})).into_any_element();
+            }
+            return items;
+        }
+
+        pub fn render(self: *Self, _: *Window, cx: *Context(Self)) *Div {
+            return div.div()
+                .id("list-example")
+                .track_focus(&self.focus_handle)
+                .on_action(SelectNext, cx.listener(select_next))
+                .on_action(SelectPrev, cx.listener(select_previous))
+                .size_full()
+                .child(uniform_list("entries", self.length, cx.processor(render_items))
+                    .track_scroll(&self.scroll_handle)
+                    .h(geometry.px(200)));
+        }
+    };
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(TestView.build);
+
+    // 10 out of 47 items are visible. The first 9 selections do not scroll.
+    for (1..10) |ix| {
+        vcx.dispatch_action(SelectNext{});
+        const v = view.read(cx.app);
+        try std.testing.expectEqual(ix, v.index);
+        try std.testing.expectEqual(Range{ .start = 0, .end = 10 }, v.visible_range);
+    }
+    // After that, each selection scrolls the list down by one item.
+    for (10..47) |ix| {
+        vcx.dispatch_action(SelectNext{});
+        const v = view.read(cx.app);
+        try std.testing.expectEqual(ix, v.index);
+        try std.testing.expectEqual(Range{ .start = ix - 9, .end = ix + 1 }, v.visible_range);
+    }
+    // Past the last item the selection wraps to the start.
+    vcx.dispatch_action(SelectNext{});
+    {
+        const v = view.read(cx.app);
+        try std.testing.expectEqual(@as(usize, 0), v.index);
+        try std.testing.expectEqual(Range{ .start = 0, .end = 10 }, view.read(cx.app).visible_range);
+    }
+    // Wrap back to the last item.
+    vcx.dispatch_action(SelectPrev{});
+    try std.testing.expectEqual(@as(usize, 46), view.read(cx.app).index);
+    try std.testing.expectEqual(Range{ .start = 37, .end = 47 }, view.read(cx.app).visible_range);
+    // The first 9 selections up do not scroll.
+    for (0..9) |k| {
+        const ix = 45 - k;
+        vcx.dispatch_action(SelectPrev{});
+        const v = view.read(cx.app);
+        try std.testing.expectEqual(ix, v.index);
+        try std.testing.expectEqual(Range{ .start = 37, .end = 47 }, v.visible_range);
+    }
+    // Then each selection scrolls up by one item.
+    for (0..37) |k| {
+        const ix = 36 - k;
+        vcx.dispatch_action(SelectPrev{});
+        const v = view.read(cx.app);
+        try std.testing.expectEqual(ix, v.index);
+        try std.testing.expectEqual(Range{ .start = ix, .end = ix + 10 }, v.visible_range);
+    }
+}
+
+test "uniform_list: item positions stay exact far down a 10 million item list" {
+    const Entry = struct { ix: usize, top: Pixels };
+    const ItemCtx = struct {
+        ix: usize,
+        recorded: *std.ArrayList(Entry),
+        allocator: std.mem.Allocator,
+    };
+
+    const Recorder = struct {
+        fn paint(ctx: ItemCtx, bounds: geometry.Bounds(Pixels), _: *Window, _: *App) void {
+            ctx.recorded.append(ctx.allocator, .{ .ix = ctx.ix, .top = bounds.origin.y }) catch oom();
+        }
+    };
+
+    const FarView = struct {
+        const Self = @This();
+        scroll_handle: UniformListScrollHandle,
+        recorded: *std.ArrayList(Entry),
+
+        fn build(_: *Window, app: *App) Entity(Self) {
+            const recorded = std.testing.allocator.create(std.ArrayList(Entry)) catch oom();
+            recorded.* = .empty;
+            return app.new(Self{ .scroll_handle = UniformListScrollHandle.new(), .recorded = recorded });
+        }
+
+        fn render_items(self: *Self, range: Range, _: *Window, _: *Context(Self)) []AnyElement {
+            const items = window_mod.frame_arena().alloc(AnyElement, range.len()) catch oom();
+            for (range.start..range.end, 0..) |ix, i| {
+                items[i] = element_canvas(.{ .ix = ix, .recorded = self.recorded, .allocator = std.testing.allocator });
+            }
+            return items;
+        }
+
+        fn element_canvas(ctx: ItemCtx) AnyElement {
+            const element = @import("canvas.zig").canvas_fn(ctx, Recorder.paint).w_full().h(geometry.px(24));
+            return AnyElement.new(element);
+        }
+
+        pub fn render(self: *Self, _: *Window, cx: *Context(Self)) *Div {
+            return div.div().size_full().child(uniform_list("entries", 10_000_000, cx.processor(render_items))
+                .track_scroll(&self.scroll_handle)
+                .h(geometry.px(200)));
+        }
+    };
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(FarView.build);
+    const state = view.read(cx.app);
+    defer {
+        state.recorded.deinit(std.testing.allocator);
+        std.testing.allocator.destroy(state.recorded);
+    }
+
+    // Past 2^27px, f32 only represents multiples of 16px. The offset is 16px into item 9_000_002,
+    // and the items must still be laid out 24px apart from that point.
+    state.recorded.clearRetainingCapacity();
+    state.scroll_handle.state.base_handle.set_offset(point(geometry.px(0), geometry.px(-216_000_064)));
+    vcx.window.refresh();
+    vcx.run_until_parked();
+
+    const recorded = state.recorded.items;
+    var checked: usize = 0;
+    for (recorded) |entry| {
+        if (entry.ix < 9_000_002 or entry.ix >= 9_000_011) continue;
+        const expected: Pixels = -16 + 24 * @as(f32, @floatFromInt(entry.ix - 9_000_002));
+        try std.testing.expectEqual(expected, entry.top);
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 9), checked);
 }

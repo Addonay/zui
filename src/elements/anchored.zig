@@ -333,3 +333,64 @@ test "anchored local position mode is relative to the parent" {
     try std.testing.expectEqual(@as(Pixels, 111), placed.origin.x);
     try std.testing.expectEqual(@as(Pixels, 222), placed.origin.y);
 }
+
+// -- window tests -------------------------------------------------------------
+
+const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+const div_mod = @import("div.zig");
+const deferred = @import("deferred.zig").deferred;
+
+/// The anchor position read by `AnchoredTestView` on every frame.
+var test_anchor_position: Point(Pixels) = .{ .x = 0, .y = 0 };
+
+/// A deferred anchored menu over a scrollable container, like GPUI's `AnchoredTestView`.
+const AnchoredTestView = struct {
+    pub fn render(_: *AnchoredTestView, _: *Window, _: *app_mod.Context(AnchoredTestView)) *div_mod.Div {
+        return div_mod.div().size_full().child(
+            div_mod.div().id("scroll-container").size_full()
+                .child(div_mod.div().h(geometry.px(2000)).w_full())
+                .child(deferred(anchored()
+                    .snap_to_window()
+                    .position(test_anchor_position)
+                    .child(div_mod.div().id("menu").w(geometry.px(200)).h(geometry.px(300)))).with_priority(1)),
+        );
+    }
+
+    fn build(_: *Window, app: *App) app_mod.Entity(AnchoredTestView) {
+        return app.new(AnchoredTestView{});
+    }
+};
+
+/// Returns the bounds of the hitbox with the given size, if one was drawn.
+fn find_hitbox_bounds(window: *const Window, width: Pixels, height: Pixels) ?Bounds(Pixels) {
+    for (window.rendered_frame.hitboxes.items) |hitbox| {
+        if (hitbox.bounds.size.width == width and hitbox.bounds.size.height == height) return hitbox.bounds;
+    }
+    return null;
+}
+
+test "anchored: places the menu at the window position without scrolling" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    test_anchor_position = .{ .x = 100, .y = 100 };
+    _, const vcx = cx.add_window_view(AnchoredTestView.build);
+
+    const menu = find_hitbox_bounds(vcx.window, 200, 300);
+    try std.testing.expect(menu != null);
+    try std.testing.expectEqual(@as(Pixels, 100), menu.?.origin.x);
+    try std.testing.expectEqual(@as(Pixels, 100), menu.?.origin.y);
+}
+
+test "anchored: snaps the menu inside the window bottom edge" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(AnchoredTestView.build);
+    const viewport = vcx.window.viewport_size;
+    test_anchor_position = .{ .x = 100, .y = viewport.height - 100 };
+    vcx.window.refresh();
+    vcx.run_until_parked();
+
+    const menu = find_hitbox_bounds(vcx.window, 200, 300);
+    try std.testing.expect(menu != null);
+    try std.testing.expectEqual(viewport.height - 300, menu.?.origin.y);
+}

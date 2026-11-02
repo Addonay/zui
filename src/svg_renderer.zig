@@ -228,8 +228,10 @@ test "exact size fits and centers the artwork" {
 
     const mask = try r.render_alpha_mask(testing.allocator, svg, .{ .exact_size = .{ .width = 20, .height = 10 } });
     defer testing.allocator.free(mask.pixels);
-    try testing.expectEqual(@as(u8, 0), mask.pixels[5]);
-    try testing.expectEqual(@as(u8, 255), mask.pixels[5 * 20 + 10]);
+    try testing.expectEqual(@as(u8, 0), mask.pixels[4]);
+    try testing.expectEqual(@as(u8, 255), mask.pixels[5]);
+    try testing.expectEqual(@as(u8, 255), mask.pixels[14]);
+    try testing.expectEqual(@as(u8, 0), mask.pixels[15]);
 }
 
 test "stroke-only icon has nonzero coverage" {
@@ -262,6 +264,8 @@ test "render_single_frame produces a 2x BGRA frame" {
     try testing.expectEqual(@as(f32, 10.0), img.render_size(0).width);
     // Opaque red in BGRA order: blue byte 0, red byte 255.
     const px = img.as_bytes(0).?;
-    const mid = (@as(usize, img.size(0).height / 2) * @as(usize, @intCast(img.size(0).width)) + @as(usize, @intCast(img.size(0).width / 2))) * 4;
+    const w: usize = @intCast(img.size(0).width);
+    const h: usize = @intCast(img.size(0).height);
+    const mid = ((h / 2) * w + w / 2) * 4;
     try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, px[mid .. mid + 4]);
 }
