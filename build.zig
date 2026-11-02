@@ -22,6 +22,10 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Vendored C backends: nanosvg (SVG parse + rasterize) and stb_image (decode).
+    zui.addIncludePath(b.path("third_party"));
+    zui.addCSourceFile(.{ .file = b.path("third_party/images.c"), .flags = &.{"-std=c99"} });
+
     // Unit tests.
     const tests = b.addTest(.{ .root_module = zui });
     const run_tests = b.addRunArtifact(tests);

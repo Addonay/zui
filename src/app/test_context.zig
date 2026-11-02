@@ -155,9 +155,16 @@ pub const TestAppContext = struct {
     /// modifiers also deliver their text, as the platform would.
     pub fn dispatch_keystroke(self: *TestAppContext, window: *Window, keystroke: Keystroke) void {
         var ks = keystroke;
-        if (ks.key_char == null and !ks.modifiers.control and !ks.modifiers.platform and ks.key.len == 1) ks.key_char = ks.key;
+        if (ks.key_char == null and !ks.modifiers.control and !ks.modifiers.platform and ks.key.len == 1) {
+            ks.key_char = if (ks.modifiers.shift and std.ascii.isLower(ks.key[0])) shifted_letter(ks.key[0]) else ks.key;
+        }
         _ = window.dispatch_event(.{ .key_down = .{ .keystroke = ks } }, self.app);
         _ = window.dispatch_event(.{ .key_up = .{ .keystroke = ks } }, self.app);
+    }
+
+    fn shifted_letter(c: u8) []const u8 {
+        const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        return upper[c - 'a' ..][0..1];
     }
 
     pub fn write_to_clipboard(self: *TestAppContext, item: platform_mod.ClipboardItem) void {
@@ -748,4 +755,129 @@ test "globals: update_global from a context notifies observers" {
         }
     }.f);
     try std.testing.expectEqual(@as(usize, 1), Seen.changes);
+}
+
+test "windows: closing a window releases its root view" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const root = (try handle.root(cx.app));
+    const weak = root.downgrade();
+    const win = handle.window(cx.app) orelse return error.TestUnexpectedResult;
+    cx.app.close_window(win);
+    try std.testing.expect(weak.upgrade(cx.app) == null);
+    try std.testing.expect(handle.window(cx.app) == null);
+}
+
+/// A parent and child both handle clicks; the child stops propagation.
+const Nested = struct {
+    parent_clicks: usize = 0,
+    child_clicks: usize = 0,
+
+    pub fn render(_: *Nested, _: *Window, cx: *Context(Nested)) *Div {
+        return div().id("parent").w(px(200)).h(px(200)).on_click(cx.listener(on_parent_click))
+            .child(div().id("child").w(px(50)).h(px(50)).on_click(cx.listener(on_child_click)));
+    }
+    fn on_parent_click(self: *Nested, _: *const ClickEvent, _: *Window, _: *Context(Nested)) void {
+        self.parent_clicks += 1;
+    }
+    fn on_child_click(self: *Nested, _: *const ClickEvent, window: *Window, _: *Context(Nested)) void {
+        self.child_clicks += 1;
+        window.stop_propagation();
+    }
+    fn build(_: *Window, app: *App) Entity(Nested) {
+        return app.new(Nested{});
+    }
+    fn read_clicks(s: *const Nested, _: *const App) struct { parent: usize, child: usize } {
+        return .{ .parent = s.parent_clicks, .child = s.child_clicks };
+    }
+};
+
+test "mouse: stop_propagation keeps a click from reaching the parent" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Nested.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    var clicks = cx.read_entity(view, Nested.read_clicks, .{});
+    try std.testing.expectEqual(@as(usize, 1), clicks.child);
+    try std.testing.expectEqual(@as(usize, 0), clicks.parent);
+
+    vcx.simulate_click(.{ .x = 100, .y = 100 }, .{});
+    clicks = cx.read_entity(view, Nested.read_clicks, .{});
+    try std.testing.expectEqual(@as(usize, 1), clicks.parent);
+}
+
+/// A text field that receives typed text through a `PlatformInputHandler` registered each frame.
+const TextField = struct {
+    focus: FocusHandle,
+    buffer: [64]u8 = @splat(0),
+    len: usize = 0,
+
+    const input_vtable: platform_mod.PlatformInputHandler.VTable = .{
+        .selected_text_range = selected_text_range,
+        .marked_text_range = marked_text_range,
+        .text_for_range = text_for_range,
+        .replace_text_in_range = replace_text_in_range,
+        .replace_and_mark_text_in_range = replace_and_mark_text_in_range,
+        .unmark_text = unmark_text,
+        .bounds_for_range = bounds_for_range,
+        .character_index_for_point = character_index_for_point,
+        .accepts_text_input = accepts_text_input,
+    };
+
+    fn from_ctx(ctx: *anyopaque) *TextField {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn selected_text_range(_: *anyopaque, _: bool, _: *Window, _: *App) ?platform_mod.UTF16Selection {
+        return null;
+    }
+    fn marked_text_range(_: *anyopaque, _: *Window, _: *App) ?platform_mod.Range {
+        return null;
+    }
+    fn text_for_range(_: *anyopaque, _: platform_mod.Range, _: *?platform_mod.Range, _: *Window, _: *App) ?[]const u8 {
+        return null;
+    }
+    fn replace_text_in_range(ctx: *anyopaque, _: ?platform_mod.Range, text: []const u8, _: *Window, cx: *App) void {
+        const self = from_ctx(ctx);
+        const n = @min(text.len, self.buffer.len - self.len);
+        @memcpy(self.buffer[self.len..][0..n], text[0..n]);
+        self.len += n;
+        cx.refresh_windows();
+    }
+    fn replace_and_mark_text_in_range(_: *anyopaque, _: ?platform_mod.Range, _: []const u8, _: ?platform_mod.Range, _: *Window, _: *App) void {}
+    fn unmark_text(_: *anyopaque, _: *Window, _: *App) void {}
+    fn bounds_for_range(_: *anyopaque, _: platform_mod.Range, _: *Window, _: *App) ?geometry.Bounds(Pixels) {
+        return null;
+    }
+    fn character_index_for_point(_: *anyopaque, _: Point(Pixels), _: *Window, _: *App) ?usize {
+        return null;
+    }
+    fn accepts_text_input(_: *anyopaque, _: *Window, _: *App) bool {
+        return true;
+    }
+
+    pub fn render(self: *TextField, window: *Window, cx: *Context(TextField)) *Div {
+        // Input handlers are registered during the frame, while the field is focused.
+        window.handle_input(&self.focus, .{ .ctx = self, .vtable = &input_vtable }, cx.app);
+        return div().id("field").w(px(100)).h(px(30)).track_focus(&self.focus);
+    }
+    fn build(_: *Window, app: *App) Entity(TextField) {
+        return app.new(TextField{ .focus = app.focus_handle() });
+    }
+    fn read_text(s: *const TextField, _: *const App) []const u8 {
+        return s.buffer[0..s.len];
+    }
+};
+
+test "keystrokes: typed text is delivered to the focused input handler" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(TextField.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.simulate_input("hi");
+    try std.testing.expectEqualStrings("hi", cx.read_entity(view, TextField.read_text, .{}));
+    vcx.simulate_keystrokes("shift-a");
+    try std.testing.expectEqualStrings("hiA", cx.read_entity(view, TextField.read_text, .{}));
+    vcx.simulate_keystrokes("cmd-a");
+    try std.testing.expectEqualStrings("hiA", cx.read_entity(view, TextField.read_text, .{}));
 }

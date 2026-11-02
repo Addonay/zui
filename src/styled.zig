@@ -843,6 +843,26 @@ pub fn Styled(comptime Self: type) type {
             return self;
         }
 
+        /// Sets the behavior of content that overflows the container to scroll.
+        pub fn overflow_scroll(self: Self) Self {
+            const s = self.style();
+            s.overflow.x = .scroll;
+            s.overflow.y = .scroll;
+            return self;
+        }
+
+        /// Sets the behavior of content that overflows the container on the X axis to scroll.
+        pub fn overflow_x_scroll(self: Self) Self {
+            self.style().overflow.x = .scroll;
+            return self;
+        }
+
+        /// Sets the behavior of content that overflows the container on the Y axis to scroll.
+        pub fn overflow_y_scroll(self: Self) Self {
+            self.style().overflow.y = .scroll;
+            return self;
+        }
+
         /// Sets the cursor style when hovering over this element.
         pub fn cursor(self: Self, kind: style.CursorStyle) Self {
             self.style().mouse_cursor = kind;
