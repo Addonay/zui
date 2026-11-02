@@ -269,7 +269,7 @@ pub const FlexWrap = enum { no_wrap, wrap, wrap_reverse };
 pub const FlexDirection = enum { row, column, row_reverse, column_reverse };
 pub const Overflow = enum { visible, clip, hidden, scroll };
 pub const Position = enum { relative, absolute };
-pub const BorderStyle = enum { solid, dashed };
+pub const BorderStyle = @import("scene.zig").BorderStyle;
 
 /// The mouse cursor shown over an element.
 pub const CursorStyle = enum {

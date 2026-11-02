@@ -729,12 +729,22 @@ test "force width places a base after a combining mark" {
 }
 
 test "force width corrects drifted base positions" {
-    var glyphs = [_]ShapedGlyph{ glyph_at(0.5, 0), glyph_at(9, 1), glyph_at(17, 2) };
+    // Glyphs more than 1px off the cell grid are moved onto it; the first is within tolerance.
+    var glyphs = [_]ShapedGlyph{ glyph_at(0.5, 0), glyph_at(10.2, 1), glyph_at(19.8, 2) };
     var layout = try make_layout(&glyphs);
     defer free_test_layout(&layout);
     apply_force_width_to_layout(&layout, 8);
     var buf: [3]f32 = undefined;
     try testing.expectEqualSlices(f32, &.{ 0.5, 8, 16 }, glyph_x_positions(&layout, &buf));
+}
+
+test "force width keeps a combining mark on a within-tolerance base" {
+    var glyphs = [_]ShapedGlyph{ glyph_at(0.5, 0), glyph_at(0.5, 3) };
+    var layout = try make_layout(&glyphs);
+    defer free_test_layout(&layout);
+    apply_force_width_to_layout(&layout, 8);
+    var buf: [2]f32 = undefined;
+    try testing.expectEqualSlices(f32, &.{ 0.5, 0.5 }, glyph_x_positions(&layout, &buf));
 }
 
 test "index_for_x and x_for_index" {

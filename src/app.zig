@@ -902,7 +902,8 @@ pub const App = struct {
         win.set_root_view(root.into_any_view());
         win.refresh();
         self.flush_effects();
-        return .{ .window_id = win.handle_id, .entity_id_ = root.entity_id(), .view_type = V };
+        _ = V;
+        return .{ .window_id = win.handle_id, .entity_id_ = root.entity_id() };
     }
 
     pub fn window_by_id(self: *App, id: window_mod.WindowId) ?*Window {

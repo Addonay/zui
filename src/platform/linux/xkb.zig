@@ -11,7 +11,7 @@
 //! tests and minimal systems keep working.
 
 const std = @import("std");
-const dl = @import("../dl.zig");
+const dl = @import("dl.zig");
 
 pub const xkb_lib_names: []const [*:0]const u8 = &.{ "libxkbcommon.so.0", "libxkbcommon.so" };
 

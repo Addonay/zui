@@ -265,12 +265,12 @@ fn alignContent(a: style_mod.AlignContent) zafi.AlignContent {
 fn gridTemplate(t: style_mod.GridTemplate, arena: std.mem.Allocator) []const zafi.GridTemplateComponent {
     const helpers = zafi.style_helpers;
     const min: zafi.MinTrackSizingFunction = switch (t.min_size) {
-        .zero => .from_length_percentage(.length(0)),
-        .min_content => .MIN_CONTENT,
-        .max_content => .MAX_CONTENT,
+        .zero => .zero,
+        .min_content => .min_content,
+        .max_content => .max_content,
     };
     const track = arena.alloc(zafi.TrackSizingFunction, 1) catch oom();
-    track[0] = helpers.minmax(min, .from_fr(1.0));
+    track[0] = helpers.minmax(min, .fr(1.0));
     const comps = arena.alloc(zafi.GridTemplateComponent, 1) catch oom();
     comps[0] = helpers.repeat(t.repeat, track);
     return comps;

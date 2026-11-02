@@ -102,7 +102,10 @@ pub const Corner = enum {
 fn fieldDefault(comptime T: type) T {
     return switch (@typeInfo(T)) {
         .int, .float => 0,
-        else => if (@hasDecl(T, "default")) T.default else undefined,
+        .optional => null,
+        .bool => false,
+        .@"struct", .@"enum", .@"union", .@"opaque" => if (@hasDecl(T, "default")) T.default else undefined,
+        else => undefined,
     };
 }
 

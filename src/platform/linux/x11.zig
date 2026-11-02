@@ -69,12 +69,14 @@ pub const X11Connection = struct {
     helper: XWindow,
     atoms: Atoms,
     windows: std.ArrayList(*X11Window) = .empty,
-    cursors: [@typeInfo(CursorStyle).@"enum".fields.len]Cursor = @splat(0),
+    cursors: [@typeInfo(CursorStyle).@"enum".field_names.len]Cursor = @splat(0),
     cursor_style: CursorStyle = .arrow,
     scale: f32 = 1,
     mods: u32 = 0,
     click: input.ClickTracker = .{},
     pressed: ?MouseButton = null,
+    /// Root position of the last button press (for window move drags).
+    press_root: [2]c_long = .{ 0, 0 },
     /// Events read during a synchronous clipboard request, replayed later.
     stash: [64]XEvent = undefined,
     stash_len: usize = 0,
@@ -82,6 +84,7 @@ pub const X11Connection = struct {
     owning_selection: bool = false,
     clip_read: ?[]u8 = null,
     dead: bool = false,
+    display_storage: [1]Display = undefined,
 
     /// Connects to the X server named by DISPLAY.
     pub fn connect(allocator: std.mem.Allocator) !*X11Connection {
@@ -243,7 +246,6 @@ pub const X11Connection = struct {
         };
         return out[0..1];
     }
-    display_storage: [1]Display = undefined,
 
     pub fn deinit(self: *X11Connection) void {
         for (self.windows.items) |w| w.close_now();
@@ -279,17 +281,20 @@ pub const X11Connection = struct {
         const ph: c_uint = @intFromFloat(@max(1, @round(b.size.height * self.scale)));
         const x = a.XCreateSimpleWindow(self.display, self.root, 0, 0, pw, ph, 0, 0, 0);
         w.x_window = x;
-        const title: [*:0]const u8 = if (options.titlebar) |t| if (t.title) |s| try self.allocator.dupeZ(u8, s) else "ZUI" else "ZUI";
+        var title_buf: [512]u8 = undefined;
+        const title_src: []const u8 = if (options.titlebar) |t| (t.title orelse "ZUI") else "ZUI";
+        const tn = @min(title_src.len, title_buf.len - 1);
+        @memcpy(title_buf[0..tn], title_src[0..tn]);
+        title_buf[tn] = 0;
+        const title: [*:0]const u8 = @ptrCast(&title_buf);
         _ = a.XStoreName(self.display, x, title);
-        const title_len = std.mem.len(title);
-        _ = a.XChangeProperty(self.display, x, self.atoms.net_wm_name, self.atoms.utf8_string, 8, 0, title, @intCast(title_len));
+        _ = a.XChangeProperty(self.display, x, self.atoms.net_wm_name, self.atoms.utf8_string, 8, 0, title, @intCast(tn));
         var protocols = [2]Atom{ self.atoms.wm_delete_window, self.atoms.net_wm_ping };
         _ = a.XSetWMProtocols(self.display, x, &protocols, 2);
         if (options.titlebar == null) self.set_decorations(x, false);
         const mask: c_long = proto.ExposureMask | proto.KeyPressMask | proto.KeyReleaseMask | proto.ButtonPressMask | proto.ButtonReleaseMask | proto.PointerMotionMask | proto.StructureNotifyMask | proto.FocusChangeMask | proto.EnterWindowMask | proto.LeaveWindowMask;
         _ = a.XSelectInput(self.display, x, mask);
         if (options.show) _ = a.XMapWindow(self.display, x);
-        self.allocator.free(std.mem.span(title).ptr[0 .. title_len + 1]);
         w.frame_wanted = true;
         self.windows.appendAssumeCapacity(w);
         w.apply_cursor();
@@ -332,7 +337,7 @@ pub const X11Connection = struct {
 
     /// The cursor object for a style, created on first use.
     fn cursor_for(self: *X11Connection, style: CursorStyle) Cursor {
-        const idx = @intFromEnum(style);
+        const idx = @backingInt(style);
         if (self.cursors[idx] == 0) {
             self.cursors[idx] = self.api.XCreateFontCursor(self.display, cursor_glyph(style));
         }
@@ -458,6 +463,7 @@ pub const X11Connection = struct {
         }
         const button = input.x11_button(b.button) orelse return;
         if (pressed) {
+            self.press_root = .{ @intCast(b.x_root), @intCast(b.y_root) };
             self.pressed = button;
             const count = self.click.press(button, pos);
             _ = w.base.emit_input(.{ .mouse_down = .{ .button = button, .position = pos, .modifiers = mods, .click_count = count } });
@@ -474,7 +480,7 @@ pub const X11Connection = struct {
         var k = ev;
         var keysym: c_ulong = 0;
         var buf: [32]u8 = undefined;
-        const n: usize = @intCast(@max(0, self.api.XLookupString(&k, &buf, buf.len, &keysym, null)));
+        const n: usize = @intCast(@max(0, self.api.XLookupString(&k, &buf, @intCast(buf.len), &keysym, null)));
         const shift = (ev.state & input.MOD_SHIFT) != 0;
         var name: ?[]const u8 = input.key_name_for_keysym(@intCast(keysym));
         if (name == null) {
@@ -558,10 +564,14 @@ pub const X11Connection = struct {
                         return self.read_paste_property();
                     },
                     proto.SelectionRequest => self.serve_selection(ev.xselectionrequest),
-                    proto.SelectionClear => self.owning_selection = false,
-                    else => if (self.stash_len < self.stash.len) {
-                        self.stash[self.stash_len] = ev;
-                        self.stash_len += 1;
+                    proto.SelectionClear => {
+                        self.owning_selection = false;
+                    },
+                    else => {
+                        if (self.stash_len < self.stash.len) {
+                            self.stash[self.stash_len] = ev;
+                            self.stash_len += 1;
+                        }
                     },
                 }
             }
@@ -758,7 +768,7 @@ pub const X11Window = struct {
         const conn = self.conn;
         var ev = std.mem.zeroes(XEvent);
         // _NET_WM_MOVERESIZE with direction 8 (move) at the last press position.
-        ev.xclient = .{ .type = proto.ClientMessage, .serial = 0, .send_event = 1, .display = conn.display, .window = self.x_window, .message_type = conn.atoms.net_wm_moveresize, .format = 32, .data = .{ .l = .{ 0, 0, 8, 1, 1 } } };
+        ev.xclient = .{ .type = proto.ClientMessage, .serial = 0, .send_event = 1, .display = conn.display, .window = self.x_window, .message_type = conn.atoms.net_wm_moveresize, .format = 32, .data = .{ .l = .{ conn.press_root[0], conn.press_root[1], 8, 1, 1 } } };
         _ = conn.api.XSendEvent(conn.display, conn.root, 0, proto.SubstructureRedirectMask | proto.SubstructureNotifyMask, &ev);
         conn.flush();
     }

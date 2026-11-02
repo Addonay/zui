@@ -23,7 +23,7 @@ const window_mod = @import("window.zig");
 
 pub const font_mod = @import("text_system/font.zig");
 pub const line_layout = @import("text_system/line_layout.zig");
-pub const line_wrapper = @import("text_system/line_wrapper.zig");
+const lw_mod = @import("text_system/line_wrapper.zig");
 pub const line = @import("text_system/line.zig");
 
 const Allocator = std.mem.Allocator;
@@ -53,11 +53,11 @@ pub const WrappedLineLayout = line_layout.WrappedLineLayout;
 pub const WrapBoundary = line_layout.WrapBoundary;
 pub const IndexResult = line_layout.IndexResult;
 pub const LineLayoutCache = line_layout.LineLayoutCache;
-pub const LineWrapper = line_wrapper.LineWrapper;
-pub const TruncateFrom = line_wrapper.TruncateFrom;
-pub const IndentAdjustment = line_wrapper.IndentAdjustment;
-pub const LineFragment = line_wrapper.LineFragment;
-pub const Boundary = line_wrapper.Boundary;
+pub const LineWrapper = lw_mod.LineWrapper;
+pub const TruncateFrom = lw_mod.TruncateFrom;
+pub const IndentAdjustment = lw_mod.IndentAdjustment;
+pub const LineFragment = lw_mod.LineFragment;
+pub const Boundary = lw_mod.Boundary;
 pub const ShapedLine = line.ShapedLine;
 pub const WrappedLine = line.WrappedLine;
 pub const DecorationRun = line.DecorationRun;
@@ -202,7 +202,7 @@ const RasterKey = struct {
     }
 };
 
-const WidthKey = struct { font_id: FontId, size_bits: u32 };
+const WidthKey = struct { fid: FontId, size_bits: u32 };
 
 /// Pending glyph raster job handed to the atlas through a `TileBuilder`.
 const TileJob = struct {
@@ -229,7 +229,7 @@ pub const TextSystem = struct {
     face_index: std.AutoHashMapUnmanaged(u32, FontId) = .empty,
     face_data: std.AutoHashMapUnmanaged(u32, FaceData) = .empty,
     raster_bounds_cache: std.AutoHashMapUnmanaged(RasterKey, Bounds(DevicePixels)) = .empty,
-    char_widths: std.AutoHashMapUnmanaged(WidthKey, *line_wrapper.CharWidthCache) = .empty,
+    char_widths: std.AutoHashMapUnmanaged(WidthKey, *lw_mod.CharWidthCache) = .empty,
 
     /// Scratch runs reused by every shaping call.
     font_runs_scratch: std.ArrayList(FontRun) = .empty,
@@ -312,7 +312,7 @@ pub const TextSystem = struct {
         return id;
     }
 
-    /// `font_id` for callers that cannot handle errors. Only allocation failure reaches the panic.
+    /// `fid` for callers that cannot handle errors. Only allocation failure reaches the panic.
     pub fn resolve_font(self: *TextSystem, f: *const Font) FontId {
         return self.font_id(f) catch @panic("OOM resolving font");
     }
@@ -429,9 +429,9 @@ pub const TextSystem = struct {
 
     // -- metrics ----------------------------------------------------------
 
-    /// Metrics of `font_id`, read from the face the first time and cached.
-    pub fn font_metrics(self: *TextSystem, font_id: FontId) FontMetrics {
-        const e = self.entry(font_id);
+    /// Metrics of `fid`, read from the face the first time and cached.
+    pub fn font_metrics(self: *TextSystem, fid: FontId) FontMetrics {
+        const e = self.entry(fid);
         if (e.metrics) |m| return m;
         const m = self.compute_metrics(e.face);
         e.metrics = m;
@@ -489,37 +489,37 @@ pub const TextSystem = struct {
         return self.face_data.getPtr(face).?;
     }
 
-    /// The bounding box of `font_id` at `font_size`.
-    pub fn bounding_box(self: *TextSystem, font_id: FontId, font_size: Pixels) Bounds(Pixels) {
-        return self.font_metrics(font_id).bounding_box_px(font_size);
+    /// The bounding box of `fid` at `font_size`.
+    pub fn bounding_box(self: *TextSystem, fid: FontId, font_size: Pixels) Bounds(Pixels) {
+        return self.font_metrics(fid).bounding_box_px(font_size);
     }
 
-    /// Ascent (distance above the baseline) of `font_id` at `font_size`.
-    pub fn ascent(self: *TextSystem, font_id: FontId, font_size: Pixels) Pixels {
-        return self.font_metrics(font_id).ascent_px(font_size);
+    /// Ascent (distance above the baseline) of `fid` at `font_size`.
+    pub fn ascent(self: *TextSystem, fid: FontId, font_size: Pixels) Pixels {
+        return self.font_metrics(fid).ascent_px(font_size);
     }
 
-    /// Descent (distance below the baseline) of `font_id` at `font_size`.
-    pub fn descent(self: *TextSystem, font_id: FontId, font_size: Pixels) Pixels {
-        return self.font_metrics(font_id).descent_px(font_size);
+    /// Descent (distance below the baseline) of `fid` at `font_size`.
+    pub fn descent(self: *TextSystem, fid: FontId, font_size: Pixels) Pixels {
+        return self.font_metrics(fid).descent_px(font_size);
     }
 
-    /// Units per em of `font_id`.
-    pub fn units_per_em(self: *TextSystem, font_id: FontId) u32 {
-        return self.font_metrics(font_id).units_per_em;
+    /// Units per em of `fid`.
+    pub fn units_per_em(self: *TextSystem, fid: FontId) u32 {
+        return self.font_metrics(fid).units_per_em;
     }
 
-    pub fn cap_height(self: *TextSystem, font_id: FontId, font_size: Pixels) Pixels {
-        return self.font_metrics(font_id).cap_height_px(font_size);
+    pub fn cap_height(self: *TextSystem, fid: FontId, font_size: Pixels) Pixels {
+        return self.font_metrics(fid).cap_height_px(font_size);
     }
 
-    pub fn x_height(self: *TextSystem, font_id: FontId, font_size: Pixels) Pixels {
-        return self.font_metrics(font_id).x_height_px(font_size);
+    pub fn x_height(self: *TextSystem, fid: FontId, font_size: Pixels) Pixels {
+        return self.font_metrics(fid).x_height_px(font_size);
     }
 
-    /// The advance of `ch` in `font_id` at `font_size` (error when the font lacks the glyph).
-    pub fn advance(self: *TextSystem, font_id: FontId, font_size: Pixels, ch: u21) !Size(Pixels) {
-        const e = self.entry(font_id);
+    /// The advance of `ch` in `fid` at `font_size` (error when the font lacks the glyph).
+    pub fn advance(self: *TextSystem, fid: FontId, font_size: Pixels, ch: u21) !Size(Pixels) {
+        const e = self.entry(fid);
         if (e.face == NO_FACE) return error.GlyphNotFound;
         const adapter = self.fs.shaper() orelse return error.GlyphNotFound;
         const gid = adapter.mapGlyph(e.face, ch);
@@ -527,31 +527,31 @@ pub const TextSystem = struct {
         return .{ .width = adapter.advanceEm(e.face, gid) * font_size, .height = 0 };
     }
 
-    /// Width of `m` in `font_id` at `font_size` (advance-based; GPUI uses ink bounds).
-    pub fn em_width(self: *TextSystem, font_id: FontId, font_size: Pixels) !Pixels {
-        return (try self.advance(font_id, font_size, 'm')).width;
+    /// Width of `m` in `fid` at `font_size` (advance-based; GPUI uses ink bounds).
+    pub fn em_width(self: *TextSystem, fid: FontId, font_size: Pixels) !Pixels {
+        return (try self.advance(fid, font_size, 'm')).width;
     }
 
     /// Advance of `m`.
-    pub fn em_advance(self: *TextSystem, font_id: FontId, font_size: Pixels) !Pixels {
-        return (try self.advance(font_id, font_size, 'm')).width;
+    pub fn em_advance(self: *TextSystem, fid: FontId, font_size: Pixels) !Pixels {
+        return (try self.advance(fid, font_size, 'm')).width;
     }
 
     /// Width of `0` (advance-based; GPUI uses ink bounds).
-    pub fn ch_width(self: *TextSystem, font_id: FontId, font_size: Pixels) !Pixels {
-        return (try self.advance(font_id, font_size, '0')).width;
+    pub fn ch_width(self: *TextSystem, fid: FontId, font_size: Pixels) !Pixels {
+        return (try self.advance(fid, font_size, '0')).width;
     }
 
     /// Advance of `0`.
-    pub fn ch_advance(self: *TextSystem, font_id: FontId, font_size: Pixels) !Pixels {
-        return (try self.advance(font_id, font_size, '0')).width;
+    pub fn ch_advance(self: *TextSystem, fid: FontId, font_size: Pixels) !Pixels {
+        return (try self.advance(fid, font_size, '0')).width;
     }
 
     /// Shaped width of one character, from the line cache (0 when no font can shape it).
-    pub fn layout_width(self: *TextSystem, font_id: FontId, font_size: Pixels, ch: u21) Pixels {
+    pub fn layout_width(self: *TextSystem, fid: FontId, font_size: Pixels, ch: u21) Pixels {
         var buf: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(ch, &buf) catch return 0;
-        const runs = [_]FontRun{.{ .len = n, .font_id = font_id }};
+        const runs = [_]FontRun{.{ .len = n, .font_id = fid }};
         const layout = self.layout_cache.layout_line(buf[0..n], font_size, &runs, null) catch return 0;
         return layout.width;
     }
@@ -622,16 +622,16 @@ pub const TextSystem = struct {
                     try decorations.append(arena, d);
                 }
 
-                const font_id = self.resolve_font(&run.font);
+                const fid = self.resolve_font(&run.font);
                 if (self.font_runs_scratch.items.len > 0) {
                     const last = &self.font_runs_scratch.items[self.font_runs_scratch.items.len - 1];
-                    if (last.font_id == font_id and !decoration_changed) {
+                    if (last.font_id == fid and !decoration_changed) {
                         last.len += len_within_line;
                     } else {
-                        try self.font_runs_scratch.append(self.allocator, .{ .len = len_within_line, .font_id = font_id });
+                        try self.font_runs_scratch.append(self.allocator, .{ .len = len_within_line, .font_id = fid });
                     }
                 } else {
-                    try self.font_runs_scratch.append(self.allocator, .{ .len = len_within_line, .font_id = font_id });
+                    try self.font_runs_scratch.append(self.allocator, .{ .len = len_within_line, .font_id = fid });
                 }
 
                 run.len -= len_within_line;
@@ -668,15 +668,15 @@ pub const TextSystem = struct {
             }
             if (decoration_changed) last_run = run;
 
-            const font_id = self.resolve_font(&run.font);
+            const fid = self.resolve_font(&run.font);
             if (self.font_runs_scratch.items.len > 0) {
                 const last = &self.font_runs_scratch.items[self.font_runs_scratch.items.len - 1];
-                if (last.font_id == font_id and !decoration_changed) {
+                if (last.font_id == fid and !decoration_changed) {
                     last.len += run.len;
                     continue;
                 }
             }
-            try self.font_runs_scratch.append(self.allocator, .{ .len = run.len, .font_id = font_id });
+            try self.font_runs_scratch.append(self.allocator, .{ .len = run.len, .font_id = fid });
         }
     }
 
@@ -686,16 +686,16 @@ pub const TextSystem = struct {
         const key: WidthKey = .{ .font_id = id, .size_bits = @bitCast(font_size) };
         const gop = self.char_widths.getOrPut(self.allocator, key) catch @panic("OOM");
         if (!gop.found_existing) {
-            const cache = self.allocator.create(line_wrapper.CharWidthCache) catch @panic("OOM");
+            const cache = self.allocator.create(lw_mod.CharWidthCache) catch @panic("OOM");
             cache.* = .{};
             gop.value_ptr.* = cache;
         }
         return LineWrapper.init(self.allocator, id, font_size, .{ .ctx = self, .width_fn = width_callback }, gop.value_ptr.*);
     }
 
-    fn width_callback(ctx: *anyopaque, font_id: u32, font_size: Pixels, ch: u21) Pixels {
+    fn width_callback(ctx: *anyopaque, fid: u32, font_size: Pixels, ch: u21) Pixels {
         const self: *TextSystem = @ptrCast(@alignCast(ctx));
-        return self.layout_width(font_id, font_size, ch);
+        return self.layout_width(fid, font_size, ch);
     }
 
     /// Ends the frame: frees layouts that were not used in it or the previous one.
@@ -741,18 +741,18 @@ pub const TextSystem = struct {
             offset += run.len;
         }
 
-        var shape_line: cozmic.shape.ShapeLine = .{};
-        defer shape_line.deinit(allocator);
+        var shaped: cozmic.shape.ShapeLine = .{};
+        defer shaped.deinit(allocator);
         var scratch = cozmic.shape.ShapeBuffer.init();
         defer scratch.deinit(allocator);
-        try shape_line.build(allocator, adapter, &scratch, text, &list, .advanced, 4, .auto);
+        try shaped.build(allocator, adapter, &scratch, text, &list, .advanced, 4, .auto);
 
         var out: std.ArrayList(cozmic.layout.LayoutLine) = .empty;
         defer {
             for (out.items) |*l| l.deinit();
             out.deinit(allocator);
         }
-        try shape_line.layoutToBuffer(allocator, &scratch, font_size, null, .none, .{ .none = {} }, null, &out, null, .disabled);
+        try shaped.layoutToBuffer(allocator, &scratch, font_size, null, .none, .{ .none = {} }, null, &out, null, .disabled);
 
         var result_runs: std.ArrayList(ShapedRun) = .empty;
         errdefer {
@@ -762,16 +762,16 @@ pub const TextSystem = struct {
         var glyphs: std.ArrayList(ShapedGlyph) = .empty;
         errdefer glyphs.deinit(allocator);
 
-        var ascent: Pixels = 0;
-        var descent: Pixels = 0;
+        var asc: Pixels = 0;
+        var desc: Pixels = 0;
         var width: Pixels = 0;
         var cur_face: u32 = NO_FACE;
         var cur_font: FontId = 0;
         var have_run = false;
 
         for (out.items) |*ll| {
-            ascent = @max(ascent, ll.max_ascent);
-            descent = @max(descent, ll.max_descent);
+            asc = @max(asc, ll.max_ascent);
+            desc = @max(desc, ll.max_descent);
             width = @max(width, ll.w);
             for (ll.glyphs.items) |g| {
                 if (!have_run or g.font_id != cur_face) {
@@ -794,15 +794,15 @@ pub const TextSystem = struct {
         }
         if (have_run) try result_runs.append(allocator, .{ .font_id = cur_font, .glyphs = try glyphs.toOwnedSlice(allocator) });
 
-        if (ascent == 0 and descent == 0 and runs.len > 0) {
-            ascent = self.ascent(runs[0].font_id, font_size);
-            descent = self.descent(runs[0].font_id, font_size);
+        if (asc == 0 and desc == 0 and runs.len > 0) {
+            asc = self.ascent(runs[0].font_id, font_size);
+            desc = self.descent(runs[0].font_id, font_size);
         }
         return .{
             .font_size = font_size,
             .width = width,
-            .ascent = ascent,
-            .descent = descent,
+            .ascent = asc,
+            .descent = desc,
             .runs = try result_runs.toOwnedSlice(allocator),
             .len = text.len,
         };
@@ -810,17 +810,17 @@ pub const TextSystem = struct {
 
     /// The layout used when no shaper is available: zero width, font-derived metrics.
     fn empty_layout(self: *TextSystem, allocator: Allocator, font_size: Pixels, text: []const u8, runs: []const FontRun) !LineLayout {
-        var ascent: Pixels = font_size * 0.8;
-        var descent: Pixels = font_size * 0.2;
+        var asc: Pixels = font_size * 0.8;
+        var desc: Pixels = font_size * 0.2;
         if (runs.len > 0) {
-            ascent = self.ascent(runs[0].font_id, font_size);
-            descent = self.descent(runs[0].font_id, font_size);
+            asc = self.ascent(runs[0].font_id, font_size);
+            desc = self.descent(runs[0].font_id, font_size);
         }
         return .{
             .font_size = font_size,
             .width = 0,
-            .ascent = ascent,
-            .descent = descent,
+            .ascent = asc,
+            .descent = desc,
             .runs = try allocator.alloc(ShapedRun, 0),
             .len = text.len,
         };
@@ -987,7 +987,10 @@ fn is_generic_name(name: []const u8) bool {
 
 fn is_monospace_name(name: []const u8) bool {
     if (std.mem.eql(u8, name, ".ZedMono") or std.mem.eql(u8, name, "monospace")) return true;
-    return std.ascii.indexOfIgnoreCase(name, "mono") != null;
+    var buf: [64]u8 = undefined;
+    if (name.len > buf.len) return false;
+    const lower = std.ascii.lowerString(buf[0..name.len], name);
+    return std.mem.indexOf(u8, lower, "mono") != null;
 }
 
 fn decoration_of(run: TextRun) DecorationRun {

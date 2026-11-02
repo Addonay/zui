@@ -193,6 +193,9 @@ pub const XEvent = extern union {
     xconfigure: XConfigureEvent,
     xclient: XClientMessageEvent,
     xcrossing: XCrossingEvent,
+    xexpose: XExposeEvent,
+    xselection: XSelectionEvent,
+    xselectionrequest: XSelectionRequestEvent,
     pad: [24]c_long,
 };
 
@@ -268,6 +271,22 @@ pub const ButtonReleaseMask: c_long = 1 << 3;
 pub const PointerMotionMask: c_long = 1 << 6;
 pub const StructureNotifyMask: c_long = 1 << 17;
 pub const FocusChangeMask: c_long = 1 << 21;
+
+pub const Expose: c_int = 12;
+pub const ZPixmap: c_int = 2;
+
+pub const XExposeEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    window: Window,
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+    count: c_int,
+};
 
 pub const EnterNotify: c_int = 7;
 pub const LeaveNotify: c_int = 8;

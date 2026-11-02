@@ -647,15 +647,15 @@ fn registryGlobal(data: ?*anyopaque, reg: *proto.Registry, name: u32, iface: [*:
     const api = self.api;
     const iface_name = std.mem.span(iface);
     if (std.mem.eql(u8, iface_name, "wl_compositor")) {
-        const ver = @min(version, 4);
+        const ver: u32 = @min(version, 4);
         self.compositor = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, api.wl_compositor_interface, ver, 0, name, api.wl_compositor_interface.name, ver, api.wl_compositor_interface));
     } else if (std.mem.eql(u8, iface_name, "wl_shm")) {
         self.shm = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, api.wl_shm_interface, @as(u32, 1), 0, name, api.wl_shm_interface.name, @as(u32, 1), api.wl_shm_interface));
     } else if (std.mem.eql(u8, iface_name, "xdg_wm_base")) {
-        const ver = @min(version, 5);
+        const ver: u32 = @min(version, 5);
         self.wm_base = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.xdg_wm_base_interface, ver, 0, name, proto.xdg_wm_base_interface.name, ver, &proto.xdg_wm_base_interface));
     } else if (std.mem.eql(u8, iface_name, "wl_seat")) {
-        const ver = @min(version, 5);
+        const ver: u32 = @min(version, 5);
         self.seat = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, api.wl_seat_interface, ver, 0, name, api.wl_seat_interface.name, ver, api.wl_seat_interface));
     } else if (std.mem.eql(u8, iface_name, "wl_data_device_manager")) {
         self.ddm = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.data_device_manager_interface, @as(u32, 1), 0, name, proto.data_device_manager_interface.name, @as(u32, 1), &proto.data_device_manager_interface));
@@ -667,12 +667,12 @@ fn registryGlobal(data: ?*anyopaque, reg: *proto.Registry, name: u32, iface: [*:
         self.frac_manager = api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.fractional_scale_manager_interface, @as(u32, 1), 0, name, proto.fractional_scale_manager_interface.name, @as(u32, 1), &proto.fractional_scale_manager_interface);
     } else if (std.mem.eql(u8, iface_name, "wl_output")) {
         if (self.output_count < max_outputs) {
-            const ver = @min(version, 3);
+            const ver: u32 = @min(version, 3);
             const out_iface = self.lib.lookup(*const proto.Interface, "wl_output_interface") orelse return;
             const proxy = api.wl_proxy_marshal_flags(@ptrCast(reg), 0, out_iface, ver, 0, name, out_iface.name, ver, out_iface);
             if (proxy) |p| {
                 self.outputs[self.output_count] = .{ .proxy = p, .name = name };
-                _ = api.wl_proxy_add_listener(p, &output_listener, &self.outputs[self.output_count]);
+                _ = api.wl_proxy_add_listener(p, &WaylandConnection.output_listener, &self.outputs[self.output_count]);
                 self.output_count += 1;
             }
         }
@@ -723,7 +723,7 @@ fn pointerEnter(data: ?*anyopaque, _: *proto.Pointer, serial: u32, surface: *pro
     self.pointer_focus = self.find_window(surface) orelse return;
     self.set_pointer_position(sx, sy);
     const w = self.pointer_focus.?;
-    w.emit_hover(true);
+    w.base.emit_hover(true);
     _ = w.base.emit_input(.{ .mouse_move = .{
         .position = self.pointer_pos,
         .pressed_button = self.pressed,
@@ -746,7 +746,7 @@ fn pointerLeave(data: ?*anyopaque, _: *proto.Pointer, _: u32, surface: *proto.Su
     self.pressed = null;
     self.axis_v = .{};
     self.axis_h = .{};
-    w.emit_hover(false);
+    w.base.emit_hover(false);
 }
 
 fn pointerMotion(data: ?*anyopaque, _: *proto.Pointer, _: u32, sx: i32, sy: i32) callconv(.c) void {

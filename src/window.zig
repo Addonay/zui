@@ -118,7 +118,6 @@ pub fn WindowHandle(comptime V: type) type {
         const Self = @This();
         window_id: WindowId,
         entity_id_: EntityId,
-        view_type: type = V,
 
         /// The root view entity.
         pub fn root(self: Self, cx: anytype) !app_mod.Entity(V) {

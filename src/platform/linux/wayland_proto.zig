@@ -550,7 +550,7 @@ pub const WaylandApi = struct {
     wl_pointer_interface: *const Interface,
     wl_keyboard_interface: *const Interface,
 
-    fn load(lib: dl.Library) ?WaylandApi {
+    pub fn load(lib: dl.Library) ?WaylandApi {
         return .{
             .wl_display_connect = lib.lookup(*const fn (?[*:0]const u8) callconv(.c) ?*Display, "wl_display_connect") orelse return null,
             .wl_display_disconnect = lib.lookup(*const fn (*Display) callconv(.c) void, "wl_display_disconnect") orelse return null,
@@ -593,7 +593,7 @@ pub const CursorApi = struct {
     image_get_buffer: *const fn (*CursorImage) callconv(.c) ?*Buffer,
     cursor_frame: *const fn (*CursorHandle, u32) callconv(.c) c_int,
 
-    fn load(lib: dl.Library) ?CursorApi {
+    pub fn load(lib: dl.Library) ?CursorApi {
         return .{
             .theme_load = lib.lookup(*const fn (?[*:0]const u8, c_int, *Shm) callconv(.c) ?*CursorTheme, "wl_cursor_theme_load") orelse return null,
             .theme_destroy = lib.lookup(*const fn (*CursorTheme) callconv(.c) void, "wl_cursor_theme_destroy") orelse return null,
