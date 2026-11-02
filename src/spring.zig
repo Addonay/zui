@@ -39,11 +39,11 @@ pub const SpringConfig = struct {
     /// Advances a spring toward a target that stays fixed for `delta_time` seconds.
     /// Analytic, so it is frame-rate independent and preserves velocity on retarget.
     pub fn step(self: SpringConfig, state: SpringState, target: f32, delta_time: f32) SpringState {
-        const propagator = self.propagator(delta_time);
+        const matrix = self.propagator(delta_time);
         const displacement = state.position - target;
         return .{
-            .position = target + propagator[0][0] * displacement + propagator[0][1] * state.velocity,
-            .velocity = propagator[1][0] * displacement + propagator[1][1] * state.velocity,
+            .position = target + matrix[0][0] * displacement + matrix[0][1] * state.velocity,
+            .velocity = matrix[1][0] * displacement + matrix[1][1] * state.velocity,
         };
     }
 
@@ -53,11 +53,11 @@ pub const SpringConfig = struct {
         const steady_state_lag = -2.0 * damping_ratio * target_velocity / natural_frequency;
         const displacement = state.position - target - steady_state_lag;
         const velocity = state.velocity - target_velocity;
-        const propagator = self.propagator(delta_time);
+        const matrix = self.propagator(delta_time);
         const moved_target = target + target_velocity * delta_time;
         return .{
-            .position = moved_target + steady_state_lag + propagator[0][0] * displacement + propagator[0][1] * velocity,
-            .velocity = target_velocity + propagator[1][0] * displacement + propagator[1][1] * velocity,
+            .position = moved_target + steady_state_lag + matrix[0][0] * displacement + matrix[0][1] * velocity,
+            .velocity = target_velocity + matrix[1][0] * displacement + matrix[1][1] * velocity,
         };
     }
 

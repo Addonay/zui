@@ -67,7 +67,7 @@ fn PaintOnly(comptime Ctx: type, comptime paint_fn: anytype) type {
     };
 }
 
-/// A canvas element holding its context and the `Hooks` callbacks (GPUI `Canvas<T>`).
+/// A canvas element holding its context and its callbacks (GPUI `Canvas<T>`).
 pub fn Canvas(comptime Ctx: type, comptime Callbacks: type) type {
     return struct {
         const Self = @This();

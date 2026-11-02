@@ -881,3 +881,35 @@ test "keystrokes: typed text is delivered to the focused input handler" {
     vcx.simulate_keystrokes("cmd-a");
     try std.testing.expectEqualStrings("hiA", cx.read_entity(view, TextField.read_text, .{}));
 }
+
+test "VisualTestContext: focus, update, mouse move and dispatch_action" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    const handle = view.read(cx.app).focus;
+    vcx.focus(handle);
+    try std.testing.expect(handle.is_focused(vcx.window));
+
+    const saves = vcx.update(struct {
+        fn f(window: *Window, _: *App) bool {
+            return window.is_action_available(app_mod.type_id(Editor.Save));
+        }
+    }.f, .{});
+    try std.testing.expect(saves);
+
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.dispatch_action(Editor.Save{});
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+}
+
+test "TestAppContext: public API compiles and an extra window opens" {
+    std.testing.refAllDecls(TestAppContext);
+    std.testing.refAllDecls(VisualTestContext);
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _ = cx.add_window_with_options(.{ .titlebar = null }, Counter.build);
+    _ = cx.executor();
+    _ = cx.foreground_executor();
+    _ = cx.background_executor();
+    try std.testing.expectEqual(@as(usize, 1), cx.app.windows.items.len);
+}

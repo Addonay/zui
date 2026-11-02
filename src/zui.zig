@@ -48,7 +48,12 @@ pub const elements = struct {
     pub const div = @import("elements/div.zig");
     pub const text = @import("elements/text.zig");
     pub const empty = @import("elements/empty.zig");
+    pub const anchored = @import("elements/anchored.zig");
+    pub const deferred = @import("elements/deferred.zig");
+    pub const canvas = @import("elements/canvas.zig");
+    pub const animation = @import("elements/animation.zig");
 };
+pub const spring = @import("spring.zig");
 
 // -- geometry ---------------------------------------------------------------
 pub const Pixels = geometry.Pixels;
@@ -181,6 +186,39 @@ pub const div = elements.div.div;
 pub const style_refinement = elements.div.style;
 pub const StyledText = elements.text.StyledText;
 pub const empty = elements.empty.empty;
+
+// -- anchored / deferred / canvas -------------------------------------------
+pub const Anchored = elements.anchored.Anchored;
+pub const AnchoredFitMode = elements.anchored.AnchoredFitMode;
+pub const AnchoredPositionMode = elements.anchored.AnchoredPositionMode;
+pub const anchored = elements.anchored.anchored;
+pub const Deferred = elements.deferred.Deferred;
+pub const deferred = elements.deferred.deferred;
+pub const Canvas = elements.canvas.Canvas;
+pub const canvas = elements.canvas.canvas;
+pub const canvas_fn = elements.canvas.canvas_fn;
+
+// -- animation / spring -------------------------------------------------------
+pub const Animation = elements.animation.Animation;
+pub const AnimationExt = elements.animation.AnimationExt;
+pub const AnimationElement = elements.animation.AnimationElement;
+pub const SpringAnimationElement = elements.animation.SpringAnimationElement;
+pub const with_animation = elements.animation.with_animation;
+pub const with_animations = elements.animation.with_animations;
+pub const with_spring = elements.animation.with_spring;
+pub const EasingFn = elements.animation.EasingFn;
+pub const linear = elements.animation.linear;
+pub const quadratic = elements.animation.quadratic;
+pub const ease_in_out = elements.animation.ease_in_out;
+pub const ease_out_quint = elements.animation.ease_out_quint;
+pub const bounce = elements.animation.bounce;
+pub const pulsating_between = elements.animation.pulsating_between;
+pub const SpringConfig = spring.SpringConfig;
+pub const SpringState = spring.SpringState;
+pub const SpringPlayback = spring.SpringPlayback;
+pub const SpringAnimation = spring.SpringAnimation;
+pub const AnimationPhase = spring.AnimationPhase;
+pub const sampled_easing = spring.sampled_easing;
 
 // -- input ------------------------------------------------------------------
 pub const Modifiers = keystroke.Modifiers;
