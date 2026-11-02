@@ -2,6 +2,7 @@ const std = @import("std");
 
 const examples = [_][]const u8{
     "hello_world",
+    "scrollable",
 };
 
 pub fn build(b: *std.Build) void {
