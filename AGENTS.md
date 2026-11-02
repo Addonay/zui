@@ -11,8 +11,14 @@ agent (or human) can pick the work up. Read it fully before changing code.
    GPUI code line by line. Where Zig forces a difference (no closures, traits,
    async sugar, explicit allocators), keep it close and idiomatic, not ugly.
 2. Use the owner's libraries: **cozmic** (text; port of cosmic-text) and
-   **zafi** (layout; port of Taffy). Use **zicr** (owner's GPU layer, port of
-   sokol_gfx) for GPU rendering.
+   **zafi** (layout; port of Taffy). Use **zicr** ONLY for its **GPU backends**
+   — the portable `zicr.gpu` device layer over **Vulkan, Direct3D 12, Metal,
+   OpenGL/GLES and WebGPU (wgpu-native/Dawn/browser)**. zicr's `render2d` is
+   NOT to be used: the renderer (batching, instance layouts, atlas, shaders,
+   path rasterization) is ZUI's own, ported from GPUI's `gpui_wgpu` renderer,
+   and it talks to the GPU exclusively through `zicr.gpu`. Copying zicr's
+   backend code directly into ZUI is allowed (owner's repo) if that works
+   better than the dependency.
 3. Once API parity is ~99.99%, focus on **performance — beat GPUI**.
 4. Dependencies only where they make sense (C/C++/Zig), minimal; otherwise
    write the code.
@@ -240,7 +246,13 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   Underline alpha is squared exactly like GPUI's shader (looks like a GPUI quirk).
   Benchmarks (4 vCPU Xeon, 1080p, ReleaseFast, 4 threads): 10k opaque rects
   5.2 ms, 10k rounded 21 ms, 10k gradients 231 ms (slowest path).
-- **GPU renderer (WIP)**: `src/renderer/gpu.zig` + `shaders.glsl` (sokol-shdc
+- **GPU renderer (WIP)** — design rule: ZUI renderer on top of `zicr.gpu`
+  backends only (Vulkan on Linux/Windows/Android, D3D12 on Windows, Metal on
+  macOS/iOS, GL/GLES as fallback, WebGPU for web/wgpu-native). Never import
+  zicr's `render2d`; import the standalone module `zicr_dep.module("gpu")`.
+  Native handle acquisition (Vulkan instance/surface/swapchain, Metal layer,
+  DXGI swapchain, GL context, WebGPU surface) is per-platform code in ZUI.
+  Files: `src/renderer/gpu.zig` + `shaders.glsl` (sokol-shdc
   annotated GLSL, port of `gpui_wgpu/src/shaders.wgsl`), gated by
   `-Dgpu=true` with a `gpu-test` step comparing GPU vs CPU pixels on lavapipe.
   The agent was stopped while fixing a compile error: importing the full
@@ -256,8 +268,11 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 
 ## 8. Known gaps / next steps (in priority order)
 
-1. Finish GPU renderer on zicr (see §7), wire into Wayland/X11 windows; then
-   macOS (Metal via zicr) and Windows (D3D12 via zicr) platforms — GPUI's
+1. Finish the GPU renderer on `zicr.gpu` backends only (see §7): switch the
+   build to `zicr_dep.module("gpu")`, add Vulkan surface/swapchain bootstrap for
+   Wayland/X11 and wire it into the Linux windows (CPU renderer stays the
+   fallback), then macOS (Metal backend) and Windows (D3D12, Vulkan fallback)
+   platforms, GL/GLES fallback, and web (WebGPU backend) — GPUI's
    `gpui_macos` / `gpui_windows` are the references; old ZUI had cocoa/win32
    skeletons in history.
 2. Div: drag & drop (`on_drag`, `on_drop`, `drag_over`), tooltips,
