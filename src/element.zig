@@ -296,7 +296,11 @@ pub fn into_any_element(value: anytype) AnyElement {
             if (@hasDecl(T, "into_any_element")) return value.into_any_element();
             if (@hasDecl(T, "into_element")) return into_any_element(value.into_element());
             // A bare element value (GPUI `impl Element` is also `IntoElement`).
-            if (@hasDecl(T, "request_layout")) return AnyElement.new(value);
+            if (@hasDecl(T, "request_layout")) {
+                const p = window_mod.frame_arena().create(T) catch @panic("OOM");
+                p.* = value;
+                return AnyElement.new(p);
+            }
         },
         else => {},
     }

@@ -301,7 +301,7 @@ pub const CursorStyle = enum {
 pub const Style = struct {
     pub const refineable_fields = .{ "overflow", "inset", "size", "min_size", "max_size", "margin", "padding", "border_widths", "gap", "corner_radii", "text" };
 
-    display: Display = .flex,
+    display: Display = .block,
     visibility: Visibility = .visible,
     overflow: Point(Overflow) = .{ .x = .visible, .y = .visible },
     scrollbar_width: AbsoluteLength = .{ .pixels = 0 },

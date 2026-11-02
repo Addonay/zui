@@ -4258,9 +4258,14 @@ const OpenedList = struct {
 fn open_list(cx: *TestAppContext, state: ListState, item_height: Pixels, width: f32, height: f32) OpenedList {
     test_list_state = state;
     test_item_height = item_height;
-    const view, const vcx = cx.add_window_view(TestListView.build);
-    resize_list(vcx, width, height);
-    return .{ .view = view, .vcx = vcx };
+    // Open at the final size so the first layout is the one the test observes.
+    const handle = cx.add_window_with_options(.{
+        .window_bounds = .{ .windowed = geometry.bounds(geometry.point(geometry.px(0), geometry.px(0)), geometry.size(geometry.px(width), geometry.px(height))) },
+    }, TestListView.build);
+    const visual = cx.allocator.create(VisualTestContext) catch @panic("OOM");
+    visual.* = .{ .window = handle.window(cx.app) orelse unreachable, .cx = cx };
+    cx.visual_contexts.append(cx.allocator, visual) catch @panic("OOM");
+    return .{ .view = handle.root(cx.app) catch unreachable, .vcx = visual };
 }
 
 fn resize_list(vcx: *VisualTestContext, width: f32, height: f32) void {

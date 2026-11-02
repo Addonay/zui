@@ -5,6 +5,10 @@ const examples = [_][]const u8{
     "pattern",
     "tree",
     "text_layout",
+    "scrollable",
+    "ownership_post",
+    "active_state_bug",
+    "gradient",
 };
 
 pub fn build(b: *std.Build) void {
