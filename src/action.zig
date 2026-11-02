@@ -45,25 +45,26 @@ pub fn box_action(allocator: Allocator, action: anytype) AnyAction {
     return .{ .type_id = type_id_of(T), .ptr = boxed, .name = action_name(T) };
 }
 
-/// Calls `f` with the action pointer cast to `*const A` when the action type matches.
+/// A handler registered with `App.on_action`, run for every dispatched action of its type.
 pub const GlobalActionListener = struct {
     action_type: TypeId,
     func: *const fn (*const anyopaque, *App) void,
 };
 
 /// Declares a unit action named `namespace::name`, like one entry of GPUI's `actions!` macro.
-pub fn Action(comptime namespace: []const u8, comptime name: []const u8) type {
+pub fn Action(comptime namespace: []const u8, comptime short_name: []const u8) type {
+    const full = namespace ++ "::" ++ short_name;
     return struct {
-        pub const action_name: []const u8 = namespace ++ "::" ++ name;
+        pub const action_name: []const u8 = full;
 
         /// The action's name, for display.
         pub fn name(_: *const @This()) []const u8 {
-            return action_name;
+            return full;
         }
 
         /// The action's name, without an instance.
         pub fn name_for_type() []const u8 {
-            return action_name;
+            return full;
         }
     };
 }

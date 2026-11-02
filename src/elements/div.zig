@@ -3796,8 +3796,8 @@ pub fn StyledElement(comptime Ext: type) type {
                         Interactivity.groups.clearRetainingCapacity();
                         Interactivity.groups_frame = window.frame_count;
                     }
-                    const active = if (pp.state) |st| st.active else false;
-                    Interactivity.groups.put(std.heap.page_allocator, g, .{ .hitbox = pp.hitbox.?.id, .active = active }) catch oom();
+                    const is_active = if (pp.state) |st| st.active else false;
+                    Interactivity.groups.put(std.heap.page_allocator, g, .{ .hitbox = pp.hitbox.?.id, .active = is_active }) catch oom();
                 }
             }
 
@@ -3818,7 +3818,7 @@ pub fn StyledElement(comptime Ext: type) type {
             pp.scroll_offset = scroll;
 
             const mask = s.overflow_mask(bounds, window.rem_size());
-            if (mask) |m| window.push_content_mask(.{ .bounds = m });
+            if (mask) |mk| window.push_content_mask(.{ .bounds = mk });
             defer if (mask != null) window.pop_content_mask();
 
             window.push_element_offset(scroll);
@@ -3887,7 +3887,7 @@ pub fn StyledElement(comptime Ext: type) type {
 
             // Children inside the overflow mask, offset by scroll.
             const mask = s.overflow_mask(bounds, rem);
-            if (mask) |m| window.push_content_mask(.{ .bounds = m });
+            if (mask) |mk| window.push_content_mask(.{ .bounds = mk });
             for (self.children_list.items) |c| c.paint(window, cx);
             if (mask != null) window.pop_content_mask();
 
