@@ -4272,7 +4272,7 @@ test "list: heights index answers prefix sums and offset searches" {
     const state = ListState.new(4, .top, 0);
     defer state.deinit();
     const heights = [_]Pixels{ 10, 20, 30, 40 };
-    for (heights, 0..) |h, ix| state.inner.set_item(ix, .{ .measured = geometry.size(0, h) });
+    for (heights, 0..) |h, ix| state.inner.set_item(ix, .{ .measured = .{ .width = 0, .height = h } });
 
     try std.testing.expectEqual(@as(Pixels, 30), state.inner.prefix_px(2));
     try std.testing.expectEqual(@as(Pixels, 100), state.inner.total_height());
