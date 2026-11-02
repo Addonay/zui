@@ -358,6 +358,9 @@ const Target = struct {
     height: usize,
     stride: usize,
     bgra: bool,
+    /// Rows `[y0, y1)` this target may write; bands of one frame are disjoint.
+    y0: usize = 0,
+    y1: usize = 0,
 
     fn init(fb: Framebuffer) ?Target {
         const w: usize = fb.width;
@@ -365,7 +368,14 @@ const Target = struct {
         const stride: usize = fb.stride;
         if (w == 0 or h == 0 or stride < w * 4) return null;
         if (fb.pixels.len < (h - 1) * stride + w * 4) return null;
-        return .{ .bytes = fb.pixels, .width = w, .height = h, .stride = stride, .bgra = fb.format == .bgra8 };
+        return .{ .bytes = fb.pixels, .width = w, .height = h, .stride = stride, .bgra = fb.format == .bgra8, .y1 = h };
+    }
+
+    fn rows(self: Target, y0: usize, y1: usize) Target {
+        var band = self;
+        band.y0 = y0;
+        band.y1 = y1;
+        return band;
     }
 
     inline fn offset(self: Target, x: usize, y: usize) usize {
@@ -524,11 +534,14 @@ const PixelRect = struct {
     y1: usize,
 };
 
-/// Pixels whose centers lie inside both `bounds` and `clip`, and inside the framebuffer.
+/// Pixels whose centers lie inside both `bounds` and `clip`, inside the framebuffer and the target's band.
 fn rect_pixels(bounds: Bounds(ScaledPixels), clip: Bounds(ScaledPixels), t: Target) ?PixelRect {
     const xs = axis_range(bounds.origin.x, bounds.origin.x + bounds.size.width, clip.origin.x, clip.origin.x + clip.size.width, t.width) orelse return null;
     const ys = axis_range(bounds.origin.y, bounds.origin.y + bounds.size.height, clip.origin.y, clip.origin.y + clip.size.height, t.height) orelse return null;
-    return .{ .x0 = xs[0], .x1 = xs[1], .y0 = ys[0], .y1 = ys[1] };
+    const y0 = @max(ys[0], t.y0);
+    const y1 = @min(ys[1], t.y1);
+    if (!(y1 > y0)) return null;
+    return .{ .x0 = xs[0], .x1 = xs[1], .y0 = y0, .y1 = y1 };
 }
 
 // ---------------------------------------------------------------------------
@@ -1322,7 +1335,7 @@ fn rasterize_triangle(acc: []F4, r: PixelRect, bp: *const BgPrep, ox: f32, oy: f
     }
 }
 
-fn draw_path(self: *CpuRenderer, t: Target, p: *const scene.Path(ScaledPixels)) void {
+fn draw_path(scratch: *std.ArrayList(F4), gpa: std.mem.Allocator, t: Target, p: *const scene.Path(ScaledPixels)) void {
     const verts = p.vertices.items;
     if (verts.len < 3) return;
     const cb = p.clipped_bounds();
@@ -1330,8 +1343,8 @@ fn draw_path(self: *CpuRenderer, t: Target, p: *const scene.Path(ScaledPixels)) 
     const w = r.x1 - r.x0;
     const h = r.y1 - r.y0;
 
-    self.path_samples.resize(self.allocator, w * h * 4) catch return;
-    const acc = self.path_samples.items;
+    scratch.resize(gpa, w * h * 4) catch return;
+    const acc = scratch.items;
     @memset(acc, zero4);
 
     const bp = BgPrep.init(p.color, cb.size.width, cb.size.height);
@@ -1359,10 +1372,24 @@ fn draw_path(self: *CpuRenderer, t: Target, p: *const scene.Path(ScaledPixels)) 
 // Renderer
 // ---------------------------------------------------------------------------
 
+fn empty_scratch() [CpuRenderer.max_bands]std.ArrayList(F4) {
+    var lists: [CpuRenderer.max_bands]std.ArrayList(F4) = undefined;
+    for (&lists) |*list| list.* = .empty;
+    return lists;
+}
+
 /// Software renderer for `Scene`. Owns scratch memory reused across frames.
 pub const CpuRenderer = struct {
+    /// Upper bound on worker bands per frame.
+    pub const max_bands = 16;
+    /// Bands are at least this many rows high, so small frames stay on one thread.
+    const min_band_rows = 32;
+
     allocator: std.mem.Allocator,
-    path_samples: std.ArrayList(F4) = .empty,
+    /// Threads to draw with: 0 uses the CPU count, 1 draws on the calling thread.
+    threads: usize = 0,
+    /// Per-band scratch for path rasterization.
+    scratch: [max_bands]std.ArrayList(F4) = empty_scratch(),
 
     /// Creates a renderer; scratch buffers grow on demand.
     pub fn init(allocator: std.mem.Allocator) CpuRenderer {
@@ -1371,21 +1398,51 @@ pub const CpuRenderer = struct {
 
     /// Releases the scratch buffers.
     pub fn deinit(self: *CpuRenderer) void {
-        self.path_samples.deinit(self.allocator);
+        for (&self.scratch) |*list| list.deinit(self.allocator);
     }
 
     /// Clears `fb` to `clear` and draws `scene` (already `finish()`ed), sampling sprite textures from `atlas`.
+    /// Rows are split into bands drawn in parallel; each band replays the whole scene in order.
     pub fn draw(self: *CpuRenderer, sc: *const Scene, atlas_: *const CpuAtlas, fb: Framebuffer, clear: Hsla) void {
-        const t = Target.init(fb) orelse return;
+        const full = Target.init(fb) orelse return;
         const clear_rgba = clear.to_rgb();
         const clear_px = [4]f32{ clear_rgba.r, clear_rgba.g, clear_rgba.b, clear_rgba.a };
-        for (0..t.height) |y| fill_opaque(t, y, 0, t.width, clear_px);
+
+        const wanted = if (self.threads == 0) (std.Thread.getCpuCount() catch 1) else self.threads;
+        const bands = std.math.clamp(@min(wanted, full.height / min_band_rows), 1, max_bands);
+        if (bands == 1) {
+            self.draw_band(0, sc, atlas_, full, clear_px);
+            return;
+        }
+
+        var jobs: [max_bands]BandJob = undefined;
+        var threads: [max_bands]?std.Thread = @splat(null);
+        for (0..bands) |i| {
+            jobs[i] = .{
+                .renderer = self,
+                .scene = sc,
+                .atlas = atlas_,
+                .target = full.rows(full.height * i / bands, full.height * (i + 1) / bands),
+                .clear = clear_px,
+                .index = i,
+            };
+        }
+        // Band 0 runs here; a band whose thread cannot be spawned also runs here, after the others.
+        for (1..bands) |i| threads[i] = std.Thread.spawn(.{}, run_job, .{&jobs[i]}) catch null;
+        run_job(&jobs[0]);
+        for (1..bands) |i| {
+            if (threads[i]) |thread| thread.join() else run_job(&jobs[i]);
+        }
+    }
+
+    fn draw_band(self: *CpuRenderer, index: usize, sc: *const Scene, atlas_: *const CpuAtlas, t: Target, clear_px: [4]f32) void {
+        for (t.y0..t.y1) |y| fill_opaque(t, y, 0, t.width, clear_px);
 
         var batches = sc.batches();
         while (batches.next()) |batch| switch (batch) {
             .shadows => |items| for (items) |*item| draw_shadow(t, item),
             .quads => |items| for (items) |*item| draw_quad(t, item),
-            .paths => |items| for (items) |*item| draw_path(self, t, item),
+            .paths => |items| for (items) |*item| draw_path(&self.scratch[index], self.allocator, t, item),
             .underlines => |items| for (items) |*item| draw_underline(t, item),
             .monochrome_sprites => |b| if (atlas_.texture(b.texture_id)) |tex| {
                 for (b.sprites) |*item| draw_mono(t, tex, item);
@@ -1401,6 +1458,19 @@ pub const CpuRenderer = struct {
         };
     }
 };
+
+const BandJob = struct {
+    renderer: *CpuRenderer,
+    scene: *const Scene,
+    atlas: *const CpuAtlas,
+    target: Target,
+    clear: [4]f32,
+    index: usize,
+};
+
+fn run_job(job: *BandJob) void {
+    job.renderer.draw_band(job.index, job.scene, job.atlas, job.target, job.clear);
+}
 
 /// Writes a binary PPM (P6) of `fb` for snapshots. Alpha is dropped.
 pub fn write_ppm(fb: Framebuffer, writer: anytype) !void {
@@ -1646,6 +1716,34 @@ test "dashed border leaves gaps" {
     }
     try testing.expect(blue > 0);
     try testing.expect(gap > 0);
+}
+
+test "interior fast path matches the full SDF" {
+    const quad: Quad = .{
+        .bounds = test_rect(3.25, 2.5, 30.5, 20),
+        .content_mask = test_mask(0, 0, 40, 30),
+        .background = color.linear_gradient(
+            45,
+            color.linear_color_stop(color.red(), 0),
+            color.linear_color_stop(color.blue(), 1),
+        ),
+        .border_color = color.hsla(0.3, 0.8, 0.4, 0.7),
+        .border_widths = .{ .top = 2, .right = 1, .bottom = 3, .left = 2 },
+        .corner_radii = .{ .top_left = 6, .top_right = 3, .bottom_right = 9, .bottom_left = 0 },
+    };
+
+    var fast = try TestFb.init(40, 30, .{ 0, 0, 0, 255 });
+    defer fast.deinit();
+    draw_quad(Target.init(fast.fb).?, &quad);
+
+    var full = try TestFb.init(40, 30, .{ 0, 0, 0, 255 });
+    defer full.deinit();
+    const t = Target.init(full.fb).?;
+    const g = QuadGeom.init(&quad);
+    const r = rect_pixels(quad.bounds, quad.content_mask.bounds, t).?;
+    for (r.y0..r.y1) |y| quad_edge(t, y, r.x0, r.x1, &g);
+
+    try testing.expectEqualSlices(u8, full.buffer, fast.buffer);
 }
 
 test "linear gradient runs from the first stop to the second" {

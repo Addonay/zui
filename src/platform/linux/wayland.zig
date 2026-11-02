@@ -209,7 +209,6 @@ pub const WaylandConnection = struct {
 
         self.xkb = xkb.Xkb.init() catch null;
         self.load_cursor_theme();
-        if (std.c.getenv("ZUI_DEBUG_EVENTS") != null) std.log.debug("wayland: connected", .{});
         return self;
     }
 
@@ -1430,3 +1429,11 @@ pub const WaylandWindow = struct {
         self.base.emit_resize(self.size, self.scale);
     }
 };
+
+test "wheel axis: wayland positive is down, lines are negated to positive-up" {
+    try std.testing.expectEqual(@as(f32, -1), WaylandConnection.axisLines(.{ .v120 = 120 }, true).?);
+    try std.testing.expectEqual(@as(f32, 1), WaylandConnection.axisLines(.{ .v120 = -120 }, true).?);
+    try std.testing.expectEqual(@as(f32, 2), WaylandConnection.axisLines(.{ .discrete = -2 }, true).?);
+    try std.testing.expectEqual(@as(f32, -1), WaylandConnection.axisLines(.{ .value = 10 }, true).?);
+    try std.testing.expect(WaylandConnection.axisLines(.{}, true) == null);
+}

@@ -1,6 +1,6 @@
 //! xkbcommon bindings for layout-correct Wayland text (dlopen, never link).
 //!
-//! The evdev tables in `evdev.zig` are US-QWERTY-only: on a German layout
+//! The evdev fallback in `input.zig` is US-QWERTY-only: on a German layout
 //! evdev says `y` where the user pressed `z`. xkbcommon compiles the
 //! compositor's keymap (sent over the `wl_keyboard.keymap` fd) and answers
 //! per-key questions in the USER's layout: keysym for bindings, UTF-8 for
@@ -176,3 +176,15 @@ pub const Xkb = struct {
         return @intCast(@min(n, out.len));
     }
 };
+
+test "xkb maps evdev keys through the compiled us keymap" {
+    var x = Xkb.init() catch return error.SkipZigTest;
+    defer x.deinit();
+    x.setKeymapString(us_test_keymap) catch return error.SkipZigTest;
+    // evdev 30 ('a' position) is xkb keycode 38.
+    x.updateKey(38, true);
+    try std.testing.expectEqual(@as(u32, 'a'), x.keysym(38));
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("a", buf[0..x.utf8(38, &buf)]);
+    x.updateKey(38, false);
+}

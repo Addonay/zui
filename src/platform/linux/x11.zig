@@ -811,3 +811,9 @@ pub const X11Window = struct {
         self.allocator.destroy(self);
     }
 };
+
+test "x11 cursor styles use cursorfont glyphs" {
+    try std.testing.expectEqual(proto.XC_left_ptr, X11Connection.cursor_glyph(.arrow));
+    try std.testing.expectEqual(proto.XC_xterm, X11Connection.cursor_glyph(.i_beam));
+    try std.testing.expectEqual(proto.XC_hand2, X11Connection.cursor_glyph(.pointing_hand));
+}

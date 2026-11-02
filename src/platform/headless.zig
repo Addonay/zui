@@ -174,6 +174,34 @@ pub const HeadlessWindow = struct {
         const self = from(p);
         self.last_scene = scene;
         self.draw_count += 1;
+        if (std.c.getenv("ZUI_SNAPSHOT")) |path| self.snapshot(scene, std.mem.span(path)) catch |err| {
+            std.log.err("snapshot failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Renders `scene` with the CPU renderer and writes a binary PPM to `path`.
+    pub fn snapshot(self: *HeadlessWindow, scene: *const scene_mod.Scene, path: []const u8) !void {
+        const cpu = @import("../renderer/cpu.zig");
+        const a = self.owner.allocator;
+        const w: u32 = @intFromFloat(@round(self.size.width * self.scale));
+        const h: u32 = @intFromFloat(@round(self.size.height * self.scale));
+        const pixels = try a.alloc(u8, @as(usize, w) * h * 4);
+        defer a.free(pixels);
+        var r = cpu.CpuRenderer.init(a);
+        defer r.deinit();
+        const fb: cpu.Framebuffer = .{ .pixels = pixels, .width = w, .height = h, .stride = w * 4, .format = .rgba8 };
+        r.draw(scene, &self.atlas, fb, @import("../color.zig").white());
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try out.print(a, "P6\n{d} {d}\n255\n", .{ w, h });
+        try out.ensureUnusedCapacity(a, @as(usize, w) * h * 3);
+        var i: usize = 0;
+        while (i < pixels.len) : (i += 4) out.appendSliceAssumeCapacity(pixels[i .. i + 3]);
+        const zpath = try a.dupeSentinel(u8, path, 0);
+        defer a.free(zpath);
+        const f = std.c.fopen(zpath, "wb") orelse return error.OpenFailed;
+        defer _ = std.c.fclose(f);
+        if (std.c.fwrite(out.items.ptr, 1, out.items.len, f) != out.items.len) return error.WriteFailed;
     }
     fn spriteAtlas(p: *PlatformWindow) atlas_mod.PlatformAtlas {
         return self_atlas(from(p));
