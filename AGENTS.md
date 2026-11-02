@@ -18,7 +18,8 @@ agent (or human) can pick the work up. Read it fully before changing code.
    path rasterization) is ZUI's own, ported from GPUI's `gpui_wgpu` renderer,
    and it talks to the GPU exclusively through `zicr.gpu`. Copying zicr's
    backend code directly into ZUI is allowed (owner's repo) if that works
-   better than the dependency.
+   better than the dependency. Actually that should be the case. copy the
+   backends to zui and leave zicr alone. discard it when done.
 3. Once API parity is ~99.99%, focus on **performance — beat GPUI**.
 4. Dependencies only where they make sense (C/C++/Zig), minimal; otherwise
    write the code.
