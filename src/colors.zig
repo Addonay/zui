@@ -1,52 +1,71 @@
-//! GPUI-shaped default color tokens.
-const core = @import("core/root.zig");
+//! Default colors used by GPUI for base components.
+const std = @import("std");
+const color = @import("color.zig");
 
+const Rgba = color.Rgba;
+const rgb = color.rgb;
+
+/// The appearance of the base colors, which varies with the system window appearance.
+pub const DefaultAppearance = enum {
+    /// Light appearance colors.
+    light,
+    /// Dark appearance colors.
+    dark,
+
+    pub const default: DefaultAppearance = .light;
+};
+
+/// The default set of colors used for styling base components.
 pub const Colors = struct {
-    text: core.Color,
-    selected_text: core.Color,
-    background: core.Color,
-    disabled: core.Color,
-    selected: core.Color,
-    border: core.Color,
-    separator: core.Color,
-    container: core.Color,
+    /// Text color.
+    text: Rgba,
+    /// Selected text color.
+    selected_text: Rgba,
+    /// Background color.
+    background: Rgba,
+    /// Disabled color.
+    disabled: Rgba,
+    /// Selected color.
+    selected: Rgba,
+    /// Border color.
+    border: Rgba,
+    /// Separator color.
+    separator: Rgba,
+    /// Container color.
+    container: Rgba,
 
-    pub fn light() @This() {
+    pub const default: Colors = Colors.light();
+
+    /// Returns the default dark colors.
+    pub fn dark() Colors {
         return .{
-            .text = core.Color.hex(0x252525),
-            .selected_text = core.Color.white,
-            .background = core.Color.white,
-            .disabled = core.Color.hex(0xb0b0b0),
-            .selected = core.Color.hex(0x2a63d9),
-            .border = core.Color.hex(0xd9d9d9),
-            .separator = core.Color.hex(0xe6e6e6),
-            .container = core.Color.hex(0xf4f5f5),
+            .text = rgb(0xffffff),
+            .selected_text = rgb(0xffffff),
+            .disabled = rgb(0x565656),
+            .selected = rgb(0x2457ca),
+            .background = rgb(0x222222),
+            .border = rgb(0x000000),
+            .separator = rgb(0xd9d9d9),
+            .container = rgb(0x262626),
         };
     }
 
-    pub fn dark() @This() {
+    /// Returns the default light colors.
+    pub fn light() Colors {
         return .{
-            .text = core.Color.white,
-            .selected_text = core.Color.white,
-            .background = core.Color.hex(0x222222),
-            .disabled = core.Color.hex(0x565656),
-            .selected = core.Color.hex(0x2457ca),
-            .border = core.Color.black,
-            .separator = core.Color.hex(0xd9d9d9),
-            .container = core.Color.hex(0x262626),
+            .text = rgb(0x252525),
+            .selected_text = rgb(0xffffff),
+            .background = rgb(0xffffff),
+            .disabled = rgb(0xb0b0b0),
+            .selected = rgb(0x2a63d9),
+            .border = rgb(0xd9d9d9),
+            .separator = rgb(0xe6e6e6),
+            .container = rgb(0xf4f5f5),
         };
     }
 };
 
-pub const DefaultAppearance = enum { light, dark };
-
-pub fn defaults(appearance: DefaultAppearance) Colors {
-    return if (appearance == .dark) Colors.dark() else Colors.light();
-}
-
-test "default color tokens provide light and dark palettes" {
-    const light = defaults(.light);
-    const dark = defaults(.dark);
-    try @import("std").testing.expect(light.background.a == 1 and dark.background.a == 1);
-    try @import("std").testing.expect(light.background.r != dark.background.r);
+test "light and dark palettes differ in background" {
+    try std.testing.expect(Colors.light().background.to_u32() != Colors.dark().background.to_u32());
+    try std.testing.expectEqual(@as(u32, 0xffffffff), Colors.default.background.to_u32());
 }

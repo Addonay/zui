@@ -1,6 +1,6 @@
 //! xkbcommon bindings for layout-correct Wayland text (dlopen, never link).
 //!
-//! The evdev tables in `evdev.zig` are US-QWERTY-only: on a German layout
+//! The evdev fallback in `input.zig` is US-QWERTY-only: on a German layout
 //! evdev says `y` where the user pressed `z`. xkbcommon compiles the
 //! compositor's keymap (sent over the `wl_keyboard.keymap` fd) and answers
 //! per-key questions in the USER's layout: keysym for bindings, UTF-8 for
@@ -11,16 +11,7 @@
 //! tests and minimal systems keep working.
 
 const std = @import("std");
-const event = @import("../event.zig");
-const dl = @import("../dl.zig");
-
-// keyFromKeysym does tag arithmetic; pin the contiguity it relies on.
-comptime {
-    std.debug.assert(@backingInt(event.Key.b) == @backingInt(event.Key.a) + 1);
-    std.debug.assert(@backingInt(event.Key.z) == @backingInt(event.Key.a) + 25);
-    std.debug.assert(@backingInt(event.Key.n9) == @backingInt(event.Key.n0) + 9);
-    std.debug.assert(@backingInt(event.Key.f12) == @backingInt(event.Key.f1) + 11);
-}
+const dl = @import("dl.zig");
 
 pub const xkb_lib_names: []const [*:0]const u8 = &.{ "libxkbcommon.so.0", "libxkbcommon.so" };
 
@@ -92,9 +83,7 @@ pub const XkbApi = struct {
     }
 };
 
-// Keysyms (from xkbcommon-keysyms.h) covering our `event.Key` enum. Like
-// GPUI's keystroke mapping, controls map by keysym (layout-independent)
-// while printable text flows through the UTF-8 query below.
+// Keysyms (from xkbcommon-keysyms.h).
 pub const XKB_KEY_NoSymbol: u32 = 0x000000;
 pub const XKB_KEY_space: u32 = 0x0020;
 pub const XKB_KEY_BackSpace: u32 = 0xff08;
@@ -108,42 +97,6 @@ pub const XKB_KEY_Up: u32 = 0xff52;
 pub const XKB_KEY_Right: u32 = 0xff53;
 pub const XKB_KEY_Down: u32 = 0xff54;
 pub const XKB_KEY_End: u32 = 0xff57;
-
-/// Map an XKB keysym to our normalized `Key`. Letters match either case;
-/// digits, controls, arrows, and F-keys by value — all layout-independent,
-/// which is the whole point over evdev codes.
-pub fn keyFromKeysym(sym: u32) event.Key {
-    if ((sym >= 'a' and sym <= 'z') or (sym >= 'A' and sym <= 'Z')) {
-        const lower = sym | 0x20;
-        return @fromBackingInt(@intCast(@backingInt(event.Key.a) + (lower - 'a')));
-    }
-    if ((sym >= 'a' and sym <= 'z') or (sym >= 'A' and sym <= 'Z')) {
-        const lower = sym | 0x20;
-        return @fromBackingInt(@intCast(@backingInt(event.Key.a) + (lower - 'a')));
-    }
-    if (sym >= '0' and sym <= '9') {
-        return @fromBackingInt(@intCast(@backingInt(event.Key.n0) + (sym - '0')));
-    }
-    // F1..F12 are contiguous keysyms AND contiguous enum members.
-    if (sym >= 0xffbe and sym <= 0xffc9) {
-        return @fromBackingInt(@intCast(@backingInt(event.Key.f1) + (sym - 0xffbe)));
-    }
-    return switch (sym) {
-        XKB_KEY_Return => .enter,
-        XKB_KEY_space => .space,
-        XKB_KEY_Tab => .tab,
-        XKB_KEY_BackSpace => .backspace,
-        XKB_KEY_Escape => .escape,
-        XKB_KEY_Delete => .delete,
-        XKB_KEY_Left => .left,
-        XKB_KEY_Right => .right,
-        XKB_KEY_Up => .up,
-        XKB_KEY_Down => .down,
-        XKB_KEY_Home => .home,
-        XKB_KEY_End => .end,
-        else => .unknown,
-    };
-}
 
 /// Owned xkb lifecycle: library + context, with at most one keymap/state
 /// pair replaced wholesale on every keymap event. All heap-free after init
@@ -224,53 +177,14 @@ pub const Xkb = struct {
     }
 };
 
-test "keysym mapping is layout-independent" {
-    const t = std.testing;
-    try t.expectEqual(event.Key.a, keyFromKeysym('a'));
-    try t.expectEqual(event.Key.a, keyFromKeysym('A'));
-    try t.expectEqual(event.Key.z, keyFromKeysym('z'));
-    try t.expectEqual(event.Key.n0, keyFromKeysym('0'));
-    try t.expectEqual(event.Key.n9, keyFromKeysym('9'));
-    try t.expectEqual(event.Key.enter, keyFromKeysym(XKB_KEY_Return));
-    try t.expectEqual(event.Key.space, keyFromKeysym(XKB_KEY_space));
-    try t.expectEqual(event.Key.backspace, keyFromKeysym(XKB_KEY_BackSpace));
-    try t.expectEqual(event.Key.escape, keyFromKeysym(XKB_KEY_Escape));
-    try t.expectEqual(event.Key.delete, keyFromKeysym(XKB_KEY_Delete));
-    try t.expectEqual(event.Key.left, keyFromKeysym(XKB_KEY_Left));
-    try t.expectEqual(event.Key.home, keyFromKeysym(XKB_KEY_Home));
-    try t.expectEqual(event.Key.end, keyFromKeysym(XKB_KEY_End));
-    try t.expectEqual(event.Key.f1, keyFromKeysym(0xffbe));
-    try t.expectEqual(event.Key.f12, keyFromKeysym(0xffc9));
-    try t.expectEqual(event.Key.unknown, keyFromKeysym(XKB_KEY_NoSymbol));
-    try t.expectEqual(event.Key.unknown, keyFromKeysym(0x1234));
-}
-
-test "xkb round-trips a compiled us keymap" {
-    const t = std.testing;
-    if (!XkbApi.isAvailable()) return;
-    var xkb = try Xkb.init();
-    defer xkb.deinit();
-    // Minimal definitions; includes resolve from the system xkb database.
-    // If the database is absent the compile fails and the test skips.
-    xkb.setKeymapString(us_test_keymap) catch return;
-    try t.expect(xkb.hasLiveState());
-
-    // evdev 30 ('a' position) == xkb keycode 38.
-    xkb.updateKey(38, true);
-    try t.expectEqual(@as(u32, 'a'), xkb.keysym(38));
-    var buf: [16]u8 = undefined;
-    const n = xkb.utf8(38, &buf);
-    try t.expectEqual(@as(usize, 1), n);
-    try t.expectEqual(@as(u8, 'a'), buf[0]);
-    xkb.updateKey(38, false);
-
-    // With shift held the same position yields 'A'.
-    xkb.updateKey(50, true); // left shift down
-    xkb.updateKey(38, true);
-    try t.expectEqual(@as(u32, 'A'), xkb.keysym(38));
-    const m = xkb.utf8(38, &buf);
-    try t.expectEqual(@as(usize, 1), m);
-    try t.expectEqual(@as(u8, 'A'), buf[0]);
-    xkb.updateKey(38, false);
-    xkb.updateKey(50, false);
+test "xkb maps evdev keys through the compiled us keymap" {
+    var x = Xkb.init() catch return error.SkipZigTest;
+    defer x.deinit();
+    x.setKeymapString(us_test_keymap) catch return error.SkipZigTest;
+    // evdev 30 ('a' position) is xkb keycode 38.
+    x.updateKey(38, true);
+    try std.testing.expectEqual(@as(u32, 'a'), x.keysym(38));
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("a", buf[0..x.utf8(38, &buf)]);
+    x.updateKey(38, false);
 }

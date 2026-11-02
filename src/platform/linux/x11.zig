@@ -1,1800 +1,819 @@
-//! X11 windowing and software presentation backend.
-//!
-//! Connects to an X11 server via dlopen'd libX11.so without compile-time headers.
-//! Manages native window creation, event dispatch, and software frame presentation
-//! via XPutImage.
-//!
-//! §5G DPI contract: `size` is the LOGICAL window size (what the app lays out
-//! against, what `windowInfo().size` reports); the OS window, framebuffer and
-//! XPutImage rect are PHYSICAL pixels (`size * scale_factor`). Pointer and
-//! scroll positions arrive in physical pixels and are divided by the window's
-//! scale in `app/window.zig` before dispatch. Scale is acquired once per
-//! connection (`ZUI_SCALE`, then integer `GDK_SCALE`, then 1.0); per-monitor
-//! RandR change detection is the documented next stage — without RandR the
-//! compositor cannot report runtime scale changes, so none are emitted.
+//! X11 backend (GPUI `gpui_linux` x11 module). One `X11Connection` owns the
+//! Display, atoms, cursors and clipboard; each platform window is a top-level
+//! X window drawn with the CPU renderer into an XImage (ZPixmap, 32 bpp) and
+//! put with XPutImage. Frames are paced at about 60 Hz.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const backend = @import("../backend.zig");
-const event = @import("../event.zig");
-const evdev = @import("evdev.zig");
-const geometry = @import("../../core/geometry.zig");
-const limits = @import("../../core/limits.zig");
-const zlog = @import("../../core/log.zig");
-const gpu = @import("../../gpu/root.zig");
-const dl = @import("../dl.zig");
-const xim_helpers = @import("x11_ime.zig");
+const geometry = @import("../../geometry.zig");
+const platform = @import("../../platform.zig");
+const scene_mod = @import("../../scene.zig");
+const atlas_mod = @import("../../atlas.zig");
+const interactive = @import("../../interactive.zig");
+const window_mod = @import("../../window.zig");
+const color = @import("../../color.zig");
+const cpu = @import("../../renderer/cpu.zig");
+const proto = @import("x11_proto.zig");
+const dl = @import("dl.zig");
+const input = @import("input.zig");
 
-// X11 Types
-const Display = opaque {};
-const XIM = opaque {};
-const XIC = opaque {};
-const Visual = opaque {};
-const GC = ?*anyopaque;
-const Window = c_ulong;
-const Drawable = c_ulong;
-const Atom = c_ulong;
-const Bool = c_int;
-const Status = c_int;
-const Cursor = c_ulong;
-const Time = c_ulong;
-const XPointer = ?*anyopaque;
-const XIMStyle = c_ulong;
+const Pixels = geometry.Pixels;
+const PxPoint = geometry.Point(Pixels);
+const PxSize = geometry.Size(Pixels);
+const PxBounds = geometry.Bounds(Pixels);
+const CursorStyle = platform.CursorStyle;
+const MouseButton = interactive.MouseButton;
+const Display = platform.Display;
+const XWindow = proto.Window;
+const Atom = proto.Atom;
+const Cursor = proto.Cursor;
+const XEvent = proto.XEvent;
 
-const XIMProc = *const fn (?*XIM, XPointer, XPointer) callconv(.c) void;
-const XICProc = *const fn (?*XIC, XPointer, XPointer) callconv(.c) Bool;
-const XIMCallback = extern struct {
-    client_data: XPointer,
-    callback: XIMProc,
-};
-const XICCallback = extern struct {
-    client_data: XPointer,
-    callback: XICProc,
-};
-const XIMText = extern struct {
-    length: c_ushort,
-    feedback: ?[*]XIMFeedback,
-    encoding_is_wchar: Bool,
-    string: extern union {
-        multi_byte: ?[*]u8,
-        wide_char: ?[*]u32,
-    },
-};
-const XIMFeedback = c_ulong;
-const XIMPreeditDrawCallbackStruct = extern struct {
-    caret: c_int,
-    chg_first: c_int,
-    chg_length: c_int,
-    text: ?*XIMText,
+const clear_color: color.Hsla = color.to_hsla(color.rgb(0x0e0e13));
+const frame_interval_ms: i64 = 16;
+
+/// Atoms interned once per connection.
+const Atoms = struct {
+    clipboard: Atom = 0,
+    utf8_string: Atom = 0,
+    targets: Atom = 0,
+    text: Atom = 0,
+    incr: Atom = 0,
+    net_wm_name: Atom = 0,
+    motif_hints: Atom = 0,
+    wm_protocols: Atom = 0,
+    wm_delete_window: Atom = 0,
+    net_wm_ping: Atom = 0,
+    net_wm_state: Atom = 0,
+    net_wm_state_maximized_vert: Atom = 0,
+    net_wm_state_maximized_horz: Atom = 0,
+    net_wm_state_fullscreen: Atom = 0,
+    net_wm_moveresize: Atom = 0,
+    paste: Atom = 0,
 };
 
-const XImage = extern struct {
-    width: c_int,
-    height: c_int,
-    xoffset: c_int,
-    format: c_int,
-    data: ?[*]u8,
-    byte_order: c_int,
-    bitmap_unit: c_int,
-    bitmap_bit_order: c_int,
-    bitmap_pad: c_int,
-    depth: c_int,
-    bytes_per_line: c_int,
-    bits_per_pixel: c_int,
-    red_mask: c_ulong,
-    green_mask: c_ulong,
-    blue_mask: c_ulong,
-    obdata: ?*anyopaque,
-    f: extern struct {
-        create_image: ?*anyopaque,
-        destroy_image: *const fn (?*XImage) callconv(.c) c_int,
-        get_pixel: ?*anyopaque,
-        put_pixel: ?*anyopaque,
-        sub_image: ?*anyopaque,
-        add_pixel: ?*anyopaque,
-    },
-};
-
-// Common X11 event types
-const KeyPress: c_int = 2;
-const KeyRelease: c_int = 3;
-const ButtonPress: c_int = 4;
-const ButtonRelease: c_int = 5;
-const MotionNotify: c_int = 6;
-const FocusIn: c_int = 9;
-const FocusOut: c_int = 10;
-const DestroyNotify: c_int = 17;
-const ConfigureNotify: c_int = 22;
-const ClientMessage: c_int = 33;
-
-const XConfigureEvent = extern struct {
-    type: c_int,
-    serial: c_ulong,
-    send_event: Bool,
-    display: ?*Display,
-    event: Window,
-    window: Window,
-    x: c_int,
-    y: c_int,
-    width: c_int,
-    height: c_int,
-    border_width: c_int,
-    above: Window,
-    override_redirect: Bool,
-};
-
-const XClientMessageEvent = extern struct {
-    type: c_int,
-    serial: c_ulong,
-    send_event: Bool,
-    display: ?*Display,
-    window: Window,
-    message_type: Atom,
-    format: c_int,
-    data: extern union {
-        b: [20]u8,
-        s: [10]c_short,
-        l: [5]c_long,
-    },
-};
-
-const XButtonEvent = extern struct {
-    type: c_int,
-    serial: c_ulong,
-    send_event: Bool,
-    display: ?*Display,
-    window: Window,
-    root: Window,
-    subwindow: Window,
-    time: c_ulong,
-    x: c_int,
-    y: c_int,
-    x_root: c_int,
-    y_root: c_int,
-    state: c_uint,
-    button: c_uint,
-    same_screen: Bool,
-};
-
-const XMotionEvent = extern struct {
-    type: c_int,
-    serial: c_ulong,
-    send_event: Bool,
-    display: ?*Display,
-    window: Window,
-    root: Window,
-    subwindow: Window,
-    time: c_ulong,
-    x: c_int,
-    y: c_int,
-    x_root: c_int,
-    y_root: c_int,
-    state: c_uint,
-    is_hint: u8,
-    same_screen: Bool,
-};
-
-const XKeyEvent = extern struct {
-    type: c_int,
-    serial: c_ulong,
-    send_event: Bool,
-    display: ?*Display,
-    window: Window,
-    root: Window,
-    subwindow: Window,
-    time: c_ulong,
-    x: c_int,
-    y: c_int,
-    x_root: c_int,
-    y_root: c_int,
-    state: c_uint,
-    keycode: c_uint,
-    same_screen: Bool,
-};
-
-const XSelectionRequestEvent = extern struct {
-    type: c_int,
-    serial: c_ulong,
-    send_event: Bool,
-    display: ?*Display,
-    owner: Window,
-    requestor: Window,
-    selection: Atom,
-    target: Atom,
-    property: Atom,
-    time: Time,
-};
-
-const XSelectionEvent = extern struct {
-    type: c_int,
-    serial: c_ulong,
-    send_event: Bool,
-    display: ?*Display,
-    requestor: Window,
-    selection: Atom,
-    target: Atom,
-    property: Atom,
-    time: Time,
-};
-
-const XAnyEvent = extern struct {
-    type: c_int,
-    serial: c_ulong,
-    send_event: Bool,
-    display: ?*Display,
-    window: Window,
-};
-
-/// Xlib's default error handler exits the process on any protocol error.
-/// With multiple windows, an in-flight request racing an external destroy
-/// (BadDrawable/BadWindow on XPutImage) would kill EVERY window. GTK/Qt
-/// install a non-fatal handler: log, ignore, keep servicing the other
-/// windows. Signature per Xlib.h (no XErrorEvent struct needed — we only
-/// log the opcode and serial).
-const XErrorHandler = ?*const fn (?*Display, ?*anyopaque) callconv(.c) c_int;
-
-/// §5G scale acquisition: shared contract in `backend.envScaleFactor`
-/// (ZUI_SCALE, then GDK_SCALE, then 1.0).
-fn envScaleFactor() f32 {
-    return backend.envScaleFactor();
-}
-
-/// Non-fatal Xlib error hook installed at connection init. Returns 0
-/// (error consumed): the failed request is dropped, the connection and all
-/// other windows keep running. Per-error details would need the real
-/// XErrorEvent struct; the opcode+serial log line covers diagnosis.
-fn x11ErrorHandler(dpy: ?*Display, err: ?*anyopaque) callconv(.c) c_int {
-    _ = dpy;
-    _ = err;
-    zlog.log("x11", "non-fatal X protocol error (request dropped)", .{});
+/// Latched Xlib error handler: a failed request is logged and dropped rather
+/// than exiting the process (Xlib's default would kill every window).
+fn errorHandler(_: ?*proto.Display, _: ?*anyopaque) callconv(.c) c_int {
+    std.log.warn("x11: protocol error (request dropped)", .{});
     return 0;
 }
 
-const XimPending = union(enum) {
-    preedit: event.CompositionText,
-    commit: event.CompositionText,
-    cancel,
-};
-
-const XEvent = extern union {
-    type: c_int,
-    xany: XAnyEvent,
-    xkey: XKeyEvent,
-    xbutton: XButtonEvent,
-    xmotion: XMotionEvent,
-    xconfigure: XConfigureEvent,
-    xclient: XClientMessageEvent,
-    pad: [24]c_long,
-};
-
-// Static ABI pins, measured against /usr/include/X11/Xlib.h (see xoffsets
-// probe): button/key/motion/client events have NO `event` field — only
-// Configure and Any do. A phantom field here once shifted every tail field
-// +8 (buttons read as garbage, XLookupString typed garbage), so these pins
-// exist to catch exactly that class of mistake.
-comptime {
-    // Xlib pins below assume the LP64 Linux ABI (c_long is 64-bit). This
-    // backend only ever runs on Linux, and foreign-target builds never
-    // import this module (see platform/root.zig) — but guard the pins
-    // anyway so a stray import fails safe instead of tripping a
-    // target-invalid assertion (e.g. Windows LLP64 where c_long is 32-bit).
-    if (builtin.target.os.tag == .linux) {
-        std.debug.assert(@sizeOf(XEvent) == 192);
-        std.debug.assert(@sizeOf(XButtonEvent) == 96);
-        std.debug.assert(@offsetOf(XButtonEvent, "window") == 32);
-        std.debug.assert(@offsetOf(XButtonEvent, "time") == 56);
-        std.debug.assert(@offsetOf(XButtonEvent, "x") == 64);
-        std.debug.assert(@offsetOf(XButtonEvent, "y") == 68);
-        std.debug.assert(@offsetOf(XButtonEvent, "x_root") == 72);
-        std.debug.assert(@offsetOf(XButtonEvent, "y_root") == 76);
-        std.debug.assert(@offsetOf(XButtonEvent, "state") == 80);
-        std.debug.assert(@offsetOf(XButtonEvent, "button") == 84);
-        std.debug.assert(@offsetOf(XButtonEvent, "same_screen") == 88);
-        std.debug.assert(@offsetOf(XKeyEvent, "keycode") == 84);
-        std.debug.assert(@offsetOf(XKeyEvent, "state") == 80);
-        std.debug.assert(@offsetOf(XKeyEvent, "time") == 56);
-        std.debug.assert(@offsetOf(XMotionEvent, "x") == 64);
-        std.debug.assert(@offsetOf(XMotionEvent, "state") == 80);
-        std.debug.assert(@offsetOf(XClientMessageEvent, "window") == 32);
-        std.debug.assert(@offsetOf(XClientMessageEvent, "data") == 56);
-        std.debug.assert(@offsetOf(XConfigureEvent, "event") == 32);
-        std.debug.assert(@offsetOf(XConfigureEvent, "window") == 40);
-        std.debug.assert(@offsetOf(XConfigureEvent, "width") == 56);
-        std.debug.assert(@offsetOf(XConfigureEvent, "height") == 60);
-        // Selection request layout follows Xlib.h field order (sequential
-        // native words after the standard 32-byte event prefix).
-        std.debug.assert(@offsetOf(XSelectionRequestEvent, "requestor") == 40);
-        std.debug.assert(@offsetOf(XSelectionRequestEvent, "selection") == 48);
-        std.debug.assert(@offsetOf(XSelectionRequestEvent, "target") == 56);
-        std.debug.assert(@offsetOf(XSelectionRequestEvent, "property") == 64);
-        std.debug.assert(@offsetOf(XSelectionRequestEvent, "time") == 72);
-        std.debug.assert(@sizeOf(XSelectionRequestEvent) == 80);
-    }
-}
-
-// Selection protocol (verified against /usr/include/X11/X.h).
-const SelectionClear: c_int = 29;
-const SelectionRequest: c_int = 30;
-const SelectionNotify: c_int = 31;
-
-const XA_PRIMARY: Atom = 1;
-const XA_ATOM: Atom = 4;
-const XA_STRING: Atom = 31;
-const XA_ANY_PROPERTY_TYPE: Atom = 0;
-const PROP_MODE_REPLACE: c_int = 0;
-const CURRENT_TIME: Time = 0;
-const XIMPreeditCallbacks: XIMStyle = 0x0002;
-const XIMStatusNothing: XIMStyle = 0x0400;
-const XBufferOverflow: c_int = -1;
-const XNInputStyle = "inputStyle";
-const XNClientWindow = "clientWindow";
-const XNFocusWindow = "focusWindow";
-const XNPreeditAttributes = "preeditAttributes";
-const XNPreeditStartCallback = "preeditStartCallback";
-const XNPreeditDoneCallback = "preeditDoneCallback";
-const XNPreeditDrawCallback = "preeditDrawCallback";
-
-// Cursor-font glyphs (verified against /usr/include/X11/cursorfont.h).
-// No extra library: these live in libX11 itself.
-const XC_LEFT_PTR: c_uint = 68;
-const XC_XTERM: c_uint = 152;
-const XC_HAND2: c_uint = 60;
-
-// Event masks
-const ExposureMask: c_long = 1 << 15;
-const KeyPressMask: c_long = 1 << 0;
-const KeyReleaseMask: c_long = 1 << 1;
-const ButtonPressMask: c_long = 1 << 2;
-const ButtonReleaseMask: c_long = 1 << 3;
-const PointerMotionMask: c_long = 1 << 6;
-const StructureNotifyMask: c_long = 1 << 17;
-const FocusChangeMask: c_long = 1 << 21;
-
-const X11Api = struct {
-    XOpenDisplay: *const fn (?[*:0]const u8) callconv(.c) ?*Display,
-    XCloseDisplay: *const fn (*Display) callconv(.c) c_int,
-    XDefaultScreen: *const fn (*Display) callconv(.c) c_int,
-    XRootWindow: *const fn (*Display, c_int) callconv(.c) Window,
-    XCreateSimpleWindow: *const fn (*Display, Window, c_int, c_int, c_uint, c_uint, c_uint, c_ulong, c_ulong) callconv(.c) Window,
-    XSelectInput: *const fn (*Display, Window, c_long) callconv(.c) c_int,
-    XMapWindow: *const fn (*Display, Window) callconv(.c) c_int,
-    XDestroyWindow: *const fn (*Display, Window) callconv(.c) c_int,
-    XStoreName: *const fn (*Display, Window, [*:0]const u8) callconv(.c) c_int,
-    XInternAtom: *const fn (*Display, [*:0]const u8, Bool) callconv(.c) Atom,
-    XSetWMProtocols: *const fn (*Display, Window, [*]const Atom, c_int) callconv(.c) Status,
-    XPending: *const fn (*Display) callconv(.c) c_int,
-    XNextEvent: *const fn (*Display, *XEvent) callconv(.c) c_int,
-    XDefaultGC: *const fn (*Display, c_int) callconv(.c) GC,
-    XDefaultVisual: *const fn (*Display, c_int) callconv(.c) *Visual,
-    XDefaultDepth: *const fn (*Display, c_int) callconv(.c) c_int,
-    XCreateImage: *const fn (*Display, *Visual, c_uint, c_int, c_int, ?[*]u8, c_uint, c_uint, c_int, c_int) callconv(.c) ?*XImage,
-    XDestroyImage: *const fn (*XImage) callconv(.c) c_int,
-    XPutImage: *const fn (*Display, Drawable, GC, *XImage, c_int, c_int, c_int, c_int, c_uint, c_uint) callconv(.c) c_int,
-    XFlush: *const fn (*Display) callconv(.c) c_int,
-    XConnectionNumber: *const fn (*Display) callconv(.c) c_int,
-    XLookupString: *const fn (*XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int,
-    XOpenIM: ?*const fn (*Display, ?*anyopaque, ?[*:0]u8, ?[*:0]u8) callconv(.c) ?*XIM,
-    XCloseIM: ?*const fn (*XIM) callconv(.c) Status,
-    XCreateIC: ?*const fn (*XIM, ...) callconv(.c) ?*XIC,
-    XDestroyIC: ?*const fn (*XIC) callconv(.c) void,
-    XSetICFocus: ?*const fn (*XIC) callconv(.c) void,
-    XUnsetICFocus: ?*const fn (*XIC) callconv(.c) void,
-    Xutf8LookupString: ?*const fn (*XIC, *XKeyEvent, [*]u8, c_int, ?*c_ulong, *Status) callconv(.c) c_int,
-    Xutf8ResetIC: ?*const fn (*XIC) callconv(.c) ?[*]u8,
-    XFilterEvent: ?*const fn (*XEvent, Window) callconv(.c) Bool,
-    XVaCreateNestedList: ?*const fn (c_int, ...) callconv(.c) ?*anyopaque,
-    XFree: *const fn (*anyopaque) callconv(.c) c_int,
-    XChangeProperty: *const fn (*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int,
-    XDeleteProperty: *const fn (*Display, Window, Atom) callconv(.c) c_int,
-    XGetWindowProperty: *const fn (*Display, Window, Atom, c_long, c_long, Bool, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *[*]u8) callconv(.c) c_int,
-    XConvertSelection: *const fn (*Display, Atom, Atom, Atom, Window, Time) callconv(.c) c_int,
-    XSetSelectionOwner: *const fn (*Display, Atom, Window, Time) callconv(.c) c_int,
-    XGetSelectionOwner: *const fn (*Display, Atom) callconv(.c) Window,
-    XSendEvent: *const fn (*Display, Window, Bool, c_long, *XEvent) callconv(.c) Status,
-    XCreateFontCursor: *const fn (*Display, c_uint) callconv(.c) Cursor,
-    XDefineCursor: *const fn (*Display, Window, Cursor) callconv(.c) c_int,
-    XFreeCursor: *const fn (*Display, Cursor) callconv(.c) c_int,
-    XResizeWindow: *const fn (*Display, Window, c_uint, c_uint) callconv(.c) c_int,
-    XIconifyWindow: *const fn (*Display, Window, c_int) callconv(.c) c_int,
-    XSetErrorHandler: *const fn (XErrorHandler) callconv(.c) XErrorHandler,
-
-    fn load(lib: dl.Library) ?X11Api {
-        return .{
-            .XOpenDisplay = lib.lookup(*const fn (?[*:0]const u8) callconv(.c) ?*Display, "XOpenDisplay") orelse return null,
-            .XCloseDisplay = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XCloseDisplay") orelse return null,
-            .XDefaultScreen = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XDefaultScreen") orelse return null,
-            .XRootWindow = lib.lookup(*const fn (*Display, c_int) callconv(.c) Window, "XRootWindow") orelse return null,
-            .XCreateSimpleWindow = lib.lookup(*const fn (*Display, Window, c_int, c_int, c_uint, c_uint, c_uint, c_ulong, c_ulong) callconv(.c) Window, "XCreateSimpleWindow") orelse return null,
-            .XSelectInput = lib.lookup(*const fn (*Display, Window, c_long) callconv(.c) c_int, "XSelectInput") orelse return null,
-            .XMapWindow = lib.lookup(*const fn (*Display, Window) callconv(.c) c_int, "XMapWindow") orelse return null,
-            .XDestroyWindow = lib.lookup(*const fn (*Display, Window) callconv(.c) c_int, "XDestroyWindow") orelse return null,
-            .XStoreName = lib.lookup(*const fn (*Display, Window, [*:0]const u8) callconv(.c) c_int, "XStoreName") orelse return null,
-            .XInternAtom = lib.lookup(*const fn (*Display, [*:0]const u8, Bool) callconv(.c) Atom, "XInternAtom") orelse return null,
-            .XSetWMProtocols = lib.lookup(*const fn (*Display, Window, [*]const Atom, c_int) callconv(.c) Status, "XSetWMProtocols") orelse return null,
-            .XPending = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XPending") orelse return null,
-            .XNextEvent = lib.lookup(*const fn (*Display, *XEvent) callconv(.c) c_int, "XNextEvent") orelse return null,
-            .XDefaultGC = lib.lookup(*const fn (*Display, c_int) callconv(.c) GC, "XDefaultGC") orelse return null,
-            .XDefaultVisual = lib.lookup(*const fn (*Display, c_int) callconv(.c) *Visual, "XDefaultVisual") orelse return null,
-            .XDefaultDepth = lib.lookup(*const fn (*Display, c_int) callconv(.c) c_int, "XDefaultDepth") orelse return null,
-            .XCreateImage = lib.lookup(*const fn (*Display, *Visual, c_uint, c_int, c_int, ?[*]u8, c_uint, c_uint, c_int, c_int) callconv(.c) ?*XImage, "XCreateImage") orelse return null,
-            .XDestroyImage = lib.lookup(*const fn (*XImage) callconv(.c) c_int, "XDestroyImage") orelse return null,
-            .XPutImage = lib.lookup(*const fn (*Display, Drawable, GC, *XImage, c_int, c_int, c_int, c_int, c_uint, c_uint) callconv(.c) c_int, "XPutImage") orelse return null,
-            .XFlush = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XFlush") orelse return null,
-            .XConnectionNumber = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XConnectionNumber") orelse return null,
-            .XLookupString = lib.lookup(*const fn (*XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int, "XLookupString") orelse return null,
-            .XOpenIM = lib.lookup(*const fn (*Display, ?*anyopaque, ?[*:0]u8, ?[*:0]u8) callconv(.c) ?*XIM, "XOpenIM"),
-            .XCloseIM = lib.lookup(*const fn (*XIM) callconv(.c) Status, "XCloseIM"),
-            .XCreateIC = lib.lookup(*const fn (*XIM, ...) callconv(.c) ?*XIC, "XCreateIC"),
-            .XDestroyIC = lib.lookup(*const fn (*XIC) callconv(.c) void, "XDestroyIC"),
-            .XSetICFocus = lib.lookup(*const fn (*XIC) callconv(.c) void, "XSetICFocus"),
-            .XUnsetICFocus = lib.lookup(*const fn (*XIC) callconv(.c) void, "XUnsetICFocus"),
-            .Xutf8LookupString = lib.lookup(*const fn (*XIC, *XKeyEvent, [*]u8, c_int, ?*c_ulong, *Status) callconv(.c) c_int, "Xutf8LookupString"),
-            .Xutf8ResetIC = lib.lookup(*const fn (*XIC) callconv(.c) ?[*]u8, "Xutf8ResetIC"),
-            .XFilterEvent = lib.lookup(*const fn (*XEvent, Window) callconv(.c) Bool, "XFilterEvent"),
-            .XVaCreateNestedList = lib.lookup(*const fn (c_int, ...) callconv(.c) ?*anyopaque, "XVaCreateNestedList"),
-            .XChangeProperty = lib.lookup(*const fn (*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int, "XChangeProperty") orelse return null,
-            .XDeleteProperty = lib.lookup(*const fn (*Display, Window, Atom) callconv(.c) c_int, "XDeleteProperty") orelse return null,
-            .XGetWindowProperty = lib.lookup(*const fn (*Display, Window, Atom, c_long, c_long, Bool, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *[*]u8) callconv(.c) c_int, "XGetWindowProperty") orelse return null,
-            .XFree = lib.lookup(*const fn (*anyopaque) callconv(.c) c_int, "XFree") orelse return null,
-            .XConvertSelection = lib.lookup(*const fn (*Display, Atom, Atom, Atom, Window, Time) callconv(.c) c_int, "XConvertSelection") orelse return null,
-            .XSetSelectionOwner = lib.lookup(*const fn (*Display, Atom, Window, Time) callconv(.c) c_int, "XSetSelectionOwner") orelse return null,
-            .XGetSelectionOwner = lib.lookup(*const fn (*Display, Atom) callconv(.c) Window, "XGetSelectionOwner") orelse return null,
-            .XSendEvent = lib.lookup(*const fn (*Display, Window, Bool, c_long, *XEvent) callconv(.c) Status, "XSendEvent") orelse return null,
-            .XCreateFontCursor = lib.lookup(*const fn (*Display, c_uint) callconv(.c) Cursor, "XCreateFontCursor") orelse return null,
-            .XDefineCursor = lib.lookup(*const fn (*Display, Window, Cursor) callconv(.c) c_int, "XDefineCursor") orelse return null,
-            .XFreeCursor = lib.lookup(*const fn (*Display, Cursor) callconv(.c) c_int, "XFreeCursor") orelse return null,
-            .XResizeWindow = lib.lookup(*const fn (*Display, Window, c_uint, c_uint) callconv(.c) c_int, "XResizeWindow") orelse return null,
-            .XIconifyWindow = lib.lookup(*const fn (*Display, Window, c_int) callconv(.c) c_int, "XIconifyWindow") orelse return null,
-            .XSetErrorHandler = lib.lookup(*const fn (XErrorHandler) callconv(.c) XErrorHandler, "XSetErrorHandler") orelse return null,
-        };
-    }
-};
-
-pub const X11Backend = struct {
+pub const X11Connection = struct {
     allocator: std.mem.Allocator,
     lib: dl.Library,
-    api: X11Api,
-    display: *Display,
+    api: proto.Api,
+    display: *proto.Display,
     screen: c_int,
-    window: Window,
-    /// Connection role: primary window (App-level handle) or a secondary
-    /// window-scoped handle sharing this connection. `windows` holds the
-    /// secondary native windows keyed by connection slot.
-    window_id: u32 = 0,
-    parent: ?*X11Backend = null,
-    windows: [limits.MAX_WINDOWS]?*X11Backend = @splat(null),
-    /// The X server destroyed this window out from under us (an external
-    /// XDestroyWindow, e.g. `xdotool windowclose`). Skip XDestroyWindow on
-    /// teardown and stop presenting to the dead drawable.
-    destroyed_by_server: bool = false,
-    gc: GC,
-    wm_delete_window: Atom,
-    wm_protocols: Atom = 0,
-    net_wm_ping: Atom = 0,
-    size: geometry.Size = .{ .w = 800, .h = 600 },
-    scale_factor: f32 = 1.0,
-    focused: bool = true,
-    presents: u32 = 0,
-    wakeups: u32 = 0,
-    pixels: []u8,
-    image: ?*XImage = null,
-    /// Vellz-backed frame renderer, persistent across presents.
-    renderer: gpu.vellz.Renderer,
-    /// Gated `ZUI_DEBUG_EVENTS` input logging (read once at init).
-    debug_events: bool = false,
-    // Clipboard + selection state.
-    atom_clipboard: Atom = 0,
-    atom_utf8_string: Atom = 0,
-    atom_targets: Atom = 0,
-    atom_text: Atom = 0,
-    atom_net_wm_name: Atom = 0,
-    atom_incr: Atom = 0,
-    atom_motif_hints: Atom = 0,
-    atom_net_wm_state: Atom = 0,
-    atom_net_wm_maximized_vert: Atom = 0,
-    atom_net_wm_maximized_horz: Atom = 0,
-    atom_net_wm_moveresize: Atom = 0,
-    root: Window = 0,
-    /// Last button press position, for move/resize drags.
-    last_button: c_uint = 1,
-    last_root_x: c_int = 0,
-    last_root_y: c_int = 0,
-    offered: [limits.MAX_CLIPBOARD_BYTES]u8 = std.mem.zeroes([limits.MAX_CLIPBOARD_BYTES]u8),
-    offered_len: usize = 0,
+    root: XWindow,
+    /// Hidden window that owns the clipboard and receives selection replies.
+    helper: XWindow,
+    atoms: Atoms,
+    windows: std.ArrayList(*X11Window) = .empty,
+    cursors: [@typeInfo(CursorStyle).@"enum".field_names.len]Cursor = @splat(0),
+    cursor_style: CursorStyle = .arrow,
+    scale: f32 = 1,
+    mods: u32 = 0,
+    click: input.ClickTracker = .{},
+    pressed: ?MouseButton = null,
+    /// Root position of the last button press (for window move drags).
+    press_root: [2]c_long = .{ 0, 0 },
+    /// Events read during a synchronous clipboard request, replayed later.
+    stash: [64]XEvent = undefined,
+    stash_len: usize = 0,
+    clip_offer: ?[]u8 = null,
     owning_selection: bool = false,
-    paste_prop: Atom = 0,
-    /// Raw server events that arrived during a synchronous paste pump;
-    /// replayed through translateOne on the next poll.
-    raw_stash: [64][192]u8 = std.mem.zeroes([64][192]u8),
-    raw_stash_len: usize = 0,
-    /// Cached font cursors indexed by CursorShape ordinal (0 = unset).
-    cursors: [3]Cursor = .{ 0, 0, 0 },
-    /// Optional XIM connection shared by all window-scoped handles on this
-    /// display. XIC remains per native window so focus and callback routing
-    /// cannot cross the multi-window boundary.
-    xim: ?*XIM = null,
-    xic: ?*XIC = null,
-    xim_owner: bool = false,
-    xim_preedit: [256]u8 = @splat(0),
-    xim_preedit_len: usize = 0,
-    xim_preedit_active: bool = false,
-    xim_pending: [8]?XimPending = @splat(null),
-    xim_pending_len: usize = 0,
+    clip_read: ?[]u8 = null,
+    dead: bool = false,
+    display_storage: [1]Display = undefined,
 
-    const vtable: backend.VTable = .{
-        .createWindow = createWindowFn,
-        .destroyWindow = destroyWindowFn,
-        .kind = kindFn,
-        .poll = pollFn,
-        .waitTimeoutNs = waitFn,
-        .wakeup = wakeupFn,
-        .windowInfo = infoFn,
-        .setTitle = titleFn,
-        .setSize = sizeFn,
-        .setDecorated = decoratedFn,
-        .dragWindow = dragFn,
-        .resizeWindow = resizeFn,
-        .minimizeWindow = minimizeFn,
-        .toggleMaximizeWindow = maximizeFn,
-        .setCursor = cursorFn,
-        .setClipboardText = setClipboardFn,
-        .clipboardText = getClipboardFn,
-        .present = presentFn,
-    };
-
-    fn getenv(name: [*:0]const u8) ?[*:0]const u8 {
-        if (!builtin.link_libc) return null;
-        return std.c.getenv(name);
-    }
-
-    pub fn isAvailable() bool {
-        if (!builtin.link_libc) return false;
-        if (getenv("DISPLAY") == null) return false;
-        var lib = dl.Library.open(&.{ "libX11.so.6", "libX11.so" }) orelse return false;
-        defer lib.close();
-        return X11Api.load(lib) != null;
-    }
-
-    fn setupXim(self: *@This(), input_method: *XIM) void {
-        const make_nested = self.api.XVaCreateNestedList orelse return;
-        const create_ic = self.api.XCreateIC orelse return;
-        const start_cb: XICCallback = .{ .client_data = self, .callback = ximPreeditStart };
-        const draw_cb: XIMCallback = .{ .client_data = self, .callback = ximPreeditDraw };
-        const done_cb: XIMCallback = .{ .client_data = self, .callback = ximPreeditDone };
-        const nested = make_nested(
-            0,
-            XNPreeditStartCallback.ptr,
-            &start_cb,
-            XNPreeditDrawCallback.ptr,
-            &draw_cb,
-            XNPreeditDoneCallback.ptr,
-            &done_cb,
-            @as(?*anyopaque, null),
-        ) orelse return;
-        defer _ = self.api.XFree(nested);
-        const style = XIMPreeditCallbacks | XIMStatusNothing;
-        self.xic = create_ic(
-            input_method,
-            XNInputStyle.ptr,
-            style,
-            XNClientWindow.ptr,
-            self.window,
-            XNFocusWindow.ptr,
-            self.window,
-            XNPreeditAttributes.ptr,
-            nested,
-            @as(?*anyopaque, null),
-        );
-        if (self.xic == null) {
-            zlog.log("x11", "XCreateIC failed; retaining XLookupString fallback", .{});
-        } else if (self.focused) {
-            if (self.api.XSetICFocus) |set_focus| set_focus(self.xic.?);
-        }
-    }
-
-    fn setupOptionalXim(self: *@This()) void {
-        const open_im = self.api.XOpenIM orelse return;
-        const close_im = self.api.XCloseIM orelse return;
-        if (self.api.XCreateIC == null or self.api.XVaCreateNestedList == null or self.api.XDestroyIC == null or self.api.Xutf8LookupString == null or self.api.Xutf8ResetIC == null or self.api.XFilterEvent == null or self.api.XSetICFocus == null or self.api.XUnsetICFocus == null) return;
-        const input_method = open_im(self.display, null, null, null) orelse {
-            zlog.log("x11", "XOpenIM unavailable; retaining XLookupString fallback", .{});
-            return;
+    /// Connects to the X server named by DISPLAY.
+    pub fn connect(allocator: std.mem.Allocator) !*X11Connection {
+        if (std.c.getenv("DISPLAY") == null) return error.NoDisplay;
+        var lib = dl.Library.open(&.{ "libX11.so.6", "libX11.so" }) orelse return error.LibraryNotFound;
+        const api = proto.Api.load(lib) orelse {
+            lib.close();
+            return error.MissingSymbols;
         };
-        self.xim = input_method;
-        self.xim_owner = true;
-        self.setupXim(input_method);
-        if (self.xic == null) {
-            _ = close_im(input_method);
-            self.xim = null;
-            self.xim_owner = false;
-        }
-    }
-
-    fn setupWindowXic(self: *@This(), input_method: ?*XIM) void {
-        if (input_method) |im| {
-            self.xim = im;
-            self.setupXim(im);
-        }
-    }
-
-    fn destroyXic(self: *@This()) void {
-        if (self.xic) |ic| {
-            if (self.api.Xutf8ResetIC) |reset| {
-                if (reset(ic)) |text| {
-                    _ = self.api.XFree(text);
-                }
-            }
-            if (self.api.XDestroyIC) |destroy| destroy(ic);
-            self.xic = null;
-        }
-    }
-
-    fn queueXim(self: *@This(), pending: XimPending) void {
-        if (self.xim_pending_len < self.xim_pending.len) {
-            self.xim_pending[self.xim_pending_len] = pending;
-            self.xim_pending_len += 1;
-        } else {
-            // A callback burst must never make the native event loop fail;
-            // retain the latest cancellation state if the tiny ring fills.
-            self.xim_pending[self.xim_pending.len - 1] = .{ .cancel = {} };
-        }
-    }
-
-    fn compositionText(bytes: []const u8, marked_start: usize, marked_end: usize) ?event.CompositionText {
-        var result = event.CompositionText.init(bytes) catch return null;
-        if (marked_start > marked_end or marked_end > bytes.len) return null;
-        result.marked = .{ .start = marked_start, .end = marked_end };
-        return result;
-    }
-
-    fn ximPreeditStart(_: ?*XIC, client_data: XPointer, _: XPointer) callconv(.c) Bool {
-        const self: *@This() = @ptrCast(@alignCast(client_data.?));
-        self.xim_preedit_active = true;
-        return 1;
-    }
-
-    fn ximPreeditDraw(_: ?*XIM, client_data: XPointer, call_data: XPointer) callconv(.c) void {
-        const self: *@This() = @ptrCast(@alignCast(client_data.?));
-        const draw = call_data orelse return;
-        const payload: *XIMPreeditDrawCallbackStruct = @ptrCast(@alignCast(draw));
-        var replacement: []const u8 = &[_]u8{};
-        if (payload.text) |text| {
-            if (text.encoding_is_wchar != 0 or text.length > 256) return;
-            if (text.string.multi_byte) |bytes| replacement = bytes[0..text.length];
-        }
-        var next: [256]u8 = undefined;
-        const next_len = xim_helpers.applyPreeditChange(
-            &next,
-            self.xim_preedit[0..self.xim_preedit_len],
-            payload.chg_first,
-            payload.chg_length,
-            replacement,
-        ) orelse return;
-        @memcpy(self.xim_preedit[0..next_len], next[0..next_len]);
-        self.xim_preedit_len = next_len;
-        self.xim_preedit_active = true;
-        const caret_chars: usize = if (payload.caret < 0) 0 else @intCast(payload.caret);
-        const caret = xim_helpers.utf8ByteOffsetForChars(self.xim_preedit[0..next_len], caret_chars) orelse next_len;
-        if (compositionText(self.xim_preedit[0..next_len], caret, caret)) |composition| {
-            self.queueXim(.{ .preedit = composition });
-        }
-    }
-
-    fn ximPreeditDone(_: ?*XIM, client_data: XPointer, _: XPointer) callconv(.c) void {
-        const self: *@This() = @ptrCast(@alignCast(client_data.?));
-        if (self.xim_preedit_active and self.xim_preedit_len != 0) self.queueXim(.cancel);
-        self.xim_preedit_len = 0;
-        self.xim_preedit_active = false;
-    }
-
-    fn flushXim(self: *@This(), owner: *X11Backend, out: *event.EventQueue) void {
-        while (self.xim_pending_len > 0) {
-            const pending = self.xim_pending[0].?;
-            var i: usize = 1;
-            while (i < self.xim_pending_len) : (i += 1) self.xim_pending[i - 1] = self.xim_pending[i];
-            self.xim_pending_len -= 1;
-            self.xim_pending[self.xim_pending_len] = null;
-            switch (pending) {
-                .preedit => |text| owner.pushTargeted(out, .{ .composition = .{ .preedit = text } }),
-                .commit => |text| owner.pushTargeted(out, .{ .composition = .{ .commit = text } }),
-                .cancel => owner.pushTargeted(out, .{ .composition = .cancel }),
-            }
-        }
-    }
-
-    fn resetXim(self: *@This(), owner: *X11Backend, out: *event.EventQueue) void {
-        if (self.xic) |ic| {
-            if (self.api.XUnsetICFocus) |unset_focus| unset_focus(ic);
-            if (self.api.Xutf8ResetIC) |reset| {
-                if (reset(ic)) |text| {
-                    _ = self.api.XFree(text);
-                }
-            }
-        }
-        if (self.xim_preedit_active or self.xim_preedit_len != 0) {
-            self.queueXim(.cancel);
-            self.xim_preedit_len = 0;
-            self.xim_preedit_active = false;
-        }
-        self.flushXim(owner, out);
-    }
-
-    pub fn init(allocator: std.mem.Allocator, title: [*:0]const u8, width: u32, height: u32) !*X11Backend {
-        if (!builtin.link_libc) return error.LibcNotLinked;
-        if (getenv("DISPLAY") == null) return error.NoDisplay;
-
-        const lib = dl.Library.open(&.{ "libX11.so.6", "libX11.so" }) orelse return error.LibraryNotFound;
-        errdefer {
-            var l = lib;
-            l.close();
-        }
-
-        const api = X11Api.load(lib) orelse return error.MissingSymbols;
-
-        const dpy = api.XOpenDisplay(null) orelse return error.CannotOpenDisplay;
-        errdefer _ = api.XCloseDisplay(dpy);
-
-        // Non-fatal protocol errors: Xlib's default handler exits the
-        // process, which with multiple windows means one window racing an
-        // external destroy kills them all.
-        _ = api.XSetErrorHandler(x11ErrorHandler);
-
+        const dpy = api.XOpenDisplay(null) orelse {
+            lib.close();
+            return error.CannotOpenDisplay;
+        };
+        _ = api.XSetErrorHandler(errorHandler);
         const screen = api.XDefaultScreen(dpy);
         const root = api.XRootWindow(dpy, screen);
-        // §5G DPI: the OS window is PHYSICAL pixels (logical * scale); the
-        // app-visible `size` stays logical. ZUI_SCALE/GDK_SCALE acquire the
-        // connection scale.
-        const scale = envScaleFactor();
-        const phys_w: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(width)) * scale)));
-        const phys_h: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(height)) * scale)));
-        const win = api.XCreateSimpleWindow(dpy, root, 0, 0, phys_w, phys_h, 0, 0, 0);
-        errdefer _ = api.XDestroyWindow(dpy, win);
-
-        _ = api.XStoreName(dpy, win, title);
-
-        const atom_clipboard = api.XInternAtom(dpy, "CLIPBOARD", 0);
-        const atom_utf8 = api.XInternAtom(dpy, "UTF8_STRING", 0);
-        const atom_targets = api.XInternAtom(dpy, "TARGETS", 0);
-        const atom_text = api.XInternAtom(dpy, "TEXT", 0);
-        const atom_net_wm_name = api.XInternAtom(dpy, "_NET_WM_NAME", 0);
-        const atom_incr = api.XInternAtom(dpy, "INCR", 0);
-        const atom_motif_hints = api.XInternAtom(dpy, "_MOTIF_WM_HINTS", 0);
-        const atom_net_wm_state = api.XInternAtom(dpy, "_NET_WM_STATE", 0);
-        const atom_net_wm_maximized_vert = api.XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_VERT", 0);
-        const atom_net_wm_maximized_horz = api.XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", 0);
-        const atom_net_wm_moveresize = api.XInternAtom(dpy, "_NET_WM_MOVERESIZE", 0);
-        // UTF-8 taskbar/window-list title alongside the Latin-1 XStoreName.
-        _ = api.XChangeProperty(dpy, win, atom_net_wm_name, atom_utf8, 8, PROP_MODE_REPLACE, title, @intCast(std.mem.len(title)));
-
-        const wm_protocols = api.XInternAtom(dpy, "WM_PROTOCOLS", 0);
-        const wm_delete = api.XInternAtom(dpy, "WM_DELETE_WINDOW", 0);
-        const net_wm_ping = api.XInternAtom(dpy, "_NET_WM_PING", 0);
-        // Advertise both close and ping: without _NET_WM_PING the window
-        // manager gets no liveness reply and flags us "Not Responding".
-        _ = api.XSetWMProtocols(dpy, win, &[2]Atom{ wm_delete, net_wm_ping }, 2);
-
-        const mask = ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | StructureNotifyMask | FocusChangeMask;
-        _ = api.XSelectInput(dpy, win, mask);
-
-        const gc = api.XDefaultGC(dpy, screen);
-        _ = api.XMapWindow(dpy, win);
-        _ = api.XFlush(dpy);
-
-        const pixels = try allocator.alloc(u8, @as(usize, phys_w) * @as(usize, phys_h) * 4);
-        errdefer allocator.free(pixels);
-        @memset(pixels, 0);
-
-        // Set the App-supplied title on the first (primary) window, keeping
-        // the uniform window-options path: connection struct carries id 0.
-        _ = api.XStoreName(dpy, win, title);
-
-        const self = try allocator.create(X11Backend);
+        const helper = api.XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0);
+        const atoms: Atoms = .{
+            .clipboard = api.XInternAtom(dpy, "CLIPBOARD", 0),
+            .utf8_string = api.XInternAtom(dpy, "UTF8_STRING", 0),
+            .targets = api.XInternAtom(dpy, "TARGETS", 0),
+            .text = api.XInternAtom(dpy, "TEXT", 0),
+            .incr = api.XInternAtom(dpy, "INCR", 0),
+            .net_wm_name = api.XInternAtom(dpy, "_NET_WM_NAME", 0),
+            .motif_hints = api.XInternAtom(dpy, "_MOTIF_WM_HINTS", 0),
+            .wm_protocols = api.XInternAtom(dpy, "WM_PROTOCOLS", 0),
+            .wm_delete_window = api.XInternAtom(dpy, "WM_DELETE_WINDOW", 0),
+            .net_wm_ping = api.XInternAtom(dpy, "_NET_WM_PING", 0),
+            .net_wm_state = api.XInternAtom(dpy, "_NET_WM_STATE", 0),
+            .net_wm_state_maximized_vert = api.XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_VERT", 0),
+            .net_wm_state_maximized_horz = api.XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", 0),
+            .net_wm_state_fullscreen = api.XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", 0),
+            .net_wm_moveresize = api.XInternAtom(dpy, "_NET_WM_MOVERESIZE", 0),
+            .paste = api.XInternAtom(dpy, "ZUI_PASTE", 0),
+        };
+        const self = allocator.create(X11Connection) catch {
+            _ = api.XCloseDisplay(dpy);
+            lib.close();
+            return error.OutOfMemory;
+        };
         self.* = .{
             .allocator = allocator,
             .lib = lib,
             .api = api,
             .display = dpy,
             .screen = screen,
-            .window = win,
-            .gc = gc,
-            .wm_delete_window = wm_delete,
-            .wm_protocols = wm_protocols,
-            .net_wm_ping = net_wm_ping,
-            .size = .{ .w = @floatFromInt(width), .h = @floatFromInt(height) },
-            .scale_factor = scale,
-            .focused = true,
-            .presents = 0,
-            .wakeups = 0,
-            .pixels = pixels,
-            .image = null,
-            .renderer = gpu.vellz.Renderer.init(allocator),
-            .debug_events = getenv("ZUI_DEBUG_EVENTS") != null,
-            .window_id = 0,
-            .atom_clipboard = atom_clipboard,
-            .atom_utf8_string = atom_utf8,
-            .atom_targets = atom_targets,
-            .atom_text = atom_text,
-            .atom_net_wm_name = atom_net_wm_name,
-            .atom_incr = atom_incr,
-            .atom_motif_hints = atom_motif_hints,
-            .atom_net_wm_state = atom_net_wm_state,
-            .atom_net_wm_maximized_vert = atom_net_wm_maximized_vert,
-            .atom_net_wm_maximized_horz = atom_net_wm_maximized_horz,
-            .atom_net_wm_moveresize = atom_net_wm_moveresize,
             .root = root,
-            .paste_prop = api.XInternAtom(dpy, "ZUI_PASTE", 0),
+            .helper = helper,
+            .atoms = atoms,
+            .scale = input.env_scale() orelse xftScale(api, dpy),
         };
-
-        self.recreateImage();
-        self.setupOptionalXim();
         return self;
     }
 
-    pub fn deinit(self: *X11Backend) void {
-        // Window-scoped children own their X windows and framebuffers;
-        // destroy them before the connection goes away.
-        for (&self.windows) |*slot| {
-            if (slot.*) |child| {
-                slot.* = null;
-                child.teardownWindow();
+    /// Scale from the Xft.dpi resource (96 dpi is 1x). Falls back to 1.
+    fn xftScale(api: proto.Api, dpy: *proto.Display) f32 {
+        const rm = api.XResourceManagerString orelse return 1;
+        const text = rm(dpy) orelse return 1;
+        const s = std.mem.span(text);
+        const key = "Xft.dpi:";
+        const at = std.mem.indexOf(u8, s, key) orelse return 1;
+        var rest = std.mem.trimStart(u8, s[at + key.len ..], " \t");
+        const end = std.mem.indexOfAny(u8, rest, " \t\r\n") orelse rest.len;
+        rest = rest[0..end];
+        const dpi = std.fmt.parseFloat(f32, rest) catch return 1;
+        if (dpi < 48 or dpi > 960) return 1;
+        return @max(1, @round(dpi / 96.0 * 4) / 4);
+    }
+
+    pub fn fd(self: *X11Connection) c_int {
+        return self.api.XConnectionNumber(self.display);
+    }
+
+    pub fn is_dead(self: *const X11Connection) bool {
+        return self.dead;
+    }
+
+    /// True when events are already queued and the caller must not block.
+    pub fn prepare_wait(self: *X11Connection) bool {
+        _ = self.api.XFlush(self.display);
+        return self.api.XPending(self.display) > 0;
+    }
+
+    pub fn finish_wait(self: *X11Connection, readable: bool) void {
+        _ = readable;
+        var ev: XEvent = undefined;
+        while (self.stash_len > 0) {
+            self.stash_len -= 1;
+            self.translate(self.stash[self.stash_len]);
+        }
+        while (self.api.XPending(self.display) > 0) {
+            _ = self.api.XNextEvent(self.display, &ev);
+            self.translate(ev);
+        }
+        _ = self.api.XFlush(self.display);
+    }
+
+    pub fn flush(self: *X11Connection) void {
+        _ = self.api.XFlush(self.display);
+    }
+
+    /// Milliseconds until the earliest frame a window wants, or null.
+    pub fn frame_timeout(self: *const X11Connection, now: i64) ?i32 {
+        var best: ?i32 = null;
+        for (self.windows.items) |w| {
+            if (!w.frame_wanted or w.closed) continue;
+            const due: i32 = @intCast(@max(0, w.last_frame_ms + frame_interval_ms - now));
+            best = if (best) |b| @min(b, due) else due;
+        }
+        return best;
+    }
+
+    pub fn pump(self: *X11Connection) void {
+        const now = input.now_ms();
+        var i: usize = 0;
+        while (i < self.windows.items.len) : (i += 1) {
+            const w = self.windows.items[i];
+            if (w.frame_wanted and !w.closed and now - w.last_frame_ms >= frame_interval_ms) {
+                w.frame_wanted = false;
+                w.last_frame_ms = now;
+                w.base.emit_request_frame(.{});
             }
         }
-        self.renderer.deinit();
-        self.destroyXic();
-        self.destroyImage();
+        self.flush();
+    }
+
+    pub fn reap(self: *X11Connection) void {
+        var i: usize = 0;
+        while (i < self.windows.items.len) {
+            const w = self.windows.items[i];
+            if (w.closed) {
+                _ = self.windows.swapRemove(i);
+                w.free();
+            } else i += 1;
+        }
+    }
+
+    pub fn live_windows(self: *const X11Connection) usize {
+        var n: usize = 0;
+        for (self.windows.items) |w| {
+            if (!w.closed) n += 1;
+        }
+        return n;
+    }
+
+    pub fn displays(self: *X11Connection) []const Display {
+        const w = self.api.XDisplayWidth(self.display, self.screen);
+        const h = self.api.XDisplayHeight(self.display, self.screen);
+        const out = &self.display_storage;
+        out[0] = .{
+            .id = 0,
+            .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = @as(f32, @floatFromInt(w)) / self.scale, .height = @as(f32, @floatFromInt(h)) / self.scale } },
+            .scale_factor = self.scale,
+        };
+        return out[0..1];
+    }
+
+    pub fn deinit(self: *X11Connection) void {
+        for (self.windows.items) |w| w.close_now();
+        for (self.windows.items) |w| w.free();
+        self.windows.deinit(self.allocator);
         for (self.cursors) |c| {
             if (c != 0) _ = self.api.XFreeCursor(self.display, c);
         }
-        self.allocator.free(self.pixels);
-        // Primary window may also have been destroyed externally.
-        if (!self.destroyed_by_server) {
-            _ = self.api.XDestroyWindow(self.display, self.window);
-        }
-        if (self.xim_owner) {
-            if (self.api.XCloseIM) |close| _ = close(self.xim.?);
-            self.xim = null;
-            self.xim_owner = false;
-        }
+        if (self.clip_offer) |c| self.allocator.free(c);
+        if (self.clip_read) |c| self.allocator.free(c);
+        _ = self.api.XDestroyWindow(self.display, self.helper);
         _ = self.api.XCloseDisplay(self.display);
         self.lib.close();
         self.allocator.destroy(self);
     }
 
-    pub fn backendHandle(self: *X11Backend) backend.Backend {
-        return .{ .ptr = self, .vtable = &vtable };
+    // -- windows ----------------------------------------------------------
+
+    pub fn open_window(self: *X11Connection, options: window_mod.WindowOptions) !*X11Window {
+        try self.windows.ensureUnusedCapacity(self.allocator, 1);
+        const b: PxBounds = if (options.window_bounds) |wb| wb.get_bounds() else .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1280, .height = 800 } };
+        const w = try self.allocator.create(X11Window);
+        w.* = .{
+            .allocator = self.allocator,
+            .conn = self,
+            .size = b.size,
+            .scale = self.scale,
+            .atlas = atlas_mod.CpuAtlas.init(self.allocator),
+            .renderer = cpu.CpuRenderer.init(self.allocator),
+        };
+        const a = &self.api;
+        const pw: c_uint = @intFromFloat(@max(1, @round(b.size.width * self.scale)));
+        const ph: c_uint = @intFromFloat(@max(1, @round(b.size.height * self.scale)));
+        const x = a.XCreateSimpleWindow(self.display, self.root, 0, 0, pw, ph, 0, 0, 0);
+        w.x_window = x;
+        var title_buf: [512]u8 = undefined;
+        const title_src: []const u8 = if (options.titlebar) |t| (t.title orelse "ZUI") else "ZUI";
+        const tn = @min(title_src.len, title_buf.len - 1);
+        @memcpy(title_buf[0..tn], title_src[0..tn]);
+        title_buf[tn] = 0;
+        const title: [*:0]const u8 = @ptrCast(&title_buf);
+        _ = a.XStoreName(self.display, x, title);
+        _ = a.XChangeProperty(self.display, x, self.atoms.net_wm_name, self.atoms.utf8_string, 8, 0, title, @intCast(tn));
+        var protocols = [2]Atom{ self.atoms.wm_delete_window, self.atoms.net_wm_ping };
+        _ = a.XSetWMProtocols(self.display, x, &protocols, 2);
+        if (options.titlebar == null) self.set_decorations(x, false);
+        const mask: c_long = proto.ExposureMask | proto.KeyPressMask | proto.KeyReleaseMask | proto.ButtonPressMask | proto.ButtonReleaseMask | proto.PointerMotionMask | proto.StructureNotifyMask | proto.FocusChangeMask | proto.EnterWindowMask | proto.LeaveWindowMask;
+        _ = a.XSelectInput(self.display, x, mask);
+        if (options.show) _ = a.XMapWindow(self.display, x);
+        w.frame_wanted = true;
+        self.windows.appendAssumeCapacity(w);
+        w.apply_cursor();
+        self.flush();
+        return w;
     }
 
-    /// §5G DPI: physical framebuffer dimensions for the current logical
-    /// size and scale. The OS window, pixel buffer, XImage and XPutImage
-    /// rect are all physical; `size` and `windowInfo().size` stay logical.
-    pub fn physW(self: *const X11Backend) u32 {
-        return @intFromFloat(@max(1, @round(self.size.w * self.scale_factor)));
+    /// Motif hints: turn off the window manager's frame (decorations = 0).
+    fn set_decorations(self: *X11Connection, x: XWindow, decorated: bool) void {
+        var hints = [5]c_long{ 2, 0, if (decorated) 1 else 0, 0, 0 };
+        _ = self.api.XChangeProperty(self.display, x, self.atoms.motif_hints, self.atoms.motif_hints, 32, 0, @ptrCast(&hints), 5);
     }
-    pub fn physH(self: *const X11Backend) u32 {
-        return @intFromFloat(@max(1, @round(self.size.h * self.scale_factor)));
+
+    fn find_window(self: *X11Connection, native: XWindow) ?*X11Window {
+        for (self.windows.items) |w| {
+            if (!w.closed and w.x_window == native) return w;
+        }
+        return null;
     }
-    /// Logical size for a physical OS-window size at this window's scale.
-    fn logicalFromPhys(self: *const X11Backend, w: u32, h: u32) geometry.Size {
-        const s = @max(0.001, self.scale_factor);
-        return .{
-            .w = @max(1, @round(@as(f32, @floatFromInt(w)) / s)),
-            .h = @max(1, @round(@as(f32, @floatFromInt(h)) / s)),
+
+    fn cursor_glyph(style: CursorStyle) c_uint {
+        return switch (style) {
+            .arrow, .context_menu, .drag_copy, .none => proto.XC_left_ptr,
+            .i_beam, .i_beam_cursor_for_vertical_layout => proto.XC_xterm,
+            .crosshair => proto.XC_crosshair,
+            .pointing_hand, .drag_link => proto.XC_hand2,
+            .open_hand => proto.XC_hand2,
+            .closed_hand => proto.XC_hand1,
+            .resize_left => proto.XC_left_side,
+            .resize_right => proto.XC_right_side,
+            .resize_left_right, .resize_column => proto.XC_sb_h_double_arrow,
+            .resize_up => proto.XC_top_side,
+            .resize_down => proto.XC_bottom_side,
+            .resize_up_down, .resize_row => proto.XC_sb_v_double_arrow,
+            .resize_up_left_down_right => proto.XC_bottom_right_corner,
+            .resize_up_right_down_left => proto.XC_bottom_left_corner,
+            .operation_not_allowed => proto.XC_X_cursor,
         };
     }
-    fn ensureBuffer(self: *X11Backend, phys_w: u32, phys_h: u32) void {
-        const new_sz = @as(usize, phys_w) * @as(usize, phys_h) * 4;
-        if (new_sz != self.pixels.len) {
-            if (self.allocator.realloc(self.pixels, new_sz)) |new_buf| {
-                self.pixels = new_buf;
-                self.recreateImage();
-            } else |_| {}
+
+    /// The cursor object for a style, created on first use.
+    fn cursor_for(self: *X11Connection, style: CursorStyle) Cursor {
+        const idx = @backingInt(style);
+        if (self.cursors[idx] == 0) {
+            self.cursors[idx] = self.api.XCreateFontCursor(self.display, cursor_glyph(style));
         }
+        return self.cursors[idx];
     }
 
-    /// Mint one more native window on this shared connection. The returned
-    /// Backend is window-scoped: it owns its own X window, framebuffer,
-    /// renderer, scale, focus, and input routing, but shares the display
-    /// connection, atoms, cursors and clipboard selection with the
-    /// primary. A null createWindow on other legacy backends keeps them
-    /// single-window; X11 gets the full multi-window path.
-    fn createWindowFn(ptr: *anyopaque, allocator: std.mem.Allocator, options: backend.WindowOptions) !backend.Backend {
-        _ = allocator; // children reuse the connection's allocator
-        const self: *X11Backend = @ptrCast(@alignCast(ptr));
-        if (self.parent != null) return error.NotAConnection; // only the primary mints windows
-        // First logical window adopts the init-created native window so the
-        // connection never orphans its primary surface.
-        if (self.window_id == 0) {
-            self.window_id = options.id;
-            const handle = self.backendHandle();
-            handle.setTitle(options.title);
-            handle.setDecorated(options.decorated);
-            if (options.width != @as(u32, @intFromFloat(self.size.w)) or options.height != @as(u32, @intFromFloat(self.size.h))) {
-                self.size.w = @floatFromInt(options.width);
-                self.size.h = @floatFromInt(options.height);
-                // §5G: setWindow goes to the OS in physical pixels (which
-                // round-trips a ConfigureNotify that resizes our physical
-                // buffer); size the buffer here as well for the first
-                // present ahead of that round-trip.
-                handle.setSize(options.width, options.height);
-                self.ensureBuffer(self.physW(), self.physH());
-            }
-            return handle;
-        }
-        var slot: ?usize = null;
-        for (&self.windows, 0..) |maybe, i| {
-            if (maybe == null) {
-                slot = i;
-                break;
-            }
-        }
-        const idx = slot orelse return error.TooManyWindows;
-        const child = try createWindowOnConnection(self, options);
-        self.windows[idx] = child;
-        return child.backendHandle();
+    pub fn set_cursor_style(self: *X11Connection, style: CursorStyle) void {
+        self.cursor_style = style;
+        for (self.windows.items) |w| w.apply_cursor();
+        self.flush();
     }
 
-    /// Shared creation path used by init (first window) and createWindowFn.
-    /// Keeps window options (id/title/size/decorated) uniform for both.
-    fn createWindowOnConnection(connection: *X11Backend, options: backend.WindowOptions) !*X11Backend {
-        const api = connection.api;
-        const dpy = connection.display;
-        // §5G DPI: OS window + framebuffer are PHYSICAL; app-visible size
-        // stays logical. Children inherit the connection scale.
-        const scale = connection.scale_factor;
-        const phys_w: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(options.width)) * scale)));
-        const phys_h: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(options.height)) * scale)));
-        const win = api.XCreateSimpleWindow(dpy, connection.root, 0, 0, phys_w, phys_h, 0, 0, 0);
-        errdefer _ = api.XDestroyWindow(dpy, win);
-        // Latin-1 fallback title via stack buffer (titles are bounded by
-        // WindowOptions), then the UTF-8 _NET_WM_NAME property.
-        var zbuf: [256]u8 = undefined;
-        const zlen = @min(options.title.len, zbuf.len - 1);
-        @memcpy(zbuf[0..zlen], options.title[0..zlen]);
-        zbuf[zlen] = 0;
-        _ = api.XStoreName(dpy, win, @ptrCast(&zbuf));
-        _ = api.XChangeProperty(dpy, win, connection.atom_net_wm_name, connection.atom_utf8_string, 8, PROP_MODE_REPLACE, options.title.ptr, @intCast(options.title.len));
-        _ = api.XSetWMProtocols(dpy, win, &[2]Atom{ connection.wm_delete_window, connection.net_wm_ping }, 2);
-        const mask = ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | StructureNotifyMask | FocusChangeMask;
-        _ = api.XSelectInput(dpy, win, mask);
-        _ = api.XMapWindow(dpy, win);
-        _ = api.XFlush(dpy);
-        errdefer _ = api.XDestroyWindow(dpy, win);
+    // -- events ----------------------------------------------------------
 
-        const pixels = try connection.allocator.alloc(u8, @as(usize, phys_w) * @as(usize, phys_h) * 4);
-        errdefer connection.allocator.free(pixels);
-        @memset(pixels, 0);
-
-        const child = try connection.allocator.create(X11Backend);
-        errdefer connection.allocator.destroy(child);
-        child.* = .{
-            .allocator = connection.allocator,
-            .lib = connection.lib,
-            .api = api,
-            .display = dpy,
-            .screen = connection.screen,
-            .window = win,
-            .gc = connection.gc,
-            .wm_delete_window = connection.wm_delete_window,
-            .wm_protocols = connection.wm_protocols,
-            .net_wm_ping = connection.net_wm_ping,
-            .size = .{ .w = @floatFromInt(options.width), .h = @floatFromInt(options.height) },
-            .scale_factor = connection.scale_factor,
-            .focused = false,
-            .presents = 0,
-            .wakeups = 0,
-            .pixels = pixels,
-            .image = null,
-            .renderer = gpu.vellz.Renderer.init(connection.allocator),
-            .debug_events = connection.debug_events,
-            .window_id = options.id,
-            .parent = connection,
-            .atom_clipboard = connection.atom_clipboard,
-            .atom_utf8_string = connection.atom_utf8_string,
-            .atom_targets = connection.atom_targets,
-            .atom_text = connection.atom_text,
-            .atom_net_wm_name = connection.atom_net_wm_name,
-            .atom_incr = connection.atom_incr,
-            .atom_motif_hints = connection.atom_motif_hints,
-            .atom_net_wm_state = connection.atom_net_wm_state,
-            .atom_net_wm_maximized_vert = connection.atom_net_wm_maximized_vert,
-            .atom_net_wm_maximized_horz = connection.atom_net_wm_maximized_horz,
-            .atom_net_wm_moveresize = connection.atom_net_wm_moveresize,
-            .root = connection.root,
-            .paste_prop = connection.paste_prop,
-        };
-        child.recreateImage();
-        child.setupWindowXic(connection.xim);
-        return child;
-    }
-
-    /// Destroy a window-scoped handle. Never closes the shared connection.
-    fn destroyWindowFn(ptr: *anyopaque) void {
-        const self: *X11Backend = @ptrCast(@alignCast(ptr));
-        const parent = self.parent orelse {
-            // Adopted primary window: reap only the native window; the
-            // renderer, framebuffer and connection are released once in
-            // deinit (this handle IS the connection struct).
-            if (!self.destroyed_by_server) {
-                _ = self.api.XDestroyWindow(self.display, self.window);
-            }
-            self.destroyed_by_server = true;
-            return;
-        };
-        for (&parent.windows) |*slot| {
-            if (slot.* == self) {
-                slot.* = null;
-                break;
-            }
+    fn translate(self: *X11Connection, ev: XEvent) void {
+        switch (ev.type) {
+            proto.SelectionRequest => return self.serve_selection(ev.xselectionrequest),
+            proto.SelectionClear => {
+                self.owning_selection = false;
+                return;
+            },
+            proto.SelectionNotify => return,
+            else => {},
         }
-        self.teardownWindow();
-    }
-
-    /// Release per-window resources but keep the shared connection alive.
-    fn teardownWindow(self: *X11Backend) void {
-        self.renderer.deinit();
-        self.destroyXic();
-        self.destroyImage();
-        self.allocator.free(self.pixels);
-        // The server already destroyed this window (DestroyNotify): a
-        // second XDestroyWindow would raise an async BadWindow error.
-        if (!self.destroyed_by_server) {
-            _ = self.api.XDestroyWindow(self.display, self.window);
-        }
-        self.allocator.destroy(self);
-    }
-
-    fn destroyImage(self: *X11Backend) void {
-        if (self.image) |img| {
-            img.data = null; // Do not let XDestroyImage free our allocator slice
-            _ = self.api.XDestroyImage(img);
-            self.image = null;
-        }
-    }
-
-    fn recreateImage(self: *X11Backend) void {
-        self.destroyImage();
-        const vis = self.api.XDefaultVisual(self.display, self.screen);
-        const depth = self.api.XDefaultDepth(self.display, self.screen);
-        // §5G DPI: the XImage wraps the PHYSICAL pixel buffer.
-        const w: c_uint = self.physW();
-        const h: c_uint = self.physH();
-        self.image = self.api.XCreateImage(self.display, vis, @intCast(depth), 2, 0, self.pixels.ptr, w, h, 32, 0);
-    }
-
-    fn kindFn(ptr: *anyopaque) backend.BackendKind {
-        _ = ptr;
-        return .x11;
-    }
-
-    fn pollFn(ptr: *anyopaque, out: *event.EventQueue) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        // Raw events stashed during a synchronous paste replay first so
-        // input order survives the nested pump. Partial replay compacts.
-        var ri: usize = 0;
-        while (ri < self.raw_stash_len and out.len < limits.MAX_EVENTS_PER_FRAME) : (ri += 1) {
-            const sev: XEvent = std.mem.bytesAsValue(XEvent, &self.raw_stash[ri]).*;
-            self.translateOne(sev, out);
-        }
-        if (ri > 0) {
-            var dst: usize = 0;
-            while (ri + dst < self.raw_stash_len) : (dst += 1) {
-                self.raw_stash[dst] = self.raw_stash[ri + dst];
-            }
-            self.raw_stash_len -= ri;
-        }
-
-        var ev: XEvent = undefined;
-        while (self.api.XPending(self.display) > 0 and out.len < limits.MAX_EVENTS_PER_FRAME) {
-            _ = self.api.XNextEvent(self.display, &ev);
-            if (self.debug_events) {
-                std.debug.print("x11 event type={d}\n", .{ev.type});
-            }
-            self.translateOne(ev, out);
-        }
-    }
-
-    /// Translate one server event. Shared by poll and the synchronous
-    /// paste pump (which stashes raw events for replay instead).
-    /// Each event is tagged with its native window id (targeted envelope);
-    /// per-window state (size, focus, framebuffer) is updated on the
-    /// owning window-scoped handle before translation.
-    fn translateOne(self: *@This(), ev: XEvent, out: *event.EventQueue) void {
-        // Route by native window: the translated event is pushed as a
-        // targeted envelope for its owning window handle. Foreign or
-        // already-destroyed native ids are dropped, never misrouted.
-        // Route by native window. ConfigureNotify (and friends with an
-        // `event` field) carry the destination in `window` at a different
-        // offset than XAnyEvent — read the union member matching the type.
-        const native: Window = switch (ev.type) {
-            ConfigureNotify => ev.xconfigure.window,
+        const native: XWindow = switch (ev.type) {
+            proto.ConfigureNotify => ev.xconfigure.window,
             else => ev.xany.window,
         };
-        const owner: *X11Backend = self.lookupWindow(native) orelse return;
-        defer owner.flushXim(owner, out);
-        if (owner.xic != null) {
-            if (owner.api.XFilterEvent) |filter| {
-                var filter_event = ev;
-                if (filter(&filter_event, owner.window) != 0) return;
-            }
-        }
+        const w = self.find_window(native) orelse return;
         switch (ev.type) {
-            DestroyNotify => {
-                // Someone else destroyed our window. Mark the handle dead,
-                // skip our own XDestroyWindow in teardown, and surface a
-                // normal close to the app so it reaps the logical window.
-                owner.destroyed_by_server = true;
-                owner.pushTargeted(out, .{ .window = .close_requested });
+            proto.DestroyNotify => {
+                w.destroyed_by_server = true;
+                w.request_close();
             },
-            ClientMessage => {
+            proto.ClientMessage => {
                 const client = ev.xclient;
-                if (client.message_type == self.wm_protocols) {
-                    if (client.data.l[0] == @as(c_long, @bitCast(self.net_wm_ping))) {
-                        // WM liveness ping: echo it back to the root window
-                        // or we get flagged "Not Responding".
-                        zlog.log("x11", "ping -> pong", .{});
-                        var reply = client;
-                        reply.window = self.root;
-                        var rev: XEvent = undefined;
-                        @memset(std.mem.asBytes(&rev), 0);
-                        @memcpy(std.mem.asBytes(&rev)[0..@sizeOf(XClientMessageEvent)], std.mem.asBytes(&reply));
-                        const mask: c_long = (1 << 20) | (1 << 21); // SubstructureRedirect|Notify
-                        _ = self.api.XSendEvent(self.display, self.root, 0, mask, &rev);
-                        _ = self.api.XFlush(self.display);
-                    } else if (client.data.l[0] == @as(c_long, @bitCast(self.wm_delete_window))) {
-                        owner.pushTargeted(out, .{ .window = .close_requested });
-                    }
-                } else if (client.data.l[0] == @as(c_long, @bitCast(self.wm_delete_window))) {
-                    owner.pushTargeted(out, .{ .window = .close_requested });
+                if (client.message_type != self.atoms.wm_protocols) return;
+                const kind: Atom = @intCast(client.data.l[0]);
+                if (kind == self.atoms.net_wm_ping) {
+                    var reply = client;
+                    reply.window = self.root;
+                    var out: XEvent = undefined;
+                    @memset(std.mem.asBytes(&out), 0);
+                    @memcpy(std.mem.asBytes(&out)[0..@sizeOf(proto.XClientMessageEvent)], std.mem.asBytes(&reply));
+                    _ = self.api.XSendEvent(self.display, self.root, 0, proto.SubstructureRedirectMask | proto.SubstructureNotifyMask, &out);
+                } else if (kind == self.atoms.wm_delete_window) {
+                    w.request_close();
                 }
             },
-            ConfigureNotify => {
+            proto.ConfigureNotify => {
                 const cfg = ev.xconfigure;
-                // §5G DPI: the OS window's pixel size is PHYSICAL; convert
-                // to logical for the app viewport. With scale 1 this is
-                // the identity mapping it always was.
-                const logical = owner.logicalFromPhys(@intCast(@max(0, cfg.width)), @max(0, cfg.height));
-                if (logical.w != owner.size.w or logical.h != owner.size.h) {
-                    owner.size = logical;
-                    owner.ensureBuffer(owner.physW(), owner.physH());
-                    owner.pushTargeted(out, .{ .window = .resized });
-                }
+                w.on_configure(@intCast(@max(0, cfg.width)), @intCast(@max(0, cfg.height)));
             },
-            FocusIn => {
-                owner.focused = true;
-                if (owner.xic) |ic| if (owner.api.XSetICFocus) |set_focus| set_focus(ic);
-                owner.pushTargeted(out, .{ .window = .focused });
+            proto.Expose => {
+                if (ev.xexpose.count == 0) w.frame_wanted = true;
             },
-            FocusOut => {
-                owner.focused = false;
-                owner.resetXim(owner, out);
-                owner.pushTargeted(out, .{ .window = .unfocused });
+            proto.FocusIn => {
+                w.focused = true;
+                w.base.emit_active(true);
             },
-            SelectionRequest => {
-                var req: XSelectionRequestEvent = undefined;
-                @memcpy(std.mem.asBytes(&req), std.mem.asBytes(&ev)[0..@sizeOf(XSelectionRequestEvent)]);
-                self.serveSelection(req);
+            proto.FocusOut => {
+                w.focused = false;
+                w.base.emit_active(false);
             },
-            SelectionClear => {
-                // Another client took CLIPBOARD; our offer is dead.
-                self.owning_selection = false;
+            proto.EnterNotify => {
+                w.base.emit_hover(true);
             },
-            SelectionNotify => {}, // consumed by the paste pump; stray ones are noise
-            ButtonPress, ButtonRelease => {
-                const b = ev.xbutton;
-                if (self.debug_events) {
-                    std.debug.print("x11 button raw={d} time={d} pos={d},{d} pressed={}\n", .{ b.button, b.time, b.x, b.y, ev.type == ButtonPress });
-                }
-                // Remember the press for titlebar drags/resizes.
-                if (ev.type == ButtonPress) {
-                    self.last_button = b.button;
-                    self.last_root_x = b.x_root;
-                    self.last_root_y = b.y_root;
-                }
-                // Wheel buttons are scroll lines, never clicks: emitting
-                // `.left` for them used to toggle checkboxes while
-                // scrolling. Release halves of wheel pairs are silent.
-                if (wheelScroll(b.button)) |delta| {
-                    if (ev.type == ButtonPress) {
-                        owner.pushTargeted(out, .{ .scroll = .{
-                            .pos = .{ .x = @floatFromInt(b.x), .y = @floatFromInt(b.y) },
-                            .dx = delta.dx,
-                            .dy = delta.dy,
-                            .modifiers = evdev.modifiersFromMask(b.state),
-                        } });
-                    }
-                    return;
-                }
-                const btn: event.MouseButton = switch (b.button) {
-                    1 => .left,
-                    2 => .middle,
-                    3 => .right,
-                    8 => .back,
-                    9 => .forward,
-                    else => return,
-                };
-                owner.pushTargeted(out, .{ .mouse = .{
-                    .pos = .{ .x = @floatFromInt(b.x), .y = @floatFromInt(b.y) },
-                    .button = btn,
-                    .pressed = (ev.type == ButtonPress),
-                    .modifiers = evdev.modifiersFromMask(b.state),
-                    .time_ms = @intCast(b.time),
-                } });
+            proto.LeaveNotify => {
+                w.base.emit_hover(false);
+                _ = w.base.emit_input(.{ .mouse_exited = .{ .position = w.logical(ev.xcrossing.x, ev.xcrossing.y), .modifiers = input.modifiers(self.mods) } });
             },
-            MotionNotify => {
+            proto.MotionNotify => {
                 const m = ev.xmotion;
-                owner.pushTargeted(out, .{ .mouse = .{
-                    .pos = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) },
-                    .button = .left,
-                    .pressed = false,
-                    .motion = true,
-                    .modifiers = evdev.modifiersFromMask(m.state),
-                    .time_ms = @intCast(m.time),
+                self.note_mods(m.state);
+                _ = w.base.emit_input(.{ .mouse_move = .{
+                    .position = w.logical(m.x, m.y),
+                    .pressed_button = self.pressed,
+                    .modifiers = input.modifiers(m.state),
                 } });
             },
-            KeyPress, KeyRelease => {
-                var k = ev.xkey;
-                // X11 keycodes are evdev+8; guard cheap keyboards that
-                // report below the offset.
-                const mapped_key = if (k.keycode >= 8)
-                    evdev.keyFromEvdev(k.keycode - 8)
-                else
-                    event.Key.unknown;
-                if (self.debug_events) {
-                    std.debug.print("x11 keycode={d} mapped={s} pressed={}\n", .{ k.keycode, @tagName(mapped_key), ev.type == KeyPress });
-                }
-                const mods = evdev.modifiersFromMask(k.state);
-                // Key releases are critical; the escalated push prints any
-                // loss unconditionally (gap report §5.4).
-                owner.pushTargeted(out, .{ .key = .{
-                    .key = mapped_key,
-                    .pressed = (ev.type == KeyPress),
-                    .modifiers = mods,
-                } });
-                // XIM owns committed text when an input context is active;
-                // otherwise preserve the long-standing XLookupString path.
-                if (ev.type == KeyPress) {
-                    var buf: [256]u8 = undefined;
-                    var lookup_status: Status = 0;
-                    const n = if (owner.xic) |ic| blk: {
-                        if (owner.api.Xutf8LookupString) |lookup| {
-                            const result = lookup(ic, &k, &buf, buf.len, null, &lookup_status);
-                            if (result != XBufferOverflow) break :blk result;
-                            // The normalized composition payload is bounded
-                            // at 256 bytes. If XIM reports a larger commit,
-                            // retain the old keymap path rather than losing
-                            // all printable input.
-                            lookup_status = 0;
-                            break :blk owner.api.XLookupString(&k, &buf, buf.len, null, null);
-                        }
-                        break :blk owner.api.XLookupString(&k, &buf, buf.len, null, null);
-                    } else owner.api.XLookupString(&k, &buf, buf.len, null, null);
-                    if (n > 0) {
-                        // Control characters (e.g. \r from Enter) are
-                        // actions, not text — the .key event covers them.
-                        const count: usize = @intCast(@min(n, @as(c_int, @intCast(buf.len))));
-                        var printable = true;
-                        for (buf[0..count]) |byte| {
-                            if (byte < 0x20 and byte != '\t') {
-                                printable = false;
-                                break;
-                            }
-                        }
-                        if (printable) {
-                            if (owner.xic != null and xim_helpers.lookupHasText(lookup_status)) {
-                                if (compositionText(buf[0..count], count, count)) |composition| {
-                                    owner.queueXim(.{ .commit = composition });
-                                }
-                            } else {
-                                const text_count = @min(count, @as(usize, 31));
-                                var text_ev = event.TextEvent{};
-                                @memcpy(text_ev.text[0..text_count], buf[0..text_count]);
-                                text_ev.len = @intCast(text_count);
-                                // Composition commits are critical (§5.4).
-                                owner.pushTargeted(out, .{ .text = text_ev });
-                            }
-                        }
-                    }
-                }
-            },
+            proto.ButtonPress, proto.ButtonRelease => self.on_button(w, ev.xbutton, ev.type == proto.ButtonPress),
+            proto.KeyPress, proto.KeyRelease => self.on_key(w, ev.xkey, ev.type == proto.KeyPress),
             else => {},
         }
     }
 
-    /// Map a native X window id to its owning backend handle, or null when
-    /// the id belongs to a foreign or already-destroyed window (those are
-    /// dropped instead of misrouted).
-    fn lookupWindow(self: *X11Backend, native: Window) ?*X11Backend {
-        if (native == self.window) return self;
-        for (self.windows) |maybe| {
-            if (maybe) |child| {
-                if (child.window == native) return child;
+    fn note_mods(self: *X11Connection, state: c_uint) void {
+        const m = @as(u32, state) & 0xff;
+        if (m == self.mods) return;
+        self.mods = m;
+        _ = self.active_window_for_mods();
+    }
+
+    /// Reports a modifier change to the focused window.
+    fn active_window_for_mods(self: *X11Connection) ?*X11Window {
+        for (self.windows.items) |w| {
+            if (w.focused and !w.closed) {
+                _ = w.base.emit_input(.{ .modifiers_changed = .{ .modifiers = input.modifiers(self.mods) } });
+                return w;
             }
         }
         return null;
     }
 
-    /// Push one translated event as a targeted envelope for this window.
-    /// Critical payloads (close, focus, text) route through the escalated
-    /// critical push: failure is printed unconditionally and counted on the
-    /// queue, never silently lost (gap report §5.4).
-    fn pushTargeted(owner: *X11Backend, out: *event.EventQueue, ev: event.EventPayload) void {
-        const envelope: event.Event = .{ .targeted = .{ .window_id = owner.window_id, .payload = ev } };
-        if (event.EventQueue.isCritical(envelope)) {
-            out.pushCriticalEscalated(envelope, "x11");
+    fn on_button(self: *X11Connection, w: *X11Window, b: proto.XButtonEvent, pressed: bool) void {
+        self.note_mods(b.state);
+        const pos = w.logical(b.x, b.y);
+        const mods = input.modifiers(b.state);
+        if (b.button >= 4 and b.button <= 7) {
+            if (!pressed) return;
+            const dx: f32 = switch (b.button) {
+                6 => -1,
+                7 => 1,
+                else => 0,
+            };
+            const dy: f32 = switch (b.button) {
+                4 => 1,
+                5 => -1,
+                else => 0,
+            };
+            _ = w.base.emit_input(.{ .scroll_wheel = .{ .position = pos, .delta = .{ .lines = .{ .x = dx, .y = dy } }, .modifiers = mods } });
+            return;
+        }
+        const button = input.x11_button(b.button) orelse return;
+        if (pressed) {
+            self.press_root = .{ @intCast(b.x_root), @intCast(b.y_root) };
+            self.pressed = button;
+            const count = self.click.press(button, pos);
+            _ = w.base.emit_input(.{ .mouse_down = .{ .button = button, .position = pos, .modifiers = mods, .click_count = count } });
         } else {
-            _ = out.push(envelope);
+            if (self.pressed) |p| if (p.eql(button)) {
+                self.pressed = null;
+            };
+            _ = w.base.emit_input(.{ .mouse_up = .{ .button = button, .position = pos, .modifiers = mods, .click_count = self.click.count } });
         }
     }
 
-    fn waitFn(ptr: *anyopaque, ns: u64) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        const fd = self.api.XConnectionNumber(self.display);
-        var pfd = [1]std.posix.pollfd{.{
-            .fd = fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ms: i32 = @intCast(@min(ns / 1_000_000, 1000));
-        _ = std.posix.poll(&pfd, ms) catch 0;
-        // Same idle-spin guard as the Wayland backend (see wayland.zig).
-        _ = std.posix.poll(&.{}, 4) catch 0;
-    }
-
-    fn wakeupFn(ptr: *anyopaque) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.wakeups += 1;
-        _ = self.api.XFlush(self.display);
-    }
-
-    /// Wheel buttons → scroll lines. Pure for testability. Positive dy
-    /// scrolls up, positive dx scrolls right.
-    fn wheelScroll(button: c_uint) ?struct { dx: f32, dy: f32 } {
-        return switch (button) {
-            4 => .{ .dx = 0, .dy = 1 },
-            5 => .{ .dx = 0, .dy = -1 },
-            6 => .{ .dx = -1, .dy = 0 },
-            7 => .{ .dx = 1, .dy = 0 },
-            else => null,
-        };
-    }
-
-    fn cursorGlyph(shape: backend.CursorShape) c_uint {
-        return switch (shape) {
-            .default => XC_LEFT_PTR,
-            .text => XC_XTERM,
-            .pointer => XC_HAND2,
-        };
-    }
-
-    fn titleFn(ptr: *anyopaque, title: []const u8) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        var buf: [512]u8 = undefined;
-        const n = @min(title.len, buf.len - 1);
-        @memcpy(buf[0..n], title[0..n]);
-        buf[n] = 0;
-        const ztitle: [*:0]const u8 = @ptrCast(&buf);
-        _ = self.api.XStoreName(self.display, self.window, ztitle);
-        _ = self.api.XChangeProperty(self.display, self.window, self.atom_net_wm_name, self.atom_utf8_string, 8, PROP_MODE_REPLACE, buf[0..n].ptr, @intCast(n));
-        _ = self.api.XFlush(self.display);
-    }
-
-    fn cursorFn(ptr: *anyopaque, shape: backend.CursorShape) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        const idx = @backingInt(shape);
-        if (self.cursors[idx] == 0) {
-            self.cursors[idx] = self.api.XCreateFontCursor(self.display, cursorGlyph(shape));
+    fn on_key(self: *X11Connection, w: *X11Window, ev: proto.XKeyEvent, pressed: bool) void {
+        self.note_mods(ev.state);
+        var k = ev;
+        var keysym: c_ulong = 0;
+        var buf: [32]u8 = undefined;
+        const n: usize = @intCast(@max(0, self.api.XLookupString(&k, &buf, @intCast(buf.len), &keysym, null)));
+        const shift = (ev.state & input.MOD_SHIFT) != 0;
+        var name: ?[]const u8 = input.key_name_for_keysym(@intCast(keysym));
+        if (name == null) {
+            if (ev.keycode >= 8) {
+                if (input.evdev_key(ev.keycode - 8, shift)) |info| name = info.name;
+            }
         }
-        _ = self.api.XDefineCursor(self.display, self.window, self.cursors[idx]);
-        _ = self.api.XFlush(self.display);
+        const key_name = name orelse return;
+        var text_buf: [64]u8 = undefined;
+        var text_len: usize = 0;
+        if (pressed) {
+            // Like xkb's utf8 query, the keysym's text ignores Control, so
+            // ctrl-a types "a" (GPUI behavior). Fall back to XLookupString's
+            // Latin-1 bytes for keysyms without a direct text form.
+            var tmp: [4]u8 = undefined;
+            if (input.utf8_for_keysym(@intCast(keysym), &tmp)) |t| {
+                @memcpy(text_buf[0..t.len], t);
+                text_len = t.len;
+            } else {
+                for (buf[0..@min(n, buf.len)]) |byte| {
+                    const enc = input.latin1_to_utf8(byte, &tmp);
+                    if (text_len + enc.len > text_buf.len) break;
+                    @memcpy(text_buf[text_len..][0..enc.len], enc);
+                    text_len += enc.len;
+                }
+            }
+        }
+        const text: ?[]const u8 = if (text_len > 0) text_buf[0..text_len] else null;
+        w.emit_key(key_name, text, pressed, false);
     }
 
-    /// Ask the server to resize; the ConfigureNotify round-trip resizes
-    /// our buffers and emits .resized like a user resize. App sizes are
-    /// logical; the OS window gets PHYSICAL pixels (§5G DPI).
-    fn sizeFn(ptr: *anyopaque, w: u32, h: u32) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (w == 0 or h == 0) return;
-        const phys_w: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(w)) * self.scale_factor)));
-        const phys_h: u32 = @intFromFloat(@max(1, @round(@as(f32, @floatFromInt(h)) * self.scale_factor)));
-        _ = self.api.XResizeWindow(self.display, self.window, phys_w, phys_h);
-        _ = self.api.XFlush(self.display);
-    }
+    // -- clipboard ----------------------------------------------------------
 
-    /// Toggle server decorations through Motif hints (flags=2 selects the
-    /// decorations field; 0 strips them for app-drawn chrome).
-    fn decoratedFn(ptr: *anyopaque, decorated: bool) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        const hints = [_]c_long{ 2, 0, if (decorated) 1 else 0, 0, 0 };
-        _ = self.api.XChangeProperty(self.display, self.window, self.atom_motif_hints, self.atom_motif_hints, 32, PROP_MODE_REPLACE, @as([*]const u8, @ptrCast(&hints)), 5);
-        _ = self.api.XFlush(self.display);
-    }
-
-    /// Forward a _NET_WM_MOVERESIZE client message to the root window.
-    /// `action` 8 moves; 0-7 resize per ResizeEdge ordinals (shared).
-    fn moveResize(self: *@This(), action: u32) void {
-        var ev = std.mem.zeroes(XEvent);
-        var msg = std.mem.zeroes(XClientMessageEvent);
-        msg.type = ClientMessage;
-        msg.display = self.display;
-        msg.window = self.window;
-        msg.message_type = self.atom_net_wm_moveresize;
-        msg.format = 32;
-        msg.data.l[0] = self.last_root_x;
-        msg.data.l[1] = self.last_root_y;
-        msg.data.l[2] = @intCast(action);
-        msg.data.l[3] = @intCast(self.last_button);
-        msg.data.l[4] = 1; // normal application source
-        @memcpy(std.mem.asBytes(&ev)[0..@sizeOf(XClientMessageEvent)], std.mem.asBytes(&msg));
-        // SubstructureNotify + SubstructureRedirect on the root window.
-        const mask: c_long = (1 << 19) | (1 << 20);
-        _ = self.api.XSendEvent(self.display, self.root, 0, mask, &ev);
-        _ = self.api.XFlush(self.display);
-    }
-
-    fn dragFn(ptr: *anyopaque) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.moveResize(8);
-    }
-
-    fn resizeFn(ptr: *anyopaque, edge: backend.ResizeEdge) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.moveResize(@backingInt(edge));
-    }
-
-    fn minimizeFn(ptr: *anyopaque) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        _ = self.api.XIconifyWindow(self.display, self.window, 0);
-        _ = self.api.XFlush(self.display);
-    }
-
-    /// Toggle maximized with the _NET_WM_STATE action=2 (toggle), so no
-    /// local state tracking can drift from the WM.
-    fn maximizeFn(ptr: *anyopaque) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        var ev = std.mem.zeroes(XEvent);
-        var msg = std.mem.zeroes(XClientMessageEvent);
-        msg.type = ClientMessage;
-        msg.display = self.display;
-        msg.window = self.window;
-        msg.message_type = self.atom_net_wm_state;
-        msg.format = 32;
-        msg.data.l[0] = 2; // _NET_WM_STATE_TOGGLE
-        msg.data.l[1] = @bitCast(self.atom_net_wm_maximized_vert);
-        msg.data.l[2] = @bitCast(self.atom_net_wm_maximized_horz);
-        @memcpy(std.mem.asBytes(&ev)[0..@sizeOf(XClientMessageEvent)], std.mem.asBytes(&msg));
-        const mask: c_long = (1 << 19) | (1 << 20);
-        _ = self.api.XSendEvent(self.display, self.root, 0, mask, &ev);
-        _ = self.api.XFlush(self.display);
-    }
-
-    fn setClipboardFn(ptr: *anyopaque, text: []const u8) bool {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        const n = @min(text.len, self.offered.len);
-        @memcpy(self.offered[0..n], text[0..n]);
-        self.offered_len = n;
-        _ = self.api.XSetSelectionOwner(self.display, self.atom_clipboard, self.window, CURRENT_TIME);
-        self.owning_selection = self.api.XGetSelectionOwner(self.display, self.atom_clipboard) == self.window;
+    pub fn set_clipboard(self: *X11Connection, text: []const u8) bool {
+        const copy = self.allocator.dupe(u8, text) catch return false;
+        if (self.clip_offer) |old| self.allocator.free(old);
+        self.clip_offer = copy;
+        _ = self.api.XSetSelectionOwner(self.display, self.atoms.clipboard, self.helper, proto.CURRENT_TIME);
+        self.owning_selection = self.api.XGetSelectionOwner(self.display, self.atoms.clipboard) == self.helper;
+        self.flush();
         return self.owning_selection;
     }
 
-    /// Answer a paste request for text we own. TARGETS advertises what we
-    /// serve; anything else is refused with property=None.
-    fn serveSelection(self: *@This(), req: XSelectionRequestEvent) void {
-        if (req.selection != self.atom_clipboard or !self.owning_selection) return;
-        var notify = std.mem.zeroes(XSelectionEvent);
-        notify.type = SelectionNotify;
+    /// Answers a paste request for text we own; anything else is refused.
+    fn serve_selection(self: *X11Connection, req: proto.XSelectionRequestEvent) void {
+        if (req.selection != self.atoms.clipboard or !self.owning_selection) return;
+        var notify = std.mem.zeroes(proto.XSelectionEvent);
+        notify.type = proto.SelectionNotify;
         notify.display = self.display;
         notify.requestor = req.requestor;
         notify.selection = req.selection;
         notify.target = req.target;
         notify.time = req.time;
-        if (req.target == self.atom_targets) {
-            const supported = [_]Atom{ self.atom_targets, self.atom_utf8_string, XA_STRING, self.atom_text };
-            _ = self.api.XChangeProperty(self.display, req.requestor, req.property, XA_ATOM, 32, PROP_MODE_REPLACE, @as([*]const u8, @ptrCast(&supported)), 4);
+        const text = self.clip_offer orelse "";
+        if (req.target == self.atoms.targets) {
+            const supported = [_]Atom{ self.atoms.targets, self.atoms.utf8_string, proto.XA_STRING, self.atoms.text };
+            _ = self.api.XChangeProperty(self.display, req.requestor, req.property, proto.XA_ATOM, 32, proto.PROP_MODE_REPLACE, @ptrCast(&supported), 4);
             notify.property = req.property;
-        } else if (req.target == self.atom_utf8_string or req.target == XA_STRING or req.target == self.atom_text) {
-            _ = self.api.XChangeProperty(self.display, req.requestor, req.property, req.target, 8, PROP_MODE_REPLACE, self.offered[0..self.offered_len].ptr, @intCast(self.offered_len));
+        } else if (req.target == self.atoms.utf8_string or req.target == proto.XA_STRING or req.target == self.atoms.text) {
+            _ = self.api.XChangeProperty(self.display, req.requestor, req.property, req.target, 8, proto.PROP_MODE_REPLACE, text.ptr, @intCast(text.len));
             notify.property = req.property;
         } else {
-            notify.property = 0; // None: refuse conversions we don't do
+            notify.property = 0;
         }
         var ev = std.mem.zeroes(XEvent);
-        @memcpy(std.mem.asBytes(&ev)[0..@sizeOf(XSelectionEvent)], std.mem.asBytes(&notify));
+        @memcpy(std.mem.asBytes(&ev)[0..@sizeOf(proto.XSelectionEvent)], std.mem.asBytes(&notify));
         _ = self.api.XSendEvent(self.display, req.requestor, 0, 0, &ev);
-        _ = self.api.XFlush(self.display);
+        self.flush();
     }
 
-    /// Monotonic milliseconds for paste deadlines.
-    fn nowMs() i64 {
-        var ts = std.mem.zeroes(std.os.linux.timespec);
-        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-        return ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000);
-    }
-
-    fn getClipboardFn(ptr: *anyopaque, out: []u8) usize {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (out.len == 0) return 0;
-        // Fast path: we own the selection, no round-trip needed.
-        if (self.owning_selection) {
-            const n = @min(self.offered_len, out.len);
-            @memcpy(out[0..n], self.offered[0..n]);
-            return n;
-        }
-        if (self.api.XGetSelectionOwner(self.display, self.atom_clipboard) == 0) return 0;
-        _ = self.api.XConvertSelection(self.display, self.atom_clipboard, self.atom_utf8_string, self.paste_prop, self.window, CURRENT_TIME);
-        _ = self.api.XFlush(self.display);
-
-        // Nested pump: serve our own requests, stash everything else raw
-        // for replay, stop at our SelectionNotify or a 500ms deadline.
-        const deadline = nowMs() + 500;
+    /// Requests the clipboard as UTF-8 and waits up to 500 ms for the reply.
+    pub fn get_clipboard(self: *X11Connection) ?[]const u8 {
+        if (self.owning_selection) return self.clip_offer;
+        if (self.api.XGetSelectionOwner(self.display, self.atoms.clipboard) == 0) return null;
+        _ = self.api.XConvertSelection(self.display, self.atoms.clipboard, self.atoms.utf8_string, self.atoms.paste, self.helper, proto.CURRENT_TIME);
+        self.flush();
+        const deadline = input.now_ms() + 500;
         var ev: XEvent = undefined;
-        while (nowMs() < deadline) {
-            const fd = self.api.XConnectionNumber(self.display);
-            var pfd = [1]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        while (input.now_ms() < deadline) {
+            var pfd = [1]std.posix.pollfd{.{ .fd = self.fd(), .events = std.posix.POLL.IN, .revents = 0 }};
             _ = std.posix.poll(&pfd, 25) catch 0;
             while (self.api.XPending(self.display) > 0) {
                 _ = self.api.XNextEvent(self.display, &ev);
-                if (ev.type == SelectionNotify) {
-                    var note: XSelectionEvent = undefined;
-                    @memcpy(std.mem.asBytes(&note), std.mem.asBytes(&ev)[0..@sizeOf(XSelectionEvent)]);
-                    if (note.selection != self.atom_clipboard or note.property == 0) return 0;
-                    return self.readPastedProperty(out);
-                } else if (ev.type == SelectionRequest) {
-                    var req: XSelectionRequestEvent = undefined;
-                    @memcpy(std.mem.asBytes(&req), std.mem.asBytes(&ev)[0..@sizeOf(XSelectionRequestEvent)]);
-                    self.serveSelection(req);
-                } else if (ev.type == SelectionClear) {
-                    self.owning_selection = false;
-                } else if (self.raw_stash_len < self.raw_stash.len) {
-                    @memcpy(&self.raw_stash[self.raw_stash_len], std.mem.asBytes(&ev));
-                    self.raw_stash_len += 1;
+                switch (ev.type) {
+                    proto.SelectionNotify => {
+                        const note = ev.xselection;
+                        if (note.selection != self.atoms.clipboard or note.property == 0) return null;
+                        return self.read_paste_property();
+                    },
+                    proto.SelectionRequest => self.serve_selection(ev.xselectionrequest),
+                    proto.SelectionClear => {
+                        self.owning_selection = false;
+                    },
+                    else => {
+                        if (self.stash_len < self.stash.len) {
+                            self.stash[self.stash_len] = ev;
+                            self.stash_len += 1;
+                        }
+                    },
                 }
             }
         }
-        return 0;
+        return null;
     }
 
-    /// Read the converted paste property the owner just wrote us. INCR
-    /// (chunked) transfers are refused by returning zero — our cap keeps
-    /// offers small and requestors fall back gracefully.
-    fn readPastedProperty(self: *@This(), out: []u8) usize {
+    fn read_paste_property(self: *X11Connection) ?[]const u8 {
         var actual_type: Atom = 0;
         var actual_format: c_int = 0;
         var nitems: c_ulong = 0;
-        var bytes_after: c_ulong = 0;
+        var after: c_ulong = 0;
         var prop: [*]u8 = undefined;
-        const want_longs: c_long = @intCast((out.len + 3) / 4);
-        const rc = self.api.XGetWindowProperty(self.display, self.window, self.paste_prop, 0, want_longs, 0, XA_ANY_PROPERTY_TYPE, &actual_type, &actual_format, &nitems, &bytes_after, &prop);
-        _ = self.api.XDeleteProperty(self.display, self.window, self.paste_prop);
-        if (rc != 0 or actual_format != 8) return 0;
-        // INCR atom signals chunked transfer, which we decline.
-        if (actual_type == self.atom_incr) {
-            _ = self.api.XFree(prop);
-            return 0;
-        }
-        const n = @min(@as(usize, @intCast(nitems)), out.len);
-        @memcpy(out[0..n], prop[0..n]);
-        _ = self.api.XFree(prop);
-        return n;
-    }
-
-    fn infoFn(ptr: *anyopaque) backend.WindowInfo {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .size = self.size,
-            .scale_factor = self.scale_factor,
-            .focused = self.focused,
-        };
-    }
-
-    fn presentFn(ptr: *anyopaque, scene: *const gpu.Scene, glyph_pixels: []const u8, image_pixels: []const u8) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        // §5G DPI: raster into the PHYSICAL framebuffer (logical scene in,
-        // physical pixels out). The window's reported scale drives the
-        // raster; glyph masks carry per-glyph density on the scene.
-        const w: u32 = self.physW();
-        const h: u32 = self.physH();
-
-        self.renderer.scale_factor = self.scale_factor;
-        // Default fashion dark background (theme.bg = #0e0e13)
-        self.renderer.render(self.pixels, w, h, .bgra32, gpu.vellz.Color.hex(0x0e0e13), scene, glyph_pixels, image_pixels) catch |err| {
-            zlog.log("x11", "vellz render failed: {s}", .{@errorName(err)});
-            return;
-        };
-
-        if (self.destroyed_by_server) return;
-        if (self.image) |img| {
-            _ = self.api.XPutImage(self.display, self.window, self.gc, img, 0, 0, 0, 0, w, h);
-            _ = self.api.XFlush(self.display);
-        }
-        self.presents += 1;
-        // Connection-level total: window-scoped presents aggregate upward
-        // (same policy as the null backend) so App diagnostics observe one
-        // counter.
-        if (self.parent) |parent| parent.presents += 1;
+        // Read up to 1 MiB of property data in one request.
+        const rc = self.api.XGetWindowProperty(self.display, self.helper, self.atoms.paste, 0, 256 * 1024, 1, proto.XA_ANY_PROPERTY_TYPE, &actual_type, &actual_format, &nitems, &after, &prop);
+        if (rc != 0 or actual_format != 8) return null;
+        defer _ = self.api.XFree(prop);
+        if (actual_type == self.atoms.incr) return null;
+        if (self.clip_read) |old| self.allocator.free(old);
+        self.clip_read = self.allocator.dupe(u8, prop[0..@intCast(nitems)]) catch null;
+        return self.clip_read;
     }
 };
 
-test "x11 availability and creation" {
-    if (!X11Backend.isAvailable()) return;
+pub const X11Window = struct {
+    base: platform.PlatformWindow = .{ .vtable = &vtable },
+    allocator: std.mem.Allocator,
+    conn: *X11Connection,
+    x_window: XWindow = 0,
+    /// Logical size; the OS window and buffers are `size * scale` physical pixels.
+    size: PxSize,
+    scale: f32,
+    /// XImage whose data is malloc'd (XDestroyImage frees it).
+    image: ?*proto.XImage = null,
+    image_w: u32 = 0,
+    image_h: u32 = 0,
+    frame_wanted: bool = false,
+    last_frame_ms: i64 = 0,
+    focused: bool = false,
+    destroyed_by_server: bool = false,
+    closed: bool = false,
+    atlas: atlas_mod.CpuAtlas,
+    renderer: cpu.CpuRenderer,
 
-    var b = X11Backend.init(std.testing.allocator, "ZUI X11 Test", 200, 150) catch |err| switch (err) {
-        error.CannotOpenDisplay => return,
-        else => return err,
+    const vtable: platform.PlatformWindow.VTable = .{
+        .bounds = bounds,
+        .content_size = contentSize,
+        .scale_factor = scaleFactor,
+        .request_frame = requestFrame,
+        .draw = draw,
+        .sprite_atlas = spriteAtlas,
+        .set_title = setTitle,
+        .minimize = minimize,
+        .zoom = zoom,
+        .toggle_fullscreen = toggleFullscreen,
+        .start_window_move = startWindowMove,
+        .resize = resize,
+        .close = close,
     };
-    defer b.deinit();
 
-    const handle = b.backendHandle();
-    try std.testing.expectEqual(backend.BackendKind.x11, handle.kind());
-    try std.testing.expectEqual(@as(f32, 200), handle.windowInfo().size.w);
-    try std.testing.expectEqual(@as(f32, 150), handle.windowInfo().size.h);
+    pub fn from(p: *platform.PlatformWindow) *X11Window {
+        return @fieldParentPtr("base", p);
+    }
 
-    var sc = gpu.Scene{};
-    _ = sc.push(.{ .x = 10, .y = 10, .w = 80, .h = 80, .color = gpu.vellz.Color.hex(0xFF0000) });
-    handle.present(&sc, &.{}, &.{});
-    try std.testing.expectEqual(@as(u32, 1), b.presents);
-}
+    /// Logical point from physical window coordinates.
+    fn logical(self: *const X11Window, x: c_int, y: c_int) PxPoint {
+        return .{ .x = @as(f32, @floatFromInt(x)) / self.scale, .y = @as(f32, @floatFromInt(y)) / self.scale };
+    }
 
-test "x11 wheel buttons map to scroll lines" {
-    try std.testing.expectEqual(@as(f32, 1), X11Backend.wheelScroll(4).?.dy);
-    try std.testing.expectEqual(@as(f32, -1), X11Backend.wheelScroll(5).?.dy);
-    try std.testing.expectEqual(@as(f32, -1), X11Backend.wheelScroll(6).?.dx);
-    try std.testing.expectEqual(@as(f32, 1), X11Backend.wheelScroll(7).?.dx);
-    try std.testing.expect(X11Backend.wheelScroll(1) == null);
-    try std.testing.expect(X11Backend.wheelScroll(8) == null);
-}
+    pub fn emit_key(self: *X11Window, name: []const u8, text: ?[]const u8, pressed: bool, held: bool) void {
+        const ks = input.make_keystroke(name, text, input.modifiers(self.conn.mods));
+        if (pressed) {
+            _ = self.base.emit_input(.{ .key_down = .{ .keystroke = ks, .is_held = held } });
+        } else {
+            _ = self.base.emit_input(.{ .key_up = .{ .keystroke = ks } });
+        }
+    }
 
-test "x11 cursor shapes use verified font glyphs" {
-    try std.testing.expectEqual(@as(c_uint, 68), X11Backend.cursorGlyph(.default));
-    try std.testing.expectEqual(@as(c_uint, 152), X11Backend.cursorGlyph(.text));
-    try std.testing.expectEqual(@as(c_uint, 60), X11Backend.cursorGlyph(.pointer));
-}
+    fn apply_cursor(self: *X11Window) void {
+        const conn = self.conn;
+        if (self.destroyed_by_server or self.closed) return;
+        const c = conn.cursor_for(conn.cursor_style);
+        _ = conn.api.XDefineCursor(conn.display, self.x_window, c);
+    }
 
-test "x11 selection protocol constants match X.h" {
-    try std.testing.expectEqual(@as(c_int, 29), SelectionClear);
-    try std.testing.expectEqual(@as(c_int, 30), SelectionRequest);
-    try std.testing.expectEqual(@as(c_int, 31), SelectionNotify);
-    try std.testing.expectEqual(@as(Atom, 1), XA_PRIMARY);
-    try std.testing.expectEqual(@as(Atom, 4), XA_ATOM);
-    try std.testing.expectEqual(@as(Atom, 31), XA_STRING);
-    try std.testing.expectEqual(@as(c_int, 0), PROP_MODE_REPLACE);
-}
+    fn on_configure(self: *X11Window, pw: u32, ph: u32) void {
+        const logical_w = @as(f32, @floatFromInt(pw)) / self.scale;
+        const logical_h = @as(f32, @floatFromInt(ph)) / self.scale;
+        if (logical_w == self.size.width and logical_h == self.size.height) return;
+        self.size = .{ .width = @round(logical_w), .height = @round(logical_h) };
+        self.base.emit_resize(self.size, self.scale);
+    }
 
-test "x11 multiwindow: two native windows with independent state and routing" {
-    if (!X11Backend.isAvailable()) return;
-    const t = std.testing;
-    var b = X11Backend.init(t.allocator, "ZUI X11 Multi", 240, 160) catch |err| switch (err) {
-        error.CannotOpenDisplay => return,
-        else => return err,
-    };
-    defer b.deinit();
-    const conn = b.backendHandle();
+    fn request_close(self: *X11Window) void {
+        if (self.closed) return;
+        if (self.base.emit_should_close()) self.base.emit_close();
+    }
 
-    // The init-created window becomes the first logical window (adopted in
-    // place); the second createWindow mints a fresh native window on the
-    // shared connection.
-    const w1 = try conn.createWindow(t.allocator, .{ .id = 7, .title = "One", .width = 200, .height = 120, .decorated = true });
-    const w2 = try conn.createWindow(t.allocator, .{ .id = 9, .title = "Two", .width = 300, .height = 180, .decorated = false });
+    fn physical(self: *const X11Window) struct { w: u32, h: u32 } {
+        return .{
+            .w = @intFromFloat(@max(1, @round(self.size.width * self.scale))),
+            .h = @intFromFloat(@max(1, @round(self.size.height * self.scale))),
+        };
+    }
 
-    try t.expect(w1.ptr == conn.ptr); // primary window handle is the connection struct
-    try t.expect(w2.ptr != conn.ptr);
-    try t.expectEqual(backend.BackendKind.x11, w1.kind());
-    try t.expectEqual(backend.BackendKind.x11, w2.kind());
-    try t.expectEqual(@as(u32, 7), b.window_id);
-    try t.expectEqual(@as(u32, 9), b.windows[0].?.window_id);
-    try t.expect(b.windows[0].?.display == b.display);
-    try t.expectEqual(@as(f32, 200), w1.windowInfo().size.w);
-    try t.expectEqual(@as(f32, 300), w2.windowInfo().size.w);
-    try t.expectEqual(@as(f32, 120), w1.windowInfo().size.h);
-    try t.expectEqual(@as(f32, 180), w2.windowInfo().size.h);
+    /// Makes sure the XImage matches the physical size, reallocating on change.
+    fn ensure_image(self: *X11Window, w: u32, h: u32) bool {
+        if (self.image != null and self.image_w == w and self.image_h == h) return true;
+        const conn = self.conn;
+        const a = &conn.api;
+        if (self.image) |img| {
+            _ = a.XDestroyImage(img); // frees the pixel buffer too
+            self.image = null;
+        }
+        const bytes = @as(usize, w) * h * 4;
+        const data: ?*anyopaque = std.c.malloc(bytes);
+        const px: [*]u8 = @ptrCast(data orelse return false);
+        const visual = a.XDefaultVisual(conn.display, conn.screen);
+        const depth = a.XDefaultDepth(conn.display, conn.screen);
+        const img = a.XCreateImage(conn.display, visual, @intCast(depth), proto.ZPixmap, 0, px, w, h, 32, @intCast(w * 4)) orelse {
+            std.c.free(data);
+            return false;
+        };
+        self.image = img;
+        self.image_w = w;
+        self.image_h = h;
+        return true;
+    }
 
-    // Per-window framebuffers: distinct pixel pools, independent presents.
-    var sc = gpu.Scene{};
-    _ = sc.push(.{ .x = 0, .y = 0, .w = 5, .h = 5, .color = gpu.vellz.Color.hex(0xFF0000) });
-    w1.present(&sc, &.{}, &.{});
-    try t.expectEqual(@as(u32, 1), b.presents);
-    try t.expectEqual(@as(u32, 0), b.windows[0].?.presents);
-    w2.present(&sc, &.{}, &.{});
-    try t.expectEqual(@as(u32, 2), b.presents);
-    try t.expectEqual(@as(u32, 1), b.windows[0].?.presents);
+    fn draw(p: *platform.PlatformWindow, scene: *const scene_mod.Scene) void {
+        const self = from(p);
+        if (self.closed or self.destroyed_by_server) return;
+        const dims = self.physical();
+        if (!self.ensure_image(dims.w, dims.h)) return;
+        const img = self.image.?;
+        const pixels = img.data.?[0 .. @as(usize, dims.w) * dims.h * 4];
+        const fb: cpu.Framebuffer = .{ .pixels = pixels, .width = dims.w, .height = dims.h, .stride = dims.w * 4, .format = .bgra8 };
+        self.renderer.draw(scene, &self.atlas, fb, clear_color);
+        const conn = self.conn;
+        const gc = conn.api.XDefaultGC(conn.display, conn.screen);
+        _ = conn.api.XPutImage(conn.display, self.x_window, gc, img, 0, 0, 0, 0, dims.w, dims.h);
+        conn.flush();
+    }
 
-    // Event routing by native window: a synthetic ConfigureNotify for w2
-    // emits exactly one targeted resize for window 9 and resizes only w2.
-    var q = event.EventQueue{};
-    var cfg = std.mem.zeroes(XEvent);
-    cfg.type = ConfigureNotify;
-    cfg.xconfigure.window = b.windows[0].?.window;
-    cfg.xconfigure.width = 333;
-    cfg.xconfigure.height = 222;
-    b.translateOne(cfg, &q);
-    try t.expectEqual(@as(usize, 1), q.len);
-    const routed = q.pop().?;
-    try t.expectEqual(@as(u32, 9), routed.targetWindowId().?);
-    try t.expectEqual(@as(f32, 333), w2.windowInfo().size.w);
-    try t.expectEqual(@as(f32, 200), w1.windowInfo().size.w);
+    fn bounds(p: *platform.PlatformWindow) PxBounds {
+        return .{ .origin = .{ .x = 0, .y = 0 }, .size = from(p).size };
+    }
+    fn contentSize(p: *platform.PlatformWindow) PxSize {
+        return from(p).size;
+    }
+    fn scaleFactor(p: *platform.PlatformWindow) f32 {
+        return from(p).scale;
+    }
+    fn requestFrame(p: *platform.PlatformWindow) void {
+        from(p).frame_wanted = true;
+    }
+    fn spriteAtlas(p: *platform.PlatformWindow) atlas_mod.PlatformAtlas {
+        return from(p).atlas.platform_atlas();
+    }
+    fn setTitle(p: *platform.PlatformWindow, title: []const u8) void {
+        const self = from(p);
+        var buf: [512]u8 = undefined;
+        const n = @min(title.len, buf.len - 1);
+        @memcpy(buf[0..n], title[0..n]);
+        buf[n] = 0;
+        const conn = self.conn;
+        _ = conn.api.XChangeProperty(conn.display, self.x_window, conn.atoms.net_wm_name, conn.atoms.utf8_string, 8, proto.PROP_MODE_REPLACE, &buf, @intCast(n));
+        _ = conn.api.XStoreName(conn.display, self.x_window, @ptrCast(&buf));
+        conn.flush();
+    }
+    fn minimize(p: *platform.PlatformWindow) void {
+        const self = from(p);
+        _ = self.conn.api.XIconifyWindow(self.conn.display, self.x_window, self.conn.screen);
+        self.conn.flush();
+    }
+    fn zoom(p: *platform.PlatformWindow) void {
+        from(p).send_state(2, from(p).conn.atoms.net_wm_state_maximized_vert, from(p).conn.atoms.net_wm_state_maximized_horz);
+    }
+    fn toggleFullscreen(p: *platform.PlatformWindow) void {
+        from(p).send_state(2, from(p).conn.atoms.net_wm_state_fullscreen, 0);
+    }
 
-    // Destroying w2 leaves w1 fully alive and frees the slot.
-    w2.destroyWindow();
-    try t.expect(b.windows[0] == null);
-    try t.expectEqual(@as(f32, 200), w1.windowInfo().size.w);
-    // The id can be reused by a later createWindow.
-    const w3 = try conn.createWindow(t.allocator, .{ .id = 9, .title = "Again", .width = 100, .height = 90, .decorated = true });
-    try t.expect(b.windows[0] != null);
-    try t.expectEqual(@as(u32, 9), b.windows[0].?.window_id);
-    w3.destroyWindow();
-    try t.expect(b.windows[0] == null);
-}
+    /// _NET_WM_STATE client message: action 2 toggles the given properties.
+    fn send_state(self: *X11Window, action: c_long, a1: Atom, a2: Atom) void {
+        const conn = self.conn;
+        var ev = std.mem.zeroes(XEvent);
+        ev.xclient = .{ .type = proto.ClientMessage, .serial = 0, .send_event = 1, .display = conn.display, .window = self.x_window, .message_type = conn.atoms.net_wm_state, .format = 32, .data = .{ .l = .{ action, @intCast(a1), @intCast(a2), 1, 0 } } };
+        _ = conn.api.XSendEvent(conn.display, conn.root, 0, proto.SubstructureRedirectMask | proto.SubstructureNotifyMask, &ev);
+        conn.flush();
+    }
 
-test "x11 repeated open/close cycles leave no ghost windows or leaks" {
-    if (!X11Backend.isAvailable()) return;
-    const t = std.testing;
-    var b = X11Backend.init(t.allocator, "ZUI X11 Cycle", 200, 150) catch |err| switch (err) {
-        error.CannotOpenDisplay => return,
-        else => return err,
-    };
-    defer b.deinit();
-    const conn = b.backendHandle();
+    fn startWindowMove(p: *platform.PlatformWindow) void {
+        const self = from(p);
+        const conn = self.conn;
+        var ev = std.mem.zeroes(XEvent);
+        // _NET_WM_MOVERESIZE with direction 8 (move) at the last press position.
+        ev.xclient = .{ .type = proto.ClientMessage, .serial = 0, .send_event = 1, .display = conn.display, .window = self.x_window, .message_type = conn.atoms.net_wm_moveresize, .format = 32, .data = .{ .l = .{ conn.press_root[0], conn.press_root[1], 8, 1, 1 } } };
+        _ = conn.api.XSendEvent(conn.display, conn.root, 0, proto.SubstructureRedirectMask | proto.SubstructureNotifyMask, &ev);
+        conn.flush();
+    }
 
-    // Cycle: adopt primary (id 1), mint a second (id 2), destroy the
-    // primary, mint a replacement on the same connection struct, destroy
-    // both. Each round-trip must free every native window it created.
-    const p1 = try conn.createWindow(t.allocator, .{ .id = 1, .title = "Cycle A", .width = 160, .height = 120, .decorated = true });
-    const c1 = try conn.createWindow(t.allocator, .{ .id = 2, .title = "Cycle B", .width = 120, .height = 90, .decorated = true });
-    try t.expect(b.windows[0] != null);
-    try t.expectEqual(@as(u32, 1), b.window_id); // primary adopted id 1
+    fn resize(p: *platform.PlatformWindow, size: PxSize) void {
+        const self = from(p);
+        const dims = @as(c_uint, @intFromFloat(@max(1, @round(size.width * self.scale))));
+        const dims_h = @as(c_uint, @intFromFloat(@max(1, @round(size.height * self.scale))));
+        _ = self.conn.api.XResizeWindow(self.conn.display, self.x_window, dims, dims_h);
+        self.conn.flush();
+    }
 
-    p1.destroyWindow(); // adopted primary: native window reaped in place
-    try t.expectEqual(@as(f32, 120), c1.windowInfo().size.w);
+    fn close(p: *platform.PlatformWindow) void {
+        from(p).close_now();
+    }
 
-    // The primary slot is spent after its first adoption: later windows are
-    // always fresh children (App renders each through its own handle, so
-    // the connection's own window fields are never presented again).
-    const p2 = try conn.createWindow(t.allocator, .{ .id = 3, .title = "Cycle C", .width = 100, .height = 80, .decorated = true });
-    try t.expect(p2.ptr != conn.ptr);
-    try t.expectEqual(@as(f32, 100), p2.windowInfo().size.w);
-    c1.destroyWindow();
-    p2.destroyWindow();
-    for (b.windows) |slot| try t.expect(slot == null);
-    try t.expect(b.destroyed_by_server); // adopted-primary destroy marked it
-}
-test "x11 external destroy surfaces close and skips native teardown" {
-    if (!X11Backend.isAvailable()) return;
-    const t = std.testing;
-    var b = X11Backend.init(t.allocator, "ZUI X11 Ext", 200, 150) catch |err| switch (err) {
-        error.CannotOpenDisplay => return,
-        else => return err,
-    };
-    defer b.deinit();
-    const conn = b.backendHandle();
-    // First createWindow adopts the primary init-created window.
-    const w2 = try conn.createWindow(t.allocator, .{ .id = 5, .title = "Victim", .width = 120, .height = 90, .decorated = true });
-    const victim: *X11Backend = @ptrCast(@alignCast(w2.ptr));
-    try t.expectEqual(@as(u32, 5), victim.window_id);
+    /// Marks the window closed and destroys its X window. Memory is freed by
+    /// `X11Connection.reap`, so callers inside an event may still touch it.
+    pub fn close_now(self: *X11Window) void {
+        if (self.closed) return;
+        self.closed = true;
+        self.frame_wanted = false;
+        if (!self.destroyed_by_server) {
+            _ = self.conn.api.XDestroyWindow(self.conn.display, self.x_window);
+        }
+        self.conn.flush();
+    }
 
-    // Simulate the server destroying the window behind our back (external
-    // XDestroyWindow): DestroyNotify must (1) mark the handle dead, (2)
-    // emit a targeted close for the app, and (3) make present a no-op so
-    // no X_PutImage reaches the dead drawable.
-    var q = event.EventQueue{};
-    var dn = std.mem.zeroes(XEvent);
-    dn.type = DestroyNotify;
-    dn.xany.window = victim.window;
-    b.translateOne(dn, &q);
-    try t.expectEqual(@as(usize, 1), q.len);
-    const closed = q.pop().?;
-    try t.expectEqual(@as(u32, 5), closed.targetWindowId().?);
-    try t.expect(closed.untargeted() == .window and closed.untargeted().window == .close_requested);
-    try t.expect(victim.destroyed_by_server);
-    // Presenting to the dead drawable must be a silent no-op (no crash,
-    // no counter): the guard runs before any X request is queued.
-    var sc = gpu.Scene{};
-    _ = sc.push(.{ .x = 0, .y = 0, .w = 4, .h = 4, .color = gpu.vellz.Color.hex(0x00FF00) });
-    w2.present(&sc, &.{}, &.{});
-    try t.expectEqual(@as(u32, 0), victim.presents);
+    /// Frees a closed window. Called only from `X11Connection.reap`.
+    pub fn free(self: *X11Window) void {
+        if (!self.closed) self.close_now();
+        if (self.image) |img| {
+            _ = self.conn.api.XDestroyImage(img);
+            self.image = null;
+        }
+        self.atlas.deinit();
+        self.renderer.deinit();
+        self.allocator.destroy(self);
+    }
+};
 
-    // Reaping through destroyWindow must NOT call XDestroyWindow again
-    // (would be an async BadWindow); the adopted primary handle survives
-    // (it is the connection struct itself) with the flag still set.
-    w2.destroyWindow();
-    try t.expect(victim.destroyed_by_server);
+test "x11 cursor styles use cursorfont glyphs" {
+    try std.testing.expectEqual(proto.XC_left_ptr, X11Connection.cursor_glyph(.arrow));
+    try std.testing.expectEqual(proto.XC_xterm, X11Connection.cursor_glyph(.i_beam));
+    try std.testing.expectEqual(proto.XC_hand2, X11Connection.cursor_glyph(.pointing_hand));
 }
