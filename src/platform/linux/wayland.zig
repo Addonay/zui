@@ -69,7 +69,8 @@ const Repeat = struct {
 
 /// One axis of pending wheel input, flushed once per pointer frame.
 const Axis = struct {
-    value: i32 = 0,
+    /// Continuous delta in logical pixels (decoded from wl_fixed).
+    value: f32 = 0,
     discrete: i32 = 0,
     v120: i32 = 0,
 };
@@ -94,7 +95,6 @@ pub const WaylandConnection = struct {
     dec_manager: ?*proto.DecorationManager = null,
     viewporter: ?*anyopaque = null,
     frac_manager: ?*anyopaque = null,
-    output_listener_lib: bool = false,
     outputs: [max_outputs]Output = @splat(.{}),
     output_count: usize = 0,
     displays_: [max_outputs]Display = undefined,
@@ -365,7 +365,7 @@ pub const WaylandConnection = struct {
         try self.windows.ensureUnusedCapacity(self.allocator, 1);
         const w = try self.allocator.create(WaylandWindow);
         const bounds: PxBounds = if (options.window_bounds) |wb| wb.get_bounds() else .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1280, .height = 800 } };
-        const scale = input.env_scale();
+        const scale = input.env_scale() orelse self.max_output_scale();
         w.* = .{
             .allocator = self.allocator,
             .conn = self,
@@ -384,6 +384,14 @@ pub const WaylandConnection = struct {
         self.windows.appendAssumeCapacity(w);
         self.flush();
         return w;
+    }
+
+    /// Largest advertised output scale; windows start at this integer scale
+    /// until fractional-scale-v1 reports the preferred one.
+    fn max_output_scale(self: *const WaylandConnection) f32 {
+        var best: i32 = 1;
+        for (self.outputs[0..self.output_count]) |out| best = @max(best, out.scale);
+        return @floatFromInt(best);
     }
 
     fn find_window(self: *WaylandConnection, surface: *proto.Surface) ?*WaylandWindow {
@@ -536,7 +544,7 @@ pub const WaylandConnection = struct {
         else if (axis.discrete != 0)
             @floatFromInt(axis.discrete)
         else
-            @as(f32, @floatFromInt(axis.value)) / 10.0;
+            axis.value / 10.0;
         if (vertical) lines = -lines;
         return lines;
     }
@@ -790,7 +798,8 @@ fn pointerButton(data: ?*anyopaque, _: *proto.Pointer, serial: u32, _: u32, code
 
 fn pointerAxis(data: ?*anyopaque, _: *proto.Pointer, _: u32, axis: u32, value: i32) callconv(.c) void {
     const self = pointerConn(data);
-    if (axis == 0) self.axis_v.value = value else self.axis_h.value = value;
+    const px = proto.wlFixedToFloat(value);
+    if (axis == 0) self.axis_v.value = px else self.axis_h.value = px;
 }
 
 fn pointerAxisDiscrete(data: ?*anyopaque, _: *proto.Pointer, axis: u32, discrete: i32) callconv(.c) void {

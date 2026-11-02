@@ -699,13 +699,20 @@ fn update_runs_after_middle_truncation(
 const testing = std.testing;
 const TEST_COLOR: @import("../color.zig").Hsla = .{ .h = 0, .s = 0, .l = 0, .a = 1 };
 
-fn fake_width(_: *anyopaque, _: u32, _: Pixels, _: u21) Pixels {
-    return 10.0;
+/// Every character advances `width` pixels (the context is a `*const Pixels`).
+fn fake_width(ctx: *anyopaque, _: u32, _: Pixels, _: u21) Pixels {
+    const w: *const Pixels = @ptrCast(@alignCast(ctx));
+    return w.*;
 }
 
-fn test_wrapper(cw: *CharWidthCache) LineWrapper {
-    var dummy: u8 = 0;
-    return LineWrapper.init(testing.allocator, 0, 16.0, .{ .ctx = &dummy, .width_fn = fake_width }, cw);
+fn test_wrapper(cw: *CharWidthCache, char_width: *const Pixels) LineWrapper {
+    return LineWrapper.init(testing.allocator, 0, 16.0, .{ .ctx = @constCast(char_width), .width_fn = fake_width }, cw);
+}
+
+/// Runs of the given byte lengths, all with the same style.
+fn runs_of(buf: []TextRun, lens: []const usize) []TextRun {
+    for (lens, 0..) |len, i| buf[i] = .{ .len = len, .font = .{}, .color = TEST_COLOR };
+    return buf[0..lens.len];
 }
 
 fn collect(it: *WrapIter, out: []Boundary) []Boundary {
@@ -717,7 +724,8 @@ fn collect(it: *WrapIter, out: []Boundary) []Boundary {
 test "wrap_line breaks at word boundaries" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
-    var w = test_wrapper(&cw);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
     defer w.deinit();
     var buf: [16]Boundary = undefined;
 
@@ -737,7 +745,8 @@ test "wrap_line breaks at word boundaries" {
 test "wrap_line with no indent drops continuation indentation" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
-    var w = test_wrapper(&cw);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
     defer w.deinit();
     var buf: [16]Boundary = undefined;
     // 12 columns at 10px in a 72px line: one break after 7 columns, and the rest fits.
@@ -748,7 +757,8 @@ test "wrap_line with no indent drops continuation indentation" {
 test "wrap_line keeps elements attached to adjacent words" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
-    var w = test_wrapper(&cw);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
     defer w.deinit();
     var buf: [16]Boundary = undefined;
     // A 20px element between "ab" and "cd" is one unbreakable unit with them.
@@ -766,7 +776,8 @@ test "wrap_line keeps elements attached to adjacent words" {
 test "wrap_line never splits a grapheme cluster" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
-    var w = test_wrapper(&cw);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
     defer w.deinit();
     var buf: [16]Boundary = undefined;
     // "e" + combining acute accent is one grapheme; every wrap must land on a grapheme start.
@@ -786,7 +797,8 @@ test "wrap_line never splits a grapheme cluster" {
 test "should_truncate_line end and start" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
-    var w = test_wrapper(&cw);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
     defer w.deinit();
     // "…" is one 10px character. End: "abc" overflows at 'd' (40px > 35px), keeping "ab" (index 2).
     try testing.expectEqual(@as(?usize, 2), w.should_truncate_line("abcdef", 35, "…", .end));
@@ -798,7 +810,8 @@ test "should_truncate_line end and start" {
 test "truncate_line end replaces the tail with the affix" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
-    var w = test_wrapper(&cw);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
     defer w.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -814,7 +827,8 @@ test "truncate_line end replaces the tail with the affix" {
 test "truncate_line leaves short text borrowed" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
-    var w = test_wrapper(&cw);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
     defer w.deinit();
     var runs = [_]TextRun{.{ .len = 3, .font = .{}, .color = TEST_COLOR }};
     const t = try w.truncate_line(testing.allocator, "abc", 100, "...", &runs, .end);
@@ -825,7 +839,8 @@ test "truncate_line leaves short text borrowed" {
 test "truncate_line start keeps the tail" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
-    var w = test_wrapper(&cw);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
     defer w.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -838,7 +853,8 @@ test "truncate_line start keeps the tail" {
 test "truncate_line middle keeps both ends" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
-    var w = test_wrapper(&cw);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
     defer w.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -856,7 +872,8 @@ test "truncate_line middle keeps both ends" {
 test "truncate_wrapped_line stops at max_lines and appends the affix" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
-    var w = test_wrapper(&cw);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
     defer w.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -870,9 +887,80 @@ test "truncate_wrapped_line stops at max_lines and appends the affix" {
 test "truncate_wrapped_line without overflow returns the input" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
-    var w = test_wrapper(&cw);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
     defer w.deinit();
     var runs = [_]TextRun{.{ .len = 5, .font = .{}, .color = TEST_COLOR }};
     const t = try w.truncate_wrapped_line(testing.allocator, "ab cd", 200, 3, "...", &runs, .end);
     try testing.expect(!t.changed);
+}
+
+test "truncate_line end across several runs keeps each run's share of the text" {
+    var cw: CharWidthCache = .{};
+    defer cw.deinit(testing.allocator);
+    // ZedMono at 16px advances 9.6px per character, as in GPUI's calibration.
+    const cell: Pixels = 9.6;
+    var w = test_wrapper(&cw, &cell);
+    defer w.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { lens: []const usize, expected: []const u8, result_lens: []const usize, width: Pixels }{
+        .{ .lens = &.{12}, .expected = "abcd…", .result_lens = &.{7}, .width = 50 },
+        .{ .lens = &.{ 4, 4, 4 }, .expected = "abcdef…", .result_lens = &.{ 4, 5 }, .width = 70 },
+        .{ .lens = &.{ 4, 4, 4 }, .expected = "abcdefgh…", .result_lens = &.{ 4, 4, 3 }, .width = 90 },
+    };
+    for (cases) |c| {
+        var buf: [8]TextRun = undefined;
+        const runs = runs_of(&buf, c.lens);
+        const t = try w.truncate_line(arena.allocator(), "abcdefghijkl", c.width, "…", runs, .end);
+        try testing.expectEqualStrings(c.expected, t.text);
+        try testing.expectEqual(c.result_lens.len, t.runs.len);
+        for (t.runs, c.result_lens) |run, want| try testing.expectEqual(want, run.len);
+    }
+}
+
+test "update_runs_after_truncation trims runs to the result length" {
+    const cases = [_]struct { result: []const u8, lens: []const usize, expected: []const usize }{
+        .{ .result = "abcd…", .lens = &.{12}, .expected = &.{7} },
+        .{ .result = "abcdef…", .lens = &.{ 4, 4, 4 }, .expected = &.{ 4, 5 } },
+        .{ .result = "abcdefgh…", .lens = &.{ 4, 4, 4 }, .expected = &.{ 4, 4, 3 } },
+    };
+    for (cases) |c| {
+        var buf: [8]TextRun = undefined;
+        const runs = runs_of(&buf, c.lens);
+        // The end case returns a prefix of `runs`, so nothing is allocated.
+        const out = try update_runs_after_truncation(testing.allocator, c.result, "…", runs, .end);
+        try testing.expectEqual(c.expected.len, out.len);
+        for (out, c.expected) |run, want| try testing.expectEqual(want, run.len);
+    }
+}
+
+test "wrap_line with extra columns keeps a fitting indent and drops an overflowing one" {
+    var cw: CharWidthCache = .{};
+    defer cw.deinit(testing.allocator);
+    const cell: Pixels = 9.6;
+    var w = test_wrapper(&cw, &cell);
+    defer w.deinit();
+    var buf: [16]Boundary = undefined;
+    // 6 base columns plus 8 extra overflow a 10-column line, so the indent falls back to 0.
+    var it = try w.wrap_line(&.{LineFragment.text_fragment("      ab cd ef gh")}, cell * 10, .{ .extra_columns = 8 });
+    try testing.expectEqualSlices(Boundary, &.{Boundary.new(9, 0)}, collect(&it, &buf));
+}
+
+test "multiline truncation fits within the requested wrapped lines" {
+    var cw: CharWidthCache = .{};
+    defer cw.deinit(testing.allocator);
+    const cell: Pixels = 9.6;
+    var w = test_wrapper(&cw, &cell);
+    defer w.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const text = "aa bbbbbb cccccc dddddd eeee ffff";
+    var buf: [4]TextRun = undefined;
+    const runs = runs_of(&buf, &.{text.len});
+    const t = try w.truncate_wrapped_line(arena.allocator(), text, 72, 2, "\u{2026}", runs, .end);
+    try testing.expect(t.changed);
+    var wrap_buf: [16]Boundary = undefined;
+    var it = try w.wrap_line(&.{LineFragment.text_fragment(t.text)}, 72, .same_indent);
+    try testing.expect(collect(&it, &wrap_buf).len < 2);
 }

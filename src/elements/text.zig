@@ -139,8 +139,8 @@ pub const TextLayout = struct {
     }
 
     /// Records the bounds the text was given (GPUI `prepaint`).
-    pub fn prepaint(self: TextLayout, bounds: Bounds(Pixels)) void {
-        self.state.bounds = bounds;
+    pub fn prepaint(self: TextLayout, b: Bounds(Pixels)) void {
+        self.state.bounds = b;
     }
 
     /// Paints backgrounds and glyphs.
@@ -163,16 +163,16 @@ pub const TextLayout = struct {
 
     fn paint_lines(self: TextLayout, pass: Pass, window: *Window, cx: *App) void {
         const st = self.state;
-        const bounds = st.bounds orelse return;
+        const b = st.bounds orelse return;
         const lh = st.line_height;
-        var line_origin = bounds.origin;
+        var line_origin = b.origin;
         const text_align = window.text_style().text_align;
         for (st.lines) |line| {
             if (pass != .foreground) {
-                line.paint_background(line_origin, lh, text_align, bounds.size.width, window, cx) catch {};
+                line.paint_background(line_origin, lh, text_align, b.size.width, window, cx) catch {};
             }
             if (pass != .background) {
-                line.paint(line_origin, lh, text_align, bounds.size.width, window, cx) catch {};
+                line.paint(line_origin, lh, text_align, b.size.width, window, cx) catch {};
             }
             line_origin.y += line.size(lh).height;
         }
@@ -181,11 +181,11 @@ pub const TextLayout = struct {
     /// The byte index of the character at `position` (relative to the window), or the nearest one.
     pub fn index_for_position(self: TextLayout, position: Point(Pixels)) IndexResult {
         const st = self.state;
-        const bounds = st.bounds orelse return .{ .err = 0 };
-        if (position.y < bounds.origin.y) return .{ .err = 0 };
+        const b = st.bounds orelse return .{ .err = 0 };
+        if (position.y < b.origin.y) return .{ .err = 0 };
 
         const lh = st.line_height;
-        var line_origin = bounds.origin;
+        var line_origin = b.origin;
         var line_start_ix: usize = 0;
         for (st.lines) |line| {
             const line_bottom = line_origin.y + line.size(lh).height;
@@ -206,9 +206,9 @@ pub const TextLayout = struct {
     /// The window position of the character at byte `index`, or null when it is out of range.
     pub fn position_for_index(self: TextLayout, index: usize) ?Point(Pixels) {
         const st = self.state;
-        const bounds = st.bounds orelse return null;
+        const b = st.bounds orelse return null;
         const lh = st.line_height;
-        var line_origin = bounds.origin;
+        var line_origin = b.origin;
         var line_start_ix: usize = 0;
         for (st.lines) |line| {
             const line_end_ix = line_start_ix + line.len();
@@ -249,7 +249,7 @@ pub const TextLayout = struct {
     }
 
     /// The bounds the text was painted into (valid after prepaint).
-    pub fn bounds_of(self: TextLayout) ?Bounds(Pixels) {
+    pub fn bounds(self: TextLayout) ?Bounds(Pixels) {
         return self.state.bounds;
     }
 

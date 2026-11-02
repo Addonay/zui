@@ -526,7 +526,8 @@ pub const WaylandApi = struct {
     wl_display_get_fd: *const fn (*Display) callconv(.c) c_int,
     wl_display_get_error: *const fn (*Display) callconv(.c) c_int,
     wl_display_get_protocol_error: *const fn (*Display, ?*?*const Interface, ?*u32) callconv(.c) u32,
-    wl_proxy_get_interface: *const fn (*anyopaque) callconv(.c) ?*const Interface,
+    /// Debug-only; absent from some libwayland builds (1.22 exports wl_proxy_get_class instead).
+    wl_proxy_get_interface: ?*const fn (*anyopaque) callconv(.c) ?*const Interface = null,
     /// Socket-drain trio for the non-blocking event loop. Long-stable
     /// libwayland API, but loaded optionally so ancient clients still
     /// start (without them pings starve — see drainEvents).
@@ -560,7 +561,7 @@ pub const WaylandApi = struct {
             .wl_display_get_fd = lib.lookup(*const fn (*Display) callconv(.c) c_int, "wl_display_get_fd") orelse return null,
             .wl_display_get_error = lib.lookup(*const fn (*Display) callconv(.c) c_int, "wl_display_get_error") orelse return null,
             .wl_display_get_protocol_error = lib.lookup(*const fn (*Display, ?*?*const Interface, ?*u32) callconv(.c) u32, "wl_display_get_protocol_error") orelse return null,
-            .wl_proxy_get_interface = lib.lookup(*const fn (*anyopaque) callconv(.c) ?*const Interface, "wl_proxy_get_interface") orelse return null,
+            .wl_proxy_get_interface = lib.lookup(*const fn (*anyopaque) callconv(.c) ?*const Interface, "wl_proxy_get_interface"),
             .wl_display_prepare_read = lib.lookup(*const fn (*Display) callconv(.c) c_int, "wl_display_prepare_read"),
             .wl_display_read_events = lib.lookup(*const fn (*Display) callconv(.c) c_int, "wl_display_read_events"),
             .wl_display_cancel_read = lib.lookup(*const fn (*Display) callconv(.c) void, "wl_display_cancel_read"),

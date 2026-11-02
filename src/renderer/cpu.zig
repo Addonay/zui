@@ -80,10 +80,6 @@ inline fn x_lanes(x0: usize) F4 {
     return s4(@floatFromInt(x0)) + lane_offsets;
 }
 
-inline fn pow_v(x: F4, p: f32) F4 {
-    return @exp(s4(p) * @log(x));
-}
-
 /// Port of get_gamma_correction_ratios from gpui/src/platform.rs for gamma values 1.0..2.2.
 fn gamma_correction_ratios(gamma: f64) [4]f32 {
     const table = [13][4]f64{
@@ -166,12 +162,34 @@ fn linear_srgb_to_oklab(c: [4]f32) [4]f32 {
     };
 }
 
-/// `srgb_to_linear` applied to the rgb lanes of a vector of pixels.
+fn srgb_to_linear_scalar(v: f32) f32 {
+    if (v < 0.04045) return v / 12.92;
+    return std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
+}
+
+const srgb_lut_size = 4096;
+/// `srgb_to_linear` sampled on a uniform grid; linear interpolation error is below 1e-7.
+const srgb_lut: [srgb_lut_size + 1]f32 = blk: {
+    @setEvalBranchQuota(10_000_000);
+    var table: [srgb_lut_size + 1]f32 = undefined;
+    for (0..srgb_lut_size + 1) |i| {
+        table[i] = srgb_to_linear_scalar(@as(f32, @floatFromInt(i)) / srgb_lut_size);
+    }
+    break :blk table;
+};
+
+/// `srgb_to_linear` for the lanes of a vector of pixels (values outside [0, 1] are clamped).
 fn srgb_to_linear4(v: F4) F4 {
-    const cutoff = v < s4(0.04045);
-    const higher = pow_v((v + s4(0.055)) / s4(1.055), 2.4);
-    const lower = v / s4(12.92);
-    return @select(f32, cutoff, lower, higher);
+    const x: [4]f32 = @min(@max(v, zero4), one4) * s4(srgb_lut_size);
+    var out: [4]f32 = undefined;
+    for (0..4) |i| {
+        const f = @min(x[i], srgb_lut_size - 1);
+        const base = @floor(f);
+        const idx: usize = @intFromFloat(base);
+        const frac = f - base;
+        out[i] = srgb_lut[idx] + (srgb_lut[idx + 1] - srgb_lut[idx]) * frac;
+    }
+    return out;
 }
 
 /// `oklab_to_linear_srgb` on channel vectors (`ch[3]` is alpha and passes through).

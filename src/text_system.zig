@@ -202,7 +202,7 @@ const RasterKey = struct {
     }
 };
 
-const WidthKey = struct { fid: FontId, size_bits: u32 };
+const WidthKey = struct { font_id: FontId, size_bits: u32 };
 
 /// Pending glyph raster job handed to the atlas through a `TileBuilder`.
 const TileJob = struct {
@@ -565,6 +565,7 @@ pub const TextSystem = struct {
 
     /// Shapes `text` as one line, styled by `runs` (GPUI `shape_line`). `text` must not contain newlines.
     pub fn shape_line(self: *TextSystem, text: []const u8, font_size: Pixels, runs: []const TextRun, force_width: ?Pixels) !ShapedLine {
+        std.debug.assert(std.mem.indexOfScalar(u8, text, '\n') == null);
         const arena = window_mod.frame_arena();
         var decorations: std.ArrayList(DecorationRun) = .empty;
         for (runs) |run| {
@@ -1124,6 +1125,72 @@ test "atlas key depends on every render parameter" {
     var emoji = base;
     emoji.is_emoji = true;
     try testing.expectEqual(atlas.AtlasTextureKind.polychrome, emoji.atlas_key().glyph.texture_kind);
+}
+
+test "no-font layout is zero width with font-derived metrics" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    const f = font(".SystemUIFont");
+    const id = try ts.font_id(&f);
+    const runs = [_]FontRun{.{ .len = 3, .font_id = id }};
+    var l = try ts.empty_layout(testing.allocator, 16, "abc", &runs);
+    defer l.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), l.len);
+    try testing.expectEqual(@as(f32, 0), l.width);
+    try testing.expect(l.ascent > 0);
+}
+
+test "glyphs shape and rasterize with a real font" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    if (!ts.fs.hasShaper() or ts.swash == null or ts.fs.fontIds().len == 0) return error.SkipZigTest;
+
+    const f = font(".SystemUIFont");
+    const id = try ts.font_id(&f);
+    const runs = [_]FontRun{.{ .len = 1, .font_id = id }};
+    const layout = try ts.layout_line("H", 16, &runs, null);
+    try testing.expect(layout.width > 0);
+    const glyph = layout.runs[0].glyphs[0];
+    var params: RenderGlyphParams = .{
+        .font_id = layout.runs[0].font_id,
+        .glyph_id = glyph.id,
+        .font_size = 16,
+        .subpixel_variant = .{ .x = 0, .y = 0 },
+        .scale_factor = 1,
+        .is_emoji = false,
+    };
+    const rb = try ts.raster_bounds(&params);
+    try testing.expect(rb.size.width > 0 and rb.size.height > 0);
+    // Cached: a second query returns the same bounds.
+    try testing.expectEqual(rb, try ts.raster_bounds(&params));
+
+    const raster = try ts.rasterize_glyph(&params);
+    try testing.expectEqual(@as(usize, @intCast(rb.size.width * rb.size.height)), raster.bytes.len);
+    var any_ink = false;
+    for (raster.bytes) |b| any_ink = any_ink or b != 0;
+    try testing.expect(any_ink);
+
+    // The atlas path builds the same bytes.
+    var builder = ts.tile_builder(&params);
+    const tile = (try builder.build()).?;
+    try testing.expectEqual(raster.size, tile.size);
+    try testing.expectEqualSlices(u8, raster.bytes, tile.bytes);
+}
+
+test "shape_text wraps long text at the given width" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    if (!ts.fs.hasShaper() or ts.fs.fontIds().len == 0) return error.SkipZigTest;
+    const f = font(".SystemUIFont");
+    const text = "alpha beta gamma delta epsilon zeta eta theta";
+    const runs = [_]TextRun{.{ .len = text.len, .font = f, .color = .{ .h = 0, .s = 0, .l = 0, .a = 1 } }};
+    const lines = try ts.shape_text(text, 16, &runs, 80, null);
+    try testing.expectEqual(@as(usize, 1), lines.len);
+    try testing.expect(lines[0].wrap_count() > 1);
+    const unwrapped = try ts.shape_text(text, 16, &runs, null, null);
+    try testing.expectEqual(@as(usize, 1), unwrapped[0].wrap_count());
+    try testing.expect(unwrapped[0].size(20).width > 80);
+    ts.finish_frame();
 }
 
 test "underline offset sits below the baseline" {

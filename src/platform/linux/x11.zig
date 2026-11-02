@@ -134,14 +134,9 @@ pub const X11Connection = struct {
             .root = root,
             .helper = helper,
             .atoms = atoms,
-            .scale = if (hasEnvScale()) input.env_scale() else xftScale(api, dpy),
+            .scale = input.env_scale() orelse xftScale(api, dpy),
         };
-        _ = api.XSelectInput(dpy, helper, 0);
         return self;
-    }
-
-    fn hasEnvScale() bool {
-        return std.c.getenv("ZUI_SCALE") != null or std.c.getenv("GDK_SCALE") != null;
     }
 
     /// Scale from the Xft.dpi resource (96 dpi is 1x). Falls back to 1.
@@ -492,13 +487,20 @@ pub const X11Connection = struct {
         var text_buf: [64]u8 = undefined;
         var text_len: usize = 0;
         if (pressed) {
-            // XLookupString yields Latin-1; encode each byte as UTF-8.
+            // Like xkb's utf8 query, the keysym's text ignores Control, so
+            // ctrl-a types "a" (GPUI behavior). Fall back to XLookupString's
+            // Latin-1 bytes for keysyms without a direct text form.
             var tmp: [4]u8 = undefined;
-            for (buf[0..@min(n, buf.len)]) |byte| {
-                const enc = input.latin1_to_utf8(byte, &tmp);
-                if (text_len + enc.len > text_buf.len) break;
-                @memcpy(text_buf[text_len..][0..enc.len], enc);
-                text_len += enc.len;
+            if (input.utf8_for_keysym(@intCast(keysym), &tmp)) |t| {
+                @memcpy(text_buf[0..t.len], t);
+                text_len = t.len;
+            } else {
+                for (buf[0..@min(n, buf.len)]) |byte| {
+                    const enc = input.latin1_to_utf8(byte, &tmp);
+                    if (text_len + enc.len > text_buf.len) break;
+                    @memcpy(text_buf[text_len..][0..enc.len], enc);
+                    text_len += enc.len;
+                }
             }
         }
         const text: ?[]const u8 = if (text_len > 0) text_buf[0..text_len] else null;

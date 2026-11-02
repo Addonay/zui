@@ -1210,6 +1210,7 @@ pub const Window = struct {
         self.next_frame.window_active = self.active;
 
         std.mem.swap(Frame, &self.rendered_frame, &self.next_frame);
+        self.text_system().finish_frame();
         std.mem.swap(std.AutoHashMapUnmanaged(EntityId, void), &self.rendered_entities, &self.next_rendered_entities);
         self.gc_element_states();
         self.hit_test(self.mouse_position_);

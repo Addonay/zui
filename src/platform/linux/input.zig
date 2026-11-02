@@ -314,15 +314,15 @@ test "click tracker counts repeated presses" {
     try std.testing.expectEqual(@as(usize, 1), t.press(.right, p));
 }
 
-/// Device scale from ZUI_SCALE, then GDK_SCALE, else 1.
-pub fn env_scale() f32 {
+/// Device scale forced by ZUI_SCALE, then GDK_SCALE. Null when neither is set.
+pub fn env_scale() ?f32 {
     if (std.c.getenv("ZUI_SCALE")) |v| {
-        const f = std.fmt.parseFloat(f32, std.mem.span(v)) catch return 1;
+        const f = std.fmt.parseFloat(f32, std.mem.span(v)) catch return null;
         if (f >= 0.25 and f <= 8) return f;
     }
     if (std.c.getenv("GDK_SCALE")) |v| {
-        const i = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return 1;
+        const i = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return null;
         if (i >= 1 and i <= 8) return @floatFromInt(i);
     }
-    return 1;
+    return null;
 }

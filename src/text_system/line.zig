@@ -184,6 +184,7 @@ const PaintArgs = struct {
 };
 
 const UnderlineRun = struct { origin: Point(Pixels), style: UnderlineStyle };
+const BackgroundRun = struct { origin: Point(Pixels), color: Hsla };
 const StrikethroughRun = struct { origin: Point(Pixels), style: StrikethroughStyle };
 
 fn paint_line(
@@ -411,7 +412,7 @@ fn paint_backgrounds(args: *PaintArgs, window: *Window, cx: *App) void {
     var decorations: DecorationIter = .{ .runs = args.decoration_runs };
     var wraps: WrapIter = .{ .boundaries = args.wrap_boundaries };
     var run_end: usize = 0;
-    var current_background: ?struct { origin: Point(Pixels), color: Hsla } = null;
+    var current_background: ?BackgroundRun = null;
 
     const width_for_align = args.align_width orelse layout.width;
     var glyph_origin: Point(Pixels) = .{
@@ -446,7 +447,7 @@ fn paint_backgrounds(args: *PaintArgs, window: *Window, cx: *App) void {
             }
             prev_glyph_position = glyph.position;
 
-            var finished_background: ?struct { origin: Point(Pixels), color: Hsla } = null;
+            var finished_background: ?BackgroundRun = null;
             if (glyph.index >= run_end) {
                 var style_run = decorations.next();
                 while (style_run) |sr| {
