@@ -8,8 +8,8 @@
     .fingerprint = 0xc00160dbcf146dfd,
     .dependencies = .{
         .cozmic = .{
-            .url = "git+https://github.com/Addonay/cozmic.git#0f3dfd810bb8eb12289c54394362f239655ea012",
-            .hash = "cozmic-0.0.1-wv6CLQRhdABKdv8OgdfHoiXGRUcHHvZSdfuAcuqSZNQ1",
+            .url = "git+https://github.com/Addonay/cozmic.git#bbc0f4f282acd024d1dc0b5e4d16fc4b08fcb6b0",
+            .hash = "cozmic-0.2.0-wv6CLdHadgCZDgNzVIZ0hrEahjAznoWRePQaKF444Q4p",
         },
         .zlay = .{
             .url = "git+https://github.com/Addonay/zlay.git#dbce9266163ba5400385693aebd86c0726464a94",
@@ -27,6 +27,10 @@
             .url = "git+https://github.com/Addonay/wgpu.git#efd94fed85abcf4891aa7b055d9d9f5c4757b4b6",
             .hash = "wgpu-0.1.0-hZv3miibBgCXbQKA1jAytJ_0pnhdPKd3LahA3ivmuGSE",
             .lazy = true,
+        },
+        .zafi = .{
+            .url = "git+https://github.com/Addonay/zafi.git#04086f7a21f120a5ea52f921fb2034d75e10264f",
+            .hash = "zafi-0.4.1-gvFdNm2TFABhWk0z8IvfPUm8cq1RoQ_mztSiQ5IoZyyr",
         },
     },
     .paths = .{
