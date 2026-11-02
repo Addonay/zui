@@ -3548,7 +3548,11 @@ pub fn StyledElement(comptime Ext: type) type {
 
         /// Sets the key context used to match key bindings.
         pub fn key_context(self: *Self, context: anytype) *Self {
-            self.interactivity.key_context = key_dispatch.KeyContext.from(context);
+            const T = @TypeOf(context);
+            self.interactivity.key_context = if (T == key_dispatch.KeyContext)
+                context
+            else
+                key_dispatch.KeyContext.parse(context) catch @panic("invalid key context");
             return self;
         }
 

@@ -13,7 +13,6 @@ const testing = std.testing;
 
 const Bounds = geometry.Bounds;
 const Corners = geometry.Corners;
-const Edges = geometry.Edges;
 const ScaledPixels = geometry.ScaledPixels;
 const Scene = scene.Scene;
 const Quad = scene.Quad;
@@ -180,7 +179,8 @@ const srgb_lut: [srgb_lut_size + 1]f32 = blk: {
 
 /// `srgb_to_linear` for the lanes of a vector of pixels (values outside [0, 1] are clamped).
 fn srgb_to_linear4(v: F4) F4 {
-    const x: [4]f32 = @min(@max(v, zero4), one4) * s4(srgb_lut_size);
+    const finite = @select(f32, v > zero4, v, zero4);
+    const x: [4]f32 = @min(finite, one4) * s4(srgb_lut_size);
     var out: [4]f32 = undefined;
     for (0..4) |i| {
         const f = @min(x[i], srgb_lut_size - 1);
@@ -461,7 +461,10 @@ inline fn blend4(t: Target, off: usize, bl: Blend16) void {
     const dst: U16 = t.bytes[off..][0..16].*;
     const dst_f: F16 = @floatFromInt(dst);
     const out = bl.p + dst_f * @as(F16, @splat(1.0 / 255.0)) * bl.inv;
-    const clamped = @min(@max(out, @as(F16, @splat(0))), @as(F16, @splat(1)));
+    // NaN compares false, so it is replaced by 0 before the float-to-int conversion.
+    const zero16: F16 = @splat(0);
+    const finite = @select(f32, out > zero16, out, zero16);
+    const clamped = @min(finite, @as(F16, @splat(1)));
     const scaled: @Vector(16, u32) = @intFromFloat(clamped * @as(F16, @splat(255)) + @as(F16, @splat(0.5)));
     const bytes: U16 = @truncate(scaled);
     t.bytes[off..][0..16].* = bytes;
@@ -1281,6 +1284,8 @@ fn rasterize_triangle(acc: []F4, r: PixelRect, bp: *const BgPrep, ox: f32, oy: f
     const dtdy = (s1.y - s0.y) * db1dy + (s2.y - s0.y) * db2dy;
     const straight = dsdx * dsdx + dsdy * dsdy < 1e-6;
 
+    const coords = [6]f32{ x0, y0, x1, y1, x2, y2 };
+    for (coords) |c| if (!std.math.isFinite(c)) return;
     const min_x = @min(x0, @min(x1, x2));
     const max_x = @max(x0, @max(x1, x2));
     const min_y = @min(y0, @min(y1, y2));
@@ -1902,6 +1907,145 @@ test "path triangle is antialiased on its diagonal and filled inside" {
     try testing.expectEqual([4]u8{ 0, 0, 0, 255 }, target.at(2, 8));
     const edge = target.at(5, 5);
     try testing.expect(edge[0] > 60 and edge[0] < 200);
+}
+
+test "checkerboard alternates cells" {
+    var sc = Scene.init(testing.allocator);
+    defer sc.deinit();
+    try sc.insert_primitive(.{ .quad = .{
+        .bounds = test_rect(0, 0, 4, 4),
+        .content_mask = test_mask(0, 0, 10, 10),
+        .background = color.checkerboard(color.red(), 2),
+    } });
+    sc.finish();
+
+    var target = try TestFb.init(10, 10, .{ 0, 0, 0, 255 });
+    defer target.deinit();
+    var atlas_ = CpuAtlas.init(testing.allocator);
+    defer atlas_.deinit();
+    var renderer = CpuRenderer.init(testing.allocator);
+    defer renderer.deinit();
+    renderer.draw(&sc, &atlas_, target.fb, color.black());
+
+    try testing.expectEqual([4]u8{ 0, 0, 0, 255 }, target.at(0, 0));
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, target.at(2, 0));
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, target.at(0, 2));
+    try testing.expectEqual([4]u8{ 0, 0, 0, 255 }, target.at(2, 2));
+}
+
+test "wavy underline stays within its band" {
+    var sc = Scene.init(testing.allocator);
+    defer sc.deinit();
+    try sc.insert_primitive(.{ .underline = .{
+        .bounds = test_rect(0, 2, 20, 4),
+        .content_mask = test_mask(0, 0, 30, 10),
+        .color = color.red(),
+        .thickness = 1,
+        .wavy = .{ .value = 1 },
+    } });
+    sc.finish();
+
+    var target = try TestFb.init(30, 10, .{ 0, 0, 0, 255 });
+    defer target.deinit();
+    var atlas_ = CpuAtlas.init(testing.allocator);
+    defer atlas_.deinit();
+    var renderer = CpuRenderer.init(testing.allocator);
+    defer renderer.deinit();
+    renderer.draw(&sc, &atlas_, target.fb, color.black());
+
+    var painted: usize = 0;
+    for (0..30) |x| {
+        for (0..10) |y| {
+            const p = target.at(@intCast(x), @intCast(y));
+            if (p[0] == 0) continue;
+            painted += 1;
+            try testing.expect(y >= 2 and y < 6 and x < 20);
+        }
+    }
+    try testing.expect(painted > 0);
+}
+
+test "subpixel sprite blends each channel separately" {
+    var cpu_atlas = CpuAtlas.init(testing.allocator);
+    defer cpu_atlas.deinit();
+    const tile = try cpu_atlas.insert(.subpixel, .{ .width = 1, .height = 1 }, &.{ 255, 255, 255, 255 });
+
+    var sc = Scene.init(testing.allocator);
+    defer sc.deinit();
+    try sc.insert_primitive(.{ .subpixel_sprite = .{
+        .tile = tile,
+        .bounds = test_rect(1, 1, 1, 1),
+        .content_mask = test_mask(0, 0, 4, 4),
+        .color = color.green(),
+    } });
+    sc.finish();
+
+    var target = try TestFb.init(4, 4, .{ 255, 0, 0, 255 });
+    defer target.deinit();
+    var renderer = CpuRenderer.init(testing.allocator);
+    defer renderer.deinit();
+    renderer.draw(&sc, &cpu_atlas, target.fb, color.red());
+
+    // color.green() has lightness 0.25, so its green channel is 0.5.
+    try testing.expectEqual([4]u8{ 0, 128, 0, 255 }, target.at(1, 1));
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, target.at(0, 0));
+}
+
+test "banded rendering matches single-threaded rendering" {
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+    var sc = Scene.init(testing.allocator);
+    defer sc.deinit();
+    const full = test_mask(0, 0, 96, 160);
+    for (0..150) |i| {
+        const x = random.float(f32) * 80;
+        const y = random.float(f32) * 150;
+        const w = 4 + random.float(f32) * 30;
+        const h = 4 + random.float(f32) * 30;
+        switch (i % 3) {
+            0 => try sc.insert_primitive(.{ .quad = .{
+                .bounds = test_rect(x, y, w, h),
+                .content_mask = full,
+                .background = color.solid_background(color.hsla(random.float(f32), 0.7, 0.5, 0.8)),
+                .corner_radii = .{ .top_left = 3, .top_right = 3, .bottom_right = 3, .bottom_left = 3 },
+                .border_widths = .{ .top = 1, .right = 1, .bottom = 1, .left = 1 },
+                .border_color = color.blue(),
+            } }),
+            1 => try sc.insert_primitive(.{ .shadow = .{
+                .blur_radius = 3,
+                .bounds = test_rect(x, y, w, h),
+                .content_mask = full,
+                .color = color.black(),
+                .element_bounds = test_rect(x, y, w, h),
+            } }),
+            else => {
+                var path = scene.Path(ScaledPixels).new(testing.allocator, .{ .x = x, .y = y });
+                path.content_mask = full;
+                path.color = color.solid_background(color.green());
+                path.move_to(.{ .x = x, .y = y });
+                try path.line_to(.{ .x = x + w, .y = y });
+                try path.line_to(.{ .x = x, .y = y + h });
+                try sc.insert_primitive(.{ .path = path });
+            },
+        }
+    }
+    sc.finish();
+
+    var atlas_ = CpuAtlas.init(testing.allocator);
+    defer atlas_.deinit();
+    var single = try TestFb.init(96, 160, .{ 10, 20, 30, 255 });
+    defer single.deinit();
+    var banded = try TestFb.init(96, 160, .{ 10, 20, 30, 255 });
+    defer banded.deinit();
+
+    var renderer = CpuRenderer.init(testing.allocator);
+    defer renderer.deinit();
+    renderer.threads = 1;
+    renderer.draw(&sc, &atlas_, single.fb, color.black());
+    renderer.threads = 4;
+    renderer.draw(&sc, &atlas_, banded.fb, color.black());
+
+    try testing.expectEqualSlices(u8, single.buffer, banded.buffer);
 }
 
 test "ppm output has a P6 header and drops alpha" {
