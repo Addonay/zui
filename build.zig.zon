@@ -1,32 +1,12 @@
 .{
     .name = .zui,
     .version = "0.0.1",
-    // cozmic (v0.0.1, published package) declares 0.17.0-dev.2085+5e36170b5
-    // as its minimum; keep the root at the same floor so `zig build` cannot
-    // accept a toolchain that the dependency rejects.
-    .minimum_zig_version = "0.17.0-dev.2085+5e36170b5",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0xc00160dbcf146dfd,
     .dependencies = .{
         .cozmic = .{
             .url = "git+https://github.com/Addonay/cozmic.git#bbc0f4f282acd024d1dc0b5e4d16fc4b08fcb6b0",
             .hash = "cozmic-0.2.0-wv6CLdHadgCZDgNzVIZ0hrEahjAznoWRePQaKF444Q4p",
-        },
-        .zlay = .{
-            .url = "git+https://github.com/Addonay/zlay.git#dbce9266163ba5400385693aebd86c0726464a94",
-            .hash = "zlay-0.1.0-0OJsDbPRDgDhk2RghWTtm2uGYh5ze2D6GrPo-wDSEj5r",
-        },
-        // Vello-derived 2D renderer: https://github.com/Addonay/vellz,
-        // pinned to the commit that makes the package self-sufficient
-        // (glyph manifest + bridge test in `.paths`). vellz's wgpu
-        // dependency is lazy; CPU-only builds of zui never fetch it.
-        .vellz = .{
-            .url = "git+https://github.com/Addonay/vellz.git#d5aa45e7eda4d3924b64c2b9dfabf1c4f3412916",
-            .hash = "vellz-0.1.0-VcH-R2VsPQBqbVwTgiWE82P4bz6fK8tx1hpBnF7zj2tg",
-        },
-        .wgpu = .{
-            .url = "git+https://github.com/Addonay/wgpu.git#efd94fed85abcf4891aa7b055d9d9f5c4757b4b6",
-            .hash = "wgpu-0.1.0-hZv3miibBgCXbQKA1jAytJ_0pnhdPKd3LahA3ivmuGSE",
-            .lazy = true,
         },
         .zafi = .{
             .url = "git+https://github.com/Addonay/zafi.git#04086f7a21f120a5ea52f921fb2034d75e10264f",
@@ -37,14 +17,10 @@
         "src",
         "examples",
         "third_party",
-        "tools",
-        "docs/PLATFORM_MATRIX.md",
         "build.zig",
         "build.zig.zon",
         "README.md",
         "LICENSE",
         "NOTICE.md",
-        "plan.md",
-        "ZUI_GAP_REPORT.md",
     },
 }
