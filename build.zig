@@ -3,6 +3,8 @@ const std = @import("std");
 const examples = [_][]const u8{
     "hello_world",
     "scrollable",
+    "ownership_post",
+    "active_state_bug",
 };
 
 pub fn build(b: *std.Build) void {

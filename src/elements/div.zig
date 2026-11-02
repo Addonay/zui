@@ -7271,6 +7271,16 @@ pub fn StyledElement(comptime Ext: type) type {
         pub const shadow_lg = StyledM.shadow_lg;
         pub const shadow_xl = StyledM.shadow_xl;
         pub const shadow_2xl = StyledM.shadow_2xl;
+
+        // -- element-specific methods forwarded from `Ext` (Img, Svg); void otherwise.
+        pub const object_fit = if (@hasDecl(Ext, "object_fit")) Ext.object_fit else {};
+        pub const grayscale = if (@hasDecl(Ext, "grayscale")) Ext.grayscale else {};
+        pub const with_fallback = if (@hasDecl(Ext, "with_fallback")) Ext.with_fallback else {};
+        pub const with_loading = if (@hasDecl(Ext, "with_loading")) Ext.with_loading else {};
+        pub const path = if (@hasDecl(Ext, "path")) Ext.path else {};
+        pub const external_path = if (@hasDecl(Ext, "external_path")) Ext.external_path else {};
+        pub const data = if (@hasDecl(Ext, "data")) Ext.data else {};
+        pub const with_transformation = if (@hasDecl(Ext, "with_transformation")) Ext.with_transformation else {};
     };
 }
 

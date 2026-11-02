@@ -125,7 +125,7 @@ pub const SvgExt = struct {
         const transformation = if (e.transformation_) |t| t.into_matrix(bounds.center(), sf) else scene.TransformationMatrix.unit();
 
         const source: SvgSource = if (e.data_) |bytes|
-            .{ .data = bytes, .key = e.data_key }
+            .{ .data = .{ .bytes = bytes, .key = e.data_key } }
         else if (e.external_path_) |p|
             .{ .external = p }
         else if (e.path_) |p|
@@ -145,11 +145,12 @@ pub const SvgExt = struct {
         const key = atlas.AtlasKey{ .svg = svg_key(source, device_size) };
         const tile = (window.sprite_atlas.get_or_insert_with(key, .{ .context = &ctx, .build_fn = SvgTile.build }) catch return) orelse return;
 
-        // Center the tile on the bounds, rounding the device-pixel origin (GPUI `round_half_toward_zero`).
+        // Draw at half the tile size, centered on the bounds. The origin is rounded in device pixels (GPUI).
         const draw_w = @as(f32, @floatFromInt(tile.bounds.size.width)) / smooth;
         const draw_h = @as(f32, @floatFromInt(tile.bounds.size.height)) / smooth;
-        const ox = @round(bounds.center().x * sf - draw_w * sf / 2.0);
-        const oy = @round(bounds.center().y * sf - draw_h * sf / 2.0);
+        const center = bounds.center();
+        const ox = @round(center.x * sf - draw_w / 2.0);
+        const oy = @round(center.y * sf - draw_h / 2.0);
         const svg_bounds: Bounds(Pixels) = .{
             .origin = .{ .x = ox / sf, .y = oy / sf },
             .size = .{ .width = draw_w / sf, .height = draw_h / sf },
@@ -160,8 +161,7 @@ pub const SvgExt = struct {
 
 /// Where an SVG's bytes come from.
 const SvgSource = union(enum) {
-    data: []const u8,
-    key: u64,
+    data: struct { bytes: []const u8, key: u64 },
     external: []const u8,
     asset: []const u8,
 };
@@ -169,7 +169,7 @@ const SvgSource = union(enum) {
 /// Key for the rasterized mask: source identity plus the device size.
 fn svg_key(source: SvgSource, size: Size(DevicePixels)) u64 {
     const id: u64 = switch (source) {
-        .data => |_| source.key,
+        .data => |d| d.key,
         .external => |p| std.hash.Wyhash.hash(0x65787400, p),
         .asset => |p| std.hash.Wyhash.hash(0x61737400, p),
     };
@@ -189,10 +189,9 @@ const SvgTile = struct {
         // The mask is copied into the atlas right away, so frame-arena memory is enough.
         const arena = window_mod.frame_arena();
         const bytes: []const u8 = switch (self.src) {
-            .data => |d| d,
+            .data => |d| d.bytes,
             .external => |p| assets.read_file(arena, p) catch return null,
             .asset => |p| self.source.load(p) orelse return null,
-            .key => unreachable,
         };
         const renderer = try self.cache.svg_renderer();
         const svg = renderer.parse_svg(arena, bytes) catch return null;
