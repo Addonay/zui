@@ -331,21 +331,21 @@ test "entities: observe, subscribe, emit and release" {
 test "entities: release listeners run before the state is dropped" {
     var cx = TestAppContext.init();
     defer cx.deinit();
-    const Holder = struct {
-        released: bool = false,
-        sub: ?Subscription = null,
-        fn watch(self: *@This(), cx_: *Context(@This())) void {
-            self.sub = cx_.on_release(on_release);
-        }
-        fn on_release(self: *@This(), _: *Context(@This())) void {
-            self.released = true;
+    const Released = struct {
+        var count: usize = 0;
+        fn on_release(_: *App, _: app_mod.EntityId, _: usize, payload: ?*const anyopaque) bool {
+            const state: *const Model = @ptrCast(@alignCast(payload.?));
+            if (state.value == 7) count += 1;
+            return false;
         }
     };
-    const holder = cx.new(Holder{});
-    cx.update_entity(holder, Holder.watch, .{});
-    const id = holder.entity_id();
-    cx.app.release_entity(id);
-    try std.testing.expect(holder.entity_id() == id);
+    Released.count = 0;
+    const model = cx.new(Model{ .value = 7 });
+    var sub = cx.app.add_release_listener(model.entity_id(), Released.on_release);
+    defer sub.unsubscribe();
+    model.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), Released.count);
+    try std.testing.expect(model.downgrade().upgrade(cx.app) == null);
 }
 
 test "entities: notify from outside the app observes via App.observe" {
@@ -639,4 +639,113 @@ test "windows: simulate_resize updates the viewport" {
     vcx.simulate_resize(.{ .width = 320, .height = 240 });
     try std.testing.expectEqual(@as(Pixels, 320), vcx.window.viewport_size.width);
     try std.testing.expectEqual(@as(Pixels, 240), vcx.window.viewport_size.height);
+}
+
+/// Re-renders from state: the quad width tracks `count`, so a repaint after `notify` is observable.
+const Growing = struct {
+    count: usize = 0,
+
+    pub fn render(self: *Growing, _: *Window, cx: *Context(Growing)) *Div {
+        return div().id("grow").h(px(50)).w(px(@floatFromInt(100 + self.count))).bg(red()).on_click(cx.listener(on_click));
+    }
+    fn on_click(self: *Growing, _: *const ClickEvent, _: *Window, cx: *Context(Growing)) void {
+        self.count += 1;
+        cx.notify();
+    }
+    fn build(_: *Window, app: *App) Entity(Growing) {
+        return app.new(Growing{});
+    }
+};
+
+fn scene_has_quad_width(window: *const Window, width: f32) bool {
+    for (window.rendered_frame.scene.quads.items) |q| {
+        if (q.bounds.size.width == width) return true;
+    }
+    return false;
+}
+
+test "windows: notify re-renders the view with new state" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Growing.build);
+    try std.testing.expect(scene_has_quad_width(vcx.window, 100));
+    vcx.simulate_click(.{ .x = 5, .y = 5 }, .{});
+    try std.testing.expect(scene_has_quad_width(vcx.window, 101));
+    try std.testing.expect(!scene_has_quad_width(vcx.window, 100));
+}
+
+test "actions: a key binding whose context does not match is ignored" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("cmd-s", Editor.Save{}, "Terminal")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.simulate_keystrokes("cmd-s");
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, Editor.read_state, .{}).saves);
+}
+
+test "actions: an unhandled action falls back to App.on_action" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Global = struct {
+        var hits: usize = 0;
+        fn on_save(_: *const Editor.Save, _: *App) void {
+            hits += 1;
+        }
+    };
+    Global.hits = 0;
+    cx.app.on_action(Editor.Save, Global.on_save);
+    cx.app.bind_keys(&.{KeyBinding.new("cmd-s", Editor.Save{}, null)});
+    _, const vcx = cx.add_window_view(Counter.build);
+    vcx.simulate_keystrokes("cmd-s");
+    try std.testing.expectEqual(@as(usize, 1), Global.hits);
+}
+
+test "windows: WindowHandle.update mutates the root view with window access" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const Setter = struct {
+        fn set(self: *Counter, value: usize, window: *Window, _: *Context(Counter)) void {
+            self.count = value;
+            window.refresh();
+        }
+    };
+    try handle.update(cx.app, Setter.set, .{@as(usize, 42)});
+    const root = (try handle.root(cx.app));
+    try std.testing.expectEqual(@as(usize, 42), root.read(cx.app).count);
+}
+
+test "tasks: foreground spawn runs during run_until_parked" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Done = struct {
+        fn work(value: usize) usize {
+            return value * 2;
+        }
+    };
+    var task = cx.app.foreground_executor().spawn(Done.work, .{@as(usize, 21)});
+    cx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 42), task.get().?);
+}
+
+test "globals: update_global from a context notifies observers" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.set_global(Theme{});
+    const Seen = struct {
+        var changes: usize = 0;
+        fn on(_: *App) void {
+            changes += 1;
+        }
+    };
+    Seen.changes = 0;
+    var sub = cx.app.observe_global(Theme, Seen.on);
+    defer sub.unsubscribe();
+    _ = cx.app.update_global(Theme, struct {
+        fn f(t: *Theme, _: *App) void {
+            t.dark = true;
+        }
+    }.f);
+    try std.testing.expectEqual(@as(usize, 1), Seen.changes);
 }
