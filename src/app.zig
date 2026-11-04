@@ -438,6 +438,12 @@ pub fn Context(comptime T: type) type {
         pub fn read_from_clipboard(self: *Self) ?platform_mod.ClipboardItem {
             return self.app.read_from_clipboard();
         }
+        pub fn write_to_primary(self: *Self, item: platform_mod.ClipboardItem) void {
+            self.app.write_to_primary(item);
+        }
+        pub fn read_from_primary(self: *Self) ?platform_mod.ClipboardItem {
+            return self.app.read_from_primary();
+        }
         pub fn defer_(self: *Self, comptime f: anytype) void {
             self.app.defer_(f);
         }
@@ -1034,6 +1040,14 @@ pub const App = struct {
 
     pub fn read_from_clipboard(self: *App) ?platform_mod.ClipboardItem {
         return self.platform.read_from_clipboard();
+    }
+
+    pub fn write_to_primary(self: *App, item: platform_mod.ClipboardItem) void {
+        self.platform.write_to_primary(item);
+    }
+
+    pub fn read_from_primary(self: *App) ?platform_mod.ClipboardItem {
+        return self.platform.read_from_primary();
     }
 
     pub fn open_url(self: *App, url: []const u8) void {

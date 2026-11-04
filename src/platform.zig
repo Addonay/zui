@@ -293,6 +293,8 @@ pub const Platform = struct {
         set_cursor_style: *const fn (*Platform, CursorStyle) void = noopCursor,
         write_to_clipboard: *const fn (*Platform, ClipboardItem) void = noopClip,
         read_from_clipboard: *const fn (*Platform) ?ClipboardItem = noClip,
+        write_to_primary: *const fn (*Platform, ClipboardItem) void = noopClip,
+        read_from_primary: *const fn (*Platform) ?ClipboardItem = noClip,
         open_url: *const fn (*Platform, []const u8) void = noopStr,
         quit_when_last_window_closes: *const fn (*Platform) bool = yes,
     };
@@ -348,6 +350,13 @@ pub const Platform = struct {
     }
     pub fn read_from_clipboard(self: *Platform) ?ClipboardItem {
         return self.vtable.read_from_clipboard(self);
+    }
+    /// The middle-click selection. Only Linux has one; elsewhere writes do nothing and reads give null.
+    pub fn write_to_primary(self: *Platform, item: ClipboardItem) void {
+        self.vtable.write_to_primary(self, item);
+    }
+    pub fn read_from_primary(self: *Platform) ?ClipboardItem {
+        return self.vtable.read_from_primary(self);
     }
     pub fn open_url(self: *Platform, url: []const u8) void {
         self.vtable.open_url(self, url);

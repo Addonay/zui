@@ -31,6 +31,12 @@ pub const Decoration = opaque {};
 pub const CursorTheme = opaque {};
 pub const TextInputManager = opaque {};
 pub const TextInput = opaque {};
+pub const PrimaryDeviceManager = opaque {};
+pub const PrimaryDevice = opaque {};
+pub const PrimaryOffer = opaque {};
+pub const PrimarySource = opaque {};
+pub const CursorShapeManager = opaque {};
+pub const CursorShapeDevice = opaque {};
 /// Cursor entry: image array layout verified against wayland-cursor.h
 /// (image_count, then images pointer; name follows and is unread).
 pub const CursorHandle = extern struct {
@@ -260,6 +266,107 @@ pub const data_device_interface: Interface = .{
     .methods = @ptrCast(&data_device_methods),
     .event_count = 6,
     .events = @ptrCast(&data_device_events),
+};
+
+// -- zwp_primary_selection_unstable_v1 ---------------------------------------
+
+pub const PrimaryOfferListener = extern struct {
+    offer: *const fn (?*anyopaque, *PrimaryOffer, [*:0]const u8) callconv(.c) void,
+};
+pub const PrimarySourceListener = extern struct {
+    send: *const fn (?*anyopaque, *PrimarySource, [*:0]const u8, i32) callconv(.c) void,
+    cancelled: *const fn (?*anyopaque, *PrimarySource) callconv(.c) void,
+};
+pub const PrimaryDeviceListener = extern struct {
+    data_offer: *const fn (?*anyopaque, *PrimaryDevice, *PrimaryOffer) callconv(.c) void,
+    selection: *const fn (?*anyopaque, *PrimaryDevice, ?*PrimaryOffer) callconv(.c) void,
+};
+
+pub const primary_offer_events = [_]Message{.{ .name = "offer", .signature = "s", .types = null }};
+pub const primary_offer_methods = [_]Message{
+    .{ .name = "receive", .signature = "sh", .types = null },
+    .{ .name = "destroy", .signature = "", .types = null },
+};
+pub const primary_offer_interface: Interface = .{
+    .name = "zwp_primary_selection_offer_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&primary_offer_methods),
+    .event_count = 1,
+    .events = @ptrCast(&primary_offer_events),
+};
+pub const primary_source_events = [_]Message{
+    .{ .name = "send", .signature = "sh", .types = null },
+    .{ .name = "cancelled", .signature = "", .types = null },
+};
+pub const primary_source_methods = [_]Message{
+    .{ .name = "offer", .signature = "s", .types = null },
+    .{ .name = "destroy", .signature = "", .types = null },
+};
+pub const primary_source_interface: Interface = .{
+    .name = "zwp_primary_selection_source_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&primary_source_methods),
+    .event_count = 2,
+    .events = @ptrCast(&primary_source_events),
+};
+pub const primary_device_events = [_]Message{
+    .{ .name = "data_offer", .signature = "n", .types = &[_]?*const anyopaque{@ptrCast(&primary_offer_interface)} },
+    .{ .name = "selection", .signature = "?o", .types = &[_]?*const anyopaque{@ptrCast(&primary_offer_interface)} },
+};
+pub const primary_device_methods = [_]Message{
+    .{ .name = "set_selection", .signature = "?ou", .types = &[_]?*const anyopaque{ @ptrCast(&primary_source_interface), null } },
+    .{ .name = "destroy", .signature = "", .types = null },
+};
+pub const primary_device_interface: Interface = .{
+    .name = "zwp_primary_selection_device_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&primary_device_methods),
+    .event_count = 2,
+    .events = @ptrCast(&primary_device_events),
+};
+pub const primary_device_manager_methods = [_]Message{
+    .{ .name = "create_source", .signature = "n", .types = &[_]?*const anyopaque{@ptrCast(&primary_source_interface)} },
+    .{ .name = "get_device", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&primary_device_interface), null } },
+    .{ .name = "destroy", .signature = "", .types = null },
+};
+pub const primary_device_manager_interface: Interface = .{
+    .name = "zwp_primary_selection_device_manager_v1",
+    .version = 1,
+    .method_count = 3,
+    .methods = @ptrCast(&primary_device_manager_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+// -- wp_cursor_shape_v1 -------------------------------------------------------
+
+pub const cursor_shape_device_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "set_shape", .signature = "uu", .types = null },
+};
+pub const cursor_shape_device_interface: Interface = .{
+    .name = "wp_cursor_shape_device_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&cursor_shape_device_methods),
+    .event_count = 0,
+    .events = null,
+};
+pub const cursor_shape_manager_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "get_pointer", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&cursor_shape_device_interface), null } },
+    .{ .name = "get_tablet_tool_v2", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&cursor_shape_device_interface), null } },
+};
+pub const cursor_shape_manager_interface: Interface = .{
+    .name = "wp_cursor_shape_manager_v1",
+    .version = 1,
+    .method_count = 3,
+    .methods = @ptrCast(&cursor_shape_manager_methods),
+    .event_count = 0,
+    .events = null,
 };
 
 pub const data_device_manager_methods = [_]Message{

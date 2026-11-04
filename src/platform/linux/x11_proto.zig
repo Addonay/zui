@@ -155,6 +155,27 @@ pub const XSelectionRequestEvent = extern struct {
     time: Time,
 };
 
+pub const XMappingEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    window: Window,
+    request: c_int,
+    first_keycode: c_int,
+    count: c_int,
+};
+
+pub const XSelectionClearEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    window: Window,
+    selection: Atom,
+    time: Time,
+};
+
 pub const XSelectionEvent = extern struct {
     type: c_int,
     serial: c_ulong,
@@ -196,6 +217,8 @@ pub const XEvent = extern union {
     xexpose: XExposeEvent,
     xselection: XSelectionEvent,
     xselectionrequest: XSelectionRequestEvent,
+    xselectionclear: XSelectionClearEvent,
+    xmapping: XMappingEvent,
     pad: [24]c_long,
 };
 
@@ -249,6 +272,7 @@ pub const SelectionClear: c_int = 29;
 pub const SelectionRequest: c_int = 30;
 pub const SelectionNotify: c_int = 31;
 
+pub const MappingNotify: c_int = 34;
 pub const XA_PRIMARY: Atom = 1;
 pub const XA_ATOM: Atom = 4;
 pub const XA_STRING: Atom = 31;
@@ -359,6 +383,8 @@ pub const Api = struct {
     XSync: *const fn (*Display, Bool) callconv(.c) c_int,
     XConnectionNumber: *const fn (*Display) callconv(.c) c_int,
     XLookupString: *const fn (*XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int,
+    XRefreshKeyboardMapping: *const fn (*XMappingEvent) callconv(.c) c_int,
+    XkbSetDetectableAutoRepeat: ?*const fn (*Display, c_int, ?*c_int) callconv(.c) c_int,
     XKeycodeToKeysym: ?*const fn (*Display, c_uint, c_int) callconv(.c) c_ulong = null,
     XChangeProperty: *const fn (*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int,
     XDeleteProperty: *const fn (*Display, Window, Atom) callconv(.c) c_int,
@@ -403,6 +429,8 @@ pub const Api = struct {
             .XFlush = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XFlush") orelse return null,
             .XSync = lib.lookup(*const fn (*Display, Bool) callconv(.c) c_int, "XSync") orelse return null,
             .XConnectionNumber = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XConnectionNumber") orelse return null,
+            .XRefreshKeyboardMapping = lib.lookup(*const fn (*XMappingEvent) callconv(.c) c_int, "XRefreshKeyboardMapping") orelse return null,
+            .XkbSetDetectableAutoRepeat = lib.lookup(*const fn (*Display, c_int, ?*c_int) callconv(.c) c_int, "XkbSetDetectableAutoRepeat"),
             .XLookupString = lib.lookup(*const fn (*XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int, "XLookupString") orelse return null,
             .XKeycodeToKeysym = lib.lookup(*const fn (*Display, c_uint, c_int) callconv(.c) c_ulong, "XKeycodeToKeysym"),
             .XChangeProperty = lib.lookup(*const fn (*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int, "XChangeProperty") orelse return null,

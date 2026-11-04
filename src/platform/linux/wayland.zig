@@ -60,12 +60,21 @@ const MIME_STRING: [*:0]const u8 = "STRING";
 
 /// Key repeat state: the held key's resolved name and text, re-emitted on a timer.
 const Repeat = struct {
-    key: []const u8 = "",
-    text: [4]u8 = undefined,
+    key_buf: [32]u8 = undefined,
+    key_len: u8 = 0,
+    text: [32]u8 = undefined,
     text_len: u8 = 0,
     code: u32 = 0,
     active: bool = false,
     next_ms: i64 = 0,
+};
+
+/// Tracks a selection's offers: the newest announced one and the one in effect.
+const OfferSlot = struct {
+    incoming: ?*anyopaque = null,
+    incoming_mimes: u8 = 0,
+    current: ?*anyopaque = null,
+    mimes: u8 = 0,
 };
 
 /// One axis of pending wheel input, flushed once per pointer frame.
@@ -89,6 +98,17 @@ pub const WaylandConnection = struct {
     wm_base: ?*proto.XdgWmBase = null,
     gpu_context: ?*window_renderer.GpuContext = null,
     gpu_probed: bool = false,
+    compose: ?xkb.Compose = null,
+    cursor_shape_manager: ?*proto.CursorShapeManager = null,
+    cursor_shape_device: ?*proto.CursorShapeDevice = null,
+    primary_manager: ?*proto.PrimaryDeviceManager = null,
+    primary_device: ?*proto.PrimaryDevice = null,
+    primary_source: ?*proto.PrimarySource = null,
+    primary_slot: OfferSlot = .{},
+    primary_offer_text: ?[]u8 = null,
+    primary_read: ?[]u8 = null,
+    owning_primary: bool = false,
+    clipboard_slot: OfferSlot = .{},
     seat: ?*proto.Seat = null,
     seat_caps: u32 = 0,
     pointer: ?*proto.Pointer = null,
@@ -130,8 +150,6 @@ pub const WaylandConnection = struct {
     clip_offer: ?[]u8 = null,
     owning_selection: bool = false,
     data_source: ?*proto.DataSource = null,
-    cur_offer: ?*proto.DataOffer = null,
-    offer_mimes: u8 = 0,
     /// Storage for the last text read from the clipboard.
     clip_read: ?[]u8 = null,
 
@@ -169,6 +187,9 @@ pub const WaylandConnection = struct {
         .drop = dataDeviceDrop,
         .selection = dataDeviceSelection,
     };
+    const primary_device_listener: proto.PrimaryDeviceListener = .{ .data_offer = primaryDeviceOffer, .selection = primaryDeviceSelection };
+    const primary_offer_listener: proto.PrimaryOfferListener = .{ .offer = primaryOfferOffer };
+    const primary_source_listener: proto.PrimarySourceListener = .{ .send = primarySourceSend, .cancelled = primarySourceCancelled };
     const data_offer_listener: proto.DataOfferListener = .{ .offer = dataOfferOffer };
     const data_source_listener: proto.DataSourceListener = .{ .target = dataSourceTarget, .send = dataSourceSend, .cancelled = dataSourceCancelled };
     const wm_listener: proto.XdgWmBaseListener = .{ .ping = xdgPing };
@@ -212,6 +233,7 @@ pub const WaylandConnection = struct {
 
         self.xkb = xkb.Xkb.init() catch null;
         self.load_cursor_theme();
+        self.compose = xkb.Compose.init();
         return self;
     }
 
@@ -345,6 +367,16 @@ pub const WaylandConnection = struct {
         if (self.gpu_context) |ctx| ctx.destroy();
         if (self.clip_offer) |c| self.allocator.free(c);
         if (self.clip_read) |c| self.allocator.free(c);
+        if (self.primary_offer_text) |c| self.allocator.free(c);
+        if (self.primary_read) |c| self.allocator.free(c);
+        if (self.compose) |*c| c.deinit();
+        if (self.clipboard_slot.current) |o| self.api.wl_proxy_destroy(@ptrCast(o));
+        if (self.primary_slot.current) |o| self.api.wl_proxy_destroy(@ptrCast(o));
+        if (self.primary_source) |o| self.api.wl_proxy_destroy(@ptrCast(o));
+        if (self.primary_device) |o| self.api.wl_proxy_destroy(@ptrCast(o));
+        if (self.primary_manager) |o| self.api.wl_proxy_destroy(@ptrCast(o));
+        if (self.cursor_shape_device) |o| self.api.wl_proxy_destroy(@ptrCast(o));
+        if (self.cursor_shape_manager) |o| self.api.wl_proxy_destroy(@ptrCast(o));
         if (self.data_source) |ds| self.api.wl_proxy_destroy(@ptrCast(ds));
         if (self.data_device) |dd| self.api.wl_proxy_destroy(@ptrCast(dd));
         if (self.ddm) |m| self.api.wl_proxy_destroy(@ptrCast(m));
@@ -447,15 +479,23 @@ pub const WaylandConnection = struct {
                 _ = self.api.wl_proxy_add_listener(dd, &data_device_listener, self);
             }
         }
+        if (self.primary_device == null and self.primary_manager != null) {
+            const raw = self.api.wl_proxy_marshal_flags(@ptrCast(self.primary_manager.?), 1, &proto.primary_device_interface, 1, 0, @as(?*anyopaque, null), @as(*anyopaque, @ptrCast(seat)));
+            if (raw) |dd| {
+                self.primary_device = @ptrCast(dd);
+                _ = self.api.wl_proxy_add_listener(dd, &primary_device_listener, self);
+            }
+        }
     }
 
     fn tick_repeat(self: *WaylandConnection) void {
         if (!self.repeat.active or self.repeat_rate == 0) return;
-        const now = input.now_ms();
-        if (now < self.repeat.next_ms) return;
-        self.repeat.next_ms = now + @divTrunc(1000, @as(i64, self.repeat_rate));
+        const step = input.repeat_step(input.now_ms(), self.repeat.next_ms, @divTrunc(1000, @as(i64, self.repeat_rate)));
+        self.repeat.next_ms = step.next_ms;
         const w = self.keyboard_focus orelse return;
-        w.emit_key(self.repeat.key, if (self.repeat.text_len > 0) self.repeat.text[0..self.repeat.text_len] else null, true, true);
+        const key = self.repeat.key_buf[0..self.repeat.key_len];
+        const text: ?[]const u8 = if (self.repeat.text_len > 0) self.repeat.text[0..self.repeat.text_len] else null;
+        for (0..step.count) |_| w.emit_key(key, text, true, true);
     }
 
     fn emit_modifiers(self: *WaylandConnection) void {
@@ -469,11 +509,13 @@ pub const WaylandConnection = struct {
         const w = self.keyboard_focus orelse return;
         const shift = (self.mods & input.MOD_SHIFT) != 0;
         var name: ?[]const u8 = null;
-        var text_buf: [4]u8 = undefined;
+        var text_buf: [32]u8 = undefined;
         var text: ?[]const u8 = null;
+        var keysym: u32 = 0;
         if (self.xkb) |*x| {
             if (x.hasLiveState()) {
-                name = input.key_name_for_keysym(x.keysym(code + 8));
+                keysym = x.keysym(code + 8);
+                name = input.key_name_for_keysym(keysym);
                 if (pressed) {
                     const n = x.utf8(code + 8, &text_buf);
                     if (n > 0) text = text_buf[0..n];
@@ -491,13 +533,30 @@ pub const WaylandConnection = struct {
                 }
             }
         }
+        var composed_buf: [32]u8 = undefined;
+        if (pressed and keysym != 0 and !input.is_modifier_keysym(keysym)) {
+            if (self.compose) |*c| switch (c.feed(keysym, &composed_buf)) {
+                .composing => text = null,
+                .composed => |t| {
+                    // As in GPUI the key becomes the result, so a binding on the
+                    // sequence's last key does not fire.
+                    text = t;
+                    name = t;
+                },
+                .nothing, .cancelled => {},
+            };
+        }
         const key_name = name orelse return;
         w.emit_key(key_name, text, pressed, false);
         if (pressed and !isModifierCode(code) and self.repeat_rate > 0) {
-            self.repeat = .{ .key = key_name, .code = code, .active = true, .next_ms = input.now_ms() + self.repeat_delay_ms };
+            self.repeat = .{ .code = code, .active = true, .next_ms = input.now_ms() + self.repeat_delay_ms };
+            const key_len = @min(key_name.len, self.repeat.key_buf.len);
+            @memcpy(self.repeat.key_buf[0..key_len], key_name[0..key_len]);
+            self.repeat.key_len = @intCast(key_len);
             if (text) |t| {
-                @memcpy(self.repeat.text[0..t.len], t);
-                self.repeat.text_len = @intCast(t.len);
+                const text_len = @min(t.len, self.repeat.text.len);
+                @memcpy(self.repeat.text[0..text_len], t[0..text_len]);
+                self.repeat.text_len = @intCast(text_len);
             }
         } else if (!pressed and self.repeat.active and self.repeat.code == code) {
             self.repeat.active = false;
@@ -520,6 +579,17 @@ pub const WaylandConnection = struct {
         if (self.pointer_enter_serial == 0 or self.pointer_focus == null) return;
         if (self.cursor_style == .none) {
             _ = self.api.wl_proxy_marshal_flags(@ptrCast(pointer), 0, null, self.api.wl_proxy_get_version(@ptrCast(pointer)), 0, self.pointer_enter_serial, @as(?*anyopaque, null), @as(i32, 0), @as(i32, 0));
+            return;
+        }
+        // Prefer the compositor's own cursors: they follow its theme and scale exactly.
+        if (self.cursor_shape_device == null) {
+            if (self.cursor_shape_manager) |manager| {
+                const raw = self.api.wl_proxy_marshal_flags(@ptrCast(manager), 1, &proto.cursor_shape_device_interface, 1, 0, @as(?*anyopaque, null), @as(*anyopaque, @ptrCast(pointer)));
+                self.cursor_shape_device = @ptrCast(raw);
+            }
+        }
+        if (self.cursor_shape_device) |device| {
+            _ = self.api.wl_proxy_marshal_flags(@ptrCast(device), 1, null, 1, 0, self.pointer_enter_serial, cursorShape(self.cursor_style));
             return;
         }
         const capi = self.cursor_api orelse return;
@@ -567,6 +637,16 @@ pub const WaylandConnection = struct {
 
     // -- clipboard -------------------------------------------------------
 
+    /// Makes `offer` the selection's current offer and destroys the one it replaces.
+    fn commit_offer(self: *WaylandConnection, slot: *OfferSlot, offer: anytype, destroy_opcode: u32) void {
+        const incoming: ?*anyopaque = if (offer) |o| @ptrCast(o) else null;
+        if (slot.current) |old| {
+            if (old != incoming) _ = self.api.wl_proxy_marshal_flags(@ptrCast(old), destroy_opcode, null, 1, 1);
+        }
+        slot.current = incoming;
+        slot.mimes = if (incoming != null and slot.incoming == incoming) slot.incoming_mimes else 0;
+    }
+
     fn offer_mime_bit(mime: []const u8) u8 {
         if (std.mem.eql(u8, mime, "text/plain;charset=utf-8")) return 1 << 0;
         if (std.mem.eql(u8, mime, "UTF8_STRING")) return 1 << 1;
@@ -610,11 +690,47 @@ pub const WaylandConnection = struct {
             return self.clip_offer;
         }
         _ = self.api.wl_display_roundtrip(self.display);
-        const offer = self.cur_offer orelse return null;
-        const mime = best_offer_mime(self.offer_mimes) orelse return null;
+        const offer = self.clipboard_slot.current orelse return null;
+        const mime = best_offer_mime(self.clipboard_slot.mimes) orelse return null;
+        return self.read_offer(offer, 1, mime, &self.clip_read);
+    }
+
+    pub fn set_primary(self: *WaylandConnection, text: []const u8) bool {
+        const manager = self.primary_manager orelse return false;
+        const device = self.primary_device orelse return false;
+        if (self.last_serial == 0) return false;
+        const copy = self.allocator.dupe(u8, text) catch return false;
+        if (self.primary_offer_text) |old| self.allocator.free(old);
+        self.primary_offer_text = copy;
+        if (self.primary_source) |old| self.api.wl_proxy_destroy(@ptrCast(old));
+        self.primary_source = null;
+        const raw = self.api.wl_proxy_marshal_flags(@ptrCast(manager), 0, &proto.primary_source_interface, 1, 0, @as(?*anyopaque, null));
+        const source: *proto.PrimarySource = @ptrCast(raw orelse return false);
+        _ = self.api.wl_proxy_add_listener(@ptrCast(source), &primary_source_listener, self);
+        for ([_][*:0]const u8{ MIME_UTF8, MIME_TEXT_UTF8, MIME_TEXT, MIME_STRING }) |mime| {
+            _ = self.api.wl_proxy_marshal_flags(@ptrCast(source), 0, null, 1, 0, mime);
+        }
+        _ = self.api.wl_proxy_marshal_flags(@ptrCast(device), 0, null, 1, 0, @as(*anyopaque, @ptrCast(source)), self.last_serial);
+        self.primary_source = source;
+        self.owning_primary = true;
+        _ = self.api.wl_display_flush(self.display);
+        return true;
+    }
+
+    pub fn get_primary(self: *WaylandConnection) ?[]const u8 {
+        if (self.owning_primary) return self.primary_offer_text;
+        _ = self.api.wl_display_roundtrip(self.display);
+        const offer = self.primary_slot.current orelse return null;
+        const mime = best_offer_mime(self.primary_slot.mimes) orelse return null;
+        return self.read_offer(offer, 0, mime, &self.primary_read);
+    }
+
+    /// Asks the selection owner for its text through a pipe. `receive_opcode` is the
+    /// offer's `receive` request. The result stays valid until the next read into `slot`.
+    fn read_offer(self: *WaylandConnection, offer: *anyopaque, receive_opcode: u32, mime: [*:0]const u8, slot: *?[]u8) ?[]const u8 {
         var fds: [2]c_int = .{ -1, -1 };
         if (std.os.linux.pipe(&fds) != 0) return null;
-        _ = self.api.wl_proxy_marshal_flags(@ptrCast(offer), 1, null, 1, 0, mime, fds[1]);
+        _ = self.api.wl_proxy_marshal_flags(@ptrCast(offer), receive_opcode, null, 1, 0, mime, fds[1]);
         _ = std.os.linux.close(fds[1]);
         _ = self.api.wl_display_flush(self.display);
         defer _ = std.os.linux.close(fds[0]);
@@ -634,19 +750,49 @@ pub const WaylandConnection = struct {
                 _ = self.api.wl_display_dispatch_pending(self.display);
             }
         }
-        if (self.clip_read) |old| self.allocator.free(old);
-        self.clip_read = self.allocator.dupe(u8, out.items) catch null;
-        return self.clip_read;
+        if (slot.*) |old| self.allocator.free(old);
+        slot.* = self.allocator.dupe(u8, out.items) catch null;
+        return slot.*;
     }
 
     // -- cursor and displays --------------------------------------------
 
     pub fn set_cursor_style(self: *WaylandConnection, style: CursorStyle) void {
+        // Windows report their cursor every frame; the compositor only needs changes.
+        // A new pointer enter re-applies it, because the compositor resets it then.
+        if (style == self.cursor_style) return;
         self.cursor_style = style;
         self.apply_cursor();
         self.flush();
     }
 };
+
+/// `wp_cursor_shape_device_v1.shape` for a style, as in gpui_linux `to_shape`.
+fn cursorShape(style: CursorStyle) u32 {
+    return switch (style) {
+        .arrow, .none => 1,
+        .context_menu => 2,
+        .pointing_hand => 4,
+        .crosshair => 8,
+        .i_beam => 9,
+        .i_beam_cursor_for_vertical_layout => 10,
+        .drag_link => 11,
+        .drag_copy => 12,
+        .operation_not_allowed => 15,
+        .open_hand => 16,
+        .closed_hand => 17,
+        .resize_right => 18,
+        .resize_up => 19,
+        .resize_down => 22,
+        .resize_left => 25,
+        .resize_left_right => 26,
+        .resize_up_down => 27,
+        .resize_up_right_down_left => 28,
+        .resize_up_left_down_right => 29,
+        .resize_column => 30,
+        .resize_row => 31,
+    };
+}
 
 fn cursorName(style: CursorStyle) [*:0]const u8 {
     return switch (style) {
@@ -689,6 +835,10 @@ fn registryGlobal(data: ?*anyopaque, reg: *proto.Registry, name: u32, iface: [*:
         self.viewporter = api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.viewporter_interface, @as(u32, 1), 0, name, proto.viewporter_interface.name, @as(u32, 1), &proto.viewporter_interface);
     } else if (std.mem.eql(u8, iface_name, "wp_fractional_scale_manager_v1")) {
         self.frac_manager = api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.fractional_scale_manager_interface, @as(u32, 1), 0, name, proto.fractional_scale_manager_interface.name, @as(u32, 1), &proto.fractional_scale_manager_interface);
+    } else if (std.mem.eql(u8, iface_name, "wp_cursor_shape_manager_v1")) {
+        self.cursor_shape_manager = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.cursor_shape_manager_interface, @as(u32, 1), 0, name, proto.cursor_shape_manager_interface.name, @as(u32, 1), @as(?*anyopaque, null)));
+    } else if (std.mem.eql(u8, iface_name, "zwp_primary_selection_device_manager_v1")) {
+        self.primary_manager = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.primary_device_manager_interface, @as(u32, 1), 0, name, proto.primary_device_manager_interface.name, @as(u32, 1), @as(?*anyopaque, null)));
     } else if (std.mem.eql(u8, iface_name, "wl_output")) {
         if (self.output_count < max_outputs) {
             const ver: u32 = @min(version, 3);
@@ -867,6 +1017,7 @@ fn keyboardLeave(data: ?*anyopaque, _: *proto.Keyboard, _: u32, surface: *proto.
     if (self.keyboard_focus != w) return;
     self.keyboard_focus = null;
     self.repeat.active = false;
+    if (self.compose) |*c| c.reset();
     w.base.emit_active(false);
 }
 
@@ -902,13 +1053,13 @@ fn keyboardRepeatInfo(data: ?*anyopaque, _: *proto.Keyboard, rate: i32, delay: i
 
 fn dataOfferOffer(data: ?*anyopaque, _: *proto.DataOffer, mime: [*:0]const u8) callconv(.c) void {
     const self = pointerConn(data);
-    self.offer_mimes |= WaylandConnection.offer_mime_bit(std.mem.span(mime));
+    self.clipboard_slot.incoming_mimes |= WaylandConnection.offer_mime_bit(std.mem.span(mime));
 }
 
 fn dataDeviceOffer(data: ?*anyopaque, _: *proto.DataDevice, offer: *proto.DataOffer) callconv(.c) void {
     const self = pointerConn(data);
-    self.cur_offer = offer;
-    self.offer_mimes = 0;
+    self.clipboard_slot.incoming = offer;
+    self.clipboard_slot.incoming_mimes = 0;
     _ = self.api.wl_proxy_add_listener(@ptrCast(offer), &WaylandConnection.data_offer_listener, self);
 }
 
@@ -919,11 +1070,49 @@ fn dataDeviceDrop(_: ?*anyopaque, _: *proto.DataDevice) callconv(.c) void {}
 
 fn dataDeviceSelection(data: ?*anyopaque, _: *proto.DataDevice, offer: ?*proto.DataOffer) callconv(.c) void {
     const self = pointerConn(data);
-    self.cur_offer = offer;
-    if (offer == null) self.offer_mimes = 0;
-    if (offer != null and self.owning_selection) {
-        // Another client took the selection; our offer is dead.
-        self.owning_selection = false;
+    // wl_data_offer.destroy is request 2. Ownership ends with the source's `cancelled`.
+    self.commit_offer(&self.clipboard_slot, offer, 2);
+}
+
+fn primaryOfferOffer(data: ?*anyopaque, _: *proto.PrimaryOffer, mime: [*:0]const u8) callconv(.c) void {
+    const self = pointerConn(data);
+    self.primary_slot.incoming_mimes |= WaylandConnection.offer_mime_bit(std.mem.span(mime));
+}
+
+fn primaryDeviceOffer(data: ?*anyopaque, _: *proto.PrimaryDevice, offer: *proto.PrimaryOffer) callconv(.c) void {
+    const self = pointerConn(data);
+    self.primary_slot.incoming = offer;
+    self.primary_slot.incoming_mimes = 0;
+    _ = self.api.wl_proxy_add_listener(@ptrCast(offer), &WaylandConnection.primary_offer_listener, self);
+}
+
+fn primaryDeviceSelection(data: ?*anyopaque, _: *proto.PrimaryDevice, offer: ?*proto.PrimaryOffer) callconv(.c) void {
+    const self = pointerConn(data);
+    self.commit_offer(&self.primary_slot, offer, 1);
+}
+
+fn primarySourceSend(data: ?*anyopaque, _: *proto.PrimarySource, _: [*:0]const u8, fd_: i32) callconv(.c) void {
+    const self = pointerConn(data);
+    write_all_and_close(fd_, self.primary_offer_text);
+}
+
+fn primarySourceCancelled(data: ?*anyopaque, source: *proto.PrimarySource) callconv(.c) void {
+    const self = pointerConn(data);
+    self.owning_primary = false;
+    if (self.primary_source == source) {
+        self.api.wl_proxy_destroy(@ptrCast(source));
+        self.primary_source = null;
+    }
+}
+
+fn write_all_and_close(fd_: i32, maybe_text: ?[]const u8) void {
+    defer _ = std.os.linux.close(fd_);
+    const text = maybe_text orelse return;
+    var off: usize = 0;
+    while (off < text.len) {
+        const n = std.os.linux.write(fd_, text[off..].ptr, text.len - off);
+        if (@as(isize, @bitCast(n)) <= 0) break;
+        off += n;
     }
 }
 
@@ -931,14 +1120,7 @@ fn dataSourceTarget(_: ?*anyopaque, _: *proto.DataSource, _: ?[*:0]const u8) cal
 
 fn dataSourceSend(data: ?*anyopaque, _: *proto.DataSource, _: [*:0]const u8, fd_: i32) callconv(.c) void {
     const self = pointerConn(data);
-    defer _ = std.os.linux.close(fd_);
-    const text = self.clip_offer orelse return;
-    var off: usize = 0;
-    while (off < text.len) {
-        const n = std.os.linux.write(fd_, text[off..].ptr, text.len - off);
-        if (@as(isize, @bitCast(n)) <= 0) break;
-        off += n;
-    }
+    write_all_and_close(fd_, self.clip_offer);
 }
 
 fn dataSourceCancelled(data: ?*anyopaque, source: *proto.DataSource) callconv(.c) void {
@@ -967,6 +1149,14 @@ const ShmBuffer = struct {
     w: u32 = 0,
     h: u32 = 0,
     busy: bool = false,
+};
+
+const PendingConfigure = struct {
+    width: i32 = 0,
+    height: i32 = 0,
+    maximized: bool = false,
+    fullscreen: bool = false,
+    resizing: bool = false,
 };
 
 pub const WaylandWindow = struct {
@@ -998,6 +1188,10 @@ pub const WaylandWindow = struct {
     renderer: cpu.CpuRenderer,
     /// Set when this window draws with the GPU; `atlas` and `renderer` then stay idle.
     gpu_window: ?window_renderer.GpuWindow = null,
+    /// State from xdg_toplevel.configure, applied atomically by xdg_surface.configure.
+    pending_configure: PendingConfigure = .{},
+    /// Interactive resizes apply at most once per frame, as in GPUI.
+    resize_throttle: bool = false,
 
     const vtable: platform.PlatformWindow.VTable = .{
         .bounds = bounds,
@@ -1166,6 +1360,7 @@ pub const WaylandWindow = struct {
     fn frameDone(data: ?*anyopaque, callback: *proto.Callback, _: u32) callconv(.c) void {
         const self: *WaylandWindow = @ptrCast(@alignCast(data.?));
         if (self.frame_callback == callback) self.frame_callback = null;
+        self.resize_throttle = false;
         self.conn.api.wl_proxy_destroy(@ptrCast(callback));
     }
 
@@ -1404,6 +1599,13 @@ pub const WaylandWindow = struct {
     fn xdgSurfaceConfigure(data: ?*anyopaque, xs: *proto.XdgSurface, serial: u32) callconv(.c) void {
         const self: *WaylandWindow = @ptrCast(@alignCast(data.?));
         const a = self.api();
+        const pending = self.pending_configure;
+        self.maximized = pending.maximized;
+        self.fullscreen = pending.fullscreen;
+        if (!(pending.resizing and self.resize_throttle)) {
+            if (pending.resizing) self.resize_throttle = true;
+            self.apply_configured_size(pending.width, pending.height);
+        }
         _ = a.wl_proxy_marshal_flags(@ptrCast(xs), 4, null, a.wl_proxy_get_version(@ptrCast(xs)), 0, serial);
         const first = !self.configured;
         self.configured = true;
@@ -1413,30 +1615,35 @@ pub const WaylandWindow = struct {
         }
     }
 
+    fn apply_configured_size(self: *WaylandWindow, width: i32, height: i32) void {
+        if (self.closed or width <= 0 or height <= 0) return;
+        const w: f32 = @floatFromInt(width);
+        const h: f32 = @floatFromInt(height);
+        if (w == self.size.width and h == self.size.height) return;
+        self.size = .{ .width = w, .height = h };
+        self.apply_buffer_scale();
+        self.update_opaque_region();
+        self.base.emit_resize(self.size, self.scale);
+        // Arms the frame callback that releases `resize_throttle`.
+        self.frame_wanted = true;
+    }
+
     fn xdgToplevelConfigure(data: ?*anyopaque, _: *proto.XdgToplevel, width: i32, height: i32, states: ?*anyopaque) callconv(.c) void {
         const self: *WaylandWindow = @ptrCast(@alignCast(data.?));
         if (self.closed) return;
-        self.maximized = false;
-        self.fullscreen = false;
+        var pending: PendingConfigure = .{ .width = width, .height = height };
         if (states) |raw| {
             const arr: *const proto.WlArray = @ptrCast(@alignCast(raw));
             if (arr.data) |items| {
-                for (0..arr.size / 4) |i| {
-                    if (items[i] == proto.XDG_STATE_MAXIMIZED) self.maximized = true;
-                    if (items[i] == 2) self.fullscreen = true; // xdg_toplevel.state.fullscreen
-                }
+                for (0..arr.size / 4) |i| switch (items[i]) {
+                    proto.XDG_STATE_MAXIMIZED => pending.maximized = true,
+                    2 => pending.fullscreen = true, // xdg_toplevel.state.fullscreen
+                    3 => pending.resizing = true, // xdg_toplevel.state.resizing
+                    else => {},
+                };
             }
         }
-        if (width > 0 and height > 0) {
-            const w: f32 = @floatFromInt(width);
-            const h: f32 = @floatFromInt(height);
-            if (w != self.size.width or h != self.size.height) {
-                self.size = .{ .width = w, .height = h };
-                self.apply_buffer_scale();
-                self.update_opaque_region();
-                self.base.emit_resize(self.size, self.scale);
-            }
-        }
+        self.pending_configure = pending;
     }
 
     fn xdgToplevelClose(data: ?*anyopaque, _: *proto.XdgToplevel) callconv(.c) void {

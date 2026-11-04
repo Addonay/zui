@@ -13,6 +13,7 @@ const window_mod = @import("../../window.zig");
 const color = @import("../../color.zig");
 const cpu = @import("../../renderer/cpu.zig");
 const window_renderer = @import("../../renderer/window_renderer.zig");
+const xkb = @import("xkb.zig");
 const proto = @import("x11_proto.zig");
 const dl = @import("dl.zig");
 const input = @import("input.zig");
@@ -68,6 +69,11 @@ pub const X11Connection = struct {
     root: XWindow,
     gpu_context: ?*window_renderer.GpuContext = null,
     gpu_probed: bool = false,
+    compose: ?xkb.Compose = null,
+    /// The physical key held down, to tell auto-repeat from a new press.
+    held_keycode: u32 = 0,
+    primary_offer: ?[]const u8 = null,
+    owning_primary: bool = false,
     /// Hidden window that owns the clipboard and receives selection replies.
     helper: XWindow,
     atoms: Atoms,
@@ -102,6 +108,7 @@ pub const X11Connection = struct {
             return error.CannotOpenDisplay;
         };
         _ = api.XSetErrorHandler(errorHandler);
+        if (api.XkbSetDetectableAutoRepeat) |set_detectable| _ = set_detectable(dpy, 1, null);
         const screen = api.XDefaultScreen(dpy);
         const root = api.XRootWindow(dpy, screen);
         const helper = api.XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0);
@@ -139,6 +146,7 @@ pub const X11Connection = struct {
             .atoms = atoms,
             .scale = input.env_scale() orelse xftScale(api, dpy),
         };
+        self.compose = xkb.Compose.init();
         return self;
     }
 
@@ -255,6 +263,8 @@ pub const X11Connection = struct {
         }
         if (self.clip_offer) |c| self.allocator.free(c);
         if (self.clip_read) |c| self.allocator.free(c);
+        if (self.primary_offer) |c| self.allocator.free(c);
+        if (self.compose) |*c| c.deinit();
         _ = self.api.XDestroyWindow(self.display, self.helper);
         _ = self.api.XCloseDisplay(self.display);
         self.lib.close();
@@ -351,6 +361,8 @@ pub const X11Connection = struct {
     }
 
     pub fn set_cursor_style(self: *X11Connection, style: CursorStyle) void {
+        // Windows report their cursor every frame; new windows apply it when created.
+        if (style == self.cursor_style) return;
         self.cursor_style = style;
         for (self.windows.items) |w| w.apply_cursor();
         self.flush();
@@ -361,8 +373,14 @@ pub const X11Connection = struct {
     fn translate(self: *X11Connection, ev: XEvent) void {
         switch (ev.type) {
             proto.SelectionRequest => return self.serve_selection(ev.xselectionrequest),
+            // The layout changed; Xlib keeps its old key map until told otherwise.
+            proto.MappingNotify => {
+                var mapping = ev.xmapping;
+                _ = self.api.XRefreshKeyboardMapping(&mapping);
+                return;
+            },
             proto.SelectionClear => {
-                self.owning_selection = false;
+                self.selection_lost(ev.xselectionclear.selection);
                 return;
             },
             proto.SelectionNotify => return,
@@ -494,7 +512,6 @@ pub const X11Connection = struct {
                 if (input.evdev_key(ev.keycode - 8, shift)) |info| name = info.name;
             }
         }
-        const key_name = name orelse return;
         var text_buf: [64]u8 = undefined;
         var text_len: usize = 0;
         if (pressed) {
@@ -514,8 +531,27 @@ pub const X11Connection = struct {
                 }
             }
         }
-        const text: ?[]const u8 = if (text_len > 0) text_buf[0..text_len] else null;
-        w.emit_key(key_name, text, pressed, false);
+        var text: ?[]const u8 = if (text_len > 0) text_buf[0..text_len] else null;
+        var composed_buf: [32]u8 = undefined;
+        // With detectable auto-repeat a held key sends presses and no releases.
+        const held = pressed and self.held_keycode == ev.keycode;
+        if (pressed) {
+            self.held_keycode = ev.keycode;
+        } else if (self.held_keycode == ev.keycode) {
+            self.held_keycode = 0;
+        }
+        if (pressed and !held and keysym != 0 and !input.is_modifier_keysym(@intCast(keysym))) {
+            if (self.compose) |*c| switch (c.feed(@intCast(keysym), &composed_buf)) {
+                .composing => text = null,
+                .composed => |t| {
+                    text = t;
+                    name = t;
+                },
+                .nothing, .cancelled => {},
+            };
+        }
+        const key_name = name orelse return;
+        w.emit_key(key_name, text, pressed, held);
     }
 
     // -- clipboard ----------------------------------------------------------
@@ -524,15 +560,38 @@ pub const X11Connection = struct {
         const copy = self.allocator.dupe(u8, text) catch return false;
         if (self.clip_offer) |old| self.allocator.free(old);
         self.clip_offer = copy;
-        _ = self.api.XSetSelectionOwner(self.display, self.atoms.clipboard, self.helper, proto.CURRENT_TIME);
-        self.owning_selection = self.api.XGetSelectionOwner(self.display, self.atoms.clipboard) == self.helper;
-        self.flush();
+        self.owning_selection = self.claim_selection(self.atoms.clipboard);
         return self.owning_selection;
+    }
+
+    pub fn set_primary(self: *X11Connection, text: []const u8) bool {
+        const copy = self.allocator.dupe(u8, text) catch return false;
+        if (self.primary_offer) |old| self.allocator.free(old);
+        self.primary_offer = copy;
+        self.owning_primary = self.claim_selection(proto.XA_PRIMARY);
+        return self.owning_primary;
+    }
+
+    fn claim_selection(self: *X11Connection, selection: Atom) bool {
+        _ = self.api.XSetSelectionOwner(self.display, selection, self.helper, proto.CURRENT_TIME);
+        const owned = self.api.XGetSelectionOwner(self.display, selection) == self.helper;
+        self.flush();
+        return owned;
+    }
+
+    fn selection_lost(self: *X11Connection, selection: Atom) void {
+        if (selection == proto.XA_PRIMARY) {
+            self.owning_primary = false;
+        } else {
+            self.owning_selection = false;
+        }
     }
 
     /// Answers a paste request for text we own; anything else is refused.
     fn serve_selection(self: *X11Connection, req: proto.XSelectionRequestEvent) void {
-        if (req.selection != self.atoms.clipboard or !self.owning_selection) return;
+        const is_primary = req.selection == proto.XA_PRIMARY;
+        if (is_primary and !self.owning_primary) return;
+        if (!is_primary and (req.selection != self.atoms.clipboard or !self.owning_selection)) return;
         var notify = std.mem.zeroes(proto.XSelectionEvent);
         notify.type = proto.SelectionNotify;
         notify.display = self.display;
@@ -540,7 +599,7 @@ pub const X11Connection = struct {
         notify.selection = req.selection;
         notify.target = req.target;
         notify.time = req.time;
-        const text = self.clip_offer orelse "";
+        const text = (if (is_primary) self.primary_offer else self.clip_offer) orelse "";
         if (req.target == self.atoms.targets) {
             const supported = [_]Atom{ self.atoms.targets, self.atoms.utf8_string, proto.XA_STRING, self.atoms.text };
             _ = self.api.XChangeProperty(self.display, req.requestor, req.property, proto.XA_ATOM, 32, proto.PROP_MODE_REPLACE, @ptrCast(&supported), 4);
@@ -560,8 +619,17 @@ pub const X11Connection = struct {
     /// Requests the clipboard as UTF-8 and waits up to 500 ms for the reply.
     pub fn get_clipboard(self: *X11Connection) ?[]const u8 {
         if (self.owning_selection) return self.clip_offer;
-        if (self.api.XGetSelectionOwner(self.display, self.atoms.clipboard) == 0) return null;
-        _ = self.api.XConvertSelection(self.display, self.atoms.clipboard, self.atoms.utf8_string, self.atoms.paste, self.helper, proto.CURRENT_TIME);
+        return self.request_selection(self.atoms.clipboard);
+    }
+
+    pub fn get_primary(self: *X11Connection) ?[]const u8 {
+        if (self.owning_primary) return self.primary_offer;
+        return self.request_selection(proto.XA_PRIMARY);
+    }
+
+    fn request_selection(self: *X11Connection, selection: Atom) ?[]const u8 {
+        if (self.api.XGetSelectionOwner(self.display, selection) == 0) return null;
+        _ = self.api.XConvertSelection(self.display, selection, self.atoms.utf8_string, self.atoms.paste, self.helper, proto.CURRENT_TIME);
         self.flush();
         const deadline = input.now_ms() + 500;
         var ev: XEvent = undefined;
@@ -573,13 +641,11 @@ pub const X11Connection = struct {
                 switch (ev.type) {
                     proto.SelectionNotify => {
                         const note = ev.xselection;
-                        if (note.selection != self.atoms.clipboard or note.property == 0) return null;
+                        if (note.selection != selection or note.property == 0) return null;
                         return self.read_paste_property();
                     },
                     proto.SelectionRequest => self.serve_selection(ev.xselectionrequest),
-                    proto.SelectionClear => {
-                        self.owning_selection = false;
-                    },
+                    proto.SelectionClear => self.selection_lost(ev.xselectionclear.selection),
                     else => {
                         if (self.stash_len < self.stash.len) {
                             self.stash[self.stash_len] = ev;

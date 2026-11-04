@@ -4,8 +4,7 @@
 //! evdev says `y` where the user pressed `z`. xkbcommon compiles the
 //! compositor's keymap (sent over the `wl_keyboard.keymap` fd) and answers
 //! per-key questions in the USER's layout: keysym for bindings, UTF-8 for
-//! text. Pattern follows gpui_linux (xkb state + compose-less core path);
-//! dead-key composition state machines are future work.
+//! text. Pattern follows gpui_linux. `Compose` adds dead keys and the Compose key.
 //!
 //! Absent libxkbcommon, the backend falls back to the evdev tables, so
 //! tests and minimal systems keep working.
@@ -176,6 +175,155 @@ pub const Xkb = struct {
         return @intCast(@min(n, out.len));
     }
 };
+
+pub const ComposeTable = opaque {};
+pub const ComposeState = opaque {};
+
+/// Result of feeding one pressed key to the compose state machine.
+pub const ComposeResult = union(enum) {
+    /// The key is not part of a sequence.
+    nothing,
+    /// A sequence is in progress; the key produces no text yet.
+    composing,
+    /// A sequence finished with this text, stored in the buffer passed to `feed`.
+    composed: []const u8,
+    /// The key broke a sequence. It has been fed again, so it may start a new one.
+    cancelled,
+};
+
+/// Dead keys and the Compose key (libxkbcommon's compose API). It works on keysyms,
+/// so both the Wayland and the X11 backends use it. Absent a table for the locale,
+/// `init` returns null and keys simply produce their own text.
+pub const Compose = struct {
+    lib: dl.Library,
+    ctx: *Context,
+    table: *ComposeTable,
+    state: *ComposeState,
+    context_unref: XkbContextUnrefFn,
+    table_unref: *const fn (*ComposeTable) callconv(.c) void,
+    state_unref: *const fn (*ComposeState) callconv(.c) void,
+    state_feed: *const fn (*ComposeState, u32) callconv(.c) c_uint,
+    state_reset: *const fn (*ComposeState) callconv(.c) void,
+    state_get_status: *const fn (*ComposeState) callconv(.c) c_uint,
+    state_get_utf8: *const fn (*ComposeState, [*]u8, usize) callconv(.c) c_int,
+
+    const status_composing = 1;
+    const status_composed = 2;
+    const status_cancelled = 3;
+
+    /// Uses the POSIX locale precedence, like SDL3 (GPUI reads only LC_CTYPE, which most
+    /// systems leave unset, and then gets the C table without dead-key sequences).
+    pub fn init() ?Compose {
+        const locale: [*:0]const u8 = std.c.getenv("LC_ALL") orelse std.c.getenv("LC_CTYPE") orelse std.c.getenv("LANG") orelse "C";
+        return init_locale(locale);
+    }
+
+    pub fn init_locale(locale: [*:0]const u8) ?Compose {
+        var lib = dl.Library.open(xkb_lib_names) orelse return null;
+        const context_new = lib.lookup(XkbContextNewFn, "xkb_context_new");
+        const context_unref = lib.lookup(XkbContextUnrefFn, "xkb_context_unref");
+        const table_new = lib.lookup(*const fn (*Context, [*:0]const u8, c_uint) callconv(.c) ?*ComposeTable, "xkb_compose_table_new_from_locale");
+        const table_unref = lib.lookup(*const fn (*ComposeTable) callconv(.c) void, "xkb_compose_table_unref");
+        const state_new = lib.lookup(*const fn (*ComposeTable, c_uint) callconv(.c) ?*ComposeState, "xkb_compose_state_new");
+        const state_unref = lib.lookup(*const fn (*ComposeState) callconv(.c) void, "xkb_compose_state_unref");
+        const state_feed = lib.lookup(*const fn (*ComposeState, u32) callconv(.c) c_uint, "xkb_compose_state_feed");
+        const state_reset = lib.lookup(*const fn (*ComposeState) callconv(.c) void, "xkb_compose_state_reset");
+        const state_get_status = lib.lookup(*const fn (*ComposeState) callconv(.c) c_uint, "xkb_compose_state_get_status");
+        const state_get_utf8 = lib.lookup(*const fn (*ComposeState, [*]u8, usize) callconv(.c) c_int, "xkb_compose_state_get_utf8");
+        const fail = context_new == null or context_unref == null or table_new == null or table_unref == null or state_new == null or state_unref == null or state_feed == null or state_reset == null or state_get_status == null or state_get_utf8 == null;
+        if (fail) {
+            lib.close();
+            return null;
+        }
+        const ctx = context_new.?(0) orelse {
+            lib.close();
+            return null;
+        };
+        const table = table_new.?(ctx, locale, 0) orelse {
+            context_unref.?(ctx);
+            lib.close();
+            return null;
+        };
+        const state = state_new.?(table, 0) orelse {
+            table_unref.?(table);
+            context_unref.?(ctx);
+            lib.close();
+            return null;
+        };
+        return .{
+            .lib = lib,
+            .ctx = ctx,
+            .table = table,
+            .state = state,
+            .context_unref = context_unref.?,
+            .table_unref = table_unref.?,
+            .state_unref = state_unref.?,
+            .state_feed = state_feed.?,
+            .state_reset = state_reset.?,
+            .state_get_status = state_get_status.?,
+            .state_get_utf8 = state_get_utf8.?,
+        };
+    }
+
+    pub fn deinit(self: *Compose) void {
+        self.state_unref(self.state);
+        self.table_unref(self.table);
+        self.context_unref(self.ctx);
+        self.lib.close();
+    }
+
+    /// Abandons a sequence in progress (focus left the window).
+    pub fn reset(self: *Compose) void {
+        self.state_reset(self.state);
+    }
+
+    /// Feeds a pressed, non-modifier keysym. Composed text is written to `out`.
+    pub fn feed(self: *Compose, keysym: u32, out: []u8) ComposeResult {
+        _ = self.state_feed(self.state, keysym);
+        switch (self.state_get_status(self.state)) {
+            status_composing => return .composing,
+            status_composed => {
+                const n = self.state_get_utf8(self.state, out.ptr, out.len);
+                if (n <= 0 or n >= out.len) return .nothing;
+                return .{ .composed = out[0..@intCast(n)] };
+            },
+            status_cancelled => {
+                // As in GPUI: the breaking key may itself begin a new sequence.
+                _ = self.state_feed(self.state, keysym);
+                return .cancelled;
+            },
+            else => return .nothing,
+        }
+    }
+};
+
+const test_dead_acute: u32 = 0xfe51;
+
+test "compose turns a dead key and a letter into one character" {
+    var compose = Compose.init_locale("en_US.UTF-8") orelse return error.SkipZigTest;
+    defer compose.deinit();
+    var buf: [32]u8 = undefined;
+    try std.testing.expect(compose.feed(test_dead_acute, &buf) == .composing);
+    const result = compose.feed('e', &buf);
+    try std.testing.expect(result == .composed);
+    try std.testing.expectEqualStrings("\u{e9}", result.composed);
+    // Plain keys pass through afterwards.
+    try std.testing.expect(compose.feed('e', &buf) == .nothing);
+}
+
+test "compose reports a broken sequence and restarts from the breaking key" {
+    var compose = Compose.init_locale("en_US.UTF-8") orelse return error.SkipZigTest;
+    defer compose.deinit();
+    var buf: [32]u8 = undefined;
+    try std.testing.expect(compose.feed(test_dead_acute, &buf) == .composing);
+    // A digit cannot follow a dead acute.
+    try std.testing.expect(compose.feed(0xff51, &buf) == .cancelled);
+    try std.testing.expect(compose.feed('e', &buf) == .nothing);
+    // Focus loss abandons a sequence.
+    try std.testing.expect(compose.feed(test_dead_acute, &buf) == .composing);
+    compose.reset();
+    try std.testing.expect(compose.feed('e', &buf) == .nothing);
+}
 
 test "xkb maps evdev keys through the compiled us keymap" {
     var x = Xkb.init() catch return error.SkipZigTest;
