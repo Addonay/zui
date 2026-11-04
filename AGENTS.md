@@ -65,7 +65,8 @@ GPUI's `hello_world.rs` (verified via headless snapshot).
 | img / svg / assets (stb_image, nanosvg) | done (sync loading; GIF first frame only) |
 | anchored, deferred, canvas, animation (+easings), spring | done |
 | list (variable height), uniform_list | done (agent stopped right after tests passed; verify) |
-| GPU renderer on zicr (`src/renderer/gpu.zig`, `shaders.glsl`, `-Dgpu=true`) | **WIP, not working yet** (see §7) |
+| GPU layer (`src/gpu/`, vendored from zicr at `87fe622`; zicr dependency removed) | done |
+| GPU renderer (`src/renderer/gpu.zig`, `shaders.glsl`, committed `shaders_gen.zig`) | done on Vulkan: default on Linux Wayland/X11, CPU fallback; subpixel sprites and surfaces not drawn (see §7) |
 | examples | 8 ported: hello_world, pattern, tree, text_layout, scrollable, ownership_post, active_state_bug, gradient |
 | macOS / Windows / web platforms | NOT started |
 
@@ -95,7 +96,12 @@ src/platform.zig         Platform / PlatformWindow vtable interfaces + shared ty
 src/platform/headless.zig  headless/test platform
 src/platform/linux.zig + linux/{wayland,wayland_proto,x11,x11_proto,xkb,input,dl}.zig
 src/renderer/cpu.zig     CPU renderer
-src/renderer/gpu.zig gpu_test.zig shaders.glsl   GPU renderer (WIP)
+src/gpu/                 portable GPU layer (Vulkan/D3D12/D3D11/Metal/GL/WebGPU), vendored from zicr
+src/renderer/gpu.zig     GPU renderer + GpuAtlas; shaders.glsl -> shaders_gen.zig (committed)
+src/renderer/vulkan.zig  libvulkan loading, instance/device, per-window swapchains
+src/renderer/window_renderer.zig  GpuContext (shared per connection) + GpuWindow
+src/renderer/gpu_test.zig  GPU vs CPU pixel comparison (skips without Vulkan 1.3)
+src/renderer/shdc/       generator that turns sokol-shdc output into shaders_gen.zig
 examples/*.zig           line-by-line ports of crates/gpui/examples/*.rs
 third_party/             stb_image, nanosvg, images.c shim
 ```
@@ -109,9 +115,10 @@ third_party/             stb_image, nanosvg, images.c shim
   - `cozmic` — `git+https://github.com/Addonay/cozmic.git#bbc0f4f282acd024d1dc0b5e4d16fc4b08fcb6b0`
     (its own deps: ezi_code, harfbuzz 14.1.0, freetype 2.14.3, zlib 1.3.1, libpng 1.6.50)
   - `zafi` — `git+https://github.com/Addonay/zafi.git#04086f7a21f120a5ea52f921fb2034d75e10264f`
-  - `zicr` (lazy) — `git+https://github.com/Addonay/zicr.git#87fe62228af2b69527ccd503da035c86b490ef42`
-    (its lazy dep `sokol_tools_bin` provides the `sokol-shdc` shader compiler)
-  - Removed from the old tree: `zlay`, `vellz`, `wgpu`.
+  - `sokol_tools_bin` (lazy) — the `sokol-shdc` binaries, fetched only by
+    `zig build shaders -Dregen-shaders=true`. Run that after editing `shaders.glsl`;
+    normal builds use the committed `src/renderer/shaders_gen.zig`.
+  - Removed: `zicr` (backends copied to `src/gpu/`, see §1.2), `zlay`, `vellz`, `wgpu`.
 - **Network quirk of the cloud container used**: Zig's own fetcher could not
   get through the HTTPS proxy ("unable to discover remote git server
   capabilities"), and GitHub archive tarballs returned 403. Workaround used:
@@ -131,7 +138,7 @@ third_party/             stb_image, nanosvg, images.c shim
 
 | Path | Source | Why |
 | --- | --- | --- |
-| `.references/zed` | `https://github.com/zed-industries/zed` (sparse: `crates/gpui`, `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_wgpu`, `gpui_web`, `gpui_platform`, `gpui_macros`) at `f816e1f` (2026-11-01) | THE reference. Every port follows these files. |
+| `.references/gpui` (local name; `.references/zed` in the cloud container) | `https://github.com/zed-industries/zed` (sparse: `crates/gpui`, `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_wgpu`, `gpui_web`, `gpui_platform`, `gpui_macros`) at `f816e1f` (2026-11-01) | THE reference. Every port follows these files. |
 | `.references/zafi` | `https://github.com/Addonay/zafi` | layout API |
 | `.references/cozmic` | `https://github.com/Addonay/cozmic` | text API |
 | `.references/zicr` | `https://github.com/Addonay/zicr` | GPU layer, shader pipeline, Vulkan bootstrap example (`tools/vk_smoke.zig`) |
@@ -247,35 +254,33 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   Underline alpha is squared exactly like GPUI's shader (looks like a GPUI quirk).
   Benchmarks (4 vCPU Xeon, 1080p, ReleaseFast, 4 threads): 10k opaque rects
   5.2 ms, 10k rounded 21 ms, 10k gradients 231 ms (slowest path).
-- **GPU renderer (WIP)** — design rule: ZUI renderer on top of `zicr.gpu`
-  backends only (Vulkan on Linux/Windows/Android, D3D12 on Windows, Metal on
-  macOS/iOS, GL/GLES as fallback, WebGPU for web/wgpu-native). Never import
-  zicr's `render2d`; import the standalone module `zicr_dep.module("gpu")`.
-  Native handle acquisition (Vulkan instance/surface/swapchain, Metal layer,
-  DXGI swapchain, GL context, WebGPU surface) is per-platform code in ZUI.
-  Files: `src/renderer/gpu.zig` + `shaders.glsl` (sokol-shdc
-  annotated GLSL, port of `gpui_wgpu/src/shaders.wgsl`), gated by
-  `-Dgpu=true` with a `gpu-test` step comparing GPU vs CPU pixels on lavapipe.
-  The agent was stopped while fixing a compile error: importing the full
-  `zicr` module pulls in zicr's `render2d`, which doesn't compile on 0.17 here;
-  the fix in progress was to use `zicr_dep.module("gpu")` (the standalone GPU
-  module) instead. Vulkan bootstrap (`vulkan_surface.zig`) and wiring into the
-  Linux windows were NOT done. Plan: port `gpui_wgpu/src/wgpu_renderer.rs`
-  batching onto zicr; instance data via instanced vertex attributes (portable
-  to GL/WebGL); persistent growable instance buffer; GpuAtlas implementing
-  PlatformAtlas with dirty-region uploads.
+- **GPU renderer**: port of `gpui_wgpu`'s batching on the vendored `src/gpu/` layer
+  (never zicr's `render2d`). Instances are per-instance vertex attributes, so it stays
+  portable to GL/WebGL. One `GpuContext` (device, atlas, pipelines) per connection, one
+  `GpuWindow` (swapchain) per window; a window that cannot get one uses the CPU renderer.
+  Selection: `ZUI_RENDERER=cpu` forces CPU, `=gpu` also accepts software Vulkan, the default
+  takes hardware devices only (the CPU renderer beats llvmpipe). Debug builds log the choice.
+  Requires Vulkan 1.3 with dynamic rendering, synchronization2 and buffer device address.
+  Wayland uses mailbox and the existing frame-callback pacing, so an occluded window never
+  blocks the main thread; X11 uses FIFO. Frame upload cap: 32 MB (`error.FrameTooLarge`,
+  about 200k quads). Pattern stripes take their remainder from the instance because the
+  packed height exceeds float precision and in-shader `fmod` drifts.
+  Not drawn yet: subpixel sprites (need dual-source blending; nothing in ZUI emits them today)
+  and platform surfaces. No device-lost recovery: a failed frame logs and retries.
+  `ZUI_VULKAN_VALIDATION=1` enables the Khronos layer when installed (it was not on the
+  machine used, so the renderer has not been run under native validation).
+  Test on software Vulkan: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`;
+  `ZUI_GPU_TEST_DUMP=dir` writes each GPU/CPU pair as PPM.
 - **Headless snapshots**: `ZUI_HEADLESS=1 ZUI_SNAPSHOT=out.ppm zig build run-<example>`.
   `ZUI_SCALE=2` sets the headless scale factor.
 
 ## 8. Known gaps / next steps (in priority order)
 
-1. Finish the GPU renderer on `zicr.gpu` backends only (see §7): switch the
-   build to `zicr_dep.module("gpu")`, add Vulkan surface/swapchain bootstrap for
-   Wayland/X11 and wire it into the Linux windows (CPU renderer stays the
-   fallback), then macOS (Metal backend) and Windows (D3D12, Vulkan fallback)
-   platforms, GL/GLES fallback, and web (WebGPU backend) — GPUI's
-   `gpui_macos` / `gpui_windows` are the references; old ZUI had cocoa/win32
-   skeletons in history.
+1. Other GPU platforms, using the backends already in `src/gpu/`: macOS (Metal), Windows
+   (D3D12, Vulkan fallback), GL/GLES fallback, web (WebGPU) — GPUI's `gpui_macos` /
+   `gpui_windows` are the references; old ZUI had cocoa/win32 skeletons in history.
+   `.github/workflows` is stale (`zig build smoke`, Windows/macOS checks, `-Daccesskit`)
+   and predates the port.
 2. Div: drag & drop (`on_drag`, `on_drop`, `drag_over`), tooltips,
    `on_file_drop`, pressure/pinch/back-gesture listeners, `on_aux_click`,
    `on_mouse_up_out`, `cached` views. `with_animation` is not yet aliased on

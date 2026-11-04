@@ -1,17 +1,14 @@
-//! GPU renderer on zicr: a port of gpui_wgpu/src/wgpu_renderer.rs and wgpu_atlas.rs.
+//! GPU renderer on the vendored `gpu` layer: a port of gpui_wgpu/src/wgpu_renderer.rs and wgpu_atlas.rs.
 //! The batching, draw order, instance packing and path compositing follow the wgpu
 //! renderer; shader math lives in shaders.glsl (a port of shaders.wgsl). Instances are
 //! per-instance vertex attributes, so the renderer needs no storage buffers.
 const std = @import("std");
-const zui = @import("zui");
-const zicr = @import("zicr");
-const shaders = @import("zui_shaders");
-
-const gpu = zicr.gpu;
-const scene = zui.scene;
-const atlas = zui.atlas;
-const geometry = zui.geometry;
-const color = zui.color;
+const gpu = @import("../gpu/root.zig");
+const shaders = @import("shaders_gen.zig");
+const scene = @import("../scene.zig");
+const atlas = @import("../atlas.zig");
+const geometry = @import("../geometry.zig");
+const color = @import("../color.zig");
 
 const Bounds = geometry.Bounds;
 const Corners = geometry.Corners;
@@ -28,6 +25,8 @@ const AtlasTile = atlas.AtlasTile;
 const TileBuilder = atlas.TileBuilder;
 const PlatformAtlas = atlas.PlatformAtlas;
 
+const TargetSize = struct { width: u32, height: u32 };
+
 /// Where a frame is drawn.
 pub const Target = union(enum) {
     /// A swapchain image acquired for this frame. Its depth format is ignored: the renderer draws without depth.
@@ -41,7 +40,7 @@ pub const Target = union(enum) {
         height: u32,
     };
 
-    fn size(self: Target) struct { width: u32, height: u32 } {
+    fn size(self: Target) TargetSize {
         return switch (self) {
             .swapchain => |sc| .{ .width = sc.width, .height = sc.height },
             .attachment => |a| .{ .width = a.width, .height = a.height },
@@ -59,6 +58,8 @@ pub const Options = struct {
     grayscale_enhanced_contrast: f32 = 1.0,
     /// Requested MSAA sample count for path rasterization; falls back to 1 when unsupported.
     path_sample_count: u32 = 4,
+    /// The device's per-frame transient upload capacity. A frame needing more is refused.
+    max_frame_upload_bytes: usize = 32 * 1024 * 1024,
 };
 
 /// Counters for the last `draw` call.
@@ -89,7 +90,7 @@ pub const QuadInstance = extern struct {
     color1: [4]f32,
     /// Background tag, color space, angle or pattern height, first stop percentage.
     bg: [4]f32,
-    /// Second stop percentage, border style (0 solid, 1 dashed).
+    /// Second stop percentage, border style (0 solid, 1 dashed), exact pattern remainder.
     bg2: [4]f32,
 };
 
@@ -159,11 +160,11 @@ const FsParams = extern struct {
 };
 
 /// Attributes for a struct of vec4 fields, one per shader location.
-fn vertexAttrs(comptime T: type) [@typeInfo(T).@"struct".fields.len]gpu.VertexAttr {
+fn vertexAttrs(comptime T: type) [@typeInfo(T).@"struct".field_names.len]gpu.VertexAttr {
     comptime {
-        const fields = @typeInfo(T).@"struct".fields;
-        var out: [fields.len]gpu.VertexAttr = undefined;
-        for (fields, 0..) |field, i| out[i] = .{ .format = .float4, .buffer = 0, .offset = @offsetOf(T, field.name) };
+        const names = @typeInfo(T).@"struct".field_names;
+        var out: [names.len]gpu.VertexAttr = undefined;
+        for (names, 0..) |name, i| out[i] = .{ .format = .float4, .buffer = 0, .offset = @offsetOf(T, name) };
         return out;
     }
 }
@@ -215,7 +216,12 @@ fn backgroundFields(bg: Background) BackgroundFields {
         .solid = hsla4(bg.solid),
         .color0 = hsla4(bg.colors[0].color),
         .color1 = hsla4(bg.colors[1].color),
-        .extra = .{ bg.colors[1].percentage, 0, 0, 0 },
+        .extra = .{
+            bg.colors[1].percentage,
+            0,
+            if (bg.tag == .pattern_slash) @rem(bg.gradient_angle_or_pattern_height, 65535.0) else 0,
+            0,
+        },
     };
 }
 
@@ -231,7 +237,7 @@ fn packQuad(q: *const scene.Quad) QuadInstance {
         .color0 = bg.color0,
         .color1 = bg.color1,
         .bg = bg.meta,
-        .bg2 = .{ bg.extra[0], @floatFromInt(@intFromEnum(q.border_style)), 0, 0 },
+        .bg2 = .{ bg.extra[0], @floatFromInt(@intFromEnum(q.border_style)), bg.extra[2], 0 },
     };
 }
 
@@ -375,6 +381,7 @@ const Upload = struct {
     texture: AtlasTextureId,
     bounds: Bounds(DevicePixels),
     offset: usize,
+    /// Distance between rows in the staging data, including padding.
     row_bytes: u32,
 };
 
@@ -470,7 +477,7 @@ pub const GpuAtlas = struct {
             self.pending_bytes.appendSliceAssumeCapacity(bytes[row * row_bytes ..][0..row_bytes]);
             self.pending_bytes.appendNTimesAssumeCapacity(0, padded_row - row_bytes);
         }
-        try self.pending.append(self.allocator, .{ .texture = texture_id, .bounds = placed.bounds, .offset = offset, .row_bytes = @intCast(row_bytes) });
+        try self.pending.append(self.allocator, .{ .texture = texture_id, .bounds = placed.bounds, .offset = offset, .row_bytes = @intCast(padded_row) });
 
         const tile_id: u32 = self.next_tile_id;
         self.next_tile_id += 1;
@@ -489,12 +496,12 @@ pub const GpuAtlas = struct {
             .label = "zui atlas texture",
         });
         errdefer self.device.destroy(image);
-        const view = try self.device.createView(.{ .texture = .{ .image = image } });
-        errdefer self.device.destroy(view);
+        const texture_view = try self.device.createView(.{ .texture = .{ .image = image } });
+        errdefer self.device.destroy(texture_view);
 
         const textures = &self.storage[@intFromEnum(kind)];
         const index: u32 = @intCast(textures.items.len);
-        try textures.append(self.allocator, .{ .image = image, .view = view, .width = width, .height = height });
+        try textures.append(self.allocator, .{ .image = image, .view = texture_view, .width = width, .height = height });
         return index;
     }
 
@@ -740,8 +747,8 @@ pub const GpuRenderer = struct {
     /// Releases pipelines, shaders, sampler and buffers. The device must still exist.
     pub fn deinit(self: *GpuRenderer) void {
         const device = self.device;
-        inline for (@typeInfo(Programs).@"struct".fields) |field| {
-            const pipeline = @field(self.programs, field.name);
+        inline for (@typeInfo(Programs).@"struct".field_names) |name| {
+            const pipeline = @field(self.programs, name);
             if (pipeline != .invalid) device.destroy(pipeline);
         }
         for (self.shader_descs) |shader| if (shader != .invalid) device.destroy(shader);
@@ -788,8 +795,9 @@ pub const GpuRenderer = struct {
         if (size.width == 0 or size.height == 0) return error.InvalidTargetSize;
         self.stats = .{};
 
-        try sprite_atlas.before_frame();
         try self.pack(sc, sprite_atlas, size.width, size.height);
+        if (self.frame_bytes.items.len + sprite_atlas.pending_bytes.items.len > self.options.max_frame_upload_bytes) return error.FrameTooLarge;
+        try sprite_atlas.before_frame();
         if (self.frame_bytes.items.len > 0) try self.uploadFrame();
         if (self.commands.items.len > 0) {
             var needs_paths = false;
@@ -885,7 +893,7 @@ pub const GpuRenderer = struct {
                     .solid = bg.solid,
                     .color0 = bg.color0,
                     .color1 = bg.color1,
-                    .bg2 = .{ bg.extra[0], 0, 0, 0 },
+                    .bg2 = bg.extra,
                 };
                 self.frame_bytes.appendSliceAssumeCapacity(std.mem.asBytes(&vertex));
             }
@@ -965,7 +973,7 @@ pub const GpuRenderer = struct {
     }
 
     /// Records every command into one pass; path batches end it, render their coverage, and resume.
-    fn record(self: *GpuRenderer, target: Target, sprite_atlas: *GpuAtlas, size: struct { width: u32, height: u32 }, clear: Hsla) void {
+    fn record(self: *GpuRenderer, target: Target, sprite_atlas: *GpuAtlas, size: TargetSize, clear: Hsla) void {
         const rgba = clear.to_rgb();
         var pass = self.beginFramePass(target, .{ .load = .{ .clear = .{ rgba.r, rgba.g, rgba.b, rgba.a } }, .store = .store });
         pass.setViewport(.{ .width = @intCast(size.width), .height = @intCast(size.height) }, .top_left);
@@ -1023,7 +1031,7 @@ pub const GpuRenderer = struct {
         self.stats.draw_calls += 1;
     }
 
-    fn rasterizePaths(self: *GpuRenderer, raster: Range, size: struct { width: u32, height: u32 }, vs: *const VsParams) void {
+    fn rasterizePaths(self: *GpuRenderer, raster: Range, size: TargetSize, vs: *const VsParams) void {
         const target = self.path_target orelse return;
         const color_view = if (target.sample_count > 1) target.msaa_view else target.attachment;
         const resolves: []const gpu.View = if (target.sample_count > 1) &.{target.attachment} else &.{};
@@ -1042,7 +1050,7 @@ pub const GpuRenderer = struct {
         self.stats.draw_calls += 1;
     }
 
-    fn compositePaths(self: *GpuRenderer, pass: *gpu.Pass, composite: Range, size: struct { width: u32, height: u32 }, flip: f32) void {
+    fn compositePaths(self: *GpuRenderer, pass: *gpu.Pass, composite: Range, size: TargetSize, flip: f32) void {
         const target = self.path_target orelse return;
         if (composite.count == 0) return;
         const vs: VsParams = .{ .viewport = .{ @floatFromInt(size.width), @floatFromInt(size.height), flip, 0 } };
