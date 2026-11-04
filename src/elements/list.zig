@@ -825,6 +825,15 @@ pub const ListState = struct {
         return .{ .x = 0, .y = @max(state.total_height() - bounds.size.height, 0) };
     }
 
+    /// The current scroll offset in pixels, for scrollbars, as a non-positive offset.
+    pub fn scroll_px_offset_for_scrollbar(self: ListState) Point(Pixels) {
+        const state = self.inner;
+        if (state.scroll_anchor == null and state.alignment == .bottom) {
+            return .{ .x = 0, .y = -self.max_offset_for_scrollbar().y };
+        }
+        return .{ .x = 0, .y = -state.scroll_top_px(state.logical_scroll_top()) };
+    }
+
     /// The bounds of the viewport in pixels.
     pub fn viewport_bounds(self: ListState) Bounds(Pixels) {
         return self.inner.last_layout_bounds orelse Bounds(Pixels){};

@@ -68,7 +68,7 @@ GPUI's `hello_world.rs` (verified via headless snapshot).
 | list (variable height), uniform_list | done (agent stopped right after tests passed; verify) |
 | GPU layer (`src/gpu/`, vendored from zicr at `87fe622`; zicr dependency removed) | done |
 | GPU renderer (`src/renderer/gpu.zig`, `shaders.glsl`, committed `shaders_gen.zig`) | done on Vulkan: default on Linux Wayland/X11, CPU fallback; subpixel sprites and surfaces not drawn (see §7) |
-| examples | 10 ported: hello_world, pattern, tree, text_layout, scrollable, ownership_post, active_state_bug, gradient, input, drag_drop |
+| examples | 22 ported: hello_world, pattern, tree, text_layout, scrollable, ownership_post, active_state_bug, gradient, input, drag_drop, shadow, opacity, svg, image, text, text_wrapper, grid_layout, uniform_list, list_example, animation, focus_visible, tab_stop |
 | macOS / Windows / web platforms | NOT started |
 
 ## 3. Repository layout (mirrors `crates/gpui/src`)
@@ -357,14 +357,16 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
    StyledElement (add `pub const with_animation = animation.AnimationExt(*Self).with_animation;` etc.).
 3. Input: multi-keystroke binding replay, tab groups, `Unbind`, `observe_keystrokes`,
    `keyboard_layout` and its change observer, IME content types.
-4. Text: ShapedLine cursor/split APIs, typographic bounds, font enumeration,
-   `add_fonts`, missing-glyph reporting.
+4. Text: **COLRv1 color fonts draw nothing**, so emoji are blank wherever that is the system's
+   emoji font, as on current Fedora. cozmic rasterizes them to a zero-size glyph; it needs a COLRv1
+   renderer. Also ShapedLine cursor/split APIs, typographic bounds, font enumeration, `add_fonts`
+   (every ported example skips GPUI's `load_fonts`), missing-glyph reporting.
 5. Async: assets/images load synchronously; GIF animation; WebP.
-6. Port the remaining GPUI examples (animation, image, image_gallery,
-   input, list_example, uniform_list, popover, anchor, painting, data_table,
-   drag_drop, focus_visible, tab_stop, window*, shadow, opacity, svg, text,
-   text_wrapper, grid_layout, set_menus, ...). Each must run headless and
-   produce a correct snapshot.
+6. Port the remaining GPUI examples (image_gallery, image_loading, gif_viewer, popover, anchor,
+   painting, data_table, mouse_pressure, window*, set_menus, ...). Each must run headless and
+   produce a correct snapshot, and should be driven for real: first frames hide most bugs. Missing
+   APIs the ported ones work around: `container_query` (grid_layout writes it out), `set_menus`,
+   `init_colors`, an HTTP client for remote images, `tab_group`, `percentage`.
 7. Performance (owner's phase 2 goal: beat GPUI): view caching (`AnyView::cached`
    with replayed scene ranges — `Scene.replay` exists), avoiding full layout
    when nothing changed, X11 XShm presentation, SIMD gradients in the CPU
