@@ -2,6 +2,7 @@
 //! element state, painting primitives and event dispatch.
 
 const std = @import("std");
+const taffy_mod = @import("taffy.zig");
 const geometry = @import("geometry.zig");
 const color_mod = @import("color.zig");
 const style_mod = @import("style.zig");
@@ -257,6 +258,7 @@ pub const Frame = struct {
     window_active: bool = false,
     arena: std.heap.ArenaAllocator,
     input_handlers: std.ArrayList(PendingInputHandler) = .empty,
+    tooltip_requests: std.ArrayList(TooltipRequest) = .empty,
 
     fn init(gpa: std.mem.Allocator) Frame {
         return .{
@@ -274,6 +276,7 @@ pub const Frame = struct {
         self.cursor_styles.deinit(gpa);
         self.deferred_draws.deinit(gpa);
         self.input_handlers.deinit(gpa);
+        self.tooltip_requests.deinit(gpa);
         self.arena.deinit();
     }
 
@@ -285,9 +288,34 @@ pub const Frame = struct {
         self.cursor_styles.clearRetainingCapacity();
         self.deferred_draws.clearRetainingCapacity();
         self.input_handlers.clearRetainingCapacity();
+        self.tooltip_requests.clearRetainingCapacity();
         self.focus = null;
         _ = self.arena.reset(.retain_capacity);
     }
+};
+
+/// A tooltip an element wants shown (GPUI `TooltipRequest`). `check_visible` runs as it is
+/// about to be placed, because an element that stopped painting has no mouse handlers
+/// left to notice the pointer moving away.
+/// Just past the pointer, flipping to the other side at the window's edge.
+pub fn tooltip_origin(mouse: Point(Pixels), tooltip_size: Size(Pixels), viewport: Size(Pixels)) Point(Pixels) {
+    var origin: Point(Pixels) = .{ .x = mouse.x + 1, .y = mouse.y + 1 };
+    if (origin.x + tooltip_size.width > viewport.width) {
+        const flipped = mouse.x - tooltip_size.width - 1;
+        origin.x = if (flipped >= 0) flipped else @max(0, viewport.width - tooltip_size.width);
+    }
+    if (origin.y + tooltip_size.height > viewport.height) {
+        const flipped = mouse.y - tooltip_size.height - 1;
+        origin.y = if (flipped >= 0) flipped else @max(0, viewport.height - tooltip_size.height);
+    }
+    return origin;
+}
+
+pub const TooltipRequest = struct {
+    view: view_mod.AnyView,
+    mouse_position: Point(Pixels),
+    ctx: *anyopaque,
+    check_visible: *const fn (ctx: *anyopaque, tooltip_bounds: Bounds(Pixels), window: *Window, cx: *App) bool,
 };
 
 const PendingInputHandler = struct {
@@ -411,6 +439,8 @@ pub const Window = struct {
     focused_text_input: ?FocusId = null,
     /// The caret may have moved: the next frame tells the input method where it landed.
     ime_position_dirty: bool = false,
+    /// Where the tooltip was last drawn, for hoverable tooltips.
+    tooltip_bounds: ?Bounds(Pixels) = null,
     focus_enabled: bool = true,
     pending_focus_events: bool = false,
     active: bool = true,
@@ -707,6 +737,16 @@ pub const Window = struct {
         }
         gop.value_ptr.frame = self.frame_count;
         return @ptrCast(@alignCast(gop.value_ptr.ptr));
+    }
+
+    /// True while `ptr` is still a live element state of this window. Timers check this,
+    /// because an element can disappear before one fires.
+    pub fn owns_element_state(self: *const Window, ptr: *const anyopaque) bool {
+        var it = self.element_states.valueIterator();
+        while (it.next()) |entry| {
+            if (entry.ptr == @constCast(ptr)) return true;
+        }
+        return false;
     }
 
     /// GPUI `with_element_state`: `f(?*S, window) struct{R, S}`-style callers
@@ -1249,8 +1289,10 @@ pub const Window = struct {
                 .height = .{ .definite = self.viewport_size.height },
             }, self, cx);
             self.prepaint_deferred_draws(cx);
+            const overlay = self.prepaint_overlay(cx);
             el.paint(self, cx);
             self.paint_deferred_draws(cx);
+            if (overlay) |o| o.paint(self, cx);
         }
         cx.pending_updates -= 1;
 
@@ -1268,6 +1310,39 @@ pub const Window = struct {
         self.needs_present = true;
         // Effects queued during render (e.g. notify) are processed now.
         cx.flush_effects();
+    }
+
+    /// The dragged view follows the pointer, and hides any tooltip while it does.
+    fn prepaint_overlay(self: *Window, cx: *App) ?element_mod.AnyElement {
+        if (cx.active_drag) |drag| {
+            const el = drag.view.into_any_element();
+            el.prepaint_as_root(self.mouse_position_.sub(drag.cursor_offset), taffy_mod.AvailableSpace.min_size(), self, cx);
+            return el;
+        }
+        return self.prepaint_tooltip(cx);
+    }
+
+    pub fn set_tooltip(self: *Window, request: TooltipRequest) void {
+        self.next_frame.tooltip_requests.append(self.allocator, request) catch oom();
+    }
+
+    /// Places the last tooltip that still wants showing, keeping it inside the window.
+    fn prepaint_tooltip(self: *Window, cx: *App) ?element_mod.AnyElement {
+        self.tooltip_bounds = null;
+        var i = self.next_frame.tooltip_requests.items.len;
+        while (i > 0) {
+            i -= 1;
+            const request = self.next_frame.tooltip_requests.items[i];
+            const el = request.view.into_any_element();
+            const tooltip_size = el.layout_as_root(taffy_mod.AvailableSpace.min_size(), self, cx);
+            const origin = tooltip_origin(request.mouse_position, tooltip_size, self.viewport_size);
+            const tooltip_area: Bounds(Pixels) = .{ .origin = origin, .size = tooltip_size };
+            if (!request.check_visible(request.ctx, tooltip_area, self, cx)) continue;
+            el.prepaint_at(origin, self, cx);
+            self.tooltip_bounds = tooltip_area;
+            return el;
+        }
+        return null;
     }
 
     fn prepaint_deferred_draws(self: *Window, cx: *App) void {
@@ -1405,8 +1480,42 @@ pub const Window = struct {
                 self.modifiers_ = e.keystroke.modifiers;
                 self.dispatch_key_event(interactive.KeyUpEvent, &e, cx);
             },
-            .file_drop => |e| {
-                self.dispatch_mouse(interactive.FileDropEvent, &e, cx);
+            // A file drag behaves like a drag started inside the window, so elements handle
+            // both the same way, as in GPUI.
+            .file_drop => |e| switch (e) {
+                .entered => |d| {
+                    self.mouse_position_ = d.position;
+                    if (cx.active_drag == null) {
+                        const view = cx.new(d.paths);
+                        const value = cx.allocator.create(interactive.ExternalPaths) catch oom();
+                        value.* = d.paths;
+                        cx.active_drag = .{
+                            .value = .{ .ptr = value, .type_id = app_mod.type_id(interactive.ExternalPaths) },
+                            .view = view_mod.AnyView.from(view),
+                            .cursor_offset = d.position,
+                            .free_value = struct {
+                                fn free(a: std.mem.Allocator, raw: *anyopaque) void {
+                                    a.destroy(@as(*interactive.ExternalPaths, @ptrCast(@alignCast(raw))));
+                                }
+                            }.free,
+                        };
+                    }
+                    return self.dispatch_event(.{ .mouse_move = .{ .position = d.position, .pressed_button = .left } }, cx);
+                },
+                .pending => |d| {
+                    self.mouse_position_ = d.position;
+                    return self.dispatch_event(.{ .mouse_move = .{ .position = d.position, .pressed_button = .left } }, cx);
+                },
+                .submit => |d| {
+                    cx.activate(true);
+                    self.mouse_position_ = d.position;
+                    return self.dispatch_event(.{ .mouse_up = .{ .button = .left, .position = d.position, .click_count = 1 } }, cx);
+                },
+                .exited, .ended => {
+                    cx.clear_active_drag();
+                    self.refresh();
+                    self.dispatch_mouse(interactive.FileDropEvent, &e, cx);
+                },
             },
             .pinch => |e| {
                 self.modifiers_ = e.modifiers;
@@ -1438,6 +1547,15 @@ pub const Window = struct {
             }
         }
         if (E == interactive.MouseMoveEvent) self.update_cursor();
+        // A drag follows the pointer, and any release no element took cancels it.
+        if (cx.has_active_drag()) {
+            if (E == interactive.MouseMoveEvent) {
+                self.refresh();
+            } else if (E == interactive.MouseUpEvent) {
+                cx.clear_active_drag();
+                self.refresh();
+            }
+        }
     }
 
     fn dispatch_key_event(self: *Window, comptime E: type, event: *const E, cx: *App) void {

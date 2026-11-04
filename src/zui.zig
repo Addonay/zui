@@ -42,6 +42,9 @@ pub const input = @import("input.zig");
 /// Grapheme segmentation and friends, which GPUI code gets from the unicode_segmentation crate.
 pub const unicode = @import("cozmic").unicode;
 pub const ElementInputHandler = input.ElementInputHandler;
+pub const TooltipBuilder = elements.div.TooltipBuilder;
+pub const AnyDrag = app.AnyDrag;
+pub const AnyDragValue = app.AnyDragValue;
 pub const assert_entity_input_handler = input.assert_entity_input_handler;
 pub const action = @import("action.zig");
 pub const executor = @import("executor.zig");

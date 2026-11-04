@@ -552,6 +552,43 @@ pub const BackgroundExecutor = struct {
         return .{ .state = state };
     }
 
+    /// Runs `on_done(ctx)` on the main thread once `duration_ns` has passed. Timers cannot
+    /// be cancelled, so `on_done` must check whether it still applies.
+    pub fn after(self: *BackgroundExecutor, fg: *ForegroundExecutor, duration_ns: u64, comptime on_done: anytype, ctx: anytype) void {
+        const Ctx = @TypeOf(ctx);
+        const Node = struct {
+            const NodeT = @This();
+            timer: Runnable,
+            fg_run: Runnable,
+            fg_core: *ForegroundCore,
+            ctx: Ctx,
+            allocator: std.mem.Allocator,
+
+            fn on_timer(r: *Runnable, execute: bool) void {
+                const node: *NodeT = @fieldParentPtr("timer", r);
+                if (!execute) return node.allocator.destroy(node);
+                node.fg_core.enqueue(&node.fg_run);
+            }
+            fn on_main(r: *Runnable, execute: bool) void {
+                const node: *NodeT = @fieldParentPtr("fg_run", r);
+                if (execute) on_done(node.ctx);
+                node.allocator.destroy(node);
+            }
+        };
+        const allocator = self.pool.allocator;
+        const node = allocator.create(Node) catch oom();
+        node.* = .{
+            .timer = .{ .run_fn = Node.on_timer },
+            .fg_run = .{ .run_fn = Node.on_main },
+            .fg_core = fg.core,
+            .ctx = ctx,
+            .allocator = allocator,
+        };
+        const now = Io.Clock.awake.now(sync_io()).nanoseconds;
+        node.timer.deadline = now + @as(i96, @intCast(duration_ns));
+        self.pool.submit_timer(&node.timer);
+    }
+
     /// Waits for `task` on the calling thread and returns its result. Consumes `task`.
     pub fn block(self: *BackgroundExecutor, task: anytype) @TypeOf(task).Value {
         _ = self;
