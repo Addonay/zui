@@ -88,6 +88,8 @@ pub const LinuxPlatform = struct {
         .set_cursor_style = setCursorStyle,
         .write_to_clipboard = writeClipboard,
         .read_from_clipboard = readClipboard,
+        .write_to_primary = writePrimary,
+        .read_from_primary = readPrimary,
     };
 
     pub fn from(p: *platform.Platform) *LinuxPlatform {
@@ -181,6 +183,22 @@ pub const LinuxPlatform = struct {
             .wayland => |c| _ = c.set_clipboard(text),
             .x11 => |c| _ = c.set_clipboard(text),
         }
+    }
+
+    fn writePrimary(p: *platform.Platform, item: platform.ClipboardItem) void {
+        const text = item.text() orelse return;
+        switch (from(p).backend) {
+            .wayland => |c| _ = c.set_primary(text),
+            .x11 => |c| _ = c.set_primary(text),
+        }
+    }
+
+    fn readPrimary(p: *platform.Platform) ?platform.ClipboardItem {
+        const text = switch (from(p).backend) {
+            .wayland => |c| c.get_primary(),
+            .x11 => |c| c.get_primary(),
+        } orelse return null;
+        return .new_string(text);
     }
 
     fn readClipboard(p: *platform.Platform) ?platform.ClipboardItem {

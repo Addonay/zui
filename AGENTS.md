@@ -271,6 +271,19 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   machine used, so the renderer has not been run under native validation).
   Test on software Vulkan: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`;
   `ZUI_GPU_TEST_DUMP=dir` writes each GPU/CPU pair as PPM.
+- **Testing native Wayland without touching the desktop**: run a private compositor with
+  `dbus-run-session`, `mutter --headless --wayland --no-x11 --virtual-monitor 1024x768
+  --wayland-display zui-test`, `XDG_RUNTIME_DIR` pointing at a scratch dir, and
+  `GSETTINGS_BACKEND=keyfile XDG_CONFIG_HOME=<scratch>` on the mutter process. Unset `DISPLAY`
+  for the client, or a Wayland failure silently falls back to X11. **Never run `gsettings` or
+  `dconf` in these scripts**: `dconf-service` is bus-activated with the bus daemon's environment
+  and writes the real user database. Keys can be injected through
+  `org.gnome.Mutter.RemoteDesktop` over one D-Bus connection (the session dies with it; its
+  keyboard hot-plugs on the first key, so that key's press is lost). `WAYLAND_DEBUG=client`
+  shows the requests sent. Plain mutter ignores layout settings, so dead keys are tested on X11:
+  `xmodmap -e "keycode 48 = dead_acute"` on Xvfb, then `xdotool key 48`. A process still
+  running at its timeout proves nothing: check for frames and protocol errors. Send output to a
+  file, since pipes can lose it when `timeout` kills the job.
 - **Headless snapshots**: `ZUI_HEADLESS=1 ZUI_SNAPSHOT=out.ppm zig build run-<example>`.
   `ZUI_SCALE=2` sets the headless scale factor.
 

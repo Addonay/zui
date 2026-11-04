@@ -304,6 +304,16 @@ pub const prelude = struct {
 };
 
 test {
+    // Backends are chosen at run time, so nothing else pulls their tests in.
+    if (@import("builtin").os.tag == .linux) {
+        _ = @import("platform/linux/xkb.zig");
+        _ = @import("platform/linux/input.zig");
+        _ = @import("platform/linux/x11.zig");
+        _ = @import("platform/linux/wayland.zig");
+        _ = @import("platform/linux/wayland_proto.zig");
+        _ = @import("platform/linux/x11_proto.zig");
+        _ = @import("platform/linux.zig");
+    }
     std.testing.refAllDecls(@This());
     _ = @import("spring.zig");
     _ = @import("elements/anchored.zig");

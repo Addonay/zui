@@ -120,6 +120,43 @@ const fkey_names = [_][]const u8{
     "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24",
 };
 
+/// True for Shift, Control, Alt, Super and friends: they never join compose sequences.
+pub fn is_modifier_keysym(sym: u32) bool {
+    return (sym >= 0xffe1 and sym <= 0xffee) or (sym >= 0xfe01 and sym <= 0xfe0f) or sym == 0xff7e or sym == 0xff7f;
+}
+
+/// How many key repeats are due at `now`, and when the next one is. Repeats are scheduled
+/// from the previous deadline, not from `now`, so a late wakeup does not slow the rate.
+/// After a long stall the backlog is dropped instead of flooding the app.
+pub const RepeatStep = struct { count: u32, next_ms: i64 };
+pub const max_repeat_burst: u32 = 8;
+
+pub fn repeat_step(now: i64, next_ms: i64, interval_ms: i64) RepeatStep {
+    if (now < next_ms) return .{ .count = 0, .next_ms = next_ms };
+    const interval = @max(interval_ms, 1);
+    const count = @divFloor(now - next_ms, interval) + 1;
+    if (count > max_repeat_burst) return .{ .count = max_repeat_burst, .next_ms = now + interval };
+    return .{ .count = @intCast(count), .next_ms = next_ms + count * interval };
+}
+
+test "key repeat keeps its rate across late wakeups" {
+    try std.testing.expectEqual(RepeatStep{ .count = 0, .next_ms = 100 }, repeat_step(99, 100, 25));
+    try std.testing.expectEqual(RepeatStep{ .count = 1, .next_ms = 125 }, repeat_step(100, 100, 25));
+    // 7 ms late: the next deadline does not move.
+    try std.testing.expectEqual(RepeatStep{ .count = 1, .next_ms = 125 }, repeat_step(107, 100, 25));
+    // Two periods late: both are delivered.
+    try std.testing.expectEqual(RepeatStep{ .count = 3, .next_ms = 175 }, repeat_step(150, 100, 25));
+    // A long stall drops the backlog.
+    try std.testing.expectEqual(RepeatStep{ .count = max_repeat_burst, .next_ms = 5025 }, repeat_step(5000, 100, 25));
+}
+
+test "modifier keysyms" {
+    try std.testing.expect(is_modifier_keysym(0xffe1)); // Shift_L
+    try std.testing.expect(is_modifier_keysym(0xfe03)); // ISO_Level3_Shift
+    try std.testing.expect(!is_modifier_keysym('a'));
+    try std.testing.expect(!is_modifier_keysym(0xfe51)); // dead_acute
+}
+
 /// UTF-8 text for a keysym (printable only). Returns a slice into `buf`.
 pub fn utf8_for_keysym(sym: u32, buf: *[4]u8) ?[]const u8 {
     const cp: u21 = switch (sym) {
