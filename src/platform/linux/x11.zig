@@ -14,6 +14,10 @@ const color = @import("../../color.zig");
 const cpu = @import("../../renderer/cpu.zig");
 const window_renderer = @import("../../renderer/window_renderer.zig");
 const xkb = @import("xkb.zig");
+const xim_preedit = @import("xim_preedit.zig");
+
+extern "c" fn setlocale(category: c_int, locale: ?[*:0]const u8) ?[*:0]const u8;
+const LC_CTYPE: c_int = 0;
 const proto = @import("x11_proto.zig");
 const dl = @import("dl.zig");
 const input = @import("input.zig");
@@ -32,6 +36,9 @@ const XEvent = proto.XEvent;
 
 const clear_color: color.Hsla = color.to_hsla(color.rgb(0x0e0e13));
 const frame_interval_ms: i64 = 16;
+const im_retry_interval_ms: i64 = 1000;
+const im_retry_count: u32 = 60;
+const window_event_mask: c_long = proto.ExposureMask | proto.KeyPressMask | proto.KeyReleaseMask | proto.ButtonPressMask | proto.ButtonReleaseMask | proto.PointerMotionMask | proto.StructureNotifyMask | proto.FocusChangeMask | proto.EnterWindowMask | proto.LeaveWindowMask;
 
 /// Atoms interned once per connection.
 const Atoms = struct {
@@ -70,6 +77,17 @@ pub const X11Connection = struct {
     gpu_context: ?*window_renderer.GpuContext = null,
     gpu_probed: bool = false,
     compose: ?xkb.Compose = null,
+    /// Null without an input method. Set from XMODIFIERS; see `open_im`.
+    xim_api: ?proto.XimApi = null,
+    im: ?*proto.XIM = null,
+    /// The style contexts are created with: inline composition, or the IM's own window.
+    im_style: c_ulong = 0,
+    im_callback_registered: bool = false,
+    /// After the server dies. Xlib's instantiate callback fires only once per registration,
+    /// and a new registration fires at once while the dead server is still advertised, so
+    /// it cannot announce a restart. Reconnecting is retried on a timer instead, for a while.
+    im_retries_left: u32 = 0,
+    im_next_retry_ms: i64 = 0,
     /// The physical key held down, to tell auto-repeat from a new press.
     held_keycode: u32 = 0,
     primary_offer: ?[]const u8 = null,
@@ -147,6 +165,7 @@ pub const X11Connection = struct {
             .scale = input.env_scale() orelse xftScale(api, dpy),
         };
         self.compose = xkb.Compose.init();
+        self.init_input_method();
         return self;
     }
 
@@ -205,11 +224,17 @@ pub const X11Connection = struct {
             const due: i32 = @intCast(@max(0, w.last_frame_ms + frame_interval_ms - now));
             best = if (best) |b| @min(b, due) else due;
         }
+        // Wake up for reconnect attempts too, or an idle window would never make them.
+        if (self.im_retries_left > 0) {
+            const due: i32 = @intCast(@max(0, self.im_next_retry_ms - now));
+            best = if (best) |b| @min(b, due) else due;
+        }
         return best;
     }
 
     pub fn pump(self: *X11Connection) void {
         const now = input.now_ms();
+        self.retry_input_method(now);
         var i: usize = 0;
         while (i < self.windows.items.len) : (i += 1) {
             const w = self.windows.items[i];
@@ -257,6 +282,7 @@ pub const X11Connection = struct {
         for (self.windows.items) |w| w.close_now();
         for (self.windows.items) |w| w.free();
         self.windows.deinit(self.allocator);
+        self.close_input_method();
         if (self.gpu_context) |ctx| ctx.destroy();
         for (self.cursors) |c| {
             if (c != 0) _ = self.api.XFreeCursor(self.display, c);
@@ -301,8 +327,7 @@ pub const X11Connection = struct {
         var protocols = [2]Atom{ self.atoms.wm_delete_window, self.atoms.net_wm_ping };
         _ = a.XSetWMProtocols(self.display, x, &protocols, 2);
         if (options.titlebar == null) self.set_decorations(x, false);
-        const mask: c_long = proto.ExposureMask | proto.KeyPressMask | proto.KeyReleaseMask | proto.ButtonPressMask | proto.ButtonReleaseMask | proto.PointerMotionMask | proto.StructureNotifyMask | proto.FocusChangeMask | proto.EnterWindowMask | proto.LeaveWindowMask;
-        _ = a.XSelectInput(self.display, x, mask);
+        _ = a.XSelectInput(self.display, x, window_event_mask);
         if (options.show) _ = a.XMapWindow(self.display, x);
         w.frame_wanted = true;
         if (!self.gpu_probed) {
@@ -370,7 +395,14 @@ pub const X11Connection = struct {
 
     // -- events ----------------------------------------------------------
 
-    fn translate(self: *X11Connection, ev: XEvent) void {
+    fn translate(self: *X11Connection, ev_in: XEvent) void {
+        var ev = ev_in;
+        // Every event goes through the input method first: it talks to its server with
+        // ordinary events, and takes the keys it wants. This includes the time with no
+        // server, since Xlib learns of one starting from an event filtered here.
+        if (self.xim_api) |x| {
+            if (x.XFilterEvent(&ev, 0) != 0) return;
+        }
         switch (ev.type) {
             proto.SelectionRequest => return self.serve_selection(ev.xselectionrequest),
             // The layout changed; Xlib keeps its old key map until told otherwise.
@@ -420,10 +452,14 @@ pub const X11Connection = struct {
             },
             proto.FocusIn => {
                 w.focused = true;
+                w.sync_ic_focus();
                 w.base.emit_active(true);
             },
             proto.FocusOut => {
                 w.focused = false;
+                w.sync_ic_focus();
+                if (self.compose) |*c| c.cancel_preedit(&w.base);
+                w.cancel_ic_composition();
                 w.base.emit_active(false);
             },
             proto.EnterNotify => {
@@ -468,6 +504,10 @@ pub const X11Connection = struct {
 
     fn on_button(self: *X11Connection, w: *X11Window, b: proto.XButtonEvent, pressed: bool) void {
         self.note_mods(b.state);
+        if (pressed) {
+            if (self.compose) |*c| c.commit_preedit(&w.base);
+            w.commit_ic_composition();
+        }
         const pos = w.logical(b.x, b.y);
         const mods = input.modifiers(b.state);
         if (b.button >= 4 and b.button <= 7) {
@@ -504,6 +544,12 @@ pub const X11Connection = struct {
         var k = ev;
         var keysym: c_ulong = 0;
         var buf: [32]u8 = undefined;
+        // Presses go through the input context when a field is composing with an IM, and
+        // the IM has already handled dead keys, so xkb compose stays out of the way.
+        const ic_active = pressed and w.ic != null and w.wants_ime;
+        if (ic_active) {
+            if (self.on_ic_key(w, &k, &keysym)) return;
+        }
         const n: usize = @intCast(@max(0, self.api.XLookupString(&k, &buf, @intCast(buf.len), &keysym, null)));
         const shift = (ev.state & input.MOD_SHIFT) != 0;
         var name: ?[]const u8 = input.key_name_for_keysym(@intCast(keysym));
@@ -540,18 +586,144 @@ pub const X11Connection = struct {
         } else if (self.held_keycode == ev.keycode) {
             self.held_keycode = 0;
         }
-        if (pressed and !held and keysym != 0 and !input.is_modifier_keysym(@intCast(keysym))) {
-            if (self.compose) |*c| switch (c.feed(@intCast(keysym), &composed_buf)) {
-                .composing => text = null,
-                .composed => |t| {
-                    text = t;
-                    name = t;
-                },
-                .nothing, .cancelled => {},
-            };
+        var replaces_preedit = false;
+        if (!ic_active and pressed and !held and keysym != 0 and !input.is_modifier_keysym(@intCast(keysym))) {
+            if (self.compose) |*c| replaces_preedit = c.process_key(&w.base, @intCast(keysym), &composed_buf, &text, &name);
         }
         const key_name = name orelse return;
         w.emit_key(key_name, text, pressed, held);
+        if (replaces_preedit) self.compose.?.finish_composed(&w.base);
+    }
+
+    // -- input method -------------------------------------------------------
+
+    /// Connects to the input method named by XMODIFIERS. Without one there is no point in
+    /// XIM: Xlib's built-in method only does compose, and xkb compose does that better,
+    /// with the sequence showing inline. The locale is set only around the open, as SDL3
+    /// does, so the application's number and date formatting stay untouched.
+    fn init_input_method(self: *X11Connection) void {
+        const mods = std.mem.span(std.c.getenv("XMODIFIERS") orelse return);
+        const at = std.mem.indexOf(u8, mods, "@im=") orelse return;
+        const name = mods[at + 4..];
+        if (name.len == 0 or std.mem.startsWith(u8, name, "none") or std.mem.startsWith(u8, name, "local")) return;
+        self.xim_api = proto.XimApi.load(self.lib) orelse return;
+        self.open_im();
+        // Also covers an IM that starts after us, or restarts.
+        if (self.xim_api) |x| {
+            self.im_callback_registered = x.XRegisterIMInstantiateCallback(self.display, null, null, null, @ptrCast(&imInstantiated), self) != 0;
+        }
+    }
+
+    fn open_im(self: *X11Connection) void {
+        const x = self.xim_api orelse return;
+        if (self.im != null) return;
+        var saved: [128]u8 = undefined;
+        var saved_ptr: ?[*:0]const u8 = null;
+        if (setlocale(LC_CTYPE, null)) |current| {
+            const text = std.mem.span(current);
+            if (text.len < saved.len) {
+                @memcpy(saved[0..text.len], text);
+                saved[text.len] = 0;
+                saved_ptr = @ptrCast(&saved);
+            }
+        }
+        _ = setlocale(LC_CTYPE, "");
+        defer if (saved_ptr) |p| {
+            _ = setlocale(LC_CTYPE, p);
+        };
+        if (x.XSupportsLocale() == 0) return;
+        _ = x.XSetLocaleModifiers("");
+        const im = x.XOpenIM(self.display, null, null, null) orelse return;
+
+        var styles: ?*proto.XIMStyles = null;
+        if (x.XGetIMValues(im, @as([*:0]const u8, "queryInputStyle"), &styles, @as(?*anyopaque, null)) != null or styles == null) {
+            _ = x.XCloseIM(im);
+            return;
+        }
+        defer _ = x.XFree(styles);
+        var chosen: c_ulong = 0;
+        for (styles.?.supported_styles[0..styles.?.count_styles]) |style| {
+            if (style == (proto.XIMPreeditCallbacks | proto.XIMStatusNothing)) {
+                chosen = style;
+                break;
+            }
+            if (style == (proto.XIMPreeditNothing | proto.XIMStatusNothing)) chosen = style;
+        }
+        if (chosen == 0) {
+            _ = x.XCloseIM(im);
+            return;
+        }
+        var destroy: proto.XIMCallback = .{ .client_data = self, .callback = @ptrCast(&imDestroyed) };
+        _ = x.XSetIMValues(im, @as([*:0]const u8, "destroyCallback"), &destroy, @as(?*anyopaque, null));
+        self.im = im;
+        self.im_style = chosen;
+        // A restarted server finds fields already waiting: give them contexts and focus.
+        for (self.windows.items) |w| {
+            if (!w.wants_ime or w.closed) continue;
+            w.ensure_ic();
+            w.sync_ic_focus();
+            if (w.base.ime_area()) |area| w.set_ime_spot(area);
+        }
+    }
+
+    fn retry_input_method(self: *X11Connection, now: i64) void {
+        if (self.im_retries_left == 0 or now < self.im_next_retry_ms) return;
+        self.im_retries_left -= 1;
+        self.im_next_retry_ms = now + im_retry_interval_ms;
+        self.open_im();
+        if (self.im != null) self.im_retries_left = 0;
+    }
+
+    fn close_input_method(self: *X11Connection) void {
+        const x = self.xim_api orelse return;
+        if (self.im_callback_registered) {
+            _ = x.XUnregisterIMInstantiateCallback(self.display, null, null, null, @ptrCast(&imInstantiated), self);
+        }
+        if (self.im) |im| _ = x.XCloseIM(im);
+        self.im = null;
+    }
+
+    fn imInstantiated(_: *proto.Display, client: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        const self: *X11Connection = @ptrCast(@alignCast(client.?));
+        self.open_im();
+    }
+
+    /// The server went away. Xlib has already destroyed the contexts.
+    fn imDestroyed(_: *proto.XIM, client: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        const self: *X11Connection = @ptrCast(@alignCast(client.?));
+        self.im = null;
+        self.im_retries_left = im_retry_count;
+        self.im_next_retry_ms = input.now_ms() + im_retry_interval_ms;
+        for (self.windows.items) |w| w.ic_lost();
+    }
+
+    /// Handles a press through the input context. True means nothing is left to do.
+    /// False means the key has no text from the IM and takes the normal path.
+    fn on_ic_key(self: *X11Connection, w: *X11Window, k: *proto.XKeyEvent, keysym: *c_ulong) bool {
+        const x = self.xim_api.?;
+        var stack: [256]u8 = undefined;
+        var buf: []u8 = &stack;
+        var status: c_int = 0;
+        var n = x.Xutf8LookupString(w.ic.?, k, buf.ptr, @intCast(buf.len), keysym, &status);
+        var heap: ?[]u8 = null;
+        defer if (heap) |h| self.allocator.free(h);
+        if (status == proto.XBufferOverflow) {
+            heap = self.allocator.alloc(u8, @intCast(n + 1)) catch return true;
+            buf = heap.?;
+            n = x.Xutf8LookupString(w.ic.?, k, buf.ptr, @intCast(buf.len), keysym, &status);
+        }
+        if (status == proto.XLookupNone) return true;
+        if (status == proto.XLookupKeySym) return false;
+        const text = buf[0..@intCast(@max(n, 0))];
+        if (text.len == 0) return status == proto.XLookupChars;
+        // Commits from the IM carry no key. A real key with plain text takes the normal
+        // path so bindings see it, which also looks up the same character again.
+        if (status == proto.XLookupChars or k.keycode == 0) {
+            w.ic_composition_ended();
+            w.base.emit_ime(.{ .insert_text = text });
+            return true;
+        }
+        return false;
     }
 
     // -- clipboard ----------------------------------------------------------
@@ -696,8 +868,24 @@ pub const X11Window = struct {
     renderer: cpu.CpuRenderer,
     /// Set when this window draws with the GPU; `atlas` and `renderer` then stay idle.
     gpu_window: ?window_renderer.GpuWindow = null,
+    /// A focused field in this window accepts text.
+    wants_ime: bool = false,
+    ic: ?*proto.XIC = null,
+    /// Stable storage: Xlib keeps pointers into these for the context's lifetime.
+    ic_callbacks: [4]proto.XIMCallback = undefined,
+    preedit: ?xim_preedit.XimPreedit = null,
+    ime_spot: ?[2]i16 = null,
+
+    fn playSystemBell(p: *platform.PlatformWindow) void {
+        const conn = from(p).conn;
+        _ = conn.api.XBell(conn.display, 0);
+        conn.flush();
+    }
 
     const vtable: platform.PlatformWindow.VTable = .{
+        .play_system_bell = playSystemBell,
+        .update_ime_enabled = updateImeEnabled,
+        .update_ime_position = updateImePosition,
         .bounds = bounds,
         .content_size = contentSize,
         .scale_factor = scaleFactor,
@@ -814,6 +1002,175 @@ pub const X11Window = struct {
     fn requestFrame(p: *platform.PlatformWindow) void {
         from(p).frame_wanted = true;
     }
+    fn updateImeEnabled(p: *platform.PlatformWindow, enabled: bool) void {
+        const self = from(p);
+        self.wants_ime = enabled;
+        if (enabled) self.ensure_ic();
+        self.sync_ic_focus();
+        if (!enabled) self.cancel_ic_composition();
+        if (enabled) if (self.base.ime_area()) |area| self.set_ime_spot(area);
+        self.conn.flush();
+    }
+
+    fn updateImePosition(p: *platform.PlatformWindow, area: PxBounds) void {
+        from(p).set_ime_spot(area);
+    }
+
+    /// Candidate windows open below the point. Skipped while composing, so they stay put
+    /// while the user chooses.
+    fn set_ime_spot(self: *X11Window, area: PxBounds) void {
+        const x = self.conn.xim_api orelse return;
+        const ic = self.ic orelse return;
+        if (self.preedit) |*pre| if (!pre.is_empty()) return;
+        const spot: [2]i16 = .{
+            @intFromFloat(std.math.clamp(@round(area.origin.x * self.scale), -32768, 32767)),
+            @intFromFloat(std.math.clamp(@round((area.origin.y + area.size.height) * self.scale), -32768, 32767)),
+        };
+        if (self.ime_spot) |old| if (old[0] == spot[0] and old[1] == spot[1]) return;
+        self.ime_spot = spot;
+        var point: proto.XPointS = .{ .x = spot[0], .y = spot[1] };
+        const list = x.XVaCreateNestedList(0, @as([*:0]const u8, "spotLocation"), &point, @as(?*anyopaque, null)) orelse return;
+        defer _ = x.XFree(list);
+        _ = x.XSetICValues(ic, @as([*:0]const u8, "preeditAttributes"), list, @as(?*anyopaque, null));
+        self.conn.flush();
+    }
+
+    /// Creates the input context on first use, and subscribes to what the IM asks for.
+    fn ensure_ic(self: *X11Window) void {
+        if (self.ic != null or self.closed) return;
+        const conn = self.conn;
+        const x = conn.xim_api orelse return;
+        const im = conn.im orelse return;
+        const client: c_ulong = self.x_window;
+        const style = conn.im_style;
+        const client_name: [*:0]const u8 = "clientWindow";
+        const focus_name: [*:0]const u8 = "focusWindow";
+        const style_name: [*:0]const u8 = "inputStyle";
+        const end: ?*anyopaque = null;
+        if (style & proto.XIMPreeditCallbacks != 0) {
+            self.ic_callbacks = .{
+                .{ .client_data = self, .callback = @ptrCast(&preeditStart) },
+                .{ .client_data = self, .callback = @ptrCast(&preeditDone) },
+                .{ .client_data = self, .callback = @ptrCast(&preeditDraw) },
+                .{ .client_data = self, .callback = @ptrCast(&preeditCaret) },
+            };
+            const list = x.XVaCreateNestedList(
+                0,
+                @as([*:0]const u8, "preeditStartCallback"),
+                &self.ic_callbacks[0],
+                @as([*:0]const u8, "preeditDoneCallback"),
+                &self.ic_callbacks[1],
+                @as([*:0]const u8, "preeditDrawCallback"),
+                &self.ic_callbacks[2],
+                @as([*:0]const u8, "preeditCaretCallback"),
+                &self.ic_callbacks[3],
+                end,
+            ) orelse return;
+            defer _ = x.XFree(list);
+            self.ic = x.XCreateIC(im, style_name, style, client_name, client, focus_name, client, @as([*:0]const u8, "preeditAttributes"), list, end);
+        } else {
+            self.ic = x.XCreateIC(im, style_name, style, client_name, client, focus_name, client, end);
+        }
+        const ic = self.ic orelse return;
+        var filter: c_long = 0;
+        if (x.XGetICValues(ic, @as([*:0]const u8, "filterEvents"), &filter, end) == null and filter != 0) {
+            _ = conn.api.XSelectInput(conn.display, self.x_window, window_event_mask | filter);
+        }
+        if (self.preedit == null) self.preedit = .{ .allocator = self.allocator };
+    }
+
+    fn sync_ic_focus(self: *X11Window) void {
+        const x = self.conn.xim_api orelse return;
+        const ic = self.ic orelse return;
+        if (self.wants_ime and self.focused) x.XSetICFocus(ic) else x.XUnsetICFocus(ic);
+    }
+
+    /// Ends a composition: the IM forgets it, and the field drops the text.
+    fn cancel_ic_composition(self: *X11Window) void {
+        const pre = if (self.preedit) |*p| p else return;
+        if (pre.is_empty()) return;
+        pre.clear();
+        self.reset_ic();
+        self.base.emit_ime(.delete_text);
+    }
+
+    /// Ends a composition, keeping its text in the field. A click does this.
+    pub fn commit_ic_composition(self: *X11Window) void {
+        const pre = if (self.preedit) |*p| p else return;
+        if (pre.is_empty()) return;
+        pre.clear();
+        self.reset_ic();
+        self.base.emit_ime(.unmark_text);
+    }
+
+    fn reset_ic(self: *X11Window) void {
+        const x = self.conn.xim_api orelse return;
+        const ic = self.ic orelse return;
+        if (x.Xutf8ResetIC(ic)) |text| _ = x.XFree(text);
+    }
+
+    /// The next commit replaces the composition in the field, so only our copy clears here.
+    fn ic_composition_ended(self: *X11Window) void {
+        if (self.preedit) |*p| p.clear();
+    }
+
+    /// The IM went away: anything composing cannot finish, so it goes too.
+    fn ic_lost(self: *X11Window) void {
+        self.ic = null;
+        self.ime_spot = null;
+        if (self.preedit) |*pre| {
+            if (!pre.is_empty()) {
+                pre.clear();
+                self.base.emit_ime(.delete_text);
+            }
+        }
+    }
+
+    fn preeditStart(_: *proto.XIC, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        return -1; // No limit on the composition's length.
+    }
+
+    fn preeditDone(_: *proto.XIC, client: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        const self: *X11Window = @ptrCast(@alignCast(client.?));
+        const pre = if (self.preedit) |*p| p else return;
+        if (pre.is_empty()) return;
+        pre.clear();
+        self.base.emit_ime(.delete_text);
+    }
+
+    fn preeditDraw(_: *proto.XIC, client: ?*anyopaque, data: *proto.XIMPreeditDrawCallbackStruct) callconv(.c) void {
+        const self: *X11Window = @ptrCast(@alignCast(client.?));
+        const pre = if (self.preedit) |*p| p else return;
+        const had = !pre.is_empty();
+        var insert: ?[]const u8 = null;
+        var wide_buf: std.ArrayList(u8) = .empty;
+        defer wide_buf.deinit(self.allocator);
+        if (data.text) |t| {
+            if (t.encoding_is_wchar != 0) {
+                // Length counts characters here; UTF-8 text gets its own length below.
+                if (t.string.wide_char) |wide| {
+                    for (wide[0..t.length]) |c| {
+                        var enc: [4]u8 = undefined;
+                        const len = std.unicode.utf8Encode(@intCast(@max(c, 0)), &enc) catch continue;
+                        wide_buf.appendSlice(self.allocator, enc[0..len]) catch break;
+                    }
+                }
+                insert = wide_buf.items;
+            } else if (t.string.multi_byte) |mb| {
+                // Input methods misreport `length`, as SDL3 found. The string is terminated.
+                insert = std.mem.span(mb);
+            }
+        }
+        pre.apply(data.chg_first, data.chg_length, insert, data.caret);
+        if (pre.is_empty()) {
+            if (had) self.base.emit_ime(.delete_text);
+        } else {
+            self.base.emit_ime(.{ .set_marked_text = .{ .text = pre.text.items, .selected = pre.selected() } });
+        }
+    }
+
+    fn preeditCaret(_: *proto.XIC, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {}
+
     fn spriteAtlas(p: *platform.PlatformWindow) atlas_mod.PlatformAtlas {
         const self = from(p);
         if (self.gpu_window) |*g| return g.ctx.sprite_atlas();
@@ -879,6 +1236,10 @@ pub const X11Window = struct {
         if (self.closed) return;
         self.closed = true;
         self.frame_wanted = false;
+        if (self.ic) |ic| {
+            if (self.conn.xim_api) |x| x.XDestroyIC(ic);
+            self.ic = null;
+        }
         // The Vulkan surface must die before the X window it wraps.
         if (self.gpu_window) |*g| {
             g.deinit();
@@ -897,6 +1258,7 @@ pub const X11Window = struct {
             _ = self.conn.api.XDestroyImage(img);
             self.image = null;
         }
+        if (self.preedit) |*p| p.deinit();
         self.atlas.deinit();
         self.renderer.deinit();
         self.allocator.destroy(self);

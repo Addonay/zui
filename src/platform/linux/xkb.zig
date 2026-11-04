@@ -11,6 +11,8 @@
 
 const std = @import("std");
 const dl = @import("dl.zig");
+const input = @import("input.zig");
+const platform = @import("../../platform.zig");
 
 pub const xkb_lib_names: []const [*:0]const u8 = &.{ "libxkbcommon.so.0", "libxkbcommon.so" };
 
@@ -206,6 +208,9 @@ pub const Compose = struct {
     state_reset: *const fn (*ComposeState) callconv(.c) void,
     state_get_status: *const fn (*ComposeState) callconv(.c) c_uint,
     state_get_utf8: *const fn (*ComposeState, [*]u8, usize) callconv(.c) c_int,
+    /// The composition shown in the focused field, kept to commit it if it gets interrupted.
+    preedit_buf: [32]u8 = undefined,
+    preedit_len: usize = 0,
 
     const status_composing = 1;
     const status_composed = 2;
@@ -272,9 +277,85 @@ pub const Compose = struct {
         self.lib.close();
     }
 
-    /// Abandons a sequence in progress (focus left the window).
+    /// Abandons a sequence in progress.
     pub fn reset(self: *Compose) void {
         self.state_reset(self.state);
+        self.preedit_len = 0;
+    }
+
+    /// Runs a pressed key through compose and shows the sequence in the focused field,
+    /// as GPUI does. `text` and `name` describe the key event about to be sent, and are
+    /// updated when the sequence finishes. Returns true when a composed key replaces a
+    /// composition; call `finish_composed` after sending that key event.
+    pub fn process_key(self: *Compose, window: *platform.PlatformWindow, keysym: u32, out: []u8, text: *?[]const u8, name: *?[]const u8) bool {
+        switch (self.feed(keysym, out)) {
+            .composing => {
+                text.* = null;
+                const shown: ?[]const u8 = blk: {
+                    var buf: [32]u8 = undefined;
+                    const n = self.state_get_utf8(self.state, &buf, buf.len);
+                    if (n > 0 and n < buf.len) {
+                        self.set_preedit(buf[0..@intCast(n)]);
+                        break :blk self.preedit_buf[0..self.preedit_len];
+                    }
+                    if (input.dead_key_text(keysym)) |dead| {
+                        self.set_preedit(dead);
+                        break :blk self.preedit_buf[0..self.preedit_len];
+                    }
+                    // The Compose key itself shows nothing.
+                    break :blk null;
+                };
+                if (shown) |t| window.emit_ime(.{ .set_marked_text = .{ .text = t } });
+                return false;
+            },
+            .composed => |t| {
+                const had_preedit = self.preedit_len > 0;
+                self.preedit_len = 0;
+                // The key becomes the result, so a binding on the last key does not fire.
+                text.* = t;
+                name.* = t;
+                return had_preedit;
+            },
+            .cancelled => {
+                // Whatever was showing was meant literally: keep it.
+                if (self.preedit_len > 0) {
+                    window.emit_ime(.{ .insert_text = self.preedit_buf[0..self.preedit_len] });
+                    self.preedit_len = 0;
+                }
+                if (input.dead_key_text(keysym)) |dead| {
+                    self.set_preedit(dead);
+                    text.* = null;
+                    window.emit_ime(.{ .set_marked_text = .{ .text = self.preedit_buf[0..self.preedit_len] } });
+                }
+                return false;
+            },
+            .nothing => return false,
+        }
+    }
+
+    /// A listener may have swallowed the composed key, leaving the composition behind.
+    pub fn finish_composed(self: *Compose, window: *platform.PlatformWindow) void {
+        _ = self;
+        window.emit_ime(.delete_text);
+    }
+
+    /// The user clicked away mid-sequence: what they typed so far stays.
+    pub fn commit_preedit(self: *Compose, window: *platform.PlatformWindow) void {
+        const had = self.preedit_len > 0;
+        if (had) window.emit_ime(.{ .insert_text = self.preedit_buf[0..self.preedit_len] });
+        self.reset();
+    }
+
+    /// Focus left the window mid-sequence: the composition goes away.
+    pub fn cancel_preedit(self: *Compose, window: *platform.PlatformWindow) void {
+        if (self.preedit_len > 0) window.emit_ime(.delete_text);
+        self.reset();
+    }
+
+    fn set_preedit(self: *Compose, text: []const u8) void {
+        const n = @min(text.len, self.preedit_buf.len);
+        @memcpy(self.preedit_buf[0..n], text[0..n]);
+        self.preedit_len = n;
     }
 
     /// Feeds a pressed, non-modifier keysym. Composed text is written to `out`.

@@ -155,6 +155,71 @@ pub const XSelectionRequestEvent = extern struct {
     time: Time,
 };
 
+// -- X input methods (Xlib.h) --------------------------------------------------
+
+pub const XIM = opaque {};
+pub const XIC = opaque {};
+pub const XPointS = extern struct { x: c_short, y: c_short };
+pub const XIMCallback = extern struct {
+    client_data: ?*anyopaque,
+    callback: ?*const anyopaque,
+};
+pub const XIMStyles = extern struct {
+    count_styles: c_ushort,
+    supported_styles: [*]c_ulong,
+};
+pub const XIMText = extern struct {
+    length: c_ushort,
+    feedback: ?*anyopaque,
+    encoding_is_wchar: Bool,
+    string: extern union { multi_byte: ?[*:0]const u8, wide_char: ?[*]const c_int },
+};
+pub const XIMPreeditDrawCallbackStruct = extern struct {
+    caret: c_int,
+    chg_first: c_int,
+    chg_length: c_int,
+    text: ?*XIMText,
+};
+pub const XIMPreeditCallbacks: c_ulong = 0x0002;
+pub const XIMPreeditNothing: c_ulong = 0x0008;
+pub const XIMStatusNothing: c_ulong = 0x0400;
+pub const XBufferOverflow: c_int = -1;
+pub const XLookupNone: c_int = 1;
+pub const XLookupChars: c_int = 2;
+pub const XLookupKeySym: c_int = 3;
+pub const XLookupBoth: c_int = 4;
+
+/// Input method functions. All optional: an Xlib without them means no IME, not a failure.
+pub const XimApi = struct {
+    XSetLocaleModifiers: *const fn (?[*:0]const u8) callconv(.c) ?[*:0]const u8,
+    XSupportsLocale: *const fn () callconv(.c) Bool,
+    XOpenIM: *const fn (*Display, ?*anyopaque, ?[*:0]const u8, ?[*:0]const u8) callconv(.c) ?*XIM,
+    XCloseIM: *const fn (*XIM) callconv(.c) c_int,
+    XGetIMValues: *const fn (*XIM, ...) callconv(.c) ?[*:0]const u8,
+    XSetIMValues: *const fn (*XIM, ...) callconv(.c) ?[*:0]const u8,
+    XCreateIC: *const fn (*XIM, ...) callconv(.c) ?*XIC,
+    XDestroyIC: *const fn (*XIC) callconv(.c) void,
+    XGetICValues: *const fn (*XIC, ...) callconv(.c) ?[*:0]const u8,
+    XSetICValues: *const fn (*XIC, ...) callconv(.c) ?[*:0]const u8,
+    XSetICFocus: *const fn (*XIC) callconv(.c) void,
+    XUnsetICFocus: *const fn (*XIC) callconv(.c) void,
+    Xutf8ResetIC: *const fn (*XIC) callconv(.c) ?[*:0]u8,
+    Xutf8LookupString: *const fn (*XIC, *XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*c_int) callconv(.c) c_int,
+    XFilterEvent: *const fn (*XEvent, c_ulong) callconv(.c) Bool,
+    XVaCreateNestedList: *const fn (c_int, ...) callconv(.c) ?*anyopaque,
+    XFree: *const fn (?*anyopaque) callconv(.c) c_int,
+    XRegisterIMInstantiateCallback: *const fn (*Display, ?*anyopaque, ?[*:0]const u8, ?[*:0]const u8, *const anyopaque, ?*anyopaque) callconv(.c) Bool,
+    XUnregisterIMInstantiateCallback: *const fn (*Display, ?*anyopaque, ?[*:0]const u8, ?[*:0]const u8, *const anyopaque, ?*anyopaque) callconv(.c) Bool,
+
+    pub fn load(lib: dl.Library) ?XimApi {
+        var out: XimApi = undefined;
+        inline for (@typeInfo(XimApi).@"struct".field_names, @typeInfo(XimApi).@"struct".field_types) |name, T| {
+            @field(out, name) = lib.lookup(T, name.ptr) orelse return null;
+        }
+        return out;
+    }
+};
+
 pub const XMappingEvent = extern struct {
     type: c_int,
     serial: c_ulong,
@@ -383,6 +448,7 @@ pub const Api = struct {
     XSync: *const fn (*Display, Bool) callconv(.c) c_int,
     XConnectionNumber: *const fn (*Display) callconv(.c) c_int,
     XLookupString: *const fn (*XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int,
+    XBell: *const fn (*Display, c_int) callconv(.c) c_int,
     XRefreshKeyboardMapping: *const fn (*XMappingEvent) callconv(.c) c_int,
     XkbSetDetectableAutoRepeat: ?*const fn (*Display, c_int, ?*c_int) callconv(.c) c_int,
     XKeycodeToKeysym: ?*const fn (*Display, c_uint, c_int) callconv(.c) c_ulong = null,
@@ -429,6 +495,7 @@ pub const Api = struct {
             .XFlush = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XFlush") orelse return null,
             .XSync = lib.lookup(*const fn (*Display, Bool) callconv(.c) c_int, "XSync") orelse return null,
             .XConnectionNumber = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XConnectionNumber") orelse return null,
+            .XBell = lib.lookup(*const fn (*Display, c_int) callconv(.c) c_int, "XBell") orelse return null,
             .XRefreshKeyboardMapping = lib.lookup(*const fn (*XMappingEvent) callconv(.c) c_int, "XRefreshKeyboardMapping") orelse return null,
             .XkbSetDetectableAutoRepeat = lib.lookup(*const fn (*Display, c_int, ?*c_int) callconv(.c) c_int, "XkbSetDetectableAutoRepeat"),
             .XLookupString = lib.lookup(*const fn (*XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int, "XLookupString") orelse return null,

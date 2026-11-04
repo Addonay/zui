@@ -38,6 +38,11 @@ pub const interactive = @import("interactive.zig");
 pub const keystroke = @import("keystroke.zig");
 pub const keymap = @import("keymap.zig");
 pub const key_dispatch = @import("key_dispatch.zig");
+pub const input = @import("input.zig");
+/// Grapheme segmentation and friends, which GPUI code gets from the unicode_segmentation crate.
+pub const unicode = @import("cozmic").unicode;
+pub const ElementInputHandler = input.ElementInputHandler;
+pub const assert_entity_input_handler = input.assert_entity_input_handler;
 pub const action = @import("action.zig");
 pub const executor = @import("executor.zig");
 pub const platform = @import("platform.zig");
@@ -307,6 +312,8 @@ test {
     // Backends are chosen at run time, so nothing else pulls their tests in.
     if (@import("builtin").os.tag == .linux) {
         _ = @import("platform/linux/xkb.zig");
+        _ = @import("platform/linux/text_input_state.zig");
+        _ = @import("platform/linux/xim_preedit.zig");
         _ = @import("platform/linux/input.zig");
         _ = @import("platform/linux/x11.zig");
         _ = @import("platform/linux/wayland.zig");

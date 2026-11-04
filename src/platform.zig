@@ -85,7 +85,7 @@ pub const UTF16Selection = struct {
 };
 
 /// Text input target (GPUI `PlatformInputHandler`), backed by an element's
-/// `EntityInputHandler` implementation. Ranges are UTF-8 byte offsets.
+/// `EntityInputHandler` implementation. Ranges are in UTF-16 code units, as in GPUI.
 pub const PlatformInputHandler = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -129,6 +129,47 @@ pub const PlatformInputHandler = struct {
     pub fn accepts_text_input(self: *PlatformInputHandler, window: *Window, cx: *App) bool {
         return self.vtable.accepts_text_input(self.ctx, window, cx);
     }
+    pub fn dispatch_input(self: *PlatformInputHandler, input: []const u8, window: *Window, cx: *App) void {
+        self.replace_text_in_range(null, input, window, cx);
+    }
+
+    /// Where IME candidates should appear: the start of the composition on the caret's
+    /// visual line, or else the selection's end. Port of `compute_ime_candidate_bounds`.
+    pub fn selected_bounds(self: *PlatformInputHandler, window: *Window, cx: *App) ?Bounds(Pixels) {
+        const marked = self.marked_text_range(window, cx);
+        const selection = self.selected_text_range(true, window, cx) orelse return null;
+        if (marked) |m| {
+            var line_start = m.start;
+            const caret = selection.range.end;
+            if (self.bounds_for_range(.{ .start = caret, .end = caret }, window, cx)) |caret_bounds| {
+                var i = caret;
+                while (i > m.start) {
+                    i -= 1;
+                    const b = self.bounds_for_range(.{ .start = i, .end = i }, window, cx) orelse continue;
+                    if (@abs(b.origin.y - caret_bounds.origin.y) > 0.1) {
+                        line_start = i + 1;
+                        break;
+                    }
+                }
+            }
+            return self.bounds_for_range(.{ .start = line_start, .end = line_start }, window, cx);
+        }
+        const offset = if (selection.reversed) selection.range.start else selection.range.end;
+        return self.bounds_for_range(.{ .start = offset, .end = offset }, window, cx);
+    }
+};
+
+/// What a platform's input method asks the focused text field to do (GPUI `ImeInput`).
+pub const ImeInput = union(enum) {
+    /// Replaces the composition, if any, or else the selection.
+    insert_text: []const u8,
+    /// Replaces the composition with new uncommitted text. `selected` is the caret or
+    /// selection inside it, in UTF-16 code units; null leaves the caret at its end.
+    set_marked_text: struct { text: []const u8, selected: ?Range = null },
+    /// Accepts the composition as ordinary text.
+    unmark_text,
+    /// Removes the composition.
+    delete_text,
 };
 
 /// Callbacks a window registers with its platform window.
@@ -142,6 +183,8 @@ pub const WindowCallbacks = struct {
     should_close: *const fn (*anyopaque) bool,
     close: *const fn (*anyopaque) void,
     appearance_changed: *const fn (*anyopaque) void,
+    ime: *const fn (*anyopaque, ImeInput) void,
+    ime_area: *const fn (*anyopaque) ?Bounds(Pixels),
 };
 
 /// The OS window interface (GPUI `PlatformWindow`).
@@ -168,6 +211,10 @@ pub const PlatformWindow = struct {
         resize: *const fn (*PlatformWindow, Size(Pixels)) void = noopResize,
         close: *const fn (*PlatformWindow) void,
         update_ime_position: *const fn (*PlatformWindow, Bounds(Pixels)) void = noopIme,
+        /// Whether a focused field wants text. Called on every change of focused field,
+        /// with false first, because some protocols must be told about each field.
+        update_ime_enabled: *const fn (*PlatformWindow, bool) void = noopImeEnabled,
+        play_system_bell: *const fn (*PlatformWindow) void = noop,
     };
 
     fn defaultAppearance(_: *PlatformWindow) WindowAppearance {
@@ -179,7 +226,8 @@ pub const PlatformWindow = struct {
     fn noop(_: *PlatformWindow) void {}
     fn noopStr(_: *PlatformWindow, _: []const u8) void {}
     fn noopResize(_: *PlatformWindow, _: Size(Pixels)) void {}
-    fn noopIme(_: *PlatformWindow, _: Bounds(Pixels)) void {}
+    fn noopImeEnabled(_: *PlatformWindow, _: bool) void {}
+fn noopIme(_: *PlatformWindow, _: Bounds(Pixels)) void {}
 
     pub fn bounds(self: *PlatformWindow) Bounds(Pixels) {
         return self.vtable.bounds(self);
@@ -253,6 +301,19 @@ pub const PlatformWindow = struct {
     pub fn emit_input(self: *PlatformWindow, event: interactive.PlatformInput) DispatchEventResult {
         if (self.callbacks) |c| return c.input(c.ctx, event);
         return .{};
+    }
+    pub fn emit_ime(self: *PlatformWindow, ime: ImeInput) void {
+        if (self.callbacks) |c| c.ime(c.ctx, ime);
+    }
+    pub fn ime_area(self: *PlatformWindow) ?Bounds(Pixels) {
+        if (self.callbacks) |c| return c.ime_area(c.ctx);
+        return null;
+    }
+    pub fn play_system_bell(self: *PlatformWindow) void {
+        self.vtable.play_system_bell(self);
+    }
+    pub fn update_ime_enabled(self: *PlatformWindow, enabled: bool) void {
+        self.vtable.update_ime_enabled(self, enabled);
     }
     pub fn emit_active(self: *PlatformWindow, active: bool) void {
         if (self.callbacks) |c| c.active_status_change(c.ctx, active);

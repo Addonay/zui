@@ -5,6 +5,8 @@
 //! so tests exercise the same dispatch paths as a real platform.
 
 const std = @import("std");
+const input_mod = @import("../input.zig");
+const headless_mod = @import("../platform/headless.zig");
 const app_mod = @import("../app.zig");
 const window_mod = @import("../window.zig");
 const interactive = @import("../interactive.zig");
@@ -858,7 +860,7 @@ const TextField = struct {
 
     pub fn render(self: *TextField, window: *Window, cx: *Context(TextField)) *Div {
         // Input handlers are registered during the frame, while the field is focused.
-        window.handle_input(&self.focus, .{ .ctx = self, .vtable = &input_vtable }, cx.app);
+        window.handle_input(&self.focus, platform_mod.PlatformInputHandler{ .ctx = self, .vtable = &input_vtable }, cx.app);
         return div().id("field").w(px(100)).h(px(30)).track_focus(&self.focus);
     }
     fn build(_: *Window, app: *App) Entity(TextField) {
@@ -880,6 +882,293 @@ test "keystrokes: typed text is delivered to the focused input handler" {
     try std.testing.expectEqualStrings("hiA", cx.read_entity(view, TextField.read_text, .{}));
     vcx.simulate_keystrokes("cmd-a");
     try std.testing.expectEqualStrings("hiA", cx.read_entity(view, TextField.read_text, .{}));
+}
+
+/// A field holding ASCII text with a composition, through `ElementInputHandler`. Two focus
+/// handles let tests move focus between fields of the same view.
+const ImeField = struct {
+    focus: FocusHandle,
+    other_focus: FocusHandle,
+    buffer: [64]u8 = @splat(0),
+    len: usize = 0,
+    marked: ?platform_mod.Range = null,
+    caret: usize = 0,
+    accepts: bool = true,
+
+    pub fn render(self: *ImeField, window: *Window, cx: *Context(ImeField)) *Div {
+        const bounds: geometry.Bounds(Pixels) = .{ .origin = .{ .x = 5, .y = 7 }, .size = .{ .width = 100, .height = 20 } };
+        window.handle_input(&self.focus, input_mod.ElementInputHandler(ImeField).new(bounds, cx.entity()), cx);
+        window.handle_input(&self.other_focus, input_mod.ElementInputHandler(ImeField).new(bounds, cx.entity()), cx);
+        return div().w(px(100)).h(px(30)).track_focus(&self.focus).child(div().w(px(10)).h(px(10)).track_focus(&self.other_focus));
+    }
+
+    pub fn text_for_range(self: *ImeField, range: platform_mod.Range, _: *?platform_mod.Range, _: *Window, _: *Context(ImeField)) ?[]const u8 {
+        return self.buffer[range.start..range.end];
+    }
+    pub fn selected_text_range(self: *ImeField, _: bool, _: *Window, _: *Context(ImeField)) ?platform_mod.UTF16Selection {
+        return .{ .range = .{ .start = self.caret, .end = self.caret } };
+    }
+    pub fn marked_text_range(self: *ImeField, _: *Window, _: *Context(ImeField)) ?platform_mod.Range {
+        return self.marked;
+    }
+    pub fn unmark_text(self: *ImeField, _: *Window, _: *Context(ImeField)) void {
+        self.marked = null;
+    }
+    pub fn replace_text_in_range(self: *ImeField, range: ?platform_mod.Range, text: []const u8, _: *Window, _: *Context(ImeField)) void {
+        const r = range orelse self.marked orelse platform_mod.Range{ .start = self.caret, .end = self.caret };
+        self.splice(r, text);
+        self.marked = null;
+    }
+    pub fn replace_and_mark_text_in_range(self: *ImeField, range: ?platform_mod.Range, text: []const u8, new_selected: ?platform_mod.Range, _: *Window, _: *Context(ImeField)) void {
+        const r = range orelse self.marked orelse platform_mod.Range{ .start = self.caret, .end = self.caret };
+        self.splice(r, text);
+        self.marked = if (text.len > 0) .{ .start = r.start, .end = r.start + text.len } else null;
+        if (new_selected) |sel| self.caret = r.start + sel.end;
+    }
+    pub fn bounds_for_range(_: *ImeField, range: platform_mod.Range, element_bounds: geometry.Bounds(Pixels), _: *Window, _: *Context(ImeField)) ?geometry.Bounds(Pixels) {
+        return .{ .origin = .{ .x = element_bounds.origin.x + @as(f32, @floatFromInt(range.start)) * 10, .y = element_bounds.origin.y }, .size = .{ .width = 0, .height = 20 } };
+    }
+    pub fn character_index_for_point(_: *ImeField, _: Point(Pixels), _: *Window, _: *Context(ImeField)) ?usize {
+        return 0;
+    }
+    pub fn accepts_text_input(self: *ImeField, _: *Window, _: *Context(ImeField)) bool {
+        return self.accepts;
+    }
+
+    fn splice(self: *ImeField, r: platform_mod.Range, text: []const u8) void {
+        const tail_len = self.len - r.end;
+        std.mem.copyForwards(u8, self.buffer[r.start + text.len..], self.buffer[r.end..self.len]);
+        @memcpy(self.buffer[r.start..][0..text.len], text);
+        self.len = r.start + text.len + tail_len;
+        self.caret = r.start + text.len;
+    }
+
+    fn build(_: *Window, app: *App) Entity(ImeField) {
+        return app.new(ImeField{ .focus = app.focus_handle(), .other_focus = app.focus_handle() });
+    }
+    fn read_text(s: *const ImeField, _: *const App) []const u8 {
+        return s.buffer[0..s.len];
+    }
+    fn read_marked(s: *const ImeField, _: *const App) ?platform_mod.Range {
+        return s.marked;
+    }
+    fn ime(vcx: *VisualTestContext, input: platform_mod.ImeInput) void {
+        vcx.window.platform_window.emit_ime(input);
+        vcx.cx.app.flush_effects();
+    }
+    fn headless(vcx: *VisualTestContext) *headless_mod.HeadlessWindow {
+        return @fieldParentPtr("base", vcx.window.platform_window);
+    }
+};
+
+const NestedFocus = struct {
+    outer: FocusHandle,
+    inner: FocusHandle,
+
+    pub fn render(self: *NestedFocus, _: *Window, _: *Context(NestedFocus)) *Div {
+        return div().id("outer").size(px(100)).track_focus(&self.outer).child(div().id("inner").size(px(20)).track_focus(&self.inner));
+    }
+    fn build(_: *Window, app: *App) Entity(NestedFocus) {
+        return app.new(NestedFocus{ .outer = app.focus_handle(), .inner = app.focus_handle() });
+    }
+};
+
+test "focus: clicking a focusable child keeps focus from its focusable parent" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(NestedFocus.build);
+    vcx.simulate_click(.{ .x = 5, .y = 5 }, .{});
+    try std.testing.expect(view.read(cx.app).inner.is_focused(vcx.window));
+    try std.testing.expect(!view.read(cx.app).outer.is_focused(vcx.window));
+    // Outside the child, the parent takes it.
+    vcx.simulate_click(.{ .x = 50, .y = 50 }, .{});
+    try std.testing.expect(view.read(cx.app).outer.is_focused(vcx.window));
+}
+
+test "input: a composition replaces itself and commits in place" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.simulate_input("ab");
+
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "n" } });
+    try std.testing.expectEqualStrings("abn", cx.read_entity(view, ImeField.read_text, .{}));
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "ni" } });
+    try std.testing.expectEqualStrings("abni", cx.read_entity(view, ImeField.read_text, .{}));
+    try std.testing.expectEqual(platform_mod.Range{ .start = 2, .end = 4 }, cx.read_entity(view, ImeField.read_marked, .{}).?);
+
+    // Committing replaces the composition, wherever the caret is.
+    ImeField.ime(vcx, .{ .insert_text = "XY" });
+    try std.testing.expectEqualStrings("abXY", cx.read_entity(view, ImeField.read_text, .{}));
+    try std.testing.expect(cx.read_entity(view, ImeField.read_marked, .{}) == null);
+
+    // A typed key replaces a composition too: that is how a composed dead key lands.
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "'" } });
+    vcx.simulate_input("e");
+    try std.testing.expectEqualStrings("abXYe", cx.read_entity(view, ImeField.read_text, .{}));
+}
+
+test "input: cancelling and accepting a composition" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.simulate_input("a");
+
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "zz" } });
+    ImeField.ime(vcx, .delete_text);
+    try std.testing.expectEqualStrings("a", cx.read_entity(view, ImeField.read_text, .{}));
+    // With nothing marked, deleting must not touch the text.
+    ImeField.ime(vcx, .delete_text);
+    try std.testing.expectEqualStrings("a", cx.read_entity(view, ImeField.read_text, .{}));
+
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "q" } });
+    ImeField.ime(vcx, .unmark_text);
+    try std.testing.expectEqualStrings("aq", cx.read_entity(view, ImeField.read_text, .{}));
+    try std.testing.expect(cx.read_entity(view, ImeField.read_marked, .{}) == null);
+}
+
+test "input: the platform hears about every change of focused field" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    const win = ImeField.headless(vcx);
+    try std.testing.expect(!win.ime_enabled);
+
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    try std.testing.expect(win.ime_enabled);
+    try std.testing.expectEqual(@as(u32, 1), win.ime_enabled_changes);
+
+    // Redrawing the same field says nothing new.
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(u32, 1), win.ime_enabled_changes);
+
+    // Moving between two text fields: off, then on again, as text-input-v3 requires.
+    vcx.focus(view.read(cx.app).other_focus);
+    vcx.run_until_parked();
+    try std.testing.expect(win.ime_enabled);
+    try std.testing.expectEqual(@as(u32, 3), win.ime_enabled_changes);
+
+    vcx.window.blur();
+    vcx.run_until_parked();
+    try std.testing.expect(!win.ime_enabled);
+}
+
+test "input: a field that refuses text disables the input method" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    const win = ImeField.headless(vcx);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    try std.testing.expect(win.ime_enabled);
+
+    view.as_mut(cx.app).accepts = false;
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(!win.ime_enabled);
+}
+
+test "input: candidates follow the caret, and the composition start while composing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    const win = ImeField.headless(vcx);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    vcx.simulate_input("ab");
+
+    vcx.window.invalidate_character_coordinates();
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(f32, 25), win.ime_position.?.origin.x);
+
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "xyz" } });
+    const area = win.base.ime_area().?;
+    try std.testing.expectEqual(@as(f32, 25), area.origin.x);
+}
+
+test "input: the caret position reaches the input method after typing, without being asked" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    const win = ImeField.headless(vcx);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    vcx.simulate_input("abc");
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(f32, 35), win.ime_position.?.origin.x);
+
+    // Text set by the application only counts once the view says so.
+    win.ime_position = null;
+    view.as_mut(cx.app).caret = 1;
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(win.ime_position == null);
+    vcx.window.notify_text_input_changed(&view.read(cx.app).focus);
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(f32, 15), win.ime_position.?.origin.x);
+
+    // Notifications about a field without focus are ignored.
+    win.ime_position = null;
+    vcx.window.notify_text_input_changed(&view.read(cx.app).other_focus);
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(win.ime_position == null);
+}
+
+const DragField = struct {
+    released_outside: usize = 0,
+    released_inside: usize = 0,
+
+    pub fn render(_: *DragField, _: *Window, cx: *Context(DragField)) *Div {
+        return div().size(px(200)).child(
+            div().id("field").size(px(20)).on_mouse_up(.left, cx.listener(on_inside)).on_mouse_up_out(.left, cx.listener(on_outside)),
+        );
+    }
+    fn on_inside(self: *DragField, _: *const interactive.MouseUpEvent, _: *Window, _: *Context(DragField)) void {
+        self.released_inside += 1;
+    }
+    fn on_outside(self: *DragField, _: *const interactive.MouseUpEvent, _: *Window, _: *Context(DragField)) void {
+        self.released_outside += 1;
+    }
+    fn build(_: *Window, app: *App) Entity(DragField) {
+        return app.new(DragField{});
+    }
+};
+
+test "div: on_mouse_up_out fires only for releases outside the element" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragField.build);
+    vcx.simulate_click(.{ .x = 5, .y = 5 }, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).released_inside);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).released_outside);
+    vcx.simulate_click(.{ .x = 100, .y = 100 }, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).released_inside);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).released_outside);
+}
+
+test "input: a released view reads as an empty field instead of crashing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    var handler = input_mod.ElementInputHandler(ImeField).new(.{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1, .height = 1 } }, view).platform_input_handler();
+    // An id that was never allocated stands in for a view released after painting.
+    const dead = input_mod.ElementInputHandler(ImeField);
+    const stale: *dead = @ptrCast(@alignCast(handler.ctx));
+    stale.view = .{ .entity_id_ = @enumFromInt(0x7fffffff) };
+    try std.testing.expect(!handler.accepts_text_input(vcx.window, cx.app));
+    try std.testing.expect(handler.selected_text_range(true, vcx.window, cx.app) == null);
+    handler.replace_text_in_range(null, "x", vcx.window, cx.app);
+    try std.testing.expect(handler.selected_bounds(vcx.window, cx.app) == null);
 }
 
 test "VisualTestContext: focus, update, mouse move and dispatch_action" {
