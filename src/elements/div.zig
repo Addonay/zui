@@ -3325,6 +3325,7 @@ pub fn style() *StyleBuilder {
 const MouseDownL = struct { button: ?MouseButton, phase: DispatchPhase, listener: Listener(MouseDownEvent) };
 const MouseUpL = struct { button: ?MouseButton, phase: DispatchPhase, listener: Listener(MouseUpEvent) };
 const DownOutL = struct { listener: Listener(MouseDownEvent) };
+const UpOutL = struct { button: MouseButton, listener: Listener(MouseUpEvent) };
 
 const ActionL = struct { action_type: app_mod.TypeId, phase: DispatchPhase, ctx: *anyopaque, func: key_dispatch.ActionFn };
 
@@ -3408,6 +3409,7 @@ pub const Interactivity = struct {
     mouse_down_listeners: List(MouseDownL) = .empty,
     mouse_up_listeners: List(MouseUpL) = .empty,
     mouse_down_out_listeners: List(DownOutL) = .empty,
+    mouse_up_out_listeners: List(UpOutL) = .empty,
     mouse_move_listeners: List(Listener(MouseMoveEvent)) = .empty,
     scroll_wheel_listeners: List(Listener(ScrollWheelEvent)) = .empty,
     key_down_listeners: List(struct { phase: DispatchPhase, l: Listener(KeyDownEvent) }) = .empty,
@@ -3654,6 +3656,12 @@ pub fn StyledElement(comptime Ext: type) type {
         /// Fires when the mouse goes down outside this element.
         pub fn on_mouse_down_out(self: *Self, listener: anytype) *Self {
             self.interactivity.mouse_down_out_listeners.append(arena(), .{ .listener = app_mod.to_listener(MouseDownEvent, listener) }) catch oom();
+            return self;
+        }
+
+        /// Fires when `button` is released outside this element, as for ending a drag.
+        pub fn on_mouse_up_out(self: *Self, button: MouseButton, listener: anytype) *Self {
+            self.interactivity.mouse_up_out_listeners.append(arena(), .{ .button = button, .listener = app_mod.to_listener(MouseUpEvent, listener) }) catch oom();
             return self;
         }
 
@@ -3945,7 +3953,7 @@ pub fn StyledElement(comptime Ext: type) type {
             const needs_down = it.mouse_down_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or
                 it.tracked_focus_handle != null or it.group_active_style != null or it.mouse_down_out_listeners.items.len > 0;
             if (needs_down) window.on_mouse_event(MouseDownEvent, ctx, onMouseDown);
-            if (it.mouse_up_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or it.group != null)
+            if (it.mouse_up_out_listeners.items.len > 0 or it.mouse_up_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or it.group != null)
                 window.on_mouse_event(MouseUpEvent, ctx, onMouseUp);
             if (it.mouse_move_listeners.items.len > 0 or it.hover_style != null or it.hover_listener != null or it.group_hover_style != null or it.group != null)
                 window.on_mouse_event(MouseMoveEvent, ctx, onMouseMove);
@@ -3971,6 +3979,8 @@ pub fn StyledElement(comptime Ext: type) type {
             if (it.tracked_focus_handle) |fh| {
                 if (!window.default_prevented) {
                     window.focus(fh);
+                    // A focusable parent must not take focus back as the event bubbles.
+                    window.prevent_default();
                 }
             }
             if (c.state) |st| {
@@ -3986,6 +3996,12 @@ pub fn StyledElement(comptime Ext: type) type {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
             const it = &c.self.interactivity;
             const hovered = c.hitbox.is_hovered(window);
+            // Capture phase, as in GPUI: nothing outside may stop the element hearing it.
+            if (phase == .capture and !hovered) {
+                for (it.mouse_up_out_listeners.items) |l| {
+                    if (l.button.eql(e.button)) l.listener.call(e, window, cx);
+                }
+            }
             if (hovered) {
                 for (it.mouse_up_listeners.items) |l| {
                     if (l.phase != phase) continue;

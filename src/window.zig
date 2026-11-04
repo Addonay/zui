@@ -407,6 +407,10 @@ pub const Window = struct {
     rem_size_override_stack: std.ArrayList(Pixels) = .empty,
     viewport_size: Size(Pixels) = .{ .width = 0, .height = 0 },
     focus_id: ?FocusId = null,
+    /// The focused element whose input handler accepts text, as last told to the platform.
+    focused_text_input: ?FocusId = null,
+    /// The caret may have moved: the next frame tells the input method where it landed.
+    ime_position_dirty: bool = false,
     focus_enabled: bool = true,
     pending_focus_events: bool = false,
     active: bool = true,
@@ -459,6 +463,8 @@ pub const Window = struct {
             .should_close = onShouldClose,
             .close = onClose,
             .appearance_changed = onAppearanceChanged,
+            .ime = onIme,
+            .ime_area = onImeArea,
         });
         return self;
     }
@@ -951,12 +957,55 @@ pub const Window = struct {
         if (self.focus_id == handle.id) self.next_frame.focus = handle.id;
     }
 
-    /// Registers the input handler for the focused element (text input).
-    pub fn handle_input(self: *Window, focus_handle: *const FocusHandle, handler: platform_mod.PlatformInputHandler, cx: *App) void {
+    /// Registers the input handler for the focused element (text input). Takes a
+    /// `PlatformInputHandler` or anything with `platform_input_handler()`, such as
+    /// `ElementInputHandler`. Call it during paint.
+    pub fn handle_input(self: *Window, focus_handle: *const FocusHandle, handler: anytype, cx: anytype) void {
         _ = cx;
-        if (self.focus_id == focus_handle.id) {
-            self.next_frame.input_handlers.append(self.allocator, .{ .handler = handler, .focus_id = focus_handle.id }) catch oom();
-        }
+        if (self.focus_id != focus_handle.id) return;
+        const erased: platform_mod.PlatformInputHandler = blk: {
+            const H = @TypeOf(handler);
+            if (@typeInfo(H) == .pointer) break :blk handler.platform_input_handler();
+            break :blk handler;
+        };
+        self.next_frame.input_handlers.append(self.allocator, .{ .handler = erased, .focus_id = focus_handle.id }) catch oom();
+    }
+
+    /// Tells the platform the caret moved, so IME candidates can follow it. Call this
+    /// after scrolling or moving the caret other than through typing.
+    pub fn invalidate_character_coordinates(self: *Window) void {
+        const S = struct {
+            fn call(window: *Window, cx: *App) void {
+                if (window.ime_area_in(cx)) |area| window.platform_window.update_ime_position(area);
+            }
+        };
+        self.on_next_frame(S.call);
+    }
+
+    /// Tells native text services that the focused field's text changed. Call this after
+    /// edits made by the application. Other fields are ignored.
+    pub fn notify_text_input_changed(self: *Window, focus_handle: *const FocusHandle) void {
+        if (self.focused_text_input == focus_handle.id) self.ime_position_dirty = true;
+    }
+
+    /// Tells native text services that the focused field's selection changed.
+    pub fn notify_text_selection_changed(self: *Window, focus_handle: *const FocusHandle) void {
+        if (self.focused_text_input == focus_handle.id) self.ime_position_dirty = true;
+    }
+
+    /// Opens the software keyboard. Linux desktops have none to ask for.
+    pub fn request_virtual_keyboard(_: *const Window) void {}
+
+    /// Opens the system emoji and symbol picker. Only macOS has one to open.
+    pub fn show_character_palette(_: *const Window) void {}
+
+    pub fn play_system_bell(self: *Window) void {
+        self.platform_window.play_system_bell();
+    }
+
+    fn ime_area_in(self: *Window, cx: *App) ?Bounds(Pixels) {
+        var handler = self.platform_window.input_handler() orelse return null;
+        return handler.selected_bounds(self, cx);
     }
 
     /// Draws `element` after the current tree, on top (GPUI `defer_draw`).
@@ -1215,7 +1264,7 @@ pub const Window = struct {
         self.gc_element_states();
         self.hit_test(self.mouse_position_);
         self.update_cursor();
-        self.update_input_handler();
+        self.update_input_handler(cx);
         self.needs_present = true;
         // Effects queued during render (e.g. notify) are processed now.
         cx.flush_effects();
@@ -1267,13 +1316,30 @@ pub const Window = struct {
         self.app.platform.set_cursor_style(style);
     }
 
-    fn update_input_handler(self: *Window) void {
+    fn update_input_handler(self: *Window, cx: *App) void {
         const handlers = self.rendered_frame.input_handlers.items;
+        var field: ?FocusId = null;
         if (handlers.len > 0) {
-            self.platform_window.set_input_handler(handlers[handlers.len - 1].handler);
+            const entry = handlers[handlers.len - 1];
+            self.platform_window.set_input_handler(entry.handler);
+            var handler = entry.handler;
+            if (handler.accepts_text_input(self, cx)) field = entry.focus_id;
         } else {
             self.platform_window.take_input_handler();
         }
+        if (field == self.focused_text_input) {
+            // After painting, layouts match the text, so the caret's position is real.
+            if (field != null and self.ime_position_dirty) {
+                if (self.ime_area_in(cx)) |area| self.platform_window.update_ime_position(area);
+            }
+            self.ime_position_dirty = false;
+            return;
+        }
+        self.ime_position_dirty = false;
+        // Text-input protocols must hear about every change of field, not only on and off.
+        if (self.focused_text_input != null) self.platform_window.update_ime_enabled(false);
+        self.focused_text_input = field;
+        if (field != null) self.platform_window.update_ime_enabled(true);
     }
 
     /// Presents the last drawn frame to the platform window.
@@ -1410,6 +1476,7 @@ pub const Window = struct {
                 if (!event.keystroke.modifiers.control and !event.keystroke.modifiers.platform) {
                     if (self.platform_window.input_handler()) |h| {
                         var handler = h;
+                        self.ime_position_dirty = true;
                         handler.replace_text_in_range(null, text, self, cx);
                     }
                 }
@@ -1470,6 +1537,36 @@ pub const Window = struct {
         const self: *Window = @ptrCast(@alignCast(ctx));
         const handled = self.dispatch_event(event, self.app);
         return .{ .propagate = !handled, .default_prevented = self.default_prevented };
+    }
+
+    fn onIme(ctx: *anyopaque, ime: platform_mod.ImeInput) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.handle_ime(ime, self.app);
+    }
+
+    fn onImeArea(ctx: *anyopaque) ?Bounds(Pixels) {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        return self.ime_area_in(self.app);
+    }
+
+    /// Applies an input method's request to the focused field.
+    pub fn handle_ime(self: *Window, ime: platform_mod.ImeInput, cx: *App) void {
+        var handler = self.platform_window.input_handler() orelse return;
+        cx.pending_updates += 1;
+        defer {
+            cx.pending_updates -= 1;
+            if (cx.pending_updates == 0) cx.flush_effects();
+        }
+        const prev_arena = current_frame_arena;
+        current_frame_arena = &self.rendered_frame.arena;
+        defer current_frame_arena = prev_arena;
+        self.ime_position_dirty = true;
+        switch (ime) {
+            .insert_text => |text| handler.replace_text_in_range(null, text, self, cx),
+            .set_marked_text => |m| handler.replace_and_mark_text_in_range(null, m.text, m.selected, self, cx),
+            .unmark_text => handler.unmark_text(self, cx),
+            .delete_text => if (handler.marked_text_range(self, cx)) |marked| handler.replace_text_in_range(marked, "", self, cx),
+        }
     }
 
     fn onActiveStatusChange(ctx: *anyopaque, active: bool) void {

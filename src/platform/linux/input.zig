@@ -120,6 +120,46 @@ const fkey_names = [_][]const u8{
     "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24",
 };
 
+/// The character a dead key stands for while it waits for the next key, as in GPUI.
+pub fn dead_key_text(keysym: u32) ?[]const u8 {
+    return switch (keysym) {
+        0xfe50 => "`", // dead_grave
+        0xfe51 => "\u{b4}", // dead_acute
+        0xfe52 => "^", // dead_circumflex
+        0xfe53 => "~", // dead_tilde
+        0xfe54 => "\u{af}", // dead_macron
+        0xfe55 => "\u{2d8}", // dead_breve
+        0xfe56 => "\u{2d9}", // dead_abovedot
+        0xfe57 => "\u{a8}", // dead_diaeresis
+        0xfe58 => "\u{2da}", // dead_abovering
+        0xfe59 => "\u{2dd}", // dead_doubleacute
+        0xfe5a => "\u{2c7}", // dead_caron
+        0xfe5b => "\u{b8}", // dead_cedilla
+        0xfe5c => "\u{2db}", // dead_ogonek
+        0xfe5d => "\u{345}", // dead_iota
+        0xfe5e => "\u{3099}", // dead_voiced_sound
+        0xfe5f => "\u{309a}", // dead_semivoiced_sound
+        0xfe60 => "\u{323}\u{323}", // dead_belowdot
+        0xfe61 => "\u{321}", // dead_hook
+        0xfe62 => "\u{31b}", // dead_horn
+        0xfe63 => "\u{336}\u{336}", // dead_stroke
+        0xfe64 => "\u{313}\u{313}", // dead_abovecomma
+        0xfe65 => "\u{2bd}", // dead_abovereversedcomma
+        0xfe66 => "\u{30f}", // dead_doublegrave
+        0xfe67 => "\u{2f3}", // dead_belowring
+        0xfe68 => "\u{331}", // dead_belowmacron
+        0xfe69 => "\u{a788}", // dead_belowcircumflex
+        0xfe6a => "\u{330}", // dead_belowtilde
+        0xfe6b => "\u{32e}", // dead_belowbreve
+        0xfe6c => "\u{324}", // dead_belowdiaeresis
+        0xfe6d => "\u{32f}", // dead_invertedbreve
+        0xfe6e => "\u{326}", // dead_belowcomma
+        0xfe8a => "\u{259}", // dead_small_schwa
+        0xfe8b => "\u{18f}", // dead_capital_schwa
+        else => null,
+    };
+}
+
 /// True for Shift, Control, Alt, Super and friends: they never join compose sequences.
 pub fn is_modifier_keysym(sym: u32) bool {
     return (sym >= 0xffe1 and sym <= 0xffee) or (sym >= 0xfe01 and sym <= 0xfe0f) or sym == 0xff7e or sym == 0xff7f;
@@ -148,6 +188,12 @@ test "key repeat keeps its rate across late wakeups" {
     try std.testing.expectEqual(RepeatStep{ .count = 3, .next_ms = 175 }, repeat_step(150, 100, 25));
     // A long stall drops the backlog.
     try std.testing.expectEqual(RepeatStep{ .count = max_repeat_burst, .next_ms = 5025 }, repeat_step(5000, 100, 25));
+}
+
+test "dead keys know their characters" {
+    try std.testing.expectEqualStrings("\u{b4}", dead_key_text(0xfe51).?);
+    try std.testing.expectEqualStrings("^", dead_key_text(0xfe52).?);
+    try std.testing.expect(dead_key_text('a') == null);
 }
 
 test "modifier keysyms" {

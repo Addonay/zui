@@ -127,8 +127,25 @@ pub const HeadlessWindow = struct {
     /// The last presented scene (borrowed from the window's rendered frame).
     last_scene: ?*const scene_mod.Scene = null,
     draw_count: u64 = 0,
+    /// What the window last told the input method, for tests.
+    ime_enabled: bool = false,
+    ime_enabled_changes: u32 = 0,
+    ime_position: ?geometry.Bounds(Pixels) = null,
+
+    fn updateImeEnabled(p: *PlatformWindow, enabled: bool) void {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        self.ime_enabled = enabled;
+        self.ime_enabled_changes += 1;
+    }
+
+    fn updateImePosition(p: *PlatformWindow, area: geometry.Bounds(Pixels)) void {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        self.ime_position = area;
+    }
 
     const vtable: PlatformWindow.VTable = .{
+        .update_ime_enabled = updateImeEnabled,
+        .update_ime_position = updateImePosition,
         .bounds = bounds,
         .content_size = contentSize,
         .scale_factor = scaleFactor,

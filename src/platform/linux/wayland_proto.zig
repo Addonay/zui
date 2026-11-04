@@ -146,8 +146,9 @@ pub const FractionalScaleListener = extern struct {
 /// zwp_text_input_v3 is optional. Keep its wire description local so the
 /// backend remains usable on compositors that do not advertise the global.
 pub const TextInputListener = extern struct {
-    enter: ?*const fn (?*anyopaque, *TextInput, *Surface) callconv(.c) void = null,
-    leave: ?*const fn (?*anyopaque, *TextInput, *Surface) callconv(.c) void = null,
+    // Surfaces are nullable: some compositors have been seen sending null here.
+    enter: ?*const fn (?*anyopaque, *TextInput, ?*Surface) callconv(.c) void = null,
+    leave: ?*const fn (?*anyopaque, *TextInput, ?*Surface) callconv(.c) void = null,
     preedit_string: ?*const fn (?*anyopaque, *TextInput, ?[*:0]const u8, i32, i32) callconv(.c) void = null,
     commit_string: ?*const fn (?*anyopaque, *TextInput, ?[*:0]const u8) callconv(.c) void = null,
     delete_surrounding_text: ?*const fn (?*anyopaque, *TextInput, u32, u32) callconv(.c) void = null,
@@ -337,6 +338,22 @@ pub const primary_device_manager_interface: Interface = .{
     .version = 1,
     .method_count = 3,
     .methods = @ptrCast(&primary_device_manager_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+// -- xdg_system_bell_v1 -------------------------------------------------------
+
+pub const SystemBell = opaque {};
+pub const system_bell_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "ring", .signature = "?o", .types = &[_]?*const anyopaque{null} },
+};
+pub const system_bell_interface: Interface = .{
+    .name = "xdg_system_bell_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&system_bell_methods),
     .event_count = 0,
     .events = null,
 };

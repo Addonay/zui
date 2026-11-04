@@ -9,6 +9,7 @@ const examples = [_][]const u8{
     "ownership_post",
     "active_state_bug",
     "gradient",
+    "input",
 };
 
 pub fn build(b: *std.Build) void {

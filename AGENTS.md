@@ -60,14 +60,15 @@ GPUI's `hello_world.rs` (verified via headless snapshot).
 | scene, bounds_tree, atlas (+CpuAtlas), path_builder | done |
 | CPU renderer (port of GPUI WGSL math; SIMD + multithreaded bands) | done |
 | headless platform (+ `ZUI_SNAPSHOT` PPM output) | done |
-| Linux platform: Wayland + X11 (dlopen, no link deps) | done; verified on Xvfb and a mock Wayland compositor; no IME yet |
+| Linux platform: Wayland + X11 (dlopen, no link deps) | done; verified on Xvfb and an isolated real compositor (see §7); IME on both |
+| Text input: `EntityInputHandler`, `ElementInputHandler`, IME (text-input-v3, XIM), dead keys | done; verified with a real input method on both (see §7) |
 | TestAppContext / VisualTestContext + end-to-end tests | done |
 | img / svg / assets (stb_image, nanosvg) | done (sync loading; GIF first frame only) |
 | anchored, deferred, canvas, animation (+easings), spring | done |
 | list (variable height), uniform_list | done (agent stopped right after tests passed; verify) |
 | GPU layer (`src/gpu/`, vendored from zicr at `87fe622`; zicr dependency removed) | done |
 | GPU renderer (`src/renderer/gpu.zig`, `shaders.glsl`, committed `shaders_gen.zig`) | done on Vulkan: default on Linux Wayland/X11, CPU fallback; subpixel sprites and surfaces not drawn (see §7) |
-| examples | 8 ported: hello_world, pattern, tree, text_layout, scrollable, ownership_post, active_state_bug, gradient |
+| examples | 9 ported: hello_world, pattern, tree, text_layout, scrollable, ownership_post, active_state_bug, gradient, input |
 | macOS / Windows / web platforms | NOT started |
 
 ## 3. Repository layout (mirrors `crates/gpui/src`)
@@ -89,12 +90,15 @@ src/elements/*.zig       div, text, img, svg, list, uniform_list, anchored, defe
 src/taffy.zig            TaffyLayoutEngine on zafi (Style -> zafi.Style conversion)
 src/text_system.zig + text_system/{font,line_layout,line,line_wrapper}.zig
 src/keystroke.zig interactive.zig keymap.zig keymap_context.zig key_dispatch.zig action.zig
+src/input.zig            ElementInputHandler: a view's EntityInputHandler methods as a PlatformInputHandler
 src/executor.zig         BackgroundExecutor, ForegroundExecutor, Task(T)
 src/scene.zig bounds_tree.zig atlas.zig path_builder.zig
 src/assets.zig svg_renderer.zig spring.zig
 src/platform.zig         Platform / PlatformWindow vtable interfaces + shared types
 src/platform/headless.zig  headless/test platform
 src/platform/linux.zig + linux/{wayland,wayland_proto,x11,x11_proto,xkb,input,dl}.zig
+src/platform/linux/text_input_state.zig  text-input-v3 double-buffered state, no Wayland in it
+src/platform/linux/xim_preedit.zig       XIM composition edits, no X11 in it
 src/renderer/cpu.zig     CPU renderer
 src/gpu/                 portable GPU layer (Vulkan/D3D12/D3D11/Metal/GL/WebGPU), vendored from zicr
 src/renderer/gpu.zig     GPU renderer + GpuAtlas; shaders.glsl -> shaders_gen.zig (committed)
@@ -112,7 +116,7 @@ third_party/             stb_image, nanosvg, images.c shim
   (installed at `~/tools/zig-x86_64-linux-0.17.0`, symlinked to `/usr/local/bin/zig`).
   Note: Zig 0.17 changed a lot vs older versions — see §9.
 - `build.zig.zon` dependencies:
-  - `cozmic` — `git+https://github.com/Addonay/cozmic.git#bbc0f4f282acd024d1dc0b5e4d16fc4b08fcb6b0`
+  - `cozmic` — `git+https://github.com/Addonay/cozmic.git#a59bca9bec6dd8eb0b41ccd637732978590382f2`
     (its own deps: ezi_code, harfbuzz 14.1.0, freetype 2.14.3, zlib 1.3.1, libpng 1.6.50)
   - `zafi` — `git+https://github.com/Addonay/zafi.git#04086f7a21f120a5ea52f921fb2034d75e10264f`
   - `sokol_tools_bin` (lazy) — the `sokol-shdc` binaries, fetched only by
@@ -271,19 +275,42 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   machine used, so the renderer has not been run under native validation).
   Test on software Vulkan: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`;
   `ZUI_GPU_TEST_DUMP=dir` writes each GPU/CPU pair as PPM.
-- **Testing native Wayland without touching the desktop**: run a private compositor with
-  `dbus-run-session`, `mutter --headless --wayland --no-x11 --virtual-monitor 1024x768
-  --wayland-display zui-test`, `XDG_RUNTIME_DIR` pointing at a scratch dir, and
-  `GSETTINGS_BACKEND=keyfile XDG_CONFIG_HOME=<scratch>` on the mutter process. Unset `DISPLAY`
-  for the client, or a Wayland failure silently falls back to X11. **Never run `gsettings` or
-  `dconf` in these scripts**: `dconf-service` is bus-activated with the bus daemon's environment
-  and writes the real user database. Keys can be injected through
-  `org.gnome.Mutter.RemoteDesktop` over one D-Bus connection (the session dies with it; its
-  keyboard hot-plugs on the first key, so that key's press is lost). `WAYLAND_DEBUG=client`
-  shows the requests sent. Plain mutter ignores layout settings, so dead keys are tested on X11:
-  `xmodmap -e "keycode 48 = dead_acute"` on Xvfb, then `xdotool key 48`. A process still
-  running at its timeout proves nothing: check for frames and protocol errors. Send output to a
-  file, since pipes can lose it when `timeout` kills the job.
+- **Text input**: ranges are UTF-16, as in GPUI. Platforms call `PlatformWindow.emit_ime`
+  (`ImeInput`), which `Window.handle_ime` applies to the focused handler. After each frame the
+  window tells the platform when the focused text field changed (off, then on, on every change,
+  because text-input-v3 requires it) and where the caret went. Wayland rules, from the protocol
+  XML: a `done` with a stale serial still applies text but must not send state (foot gets this
+  wrong); the rectangle is not moved while composing; `enter` can arrive before `wl_keyboard.enter`
+  and with a null surface; one-byte commits go through as key presses, because IBus takes plain
+  keys too. X11: XIM is opened only when XMODIFIERS names a real method, otherwise xkb compose
+  shows dead keys inline. Xlib's instantiate callback fires once per registration, so after a
+  server dies reconnecting is retried once a second for a minute. Every event must go through
+  `XFilterEvent`, also while no server is connected. Not done: `delete_surrounding_text` (we never
+  send surrounding text), content types such as password fields, `observe_keystrokes`,
+  `keyboard_layout`, multi-keystroke replay.
+- **Testing without touching the desktop**: isolate *before* starting the bus, so the bus and
+  everything it activates inherit it: `env -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS
+  -u IBUS_ADDRESS HOME=<s>/home XDG_CONFIG_HOME=<s>/cfg XDG_DATA_HOME=<s>/data XDG_CACHE_HOME=<s>/cache
+  XDG_STATE_HOME=<s>/state XDG_RUNTIME_DIR=<s>/rt dbus-run-session -- script`. **Never run
+  `gsettings` or `dconf` outside that**, and setting these variables inside the script is too late:
+  `dconf-service` is activated with the bus daemon's environment and writes the real user database.
+  Compare `stat ~/.config/dconf/user` and the real `ibus-daemon` PID before and after.
+  - Native Wayland: `mutter --headless --wayland --no-x11 --virtual-monitor 1024x768
+    --wayland-display zui-test`. Unset `DISPLAY` for the client, or a Wayland failure silently falls
+    back to X11. `WAYLAND_DEBUG=client` shows the protocol.
+  - A real Wayland IME: `gnome-shell --headless --wayland --no-x11 --unsafe-mode` instead, with
+    `GSETTINGS_BACKEND=keyfile` and `sources=[('ibus','libpinyin')]` in
+    `<s>/cfg/glib-2.0/settings/keyfile`. It starts its own ibus. Press Escape to leave the overview,
+    then click the field: a new window does not get keyboard focus by itself.
+  - Keys and clicks: `org.gnome.Mutter.RemoteDesktop` over one D-Bus connection (the session dies
+    with it; its keyboard hot-plugs on the first key, so that press is lost).
+  - A real X11 IME: `ibus-daemon --xim --panel=disable`, `ibus engine libpinyin`,
+    `XMODIFIERS=@im=ibus`, on Xvfb. Unset `WAYLAND_DISPLAY`, or the app opens on the real desktop.
+  - Dead keys on X11: `xmodmap -e "keycode 48 = dead_acute"`, then `xdotool key 48`. Plain mutter
+    ignores layout settings.
+  - A process still running at its timeout proves nothing: check for frames and protocol errors.
+    Send output to a file, since pipes can lose it when `timeout` kills the job. `xdotool
+    windowclose` destroys the window under the app, which logs harmless X11 protocol errors.
 - **Headless snapshots**: `ZUI_HEADLESS=1 ZUI_SNAPSHOT=out.ppm zig build run-<example>`.
   `ZUI_SCALE=2` sets the headless scale factor.
 
@@ -298,9 +325,8 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
    `on_file_drop`, pressure/pinch/back-gesture listeners, `on_aux_click`,
    `on_mouse_up_out`, `cached` views. `with_animation` is not yet aliased on
    StyledElement (add `pub const with_animation = animation.AnimationExt(*Self).with_animation;` etc.).
-3. Input: `EntityInputHandler` / `ElementInputHandler` (GPUI text input
-   example), IME (Wayland text-input-v3, X11 XIM), multi-keystroke binding
-   replay, tab groups, `Unbind`.
+3. Input: multi-keystroke binding replay, tab groups, `Unbind`, `observe_keystrokes`,
+   `keyboard_layout` and its change observer, IME content types.
 4. Text: ShapedLine cursor/split APIs, typographic bounds, font enumeration,
    `add_fonts`, missing-glyph reporting.
 5. Async: assets/images load synchronously; GIF animation; WebP.

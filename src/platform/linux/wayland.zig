@@ -17,6 +17,7 @@ const window_renderer = @import("../../renderer/window_renderer.zig");
 const proto = @import("wayland_proto.zig");
 const dl = @import("dl.zig");
 const xkb = @import("xkb.zig");
+const text_input_state = @import("text_input_state.zig");
 const input = @import("input.zig");
 
 const Pixels = geometry.Pixels;
@@ -99,6 +100,17 @@ pub const WaylandConnection = struct {
     gpu_context: ?*window_renderer.GpuContext = null,
     gpu_probed: bool = false,
     compose: ?xkb.Compose = null,
+    system_bell: ?*proto.SystemBell = null,
+    text_input_manager: ?*proto.TextInputManager = null,
+    text_input: ?*proto.TextInput = null,
+    /// Double-buffered text input events; see text_input_state.zig.
+    text_input_state: text_input_state.TextInputState = undefined,
+    /// The window the compositor says has text-input focus. Tracked apart from keyboard
+    /// focus because the two `enter` events can arrive in either order.
+    text_input_window: ?*WaylandWindow = null,
+    text_input_enabled: bool = false,
+    /// Dedupes the rectangle: re-sending it can make an input method redraw and answer.
+    last_ime_rect: ?[4]i32 = null,
     cursor_shape_manager: ?*proto.CursorShapeManager = null,
     cursor_shape_device: ?*proto.CursorShapeDevice = null,
     primary_manager: ?*proto.PrimaryDeviceManager = null,
@@ -187,6 +199,14 @@ pub const WaylandConnection = struct {
         .drop = dataDeviceDrop,
         .selection = dataDeviceSelection,
     };
+    const text_input_listener: proto.TextInputListener = .{
+        .enter = textInputEnter,
+        .leave = textInputLeave,
+        .preedit_string = textInputPreedit,
+        .commit_string = textInputCommit,
+        .delete_surrounding_text = textInputDeleteSurrounding,
+        .done = textInputDone,
+    };
     const primary_device_listener: proto.PrimaryDeviceListener = .{ .data_offer = primaryDeviceOffer, .selection = primaryDeviceSelection };
     const primary_offer_listener: proto.PrimaryOfferListener = .{ .offer = primaryOfferOffer };
     const primary_source_listener: proto.PrimarySourceListener = .{ .send = primarySourceSend, .cancelled = primarySourceCancelled };
@@ -234,6 +254,7 @@ pub const WaylandConnection = struct {
         self.xkb = xkb.Xkb.init() catch null;
         self.load_cursor_theme();
         self.compose = xkb.Compose.init();
+        self.text_input_state = .{ .allocator = self.allocator };
         return self;
     }
 
@@ -370,6 +391,10 @@ pub const WaylandConnection = struct {
         if (self.primary_offer_text) |c| self.allocator.free(c);
         if (self.primary_read) |c| self.allocator.free(c);
         if (self.compose) |*c| c.deinit();
+        self.text_input_state.deinit();
+        if (self.text_input) |o| self.api.wl_proxy_destroy(@ptrCast(o));
+        if (self.text_input_manager) |o| self.api.wl_proxy_destroy(@ptrCast(o));
+        if (self.system_bell) |o| self.api.wl_proxy_destroy(@ptrCast(o));
         if (self.clipboard_slot.current) |o| self.api.wl_proxy_destroy(@ptrCast(o));
         if (self.primary_slot.current) |o| self.api.wl_proxy_destroy(@ptrCast(o));
         if (self.primary_source) |o| self.api.wl_proxy_destroy(@ptrCast(o));
@@ -449,7 +474,85 @@ pub const WaylandConnection = struct {
         return null;
     }
 
+    // -- text input --------------------------------------------------------
+
+    fn text_input_request(self: *WaylandConnection, opcode: u32) void {
+        const ti = self.text_input orelse return;
+        _ = self.api.wl_proxy_marshal_flags(@ptrCast(ti), opcode, null, 1, 0);
+    }
+
+    fn text_input_commit(self: *WaylandConnection) void {
+        self.text_input_request(7);
+        self.text_input_state.commits +%= 1;
+    }
+
+    /// Makes the protocol's enabled state match what the focused window wants.
+    fn sync_text_input(self: *WaylandConnection) void {
+        const ti = self.text_input orelse return;
+        const want = if (self.text_input_window) |w| w.wants_ime else false;
+        if (want == self.text_input_enabled) return;
+        self.text_input_enabled = want;
+        self.last_ime_rect = null;
+        self.text_input_state.reset();
+        if (want) {
+            self.text_input_request(1); // enable
+            _ = self.api.wl_proxy_marshal_flags(@ptrCast(ti), 5, null, 1, 0, @as(u32, 0), @as(u32, 0)); // normal content
+            if (self.text_input_window.?.base.ime_area()) |area| self.set_ime_rect(area);
+        } else {
+            self.text_input_request(2); // disable
+        }
+        self.text_input_commit();
+        self.flush();
+    }
+
+    /// Queues the rectangle unless unchanged. Returns true when a commit is needed.
+    fn set_ime_rect(self: *WaylandConnection, area: PxBounds) void {
+        const ti = self.text_input orelse return;
+        const rect = ime_rect(area);
+        if (self.last_ime_rect) |last| {
+            if (std.mem.eql(i32, &last, &rect)) return;
+        }
+        self.last_ime_rect = rect;
+        _ = self.api.wl_proxy_marshal_flags(@ptrCast(ti), 6, null, 1, 0, rect[0], rect[1], rect[2], rect[3]);
+    }
+
+    /// Moves candidate windows to `area`, unless a composition is on screen: moving
+    /// them then is left to `done`, or they jump while the user is choosing.
+    fn update_ime_position(self: *WaylandConnection, window: *WaylandWindow, area: PxBounds) void {
+        if (!self.text_input_enabled or self.text_input_window != window) return;
+        if (self.text_input_state.composing) return;
+        const before = self.last_ime_rect;
+        self.set_ime_rect(area);
+        if (before == null or !std.mem.eql(i32, &before.?, &self.last_ime_rect.?)) {
+            self.text_input_commit();
+            self.flush();
+        }
+    }
+
+    /// A click ends any composition and keeps its text; the input method must also forget
+    /// it, and text-input-v3 has no reset request, so it gets disabled and enabled again.
+    fn commit_composition(self: *WaylandConnection) void {
+        const w = self.keyboard_focus orelse return;
+        if (self.text_input_state.composing and self.text_input_enabled) {
+            self.text_input_enabled = false;
+            self.sync_text_input_after_reset();
+            w.base.emit_ime(.unmark_text);
+        } else if (self.compose) |*c| {
+            c.commit_preedit(&w.base);
+        }
+    }
+
+    fn sync_text_input_after_reset(self: *WaylandConnection) void {
+        self.text_input_request(2);
+        self.text_input_commit();
+        self.sync_text_input();
+    }
+
     fn release_focus(self: *WaylandConnection, w: *WaylandWindow) void {
+        if (self.text_input_window == w) {
+            self.text_input_window = null;
+            self.sync_text_input();
+        }
         if (self.keyboard_focus == w) self.keyboard_focus = null;
         if (self.pointer_focus == w) self.pointer_focus = null;
     }
@@ -477,6 +580,14 @@ pub const WaylandConnection = struct {
             if (raw) |dd| {
                 self.data_device = @ptrCast(dd);
                 _ = self.api.wl_proxy_add_listener(dd, &data_device_listener, self);
+            }
+        }
+        if (self.text_input == null and self.text_input_manager != null and (self.seat_caps & proto.WL_SEAT_CAP_KEYBOARD) != 0) {
+            const raw = self.api.wl_proxy_marshal_flags(@ptrCast(self.text_input_manager.?), 1, &proto.text_input_interface, 1, 0, @as(?*anyopaque, null), @as(*anyopaque, @ptrCast(seat)));
+            if (raw) |ti| {
+                self.text_input = @ptrCast(ti);
+                self.text_input_state.commits = 0;
+                _ = self.api.wl_proxy_add_listener(ti, &text_input_listener, self);
             }
         }
         if (self.primary_device == null and self.primary_manager != null) {
@@ -534,20 +645,13 @@ pub const WaylandConnection = struct {
             }
         }
         var composed_buf: [32]u8 = undefined;
+        var replaces_preedit = false;
         if (pressed and keysym != 0 and !input.is_modifier_keysym(keysym)) {
-            if (self.compose) |*c| switch (c.feed(keysym, &composed_buf)) {
-                .composing => text = null,
-                .composed => |t| {
-                    // As in GPUI the key becomes the result, so a binding on the
-                    // sequence's last key does not fire.
-                    text = t;
-                    name = t;
-                },
-                .nothing, .cancelled => {},
-            };
+            if (self.compose) |*c| replaces_preedit = c.process_key(&w.base, keysym, &composed_buf, &text, &name);
         }
         const key_name = name orelse return;
         w.emit_key(key_name, text, pressed, false);
+        if (replaces_preedit) self.compose.?.finish_composed(&w.base);
         if (pressed and !isModifierCode(code) and self.repeat_rate > 0) {
             self.repeat = .{ .code = code, .active = true, .next_ms = input.now_ms() + self.repeat_delay_ms };
             const key_len = @min(key_name.len, self.repeat.key_buf.len);
@@ -794,6 +898,17 @@ fn cursorShape(style: CursorStyle) u32 {
     };
 }
 
+/// Surface-local integer rectangle for an IME area. Zero sizes are bumped to 1, since
+/// a caret range has no width and some input methods ignore empty rectangles.
+fn ime_rect(area: PxBounds) [4]i32 {
+    return .{
+        @intFromFloat(@round(area.origin.x)),
+        @intFromFloat(@round(area.origin.y)),
+        @max(1, @as(i32, @intFromFloat(@round(area.size.width)))),
+        @max(1, @as(i32, @intFromFloat(@round(area.size.height)))),
+    };
+}
+
 fn cursorName(style: CursorStyle) [*:0]const u8 {
     return switch (style) {
         .arrow, .context_menu, .drag_link, .drag_copy, .operation_not_allowed => "left_ptr",
@@ -835,6 +950,10 @@ fn registryGlobal(data: ?*anyopaque, reg: *proto.Registry, name: u32, iface: [*:
         self.viewporter = api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.viewporter_interface, @as(u32, 1), 0, name, proto.viewporter_interface.name, @as(u32, 1), &proto.viewporter_interface);
     } else if (std.mem.eql(u8, iface_name, "wp_fractional_scale_manager_v1")) {
         self.frac_manager = api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.fractional_scale_manager_interface, @as(u32, 1), 0, name, proto.fractional_scale_manager_interface.name, @as(u32, 1), &proto.fractional_scale_manager_interface);
+    } else if (std.mem.eql(u8, iface_name, "xdg_system_bell_v1")) {
+        self.system_bell = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.system_bell_interface, @as(u32, 1), 0, name, proto.system_bell_interface.name, @as(u32, 1), @as(?*anyopaque, null)));
+    } else if (std.mem.eql(u8, iface_name, "zwp_text_input_manager_v3")) {
+        self.text_input_manager = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.text_input_manager_interface, @as(u32, 1), 0, name, proto.text_input_manager_interface.name, @as(u32, 1), @as(?*anyopaque, null)));
     } else if (std.mem.eql(u8, iface_name, "wp_cursor_shape_manager_v1")) {
         self.cursor_shape_manager = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.cursor_shape_manager_interface, @as(u32, 1), 0, name, proto.cursor_shape_manager_interface.name, @as(u32, 1), @as(?*anyopaque, null)));
     } else if (std.mem.eql(u8, iface_name, "zwp_primary_selection_device_manager_v1")) {
@@ -941,6 +1060,7 @@ fn pointerButton(data: ?*anyopaque, _: *proto.Pointer, serial: u32, _: u32, code
     const button = input.evdev_button(code) orelse return;
     const pressed = state == 1;
     if (pressed) {
+        self.commit_composition();
         self.pressed = button;
         const count = self.click.press(button, self.pointer_pos);
         _ = w.base.emit_input(.{ .mouse_down = .{
@@ -1017,7 +1137,7 @@ fn keyboardLeave(data: ?*anyopaque, _: *proto.Keyboard, _: u32, surface: *proto.
     if (self.keyboard_focus != w) return;
     self.keyboard_focus = null;
     self.repeat.active = false;
-    if (self.compose) |*c| c.reset();
+    if (self.compose) |*c| c.cancel_preedit(&w.base);
     w.base.emit_active(false);
 }
 
@@ -1116,6 +1236,64 @@ fn write_all_and_close(fd_: i32, maybe_text: ?[]const u8) void {
     }
 }
 
+fn textInputEnter(data: ?*anyopaque, _: *proto.TextInput, surface: ?*proto.Surface) callconv(.c) void {
+    const self = pointerConn(data);
+    const s = surface orelse return;
+    self.text_input_window = self.find_window(s);
+    self.sync_text_input();
+}
+
+fn textInputLeave(data: ?*anyopaque, _: *proto.TextInput, _: ?*proto.Surface) callconv(.c) void {
+    const self = pointerConn(data);
+    const w = self.text_input_window;
+    const composing = self.text_input_state.composing;
+    self.text_input_window = null;
+    self.sync_text_input();
+    if (composing) if (w) |window| window.base.emit_ime(.delete_text);
+}
+
+fn textInputPreedit(data: ?*anyopaque, _: *proto.TextInput, text: ?[*:0]const u8, begin: i32, end: i32) callconv(.c) void {
+    const self = pointerConn(data);
+    self.text_input_state.on_preedit(if (text) |t| std.mem.span(t) else null, begin, end);
+}
+
+fn textInputCommit(data: ?*anyopaque, _: *proto.TextInput, text: ?[*:0]const u8) callconv(.c) void {
+    const self = pointerConn(data);
+    self.text_input_state.on_commit(if (text) |t| std.mem.span(t) else null);
+}
+
+/// We never send surrounding text, so input methods have no business asking for this.
+fn textInputDeleteSurrounding(_: ?*anyopaque, _: *proto.TextInput, _: u32, _: u32) callconv(.c) void {}
+
+fn textInputDone(data: ?*anyopaque, _: *proto.TextInput, serial: u32) callconv(.c) void {
+    const self = pointerConn(data);
+    const done = self.text_input_state.on_done(serial);
+    defer self.text_input_state.free_done(done);
+    const w = self.text_input_window orelse return;
+    if (done.clear_preedit) w.base.emit_ime(.delete_text);
+    if (done.commit) |text| {
+        // IBus takes plain keys too. A one-byte commit goes through as a key press, so
+        // bindings on letters keep working, as in GPUI.
+        if (text.len == 1) {
+            _ = w.base.emit_input(.{ .key_down = .{ .keystroke = .{ .key = text, .key_char = text } } });
+        } else {
+            w.base.emit_ime(.{ .insert_text = text });
+        }
+    }
+    if (done.preedit) |text| w.base.emit_ime(.{ .set_marked_text = .{ .text = text, .selected = done.preedit_selected } });
+    // State may only be sent once the compositor has caught up with our commits.
+    if (done.serial_matches and self.text_input_enabled) {
+        if (w.base.ime_area()) |area| {
+            const before = self.last_ime_rect;
+            self.set_ime_rect(area);
+            if (before == null or !std.mem.eql(i32, &before.?, &self.last_ime_rect.?)) {
+                self.text_input_commit();
+                self.flush();
+            }
+        }
+    }
+}
+
 fn dataSourceTarget(_: ?*anyopaque, _: *proto.DataSource, _: ?[*:0]const u8) callconv(.c) void {}
 
 fn dataSourceSend(data: ?*anyopaque, _: *proto.DataSource, _: [*:0]const u8, fd_: i32) callconv(.c) void {
@@ -1190,10 +1368,34 @@ pub const WaylandWindow = struct {
     gpu_window: ?window_renderer.GpuWindow = null,
     /// State from xdg_toplevel.configure, applied atomically by xdg_surface.configure.
     pending_configure: PendingConfigure = .{},
+    /// A focused field in this window accepts text.
+    wants_ime: bool = false,
     /// Interactive resizes apply at most once per frame, as in GPUI.
     resize_throttle: bool = false,
 
+    fn updateImeEnabled(p: *platform.PlatformWindow, enabled: bool) void {
+        const self = from(p);
+        self.wants_ime = enabled;
+        self.conn.sync_text_input();
+    }
+
+    fn updateImePosition(p: *platform.PlatformWindow, area: PxBounds) void {
+        const self = from(p);
+        self.conn.update_ime_position(self, area);
+    }
+
+    fn playSystemBell(p: *platform.PlatformWindow) void {
+        const self = from(p);
+        const bell = self.conn.system_bell orelse return;
+        const a = self.api();
+        _ = a.wl_proxy_marshal_flags(@ptrCast(bell), 1, null, 1, 0, @as(?*anyopaque, @ptrCast(self.surface)));
+        self.conn.flush();
+    }
+
     const vtable: platform.PlatformWindow.VTable = .{
+        .play_system_bell = playSystemBell,
+        .update_ime_enabled = updateImeEnabled,
+        .update_ime_position = updateImePosition,
         .bounds = bounds,
         .content_size = contentSize,
         .scale_factor = scaleFactor,
