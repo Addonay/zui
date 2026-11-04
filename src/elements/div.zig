@@ -41,6 +41,7 @@ const MouseUpEvent = interactive.MouseUpEvent;
 const MouseMoveEvent = interactive.MouseMoveEvent;
 const ScrollWheelEvent = interactive.ScrollWheelEvent;
 const ClickEvent = interactive.ClickEvent;
+const PinchEvent = interactive.PinchEvent;
 const KeyDownEvent = interactive.KeyDownEvent;
 const KeyUpEvent = interactive.KeyUpEvent;
 const ModifiersChangedEvent = interactive.ModifiersChangedEvent;
@@ -3325,6 +3326,52 @@ pub fn style() *StyleBuilder {
 const MouseDownL = struct { button: ?MouseButton, phase: DispatchPhase, listener: Listener(MouseDownEvent) };
 const MouseUpL = struct { button: ?MouseButton, phase: DispatchPhase, listener: Listener(MouseUpEvent) };
 const DownOutL = struct { listener: Listener(MouseDownEvent) };
+const view_mod = @import("../view.zig");
+const DROP_DRAG_THRESHOLD: f32 = 2;
+const DEFAULT_TOOLTIP_SHOW_DELAY_NS: u64 = 500 * std.time.ns_per_ms;
+const HOVERABLE_TOOLTIP_HIDE_DELAY_NS: u64 = 500 * std.time.ns_per_ms;
+
+const DropL = struct {
+    type_id: app_mod.TypeId,
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, value: *anyopaque, window: *Window, cx: *App) void,
+};
+const DragListener = struct {
+    /// Makes the app's copy of the value and the view that shows it.
+    start: *const fn (value: *anyopaque, offset: Point(Pixels), window: *Window, cx: *App) app_mod.AnyDrag,
+    value: *anyopaque,
+};
+const DragOverStyle = struct { type_id: app_mod.TypeId, style: *StyleRefinement };
+const GroupDragOverStyle = struct { type_id: app_mod.TypeId, group: []const u8, style: *StyleRefinement };
+
+/// Builds the view a tooltip shows. `ctx` may live in the frame arena: elements register
+/// their builder again on every frame, so a timer firing later finds a live one.
+pub const TooltipBuilder = struct {
+    ctx: *anyopaque = undefined,
+    build: *const fn (ctx: *anyopaque, window: *Window, cx: *App) view_mod.AnyView,
+
+    pub fn from_fn(comptime f: fn (*Window, *App) view_mod.AnyView) TooltipBuilder {
+        return .{ .build = struct {
+            fn call(_: *anyopaque, window: *Window, cx: *App) view_mod.AnyView {
+                return f(window, cx);
+            }
+        }.call };
+    }
+
+    pub fn with(ctx: anytype, comptime f: anytype) TooltipBuilder {
+        const Ctx = @TypeOf(ctx);
+        return .{ .ctx = @ptrCast(ctx), .build = struct {
+            fn call(raw: *anyopaque, window: *Window, cx: *App) view_mod.AnyView {
+                return f(@as(Ctx, @ptrCast(@alignCast(raw))), window, cx);
+            }
+        }.call };
+    }
+};
+
+/// Where a tooltip is in its life (GPUI `ActiveTooltip`). Timers cannot be cancelled, so
+/// each scheduled one carries a generation and does nothing if it has moved on.
+pub const TooltipPhase = enum { none, waiting_for_show, visible, waiting_for_hide };
+
 const UpOutL = struct { button: MouseButton, listener: Listener(MouseUpEvent) };
 
 const ActionL = struct { action_type: app_mod.TypeId, phase: DispatchPhase, ctx: *anyopaque, func: key_dispatch.ActionFn };
@@ -3379,6 +3426,124 @@ pub const ScrollHandleState = struct {
 };
 
 /// Per-element state persisted across frames (GPUI `InteractiveElementState`).
+fn to_tooltip_builder(build_tooltip: anytype) TooltipBuilder {
+    const B = @TypeOf(build_tooltip);
+    if (B == TooltipBuilder) return build_tooltip;
+    return TooltipBuilder.from_fn(build_tooltip);
+}
+
+// -- tooltip state machine, ported from GPUI's register_tooltip_mouse_handlers ----
+
+fn clear_tooltip(st: *InteractiveElementState, window: *Window, cx: *App) void {
+    st.tooltip_generation +%= 1;
+    const had = st.tooltip_phase != .none;
+    st.tooltip_phase = .none;
+    if (st.tooltip_view) |view| {
+        st.tooltip_view = null;
+        cx.release_entity(view.entity_id);
+    }
+    if (had) window.refresh();
+}
+
+fn pointer_on_tooltip(window: *const Window) bool {
+    const b = window.tooltip_bounds orelse return false;
+    return b.contains(window.mouse_position());
+}
+
+/// A click or a scroll closes a tooltip, unless it can be interacted with.
+fn dismiss_tooltip_on_input(st: *InteractiveElementState, window: *Window, cx: *App) void {
+    if (st.tooltip_hoverable or pointer_on_tooltip(window)) return;
+    clear_tooltip(st, window, cx);
+}
+
+fn tooltip_on_mouse_move(st: *InteractiveElementState, hovered_now: bool, phase: DispatchPhase, show_delay_ns: u64, window: *Window, cx: *App) void {
+    const hovered = hovered_now and st.pending_mouse_down == null;
+    switch (st.tooltip_phase) {
+        .none => if (hovered and phase == .bubble) {
+            st.tooltip_generation +%= 1;
+            st.tooltip_phase = .waiting_for_show;
+            schedule_tooltip_timer(st, TooltipTimer.show, show_delay_ns, window, cx);
+        },
+        .waiting_for_show => if (!hovered) {
+            st.tooltip_generation +%= 1;
+            st.tooltip_phase = .none;
+        },
+        .visible => if (phase == .capture and !hovered and !(st.tooltip_hoverable and pointer_on_tooltip(window))) {
+            window.refresh();
+        },
+        .waiting_for_hide => if (phase == .capture and (hovered or pointer_on_tooltip(window))) {
+            window.refresh();
+        },
+    }
+}
+
+/// Runs while the tooltip is being placed. An element that stopped painting has no mouse
+/// handlers left, so this is what finally closes its tooltip.
+fn tooltip_check_visible(raw: *anyopaque, tooltip_bounds: Bounds(Pixels), window: *Window, cx: *App) bool {
+    const st: *InteractiveElementState = @ptrCast(@alignCast(raw));
+    const mouse = window.mouse_position();
+    const hovered = !window.last_input_was_keyboard and st.pending_mouse_down == null and
+        (st.tooltip_source_bounds.contains(mouse) or (st.tooltip_hoverable and tooltip_bounds.contains(mouse)));
+    switch (st.tooltip_phase) {
+        .visible => if (!hovered) {
+            if (st.tooltip_hoverable) {
+                st.tooltip_generation +%= 1;
+                st.tooltip_phase = .waiting_for_hide;
+                schedule_tooltip_timer(st, TooltipTimer.hide, HOVERABLE_TOOLTIP_HIDE_DELAY_NS, window, cx);
+            } else {
+                clear_tooltip(st, window, cx);
+            }
+        },
+        .waiting_for_hide => if (hovered) {
+            st.tooltip_generation +%= 1;
+            st.tooltip_phase = .visible;
+        },
+        .none, .waiting_for_show => {},
+    }
+    return st.tooltip_phase == .visible or st.tooltip_phase == .waiting_for_hide;
+}
+
+/// A pending timer. Windows and elements can be gone by the time it fires, so it holds ids.
+const TooltipTimer = struct {
+    app: *App,
+    window_id: window_mod.WindowId,
+    state: *InteractiveElementState,
+    generation: u64,
+
+    /// Finds the state, if its window and element still exist and nothing else happened.
+    fn live(self: TooltipTimer) ?*Window {
+        const window = self.app.window_by_id(self.window_id) orelse return null;
+        if (!window.owns_element_state(self.state) or self.state.tooltip_generation != self.generation) return null;
+        return window;
+    }
+
+    fn show(self: TooltipTimer) void {
+        const window = self.live() orelse return;
+        const st = self.state;
+        if (st.tooltip_phase != .waiting_for_show) return;
+        const builder = st.tooltip_builder orelse return;
+        self.app.pending_updates += 1;
+        st.tooltip_view = builder.build(builder.ctx, window, self.app);
+        self.app.pending_updates -= 1;
+        st.tooltip_mouse = window.mouse_position();
+        st.tooltip_phase = .visible;
+        window.refresh();
+        self.app.flush_effects();
+    }
+
+    fn hide(self: TooltipTimer) void {
+        const window = self.live() orelse return;
+        if (self.state.tooltip_phase != .waiting_for_hide) return;
+        clear_tooltip(self.state, window, self.app);
+        self.app.flush_effects();
+    }
+};
+
+fn schedule_tooltip_timer(st: *InteractiveElementState, comptime f: fn (TooltipTimer) void, delay_ns: u64, window: *Window, cx: *App) void {
+    const timer: TooltipTimer = .{ .app = cx, .window_id = window.window_handle_id(), .state = st, .generation = st.tooltip_generation };
+    cx.background_executor().after(cx.foreground_executor(), delay_ns, f, timer);
+}
+
 pub const InteractiveElementState = struct {
     focus_handle: ?FocusHandle = null,
     pending_mouse_down: ?MouseDownEvent = null,
@@ -3388,6 +3553,15 @@ pub const InteractiveElementState = struct {
     active: bool = false,
     scroll_offset: Point(Pixels) = .{ .x = 0, .y = 0 },
     hover_listener_state: bool = false,
+    /// Set in capture, fired in bubble, so stopped propagation cannot leave it stuck.
+    captured_mouse_down: ?MouseDownEvent = null,
+    tooltip_phase: TooltipPhase = .none,
+    tooltip_generation: u64 = 0,
+    tooltip_view: ?view_mod.AnyView = null,
+    tooltip_mouse: Point(Pixels) = .{ .x = 0, .y = 0 },
+    tooltip_builder: ?TooltipBuilder = null,
+    tooltip_hoverable: bool = false,
+    tooltip_source_bounds: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } },
 };
 
 /// All interactive and stateful behavior of a styled element (GPUI `Interactivity`).
@@ -3410,6 +3584,17 @@ pub const Interactivity = struct {
     mouse_up_listeners: List(MouseUpL) = .empty,
     mouse_down_out_listeners: List(DownOutL) = .empty,
     mouse_up_out_listeners: List(UpOutL) = .empty,
+    aux_click_listeners: List(Listener(ClickEvent)) = .empty,
+    pinch_listeners: List(Listener(PinchEvent)) = .empty,
+    capture_pinch_listeners: List(Listener(PinchEvent)) = .empty,
+    drop_listeners: List(DropL) = .empty,
+    can_drop_predicate: ?*const fn (value: app_mod.AnyDragValue, window: *Window, cx: *App) bool = null,
+    drag_listener: ?DragListener = null,
+    drag_over_styles: List(DragOverStyle) = .empty,
+    group_drag_over_styles: List(GroupDragOverStyle) = .empty,
+    tooltip_builder: ?TooltipBuilder = null,
+    tooltip_hoverable: bool = false,
+    tooltip_show_delay_ns: ?u64 = null,
     mouse_move_listeners: List(Listener(MouseMoveEvent)) = .empty,
     scroll_wheel_listeners: List(Listener(ScrollWheelEvent)) = .empty,
     key_down_listeners: List(struct { phase: DispatchPhase, l: Listener(KeyDownEvent) }) = .empty,
@@ -3428,7 +3613,10 @@ pub const Interactivity = struct {
             self.active_style != null or self.group != null or self.occlude_mouse or self.block_mouse_except_scroll_ or
             self.mouse_down_listeners.items.len > 0 or self.mouse_up_listeners.items.len > 0 or self.mouse_down_out_listeners.items.len > 0 or
             self.mouse_move_listeners.items.len > 0 or self.scroll_wheel_listeners.items.len > 0 or self.click_listeners.items.len > 0 or
-            self.hover_listener != null or self.base_style.mouse_cursor != null;
+            self.hover_listener != null or self.base_style.mouse_cursor != null or
+            self.aux_click_listeners.items.len > 0 or self.pinch_listeners.items.len > 0 or self.capture_pinch_listeners.items.len > 0 or
+            self.drop_listeners.items.len > 0 or self.drag_listener != null or self.drag_over_styles.items.len > 0 or
+            self.tooltip_builder != null or self.mouse_up_out_listeners.items.len > 0;
     }
 
     /// The style for this frame: base refined by focus/hover/active states (GPUI `compute_style`).
@@ -3450,6 +3638,21 @@ pub const Interactivity = struct {
             }
         }
         if (self.group_active_style) |g| if (group_active(g.group)) s.refine(g.style);
+        if (cx.active_drag) |drag| {
+            const allowed = if (self.can_drop_predicate) |predicate| predicate(drag.value, window, cx) else true;
+            if (allowed) {
+                for (self.group_drag_over_styles.items) |g| {
+                    if (g.type_id != drag.value.type_id) continue;
+                    if (group_hitbox(g.group)) |gh| if (window_hovered(gh, window)) s.refine(g.style);
+                }
+                if (hitbox) |hb| {
+                    for (self.drag_over_styles.items) |d| {
+                        if (d.type_id == drag.value.type_id and hb.is_hovered(window)) s.refine(d.style);
+                    }
+                }
+            }
+            s.mouse_cursor = drag.cursor_style;
+        }
         return s;
     }
 
@@ -3743,6 +3946,100 @@ pub fn StyledElement(comptime Ext: type) type {
         // -- StatefulInteractiveElement ------------------------------------
 
         /// Click handler (requires `.id(...)`).
+        /// Fires for clicks with any button but the left one.
+        pub fn on_aux_click(self: *Self, listener: anytype) *Self {
+            self.interactivity.aux_click_listeners.append(arena(), app_mod.to_listener(ClickEvent, listener)) catch oom();
+            return self;
+        }
+
+        pub fn on_pinch(self: *Self, listener: anytype) *Self {
+            self.interactivity.pinch_listeners.append(arena(), app_mod.to_listener(PinchEvent, listener)) catch oom();
+            return self;
+        }
+
+        pub fn capture_pinch(self: *Self, listener: anytype) *Self {
+            self.interactivity.capture_pinch_listeners.append(arena(), app_mod.to_listener(PinchEvent, listener)) catch oom();
+            return self;
+        }
+
+        /// Makes this element draggable once the pointer moves past a small threshold.
+        /// `constructor(value, cursor_offset, window, cx)` returns the entity to show under the
+        /// pointer. `value` is copied for the length of the drag. The element needs an id.
+        pub fn on_drag(self: *Self, value: anytype, comptime constructor: anytype) *Self {
+            const T = @TypeOf(value);
+            const held = arena().create(T) catch oom();
+            held.* = value;
+            self.interactivity.drag_listener = .{ .value = held, .start = struct {
+                fn start(raw: *anyopaque, offset: Point(Pixels), window: *Window, cx: *App) app_mod.AnyDrag {
+                    const source: *const T = @ptrCast(@alignCast(raw));
+                    const copy = cx.allocator.create(T) catch oom();
+                    copy.* = source.*;
+                    return .{
+                        .value = .{ .ptr = copy, .type_id = app_mod.type_id(T) },
+                        .view = view_mod.AnyView.from(constructor(@as(*const T, copy), offset, window, cx)),
+                        .cursor_offset = offset,
+                        .free_value = struct {
+                            fn free(a: std.mem.Allocator, held_value: *anyopaque) void {
+                                a.destroy(@as(*T, @ptrCast(@alignCast(held_value))));
+                            }
+                        }.free,
+                    };
+                }
+            }.start };
+            return self;
+        }
+
+        /// Receives a dragged `T` released over this element. File drags arrive as `ExternalPaths`.
+        pub fn on_drop(self: *Self, comptime T: type, listener: anytype) *Self {
+            const held = arena().create(Listener(T)) catch oom();
+            held.* = app_mod.to_listener(T, listener);
+            self.interactivity.drop_listeners.append(arena(), .{ .type_id = app_mod.type_id(T), .ctx = held, .call = struct {
+                fn call(raw: *anyopaque, value: *anyopaque, window: *Window, cx: *App) void {
+                    const l: *const Listener(T) = @ptrCast(@alignCast(raw));
+                    l.call(@ptrCast(@alignCast(value)), window, cx);
+                }
+            }.call }) catch oom();
+            return self;
+        }
+
+        /// Decides whether the drag may be dropped here, and whether drag_over styles apply.
+        pub fn can_drop(self: *Self, predicate: *const fn (app_mod.AnyDragValue, *Window, *App) bool) *Self {
+            self.interactivity.can_drop_predicate = predicate;
+            return self;
+        }
+
+        /// Style applied while a dragged `T` is over this element.
+        pub fn drag_over(self: *Self, comptime T: type, s: anytype) *Self {
+            self.interactivity.drag_over_styles.append(arena(), .{ .type_id = app_mod.type_id(T), .style = to_style_refinement(s) }) catch oom();
+            return self;
+        }
+
+        /// Style applied while a dragged `T` is over the named group.
+        pub fn group_drag_over(self: *Self, comptime T: type, group_name: []const u8, s: anytype) *Self {
+            self.interactivity.group_drag_over_styles.append(arena(), .{ .type_id = app_mod.type_id(T), .group = group_name, .style = to_style_refinement(s) }) catch oom();
+            return self;
+        }
+
+        /// Shows a view after the pointer rests here. Takes a `fn(*Window, *App) AnyView` or
+        /// a `TooltipBuilder`. The element needs an id.
+        pub fn tooltip(self: *Self, build_tooltip: anytype) *Self {
+            self.interactivity.tooltip_builder = to_tooltip_builder(build_tooltip);
+            self.interactivity.tooltip_hoverable = false;
+            return self;
+        }
+
+        /// Like `tooltip`, but the pointer may move onto the tooltip without it closing.
+        pub fn hoverable_tooltip(self: *Self, build_tooltip: anytype) *Self {
+            self.interactivity.tooltip_builder = to_tooltip_builder(build_tooltip);
+            self.interactivity.tooltip_hoverable = true;
+            return self;
+        }
+
+        pub fn tooltip_show_delay(self: *Self, delay_ms: u64) *Self {
+            self.interactivity.tooltip_show_delay_ns = delay_ms * std.time.ns_per_ms;
+            return self;
+        }
+
         pub fn on_click(self: *Self, listener: anytype) *Self {
             self.interactivity.click_listeners.append(arena(), app_mod.to_listener(ClickEvent, listener)) catch oom();
             return self;
@@ -3797,6 +4094,18 @@ pub fn StyledElement(comptime Ext: type) type {
                 window.set_focus_handle(&hh, cx);
             }
             if (it.key_context) |kc| window.set_key_context(kc);
+
+            // A tooltip that is showing asks to be drawn at the end of the frame.
+            if (pp.state) |st| {
+                st.tooltip_builder = it.tooltip_builder;
+                st.tooltip_hoverable = it.tooltip_hoverable;
+                st.tooltip_source_bounds = bounds;
+                if (it.tooltip_builder == null) {
+                    clear_tooltip(st, window, cx);
+                } else if (st.tooltip_view) |view| {
+                    window.set_tooltip(.{ .view = view, .mouse_position = st.tooltip_mouse, .ctx = st, .check_visible = tooltip_check_visible });
+                }
+            }
 
             // Key & action listeners attach to this element's dispatch node.
             for (it.key_down_listeners.items) |*kl| registerKey(KeyDownEvent, window, kl.phase, &kl.l);
@@ -3951,13 +4260,15 @@ pub fn StyledElement(comptime Ext: type) type {
             ctx.* = .{ .self = self, .hitbox = hb.*, .state = state };
 
             const needs_down = it.mouse_down_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or
-                it.tracked_focus_handle != null or it.group_active_style != null or it.mouse_down_out_listeners.items.len > 0;
+                it.tracked_focus_handle != null or it.group_active_style != null or it.mouse_down_out_listeners.items.len > 0 or
+                it.aux_click_listeners.items.len > 0 or it.drag_listener != null or it.tooltip_builder != null;
             if (needs_down) window.on_mouse_event(MouseDownEvent, ctx, onMouseDown);
-            if (it.mouse_up_out_listeners.items.len > 0 or it.mouse_up_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or it.group != null)
+            if (it.pinch_listeners.items.len > 0 or it.capture_pinch_listeners.items.len > 0) window.on_mouse_event(PinchEvent, ctx, onPinch);
+            if (it.drop_listeners.items.len > 0 or it.aux_click_listeners.items.len > 0 or it.drag_listener != null or it.tooltip_builder != null or it.mouse_up_out_listeners.items.len > 0 or it.mouse_up_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or it.group != null)
                 window.on_mouse_event(MouseUpEvent, ctx, onMouseUp);
-            if (it.mouse_move_listeners.items.len > 0 or it.hover_style != null or it.hover_listener != null or it.group_hover_style != null or it.group != null)
+            if (it.drag_listener != null or it.tooltip_builder != null or it.drag_over_styles.items.len > 0 or it.mouse_move_listeners.items.len > 0 or it.hover_style != null or it.hover_listener != null or it.group_hover_style != null or it.group != null)
                 window.on_mouse_event(MouseMoveEvent, ctx, onMouseMove);
-            if (it.scroll_wheel_listeners.items.len > 0 or it.base_style.overflow.x == .scroll or it.base_style.overflow.y == .scroll)
+            if (it.tooltip_builder != null or it.scroll_wheel_listeners.items.len > 0 or it.base_style.overflow.x == .scroll or it.base_style.overflow.y == .scroll)
                 window.on_mouse_event(ScrollWheelEvent, ctx, onScrollWheel);
         }
 
@@ -3965,6 +4276,7 @@ pub fn StyledElement(comptime Ext: type) type {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
             const it = &c.self.interactivity;
             const hovered = c.hitbox.is_hovered(window);
+            if (it.tooltip_builder != null) if (c.state) |st| dismiss_tooltip_on_input(st, window, cx);
             if (phase == .bubble and !hovered) {
                 for (it.mouse_down_out_listeners.items) |l| l.listener.call(e, window, cx);
             }
@@ -3984,6 +4296,8 @@ pub fn StyledElement(comptime Ext: type) type {
                 }
             }
             if (c.state) |st| {
+                if ((it.drag_listener != null and e.button == .left) or it.aux_click_listeners.items.len > 0 and e.button != .left) st.pending_mouse_down = e.*;
+                if (it.tooltip_builder != null) st.pending_mouse_down = e.*;
                 if (it.click_listeners.items.len > 0 and e.button == .left) st.pending_mouse_down = e.*;
                 if (it.active_style != null or it.group != null) {
                     st.active = true;
@@ -4010,17 +4324,46 @@ pub fn StyledElement(comptime Ext: type) type {
                     if (!window.propagate_event) return;
                 }
             }
-            if (phase != .bubble) return;
+            if (phase == .capture) {
+                // Done here so another handler stopping propagation cannot leave it set. Off
+                // the element it just clears, which keeps an element that moved under the
+                // pointer from starting a drag on its own.
+                if (c.state) |st| {
+                    if (st.pending_mouse_down) |down| {
+                        st.pending_mouse_down = null;
+                        if (hovered) st.captured_mouse_down = down;
+                        window.refresh();
+                    }
+                }
+                return;
+            }
+            if (hovered and it.drop_listeners.items.len > 0) {
+                if (cx.active_drag) |drag| {
+                    for (it.drop_listeners.items) |l| {
+                        if (l.type_id != drag.value.type_id) continue;
+                        const allowed = if (it.can_drop_predicate) |predicate| predicate(drag.value, window, cx) else true;
+                        if (allowed) {
+                            l.call(l.ctx, drag.value.ptr, window, cx);
+                            window.refresh();
+                            window.stop_propagation();
+                        }
+                        cx.clear_active_drag();
+                        break;
+                    }
+                }
+            }
             if (c.state) |st| {
                 if (st.active) {
                     st.active = false;
                     window.refresh();
                 }
-                if (st.pending_mouse_down) |down| {
-                    st.pending_mouse_down = null;
-                    if (hovered and e.button == .left) {
-                        const click: ClickEvent = .{ .mouse = .{ .down = down, .up = e.* } };
+                if (st.captured_mouse_down) |down| {
+                    st.captured_mouse_down = null;
+                    const click: ClickEvent = .{ .mouse = .{ .down = down, .up = e.* } };
+                    if (down.button == .left) {
                         for (it.click_listeners.items) |l| l.call(&click, window, cx);
+                    } else {
+                        for (it.aux_click_listeners.items) |l| l.call(&click, window, cx);
                     }
                 }
             }
@@ -4030,8 +4373,24 @@ pub fn StyledElement(comptime Ext: type) type {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
             const it = &c.self.interactivity;
             const hovered = c.hitbox.is_hovered(window);
+            if (it.tooltip_builder != null) if (c.state) |st| tooltip_on_mouse_move(st, hovered, phase, it.tooltip_show_delay_ns orelse DEFAULT_TOOLTIP_SHOW_DELAY_NS, window, cx);
             if (phase == .bubble and hovered) {
                 for (it.mouse_move_listeners.items) |l| l.call(e, window, cx);
+            }
+            if (phase == .bubble and !cx.has_active_drag()) {
+                if (it.drag_listener) |listener| if (c.state) |st| if (st.pending_mouse_down) |down| {
+                    const dx = e.position.x - down.position.x;
+                    const dy = e.position.y - down.position.y;
+                    if (down.button == .left and @sqrt(dx * dx + dy * dy) > DROP_DRAG_THRESHOLD) {
+                        st.active = false;
+                        st.pending_mouse_down = null;
+                        const offset: Point(Pixels) = .{ .x = e.position.x - c.hitbox.bounds.origin.x, .y = e.position.y - c.hitbox.bounds.origin.y };
+                        cx.set_active_drag(listener.start(listener.value, offset, window, cx));
+                        window.refresh();
+                        window.stop_propagation();
+                        return;
+                    }
+                };
             }
             if (phase != .capture) return;
             if (c.state) |st| {
@@ -4047,9 +4406,18 @@ pub fn StyledElement(comptime Ext: type) type {
             if (it.group_hover_style != null) window.refresh();
         }
 
+        fn onPinch(raw: *anyopaque, e: *const PinchEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
+            const c: *MouseCtx = @ptrCast(@alignCast(raw));
+            const it = &c.self.interactivity;
+            if (!c.hitbox.is_hovered(window)) return;
+            const list = if (phase == .capture) it.capture_pinch_listeners.items else it.pinch_listeners.items;
+            for (list) |l| l.call(e, window, cx);
+        }
+
         fn onScrollWheel(raw: *anyopaque, e: *const ScrollWheelEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
             const it = &c.self.interactivity;
+            if (it.tooltip_builder != null) if (c.state) |st| dismiss_tooltip_on_input(st, window, cx);
             if (phase != .bubble or !c.hitbox.should_handle_scroll(window)) return;
             for (it.scroll_wheel_listeners.items) |l| l.call(e, window, cx);
             const s = it.base_style.overflow;

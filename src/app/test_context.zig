@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const input_mod = @import("../input.zig");
+const view_mod = @import("../view.zig");
+const color_mod = @import("../color.zig");
 const headless_mod = @import("../platform/headless.zig");
 const app_mod = @import("../app.zig");
 const window_mod = @import("../window.zig");
@@ -1169,6 +1171,354 @@ test "input: a released view reads as an empty field instead of crashing" {
     try std.testing.expect(handler.selected_text_range(true, vcx.window, cx.app) == null);
     handler.replace_text_in_range(null, "x", vcx.window, cx.app);
     try std.testing.expect(handler.selected_bounds(vcx.window, cx.app) == null);
+}
+
+const Payload = struct { n: u32 };
+
+const DragPreview = struct {
+    n: u32,
+    pub fn render(_: *DragPreview, _: *Window, _: *Context(DragPreview)) *Div {
+        return div().w(px(10)).h(px(10)).bg(color_mod.red());
+    }
+};
+
+const DragPage = struct {
+    dropped: ?u32 = null,
+    drops: usize = 0,
+    clicks: usize = 0,
+    aux_clicks: usize = 0,
+    previews_made: usize = 0,
+    files: usize = 0,
+    file_name: [64]u8 = undefined,
+    file_name_len: usize = 0,
+    allow: bool = true,
+    pinches: usize = 0,
+
+    var allow_drop: bool = true;
+
+    fn make_preview(value: *const Payload, _: Point(Pixels), _: *Window, cx: *App) Entity(DragPreview) {
+        return cx.new(DragPreview{ .n = value.n });
+    }
+    fn refuse(_: app_mod.AnyDragValue, _: *Window, _: *App) bool {
+        return allow_drop;
+    }
+    fn on_drop(self: *DragPage, value: *const Payload, _: *Window, _: *Context(DragPage)) void {
+        self.dropped = value.n;
+        self.drops += 1;
+    }
+    fn on_files(self: *DragPage, value: *const interactive.ExternalPaths, _: *Window, _: *Context(DragPage)) void {
+        self.files = value.items.len;
+        // Paths belong to the platform, so a handler that keeps them copies them.
+        const first = value.items[0];
+        self.file_name_len = @min(first.len, self.file_name.len);
+        @memcpy(self.file_name[0..self.file_name_len], first[0..self.file_name_len]);
+    }
+    fn on_click(self: *DragPage, _: *const interactive.ClickEvent, _: *Window, _: *Context(DragPage)) void {
+        self.clicks += 1;
+    }
+    fn on_aux(self: *DragPage, _: *const interactive.ClickEvent, _: *Window, _: *Context(DragPage)) void {
+        self.aux_clicks += 1;
+    }
+    fn on_pinch(self: *DragPage, _: *const interactive.PinchEvent, _: *Window, _: *Context(DragPage)) void {
+        self.pinches += 1;
+    }
+    pub fn render(_: *DragPage, _: *Window, cx: *Context(DragPage)) *Div {
+        return div().size(px(300)).child(
+            div().id("source").absolute().left(px(0)).top(px(0)).w(px(50)).h(px(50))
+                .on_drag(Payload{ .n = 7 }, make_preview)
+                .on_click(cx.listener(on_click))
+                .on_aux_click(cx.listener(on_aux)),
+        ).child(
+            div().id("target").absolute().left(px(100)).top(px(0)).w(px(50)).h(px(50))
+                .on_drop(Payload, cx.listener(on_drop))
+                .on_drop(interactive.ExternalPaths, cx.listener(on_files))
+                .on_pinch(cx.listener(on_pinch)),
+        ).child(
+            div().id("picky").absolute().left(px(200)).top(px(0)).w(px(50)).h(px(50))
+                .can_drop(refuse)
+                .on_drop(Payload, cx.listener(on_drop)),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(DragPage) {
+        return app.new(DragPage{});
+    }
+};
+
+fn start_drag(vcx: *VisualTestContext) void {
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .left, .{});
+    vcx.simulate_mouse_move(.{ .x = 30, .y = 10 }, .left, .{});
+    vcx.run_until_parked();
+}
+
+test "drag: dropping on a target delivers the value and ends the drag" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    start_drag(vcx);
+    try std.testing.expect(cx.app.has_active_drag());
+    vcx.simulate_mouse_move(.{ .x = 120, .y = 10 }, .left, .{});
+    vcx.run_until_parked();
+    vcx.simulate_mouse_up(.{ .x = 120, .y = 10 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    try std.testing.expectEqual(@as(?u32, 7), view.read(cx.app).dropped);
+    // Starting a drag is not a click.
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).clicks);
+}
+
+test "drag: a release away from any target cancels without delivering" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    start_drag(vcx);
+    vcx.simulate_mouse_move(.{ .x = 280, .y = 280 }, .left, .{});
+    vcx.simulate_mouse_up(.{ .x = 280, .y = 280 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    try std.testing.expect(view.read(cx.app).dropped == null);
+}
+
+test "drag: small jitter stays a click, and only the threshold starts a drag" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .left, .{});
+    vcx.simulate_mouse_move(.{ .x = 11, .y = 11 }, .left, .{});
+    try std.testing.expect(!cx.app.has_active_drag());
+    vcx.simulate_mouse_up(.{ .x = 11, .y = 11 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).clicks);
+}
+
+test "drag: moving the pointer without a press does not start one" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(DragPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.simulate_mouse_move(.{ .x = 40, .y = 40 }, null, .{});
+    try std.testing.expect(!cx.app.has_active_drag());
+    // A press and release elsewhere clears any state before moving back over.
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .left, .{});
+    vcx.simulate_mouse_up(.{ .x = 280, .y = 280 }, .left, .{});
+    vcx.simulate_mouse_move(.{ .x = 30, .y = 30 }, null, .{});
+    try std.testing.expect(!cx.app.has_active_drag());
+}
+
+test "drag: can_drop refuses the value, and the drag still ends" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    DragPage.allow_drop = false;
+    defer DragPage.allow_drop = true;
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    start_drag(vcx);
+    vcx.simulate_mouse_move(.{ .x = 220, .y = 10 }, .left, .{});
+    vcx.simulate_mouse_up(.{ .x = 220, .y = 10 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expect(view.read(cx.app).dropped == null);
+    try std.testing.expect(!cx.app.has_active_drag());
+}
+
+test "drag: the preview draws at the pointer, and stop_active_drag cancels it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(DragPage.build);
+    const before = vcx.window.rendered_frame.scene.quads.items.len;
+    start_drag(vcx);
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.rendered_frame.scene.quads.items.len > before);
+    try std.testing.expect(cx.app.stop_active_drag(vcx.window));
+    try std.testing.expect(!cx.app.stop_active_drag(vcx.window));
+}
+
+test "clicks: other buttons reach on_aux_click, not on_click" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .right, .{});
+    vcx.simulate_mouse_up(.{ .x = 10, .y = 10 }, .right, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).aux_clicks);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).clicks);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).clicks);
+}
+
+test "file drags: paths reach on_drop like any other drag" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    const paths = [_][]const u8{ "/tmp/a.txt", "/tmp/b.png" };
+    vcx.simulate_event(.{ .file_drop = .{ .entered = .{ .position = .{ .x = 120, .y = 10 }, .paths = .{ .items = &paths } } } });
+    try std.testing.expect(cx.app.has_active_drag());
+    vcx.run_until_parked();
+    vcx.simulate_event(.{ .file_drop = .{ .pending = .{ .position = .{ .x = 125, .y = 12 } } } });
+    vcx.run_until_parked();
+    vcx.simulate_event(.{ .file_drop = .{ .submit = .{ .position = .{ .x = 125, .y = 12 } } } });
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    try std.testing.expectEqual(@as(usize, 2), view.read(cx.app).files);
+    const page = view.read(cx.app);
+    try std.testing.expectEqualStrings("/tmp/a.txt", page.file_name[0..page.file_name_len]);
+}
+
+test "file drags: leaving the window ends the drag and drops nothing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    const paths = [_][]const u8{"/tmp/a.txt"};
+    vcx.simulate_event(.{ .file_drop = .{ .entered = .{ .position = .{ .x = 120, .y = 10 }, .paths = .{ .items = &paths } } } });
+    vcx.simulate_event(.{ .file_drop = .exited });
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).files);
+}
+
+test "pinch: reaches the element under the pointer" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    vcx.simulate_mouse_move(.{ .x = 120, .y = 10 }, null, .{});
+    vcx.simulate_event(.{ .pinch = .{ .position = .{ .x = 120, .y = 10 }, .delta = 0.1 } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).pinches);
+    vcx.simulate_mouse_move(.{ .x = 280, .y = 280 }, null, .{});
+    vcx.simulate_event(.{ .pinch = .{ .position = .{ .x = 280, .y = 280 }, .delta = 0.1 } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).pinches);
+}
+
+const TooltipView = struct {
+    pub fn render(_: *TooltipView, _: *Window, _: *Context(TooltipView)) *Div {
+        return div().w(px(40)).h(px(20)).bg(color_mod.red());
+    }
+};
+
+const TooltipPage = struct {
+    show_button: bool = true,
+    hoverable: bool = false,
+
+    fn build_tip(_: *Window, cx: *App) view_mod.AnyView {
+        return view_mod.AnyView.from(cx.new(TooltipView{}));
+    }
+    pub fn render(self: *TooltipPage, _: *Window, _: *Context(TooltipPage)) *Div {
+        const root = div().size(px(300));
+        if (self.show_button) {
+            const button = div().id("button").absolute().left(px(0)).top(px(0)).w(px(50)).h(px(50)).tooltip_show_delay(1);
+            _ = if (self.hoverable) button.hoverable_tooltip(build_tip) else button.tooltip(build_tip);
+            _ = root.child(button);
+        }
+        return root;
+    }
+    fn build(_: *Window, app: *App) Entity(TooltipPage) {
+        return app.new(TooltipPage{});
+    }
+};
+
+fn wait_for_tooltip(vcx: *VisualTestContext, wanted: bool) !void {
+    for (0..200) |_| {
+        vcx.run_until_parked();
+        if ((vcx.window.tooltip_bounds != null) == wanted) return;
+        var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+    return error.TooltipTimedOut;
+}
+
+test "tooltip: shows after the delay and closes when the pointer leaves" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.run_until_parked();
+    try wait_for_tooltip(vcx, true);
+    try std.testing.expectEqual(@as(f32, 11), vcx.window.tooltip_bounds.?.origin.x);
+    vcx.simulate_mouse_move(.{ .x = 200, .y = 200 }, null, .{});
+    try wait_for_tooltip(vcx, false);
+}
+
+test "tooltip: leaving before the delay means it never shows" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.simulate_mouse_move(.{ .x = 200, .y = 200 }, null, .{});
+    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 40 * std.time.ns_per_ms };
+    _ = std.os.linux.nanosleep(&ts, null);
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds == null);
+}
+
+test "tooltip: a press closes it, and does not bring it back" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    try wait_for_tooltip(vcx, true);
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .left, .{});
+    try wait_for_tooltip(vcx, false);
+    vcx.simulate_mouse_up(.{ .x = 10, .y = 10 }, .left, .{});
+    vcx.run_until_parked();
+}
+
+test "tooltip: its element disappearing while it shows closes it safely" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    try wait_for_tooltip(vcx, true);
+    view.as_mut(cx.app).show_button = false;
+    vcx.window.refresh();
+    try wait_for_tooltip(vcx, false);
+}
+
+test "tooltip: a timer firing after its element is gone does nothing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    view.as_mut(cx.app).show_button = false;
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 30 * std.time.ns_per_ms };
+    _ = std.os.linux.nanosleep(&ts, null);
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds == null);
+}
+
+test "tooltip: a hoverable one survives the pointer moving onto it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(TooltipPage.build);
+    view.as_mut(cx.app).hoverable = true;
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    try wait_for_tooltip(vcx, true);
+    const b = vcx.window.tooltip_bounds.?;
+    // Off the button, onto the tooltip. The tooltip starts at the pointer, inside the button,
+    // so go to its far corner, moved past the button with the tooltip still there.
+    vcx.simulate_mouse_move(.{ .x = b.origin.x + b.size.width - 1, .y = b.origin.y + 1 }, null, .{});
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds != null);
+}
+
+test "tooltip placement stays inside the window" {
+    const viewport: geometry.Size(Pixels) = .{ .width = 100, .height = 100 };
+    const tip: geometry.Size(Pixels) = .{ .width = 30, .height = 20 };
+    const place = window_mod.tooltip_origin;
+    try std.testing.expectEqual(@as(f32, 11), place(.{ .x = 10, .y = 10 }, tip, viewport).x);
+    // Past the right and bottom edges it flips to the other side of the pointer.
+    const corner = place(.{ .x = 95, .y = 95 }, tip, viewport);
+    try std.testing.expectEqual(@as(f32, 64), corner.x);
+    try std.testing.expectEqual(@as(f32, 74), corner.y);
+    // Bigger than the window: pinned to the start rather than off screen.
+    const huge = place(.{ .x = 5, .y = 5 }, .{ .width = 500, .height = 500 }, viewport);
+    try std.testing.expectEqual(@as(f32, 0), huge.x);
+    try std.testing.expectEqual(@as(f32, 0), huge.y);
 }
 
 test "VisualTestContext: focus, update, mouse move and dispatch_action" {

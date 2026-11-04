@@ -587,8 +587,13 @@ pub const MouseExitEvent = struct {
 
 /// Paths from the platform, such as from a file drop. Borrowed slices.
 pub const ExternalPaths = struct {
-    /// The dropped paths.
+    /// The dropped paths. They belong to the platform: copy them in a drop handler to keep them.
     items: []const []const u8 = &.{},
+
+    /// A file drag has no picture of its own in the window: the system draws it.
+    pub fn render(_: *ExternalPaths, _: anytype, _: anytype) @import("element.zig").AnyElement {
+        return @import("elements/empty.zig").empty();
+    }
 
     /// Returns the paths as a slice.
     pub fn paths(self: ExternalPaths) []const []const u8 {

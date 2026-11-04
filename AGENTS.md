@@ -52,7 +52,7 @@ GPUI's `hello_world.rs` (verified via headless snapshot).
 | app: App, Application, Entity/WeakEntity/AnyEntity, Context(T), globals, observe/subscribe/emit/release, effects | done |
 | window: frames, hitboxes, element state, focus, text style stack, content masks, opacity, paint_* primitives, mouse/key/action dispatch, deferred draws | done |
 | element protocol, AnyElement, IntoElement, ParentElement, FluentBuilder, views (AnyView) | done |
-| div + Interactivity (hover/active/focus/in_focus styles, click, mouse/key/action listeners, scroll, groups, track_focus, key_context) | done (drag/drop, tooltips, file drop, pressure/pinch NOT yet) |
+| div + Interactivity (hover/active/focus/in_focus styles, click, aux click, mouse/key/action listeners, scroll, pinch, groups, track_focus, key_context, drag and drop, file drop, tooltips) | done (pressure and back-gesture listeners, external drag payloads NOT yet) |
 | layout engine on zafi (`taffy.zig`, GPUI's TaffyLayoutEngine) | done |
 | text system on cozmic (shaping+fallback, two-frame line layout cache, LineWrapper, ShapedLine/WrappedLine, StyledText/InteractiveText) | done (some GPUI extras missing, see §8) |
 | keystroke, interactive events, keymap + context predicates, key_dispatch, actions | done (multi-keystroke pending replay, tab groups NOT yet) |
@@ -68,7 +68,7 @@ GPUI's `hello_world.rs` (verified via headless snapshot).
 | list (variable height), uniform_list | done (agent stopped right after tests passed; verify) |
 | GPU layer (`src/gpu/`, vendored from zicr at `87fe622`; zicr dependency removed) | done |
 | GPU renderer (`src/renderer/gpu.zig`, `shaders.glsl`, committed `shaders_gen.zig`) | done on Vulkan: default on Linux Wayland/X11, CPU fallback; subpixel sprites and surfaces not drawn (see §7) |
-| examples | 9 ported: hello_world, pattern, tree, text_layout, scrollable, ownership_post, active_state_bug, gradient, input |
+| examples | 10 ported: hello_world, pattern, tree, text_layout, scrollable, ownership_post, active_state_bug, gradient, input, drag_drop |
 | macOS / Windows / web platforms | NOT started |
 
 ## 3. Repository layout (mirrors `crates/gpui/src`)
@@ -302,6 +302,13 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   `FileDropEvent`, but nothing turns them into element drops until `on_drop` exists.
   Extension struct layouts in `x11_proto.zig` are checked at compile time against values measured
   with `offsetof`.
+- **Drag and drop**: `App.active_drag` holds an `AnyDrag`: an erased copy of the value (shallow, so
+  slices inside must outlive the drag) and the view drawn under the pointer, released when it ends.
+  Platform file drags become the same thing with an `ExternalPaths` value, whose paths belong to the
+  platform: a drop handler that keeps them must copy them. Any mouse up that no element took
+  cancels the drag.
+- **Tooltips**: a small state machine in `InteractiveElementState`. Timers cannot be cancelled, so
+  each carries a generation, and checks with `Window.owns_element_state` that its element still exists.
 - **Wayland pointer and drags**: fingers scroll in pixels, wheels in lines. `wl_data_device` is
   bound at version 3, so a drag offers copy only (a move would make the source delete the user's
   files). The file list is read through a non-blocking pipe polled by the main loop, with a timeout,
@@ -345,9 +352,8 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
    `gpui_windows` are the references; old ZUI had cocoa/win32 skeletons in history.
    `.github/workflows` is stale (`zig build smoke`, Windows/macOS checks, `-Daccesskit`)
    and predates the port.
-2. Div: drag & drop (`on_drag`, `on_drop`, `drag_over`), tooltips,
-   `on_file_drop`, pressure/pinch/back-gesture listeners, `on_aux_click`,
-   `on_mouse_up_out`, `cached` views. `with_animation` is not yet aliased on
+2. Div: pressure and back-gesture listeners, long-press tooltips, external drag payloads
+   (dragging out of the window), `cached` views. `with_animation` is not yet aliased on
    StyledElement (add `pub const with_animation = animation.AnimationExt(*Self).with_animation;` etc.).
 3. Input: multi-keystroke binding replay, tab groups, `Unbind`, `observe_keystrokes`,
    `keyboard_layout` and its change observer, IME content types.

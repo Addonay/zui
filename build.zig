@@ -10,6 +10,7 @@ const examples = [_][]const u8{
     "active_state_bug",
     "gradient",
     "input",
+    "drag_drop",
 };
 
 pub fn build(b: *std.Build) void {

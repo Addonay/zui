@@ -5,6 +5,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const geometry = @import("geometry.zig");
+const style_mod = @import("style.zig");
+const view_mod = @import("view.zig");
 const window_mod = @import("window.zig");
 const platform_mod = @import("platform.zig");
 const element_mod = @import("element.zig");
@@ -526,6 +528,30 @@ const Subscriber = struct {
 
 /// A subscription handle (GPUI `Subscription`). Call `unsubscribe` to stop
 /// it; `detach` (or just discarding it) keeps it alive for the app's life.
+/// The value being dragged, with its type erased (GPUI's `&dyn Any` on a drag).
+pub const AnyDragValue = struct {
+    ptr: *anyopaque,
+    type_id: TypeId,
+
+    pub fn is(self: AnyDragValue, comptime T: type) bool {
+        return self.type_id == type_id(T);
+    }
+    pub fn downcast(self: AnyDragValue, comptime T: type) ?*const T {
+        if (!self.is(T)) return null;
+        return @ptrCast(@alignCast(self.ptr));
+    }
+};
+
+/// A drag in progress (GPUI `AnyDrag`). The value is copied when the drag starts, so
+/// plain data needs no care. Slices inside it must outlive the drag.
+pub const AnyDrag = struct {
+    value: AnyDragValue,
+    view: view_mod.AnyView,
+    cursor_offset: geometry.Point(Pixels),
+    cursor_style: ?style_mod.CursorStyle = null,
+    free_value: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
+};
+
 pub const Subscription = struct {
     app: ?*App,
     id: u64,
@@ -563,6 +589,8 @@ const GlobalSlot = struct { ptr: *anyopaque, destroy: *const fn (std.mem.Allocat
 /// The global application state (GPUI `App`).
 pub const App = struct {
     allocator: std.mem.Allocator,
+    /// The drag following the pointer, across all windows.
+    active_drag: ?AnyDrag = null,
     platform: *platform_mod.Platform,
     entities: EntityMap = .{},
     windows: std.ArrayList(?*Window) = .empty,
@@ -698,6 +726,42 @@ pub const App = struct {
             if (self.pending_updates == 0) self.flush_effects();
         }
         return @call(.auto, f, .{state} ++ args ++ .{&ctx});
+    }
+
+    pub fn has_active_drag(self: *const App) bool {
+        return self.active_drag != null;
+    }
+
+    pub fn active_drag_cursor_style(self: *const App) ?style_mod.CursorStyle {
+        return if (self.active_drag) |d| d.cursor_style else null;
+    }
+
+    pub fn set_active_drag_cursor_style(self: *App, cursor_style: style_mod.CursorStyle, window: *Window) void {
+        if (self.active_drag) |*d| {
+            d.cursor_style = cursor_style;
+            window.refresh();
+        }
+    }
+
+    /// Cancels the drag. Returns true if there was one.
+    pub fn stop_active_drag(self: *App, window: *Window) bool {
+        if (self.active_drag == null) return false;
+        self.clear_active_drag();
+        window.refresh();
+        return true;
+    }
+
+    pub fn set_active_drag(self: *App, drag: AnyDrag) void {
+        self.clear_active_drag();
+        self.active_drag = drag;
+    }
+
+    /// Ends the drag and releases what it owns: its copy of the value and its view.
+    pub fn clear_active_drag(self: *App) void {
+        const drag = self.active_drag orelse return;
+        self.active_drag = null;
+        if (drag.free_value) |free| free(self.allocator, drag.value.ptr);
+        self.release_entity(drag.view.entity_id);
     }
 
     pub fn release_entity(self: *App, id: EntityId) void {
