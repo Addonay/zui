@@ -24,6 +24,19 @@ pub const Backend = union(enum) {
             inline else => |c| c.fd(),
         };
     }
+    /// A descriptor the backend is reading without blocking, such as a drag's file list.
+    fn extra_fd(self: Backend) c_int {
+        return switch (self) {
+            .wayland => |c| c.extra_fd(),
+            .x11 => -1,
+        };
+    }
+    fn on_extra_fd(self: Backend) void {
+        switch (self) {
+            .wayland => |c| c.on_extra_fd(),
+            .x11 => {},
+        }
+    }
     fn prepare_wait(self: Backend) bool {
         return switch (self) {
             inline else => |c| c.prepare_wait(),
@@ -120,14 +133,17 @@ pub const LinuxPlatform = struct {
         const now = input.now_ms();
         const timeout = self.backend.timeout(now) orelse -1;
         const has_pending = self.backend.prepare_wait();
-        var fds = [2]std.posix.pollfd{
+        // Poll ignores a negative descriptor.
+        var fds = [3]std.posix.pollfd{
             .{ .fd = self.backend.fd(), .events = std.posix.POLL.IN, .revents = 0 },
             .{ .fd = self.wake_fd, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = self.backend.extra_fd(), .events = std.posix.POLL.IN, .revents = 0 },
         };
         if (!has_pending) {
             _ = std.posix.poll(&fds, timeout) catch 0;
         }
         self.backend.finish_wait(fds[0].revents != 0);
+        if (fds[2].revents != 0) self.backend.on_extra_fd();
         if (fds[1].revents != 0) {
             var buf: u64 = 0;
             _ = std.os.linux.read(self.wake_fd, @ptrCast(&buf), 8);

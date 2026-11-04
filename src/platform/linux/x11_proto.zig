@@ -243,6 +243,37 @@ pub const XIEnterEvent = extern struct {
     mods: XIModifierState,
     group: XIGroupState,
 };
+pub const XI_GesturePinchBegin: c_int = 27;
+pub const XI_GesturePinchUpdate: c_int = 28;
+pub const XI_GesturePinchEnd: c_int = 29;
+pub const XIGesturePinchEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    extension: c_int,
+    evtype: c_int,
+    time: Time,
+    deviceid: c_int,
+    sourceid: c_int,
+    detail: c_int,
+    root: Window,
+    event: Window,
+    child: Window,
+    root_x: f64,
+    root_y: f64,
+    event_x: f64,
+    event_y: f64,
+    delta_x: f64,
+    delta_y: f64,
+    delta_unaccel_x: f64,
+    delta_unaccel_y: f64,
+    scale: f64,
+    delta_angle: f64,
+    flags: c_int,
+    mods: XIModifierState,
+    group: XIGroupState,
+};
 pub const XIAnyClassInfo = extern struct { type: c_int, sourceid: c_int };
 pub const XIScrollClassInfo = extern struct {
     type: c_int,
@@ -369,6 +400,8 @@ comptime {
             .{ @sizeOf(XIDeviceEvent), 200 },          .{ @offsetOf(XIDeviceEvent, "event_x"), 104 },
             .{ @offsetOf(XIDeviceEvent, "flags"), 120 }, .{ @offsetOf(XIDeviceEvent, "buttons"), 128 },
             .{ @offsetOf(XIDeviceEvent, "valuators"), 144 }, .{ @offsetOf(XIDeviceEvent, "mods"), 168 },
+            .{ @sizeOf(XIGesturePinchEvent), 208 },    .{ @offsetOf(XIGesturePinchEvent, "scale"), 152 },
+            .{ @offsetOf(XIGesturePinchEvent, "mods"), 172 },
             .{ @sizeOf(XIEnterEvent), 184 },           .{ @offsetOf(XIEnterEvent, "mode"), 120 },
             .{ @offsetOf(XIEnterEvent, "buttons"), 136 }, .{ @offsetOf(XIEnterEvent, "mods"), 152 },
             .{ @sizeOf(XIDeviceInfo), 40 },            .{ @offsetOf(XIDeviceInfo, "classes"), 32 },

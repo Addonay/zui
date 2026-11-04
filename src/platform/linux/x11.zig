@@ -116,6 +116,8 @@ pub const X11Connection = struct {
     xi_lib: ?dl.Library = null,
     xi_api: ?proto.XiApi = null,
     xi_opcode: c_int = 0,
+    xi_has_gestures: bool = false,
+    pinch_scale: f32 = 1,
     scroll_devices: x11_scroll.ScrollDevices = .{},
     xrandr_lib: ?dl.Library = null,
     xrandr_api: ?proto.XrandrApi = null,
@@ -729,7 +731,7 @@ pub const X11Connection = struct {
         var event_base: c_int = 0;
         var error_base: c_int = 0;
         var major: c_int = 2;
-        var minor: c_int = 1;
+        var minor: c_int = 4;
         if (self.api.XQueryExtension(self.display, "XInputExtension", &self.xi_opcode, &event_base, &error_base) == 0 or
             x.XIQueryVersion(self.display, &major, &minor) != 0 or major < 2 or (major == 2 and minor < 1))
         {
@@ -738,6 +740,8 @@ pub const X11Connection = struct {
         }
         self.xi_lib = lib;
         self.xi_api = x;
+        // The server answers with what it has: pinch needs 2.4.
+        self.xi_has_gestures = major > 2 or minor >= 4;
         var hierarchy_bits: [2]u8 = @splat(0);
         set_mask_bit(&hierarchy_bits, proto.XI_HierarchyChanged);
         var mask: proto.XIEventMask = .{ .deviceid = proto.XIAllDevices, .mask_len = hierarchy_bits.len, .mask = &hierarchy_bits };
@@ -747,11 +751,17 @@ pub const X11Connection = struct {
 
     fn select_xinput(self: *X11Connection, window: XWindow) void {
         const x = self.xi_api orelse return;
-        var bits: [2]u8 = @splat(0);
+        var bits: [4]u8 = @splat(0);
         for ([_]c_int{ proto.XI_Motion, proto.XI_ButtonPress, proto.XI_ButtonRelease, proto.XI_Enter, proto.XI_Leave, proto.XI_DeviceChanged }) |event| {
             set_mask_bit(&bits, event);
         }
-        var mask: proto.XIEventMask = .{ .deviceid = proto.XIAllMasterDevices, .mask_len = bits.len, .mask = &bits };
+        // An older server rejects a mask naming events it does not know.
+        if (self.xi_has_gestures) {
+            for ([_]c_int{ proto.XI_GesturePinchBegin, proto.XI_GesturePinchUpdate, proto.XI_GesturePinchEnd }) |event| {
+                set_mask_bit(&bits, event);
+            }
+        }
+        var mask: proto.XIEventMask = .{ .deviceid = proto.XIAllMasterDevices, .mask_len = if (self.xi_has_gestures) 4 else 2, .mask = &bits };
         _ = x.XISelectEvents(self.display, window, @ptrCast(&mask), 1);
     }
 
@@ -823,6 +833,30 @@ pub const X11Connection = struct {
                 self.scroll_devices.reset_all();
             },
             proto.XI_HierarchyChanged => self.query_scroll_devices(),
+            proto.XI_GesturePinchBegin, proto.XI_GesturePinchUpdate, proto.XI_GesturePinchEnd => {
+                const e: *const proto.XIGesturePinchEvent = @ptrCast(@alignCast(data));
+                const w = self.find_window(e.event) orelse return;
+                const delta: f32, const phase: interactive.TouchPhase = switch (ev.xcookie.evtype) {
+                    proto.XI_GesturePinchBegin => blk: {
+                        self.pinch_scale = 1;
+                        break :blk .{ 0, .started };
+                    },
+                    proto.XI_GesturePinchUpdate => blk: {
+                        // Events carry the total scale, and ZUI wants the change.
+                        const next: f32 = @floatCast(e.scale);
+                        const change = next - self.pinch_scale;
+                        self.pinch_scale = next;
+                        break :blk .{ change, .moved };
+                    },
+                    else => .{ 0, .ended },
+                };
+                _ = w.base.emit_input(.{ .pinch = .{
+                    .position = w.logical_f(e.event_x, e.event_y),
+                    .delta = delta,
+                    .modifiers = input.modifiers(@bitCast(e.mods.effective)),
+                    .phase = phase,
+                } });
+            },
             else => {},
         }
     }

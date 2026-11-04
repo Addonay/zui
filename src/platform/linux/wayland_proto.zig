@@ -189,12 +189,17 @@ pub const SeatListener = extern struct {
 /// wayland-client-protocol.h; bound at version 1 so only v1 events exist.
 pub const DataOfferListener = extern struct {
     offer: ?*const fn (?*anyopaque, *DataOffer, [*:0]const u8) callconv(.c) void = null,
+    source_actions: ?*const fn (?*anyopaque, *DataOffer, u32) callconv(.c) void = null,
+    action: ?*const fn (?*anyopaque, *DataOffer, u32) callconv(.c) void = null,
 };
 
 pub const DataSourceListener = extern struct {
     target: ?*const fn (?*anyopaque, *DataSource, ?[*:0]const u8) callconv(.c) void = null,
     send: ?*const fn (?*anyopaque, *DataSource, [*:0]const u8, i32) callconv(.c) void = null,
     cancelled: ?*const fn (?*anyopaque, *DataSource) callconv(.c) void = null,
+    dnd_drop_performed: ?*const fn (?*anyopaque, *DataSource) callconv(.c) void = null,
+    dnd_finished: ?*const fn (?*anyopaque, *DataSource) callconv(.c) void = null,
+    action: ?*const fn (?*anyopaque, *DataSource, u32) callconv(.c) void = null,
 };
 
 pub const DataDeviceListener = extern struct {
@@ -208,18 +213,22 @@ pub const DataDeviceListener = extern struct {
 
 pub const data_offer_events = [_]Message{
     .{ .name = "offer", .signature = "s", .types = null },
+    .{ .name = "source_actions", .signature = "3u", .types = null },
+    .{ .name = "action", .signature = "3u", .types = null },
 };
 pub const data_offer_methods = [_]Message{
     .{ .name = "accept", .signature = "u?s", .types = null },
     .{ .name = "receive", .signature = "sh", .types = null },
     .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "finish", .signature = "3", .types = null },
+    .{ .name = "set_actions", .signature = "3uu", .types = null },
 };
 pub const data_offer_interface: Interface = .{
     .name = "wl_data_offer",
-    .version = 1,
-    .method_count = 3,
+    .version = 3,
+    .method_count = 5,
     .methods = @ptrCast(&data_offer_methods),
-    .event_count = 1,
+    .event_count = 3,
     .events = @ptrCast(&data_offer_events),
 };
 
@@ -227,17 +236,21 @@ pub const data_source_events = [_]Message{
     .{ .name = "target", .signature = "?s", .types = null },
     .{ .name = "send", .signature = "sh", .types = null },
     .{ .name = "cancelled", .signature = "", .types = null },
+    .{ .name = "dnd_drop_performed", .signature = "3", .types = null },
+    .{ .name = "dnd_finished", .signature = "3", .types = null },
+    .{ .name = "action", .signature = "3u", .types = null },
 };
 pub const data_source_methods = [_]Message{
     .{ .name = "offer", .signature = "s", .types = null },
     .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "set_actions", .signature = "3u", .types = null },
 };
 pub const data_source_interface: Interface = .{
     .name = "wl_data_source",
-    .version = 1,
-    .method_count = 2,
+    .version = 3,
+    .method_count = 3,
     .methods = @ptrCast(&data_source_methods),
-    .event_count = 3,
+    .event_count = 6,
     .events = @ptrCast(&data_source_events),
 };
 
@@ -258,7 +271,7 @@ pub const data_device_events = [_]Message{
 pub const data_device_methods = [_]Message{
     .{ .name = "start_drag", .signature = "?oo?ou", .types = null },
     .{ .name = "set_selection", .signature = "?ou", .types = null },
-    .{ .name = "release", .signature = "", .types = null },
+    .{ .name = "release", .signature = "2", .types = null },
 };
 pub const data_device_interface: Interface = .{
     .name = "wl_data_device",
@@ -338,6 +351,42 @@ pub const primary_device_manager_interface: Interface = .{
     .version = 1,
     .method_count = 3,
     .methods = @ptrCast(&primary_device_manager_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+// -- zwp_pointer_gestures_v1 ---------------------------------------------------
+
+pub const PointerGestures = opaque {};
+pub const PointerGesturePinch = opaque {};
+pub const PointerGesturePinchListener = extern struct {
+    begin: *const fn (?*anyopaque, *PointerGesturePinch, u32, u32, ?*Surface, u32) callconv(.c) void,
+    update: *const fn (?*anyopaque, *PointerGesturePinch, u32, i32, i32, i32, i32) callconv(.c) void,
+    end: *const fn (?*anyopaque, *PointerGesturePinch, u32, u32, i32) callconv(.c) void,
+};
+pub const pointer_gesture_pinch_methods = [_]Message{.{ .name = "destroy", .signature = "", .types = null }};
+pub const pointer_gesture_pinch_events = [_]Message{
+    .{ .name = "begin", .signature = "uuou", .types = &[_]?*const anyopaque{ null, null, null, null } },
+    .{ .name = "update", .signature = "uffff", .types = null },
+    .{ .name = "end", .signature = "uui", .types = null },
+};
+pub const pointer_gesture_pinch_interface: Interface = .{
+    .name = "zwp_pointer_gesture_pinch_v1",
+    .version = 1,
+    .method_count = 1,
+    .methods = @ptrCast(&pointer_gesture_pinch_methods),
+    .event_count = 3,
+    .events = @ptrCast(&pointer_gesture_pinch_events),
+};
+pub const pointer_gestures_methods = [_]Message{
+    .{ .name = "get_swipe_gesture", .signature = "no", .types = &[_]?*const anyopaque{ null, null } },
+    .{ .name = "get_pinch_gesture", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&pointer_gesture_pinch_interface), null } },
+};
+pub const pointer_gestures_interface: Interface = .{
+    .name = "zwp_pointer_gestures_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&pointer_gestures_methods),
     .event_count = 0,
     .events = null,
 };
@@ -468,8 +517,8 @@ pub const xdg_surface_interface: Interface = .{
 pub const xdg_toplevel_events = [_]Message{
     .{ .name = "configure", .signature = "iia", .types = null },
     .{ .name = "close", .signature = "", .types = null },
-    .{ .name = "configure_bounds", .signature = "ii", .types = null },
-    .{ .name = "wm_capabilities", .signature = "a", .types = null },
+    .{ .name = "configure_bounds", .signature = "4ii", .types = null },
+    .{ .name = "wm_capabilities", .signature = "5a", .types = null },
 };
 pub const xdg_toplevel_methods = [_]Message{
     .{ .name = "destroy", .signature = "", .types = null },

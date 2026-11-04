@@ -315,6 +315,7 @@ test {
         _ = @import("platform/linux/text_input_state.zig");
         _ = @import("platform/linux/xim_preedit.zig");
         _ = @import("platform/linux/x11_scroll.zig");
+        _ = @import("platform/linux/wayland_scroll.zig");
         _ = @import("platform/linux/xdnd.zig");
         _ = @import("platform/linux/input.zig");
         _ = @import("platform/linux/x11.zig");

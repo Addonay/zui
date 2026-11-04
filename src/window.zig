@@ -1408,6 +1408,10 @@ pub const Window = struct {
             .file_drop => |e| {
                 self.dispatch_mouse(interactive.FileDropEvent, &e, cx);
             },
+            .pinch => |e| {
+                self.modifiers_ = e.modifiers;
+                self.dispatch_mouse(interactive.PinchEvent, &e, cx);
+            },
             else => {},
         }
         return !self.propagate_event or self.default_prevented;
