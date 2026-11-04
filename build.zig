@@ -11,6 +11,18 @@ const examples = [_][]const u8{
     "gradient",
     "input",
     "drag_drop",
+    "shadow",
+    "opacity",
+    "svg",
+    "image",
+    "text",
+    "text_wrapper",
+    "grid_layout",
+    "uniform_list",
+    "list_example",
+    "animation",
+    "focus_visible",
+    "tab_stop",
 };
 
 pub fn build(b: *std.Build) void {
