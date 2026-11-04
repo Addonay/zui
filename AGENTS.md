@@ -101,6 +101,7 @@ src/platform/linux/text_input_state.zig  text-input-v3 double-buffered state, no
 src/platform/linux/xim_preedit.zig       XIM composition edits, no X11 in it
 src/platform/linux/x11_scroll.zig        XInput2 scroll valuators, no X11 in it
 src/platform/linux/xdnd.zig              text/uri-list parsing for file drags
+src/platform/linux/wayland_scroll.zig    wl_pointer axis frames, no Wayland in it
 src/renderer/cpu.zig     CPU renderer
 src/gpu/                 portable GPU layer (Vulkan/D3D12/D3D11/Metal/GL/WebGPU), vendored from zicr
 src/renderer/gpu.zig     GPU renderer + GpuAtlas; shaders.glsl -> shaders_gen.zig (committed)
@@ -301,6 +302,12 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   `FileDropEvent`, but nothing turns them into element drops until `on_drop` exists.
   Extension struct layouts in `x11_proto.zig` are checked at compile time against values measured
   with `offsetof`.
+- **Wayland pointer and drags**: fingers scroll in pixels, wheels in lines. `wl_data_device` is
+  bound at version 3, so a drag offers copy only (a move would make the source delete the user's
+  files). The file list is read through a non-blocking pipe polled by the main loop, with a timeout,
+  because a slow source must not freeze the window. `finish` is sent only with an accepted type and
+  a chosen action, since it is a protocol error otherwise. Drags cannot be tested with the harness
+  below: even GTK to GTK gets cancelled under injected pointers, so test those by hand.
 - **Testing without touching the desktop**: isolate *before* starting the bus, so the bus and
   everything it activates inherit it: `env -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS
   -u IBUS_ADDRESS HOME=<s>/home XDG_CONFIG_HOME=<s>/cfg XDG_DATA_HOME=<s>/data XDG_CACHE_HOME=<s>/cache

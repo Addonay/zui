@@ -18,6 +18,8 @@ const proto = @import("wayland_proto.zig");
 const dl = @import("dl.zig");
 const xkb = @import("xkb.zig");
 const text_input_state = @import("text_input_state.zig");
+const wayland_scroll = @import("wayland_scroll.zig");
+const xdnd = @import("xdnd.zig");
 const input = @import("input.zig");
 
 const Pixels = geometry.Pixels;
@@ -78,12 +80,33 @@ const OfferSlot = struct {
     mimes: u8 = 0,
 };
 
-/// One axis of pending wheel input, flushed once per pointer frame.
-const Axis = struct {
-    /// Continuous delta in logical pixels (decoded from wl_fixed).
-    value: f32 = 0,
-    discrete: i32 = 0,
-    v120: i32 = 0,
+const MIME_URI_LIST: [*:0]const u8 = "text/uri-list";
+const mime_bit_uri_list: u8 = 1 << 4;
+const dnd_action_none: u32 = 0;
+const dnd_action_copy: u32 = 1;
+/// A source that sends nothing for this long is given up on, so it cannot hang a drag.
+const drag_read_timeout_ms: i64 = 4000;
+const drag_read_limit: usize = 16 * 1024 * 1024;
+
+/// One file drag in progress over a window of ours.
+const DragSession = struct {
+    offer: ?*proto.DataOffer = null,
+    window: ?*WaylandWindow = null,
+    position: PxPoint = .{ .x = 0, .y = 0 },
+    /// The offer has a file list and we accepted it. Finishing is an error otherwise.
+    accepted: bool = false,
+    /// What the compositor chose. Finishing with none is an error too.
+    action: u32 = dnd_action_none,
+    /// The pipe the file list arrives through, read without blocking.
+    read_fd: c_int = -1,
+    read_deadline_ms: i64 = 0,
+    data: std.ArrayList(u8) = .empty,
+    paths: []const []const u8 = &.{},
+    /// The window has been told about the files.
+    entered: bool = false,
+    /// The drop came first. Leave no longer cancels: the data can still be read, and the
+    /// drop completes when it lands.
+    drop_pending: bool = false,
 };
 
 /// The compositor connection. Owns globals, seat devices, clipboard and cursors.
@@ -152,8 +175,14 @@ pub const WaylandConnection = struct {
     cursor_style: CursorStyle = .arrow,
     mods: u32 = 0,
     mods_reported: u32 = 0,
-    axis_v: Axis = .{},
-    axis_h: Axis = .{},
+    axis_frame: wayland_scroll.AxisFrame = .{},
+    drag: DragSession = .{},
+    drag_serial: u32 = 0,
+    ddm_version: u32 = 1,
+    pointer_gestures: ?*proto.PointerGestures = null,
+    pinch_gesture: ?*proto.PointerGesturePinch = null,
+    /// The scale reported by the last pinch update: events carry totals, ZUI wants changes.
+    pinch_scale: f32 = 1,
     repeat_rate: i32 = 0,
     repeat_delay_ms: i64 = 0,
     repeat: Repeat = .{},
@@ -176,7 +205,7 @@ pub const WaylandConnection = struct {
         .button = pointerButton,
         .axis = pointerAxis,
         .frame = pointerFrame,
-        .axis_source = pointerNoopSource,
+        .axis_source = pointerAxisSource,
         .axis_stop = pointerNoopStop,
         .axis_discrete = pointerAxisDiscrete,
         .axis_value120 = pointerAxisValue120,
@@ -210,8 +239,9 @@ pub const WaylandConnection = struct {
     const primary_device_listener: proto.PrimaryDeviceListener = .{ .data_offer = primaryDeviceOffer, .selection = primaryDeviceSelection };
     const primary_offer_listener: proto.PrimaryOfferListener = .{ .offer = primaryOfferOffer };
     const primary_source_listener: proto.PrimarySourceListener = .{ .send = primarySourceSend, .cancelled = primarySourceCancelled };
-    const data_offer_listener: proto.DataOfferListener = .{ .offer = dataOfferOffer };
-    const data_source_listener: proto.DataSourceListener = .{ .target = dataSourceTarget, .send = dataSourceSend, .cancelled = dataSourceCancelled };
+    const data_offer_listener: proto.DataOfferListener = .{ .offer = dataOfferOffer, .source_actions = dataOfferSourceActions, .action = dataOfferAction };
+    const pinch_listener: proto.PointerGesturePinchListener = .{ .begin = pinchBegin, .update = pinchUpdate, .end = pinchEnd };
+    const data_source_listener: proto.DataSourceListener = .{ .target = dataSourceTarget, .send = dataSourceSend, .cancelled = dataSourceCancelled, .dnd_drop_performed = dataSourceDndNoop, .dnd_finished = dataSourceDndNoop, .action = dataSourceActionNoop };
     const wm_listener: proto.XdgWmBaseListener = .{ .ping = xdgPing };
 
     /// Connects to the compositor named by WAYLAND_DISPLAY.
@@ -327,14 +357,20 @@ pub const WaylandConnection = struct {
 
     /// Milliseconds until the next key repeat, or null when no key is held.
     pub fn repeat_timeout(self: *const WaylandConnection, now: i64) ?i32 {
-        if (!self.repeat.active or self.repeat_rate == 0) return null;
-        return @intCast(@max(0, self.repeat.next_ms - now));
+        var best: ?i64 = null;
+        if (self.repeat.active and self.repeat_rate != 0) best = @max(0, self.repeat.next_ms - now);
+        if (self.drag.read_fd >= 0) {
+            const due = @max(0, self.drag.read_deadline_ms - now);
+            best = if (best) |b| @min(b, due) else due;
+        }
+        return if (best) |b| @intCast(b) else null;
     }
 
     /// Emits synthetic repeats for a held key and requests frames for windows
     /// that asked for one (their callback is not in flight).
     pub fn pump(self: *WaylandConnection) void {
         self.tick_repeat();
+        self.check_drag_timeout(input.now_ms());
         var i: usize = 0;
         while (i < self.windows.items.len) : (i += 1) {
             const w = self.windows.items[i];
@@ -395,6 +431,10 @@ pub const WaylandConnection = struct {
         if (self.text_input) |o| self.api.wl_proxy_destroy(@ptrCast(o));
         if (self.text_input_manager) |o| self.api.wl_proxy_destroy(@ptrCast(o));
         if (self.system_bell) |o| self.api.wl_proxy_destroy(@ptrCast(o));
+        self.reset_drag();
+        self.drag.data.deinit(self.allocator);
+        if (self.pinch_gesture) |o| self.api.wl_proxy_destroy(@ptrCast(o));
+        if (self.pointer_gestures) |o| self.api.wl_proxy_destroy(@ptrCast(o));
         if (self.clipboard_slot.current) |o| self.api.wl_proxy_destroy(@ptrCast(o));
         if (self.primary_slot.current) |o| self.api.wl_proxy_destroy(@ptrCast(o));
         if (self.primary_source) |o| self.api.wl_proxy_destroy(@ptrCast(o));
@@ -549,6 +589,10 @@ pub const WaylandConnection = struct {
     }
 
     fn release_focus(self: *WaylandConnection, w: *WaylandWindow) void {
+        if (self.drag.window == w) {
+            self.drag.window = null;
+            self.reset_drag();
+        }
         if (self.text_input_window == w) {
             self.text_input_window = null;
             self.sync_text_input();
@@ -566,6 +610,13 @@ pub const WaylandConnection = struct {
             if (self.api.wl_proxy_marshal_flags(@ptrCast(seat), 0, self.api.wl_pointer_interface, ver, 0, @as(?*anyopaque, null))) |p| {
                 self.pointer = @ptrCast(p);
                 _ = self.api.wl_proxy_add_listener(p, &pointer_listener, self);
+                if (self.pointer_gestures) |g| {
+                    const raw = self.api.wl_proxy_marshal_flags(@ptrCast(g), 1, &proto.pointer_gesture_pinch_interface, 1, 0, @as(?*anyopaque, null), p);
+                    if (raw) |pinch| {
+                        self.pinch_gesture = @ptrCast(pinch);
+                        _ = self.api.wl_proxy_add_listener(pinch, @ptrCast(&pinch_listener), self);
+                    }
+                }
             }
         }
         if (self.keyboard == null and (self.seat_caps & proto.WL_SEAT_CAP_KEYBOARD) != 0) {
@@ -576,7 +627,7 @@ pub const WaylandConnection = struct {
             }
         }
         if (self.data_device == null and self.ddm != null) {
-            const raw = self.api.wl_proxy_marshal_flags(@ptrCast(self.ddm.?), 1, &proto.data_device_interface, 1, 0, @as(?*anyopaque, null), @as(*anyopaque, @ptrCast(seat)));
+            const raw = self.api.wl_proxy_marshal_flags(@ptrCast(self.ddm.?), 1, &proto.data_device_interface, self.ddm_version, 0, @as(?*anyopaque, null), @as(*anyopaque, @ptrCast(seat)));
             if (raw) |dd| {
                 self.data_device = @ptrCast(dd);
                 _ = self.api.wl_proxy_add_listener(dd, &data_device_listener, self);
@@ -711,32 +762,118 @@ pub const WaylandConnection = struct {
     }
 
     fn flush_axes(self: *WaylandConnection) void {
-        const dy = axisLines(self.axis_v, true);
-        const dx = axisLines(self.axis_h, false);
-        self.axis_v = .{};
-        self.axis_h = .{};
+        const mods = input.modifiers(self.mods);
+        const scroll = self.axis_frame.take(mods.shift) orelse return;
         const w = self.pointer_focus orelse return;
-        if (dx == null and dy == null) return;
         _ = w.base.emit_input(.{ .scroll_wheel = .{
             .position = self.pointer_pos,
-            .delta = .{ .lines = .{ .x = dx orelse 0, .y = dy orelse 0 } },
-            .modifiers = input.modifiers(self.mods),
+            .delta = switch (scroll) {
+                .pixels => |d| .{ .pixels = .{ .x = d.x, .y = d.y } },
+                .lines => |d| .{ .lines = .{ .x = d.x, .y = d.y } },
+            },
+            .modifiers = mods,
             .source = .pointer,
         } });
     }
 
-    /// Scroll lines for one axis. High-resolution steps win, then discrete
-    /// notches, then continuous pixels (about 10 per notch). Positive is up.
-    fn axisLines(axis: Axis, vertical: bool) ?f32 {
-        if (axis.v120 == 0 and axis.discrete == 0 and axis.value == 0) return null;
-        var lines: f32 = if (axis.v120 != 0)
-            @as(f32, @floatFromInt(axis.v120)) / 120.0
-        else if (axis.discrete != 0)
-            @floatFromInt(axis.discrete)
-        else
-            axis.value / 10.0;
-        if (vertical) lines = -lines;
-        return lines;
+    // -- file drags ---------------------------------------------------------
+
+    pub fn extra_fd(self: *const WaylandConnection) c_int {
+        return self.drag.read_fd;
+    }
+
+    /// Reads what is available of the file list. The source runs at its own pace, and
+    /// waiting for it here would freeze the window, so this never blocks.
+    pub fn on_extra_fd(self: *WaylandConnection) void {
+        var chunk: [8192]u8 = undefined;
+        while (self.drag.read_fd >= 0) {
+            const n: isize = @bitCast(std.os.linux.read(self.drag.read_fd, &chunk, chunk.len));
+            if (n == -@as(isize, @intFromEnum(std.os.linux.E.AGAIN))) return;
+            if (n == -@as(isize, @intFromEnum(std.os.linux.E.INTR))) continue;
+            if (n <= 0) return self.finish_drag_read(n == 0);
+            self.drag.data.appendSlice(self.allocator, chunk[0..@intCast(n)]) catch return self.finish_drag_read(false);
+            if (self.drag.data.items.len > drag_read_limit) return self.finish_drag_read(false);
+        }
+    }
+
+    fn close_drag_pipe(self: *WaylandConnection) void {
+        if (self.drag.read_fd >= 0) _ = std.os.linux.close(self.drag.read_fd);
+        self.drag.read_fd = -1;
+        self.drag.data.clearRetainingCapacity();
+    }
+
+    fn finish_drag_read(self: *WaylandConnection, ok: bool) void {
+        const w = self.drag.window;
+        if (ok) self.drag.paths = xdnd.parse_uri_list(self.allocator, self.drag.data.items) catch &.{};
+        self.close_drag_pipe();
+        if (w) |window| {
+            if (self.drag.paths.len > 0) {
+                self.drag.entered = true;
+                _ = window.base.emit_input(.{ .file_drop = .{ .entered = .{ .position = self.drag.position, .paths = .{ .items = self.drag.paths } } } });
+            } else if (self.drag.offer) |offer| {
+                // Text, not files: refuse it, so the source shows a refused drop.
+                self.accept_drag_mime(offer, null);
+                self.drag.accepted = false;
+            }
+        }
+        if (self.drag.drop_pending) self.complete_drop();
+        self.flush();
+    }
+
+    fn accept_drag_mime(self: *WaylandConnection, offer: *proto.DataOffer, mime: ?[*:0]const u8) void {
+        _ = self.api.wl_proxy_marshal_flags(@ptrCast(offer), 0, null, 1, 0, self.drag_serial, mime);
+    }
+
+    fn start_drag(self: *WaylandConnection, w: *WaylandWindow, offer: *proto.DataOffer, mimes: u8) void {
+        self.drag.offer = offer;
+        self.drag.window = w;
+        if (mimes & mime_bit_uri_list == 0) {
+            self.accept_drag_mime(offer, null);
+            return;
+        }
+        self.accept_drag_mime(offer, MIME_URI_LIST);
+        self.drag.accepted = true;
+        // Copy only. A move would have the source delete the user's files once dropped,
+        // and elements receiving paths do not promise to have taken them.
+        if (self.ddm_version >= 3) {
+            _ = self.api.wl_proxy_marshal_flags(@ptrCast(offer), 4, null, self.ddm_version, 0, dnd_action_copy, dnd_action_copy);
+        } else {
+            self.drag.action = dnd_action_copy;
+        }
+        var fds: [2]i32 = .{ -1, -1 };
+        if (@as(isize, @bitCast(std.os.linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true }))) != 0) return;
+        _ = self.api.wl_proxy_marshal_flags(@ptrCast(offer), 1, null, 1, 0, MIME_URI_LIST, fds[1]);
+        _ = std.os.linux.close(fds[1]);
+        self.drag.read_fd = fds[0];
+        self.drag.read_deadline_ms = input.now_ms() + drag_read_timeout_ms;
+    }
+
+    /// Ends the session and releases everything. An offer still held is simply destroyed.
+    fn reset_drag(self: *WaylandConnection) void {
+        self.close_drag_pipe();
+        if (self.drag.offer) |offer| _ = self.api.wl_proxy_marshal_flags(@ptrCast(offer), 2, null, 1, 1);
+        if (self.drag.paths.len > 0) xdnd.free_paths(self.allocator, self.drag.paths);
+        var data = self.drag.data;
+        data.clearRetainingCapacity();
+        self.drag = .{ .data = data };
+    }
+
+    fn complete_drop(self: *WaylandConnection) void {
+        const w = self.drag.window orelse return self.reset_drag();
+        if (self.drag.entered) {
+            _ = w.base.emit_input(.{ .file_drop = .{ .submit = .{ .position = self.drag.position } } });
+        }
+        // Finishing without an accepted type and a chosen action is a protocol error.
+        if (self.drag.offer) |offer| {
+            if (self.ddm_version >= 3 and self.drag.entered and self.drag.accepted and self.drag.action != dnd_action_none) {
+                _ = self.api.wl_proxy_marshal_flags(@ptrCast(offer), 3, null, self.ddm_version, 0);
+            }
+        }
+        self.reset_drag();
+    }
+
+    fn check_drag_timeout(self: *WaylandConnection, now: i64) void {
+        if (self.drag.read_fd >= 0 and now >= self.drag.read_deadline_ms) self.finish_drag_read(false);
     }
 
     // -- clipboard -------------------------------------------------------
@@ -752,6 +889,7 @@ pub const WaylandConnection = struct {
     }
 
     fn offer_mime_bit(mime: []const u8) u8 {
+        if (std.mem.eql(u8, mime, "text/uri-list")) return mime_bit_uri_list;
         if (std.mem.eql(u8, mime, "text/plain;charset=utf-8")) return 1 << 0;
         if (std.mem.eql(u8, mime, "UTF8_STRING")) return 1 << 1;
         if (std.mem.eql(u8, mime, "text/plain")) return 1 << 2;
@@ -776,7 +914,7 @@ pub const WaylandConnection = struct {
         self.clip_offer = copy;
         if (self.data_source) |ds| self.api.wl_proxy_destroy(@ptrCast(ds));
         self.data_source = null;
-        const raw = self.api.wl_proxy_marshal_flags(@ptrCast(ddm), 0, &proto.data_source_interface, 1, 0, @as(?*anyopaque, null));
+        const raw = self.api.wl_proxy_marshal_flags(@ptrCast(ddm), 0, &proto.data_source_interface, self.ddm_version, 0, @as(?*anyopaque, null));
         const source: *proto.DataSource = @ptrCast(raw orelse return false);
         _ = self.api.wl_proxy_add_listener(@ptrCast(source), &data_source_listener, self);
         for ([_][*:0]const u8{ MIME_UTF8, MIME_TEXT_UTF8, MIME_TEXT, MIME_STRING }) |mime| {
@@ -940,10 +1078,16 @@ fn registryGlobal(data: ?*anyopaque, reg: *proto.Registry, name: u32, iface: [*:
         const ver: u32 = @min(version, 5);
         self.wm_base = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.xdg_wm_base_interface, ver, 0, name, proto.xdg_wm_base_interface.name, ver, &proto.xdg_wm_base_interface));
     } else if (std.mem.eql(u8, iface_name, "wl_seat")) {
-        const ver: u32 = @min(version, 5);
+        // Version 8 brings high resolution wheels. Newer keyboards can repeat keys on their
+        // own, which the repeat timer here would then double, so this stops at 9.
+        const ver: u32 = @min(version, 9);
         self.seat = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, api.wl_seat_interface, ver, 0, name, api.wl_seat_interface.name, ver, api.wl_seat_interface));
     } else if (std.mem.eql(u8, iface_name, "wl_data_device_manager")) {
-        self.ddm = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.data_device_manager_interface, @as(u32, 1), 0, name, proto.data_device_manager_interface.name, @as(u32, 1), &proto.data_device_manager_interface));
+        const ver: u32 = @min(version, 3);
+        self.ddm_version = ver;
+        self.ddm = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.data_device_manager_interface, ver, 0, name, proto.data_device_manager_interface.name, ver, @as(?*anyopaque, null)));
+    } else if (std.mem.eql(u8, iface_name, "zwp_pointer_gestures_v1")) {
+        self.pointer_gestures = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.pointer_gestures_interface, @as(u32, 1), 0, name, proto.pointer_gestures_interface.name, @as(u32, 1), @as(?*anyopaque, null)));
     } else if (std.mem.eql(u8, iface_name, "zxdg_decoration_manager_v1")) {
         self.dec_manager = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.decoration_manager_interface, @as(u32, 1), 0, name, proto.decoration_manager_interface.name, @as(u32, 1), &proto.decoration_manager_interface));
     } else if (std.mem.eql(u8, iface_name, "wp_viewporter")) {
@@ -1037,8 +1181,7 @@ fn pointerLeave(data: ?*anyopaque, _: *proto.Pointer, _: u32, surface: *proto.Su
     } });
     self.pointer_focus = null;
     self.pressed = null;
-    self.axis_v = .{};
-    self.axis_h = .{};
+    self.axis_frame = .{ .source = self.axis_frame.source };
     w.base.emit_hover(false);
 }
 
@@ -1083,26 +1226,25 @@ fn pointerButton(data: ?*anyopaque, _: *proto.Pointer, serial: u32, _: u32, code
 }
 
 fn pointerAxis(data: ?*anyopaque, _: *proto.Pointer, _: u32, axis: u32, value: i32) callconv(.c) void {
-    const self = pointerConn(data);
-    const px = proto.wlFixedToFloat(value);
-    if (axis == 0) self.axis_v.value = px else self.axis_h.value = px;
+    pointerConn(data).axis_frame.on_axis(axis, proto.wlFixedToFloat(value));
 }
 
 fn pointerAxisDiscrete(data: ?*anyopaque, _: *proto.Pointer, axis: u32, discrete: i32) callconv(.c) void {
-    const self = pointerConn(data);
-    if (axis == 0) self.axis_v.discrete = discrete else self.axis_h.discrete = discrete;
+    pointerConn(data).axis_frame.on_discrete(axis, discrete);
 }
 
 fn pointerAxisValue120(data: ?*anyopaque, _: *proto.Pointer, axis: u32, v120: i32) callconv(.c) void {
-    const self = pointerConn(data);
-    if (axis == 0) self.axis_v.v120 = v120 else self.axis_h.v120 = v120;
+    pointerConn(data).axis_frame.on_value120(axis, v120);
+}
+
+fn pointerAxisSource(data: ?*anyopaque, _: *proto.Pointer, source: u32) callconv(.c) void {
+    pointerConn(data).axis_frame.on_source(source);
 }
 
 fn pointerFrame(data: ?*anyopaque, _: *proto.Pointer) callconv(.c) void {
     pointerConn(data).flush_axes();
 }
 
-fn pointerNoopSource(_: ?*anyopaque, _: *proto.Pointer, _: u32) callconv(.c) void {}
 fn pointerNoopStop(_: ?*anyopaque, _: *proto.Pointer, _: u32, _: u32) callconv(.c) void {}
 fn pointerNoopDirection(_: ?*anyopaque, _: *proto.Pointer, _: u32, _: u32) callconv(.c) void {}
 
@@ -1183,10 +1325,94 @@ fn dataDeviceOffer(data: ?*anyopaque, _: *proto.DataDevice, offer: *proto.DataOf
     _ = self.api.wl_proxy_add_listener(@ptrCast(offer), &WaylandConnection.data_offer_listener, self);
 }
 
-fn dataDeviceEnter(_: ?*anyopaque, _: *proto.DataDevice, _: u32, _: *proto.Surface, _: i32, _: i32, _: ?*proto.DataOffer) callconv(.c) void {}
-fn dataDeviceLeave(_: ?*anyopaque, _: *proto.DataDevice) callconv(.c) void {}
-fn dataDeviceMotion(_: ?*anyopaque, _: *proto.DataDevice, _: u32, _: i32, _: i32) callconv(.c) void {}
-fn dataDeviceDrop(_: ?*anyopaque, _: *proto.DataDevice) callconv(.c) void {}
+fn dataDeviceEnter(data: ?*anyopaque, _: *proto.DataDevice, serial: u32, surface: *proto.Surface, x: i32, y: i32, offer: ?*proto.DataOffer) callconv(.c) void {
+    const self = pointerConn(data);
+    self.drag_serial = serial;
+    // This offer belongs to the drag, not the clipboard.
+    var mimes: u8 = 0;
+    if (offer != null and self.clipboard_slot.incoming == @as(?*anyopaque, @ptrCast(offer))) {
+        mimes = self.clipboard_slot.incoming_mimes;
+        self.clipboard_slot.incoming = null;
+        self.clipboard_slot.incoming_mimes = 0;
+    }
+    // A compositor can move on to a new enter without a leave.
+    if (self.drag.window) |old| {
+        if (self.drag.entered) _ = old.base.emit_input(.{ .file_drop = .exited });
+    }
+    self.reset_drag();
+    const o = offer orelse return;
+    const w = self.find_window(surface) orelse {
+        _ = self.api.wl_proxy_marshal_flags(@ptrCast(o), 2, null, 1, 1);
+        return;
+    };
+    self.drag.position = .{ .x = proto.wlFixedToFloat(x), .y = proto.wlFixedToFloat(y) };
+    self.start_drag(w, o, mimes);
+    self.flush();
+}
+
+fn dataDeviceLeave(data: ?*anyopaque, _: *proto.DataDevice) callconv(.c) void {
+    const self = pointerConn(data);
+    // Compositors also send leave after a drop, and the drop is still being completed.
+    if (self.drag.drop_pending) return;
+    if (self.drag.window) |w| {
+        if (self.drag.entered) _ = w.base.emit_input(.{ .file_drop = .exited });
+    }
+    self.reset_drag();
+}
+
+fn dataDeviceMotion(data: ?*anyopaque, _: *proto.DataDevice, _: u32, x: i32, y: i32) callconv(.c) void {
+    const self = pointerConn(data);
+    const w = self.drag.window orelse return;
+    self.drag.position = .{ .x = proto.wlFixedToFloat(x), .y = proto.wlFixedToFloat(y) };
+    if (self.drag.entered) _ = w.base.emit_input(.{ .file_drop = .{ .pending = .{ .position = self.drag.position } } });
+}
+
+fn dataDeviceDrop(data: ?*anyopaque, _: *proto.DataDevice) callconv(.c) void {
+    const self = pointerConn(data);
+    if (self.drag.read_fd >= 0) {
+        self.drag.drop_pending = true;
+        return;
+    }
+    self.complete_drop();
+    self.flush();
+}
+
+fn dataOfferSourceActions(_: ?*anyopaque, _: *proto.DataOffer, _: u32) callconv(.c) void {}
+
+fn dataOfferAction(data: ?*anyopaque, offer: *proto.DataOffer, action: u32) callconv(.c) void {
+    const self = pointerConn(data);
+    if (self.drag.offer == offer) self.drag.action = action;
+}
+
+fn dataSourceDndNoop(_: ?*anyopaque, _: *proto.DataSource) callconv(.c) void {}
+fn dataSourceActionNoop(_: ?*anyopaque, _: *proto.DataSource, _: u32) callconv(.c) void {}
+
+// -- pinch gesture --------------------------------------------------------
+
+fn emit_pinch(self: *WaylandConnection, delta: f32, phase: interactive.TouchPhase) void {
+    const w = self.pointer_focus orelse return;
+    _ = w.base.emit_input(.{ .pinch = .{ .position = self.pointer_pos, .delta = delta, .modifiers = input.modifiers(self.mods), .phase = phase } });
+}
+
+fn pinchBegin(data: ?*anyopaque, _: *proto.PointerGesturePinch, _: u32, _: u32, _: ?*proto.Surface, _: u32) callconv(.c) void {
+    const self = pointerConn(data);
+    self.pinch_scale = 1;
+    emit_pinch(self, 0, .started);
+}
+
+fn pinchUpdate(data: ?*anyopaque, _: *proto.PointerGesturePinch, _: u32, _: i32, _: i32, scale: i32, _: i32) callconv(.c) void {
+    const self = pointerConn(data);
+    const next = proto.wlFixedToFloat(scale);
+    const delta = next - self.pinch_scale;
+    self.pinch_scale = next;
+    emit_pinch(self, delta, .moved);
+}
+
+fn pinchEnd(data: ?*anyopaque, _: *proto.PointerGesturePinch, _: u32, _: u32, _: i32) callconv(.c) void {
+    const self = pointerConn(data);
+    self.pinch_scale = 1;
+    emit_pinch(self, 0, .ended);
+}
 
 fn dataDeviceSelection(data: ?*anyopaque, _: *proto.DataDevice, offer: ?*proto.DataOffer) callconv(.c) void {
     const self = pointerConn(data);
@@ -1871,10 +2097,3 @@ pub const WaylandWindow = struct {
     }
 };
 
-test "wheel axis: wayland positive is down, lines are negated to positive-up" {
-    try std.testing.expectEqual(@as(f32, -1), WaylandConnection.axisLines(.{ .v120 = 120 }, true).?);
-    try std.testing.expectEqual(@as(f32, 1), WaylandConnection.axisLines(.{ .v120 = -120 }, true).?);
-    try std.testing.expectEqual(@as(f32, 2), WaylandConnection.axisLines(.{ .discrete = -2 }, true).?);
-    try std.testing.expectEqual(@as(f32, -1), WaylandConnection.axisLines(.{ .value = 10 }, true).?);
-    try std.testing.expect(WaylandConnection.axisLines(.{}, true) == null);
-}
