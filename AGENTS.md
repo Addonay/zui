@@ -99,6 +99,8 @@ src/platform/headless.zig  headless/test platform
 src/platform/linux.zig + linux/{wayland,wayland_proto,x11,x11_proto,xkb,input,dl}.zig
 src/platform/linux/text_input_state.zig  text-input-v3 double-buffered state, no Wayland in it
 src/platform/linux/xim_preedit.zig       XIM composition edits, no X11 in it
+src/platform/linux/x11_scroll.zig        XInput2 scroll valuators, no X11 in it
+src/platform/linux/xdnd.zig              text/uri-list parsing for file drags
 src/renderer/cpu.zig     CPU renderer
 src/gpu/                 portable GPU layer (Vulkan/D3D12/D3D11/Metal/GL/WebGPU), vendored from zicr
 src/renderer/gpu.zig     GPU renderer + GpuAtlas; shaders.glsl -> shaders_gen.zig (committed)
@@ -288,6 +290,17 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   `XFilterEvent`, also while no server is connected. Not done: `delete_surrounding_text` (we never
   send surrounding text), content types such as password fields, `observe_keystrokes`,
   `keyboard_layout`, multi-keystroke replay.
+- **X11 pointer and timing**: pointer events come from XInput2 when libXi and XI 2.1 are there,
+  and from core events otherwise (selecting XI2 suppresses the core ones for that window). Wheels
+  report both through valuators and as emulated buttons 4 to 7: the emulated ones are skipped, or
+  every notch would scroll twice. Keys stay on core events, because XIM needs them. Each monitor's
+  refresh rate comes from RandR (interlace and double scan included), so frames follow the display
+  under the window. No frames while unmapped or fully covered. `_NET_WM_SYNC_REQUEST` is answered
+  after the frame is drawn, not on configure as in GPUI. XDND takes `text/uri-list` of any length up
+  to 16 MB, unlike GPUI's 4 KB; lists sent with INCR are refused. Events are emitted as
+  `FileDropEvent`, but nothing turns them into element drops until `on_drop` exists.
+  Extension struct layouts in `x11_proto.zig` are checked at compile time against values measured
+  with `offsetof`.
 - **Testing without touching the desktop**: isolate *before* starting the bus, so the bus and
   everything it activates inherit it: `env -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS
   -u IBUS_ADDRESS HOME=<s>/home XDG_CONFIG_HOME=<s>/cfg XDG_DATA_HOME=<s>/data XDG_CACHE_HOME=<s>/cache
@@ -306,6 +319,10 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
     with it; its keyboard hot-plugs on the first key, so that press is lost).
   - A real X11 IME: `ibus-daemon --xim --panel=disable`, `ibus engine libpinyin`,
     `XMODIFIERS=@im=ibus`, on Xvfb. Unset `WAYLAND_DISPLAY`, or the app opens on the real desktop.
+  - Smooth scrolling and a real window manager: leave out `--no-x11` so mutter starts XWayland.
+    The display name is in its log ("public X11 display"), and the client needs
+    `XAUTHORITY=$XDG_RUNTIME_DIR/.mutter-Xwaylandauth.*`. `NotifyPointerAxis` gives real valuators.
+    `--virtual-monitor 1024x768@120` tests refresh rates.
   - Dead keys on X11: `xmodmap -e "keycode 48 = dead_acute"`, then `xdotool key 48`. Plain mutter
     ignores layout settings.
   - A process still running at its timeout proves nothing: check for frames and protocol errors.
