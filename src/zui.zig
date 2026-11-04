@@ -43,6 +43,12 @@ pub const executor = @import("executor.zig");
 pub const platform = @import("platform.zig");
 pub const renderer = struct {
     pub const cpu = @import("renderer/cpu.zig");
+    pub const gpu = @import("renderer/gpu.zig");
+    pub const vulkan = @import("renderer/vulkan.zig");
+    pub const window_renderer = @import("renderer/window_renderer.zig");
+    test {
+        _ = @import("renderer/gpu_test.zig");
+    }
 };
 pub const elements = struct {
     pub const div = @import("elements/div.zig");

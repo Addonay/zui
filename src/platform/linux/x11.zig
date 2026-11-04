@@ -12,6 +12,7 @@ const interactive = @import("../../interactive.zig");
 const window_mod = @import("../../window.zig");
 const color = @import("../../color.zig");
 const cpu = @import("../../renderer/cpu.zig");
+const window_renderer = @import("../../renderer/window_renderer.zig");
 const proto = @import("x11_proto.zig");
 const dl = @import("dl.zig");
 const input = @import("input.zig");
@@ -65,6 +66,8 @@ pub const X11Connection = struct {
     display: *proto.Display,
     screen: c_int,
     root: XWindow,
+    gpu_context: ?*window_renderer.GpuContext = null,
+    gpu_probed: bool = false,
     /// Hidden window that owns the clipboard and receives selection replies.
     helper: XWindow,
     atoms: Atoms,
@@ -246,6 +249,7 @@ pub const X11Connection = struct {
         for (self.windows.items) |w| w.close_now();
         for (self.windows.items) |w| w.free();
         self.windows.deinit(self.allocator);
+        if (self.gpu_context) |ctx| ctx.destroy();
         for (self.cursors) |c| {
             if (c != 0) _ = self.api.XFreeCursor(self.display, c);
         }
@@ -291,6 +295,13 @@ pub const X11Connection = struct {
         _ = a.XSelectInput(self.display, x, mask);
         if (options.show) _ = a.XMapWindow(self.display, x);
         w.frame_wanted = true;
+        if (!self.gpu_probed) {
+            self.gpu_probed = true;
+            self.gpu_context = window_renderer.GpuContext.create(self.allocator, .x11);
+        }
+        if (self.gpu_context) |ctx| {
+            w.gpu_window = window_renderer.GpuWindow.create(ctx, .{ .x11 = .{ .display = @ptrCast(self.display), .window = x } }, pw, ph, .{});
+        }
         self.windows.appendAssumeCapacity(w);
         w.apply_cursor();
         self.flush();
@@ -617,6 +628,8 @@ pub const X11Window = struct {
     closed: bool = false,
     atlas: atlas_mod.CpuAtlas,
     renderer: cpu.CpuRenderer,
+    /// Set when this window draws with the GPU; `atlas` and `renderer` then stay idle.
+    gpu_window: ?window_renderer.GpuWindow = null,
 
     const vtable: platform.PlatformWindow.VTable = .{
         .bounds = bounds,
@@ -707,6 +720,11 @@ pub const X11Window = struct {
         const self = from(p);
         if (self.closed or self.destroyed_by_server) return;
         const dims = self.physical();
+        if (self.gpu_window) |*g| {
+            if (!g.draw(scene, clear_color, dims.w, dims.h)) self.frame_wanted = true;
+            self.conn.flush();
+            return;
+        }
         if (!self.ensure_image(dims.w, dims.h)) return;
         const img = self.image.?;
         const pixels = img.data.?[0 .. @as(usize, dims.w) * dims.h * 4];
@@ -731,7 +749,9 @@ pub const X11Window = struct {
         from(p).frame_wanted = true;
     }
     fn spriteAtlas(p: *platform.PlatformWindow) atlas_mod.PlatformAtlas {
-        return from(p).atlas.platform_atlas();
+        const self = from(p);
+        if (self.gpu_window) |*g| return g.ctx.sprite_atlas();
+        return self.atlas.platform_atlas();
     }
     fn setTitle(p: *platform.PlatformWindow, title: []const u8) void {
         const self = from(p);
@@ -793,6 +813,11 @@ pub const X11Window = struct {
         if (self.closed) return;
         self.closed = true;
         self.frame_wanted = false;
+        // The Vulkan surface must die before the X window it wraps.
+        if (self.gpu_window) |*g| {
+            g.deinit();
+            self.gpu_window = null;
+        }
         if (!self.destroyed_by_server) {
             _ = self.conn.api.XDestroyWindow(self.conn.display, self.x_window);
         }

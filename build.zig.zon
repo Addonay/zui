@@ -8,9 +8,10 @@
             .url = "git+https://github.com/Addonay/cozmic.git#bbc0f4f282acd024d1dc0b5e4d16fc4b08fcb6b0",
             .hash = "cozmic-0.2.0-wv6CLdHadgCZDgNzVIZ0hrEahjAznoWRePQaKF444Q4p",
         },
-        .zicr = .{
-            .url = "git+https://github.com/Addonay/zicr.git#87fe62228af2b69527ccd503da035c86b490ef42",
-            .hash = "zicr-0.0.1-HkxCrMMFQQBKOBbLswueqTQ6J4MspWkauSpOXQvZ5JEp",
+        // Only for `-Dregen-shaders=true`; the generated module is committed.
+        .sokol_tools_bin = .{
+            .url = "git+https://github.com/floooh/sokol-tools-bin#b975d5642093d62e76a1e088bdae945d6d8b8ff2",
+            .hash = "sokolshdc-0.1.0-r2KZDjW2UwOpu-g-yesxmX_xn0o4xpvd6x9lNUHHpJF4",
             .lazy = true,
         },
         .zafi = .{

@@ -116,7 +116,7 @@ vec4 distance_from_clip(vec2 position, vec4 clip) {
 }
 
 // Background evaluation (gradient_color). Colors are prepared by prepare_gradient().
-vec4 gradient_color(float tag, float color_space, float angle, float pct0, float pct1,
+vec4 gradient_color(float tag, float color_space, float angle, float pct0, float pct1, float pattern_rem,
                     vec4 bounds, vec2 position, vec4 solid_color, vec4 color0, vec4 color1) {
     if (tag == 1.0) {
         float angle_rad = (fmod_f(angle, 360.0) - 90.0) * M_PI_F / 180.0;
@@ -145,7 +145,9 @@ vec4 gradient_color(float tag, float color_space, float angle, float pct0, float
     }
     if (tag == 2.0) {
         float pattern_width = (angle / 65535.0) / 255.0;
-        float pattern_interval = fmod_f(angle, 65535.0) / 255.0;
+        // The packed height needs more bits than a float mantissa has, and in-shader fmod rounds
+        // badly at that magnitude: stripes drift. The exact remainder comes from the instance.
+        float pattern_interval = pattern_rem / 255.0;
         float pattern_height = pattern_width + pattern_interval;
         float stripe_angle = M_PI_F / 4.0;
         float pattern_period = pattern_height * sin(stripe_angle);
@@ -273,7 +275,7 @@ void main() {
     if (any(lessThan(v_clip, vec4(0.0)))) discard;
 
     float border_style = f_bg2.y;
-    vec4 background_color = gradient_color(f_bg.x, f_bg.y, f_bg.z, f_bg.w, f_bg2.x,
+    vec4 background_color = gradient_color(f_bg.x, f_bg.y, f_bg.z, f_bg.w, f_bg2.x, f_bg2.z,
         f_bounds, v_pos, f_solid, f_color0, f_color1);
 
     bool unrounded = f_radii.x == 0.0 && f_radii.w == 0.0 && f_radii.y == 0.0 && f_radii.z == 0.0;
@@ -826,7 +828,7 @@ void main() {
         float sdf_distance = f / length(gradient);
         alpha = saturate(0.5 - sdf_distance);
     }
-    vec4 color = gradient_color(f_bg.x, f_bg.y, f_bg.z, f_bg.w, f_bg2.x,
+    vec4 color = gradient_color(f_bg.x, f_bg.y, f_bg.z, f_bg.w, f_bg2.x, f_bg2.z,
         f_bounds, v_pos, f_solid, f_color0, f_color1);
     frag_color = vec4(color.rgb * color.a * alpha, color.a * alpha);
 }

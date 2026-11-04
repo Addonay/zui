@@ -13,6 +13,7 @@ const window_mod = @import("../../window.zig");
 const color = @import("../../color.zig");
 const keystroke = @import("../../keystroke.zig");
 const cpu = @import("../../renderer/cpu.zig");
+const window_renderer = @import("../../renderer/window_renderer.zig");
 const proto = @import("wayland_proto.zig");
 const dl = @import("dl.zig");
 const xkb = @import("xkb.zig");
@@ -86,6 +87,8 @@ pub const WaylandConnection = struct {
     compositor: ?*proto.Compositor = null,
     shm: ?*proto.Shm = null,
     wm_base: ?*proto.XdgWmBase = null,
+    gpu_context: ?*window_renderer.GpuContext = null,
+    gpu_probed: bool = false,
     seat: ?*proto.Seat = null,
     seat_caps: u32 = 0,
     pointer: ?*proto.Pointer = null,
@@ -336,6 +339,7 @@ pub const WaylandConnection = struct {
         for (self.windows.items) |w| w.free_protocol();
         for (self.windows.items) |w| w.free();
         self.windows.deinit(self.allocator);
+        if (self.gpu_context) |ctx| ctx.destroy();
         if (self.clip_offer) |c| self.allocator.free(c);
         if (self.clip_read) |c| self.allocator.free(c);
         if (self.data_source) |ds| self.api.wl_proxy_destroy(@ptrCast(ds));
@@ -360,6 +364,15 @@ pub const WaylandConnection = struct {
 
     // -- window creation -------------------------------------------------
 
+    fn create_gpu_window(self: *WaylandConnection, w: *WaylandWindow) ?window_renderer.GpuWindow {
+        if (!self.gpu_probed) {
+            self.gpu_probed = true;
+            self.gpu_context = window_renderer.GpuContext.create(self.allocator, .wayland);
+        }
+        const ctx = self.gpu_context orelse return null;
+        return window_renderer.GpuWindow.create(ctx, .{ .wayland = .{ .display = @ptrCast(self.display), .surface = @ptrCast(w.surface.?) } }, w.phys_w(), w.phys_h(), .{ .externally_paced = true });
+    }
+
     pub fn open_window(self: *WaylandConnection, options: window_mod.WindowOptions) !*WaylandWindow {
         try self.windows.ensureUnusedCapacity(self.allocator, 1);
         const w = try self.allocator.create(WaylandWindow);
@@ -380,6 +393,7 @@ pub const WaylandConnection = struct {
             w.free();
             return err;
         };
+        w.gpu_window = self.create_gpu_window(w);
         self.windows.appendAssumeCapacity(w);
         self.flush();
         return w;
@@ -979,6 +993,8 @@ pub const WaylandWindow = struct {
     closed: bool = false,
     atlas: atlas_mod.CpuAtlas,
     renderer: cpu.CpuRenderer,
+    /// Set when this window draws with the GPU; `atlas` and `renderer` then stay idle.
+    gpu_window: ?window_renderer.GpuWindow = null,
 
     const vtable: platform.PlatformWindow.VTable = .{
         .bounds = bounds,
@@ -1236,7 +1252,9 @@ pub const WaylandWindow = struct {
         from(p).frame_wanted = true;
     }
     fn spriteAtlas(p: *platform.PlatformWindow) atlas_mod.PlatformAtlas {
-        return from(p).atlas.platform_atlas();
+        const self = from(p);
+        if (self.gpu_window) |*g| return g.ctx.sprite_atlas();
+        return self.atlas.platform_atlas();
     }
     fn setTitle(p: *platform.PlatformWindow, title: []const u8) void {
         from(p).set_title(title);
@@ -1279,6 +1297,12 @@ pub const WaylandWindow = struct {
         if (self.closed or !self.configured) return;
         const pw = self.phys_w();
         const ph = self.phys_h();
+        if (self.gpu_window) |*g| {
+            // The present commits the surface, including the frame callback of emit_frame.
+            if (g.draw(scene, clear_color, pw, ph)) self.drew = true else self.frame_wanted = true;
+            self.conn.flush();
+            return;
+        }
         const entry = self.acquire(pw, ph) orelse {
             self.frame_wanted = true;
             return;
@@ -1323,6 +1347,11 @@ pub const WaylandWindow = struct {
 
     fn free_protocol(self: *WaylandWindow) void {
         const a = &self.conn.api;
+        // The Vulkan surface must die before the wl_surface it wraps.
+        if (self.gpu_window) |*g| {
+            g.deinit();
+            self.gpu_window = null;
+        }
         if (self.frame_callback) |cb| {
             a.wl_proxy_destroy(@ptrCast(cb));
             self.frame_callback = null;

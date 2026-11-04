@@ -14,13 +14,14 @@ const examples = [_][]const u8{
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const gpu = b.option(bool, "gpu", "Build the zicr GPU renderer and its tests (default: false)") orelse false;
+    const gpu_debug = b.option(bool, "gpu-debug", "Enable the GPU validation layer (default: Debug and ReleaseSafe)");
 
     const zafi = b.dependency("zafi", .{ .target = target, .optimize = optimize });
     const cozmic = b.dependency("cozmic", .{ .target = target, .optimize = optimize });
 
     const build_options = b.addOptions();
-    build_options.addOption(bool, "gpu", gpu);
+    build_options.addOption(?bool, "debug", gpu_debug);
+    build_options.addOption(bool, "validate_non_fatal", false);
 
     const zui = b.addModule("zui", .{
         .root_source_file = b.path("src/zui.zig"),
@@ -63,44 +64,30 @@ pub fn build(b: *std.Build) void {
         b.step("run-" ++ name, "Run the " ++ name ++ " example").dependOn(&run.step);
     }
 
-    // GPU renderer on zicr (`-Dgpu=true`). Lazy: the zicr dependency and its shader
-    // compiler are fetched only in this configuration.
-    if (gpu) {
-        const zicr_dep = b.lazyDependency("zicr", .{ .target = target, .optimize = optimize }) orelse return;
-        const zicr_build = b.lazyImport(@This(), "zicr") orelse return;
-        const zicr = zicr_dep.module("zicr");
-        const shaders = zicr_build.addShaderModule(b, zicr_dep, .{
-            .input = b.path("src/renderer/shaders.glsl"),
-            .zicr = zicr,
-        }) orelse return;
-
-        const gpu_mod = b.createModule(.{
-            .root_source_file = b.path("src/renderer/gpu.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "zui", .module = zui },
-                .{ .name = "zicr", .module = zicr },
-                .{ .name = "zui_shaders", .module = shaders },
-            },
+    // Shader regeneration: compiles renderer/shaders.glsl for every backend and rewrites the
+    // committed renderer/shaders_gen.zig. Everyone else needs no shader compiler.
+    if (b.option(bool, "regen-shaders", "Regenerate src/renderer/shaders_gen.zig with sokol-shdc (downloads it)") orelse false) {
+        const shdc = b.lazyDependency("sokol_tools_bin", .{}) orelse return;
+        const generator = b.addExecutable(.{
+            .name = "zui-shdc",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/renderer/shdc/main.zig"),
+                .target = b.graph.host,
+                .optimize = .safe,
+            }),
         });
-
-        const gpu_test_mod = b.createModule(.{
-            .root_source_file = b.path("src/renderer/gpu_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "zui", .module = zui },
-                .{ .name = "zicr", .module = zicr },
-                .{ .name = "zui_gpu", .module = gpu_mod },
-                .{ .name = "zui_shaders", .module = shaders },
-            },
-        });
-        const gpu_tests = b.addTest(.{ .root_module = gpu_test_mod });
-        const run_gpu_tests = b.addRunArtifact(gpu_tests);
-        const gpu_test_step = b.step("gpu-test", "Compare the GPU renderer with the CPU renderer (needs -Dgpu=true)");
-        gpu_test_step.dependOn(&run_gpu_tests.step);
+        const run = b.addRunArtifact(generator);
+        run.addFileArg(shdc.path(shdcPath(b.graph.host.result) orelse @panic("no bundled sokol-shdc for this host")));
+        run.addFileArg(b.path("src/renderer/shaders.glsl"));
+        const output = run.addOutputFileArg("shaders_gen.zig");
+        _ = run.addOutputDirectoryArg("shdc");
+        run.addArg("glsl410:glsl300es:hlsl5:metal_macos:metal_ios:metal_sim:wgsl:spirv_vk");
+        const update = b.addUpdateSourceFiles();
+        update.addCopyFileToSource(output, "src/renderer/shaders_gen.zig");
+        b.step("shaders", "Regenerate src/renderer/shaders_gen.zig").dependOn(&update.step);
     }
+}
+
+fn shdcPath(target: std.Target) ?[]const u8 {
+    return @import("src/renderer/shdc/compiler.zig").bundledPath(target.os.tag, target.cpu.arch);
 }
