@@ -246,18 +246,21 @@ pub const WaylandConnection = struct {
         return self.dead;
     }
 
-    /// Before blocking: drains queued events and arms the read. Returns true
-    /// when events are already dispatchable and the caller must not block.
+    /// Before blocking: drains queued events and arms the read. Returns true when
+    /// events were dispatched: they may have asked for a frame, so the caller must go
+    /// round its loop instead of blocking. Mesa's WSI reads the socket during swapchain
+    /// calls, which leaves our events queued with nothing left to wake the poll.
     pub fn prepare_wait(self: *WaylandConnection) bool {
+        var dispatched = false;
         if (self.api.wl_display_prepare_read) |prepare| {
             while (prepare(self.display) != 0) {
-                _ = self.api.wl_display_dispatch_pending(self.display);
+                if (self.api.wl_display_dispatch_pending(self.display) > 0) dispatched = true;
             }
-        } else {
-            _ = self.api.wl_display_dispatch_pending(self.display);
+        } else if (self.api.wl_display_dispatch_pending(self.display) > 0) {
+            dispatched = true;
         }
         _ = self.api.wl_display_flush(self.display);
-        return false;
+        return dispatched;
     }
 
     /// After waiting: reads the socket if it was readable, then dispatches.
@@ -1111,7 +1114,7 @@ pub const WaylandWindow = struct {
         const surface = self.surface orelse return;
         const a = self.api();
         if (self.viewport) |vp| {
-            _ = a.wl_proxy_marshal_flags(vp, 2, null, 1, 0, @as(i32, 0), @as(i32, 0), @as(i32, @intFromFloat(self.size.width)), @as(i32, @intFromFloat(self.size.height)));
+            _ = a.wl_proxy_marshal_flags(vp, 2, null, 1, 0, @as(i32, @intFromFloat(self.size.width)), @as(i32, @intFromFloat(self.size.height)));
         } else {
             _ = a.wl_proxy_marshal_flags(@ptrCast(surface), 8, null, a.wl_proxy_get_version(@ptrCast(surface)), 0, @as(i32, @intFromFloat(self.scale)));
         }
