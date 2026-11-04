@@ -249,7 +249,7 @@ pub const data_device_events = [_]Message{
     .{ .name = "selection", .signature = "?o", .types = &[_]?*const anyopaque{@ptrCast(&data_offer_interface)} },
 };
 pub const data_device_methods = [_]Message{
-    .{ .name = "start_drag", .signature = "oo?ou", .types = null },
+    .{ .name = "start_drag", .signature = "?oo?ou", .types = null },
     .{ .name = "set_selection", .signature = "?ou", .types = null },
     .{ .name = "release", .signature = "", .types = null },
 };
@@ -328,7 +328,7 @@ pub const xdg_surface_events = [_]Message{
 pub const xdg_surface_methods = [_]Message{
     .{ .name = "destroy", .signature = "", .types = null },
     .{ .name = "get_toplevel", .signature = "n", .types = &[_]?*const anyopaque{@ptrCast(&xdg_toplevel_interface)} },
-    .{ .name = "get_popup", .signature = "noo", .types = null },
+    .{ .name = "get_popup", .signature = "n?oo", .types = null },
     .{ .name = "set_window_geometry", .signature = "iiii", .types = null },
     .{ .name = "ack_configure", .signature = "u", .types = null },
 };
@@ -359,7 +359,7 @@ pub const xdg_toplevel_methods = [_]Message{
     .{ .name = "set_min_size", .signature = "ii", .types = null },
     .{ .name = "set_maximized", .signature = "", .types = null },
     .{ .name = "unset_maximized", .signature = "", .types = null },
-    .{ .name = "set_fullscreen", .signature = "o", .types = null },
+    .{ .name = "set_fullscreen", .signature = "?o", .types = null },
     .{ .name = "unset_fullscreen", .signature = "", .types = null },
     .{ .name = "set_minimized", .signature = "", .types = null },
 };
@@ -407,8 +407,8 @@ pub const decoration_manager_interface: Interface = .{
 // rect, so the app rasterizes sharp at any fractional density.
 pub const viewport_methods = [_]Message{
     .{ .name = "destroy", .signature = "", .types = null },
-    .{ .name = "set_source", .signature = "fffff", .types = null },
-    .{ .name = "set_destination", .signature = "iiii", .types = null },
+    .{ .name = "set_source", .signature = "ffff", .types = null },
+    .{ .name = "set_destination", .signature = "ii", .types = null },
 };
 pub const viewport_interface: Interface = .{
     .name = "wp_viewport",
@@ -421,7 +421,7 @@ pub const viewport_interface: Interface = .{
 
 pub const viewporter_methods = [_]Message{
     .{ .name = "destroy", .signature = "", .types = null },
-    .{ .name = "get_viewporter", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&viewport_interface), null } },
+    .{ .name = "get_viewport", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&viewport_interface), null } },
 };
 pub const viewporter_interface: Interface = .{
     .name = "wp_viewporter",
