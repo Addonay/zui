@@ -120,6 +120,43 @@ const fkey_names = [_][]const u8{
     "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24",
 };
 
+/// Lines scrolled by one wheel notch, as in gpui_linux.
+pub const SCROLL_LINES: f32 = 3.0;
+
+/// Milliseconds between frames for a display mode. Interlaced modes refresh twice as often
+/// and double-scanned ones half as often, as SDL3 accounts for. Unknown modes get 60 Hz.
+pub const default_frame_interval_ms: i64 = 16;
+pub const mode_interlace: u64 = 0x10;
+pub const mode_double_scan: u64 = 0x20;
+
+pub fn frame_interval_ms(dot_clock: u64, h_total: u32, v_total: u32, flags: u64) i64 {
+    if (dot_clock == 0 or h_total == 0 or v_total == 0) return default_frame_interval_ms;
+    var lines: u64 = v_total;
+    if (flags & mode_double_scan != 0) lines *= 2;
+    var clock = dot_clock;
+    if (flags & mode_interlace != 0) clock *= 2;
+    const denominator = @as(u64, h_total) * lines;
+    // Rounded down, so the timer never holds a frame past the display's next refresh.
+    const interval: i64 = @intCast(@divFloor(denominator * 1000, clock));
+    return std.math.clamp(interval, 1, 100);
+}
+
+test "frame intervals from display modes" {
+    // 1920x1080 at 60 Hz, 144 Hz.
+    try std.testing.expectEqual(@as(i64, 16), frame_interval_ms(148_500_000, 2200, 1125, 0));
+    try std.testing.expectEqual(@as(i64, 6), frame_interval_ms(356_000_000, 2200, 1125, 0));
+    // Interlaced 1080i at 30 full frames still scans 60 fields a second.
+    try std.testing.expectEqual(@as(i64, 16), frame_interval_ms(74_250_000, 2200, 1125, mode_interlace));
+    // Double scan draws every line twice, so 30 frames a second.
+    try std.testing.expectEqual(@as(i64, 33), frame_interval_ms(74_250_000, 1100, 1125, mode_double_scan));
+    // Virtual displays often report nothing useful.
+    try std.testing.expectEqual(default_frame_interval_ms, frame_interval_ms(0, 2200, 1125, 0));
+    try std.testing.expectEqual(default_frame_interval_ms, frame_interval_ms(148_500_000, 0, 1125, 0));
+    // Absurd values stay in a sane range.
+    try std.testing.expectEqual(@as(i64, 100), frame_interval_ms(1, 1000, 1000, 0));
+    try std.testing.expectEqual(@as(i64, 1), frame_interval_ms(std.math.maxInt(u32), 1, 1, 0));
+}
+
 /// The character a dead key stands for while it waits for the next key, as in GPUI.
 pub fn dead_key_text(keysym: u32) ?[]const u8 {
     return switch (keysym) {

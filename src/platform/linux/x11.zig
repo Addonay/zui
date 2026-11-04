@@ -15,6 +15,8 @@ const cpu = @import("../../renderer/cpu.zig");
 const window_renderer = @import("../../renderer/window_renderer.zig");
 const xkb = @import("xkb.zig");
 const xim_preedit = @import("xim_preedit.zig");
+const x11_scroll = @import("x11_scroll.zig");
+const xdnd = @import("xdnd.zig");
 
 extern "c" fn setlocale(category: c_int, locale: ?[*:0]const u8) ?[*:0]const u8;
 const LC_CTYPE: c_int = 0;
@@ -35,10 +37,9 @@ const Cursor = proto.Cursor;
 const XEvent = proto.XEvent;
 
 const clear_color: color.Hsla = color.to_hsla(color.rgb(0x0e0e13));
-const frame_interval_ms: i64 = 16;
 const im_retry_interval_ms: i64 = 1000;
 const im_retry_count: u32 = 60;
-const window_event_mask: c_long = proto.ExposureMask | proto.KeyPressMask | proto.KeyReleaseMask | proto.ButtonPressMask | proto.ButtonReleaseMask | proto.PointerMotionMask | proto.StructureNotifyMask | proto.FocusChangeMask | proto.EnterWindowMask | proto.LeaveWindowMask;
+const window_event_mask: c_long = proto.ExposureMask | proto.KeyPressMask | proto.KeyReleaseMask | proto.ButtonPressMask | proto.ButtonReleaseMask | proto.PointerMotionMask | proto.StructureNotifyMask | proto.FocusChangeMask | proto.EnterWindowMask | proto.LeaveWindowMask | proto.VisibilityChangeMask;
 
 /// Atoms interned once per connection.
 const Atoms = struct {
@@ -58,7 +59,42 @@ const Atoms = struct {
     net_wm_state_fullscreen: Atom = 0,
     net_wm_moveresize: Atom = 0,
     paste: Atom = 0,
+    net_wm_sync_request: Atom = 0,
+    net_wm_sync_request_counter: Atom = 0,
+    xdnd_aware: Atom = 0,
+    xdnd_enter: Atom = 0,
+    xdnd_position: Atom = 0,
+    xdnd_status: Atom = 0,
+    xdnd_leave: Atom = 0,
+    xdnd_drop: Atom = 0,
+    xdnd_finished: Atom = 0,
+    xdnd_selection: Atom = 0,
+    xdnd_type_list: Atom = 0,
+    xdnd_action_copy: Atom = 0,
+    xdnd_data: Atom = 0,
+    text_uri_list: Atom = 0,
 };
+
+/// XDND protocol version we speak.
+const xdnd_version: c_long = 5;
+
+/// One file drag in progress over a window of ours.
+const DragSession = struct {
+    source: XWindow = 0,
+    window: ?*X11Window = null,
+    /// Empty when the source offers nothing we understand: the drag is then refused.
+    has_uri_list: bool = false,
+    requested: bool = false,
+    /// `paths` holds the files and the window has been told about them.
+    entered: bool = false,
+    position: PxPoint = .{ .x = 0, .y = 0 },
+    /// The drop arrived before the data did, so it finishes when the data lands.
+    drop_pending: bool = false,
+    paths: []const []const u8 = &.{},
+};
+
+/// A monitor's rectangle and how often it refreshes.
+const CrtcRate = struct { x: c_int, y: c_int, w: c_int, h: c_int, interval_ms: i64 };
 
 /// Latched Xlib error handler: a failed request is logged and dropped rather
 /// than exiting the process (Xlib's default would kill every window).
@@ -77,6 +113,18 @@ pub const X11Connection = struct {
     gpu_context: ?*window_renderer.GpuContext = null,
     gpu_probed: bool = false,
     compose: ?xkb.Compose = null,
+    xi_lib: ?dl.Library = null,
+    xi_api: ?proto.XiApi = null,
+    xi_opcode: c_int = 0,
+    scroll_devices: x11_scroll.ScrollDevices = .{},
+    xrandr_lib: ?dl.Library = null,
+    xrandr_api: ?proto.XrandrApi = null,
+    xrandr_event_base: c_int = 0,
+    crtc_rates: [16]CrtcRate = undefined,
+    crtc_count: usize = 0,
+    xext_lib: ?dl.Library = null,
+    xsync_api: ?proto.XsyncApi = null,
+    drag: DragSession = .{},
     /// Null without an input method. Set from XMODIFIERS; see `open_im`.
     xim_api: ?proto.XimApi = null,
     im: ?*proto.XIM = null,
@@ -146,6 +194,20 @@ pub const X11Connection = struct {
             .net_wm_state_maximized_horz = api.XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", 0),
             .net_wm_state_fullscreen = api.XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", 0),
             .net_wm_moveresize = api.XInternAtom(dpy, "_NET_WM_MOVERESIZE", 0),
+            .net_wm_sync_request = api.XInternAtom(dpy, "_NET_WM_SYNC_REQUEST", 0),
+            .net_wm_sync_request_counter = api.XInternAtom(dpy, "_NET_WM_SYNC_REQUEST_COUNTER", 0),
+            .xdnd_aware = api.XInternAtom(dpy, "XdndAware", 0),
+            .xdnd_enter = api.XInternAtom(dpy, "XdndEnter", 0),
+            .xdnd_position = api.XInternAtom(dpy, "XdndPosition", 0),
+            .xdnd_status = api.XInternAtom(dpy, "XdndStatus", 0),
+            .xdnd_leave = api.XInternAtom(dpy, "XdndLeave", 0),
+            .xdnd_drop = api.XInternAtom(dpy, "XdndDrop", 0),
+            .xdnd_finished = api.XInternAtom(dpy, "XdndFinished", 0),
+            .xdnd_selection = api.XInternAtom(dpy, "XdndSelection", 0),
+            .xdnd_type_list = api.XInternAtom(dpy, "XdndTypeList", 0),
+            .xdnd_action_copy = api.XInternAtom(dpy, "XdndActionCopy", 0),
+            .xdnd_data = api.XInternAtom(dpy, "ZUI_XDND_DATA", 0),
+            .text_uri_list = api.XInternAtom(dpy, "text/uri-list", 0),
             .paste = api.XInternAtom(dpy, "ZUI_PASTE", 0),
         };
         const self = allocator.create(X11Connection) catch {
@@ -166,6 +228,9 @@ pub const X11Connection = struct {
         };
         self.compose = xkb.Compose.init();
         self.init_input_method();
+        self.init_xinput();
+        self.init_xrandr();
+        self.init_xsync();
         return self;
     }
 
@@ -220,8 +285,8 @@ pub const X11Connection = struct {
     pub fn frame_timeout(self: *const X11Connection, now: i64) ?i32 {
         var best: ?i32 = null;
         for (self.windows.items) |w| {
-            if (!w.frame_wanted or w.closed) continue;
-            const due: i32 = @intCast(@max(0, w.last_frame_ms + frame_interval_ms - now));
+            if (!w.frame_wanted or w.closed or !w.visible) continue;
+            const due: i32 = @intCast(@max(0, w.last_frame_ms + w.frame_interval_ms - now));
             best = if (best) |b| @min(b, due) else due;
         }
         // Wake up for reconnect attempts too, or an idle window would never make them.
@@ -238,10 +303,15 @@ pub const X11Connection = struct {
         var i: usize = 0;
         while (i < self.windows.items.len) : (i += 1) {
             const w = self.windows.items[i];
-            if (w.frame_wanted and !w.closed and now - w.last_frame_ms >= frame_interval_ms) {
+            if (w.frame_wanted and !w.closed and w.visible and now - w.last_frame_ms >= w.frame_interval_ms) {
                 w.frame_wanted = false;
                 w.last_frame_ms = now;
                 w.base.emit_request_frame(.{});
+                // Whether or not the app had anything to draw, the frame for this size is done.
+                w.acknowledge_sync();
+            } else if (!w.visible and !w.closed) {
+                // A window nobody can see must not make the window manager wait for it.
+                w.acknowledge_sync();
             }
         }
         self.flush();
@@ -283,6 +353,7 @@ pub const X11Connection = struct {
         for (self.windows.items) |w| w.free();
         self.windows.deinit(self.allocator);
         self.close_input_method();
+        self.reset_drag();
         if (self.gpu_context) |ctx| ctx.destroy();
         for (self.cursors) |c| {
             if (c != 0) _ = self.api.XFreeCursor(self.display, c);
@@ -293,6 +364,10 @@ pub const X11Connection = struct {
         if (self.compose) |*c| c.deinit();
         _ = self.api.XDestroyWindow(self.display, self.helper);
         _ = self.api.XCloseDisplay(self.display);
+        // Only now: these libraries register close hooks with Xlib, which XCloseDisplay calls.
+        if (self.xi_lib) |*l| l.close();
+        if (self.xrandr_lib) |*l| l.close();
+        if (self.xext_lib) |*l| l.close();
         self.lib.close();
         self.allocator.destroy(self);
     }
@@ -324,10 +399,23 @@ pub const X11Connection = struct {
         const title: [*:0]const u8 = @ptrCast(&title_buf);
         _ = a.XStoreName(self.display, x, title);
         _ = a.XChangeProperty(self.display, x, self.atoms.net_wm_name, self.atoms.utf8_string, 8, 0, title, @intCast(tn));
-        var protocols = [2]Atom{ self.atoms.wm_delete_window, self.atoms.net_wm_ping };
-        _ = a.XSetWMProtocols(self.display, x, &protocols, 2);
+        // Every window takes file drags. Whether an element wants them is decided later.
+        var dnd_version: c_ulong = @intCast(xdnd_version);
+        _ = a.XChangeProperty(self.display, x, self.atoms.xdnd_aware, proto.XA_ATOM, 32, 0, @ptrCast(&dnd_version), 1);
+        var protocols = [3]Atom{ self.atoms.wm_delete_window, self.atoms.net_wm_ping, self.atoms.net_wm_sync_request };
+        var protocol_count: c_int = 2;
+        if (self.xsync_api) |sync| {
+            w.sync_counter = sync.XSyncCreateCounter(self.display, .{ .hi = 0, .lo = 0 });
+            if (w.sync_counter != 0) {
+                var counter: c_ulong = w.sync_counter;
+                _ = a.XChangeProperty(self.display, x, self.atoms.net_wm_sync_request_counter, proto.XA_CARDINAL, 32, 0, @ptrCast(&counter), 1);
+                protocol_count = 3;
+            }
+        }
+        _ = a.XSetWMProtocols(self.display, x, &protocols, protocol_count);
         if (options.titlebar == null) self.set_decorations(x, false);
         _ = a.XSelectInput(self.display, x, window_event_mask);
+        self.select_xinput(x);
         if (options.show) _ = a.XMapWindow(self.display, x);
         w.frame_wanted = true;
         if (!self.gpu_probed) {
@@ -415,8 +503,21 @@ pub const X11Connection = struct {
                 self.selection_lost(ev.xselectionclear.selection);
                 return;
             },
-            proto.SelectionNotify => return,
+            proto.SelectionNotify => {
+                if (ev.xselection.selection == self.atoms.xdnd_selection) self.on_drag_data(ev.xselection);
+                return;
+            },
+            proto.GenericEvent => return self.on_generic_event(&ev),
             else => {},
+        }
+        if (self.xrandr_api) |x| {
+            const kind = ev.type - self.xrandr_event_base;
+            if (kind == proto.RRScreenChangeNotify or kind == proto.RRNotify) {
+                _ = x.XRRUpdateConfiguration(&ev);
+                self.refresh_crtcs();
+                for (self.windows.items) |win| win.update_frame_interval();
+                return;
+            }
         }
         const native: XWindow = switch (ev.type) {
             proto.ConfigureNotify => ev.xconfigure.window,
@@ -430,8 +531,18 @@ pub const X11Connection = struct {
             },
             proto.ClientMessage => {
                 const client = ev.xclient;
+                if (self.on_drag_message(w, client)) return;
                 if (client.message_type != self.atoms.wm_protocols) return;
                 const kind: Atom = @intCast(client.data.l[0]);
+                if (kind == self.atoms.net_wm_sync_request) {
+                    w.pending_sync = .{
+                        .lo = @truncate(@as(c_ulong, @bitCast(client.data.l[2]))),
+                        .hi = @truncate(client.data.l[3]),
+                    };
+                    // The configure may not change the size, and the counter must still move.
+                    w.frame_wanted = true;
+                    return;
+                }
                 if (kind == self.atoms.net_wm_ping) {
                     var reply = client;
                     reply.window = self.root;
@@ -446,7 +557,17 @@ pub const X11Connection = struct {
             proto.ConfigureNotify => {
                 const cfg = ev.xconfigure;
                 w.on_configure(@intCast(@max(0, cfg.width)), @intCast(@max(0, cfg.height)));
+                w.update_frame_interval();
             },
+            proto.VisibilityNotify => {
+                w.visible = ev.xvisibility.state != proto.VisibilityFullyObscured;
+                if (w.visible) w.frame_wanted = true;
+            },
+            proto.MapNotify => {
+                w.visible = true;
+                w.frame_wanted = true;
+            },
+            proto.UnmapNotify => w.visible = false,
             proto.Expose => {
                 if (ev.xexpose.count == 0) w.frame_wanted = true;
             },
@@ -513,16 +634,16 @@ pub const X11Connection = struct {
         if (b.button >= 4 and b.button <= 7) {
             if (!pressed) return;
             const dx: f32 = switch (b.button) {
-                6 => -1,
-                7 => 1,
+                6 => input.SCROLL_LINES,
+                7 => -input.SCROLL_LINES,
                 else => 0,
             };
             const dy: f32 = switch (b.button) {
-                4 => 1,
-                5 => -1,
+                4 => input.SCROLL_LINES,
+                5 => -input.SCROLL_LINES,
                 else => 0,
             };
-            _ = w.base.emit_input(.{ .scroll_wheel = .{ .position = pos, .delta = .{ .lines = .{ .x = dx, .y = dy } }, .modifiers = mods } });
+            self.emit_scroll(w, pos, .{ .x = dx, .y = dy }, mods);
             return;
         }
         const button = input.x11_button(b.button) orelse return;
@@ -593,6 +714,364 @@ pub const X11Connection = struct {
         const key_name = name orelse return;
         w.emit_key(key_name, text, pressed, held);
         if (replaces_preedit) self.compose.?.finish_composed(&w.base);
+    }
+
+    // -- XInput2 -------------------------------------------------------------
+
+    /// Asks for XInput2 pointer events, which carry smooth scrolling and fractional
+    /// positions. Without libXi or XI 2.1 the core events keep working as they are.
+    fn init_xinput(self: *X11Connection) void {
+        var lib = dl.Library.open(&.{ "libXi.so.6", "libXi.so" }) orelse return;
+        const x = proto.XiApi.load(lib) orelse {
+            lib.close();
+            return;
+        };
+        var event_base: c_int = 0;
+        var error_base: c_int = 0;
+        var major: c_int = 2;
+        var minor: c_int = 1;
+        if (self.api.XQueryExtension(self.display, "XInputExtension", &self.xi_opcode, &event_base, &error_base) == 0 or
+            x.XIQueryVersion(self.display, &major, &minor) != 0 or major < 2 or (major == 2 and minor < 1))
+        {
+            lib.close();
+            return;
+        }
+        self.xi_lib = lib;
+        self.xi_api = x;
+        var hierarchy_bits: [2]u8 = @splat(0);
+        set_mask_bit(&hierarchy_bits, proto.XI_HierarchyChanged);
+        var mask: proto.XIEventMask = .{ .deviceid = proto.XIAllDevices, .mask_len = hierarchy_bits.len, .mask = &hierarchy_bits };
+        _ = x.XISelectEvents(self.display, self.root, @ptrCast(&mask), 1);
+        self.query_scroll_devices();
+    }
+
+    fn select_xinput(self: *X11Connection, window: XWindow) void {
+        const x = self.xi_api orelse return;
+        var bits: [2]u8 = @splat(0);
+        for ([_]c_int{ proto.XI_Motion, proto.XI_ButtonPress, proto.XI_ButtonRelease, proto.XI_Enter, proto.XI_Leave, proto.XI_DeviceChanged }) |event| {
+            set_mask_bit(&bits, event);
+        }
+        var mask: proto.XIEventMask = .{ .deviceid = proto.XIAllMasterDevices, .mask_len = bits.len, .mask = &bits };
+        _ = x.XISelectEvents(self.display, window, @ptrCast(&mask), 1);
+    }
+
+    fn set_mask_bit(bits: []u8, event: c_int) void {
+        const e: usize = @intCast(event);
+        bits[e / 8] |= @as(u8, 1) << @intCast(e % 8);
+    }
+
+    fn query_scroll_devices(self: *X11Connection) void {
+        const x = self.xi_api orelse return;
+        var count: c_int = 0;
+        const infos = x.XIQueryDevice(self.display, proto.XIAllDevices, &count) orelse return;
+        defer x.XIFreeDeviceInfo(infos);
+        var devices: [x11_scroll.ScrollDevices.max_devices]x11_scroll.Device = undefined;
+        var n: usize = 0;
+        for (infos[0..@intCast(@max(count, 0))]) |info| {
+            if (info.use != proto.XISlavePointer or n == devices.len) continue;
+            var device: x11_scroll.Device = .{ .id = info.deviceid };
+            const classes = info.classes orelse continue;
+            for (classes[0..@intCast(@max(info.num_classes, 0))]) |class| {
+                if (class.type != proto.XIScrollClass) continue;
+                const scroll: *const proto.XIScrollClassInfo = @ptrCast(@alignCast(class));
+                const axis = x11_scroll.make_axis(scroll.number, scroll.increment);
+                if (scroll.scroll_type == proto.XIScrollTypeVertical) device.vertical = axis;
+                if (scroll.scroll_type == proto.XIScrollTypeHorizontal) device.horizontal = axis;
+            }
+            if (device.vertical.valuator == null and device.horizontal.valuator == null) continue;
+            devices[n] = device;
+            n += 1;
+        }
+        self.scroll_devices.replace(devices[0..n]);
+    }
+
+    fn on_generic_event(self: *X11Connection, ev: *XEvent) void {
+        if (self.xi_api == null or ev.xcookie.extension != self.xi_opcode) return;
+        // A cookie's data is only available for the most recent event, so an event held
+        // back during a clipboard wait comes up empty. It is dropped, which at worst loses
+        // a motion: buttons there are rare, as the wait only lasts during a paste.
+        if (self.api.XGetEventData(self.display, &ev.xcookie) == 0) return;
+        defer self.api.XFreeEventData(self.display, &ev.xcookie);
+        const data = ev.xcookie.data orelse return;
+        switch (ev.xcookie.evtype) {
+            proto.XI_Motion, proto.XI_ButtonPress, proto.XI_ButtonRelease => {
+                const e: *const proto.XIDeviceEvent = @ptrCast(@alignCast(data));
+                const w = self.find_window(e.event) orelse return;
+                self.on_xi_device_event(w, e);
+            },
+            proto.XI_Enter, proto.XI_Leave => {
+                const e: *const proto.XIEnterEvent = @ptrCast(@alignCast(data));
+                // A position taken before leaving would turn into one huge scroll on return.
+                self.scroll_devices.reset_all();
+                // Grabs produce crossings too; the pointer did not really go anywhere.
+                if (e.mode != proto.NotifyNormal) return;
+                const w = self.find_window(e.event) orelse return;
+                if (ev.xcookie.evtype == proto.XI_Enter) {
+                    w.base.emit_hover(true);
+                } else {
+                    _ = w.base.emit_input(.{ .mouse_exited = .{
+                        .position = w.logical_f(e.event_x, e.event_y),
+                        .pressed_button = self.pressed,
+                        .modifiers = input.modifiers(@bitCast(e.mods.effective)),
+                    } });
+                    w.base.emit_hover(false);
+                }
+            },
+            // The physical device behind the pointer changed, and its axes with it.
+            proto.XI_DeviceChanged => {
+                self.query_scroll_devices();
+                self.scroll_devices.reset_all();
+            },
+            proto.XI_HierarchyChanged => self.query_scroll_devices(),
+            else => {},
+        }
+    }
+
+    fn on_xi_device_event(self: *X11Connection, w: *X11Window, e: *const proto.XIDeviceEvent) void {
+        const state: c_uint = @bitCast(e.mods.effective);
+        self.note_mods(state);
+        const pos = w.logical_f(e.event_x, e.event_y);
+        const mods = input.modifiers(state);
+        switch (e.evtype) {
+            proto.XI_Motion => {
+                const mask = if (e.valuators.mask) |m| m[0..@intCast(@max(e.valuators.mask_len, 0))] else &[_]u8{};
+                // Scrolling also arrives as motion: the pointer only moved if axis 0 or 1 did.
+                if (mask.len > 0 and mask[0] & 3 != 0) {
+                    _ = w.base.emit_input(.{ .mouse_move = .{ .position = pos, .pressed_button = self.pressed, .modifiers = mods } });
+                }
+                if (e.valuators.values) |values| {
+                    const value_count = count_bits(mask);
+                    if (self.scroll_devices.on_motion(e.sourceid, mask, values[0..value_count])) |delta| {
+                        self.emit_scroll(w, pos, .{ .x = delta.x, .y = delta.y }, mods);
+                    }
+                }
+            },
+            proto.XI_ButtonPress, proto.XI_ButtonRelease => {
+                // Wheels report through valuators and also as emulated buttons 4 to 7, for
+                // old clients. Using both would scroll twice. Other emulated buttons come
+                // from touch screens and are the only report of those presses.
+                if (e.detail >= 4 and e.detail <= 7 and e.flags & proto.XIPointerEmulated != 0) return;
+                var b = std.mem.zeroes(proto.XButtonEvent);
+                b.x = @intFromFloat(std.math.clamp(@round(e.event_x), -1e9, 1e9));
+                b.y = @intFromFloat(std.math.clamp(@round(e.event_y), -1e9, 1e9));
+                b.x_root = @intFromFloat(std.math.clamp(@round(e.root_x), -1e9, 1e9));
+                b.y_root = @intFromFloat(std.math.clamp(@round(e.root_y), -1e9, 1e9));
+                b.state = state;
+                b.button = @intCast(@max(e.detail, 0));
+                self.on_button(w, b, e.evtype == proto.XI_ButtonPress);
+            },
+            else => {},
+        }
+    }
+
+    fn count_bits(mask: []const u8) usize {
+        var n: usize = 0;
+        for (mask) |b| n += @popCount(b);
+        return n;
+    }
+
+    /// Shift turns vertical scrolling horizontal, as in GPUI.
+    fn emit_scroll(_: *X11Connection, w: *X11Window, pos: PxPoint, delta: x11_scroll.Delta, mods: input.Modifiers) void {
+        const lines: x11_scroll.Delta = if (mods.shift) .{ .x = delta.y, .y = 0 } else delta;
+        _ = w.base.emit_input(.{ .scroll_wheel = .{ .position = pos, .delta = .{ .lines = .{ .x = lines.x, .y = lines.y } }, .modifiers = mods } });
+    }
+
+    // -- RandR ----------------------------------------------------------------
+
+    /// Learns each monitor's refresh rate, so animation runs at the display's real rate.
+    fn init_xrandr(self: *X11Connection) void {
+        var lib = dl.Library.open(&.{ "libXrandr.so.2", "libXrandr.so" }) orelse return;
+        const x = proto.XrandrApi.load(lib) orelse {
+            lib.close();
+            return;
+        };
+        var error_base: c_int = 0;
+        if (x.XRRQueryExtension(self.display, &self.xrandr_event_base, &error_base) == 0) {
+            lib.close();
+            return;
+        }
+        self.xrandr_lib = lib;
+        self.xrandr_api = x;
+        x.XRRSelectInput(self.display, self.root, proto.RRScreenChangeNotifyMask | proto.RRCrtcChangeNotifyMask);
+        self.refresh_crtcs();
+    }
+
+    fn refresh_crtcs(self: *X11Connection) void {
+        const x = self.xrandr_api orelse return;
+        self.crtc_count = 0;
+        const res = x.XRRGetScreenResourcesCurrent(self.display, self.root) orelse return;
+        defer x.XRRFreeScreenResources(res);
+        const crtcs = res.crtcs orelse return;
+        const modes = res.modes orelse return;
+        for (crtcs[0..@intCast(@max(res.ncrtc, 0))]) |crtc| {
+            if (self.crtc_count == self.crtc_rates.len) break;
+            const info = x.XRRGetCrtcInfo(self.display, res, crtc) orelse continue;
+            defer x.XRRFreeCrtcInfo(info);
+            if (info.mode == 0) continue; // Off.
+            var interval = input.default_frame_interval_ms;
+            for (modes[0..@intCast(@max(res.nmode, 0))]) |mode| {
+                if (mode.id != info.mode) continue;
+                interval = input.frame_interval_ms(mode.dotClock, mode.hTotal, mode.vTotal, mode.modeFlags);
+                break;
+            }
+            self.crtc_rates[self.crtc_count] = .{ .x = info.x, .y = info.y, .w = @intCast(info.width), .h = @intCast(info.height), .interval_ms = interval };
+            self.crtc_count += 1;
+        }
+    }
+
+    /// The refresh interval of the monitor holding a root-relative point. Off every monitor,
+    /// the fastest one wins, so nothing ends up slower than it needs to be.
+    fn interval_at(self: *const X11Connection, x: c_int, y: c_int) i64 {
+        var fastest: ?i64 = null;
+        for (self.crtc_rates[0..self.crtc_count]) |c| {
+            if (x >= c.x and y >= c.y and x < c.x + c.w and y < c.y + c.h) return c.interval_ms;
+            fastest = if (fastest) |f| @min(f, c.interval_ms) else c.interval_ms;
+        }
+        return fastest orelse input.default_frame_interval_ms;
+    }
+
+    // -- XSync ----------------------------------------------------------------
+
+    fn init_xsync(self: *X11Connection) void {
+        var lib = dl.Library.open(&.{ "libXext.so.6", "libXext.so" }) orelse return;
+        const x = proto.XsyncApi.load(lib) orelse {
+            lib.close();
+            return;
+        };
+        var event_base: c_int = 0;
+        var error_base: c_int = 0;
+        var major: c_int = 0;
+        var minor: c_int = 0;
+        if (x.XSyncQueryExtension(self.display, &event_base, &error_base) == 0 or x.XSyncInitialize(self.display, &major, &minor) == 0) {
+            lib.close();
+            return;
+        }
+        self.xext_lib = lib;
+        self.xsync_api = x;
+    }
+
+    // -- file drags (XDND) ----------------------------------------------------
+
+    /// Handles an Xdnd client message. False means it was something else.
+    fn on_drag_message(self: *X11Connection, w: *X11Window, client: proto.XClientMessageEvent) bool {
+        const kind = client.message_type;
+        const l = client.data.l;
+        if (kind == self.atoms.xdnd_enter) {
+            self.reset_drag();
+            self.drag.source = @bitCast(l[0]);
+            self.drag.window = w;
+            self.drag.has_uri_list = self.source_offers_uri_list(l);
+        } else if (kind == self.atoms.xdnd_position) {
+            if (!self.is_drag_source(l[0]) or self.drag.window != w) return true;
+            const root_pos: c_ulong = @bitCast(l[2]);
+            var wx: c_int = 0;
+            var wy: c_int = 0;
+            var child: XWindow = 0;
+            _ = self.api.XTranslateCoordinates(self.display, self.root, w.x_window, @intCast((root_pos >> 16) & 0xffff), @intCast(root_pos & 0xffff), &wx, &wy, &child);
+            self.drag.position = w.logical(wx, wy);
+            if (self.drag.has_uri_list and !self.drag.requested) {
+                self.drag.requested = true;
+                _ = self.api.XConvertSelection(self.display, self.atoms.xdnd_selection, self.atoms.text_uri_list, self.atoms.xdnd_data, w.x_window, @bitCast(l[3]));
+            }
+            if (self.drag.entered) {
+                _ = w.base.emit_input(.{ .file_drop = .{ .pending = .{ .position = self.drag.position } } });
+            }
+            self.send_drag_message(self.atoms.xdnd_status, w.x_window, .{ @bitCast(w.x_window), if (self.drag.has_uri_list) 1 else 0, 0, 0, @bitCast(self.atoms.xdnd_action_copy) });
+        } else if (kind == self.atoms.xdnd_leave) {
+            if (!self.is_drag_source(l[0])) return true;
+            if (self.drag.entered) _ = w.base.emit_input(.{ .file_drop = .exited });
+            self.reset_drag();
+        } else if (kind == self.atoms.xdnd_drop) {
+            if (!self.is_drag_source(l[0])) return true;
+            if (self.drag.entered) {
+                self.finish_drag(w, true);
+            } else if (self.drag.requested) {
+                self.drag.drop_pending = true;
+            } else {
+                self.finish_drag(w, false);
+            }
+        } else {
+            return false;
+        }
+        self.flush();
+        return true;
+    }
+
+    fn is_drag_source(self: *const X11Connection, value: c_long) bool {
+        return self.drag.source != 0 and self.drag.source == @as(XWindow, @bitCast(value));
+    }
+
+    /// Up to three types fit in the message; more are in a property on the source.
+    fn source_offers_uri_list(self: *X11Connection, l: [5]c_long) bool {
+        for (l[2..5]) |t| {
+            if (@as(Atom, @bitCast(t)) == self.atoms.text_uri_list) return true;
+        }
+        if (@as(c_ulong, @bitCast(l[1])) & 1 == 0) return false;
+        var actual_type: Atom = 0;
+        var actual_format: c_int = 0;
+        var nitems: c_ulong = 0;
+        var after: c_ulong = 0;
+        var prop: [*]u8 = undefined;
+        const rc = self.api.XGetWindowProperty(self.display, @bitCast(l[0]), self.atoms.xdnd_type_list, 0, 1024, 0, proto.XA_ATOM, &actual_type, &actual_format, &nitems, &after, &prop);
+        if (rc != 0 or actual_type != proto.XA_ATOM or actual_format != 32) return false;
+        defer _ = self.api.XFree(prop);
+        const atoms: [*]const c_ulong = @ptrCast(@alignCast(prop));
+        for (atoms[0..@intCast(nitems)]) |t| {
+            if (t == self.atoms.text_uri_list) return true;
+        }
+        return false;
+    }
+
+    /// The file list arrived. GPUI reads the first 4 KB of it, which truncates long
+    /// selections, so this takes it all, up to 16 MB.
+    fn on_drag_data(self: *X11Connection, note: proto.XSelectionEvent) void {
+        const w = self.drag.window orelse return;
+        if (note.requestor != w.x_window or self.drag.entered) return;
+        if (note.property != 0) self.read_drag_paths(w);
+        if (self.drag.paths.len > 0) {
+            self.drag.entered = true;
+            _ = w.base.emit_input(.{ .file_drop = .{ .entered = .{ .position = self.drag.position, .paths = .{ .items = self.drag.paths } } } });
+        } else {
+            self.drag.has_uri_list = false;
+        }
+        if (self.drag.drop_pending) self.finish_drag(w, self.drag.entered);
+        self.flush();
+    }
+
+    fn read_drag_paths(self: *X11Connection, w: *X11Window) void {
+        var actual_type: Atom = 0;
+        var actual_format: c_int = 0;
+        var nitems: c_ulong = 0;
+        var after: c_ulong = 0;
+        var prop: [*]u8 = undefined;
+        const rc = self.api.XGetWindowProperty(self.display, w.x_window, self.atoms.xdnd_data, 0, 4 * 1024 * 1024, 1, 0, &actual_type, &actual_format, &nitems, &after, &prop);
+        if (rc != 0 or actual_type == 0) return;
+        defer _ = self.api.XFree(prop);
+        // INCR means a list over the server's request limit, and is not worth supporting.
+        if (actual_format != 8 or actual_type == self.atoms.incr) return;
+        self.drag.paths = xdnd.parse_uri_list(self.allocator, prop[0..@intCast(nitems)]) catch &.{};
+    }
+
+    fn finish_drag(self: *X11Connection, w: *X11Window, accepted: bool) void {
+        if (accepted) _ = w.base.emit_input(.{ .file_drop = .{ .submit = .{ .position = self.drag.position } } });
+        self.send_drag_message(self.atoms.xdnd_finished, w.x_window, .{ @bitCast(w.x_window), if (accepted) 1 else 0, if (accepted) @bitCast(self.atoms.xdnd_action_copy) else 0, 0, 0 });
+        self.reset_drag();
+    }
+
+    fn send_drag_message(self: *X11Connection, kind: Atom, _: XWindow, data: [5]c_long) void {
+        var ev = std.mem.zeroes(XEvent);
+        ev.xclient = std.mem.zeroes(proto.XClientMessageEvent);
+        ev.xclient.type = proto.ClientMessage;
+        ev.xclient.window = self.drag.source;
+        ev.xclient.message_type = kind;
+        ev.xclient.format = 32;
+        ev.xclient.data.l = data;
+        _ = self.api.XSendEvent(self.display, self.drag.source, 0, 0, &ev);
+    }
+
+    fn reset_drag(self: *X11Connection) void {
+        if (self.drag.paths.len > 0) xdnd.free_paths(self.allocator, self.drag.paths);
+        self.drag = .{};
     }
 
     // -- input method -------------------------------------------------------
@@ -813,6 +1292,11 @@ pub const X11Connection = struct {
                 switch (ev.type) {
                     proto.SelectionNotify => {
                         const note = ev.xselection;
+                        // A drag's data can land in the middle of a paste.
+                        if (note.selection == self.atoms.xdnd_selection) {
+                            self.on_drag_data(note);
+                            continue;
+                        }
                         if (note.selection != selection or note.property == 0) return null;
                         return self.read_paste_property();
                     },
@@ -861,6 +1345,12 @@ pub const X11Window = struct {
     image_h: u32 = 0,
     frame_wanted: bool = false,
     last_frame_ms: i64 = 0,
+    frame_interval_ms: i64 = input.default_frame_interval_ms,
+    /// False while unmapped or fully covered: no frames then, as in GPUI.
+    visible: bool = true,
+    /// _NET_WM_SYNC_REQUEST: the window manager waits for this counter during resizes.
+    sync_counter: c_ulong = 0,
+    pending_sync: ?proto.XSyncValue = null,
     focused: bool = false,
     destroyed_by_server: bool = false,
     closed: bool = false,
@@ -906,6 +1396,37 @@ pub const X11Window = struct {
     }
 
     /// Logical point from physical window coordinates.
+    fn logical_f(self: *const X11Window, x: f64, y: f64) PxPoint {
+        return .{ .x = @as(f32, @floatCast(x)) / self.scale, .y = @as(f32, @floatCast(y)) / self.scale };
+    }
+
+    /// Tells the window manager the frame for its last configure is finished. GPUI does
+    /// this when the configure arrives, which lets the frame tear; this waits for the draw.
+    fn acknowledge_sync(self: *X11Window) void {
+        const value = self.pending_sync orelse return;
+        self.pending_sync = null;
+        const sync = self.conn.xsync_api orelse return;
+        if (self.sync_counter == 0) return;
+        _ = sync.XSyncSetCounter(self.conn.display, self.sync_counter, value);
+        self.conn.flush();
+    }
+
+    /// Follows the monitor under the window's center. One monitor needs no round trip.
+    fn update_frame_interval(self: *X11Window) void {
+        const conn = self.conn;
+        if (conn.crtc_count == 0 or self.closed or self.destroyed_by_server) return;
+        if (conn.crtc_count == 1) {
+            self.frame_interval_ms = conn.crtc_rates[0].interval_ms;
+            return;
+        }
+        const dims = self.physical();
+        var rx: c_int = 0;
+        var ry: c_int = 0;
+        var child: XWindow = 0;
+        if (conn.api.XTranslateCoordinates(conn.display, self.x_window, conn.root, @intCast(dims.w / 2), @intCast(dims.h / 2), &rx, &ry, &child) == 0) return;
+        self.frame_interval_ms = conn.interval_at(rx, ry);
+    }
+
     fn logical(self: *const X11Window, x: c_int, y: c_int) PxPoint {
         return .{ .x = @as(f32, @floatFromInt(x)) / self.scale, .y = @as(f32, @floatFromInt(y)) / self.scale };
     }
@@ -1239,6 +1760,11 @@ pub const X11Window = struct {
         if (self.ic) |ic| {
             if (self.conn.xim_api) |x| x.XDestroyIC(ic);
             self.ic = null;
+        }
+        if (self.conn.drag.window == self) self.conn.reset_drag();
+        if (self.sync_counter != 0) {
+            if (self.conn.xsync_api) |sync| _ = sync.XSyncDestroyCounter(self.conn.display, self.sync_counter);
+            self.sync_counter = 0;
         }
         // The Vulkan surface must die before the X window it wraps.
         if (self.gpu_window) |*g| {
