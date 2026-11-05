@@ -42,6 +42,8 @@ const MouseDownEvent = interactive.MouseDownEvent;
 const MouseUpEvent = interactive.MouseUpEvent;
 const MouseMoveEvent = interactive.MouseMoveEvent;
 const ScrollWheelEvent = interactive.ScrollWheelEvent;
+const MouseExitEvent = interactive.MouseExitEvent;
+const FileDropEvent = interactive.FileDropEvent;
 const ClickEvent = interactive.ClickEvent;
 const PinchEvent = interactive.PinchEvent;
 const MousePressureEvent = interactive.MousePressureEvent;
@@ -3345,6 +3347,73 @@ const DragListener = struct {
     value: *anyopaque,
 };
 const DragOverStyle = struct { type_id: app_mod.TypeId, style: *StyleRefinement };
+
+/// GPUI `DragMoveEvent<T>`: a drag of `T` moved. `event` is the mouse move, `bounds` the element's.
+pub fn DragMoveEvent(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        event: MouseMoveEvent,
+        bounds: Bounds(Pixels),
+        item: *const T,
+
+        /// The value being dragged (GPUI `drag`).
+        pub fn drag(_: *const Self, cx: *const App) *const T {
+            return cx.active_drag.?.value.downcast(T).?;
+        }
+
+        /// The item about to be dropped (GPUI `dragged_item`).
+        pub fn dragged_item(self: *const Self) *const T {
+            return self.item;
+        }
+    };
+}
+
+const DragMoveL = struct {
+    type_id: app_mod.TypeId,
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, event: *const MouseMoveEvent, bounds: Bounds(Pixels), item: *anyopaque, window: *Window, cx: *App) void,
+};
+
+/// GPUI `HoverListenerMode`: whether `on_hover` honours the last input being the keyboard.
+pub const HoverListenerMode = enum {
+    input_modality_aware,
+    input_modality_independent,
+
+    pub fn is_hovered(self: HoverListenerMode, hitbox: *const Hitbox, window: *const Window) bool {
+        return switch (self) {
+            .input_modality_aware => hitbox.is_hovered(window),
+            .input_modality_independent => hitbox.is_hovered_ignoring_last_input(window),
+        };
+    }
+};
+
+/// What `on_children_prepainted` hears: the bounds of the children in child order (GPUI passes a
+/// `Vec<Bounds>`). Listeners take `*const PrepaintedChildren`, and `cx.listener` works with them.
+pub const PrepaintedChildren = struct {
+    bounds: []const Bounds(Pixels),
+};
+
+/// GPUI `ScrollAnchor`: scrolls an element that need not be a direct child of the scroll container.
+pub const ScrollAnchor = struct {
+    handle: ScrollHandle,
+    /// Where the element was last painted, relative to the scroll content.
+    last_origin: *Point(Pixels),
+
+    pub fn for_handle(handle: ScrollHandle) ScrollAnchor {
+        const allocator = handle.state.allocator orelse std.heap.page_allocator;
+        const origin = allocator.create(Point(Pixels)) catch oom();
+        origin.* = .{ .x = 0, .y = 0 };
+        return .{ .handle = handle, .last_origin = origin };
+    }
+
+    /// Asks the handle's container to scroll this element to the top of its viewport. The container
+    /// does it in its next prepaint (GPUI `scroll_to`, which runs on the next frame).
+    pub fn scroll_to(self: ScrollAnchor, window: *Window, cx: *App) void {
+        _ = cx;
+        self.handle.state.anchor_request = self;
+        window.refresh();
+    }
+};
 const GroupDragOverStyle = struct { type_id: app_mod.TypeId, group: []const u8, style: *StyleRefinement };
 
 /// Builds the view a tooltip shows. `ctx` may live in the frame arena: elements register
@@ -3400,8 +3469,31 @@ pub const ScrollHandle = struct {
     pub fn bounds(self: ScrollHandle) Bounds(Pixels) {
         return self.state.bounds;
     }
+    /// Scrolls to the bottom in the next prepaint, once the content size is known (GPUI).
     pub fn scroll_to_bottom(self: ScrollHandle) void {
-        self.state.offset.y = -self.state.max_offset.height;
+        self.state.scroll_to_bottom = true;
+    }
+    /// The child at the top of the viewport (GPUI `top_item`).
+    pub fn top_item(self: ScrollHandle) usize {
+        return child_index_at(self.state.child_bounds.items, self.state.bounds.top() - self.state.offset.y);
+    }
+    /// The child at the bottom of the viewport (GPUI `bottom_item`).
+    pub fn bottom_item(self: ScrollHandle) usize {
+        return child_index_at(self.state.child_bounds.items, self.state.bounds.bottom() - self.state.offset.y);
+    }
+    /// The top child, and how far its top is above the viewport's top (GPUI `logical_scroll_top`).
+    pub fn logical_scroll_top(self: ScrollHandle) struct { usize, Pixels } {
+        const ix = self.top_item();
+        const children = self.state.child_bounds.items;
+        if (ix >= children.len) return .{ ix, 0 };
+        return .{ ix, children[ix].top() + self.state.offset.y - self.state.bounds.top() };
+    }
+    /// The bottom child, and how far its bottom is below the viewport's bottom (GPUI `logical_scroll_bottom`).
+    pub fn logical_scroll_bottom(self: ScrollHandle) struct { usize, Pixels } {
+        const ix = self.bottom_item();
+        const children = self.state.child_bounds.items;
+        if (ix >= children.len) return .{ ix, 0 };
+        return .{ ix, children[ix].bottom() + self.state.offset.y - self.state.bounds.bottom() };
     }
     pub fn scroll_to_top(self: ScrollHandle) void {
         self.state.offset.y = 0;
@@ -3413,9 +3505,50 @@ pub const ScrollHandle = struct {
         if (ix >= self.state.child_bounds.items.len) return null;
         return self.state.child_bounds.items[ix];
     }
-    /// Scrolls so that child `ix` is visible.
+    /// Scrolls the least needed to make child `ix` fully visible, in the next prepaint (GPUI `scroll_to_item`).
     pub fn scroll_to_item(self: ScrollHandle, ix: usize) void {
-        self.state.requested_scroll_top = ix;
+        self.state.active_item = .{ .index = ix, .strategy = .first_visible };
+    }
+    /// Scrolls so that child `ix` is the top one visible, in the next prepaint (GPUI `scroll_to_top_of_item`).
+    pub fn scroll_to_top_of_item(self: ScrollHandle, ix: usize) void {
+        self.state.active_item = .{ .index = ix, .strategy = .top };
+    }
+
+    /// Applies the requests made since the last prepaint, against the child bounds of that prepaint
+    /// (GPUI `scroll_to_active_item`, and the `ScrollAnchor` request).
+    fn scroll_to_active_item(self: ScrollHandle) void {
+        const st = self.state;
+        if (st.anchor_request) |anchor| {
+            st.anchor_request = null;
+            st.offset = .{ .x = st.bounds.origin.x - anchor.last_origin.x, .y = st.bounds.origin.y - anchor.last_origin.y };
+        }
+        const active = st.active_item orelse return;
+        if (active.index >= st.child_bounds.items.len) return;
+        const b = st.child_bounds.items[active.index];
+        var off = st.offset;
+        switch (active.strategy) {
+            .first_visible => if (st.overflow.y == .scroll) {
+                if (b.size.height > st.bounds.size.height) {
+                    off.y = st.bounds.top() - b.top();
+                } else if (b.top() + off.y < st.bounds.top()) {
+                    off.y = st.bounds.top() - b.top();
+                } else if (b.bottom() + off.y > st.bounds.bottom()) {
+                    off.y = st.bounds.bottom() - b.bottom();
+                }
+            },
+            .top => off.y = st.bounds.top() - b.top(),
+        }
+        if (st.overflow.x == .scroll) {
+            if (b.size.width > st.bounds.size.width) {
+                off.x = st.bounds.left() - b.left();
+            } else if (b.left() + off.x < st.bounds.left()) {
+                off.x = st.bounds.left() - b.left();
+            } else if (b.right() + off.x > st.bounds.right()) {
+                off.x = st.bounds.right() - b.right();
+            }
+        }
+        st.offset = off;
+        st.active_item = null;
     }
 };
 
@@ -3424,9 +3557,44 @@ pub const ScrollHandleState = struct {
     bounds: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } },
     max_offset: Size(Pixels) = .{ .width = 0, .height = 0 },
     child_bounds: std.ArrayList(Bounds(Pixels)) = .empty,
-    requested_scroll_top: ?usize = null,
+    /// The child to scroll to in the next prepaint (GPUI `active_item`).
+    active_item: ?ActiveScrollItem = null,
+    /// Scroll to the bottom in the next prepaint (GPUI `scroll_to_bottom`).
+    scroll_to_bottom: bool = false,
+    /// An element asked to be scrolled to (GPUI `ScrollAnchor::scroll_to`), applied in the next prepaint.
+    anchor_request: ?ScrollAnchor = null,
+    /// The overflow of the tracked element, from its last prepaint.
+    overflow: Point(style_mod.Overflow) = .{ .x = .visible, .y = .visible },
     allocator: ?std.mem.Allocator = null,
 };
+
+const ActiveScrollItem = struct {
+    index: usize,
+    strategy: enum { first_visible, top },
+};
+
+/// GPUI's binary search over child bounds, with its comparison: the child that contains `y`, or the
+/// nearest one when none does.
+fn child_index_at(children: []const Bounds(Pixels), y: Pixels) usize {
+    if (children.len == 0) return 0;
+    var size = children.len;
+    var base: usize = 0;
+    while (size > 1) {
+        const half = size / 2;
+        const mid = base + half;
+        if (compare_child(children[mid], y) != .gt) base = mid;
+        size -= half;
+    }
+    const c = compare_child(children[base], y);
+    if (c == .eq) return base;
+    return @min(base + @intFromBool(c == .lt), children.len - 1);
+}
+
+fn compare_child(child: Bounds(Pixels), y: Pixels) std.math.Order {
+    if (y < child.top()) return .gt;
+    if (y > child.bottom()) return .lt;
+    return .eq;
+}
 
 /// Per-element state persisted across frames (GPUI `InteractiveElementState`).
 fn to_tooltip_builder(build_tooltip: anytype) TooltipBuilder {
@@ -3547,6 +3715,18 @@ fn schedule_tooltip_timer(st: *InteractiveElementState, comptime f: fn (TooltipT
     cx.background_executor().after(cx.foreground_executor(), delay_ns, f, timer);
 }
 
+/// How far a scroll moves each axis (GPUI `paint_scroll_listener`). An axis that scrolls takes its own
+/// delta, or the other delta when only it scrolls and the scroll is not restricted to one axis. Unless
+/// concurrent scrolling is allowed, only the dominant axis moves.
+fn scroll_step(delta: Point(Pixels), ox: style_mod.Overflow, oy: style_mod.Overflow, restrict: bool, concurrent: bool) Point(Pixels) {
+    var dx: Pixels = if (ox == .scroll and delta.x != 0) delta.x else if (ox == .scroll and !restrict and oy != .scroll) delta.y else 0;
+    var dy: Pixels = if (oy == .scroll and delta.y != 0) delta.y else if (oy == .scroll and !restrict and ox != .scroll) delta.x else 0;
+    if (!concurrent and dx != 0 and dy != 0) {
+        if (@abs(dx) > @abs(dy)) dy = 0 else dx = 0;
+    }
+    return .{ .x = dx, .y = dy };
+}
+
 fn clamp_scroll(offset: Point(Pixels), max: Size(Pixels)) Point(Pixels) {
     return .{ .x = std.math.clamp(offset.x, -max.width, 0), .y = std.math.clamp(offset.y, -max.height, 0) };
 }
@@ -3642,17 +3822,28 @@ pub const Interactivity = struct {
     action_listeners: List(ActionL) = .empty,
     click_listeners: List(Listener(ClickEvent)) = .empty,
     hover_listener: ?Listener(bool) = null,
-    occlude_mouse: bool = false,
+    hover_listener_mode: HoverListenerMode = .input_modality_aware,
+    mouse_exit_listeners: List(Listener(MouseExitEvent)) = .empty,
+    file_drop_exit_listeners: List(Listener(FileDropEvent)) = .empty,
+    drag_move_listeners: List(DragMoveL) = .empty,
+    scroll_anchor: ?ScrollAnchor = null,
+    occlude_mouse_: bool = false,
     block_mouse_except_scroll_: bool = false,
     tab_index: ?isize = null,
     tab_stop: ?bool = null,
     tab_group_: bool = false,
 
+    /// Blocks mouse events from reaching the elements behind this one (GPUI `occlude_mouse`).
+    pub fn occlude_mouse(self: *Interactivity) void {
+        self.occlude_mouse_ = true;
+    }
+
     fn needs_hitbox(self: *const Interactivity) bool {
         return self.element_id != null or self.focusable or self.tracked_focus_handle != null or self.hover_style != null or
-            self.active_style != null or self.group != null or self.occlude_mouse or self.block_mouse_except_scroll_ or
+            self.active_style != null or self.group != null or self.occlude_mouse_ or self.block_mouse_except_scroll_ or
             self.mouse_down_listeners.items.len > 0 or self.mouse_up_listeners.items.len > 0 or self.mouse_down_out_listeners.items.len > 0 or
             self.mouse_move_listeners.items.len > 0 or self.scroll_wheel_listeners.items.len > 0 or self.click_listeners.items.len > 0 or
+            self.mouse_exit_listeners.items.len > 0 or self.file_drop_exit_listeners.items.len > 0 or self.drag_move_listeners.items.len > 0 or
             self.hover_listener != null or self.base_style.mouse_cursor != null or
             self.aux_click_listeners.items.len > 0 or self.pinch_listeners.items.len > 0 or self.capture_pinch_listeners.items.len > 0 or
             self.mouse_pressure_listeners.items.len > 0 or self.capture_mouse_pressure_listeners.items.len > 0 or
@@ -3747,6 +3938,10 @@ pub fn StyledElement(comptime Ext: type) type {
         ext: Ext = .{},
         /// The image cache for the images under this element (set with `image_cache`).
         image_cache_provider: ?image_cache_mod.ImageCacheProvider = null,
+        /// Set by `on_children_prepainted` (GPUI `prepaint_listener`).
+        prepaint_listener: ?Listener(PrepaintedChildren) = null,
+        /// Set by `with_dynamic_prepaint_order` (GPUI `prepaint_order_fn`).
+        prepaint_order_fn: ?*const fn (window: *Window, cx: *App) []const usize = null,
 
         pub const RequestLayoutState = DivFrameState;
         pub const PrepaintState = DivPrepaintState;
@@ -3934,8 +4129,81 @@ pub fn StyledElement(comptime Ext: type) type {
             return self;
         }
 
-        pub fn on_scroll_wheel(self: *Self, listener: anytype) *Self {
+        /// Scroll events over this element, in the bubble phase (GPUI `on_scroll`).
+        pub fn on_scroll(self: *Self, listener: anytype) *Self {
             self.interactivity.scroll_wheel_listeners.append(arena(), app_mod.to_listener(ScrollWheelEvent, listener)) catch oom();
+            return self;
+        }
+
+        /// The former name of `on_scroll` (GPUI `on_scroll_wheel`, deprecated).
+        pub fn on_scroll_wheel(self: *Self, listener: anytype) *Self {
+            return self.on_scroll(listener);
+        }
+
+        /// Called when the mouse leaves the window while over this element (GPUI `on_mouse_exit`).
+        pub fn on_mouse_exit(self: *Self, listener: anytype) *Self {
+            self.interactivity.mouse_exit_listeners.append(arena(), app_mod.to_listener(MouseExitEvent, listener)) catch oom();
+            return self;
+        }
+
+        /// Called with `FileDropEvent.exited` when a file drag leaves the window while over this
+        /// element (GPUI `on_file_drop_exit`).
+        pub fn on_file_drop_exit(self: *Self, listener: anytype) *Self {
+            self.interactivity.file_drop_exit_listeners.append(arena(), app_mod.to_listener(FileDropEvent, listener)) catch oom();
+            return self;
+        }
+
+        /// Called for every move during a drag of a `T` that started with this element under the
+        /// pointer, whether or not the pointer is over this element (GPUI `on_drag_move::<T>`). The
+        /// listener takes `*const DragMoveEvent(T)`. Useful for resizing and other drags that drop nothing.
+        pub fn on_drag_move(self: *Self, comptime T: type, listener: anytype) *Self {
+            const E = DragMoveEvent(T);
+            const held = arena().create(Listener(E)) catch oom();
+            held.* = app_mod.to_listener(E, listener);
+            self.interactivity.drag_move_listeners.append(arena(), .{ .type_id = app_mod.type_id(T), .ctx = held, .call = struct {
+                fn call(raw: *anyopaque, event: *const MouseMoveEvent, bounds: Bounds(Pixels), item: *anyopaque, window: *Window, cx: *App) void {
+                    const l: *const Listener(E) = @ptrCast(@alignCast(raw));
+                    const ev: E = .{ .event = event.*, .bounds = bounds, .item = @ptrCast(@alignCast(item)) };
+                    l.call(&ev, window, cx);
+                }
+            }.call }) catch oom();
+            return self;
+        }
+
+        /// Sets the hit testing `on_hover` uses (GPUI `hover_listener_mode`).
+        pub fn hover_listener_mode(self: *Self, mode: HoverListenerMode) *Self {
+            self.interactivity.hover_listener_mode = mode;
+            return self;
+        }
+
+        /// Keeps this element scrolled into view by its scroll container (GPUI `anchor_scroll`).
+        pub fn anchor_scroll(self: *Self, scroll_anchor: ?ScrollAnchor) *Self {
+            self.interactivity.scroll_anchor = scroll_anchor;
+            return self;
+        }
+
+        /// Scrolls along the axis the gesture starts on (GPUI `restrict_scroll_to_axis`).
+        pub fn restrict_scroll_to_axis(self: *Self) *Self {
+            self.interactivity.base_style.restrict_scroll_to_axis = true;
+            return self;
+        }
+
+        /// Lets a scroll move both axes at once; by default only the dominant axis moves (GPUI `allow_concurrent_scroll`).
+        pub fn allow_concurrent_scroll(self: *Self) *Self {
+            self.interactivity.base_style.allow_concurrent_scroll = true;
+            return self;
+        }
+
+        /// Runs `listener` with the bounds of the children once they are prepainted (GPUI `on_children_prepainted`).
+        pub fn on_children_prepainted(self: *Self, listener: anytype) *Self {
+            self.prepaint_listener = app_mod.to_listener(PrepaintedChildren, listener);
+            return self;
+        }
+
+        /// Prepaints the children in the order `order_fn` returns their indices (GPUI `with_dynamic_prepaint_order`).
+        /// Each index must appear once. The order is asked for in every prepaint.
+        pub fn with_dynamic_prepaint_order(self: *Self, comptime order_fn: fn (*Window, *App) []const usize) *Self {
+            self.prepaint_order_fn = &order_fn;
             return self;
         }
 
@@ -3995,7 +4263,7 @@ pub fn StyledElement(comptime Ext: type) type {
 
         /// Blocks mouse events from reaching elements behind this one.
         pub fn occlude(self: *Self) *Self {
-            self.interactivity.occlude_mouse = true;
+            self.interactivity.occlude_mouse();
             return self;
         }
 
@@ -4125,6 +4393,23 @@ pub fn StyledElement(comptime Ext: type) type {
             return self;
         }
 
+        /// Runs `listener` for the action when it is dispatched to this element, in the bubble phase
+        /// (GPUI `on_boxed_action`). `action` is type-erased, so it must outlive the frame.
+        pub fn on_boxed_action(self: *Self, action: action_mod.AnyAction, comptime listener: fn (*const action_mod.AnyAction, *Window, *App) void) *Self {
+            const Held = struct {
+                action: action_mod.AnyAction,
+                fn call(raw: *anyopaque, _: *const anyopaque, phase: DispatchPhase, window: *Window, cx: *App) void {
+                    if (phase != .bubble) return;
+                    const held: *const @This() = @ptrCast(@alignCast(raw));
+                    listener(&held.action, window, cx);
+                }
+            };
+            const held = arena().create(Held) catch oom();
+            held.* = .{ .action = action };
+            self.interactivity.action_listeners.append(arena(), .{ .action_type = action.type_id, .phase = .bubble, .ctx = held, .func = Held.call }) catch oom();
+            return self;
+        }
+
         /// Tracks the scroll position in `handle`.
         pub fn track_scroll(self: *Self, handle: *const ScrollHandle) *Self {
             self.interactivity.tracked_scroll_handle = handle.*;
@@ -4159,6 +4444,11 @@ pub fn StyledElement(comptime Ext: type) type {
             const it = &self.interactivity;
             var pp: DivPrepaintState = .{};
             if (gid) |g| pp.state = window.element_state(InteractiveElementState, g.*, .{});
+            // Where an anchored element is, so its container can scroll to it (GPUI `scroll_anchor`).
+            if (it.scroll_anchor) |anchor| {
+                const offset = window.element_offset();
+                anchor.last_origin.* = .{ .x = bounds.origin.x - offset.x, .y = bounds.origin.y - offset.y };
+            }
 
             // Focus handle: tracked, or an implicit one stored in element state.
             if (it.focusable and it.tracked_focus_handle == null) {
@@ -4194,7 +4484,7 @@ pub fn StyledElement(comptime Ext: type) type {
             for (it.action_listeners.items) |al| window.on_action(al.action_type, al.ctx, al.func);
 
             if (it.needs_hitbox()) {
-                const behavior: window_mod.HitboxBehavior = if (it.occlude_mouse) .block_mouse else if (it.block_mouse_except_scroll_) .block_mouse_except_scroll else .normal;
+                const behavior: window_mod.HitboxBehavior = if (it.occlude_mouse_) .block_mouse else if (it.block_mouse_except_scroll_) .block_mouse_except_scroll else .normal;
                 pp.hitbox = window.insert_hitbox(bounds, behavior);
                 if (it.group) |g| {
                     if (Interactivity.groups_frame != window.frame_count) {
@@ -4216,15 +4506,24 @@ pub fn StyledElement(comptime Ext: type) type {
             // Scroll offset, clamped before the children use it (GPUI `clamp_scroll_position`):
             // a wheel event past the end must not paint a frame out there.
             var scroll: Point(Pixels) = .{ .x = 0, .y = 0 };
+            // The children are measured, and the requests made since the last frame applied, before the
+            // offset is clamped (GPUI `Div::prepaint` and `scroll_to_active_item`).
+            if (it.tracked_scroll_handle) |sh| {
+                sh.state.child_bounds.clearRetainingCapacity();
+                const allocator = sh.state.allocator orelse std.heap.page_allocator;
+                for (rl.child_layout_ids) |lid| sh.state.child_bounds.append(allocator, window.layout_bounds(lid)) catch oom();
+                sh.scroll_to_active_item();
+            }
             if (s.overflow.x == .scroll or s.overflow.y == .scroll) {
                 const max = scroll_max(bounds, s, rl.child_layout_ids, window);
                 if (it.tracked_scroll_handle) |sh| {
                     sh.state.max_offset = max;
                     sh.state.bounds = bounds;
-                    sh.state.child_bounds.clearRetainingCapacity();
-                    const allocator = sh.state.allocator orelse std.heap.page_allocator;
-                    for (rl.child_layout_ids) |lid| sh.state.child_bounds.append(allocator, window.layout_bounds(lid)) catch oom();
+                    sh.state.overflow = s.overflow;
+                    const to_bottom = sh.state.scroll_to_bottom;
+                    sh.state.scroll_to_bottom = false;
                     scroll = clamp_scroll(sh.offset(), max);
+                    if (to_bottom) scroll.y = -max.height;
                     sh.set_offset(scroll);
                 }
                 if (pp.state) |st| {
@@ -4240,8 +4539,20 @@ pub fn StyledElement(comptime Ext: type) type {
             defer if (mask != null) window.pop_content_mask();
 
             window.push_element_offset(scroll);
-            for (self.children_list.items) |c| c.prepaint(window, cx);
+            if (self.prepaint_order_fn) |order_fn| {
+                for (order_fn(window, cx)) |ix| {
+                    if (ix < self.children_list.items.len) self.children_list.items[ix].prepaint(window, cx);
+                }
+            } else {
+                for (self.children_list.items) |c| c.prepaint(window, cx);
+            }
             window.pop_element_offset();
+            if (self.prepaint_listener) |listener| {
+                const child_bounds = arena().alloc(Bounds(Pixels), rl.child_layout_ids.len) catch oom();
+                for (rl.child_layout_ids, 0..) |lid, i| child_bounds[i] = window.layout_bounds(lid);
+                const prepainted: PrepaintedChildren = .{ .bounds = child_bounds };
+                listener.call(&prepainted, window, cx);
+            }
             if (@hasDecl(Ext, "prepaint_ext")) Ext.prepaint_ext(self, bounds, window, cx);
 
             return pp;
@@ -4342,8 +4653,10 @@ pub fn StyledElement(comptime Ext: type) type {
             if (it.mouse_pressure_listeners.items.len > 0 or it.capture_mouse_pressure_listeners.items.len > 0) window.on_mouse_event(MousePressureEvent, ctx, onMousePressure);
             if (it.drop_listeners.items.len > 0 or it.aux_click_listeners.items.len > 0 or it.drag_listener != null or it.tooltip_builder != null or it.mouse_up_out_listeners.items.len > 0 or it.mouse_up_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or it.group != null)
                 window.on_mouse_event(MouseUpEvent, ctx, onMouseUp);
-            if (it.drag_listener != null or it.tooltip_builder != null or it.drag_over_styles.items.len > 0 or it.mouse_move_listeners.items.len > 0 or it.hover_style != null or it.hover_listener != null or it.group_hover_style != null or it.group != null)
+            if (it.drag_listener != null or it.tooltip_builder != null or it.drag_over_styles.items.len > 0 or it.mouse_move_listeners.items.len > 0 or it.hover_style != null or it.hover_listener != null or it.group_hover_style != null or it.group != null or it.drag_move_listeners.items.len > 0)
                 window.on_mouse_event(MouseMoveEvent, ctx, onMouseMove);
+            if (it.mouse_exit_listeners.items.len > 0 or it.hover_listener != null) window.on_mouse_event(MouseExitEvent, ctx, onMouseExit);
+            if (it.file_drop_exit_listeners.items.len > 0) window.on_mouse_event(FileDropEvent, ctx, onFileDrop);
             if (it.tooltip_builder != null or it.scroll_wheel_listeners.items.len > 0 or it.base_style.overflow.x == .scroll or it.base_style.overflow.y == .scroll)
                 window.on_mouse_event(ScrollWheelEvent, ctx, onScrollWheel);
         }
@@ -4449,6 +4762,13 @@ pub fn StyledElement(comptime Ext: type) type {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
             const it = &c.self.interactivity;
             const hovered = c.hitbox.is_hovered(window);
+            // Drag-move listeners hear every move of a drag of their type, wherever the pointer is.
+            if (phase == .capture) if (cx.active_drag) |drag| {
+                for (it.drag_move_listeners.items) |l| {
+                    if (l.type_id != drag.value.type_id) continue;
+                    l.call(l.ctx, e, c.hitbox.bounds, drag.value.ptr, window, cx);
+                }
+            };
             if (it.tooltip_builder != null) if (c.state) |st| tooltip_on_mouse_move(st, hovered, phase, it.tooltip_show_delay_ns orelse DEFAULT_TOOLTIP_SHOW_DELAY_NS, window, cx);
             if (phase == .bubble and hovered) {
                 for (it.mouse_move_listeners.items) |l| l.call(e, window, cx);
@@ -4474,14 +4794,47 @@ pub fn StyledElement(comptime Ext: type) type {
             if (c.state) |st| {
                 if (st.hovered != hovered) {
                     st.hovered = hovered;
-                    if (it.hover_listener) |hl| hl.call(&hovered, window, cx);
                     if (it.hover_style != null or it.group != null) window.refresh();
+                }
+                if (it.hover_listener) |hl| {
+                    // Not while a button is held or a drag runs, as in GPUI.
+                    const listener_hovered = st.pending_mouse_down == null and !cx.has_active_drag() and
+                        it.hover_listener_mode.is_hovered(&c.hitbox, window);
+                    if (st.hover_listener_state != listener_hovered) {
+                        st.hover_listener_state = listener_hovered;
+                        hl.call(&listener_hovered, window, cx);
+                    }
                 }
             } else if (it.hover_style != null) {
                 // Without persistent state, refresh whenever hover may have changed.
                 window.refresh();
             }
             if (it.group_hover_style != null) window.refresh();
+        }
+
+        fn onMouseExit(raw: *anyopaque, e: *const MouseExitEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
+            const c: *MouseCtx = @ptrCast(@alignCast(raw));
+            const it = &c.self.interactivity;
+            if (phase != .bubble) return;
+            if (c.hitbox.is_hovered(window)) {
+                for (it.mouse_exit_listeners.items) |l| l.call(e, window, cx);
+            }
+            // The pointer can leave without a last move, so the hover listener is cleared here too.
+            if (it.hover_listener) |hl| if (c.state) |st| {
+                if (st.hover_listener_state) {
+                    st.hover_listener_state = false;
+                    const off = false;
+                    hl.call(&off, window, cx);
+                }
+            };
+        }
+
+        fn onFileDrop(raw: *anyopaque, e: *const FileDropEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
+            const c: *MouseCtx = @ptrCast(@alignCast(raw));
+            const it = &c.self.interactivity;
+            if (phase != .bubble or std.meta.activeTag(e.*) != .exited) return;
+            if (!c.hitbox.is_hovered_ignoring_last_input(window)) return;
+            for (it.file_drop_exit_listeners.items) |l| l.call(e, window, cx);
         }
 
         fn onPinch(raw: *anyopaque, e: *const PinchEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
@@ -4510,14 +4863,14 @@ pub fn StyledElement(comptime Ext: type) type {
             if (s.x != .scroll and s.y != .scroll) return;
             const delta = e.delta.pixel_delta(window.line_height());
             const old: Point(Pixels) = if (it.tracked_scroll_handle) |sh| sh.offset() else if (c.state) |st| st.scroll_offset else return;
-            var off = old;
-            if (s.x == .scroll) off.x += delta.x;
-            if (s.y == .scroll) off.y += delta.y;
+            // Unset refinements read as the defaults: visible overflow, and both flags off.
+            const step = scroll_step(delta, s.x orelse .visible, s.y orelse .visible, it.base_style.restrict_scroll_to_axis orelse false, it.base_style.allow_concurrent_scroll orelse false);
+            var off: Point(Pixels) = .{ .x = old.x + step.x, .y = old.y + step.y };
             // Unknown until the first frame; prepaint clamps again in any case.
             const max: ?Size(Pixels) = if (it.tracked_scroll_handle) |sh| sh.max_offset() else if (c.state) |st| st.scroll_max else null;
             if (max) |limit| off = clamp_scroll(off, limit);
-            window.stop_propagation();
-            // At the limit nothing moved, so nothing needs drawing.
+            // At the limit nothing moved, so nothing needs drawing. Unlike the old behaviour, the event
+            // is not stopped: an outer scroll container under this one scrolls too, as in GPUI.
             if (off.x == old.x and off.y == old.y) return;
             if (it.tracked_scroll_handle) |sh| sh.set_offset(off);
             if (c.state) |st| st.scroll_offset = off;
