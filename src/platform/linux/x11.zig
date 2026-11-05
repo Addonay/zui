@@ -61,6 +61,8 @@ const Atoms = struct {
     paste: Atom = 0,
     net_wm_sync_request: Atom = 0,
     net_wm_sync_request_counter: Atom = 0,
+    gtk_show_window_menu: Atom = 0,
+    net_wm_cm_s0: Atom = 0,
     xdnd_aware: Atom = 0,
     xdnd_enter: Atom = 0,
     xdnd_position: Atom = 0,
@@ -154,6 +156,9 @@ pub const X11Connection = struct {
     pressed: ?MouseButton = null,
     /// Root position of the last button press (for window move drags).
     press_root: [2]c_long = .{ 0, 0 },
+    /// Whether a compositor owns the screen (`_NET_WM_CM_S0`), read once: client-side
+    /// decorations need one, as in GPUI, and the owner cannot change without a restart here.
+    compositor_running: ?bool = null,
     /// Events read during a synchronous clipboard request, replayed later.
     stash: [64]XEvent = undefined,
     stash_len: usize = 0,
@@ -198,6 +203,8 @@ pub const X11Connection = struct {
             .net_wm_moveresize = api.XInternAtom(dpy, "_NET_WM_MOVERESIZE", 0),
             .net_wm_sync_request = api.XInternAtom(dpy, "_NET_WM_SYNC_REQUEST", 0),
             .net_wm_sync_request_counter = api.XInternAtom(dpy, "_NET_WM_SYNC_REQUEST_COUNTER", 0),
+            .gtk_show_window_menu = api.XInternAtom(dpy, "_GTK_SHOW_WINDOW_MENU", 0),
+            .net_wm_cm_s0 = api.XInternAtom(dpy, "_NET_WM_CM_S0", 0),
             .xdnd_aware = api.XInternAtom(dpy, "XdndAware", 0),
             .xdnd_enter = api.XInternAtom(dpy, "XdndEnter", 0),
             .xdnd_position = api.XInternAtom(dpy, "XdndPosition", 0),
@@ -391,7 +398,10 @@ pub const X11Connection = struct {
         const a = &self.api;
         const pw: c_uint = @intFromFloat(@max(1, @round(b.size.width * self.scale)));
         const ph: c_uint = @intFromFloat(@max(1, @round(b.size.height * self.scale)));
-        const x = a.XCreateSimpleWindow(self.display, self.root, 0, 0, pw, ph, 0, 0, 0);
+        // The window opens at its requested origin, so windows that are placed side by side stay apart.
+        const ox: c_int = @intFromFloat(@round(b.origin.x * self.scale));
+        const oy: c_int = @intFromFloat(@round(b.origin.y * self.scale));
+        const x = a.XCreateSimpleWindow(self.display, self.root, ox, oy, pw, ph, 0, 0, 0);
         w.x_window = x;
         var title_buf: [512]u8 = undefined;
         const title_src: []const u8 = if (options.titlebar) |t| (t.title orelse "ZUI") else "ZUI";
@@ -415,7 +425,14 @@ pub const X11Connection = struct {
             }
         }
         _ = a.XSetWMProtocols(self.display, x, &protocols, protocol_count);
-        if (options.titlebar == null) self.set_decorations(x, false);
+        // Client decorations are only honoured with a compositor, as in GPUI; without one the
+        // window manager keeps its frame. Without a titlebar and without a request, no frame.
+        const decorated = if (options.window_decorations) |d| switch (d) {
+            .server => true,
+            .client => !self.has_compositor(),
+        } else options.titlebar != null;
+        w.decorated = decorated;
+        if (!decorated) self.set_decorations(x, false);
         _ = a.XSelectInput(self.display, x, window_event_mask);
         self.select_xinput(x);
         if (options.show) _ = a.XMapWindow(self.display, x);
@@ -431,6 +448,14 @@ pub const X11Connection = struct {
         w.apply_cursor();
         self.flush();
         return w;
+    }
+
+    /// Whether a compositor owns the screen. Asked once per connection, since it is a round trip.
+    fn has_compositor(self: *X11Connection) bool {
+        if (self.compositor_running == null) {
+            self.compositor_running = self.api.XGetSelectionOwner(self.display, self.atoms.net_wm_cm_s0) != 0;
+        }
+        return self.compositor_running.?;
     }
 
     /// Motif hints: turn off the window manager's frame (decorations = 0).
@@ -1382,6 +1407,8 @@ pub const X11Window = struct {
     frame_interval_ms: i64 = input.default_frame_interval_ms,
     /// False while unmapped or fully covered: no frames then, as in GPUI.
     visible: bool = true,
+    /// False when the app draws the frame (client decorations, or no titlebar requested).
+    decorated: bool = true,
     /// _NET_WM_SYNC_REQUEST: the window manager waits for this counter during resizes.
     sync_counter: c_ulong = 0,
     pending_sync: ?proto.XSyncValue = null,
@@ -1421,6 +1448,9 @@ pub const X11Window = struct {
         .zoom = zoom,
         .toggle_fullscreen = toggleFullscreen,
         .start_window_move = startWindowMove,
+        .start_window_resize = startWindowResize,
+        .show_window_menu = showWindowMenu,
+        .window_decorations = windowDecorations,
         .resize = resize,
         .close = close,
     };
@@ -1764,13 +1794,59 @@ pub const X11Window = struct {
     }
 
     fn startWindowMove(p: *platform.PlatformWindow) void {
-        const self = from(p);
+        from(p).send_moveresize(8);
+    }
+
+    fn startWindowResize(p: *platform.PlatformWindow, edge: platform.ResizeEdge) void {
+        from(p).send_moveresize(resize_direction(edge));
+    }
+
+    /// _NET_WM_MOVERESIZE direction for a resize edge (GPUI `resize_edge_to_moveresize`).
+    fn resize_direction(edge: platform.ResizeEdge) c_long {
+        return switch (edge) {
+            .top_left => 0,
+            .top => 1,
+            .top_right => 2,
+            .right => 3,
+            .bottom_right => 4,
+            .bottom => 5,
+            .bottom_left => 6,
+            .left => 7,
+        };
+    }
+
+    /// Hands a move (8) or resize (0 to 7) to the window manager, from the last press.
+    fn send_moveresize(self: *X11Window, direction: c_long) void {
         const conn = self.conn;
         var ev = std.mem.zeroes(XEvent);
-        // _NET_WM_MOVERESIZE with direction 8 (move) at the last press position.
-        ev.xclient = .{ .type = proto.ClientMessage, .serial = 0, .send_event = 1, .display = conn.display, .window = self.x_window, .message_type = conn.atoms.net_wm_moveresize, .format = 32, .data = .{ .l = .{ conn.press_root[0], conn.press_root[1], 8, 1, 1 } } };
+        ev.xclient = .{ .type = proto.ClientMessage, .serial = 0, .send_event = 1, .display = conn.display, .window = self.x_window, .message_type = conn.atoms.net_wm_moveresize, .format = 32, .data = .{ .l = .{ conn.press_root[0], conn.press_root[1], direction, 1, 1 } } };
         _ = conn.api.XSendEvent(conn.display, conn.root, 0, proto.SubstructureRedirectMask | proto.SubstructureNotifyMask, &ev);
         conn.flush();
+    }
+
+    /// Asks the window manager for its window menu at `position` (GPUI `show_window_menu`).
+    /// GPUI first ungrabs the pointer; this port never holds a grab, so it does not.
+    fn showWindowMenu(p: *platform.PlatformWindow, position: PxPoint) void {
+        const self = from(p);
+        const conn = self.conn;
+        var rx: c_int = 0;
+        var ry: c_int = 0;
+        var child: XWindow = 0;
+        const px_x: c_int = @intFromFloat(@round(position.x * self.scale));
+        const px_y: c_int = @intFromFloat(@round(position.y * self.scale));
+        if (conn.api.XTranslateCoordinates(conn.display, self.x_window, conn.root, px_x, px_y, &rx, &ry, &child) == 0) return;
+        var ev = std.mem.zeroes(XEvent);
+        // The first datum is the XInput device group (XINPUT_ALL_DEVICE_GROUPS = 1 in GPUI).
+        ev.xclient = .{ .type = proto.ClientMessage, .serial = 0, .send_event = 1, .display = conn.display, .window = self.x_window, .message_type = conn.atoms.gtk_show_window_menu, .format = 32, .data = .{ .l = .{ 1, @as(c_long, rx), @as(c_long, ry), 0, 0 } } };
+        _ = conn.api.XSendEvent(conn.display, conn.root, 0, proto.SubstructureRedirectMask | proto.SubstructureNotifyMask, &ev);
+        conn.flush();
+    }
+
+    fn windowDecorations(p: *platform.PlatformWindow) platform.Decorations {
+        const self = from(p);
+        // Tiling is not tracked here (only the fullscreen state is), so no edge is reported as tiled.
+        if (self.decorated) return .server;
+        return .{ .client = .{ .tiling = .{} } };
     }
 
     fn resize(p: *platform.PlatformWindow, size: PxSize) void {
