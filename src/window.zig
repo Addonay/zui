@@ -20,6 +20,7 @@ const atlas_mod = @import("atlas.zig");
 const view_mod = @import("view.zig");
 const refineable = @import("refineable.zig");
 const prompts = @import("window/prompts.zig");
+const focus_events = @import("window/focus_events.zig");
 const assets_mod = @import("assets.zig");
 const image_cache_mod = @import("image_cache.zig");
 
@@ -1565,7 +1566,11 @@ pub const Window = struct {
         self.next_frame.focus = self.focus_id;
         self.next_frame.window_active = self.active;
 
+        // Focus listeners compare the focus path of the frame drawn now with the previous one.
+        const previous_focus = focus_events.focus_path(&self.rendered_frame, self.allocator);
+        const previous_active = self.rendered_frame.window_active;
         std.mem.swap(Frame, &self.rendered_frame, &self.next_frame);
+        focus_events.after_draw(self, cx, previous_focus, previous_active);
         self.text_system().finish_frame();
         std.mem.swap(std.AutoHashMapUnmanaged(EntityId, void), &self.rendered_entities, &self.next_rendered_entities);
         self.gc_element_states();

@@ -21,6 +21,10 @@ const assets_mod = @import("assets.zig");
 const asset_cache_mod = @import("asset_cache.zig");
 const uniform_list_mod = @import("elements/uniform_list.zig");
 const list_mod = @import("elements/list.zig");
+const focus_events = @import("window/focus_events.zig");
+
+/// Given to `Context.on_focus_out` listeners (GPUI `FocusOutEvent`).
+pub const FocusOutEvent = focus_events.FocusOutEvent;
 
 const Window = window_mod.Window;
 const WindowOptions = window_mod.WindowOptions;
@@ -208,6 +212,11 @@ pub fn WeakEntity(comptime T: type) type {
             const e = self.upgrade(cx) orelse return null;
             return e.read(cx);
         }
+
+        /// The same entity without its type (GPUI `WeakEntity::into`).
+        pub fn into_any(self: Self) AnyWeakEntity {
+            return .{ .entity_id_ = self.entity_id_, .tid = type_id(T) };
+        }
     };
 }
 
@@ -220,6 +229,41 @@ pub const AnyEntity = struct {
         return self.entity_id_;
     }
     pub fn downcast(self: AnyEntity, comptime T: type) ?Entity(T) {
+        if (self.tid != type_id(T)) return null;
+        return .{ .entity_id_ = self.entity_id_ };
+    }
+    /// The type of the entity (GPUI `AnyEntity::entity_type`).
+    pub fn entity_type(self: AnyEntity) TypeId {
+        return self.tid;
+    }
+    /// A weak handle to the same entity (GPUI `AnyEntity::downgrade`).
+    pub fn downgrade(self: AnyEntity) AnyWeakEntity {
+        return .{ .entity_id_ = self.entity_id_, .tid = self.tid };
+    }
+};
+
+/// A type-erased weak handle (GPUI `AnyWeakEntity`): `upgrade` fails once the entity is released.
+pub const AnyWeakEntity = struct {
+    entity_id_: EntityId,
+    tid: TypeId,
+
+    pub fn entity_id(self: AnyWeakEntity) EntityId {
+        return self.entity_id_;
+    }
+    pub fn entity_type(self: AnyWeakEntity) TypeId {
+        return self.tid;
+    }
+    /// A strong handle, if the entity is still alive.
+    pub fn upgrade(self: AnyWeakEntity, cx: anytype) ?AnyEntity {
+        if (!self.is_upgradable(cx)) return null;
+        return .{ .entity_id_ = self.entity_id_, .tid = self.tid };
+    }
+    /// Whether the entity is still alive (GPUI `AnyWeakEntity::is_upgradable`).
+    pub fn is_upgradable(self: AnyWeakEntity, cx: anytype) bool {
+        return app_of(cx).entities.get(self.entity_id_) != null;
+    }
+    /// The typed handle, if the entity is alive and really is a `T`.
+    pub fn downcast(self: AnyWeakEntity, comptime T: type) ?WeakEntity(T) {
         if (self.tid != type_id(T)) return null;
         return .{ .entity_id_ = self.entity_id_ };
     }
@@ -236,6 +280,22 @@ pub fn app_of(cx: anytype) *App {
 
 // ---------------------------------------------------------------------------
 // Context(T).
+
+/// The state a subscriber keeps when it needs a window as well as its entity. Owned by the
+/// subscriber (see `App.add_owned_subscriber`).
+const WindowBound = struct {
+    entity: EntityId,
+    window: window_mod.WindowId,
+};
+
+/// The state of a focus subscriber: its entity and the focus handle it watches.
+const EntityFocus = struct {
+    entity: EntityId,
+    focus: u64,
+};
+
+/// Which focus change a `Context.on_focus*` listener waits for.
+const FocusMode = enum { focus, focus_in, blur, focus_out, lost };
 
 /// The context passed to entity updates and renders (GPUI `Context<T>`).
 /// It forwards the most common `App` methods; use `cx.app` for the rest.
@@ -497,6 +557,235 @@ pub fn Context(comptime T: type) type {
             return self.app.foreground_executor().spawn(f, .{ weak, self.app.to_async() } ++ args);
         }
 
+        /// Runs `f(this, cx)` whenever this entity notifies (GPUI `observe_self`).
+        pub fn observe_self(self: *Self, comptime f: anytype) Subscription {
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, _: ?*const anyopaque) bool {
+                    const id = EntityId.from_u64(ctx);
+                    const state = app.entities.get(id) orelse return false;
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    f(@as(*T, @ptrCast(@alignCast(state))), &c);
+                    return true;
+                }
+            };
+            return self.app.add_observer(self.entity_id_, self.entity_id_.as_u64(), S.call);
+        }
+
+        /// Runs `f(this, event, cx)` for each event this entity emits (GPUI `subscribe_self`).
+        pub fn subscribe_self(self: *Self, comptime f: anytype) Subscription {
+            const Ev = T.Event;
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                    const id = EntityId.from_u64(ctx);
+                    const state = app.entities.get(id) orelse return false;
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    const ev: *const Ev = @ptrCast(@alignCast(payload.?));
+                    f(@as(*T, @ptrCast(@alignCast(state))), ev, &c);
+                    return true;
+                }
+            };
+            return self.app.add_event_listener(self.entity_id_, type_id(Ev), self.entity_id_.as_u64(), S.call);
+        }
+
+        /// Runs `f(this, released, cx)` when `observed` is released, once (GPUI `observe_release`).
+        pub fn observe_release(self: *Self, observed: anytype, comptime f: anytype) Subscription {
+            const T2 = @TypeOf(observed).Type;
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                    const id = EntityId.from_u64(ctx);
+                    const state = app.entities.get(id) orelse return false;
+                    const released: *T2 = @ptrCast(@alignCast(@constCast(payload.?)));
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    f(@as(*T, @ptrCast(@alignCast(state))), released, &c);
+                    return false;
+                }
+            };
+            return self.app.add_subscriber(.{ .kind = .release, .emitter = observed.entity_id().as_u64(), .ctx = self.entity_id_.as_u64(), .func = S.call, .id = 0 });
+        }
+
+        /// Runs `f(this, released, window, cx)` when `observed` is released, once (GPUI `observe_release_in`).
+        /// If `window` has been closed by then, the callback does not run: ZUI has no window handle
+        /// that stays valid after its window is gone.
+        pub fn observe_release_in(self: *Self, observed: anytype, window: *Window, comptime f: anytype) Subscription {
+            const T2 = @TypeOf(observed).Type;
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                    const bound: *const WindowBound = @ptrFromInt(ctx);
+                    const state = app.entities.get(bound.entity) orelse return false;
+                    const win = app.window_by_id(bound.window) orelse return false;
+                    const released: *T2 = @ptrCast(@alignCast(@constCast(payload.?)));
+                    var c: Context(T) = .{ .app = app, .entity_id_ = bound.entity };
+                    f(@as(*T, @ptrCast(@alignCast(state))), released, win, &c);
+                    return false;
+                }
+            };
+            return self.app.add_owned_subscriber(.{ .kind = .release, .emitter = observed.entity_id().as_u64(), .ctx = 0, .func = S.call, .id = 0 }, WindowBound, .{ .entity = self.entity_id_, .window = window.handle_id });
+        }
+
+        /// Runs `f(this, window, app)` when this entity is released, once (GPUI `on_release_in`).
+        /// As with `observe_release_in`, it does not run if the window is closed by then.
+        pub fn on_release_in(self: *Self, window: *Window, comptime f: anytype) Subscription {
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                    const bound: *const WindowBound = @ptrFromInt(ctx);
+                    const win = app.window_by_id(bound.window) orelse return false;
+                    f(@as(*T, @ptrCast(@alignCast(@constCast(payload.?)))), win, app);
+                    return false;
+                }
+            };
+            return self.app.add_owned_subscriber(.{ .kind = .release, .emitter = self.entity_id_.as_u64(), .ctx = 0, .func = S.call, .id = 0 }, WindowBound, .{ .entity = self.entity_id_, .window = window.handle_id });
+        }
+
+        /// Runs `f(this, observed, window, cx)` whenever `observed` notifies (GPUI `observe_in`).
+        /// `window` is the one given here; the callback does not run while it is closed.
+        pub fn observe_in(self: *Self, observed: anytype, window: *Window, comptime f: anytype) Subscription {
+            const E = @TypeOf(observed);
+            const S = struct {
+                fn call(app: *App, emitter: EntityId, ctx: usize, _: ?*const anyopaque) bool {
+                    const bound: *const WindowBound = @ptrFromInt(ctx);
+                    const state = app.entities.get(bound.entity) orelse return false;
+                    const win = app.window_by_id(bound.window) orelse return true;
+                    var c: Context(T) = .{ .app = app, .entity_id_ = bound.entity };
+                    f(@as(*T, @ptrCast(@alignCast(state))), E{ .entity_id_ = emitter }, win, &c);
+                    return true;
+                }
+            };
+            return self.app.add_owned_subscriber(.{ .kind = .observe, .emitter = observed.entity_id().as_u64(), .ctx = 0, .func = S.call, .id = 0 }, WindowBound, .{ .entity = self.entity_id_, .window = window.handle_id });
+        }
+
+        /// Runs `f(this, window, cx)` whenever the global `G` changes (GPUI `observe_global_in`).
+        pub fn observe_global_in(self: *Self, comptime G: type, window: *Window, comptime f: anytype) Subscription {
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, _: ?*const anyopaque) bool {
+                    const bound: *const WindowBound = @ptrFromInt(ctx);
+                    const state = app.entities.get(bound.entity) orelse return false;
+                    // A window that is closed (or briefly unavailable) skips this change and stays observed.
+                    const win = app.window_by_id(bound.window) orelse return true;
+                    var c: Context(T) = .{ .app = app, .entity_id_ = bound.entity };
+                    f(@as(*T, @ptrCast(@alignCast(state))), win, &c);
+                    return true;
+                }
+            };
+            return self.app.add_owned_subscriber(.{ .kind = .global, .emitter = 0, .event_type = type_id(G), .ctx = 0, .func = S.call, .id = 0 }, WindowBound, .{ .entity = self.entity_id_, .window = window.handle_id });
+        }
+
+        /// Runs `f(this, window, cx)` at the end of the current update, if the entity and the window
+        /// still exist (GPUI `defer_in`).
+        pub fn defer_in(self: *Self, window: *Window, comptime f: anytype) void {
+            const bound = self.app.effect_arena.allocator().create(WindowBound) catch oom();
+            bound.* = .{ .entity = self.entity_id_, .window = window.handle_id };
+            const S = struct {
+                fn run(app: *App, ctx: usize) void {
+                    const b: *const WindowBound = @ptrFromInt(ctx);
+                    const state = app.entities.get(b.entity) orelse return;
+                    const win = app.window_by_id(b.window) orelse return;
+                    var c: Context(T) = .{ .app = app, .entity_id_ = b.entity };
+                    f(@as(*T, @ptrCast(@alignCast(state))), win, &c);
+                }
+            };
+            self.app.push_effect(.{ .deferred = .{ .ctx = @intFromPtr(bound), .func = S.run } });
+        }
+
+        /// Moves focus to `view`, which must have a `focus_handle` (GPUI `focus_view`).
+        pub fn focus_view(self: *Self, view: anytype, window: *Window) void {
+            const handle = view.read(self.app).focus_handle(self.app);
+            window.focus(handle);
+        }
+
+        /// Moves focus to this entity's focus handle at the end of the current update (GPUI
+        /// `focus_self`). The entity must have a `focus_handle` method.
+        pub fn focus_self(self: *Self, window: *Window) void {
+            const S = struct {
+                fn run(this: *T, win: *Window, cx: *Context(T)) void {
+                    this.focus_handle(cx.app).focus(win);
+                }
+            };
+            self.defer_in(window, S.run);
+        }
+
+        /// Runs `f(this, window, cx)` when `handle` gets focus, from outside its subtree (GPUI `on_focus`).
+        pub fn on_focus(self: *Self, handle: window_mod.FocusHandle, window: *Window, comptime f: anytype) Subscription {
+            return self.focus_listener(window, .focus, .focus, handle.id, f);
+        }
+
+        /// Runs `f(this, window, cx)` when `handle` or something beneath it gets focus (GPUI `on_focus_in`).
+        pub fn on_focus_in(self: *Self, handle: window_mod.FocusHandle, window: *Window, comptime f: anytype) Subscription {
+            return self.focus_listener(window, .focus, .focus_in, handle.id, f);
+        }
+
+        /// Runs `f(this, window, cx)` when `handle` loses focus (GPUI `on_blur`).
+        pub fn on_blur(self: *Self, handle: window_mod.FocusHandle, window: *Window, comptime f: anytype) Subscription {
+            return self.focus_listener(window, .focus, .blur, handle.id, f);
+        }
+
+        /// Runs `f(this, event, window, cx)` when `handle` or something beneath it loses focus (GPUI `on_focus_out`).
+        pub fn on_focus_out(self: *Self, handle: window_mod.FocusHandle, window: *Window, comptime f: anytype) Subscription {
+            return self.focus_listener(window, .focus, .focus_out, handle.id, f);
+        }
+
+        /// Runs `f(this, window, cx)` when nothing in the window has focus any more, which usually means
+        /// the focused element was removed. Use it to pick a default to focus (GPUI `on_focus_lost`).
+        pub fn on_focus_lost(self: *Self, window: *Window, comptime f: anytype) Subscription {
+            return self.focus_listener(window, .focus_lost, .lost, 0, f);
+        }
+
+        fn focus_listener(self: *Self, window: *Window, comptime kind: SubscriberKind, comptime mode: FocusMode, focus: u64, comptime f: anytype) Subscription {
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                    const watch: *const EntityFocus = @ptrFromInt(ctx);
+                    const state = app.entities.get(watch.entity) orelse return false;
+                    const p: *const focus_events.Payload = @ptrCast(@alignCast(payload.?));
+                    const ev = p.event;
+                    const hit = switch (mode) {
+                        .focus => focus_events.last(ev.previous_focus_path) != watch.focus and focus_events.last(ev.current_focus_path) == watch.focus,
+                        .focus_in => ev.is_focus_in(watch.focus),
+                        .blur => focus_events.last(ev.previous_focus_path) == watch.focus and focus_events.last(ev.current_focus_path) != watch.focus,
+                        .focus_out => ev.is_focus_out(watch.focus),
+                        .lost => true,
+                    };
+                    if (!hit) return true;
+                    var c: Context(T) = .{ .app = app, .entity_id_ = watch.entity };
+                    const this: *T = @ptrCast(@alignCast(state));
+                    if (comptime mode == .focus_out) {
+                        const blurred = focus_events.last(ev.previous_focus_path) orelse return true;
+                        f(this, focus_events.FocusOutEvent{ .blurred = .{ .id = blurred } }, p.window, &c);
+                    } else {
+                        f(this, p.window, &c);
+                    }
+                    return true;
+                }
+            };
+            return self.app.add_owned_subscriber(.{ .kind = kind, .emitter = window.handle_id, .ctx = 0, .func = S.call, .id = 0 }, EntityFocus, .{ .entity = self.entity_id_, .focus = focus });
+        }
+
+        /// Runs `f(this, cx)` when the app quits, before it is torn down (GPUI `on_app_quit`).
+        pub fn on_app_quit(self: *Self, comptime f: anytype) Subscription {
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, _: ?*const anyopaque) bool {
+                    const id = EntityId.from_u64(ctx);
+                    const state = app.entities.get(id) orelse return false;
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    f(@as(*T, @ptrCast(@alignCast(state))), &c);
+                    return true;
+                }
+            };
+            return self.app.add_subscriber(.{ .kind = .app_quit, .emitter = 0, .ctx = self.entity_id_.as_u64(), .func = S.call, .id = 0 });
+        }
+
+        /// Spawns `f(weak_this, window_cx, args...)` on the main thread (GPUI `spawn_in`). `window_cx`
+        /// is an `AsyncWindowContext` by value, not a pointer.
+        pub fn spawn_in(self: *Self, window: *Window, comptime f: anytype, args: anytype) executor_mod.Task(ReturnOf(f)) {
+            const weak: WeakEntity(T) = .{ .entity_id_ = self.entity_id_ };
+            const wcx: AsyncWindowContext = .{ .app = self.app, .window_id = window.handle_id };
+            return self.app.foreground_executor().spawn(f, .{ weak, wcx } ++ args);
+        }
+
+        /// Like `spawn_in`, with a priority. Foreground work runs in order, so it is ignored (as in GPUI).
+        pub fn spawn_in_with_priority(self: *Self, priority: executor_mod.Priority, window: *Window, comptime f: anytype, args: anytype) executor_mod.Task(ReturnOf(f)) {
+            _ = priority;
+            return self.spawn_in(window, f, args);
+        }
+
         // -- App forwarding (GPUI's Context derefs to App) ------------------
 
         pub fn new(self: *Self, init: anytype) Entity(EntityTypeOf(@TypeOf(init))) {
@@ -621,7 +910,30 @@ pub fn EntityTypeOf(comptime I: type) type {
 /// Callback shape for observers/subscribers; returns false to unsubscribe.
 const SubscriberFn = *const fn (app: *App, emitter: EntityId, ctx: usize, payload: ?*const anyopaque) bool;
 
-const SubscriberKind = enum { observe, event, release, global, window_closed, window_appearance, window_bounds, window_activation };
+const SubscriberKind = enum {
+    observe,
+    event,
+    release,
+    global,
+    window_closed,
+    window_appearance,
+    window_bounds,
+    window_activation,
+    /// A window's focus changed (`Context.on_focus` and its siblings).
+    focus,
+    /// A window has nothing focused any more (`Context.on_focus_lost`).
+    focus_lost,
+    app_quit,
+    /// An entity of type `event_type` was created (`App.observe_new`).
+    new_entity,
+};
+
+/// A context allocated for one subscriber. `Subscriber.ctx` is its address, and `free` releases it
+/// when the subscriber goes away.
+const OwnedContext = struct {
+    ptr: *anyopaque,
+    free: *const fn (std.mem.Allocator, *anyopaque) void,
+};
 
 const Subscriber = struct {
     kind: SubscriberKind,
@@ -631,6 +943,7 @@ const Subscriber = struct {
     func: SubscriberFn,
     active: bool = true,
     id: u64,
+    owned: ?OwnedContext = null,
 };
 
 /// A subscription handle (GPUI `Subscription`). Call `unsubscribe` to stop
@@ -707,6 +1020,16 @@ const Effect = union(enum) {
 
 const GlobalSlot = struct { ptr: *anyopaque, destroy: *const fn (std.mem.Allocator, *anyopaque) void };
 
+/// When the app quits by itself, after its last window closes (GPUI `QuitMode`).
+pub const QuitMode = enum {
+    /// What the platform does: quit when the last window closes, except on macOS.
+    default,
+    /// Never quit by itself; `quit` must be called.
+    explicit,
+    /// Quit when the last window closes, on every platform.
+    last_window_closed,
+};
+
 /// The global application state (GPUI `App`).
 /// A type-erased `on_system_notification_response` handler: `func(ctx, response, app)`.
 const SystemNotificationHandler = struct {
@@ -748,6 +1071,9 @@ pub const App = struct {
     global_action_listeners: std.ArrayList(action_mod.GlobalActionListener) = .empty,
     next_focus_id: u64 = 1,
     quitting: bool = false,
+    /// `shutdown` has run; it runs once.
+    shut_down: bool = false,
+    quit_mode: QuitMode = .default,
     reduce_motion: bool = false,
     async_app: AsyncApp = undefined,
 
@@ -781,6 +1107,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        self.shutdown();
         if (self.system_notification_response) |h| h.free(self.allocator, h.ctx);
         self.system_notification_response = null;
         // Each slot is cleared before its window is destroyed, as close_window does, so a window
@@ -802,6 +1129,8 @@ pub const App = struct {
         var it = self.globals.valueIterator();
         while (it.next()) |g| g.destroy(self.allocator, g.ptr);
         self.globals.deinit(self.allocator);
+        // Subscribers that were never compacted still own their contexts.
+        for (self.subscribers.items) |s| if (s.owned) |o| o.free(self.allocator, o.ptr);
         self.subscribers.deinit(self.allocator);
         self.pending_effects.deinit(self.allocator);
         self.effect_arena.deinit();
@@ -850,6 +1179,7 @@ pub const App = struct {
             self.pending_updates -= 1;
         }
         self.entities.slots.items[id.index()].ptr = ptr;
+        self.notify_new_entity(T, id, ptr);
         return .{ .entity_id_ = id };
     }
 
@@ -869,6 +1199,7 @@ pub const App = struct {
                 app.allocator.destroy(@as(*T, @ptrCast(@alignCast(p))));
             }
         }.d };
+        self.notify_new_entity(T, id, ptr);
         return .{ .entity_id_ = id };
     }
 
@@ -923,16 +1254,23 @@ pub const App = struct {
     pub fn release_entity(self: *App, id: EntityId) void {
         const i = id.index();
         if (i >= self.entities.slots.items.len) return;
-        const s = &self.entities.slots.items[i];
-        if (s.generation != id.generation() or s.ptr == null) return;
-        const p = s.ptr.?;
-        // Release listeners see the state before it's destroyed.
-        for (self.subscribers.items) |*sub| {
+        {
+            const s = &self.entities.slots.items[i];
+            if (s.generation != id.generation() or s.ptr == null) return;
+        }
+        const p = self.entities.slots.items[i].ptr.?;
+        // Release listeners see the state before it's destroyed. By index: a listener may
+        // subscribe, which can move the list.
+        var k: usize = 0;
+        while (k < self.subscribers.items.len) : (k += 1) {
+            const sub = self.subscribers.items[k];
             if (sub.active and sub.kind == .release and sub.emitter == id.as_u64()) {
+                self.subscribers.items[k].active = false;
                 _ = sub.func(self, id, sub.ctx, p);
-                sub.active = false;
             }
         }
+        // Re-fetched: a listener may have created entities, which can move the slots.
+        const s = &self.entities.slots.items[i];
         if (s.destroy) |d| d(self, p);
         s.ptr = null;
         s.generation +%= 1;
@@ -1025,6 +1363,8 @@ pub const App = struct {
             if (s.active) {
                 self.subscribers.items[j] = s;
                 j += 1;
+            } else if (s.owned) |o| {
+                o.free(self.allocator, o.ptr);
             }
         }
         self.subscribers.shrinkRetainingCapacity(j);
@@ -1036,6 +1376,103 @@ pub const App = struct {
         self.next_subscription_id += 1;
         self.subscribers.append(self.allocator, sub) catch oom();
         return .{ .app = self, .id = sub.id };
+    }
+
+    /// Adds a subscriber whose context is a copy of `value`. The copy lives until the subscriber
+    /// is removed (unsubscribed, or it returned false), so the callback can read it through `ctx`.
+    fn add_owned_subscriber(self: *App, s: Subscriber, comptime Ctx: type, value: Ctx) Subscription {
+        const Free = struct {
+            fn free(a: std.mem.Allocator, raw: *anyopaque) void {
+                a.destroy(@as(*Ctx, @ptrCast(@alignCast(raw))));
+            }
+        };
+        const ptr = self.allocator.create(Ctx) catch oom();
+        ptr.* = value;
+        var sub = s;
+        sub.ctx = @intFromPtr(ptr);
+        sub.owned = .{ .ptr = ptr, .free = Free.free };
+        return self.add_subscriber(sub);
+    }
+
+    /// Runs the `kind` subscribers of `win` with `payload`. Used for focus changes, which need both
+    /// the event and the window.
+    pub fn dispatch_window_payload(self: *App, kind: SubscriberKind, win: *Window, payload: *const anyopaque) void {
+        self.pending_updates += 1;
+        defer {
+            self.pending_updates -= 1;
+            if (self.pending_updates == 0) self.flush_effects();
+        }
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != kind or sub.emitter != @as(u64, win.handle_id)) continue;
+            if (!sub.func(self, EntityId.from_u64(0), sub.ctx, payload)) self.subscribers.items[i].active = false;
+        }
+    }
+
+    /// Runs `f(this, window, cx)`-style observers of new entities: every `observe_new` callback for
+    /// `T` gets the entity that was just created.
+    fn notify_new_entity(self: *App, comptime T: type, id: EntityId, ptr: *T) void {
+        self.pending_updates += 1;
+        defer {
+            self.pending_updates -= 1;
+            if (self.pending_updates == 0) self.flush_effects();
+        }
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != .new_entity or sub.event_type != type_id(T)) continue;
+            if (!sub.func(self, id, sub.ctx, ptr)) self.subscribers.items[i].active = false;
+        }
+    }
+
+    /// Calls `f(this, window, cx)` for every entity of type `T` created from now on (GPUI
+    /// `observe_new`). `window` is always null: ZUI does not know which window an entity will be
+    /// drawn in when it is created, so an app that needs one must find it in a later update.
+    pub fn observe_new(self: *App, comptime T: type, comptime f: fn (*T, ?*Window, *Context(T)) void) Subscription {
+        const S = struct {
+            fn call(app: *App, id: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const this: *T = @ptrCast(@alignCast(@constCast(payload.?)));
+                var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                f(this, null, &c);
+                return true;
+            }
+        };
+        return self.add_subscriber(.{ .kind = .new_entity, .emitter = 0, .event_type = type_id(T), .ctx = 0, .func = S.call, .id = 0 });
+    }
+
+    /// Runs the `on_app_quit` handlers once (GPUI `shutdown`). `Application.run` calls it when the
+    /// platform loop has ended, and `deinit` calls it too. Windows and entities still exist.
+    pub fn shutdown(self: *App) void {
+        if (self.shut_down) return;
+        self.shut_down = true;
+        self.pending_updates += 1;
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != .app_quit) continue;
+            // Handlers are removed once they have run, as GPUI's are.
+            self.subscribers.items[i].active = false;
+            _ = sub.func(self, EntityId.from_u64(0), sub.ctx, null);
+        }
+        self.pending_updates -= 1;
+        if (self.pending_updates == 0) self.flush_effects();
+    }
+
+    /// Runs `f(cx)` when the app quits (GPUI `App::on_app_quit`). Runs once, from `shutdown`.
+    pub fn on_app_quit(self: *App, comptime f: fn (*App) void) Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, _: ?*const anyopaque) bool {
+                f(app);
+                return true;
+            }
+        };
+        return self.add_subscriber(.{ .kind = .app_quit, .emitter = 0, .ctx = 0, .func = S.call, .id = 0 });
+    }
+
+    /// Sets when the app quits by itself (GPUI `set_quit_mode`).
+    pub fn set_quit_mode(self: *App, mode: QuitMode) void {
+        self.quit_mode = mode;
     }
 
     pub fn add_observer(self: *App, observed: EntityId, ctx: usize, func: SubscriberFn) Subscription {
@@ -1142,6 +1579,24 @@ pub const App = struct {
         const g = self.global(G);
         defer self.push_effect(.{ .global_changed = type_id(G) });
         return f(g, self);
+    }
+
+    /// Mutable access to the global `G`, which must be set (GPUI `global_mut`). `global` already
+    /// returns a mutable pointer; this is the name GPUI code uses. Does not notify observers.
+    pub fn global_mut(self: *App, comptime G: type) *G {
+        return self.global(G);
+    }
+
+    /// Like `update_global`, after setting `G{}` if it is not set yet (GPUI `update_default_global`).
+    pub fn update_default_global(self: *App, comptime G: type, comptime f: anytype) ReturnOf(f) {
+        _ = self.default_global(G);
+        return self.update_global(G, f);
+    }
+
+    /// Runs `f(args...)` on a background thread (GPUI `background_spawn`, the `AppContext` method).
+    /// Same as `background_executor().spawn`.
+    pub fn background_spawn(self: *App, comptime f: anytype, args: anytype) executor_mod.Task(ReturnOf(f)) {
+        return self.background_executor_.spawn(f, args);
     }
 
     pub fn remove_global(self: *App, comptime G: type) void {
@@ -1289,7 +1744,12 @@ pub const App = struct {
         self.dispatch_window_closed(id);
         var any_open = false;
         for (self.windows.items) |w| any_open = any_open or w != null;
-        if (!any_open and self.platform.quit_when_last_window_closes()) self.quit();
+        const quit_on_last = switch (self.quit_mode) {
+            .default => self.platform.quit_when_last_window_closes(),
+            .explicit => false,
+            .last_window_closed => true,
+        };
+        if (!any_open and quit_on_last) self.quit();
     }
 
     /// Closes the window with this handle once the current update ends (GPUI `remove_window`).
@@ -1407,6 +1867,12 @@ pub const App = struct {
         return self.asset_loads.contains(A, source);
     }
 
+    /// Sets the client that fetches remote images (GPUI `set_http_client`). `Application.with_http_client`
+    /// does the same before the app runs.
+    pub fn set_http_client(self: *App, client: http_client_mod.HttpClient) void {
+        self.asset_cache.fetch_config.?.http_client = client;
+    }
+
     /// Removes `image`'s tiles from every window's sprite atlas, before the image is freed (GPUI
     /// `drop_image`, which also takes the window being drawn; here all windows are cleaned).
     pub fn drop_image(self: *App, image: *const assets_mod.RenderImage) void {
@@ -1416,6 +1882,12 @@ pub const App = struct {
     /// Spawns a foreground task `f(async_cx, args...)`.
     pub fn spawn(self: *App, comptime f: anytype, args: anytype) executor_mod.Task(ReturnOf(f)) {
         return self.foreground_executor_.spawn(f, .{self.to_async()} ++ args);
+    }
+
+    /// Like `spawn`, with a priority. Foreground work runs in order, so the priority is ignored (as in GPUI).
+    pub fn spawn_with_priority(self: *App, priority: executor_mod.Priority, comptime f: anytype, args: anytype) executor_mod.Task(ReturnOf(f)) {
+        _ = priority;
+        return self.spawn(f, args);
     }
 
     pub fn to_async(self: *App) *AsyncApp {
@@ -1498,6 +1970,12 @@ pub const App = struct {
 
     pub fn primary_display(self: *App) ?platform_mod.Display {
         return self.platform.primary_display();
+    }
+
+    /// The display with this id, if it is connected (GPUI `find_display`).
+    pub fn find_display(self: *App, id: platform_mod.DisplayId) ?platform_mod.Display {
+        for (self.displays()) |d| if (d.id == id) return d;
+        return null;
     }
 
     /// Size of the primary display, used by `Bounds.centered`.
@@ -1602,6 +2080,46 @@ pub const AsyncApp = struct {
     pub fn refresh(self: *AsyncApp) void {
         self.app.refresh_windows();
     }
+
+    /// Runs `f(global, app, args...)` with the global `G` (GPUI `read_global`). Fails if `G` is not set.
+    pub fn read_global(self: *AsyncApp, comptime G: type, comptime f: anytype, args: anytype) error{GlobalNotFound}!ReturnOf(f) {
+        const g = self.app.try_global(G) orelse return error.GlobalNotFound;
+        return @call(.auto, f, .{ g, self.app } ++ args);
+    }
+
+    /// Like `read_global`, but null when `G` is not set (GPUI `try_read_global`).
+    pub fn try_read_global(self: *AsyncApp, comptime G: type, comptime f: anytype, args: anytype) ?ReturnOf(f) {
+        const g = self.app.try_global(G) orelse return null;
+        return @call(.auto, f, .{ g, self.app } ++ args);
+    }
+};
+
+/// An app context for a window, usable across suspension points (GPUI `AsyncWindowContext`). It
+/// holds the window's id, so it works after the window has closed: `update` then fails.
+pub const AsyncWindowContext = struct {
+    app: *App,
+    window_id: window_mod.WindowId,
+
+    /// Runs `f(window, app, args...)` in the window (GPUI `AsyncWindowContext::update`), or fails
+    /// with `error.WindowClosed`. Effects it queues are flushed afterwards.
+    pub fn update(self: AsyncWindowContext, comptime f: anytype, args: anytype) error{WindowClosed}!ReturnOf(f) {
+        const win = self.app.window_by_id(self.window_id) orelse return error.WindowClosed;
+        const r = @call(.auto, f, .{ win, self.app } ++ args);
+        self.app.flush_effects();
+        return r;
+    }
+
+    /// The window this context is for (GPUI `window_handle`).
+    pub fn window_handle(self: AsyncWindowContext) window_mod.AnyWindowHandle {
+        return .{ .id = self.window_id };
+    }
+
+    pub fn background_executor(self: AsyncWindowContext) *executor_mod.BackgroundExecutor {
+        return self.app.background_executor();
+    }
+    pub fn foreground_executor(self: AsyncWindowContext) *executor_mod.ForegroundExecutor {
+        return self.app.foreground_executor();
+    }
 };
 
 /// The application entry point (GPUI `Application`).
@@ -1646,6 +2164,12 @@ pub const Application = struct {
         return self;
     }
 
+    /// Sets when the app quits by itself, after its last window closes (GPUI `with_quit_mode`).
+    pub fn with_quit_mode(self: Application, mode: QuitMode) Application {
+        self.app.set_quit_mode(mode);
+        return self;
+    }
+
     pub fn with_assets(self: Application, source: anytype) Application {
         self.app.asset_source = if (@TypeOf(source) == assets_mod.AssetSource) source else assets_mod.AssetSource.from(source);
         return self;
@@ -1661,6 +2185,8 @@ pub const Application = struct {
             }
         };
         self.platform.run(self.app, S.launched);
+        // The loop has ended: quit handlers run while windows and entities still exist.
+        self.app.shutdown();
         self.app.deinit();
         self.platform.deinit();
     }

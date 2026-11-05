@@ -35,6 +35,11 @@ fn oom() noreturn {
     @panic("out of memory");
 }
 
+/// How soon a background task runs (GPUI `Priority`). When workers are free, higher
+/// priorities are taken first. `RealtimeAudio` is not ported: it needs a dedicated OS
+/// thread with realtime scheduling, which no ZUI platform sets up.
+pub const Priority = enum { high, medium, low };
+
 fn ReturnType(comptime f: anytype) type {
     return @typeInfo(@TypeOf(f)).@"fn".return_type.?;
 }
@@ -115,6 +120,10 @@ fn TaskState(comptime T: type) type {
         /// 0 until the result is stored, then 1. Also the futex word.
         done: std.atomic.Value(u32) = .init(0),
         cancelled: std.atomic.Value(bool) = .init(false),
+        /// Set by `detach_and_log_err`: an error result is logged when the task completes.
+        log_on_completion: std.atomic.Value(bool) = .init(false),
+        /// Whoever flips this first logs the error. Completion and detaching can race.
+        logged: std.atomic.Value(bool) = .init(false),
         pump: ?Pump = null,
         result: T = undefined,
 
@@ -127,8 +136,17 @@ fn TaskState(comptime T: type) type {
         /// Stores the result and wakes waiters. Called once, by the runnable.
         fn complete(self: *S, value: T) void {
             self.result = value;
-            self.done.store(1, .release);
+            self.done.store(1, .seq_cst);
             sync_io().futexWake(u32, &self.done.raw, std.math.maxInt(u32));
+            if (self.log_on_completion.load(.seq_cst)) self.log_error_once();
+        }
+
+        /// Logs the result if it is an error and nobody has logged it yet. Only called once the
+        /// result is stored.
+        fn log_error_once(self: *S) void {
+            if (@typeInfo(T) != .error_union) return;
+            if (self.logged.cmpxchgStrong(false, true, .seq_cst, .seq_cst) != null) return;
+            if (self.result) |_| {} else |err| log_task_error(err);
         }
 
         fn release(self: *S) void {
@@ -152,6 +170,40 @@ fn wait_until_done(comptime S: type, s: *S) void {
             io.futexWaitUncancelable(u32, &s.done.raw, 0);
         }
     }
+}
+
+/// Like `wait_until_done`, but gives up after `timeout_ns`. Returns whether the task completed.
+fn wait_until_done_for(s: anytype, timeout_ns: u64) bool {
+    const io = sync_io();
+    const deadline = now_ns() +| timeout_ns;
+    while (s.done.load(.acquire) == 0) {
+        const now = now_ns();
+        if (now >= deadline) return false;
+        var slice = deadline - now;
+        // Background threads may queue main-thread work without waking us, so a waiter that
+        // pumps re-checks every millisecond.
+        if (s.pump) |p| {
+            if (p.run(p.ctx) > 0) continue;
+            slice = @min(slice, std.time.ns_per_ms);
+        }
+        io.futexWaitTimeout(u32, &s.done.raw, 0, .{ .duration = .{
+            .raw = .fromNanoseconds(@intCast(slice)),
+            .clock = .awake,
+        } }) catch {};
+    }
+    return true;
+}
+
+/// Where `detach_and_log_err` reports an error. It logs by default. The test runner fails any test
+/// that logs an error, so tests replace this to count the errors instead.
+pub var task_error_sink: *const fn (err: anyerror) void = log_error_sink;
+
+fn log_error_sink(err: anyerror) void {
+    std.log.err("task failed: {s}", .{@errorName(err)});
+}
+
+fn log_task_error(err: anyerror) void {
+    task_error_sink(err);
 }
 
 /// Handle to a running computation (GPUI `Task<T>`).
@@ -208,6 +260,12 @@ pub fn Task(comptime T: type) type {
             return v;
         }
 
+        /// Waits up to `timeout_ns` for the result without taking it. Returns whether it is ready.
+        pub fn wait_for(self: *Self, timeout_ns: u64) bool {
+            if (self.state) |s| return wait_until_done_for(s, timeout_ns);
+            return self.ready_value != null;
+        }
+
         /// Cancels the task. A task that has not started is skipped; a running one
         /// finishes but its result is discarded.
         pub fn cancel(self: *Self) void {
@@ -222,6 +280,23 @@ pub fn Task(comptime T: type) type {
 
         /// Same as `cancel`; dropping a task cancels it.
         pub const deinit = cancel;
+
+        /// Runs the task to completion in the background and logs its error if it fails
+        /// (GPUI `TaskExt::detach_and_log_err`). Only exists for tasks whose result is an error
+        /// union. The error is logged once, when the task completes.
+        pub const detach_and_log_err = if (@typeInfo(T) == .error_union) detach_and_log_err_impl else {};
+
+        fn detach_and_log_err_impl(self: *Self) void {
+            if (self.state) |s| {
+                s.log_on_completion.store(true, .seq_cst);
+                // The task may have completed before the flag was set. The claim makes sure
+                // only one side logs.
+                if (s.done.load(.seq_cst) != 0) s.log_error_once();
+            } else if (self.ready_value) |v| {
+                if (v) |_| {} else |err| log_task_error(err);
+            }
+            self.drop_handle();
+        }
 
         fn drop_handle(self: *Self) void {
             if (self.state) |s| s.release();
@@ -271,6 +346,60 @@ fn spawn_node(
     return .{ &node.runnable, state };
 }
 
+/// The result of `BackgroundExecutor.block_with_timeout` (GPUI `Result<R, impl Future>`).
+pub fn BlockWithTimeout(comptime T: type, comptime TaskT: type) type {
+    return union(enum) {
+        /// The task finished in time.
+        ok: T,
+        /// Still running. The task is handed back, and can be waited on again.
+        pending: TaskT,
+    };
+}
+
+/// A heap job that calls `f(args...)` and drops its result, for work spawned on a `Scope`. The
+/// job frees itself when it has run.
+fn Discard(comptime f: anytype, comptime Args: type) type {
+    return struct {
+        const Job = @This();
+        allocator: std.mem.Allocator,
+        args: Args,
+
+        fn run(job: *Job) void {
+            defer job.allocator.destroy(job);
+            _ = @call(.auto, f, job.args);
+        }
+    };
+}
+
+/// Tasks spawned on a `Scope` are all waited for when `BackgroundExecutor.scoped` returns
+/// (GPUI `Scope`). The arguments are copied, so they may point into the caller's stack.
+pub const Scope = struct {
+    executor: *BackgroundExecutor,
+    priority: Priority,
+    tasks: std.ArrayList(Task(void)) = .empty,
+
+    /// How many CPUs are available to the dispatcher.
+    pub fn num_cpus(self: *const Scope) usize {
+        return self.executor.num_cpus();
+    }
+
+    /// Runs `f(args...)` on a worker thread. Its result is discarded. Unlike GPUI's closure, this
+    /// takes a function and its arguments.
+    pub fn spawn(self: *Scope, comptime f: anytype, args: anytype) void {
+        const Job = Discard(f, @TypeOf(args));
+        const allocator = self.executor.pool.allocator;
+        const job = allocator.create(Job) catch oom();
+        job.* = .{ .allocator = allocator, .args = args };
+        const t = self.executor.spawn_with_priority(self.priority, Job.run, .{job});
+        self.tasks.append(allocator, t) catch oom();
+    }
+
+    fn wait_all(self: *Scope) void {
+        for (self.tasks.items) |*t| t.wait();
+        self.tasks.deinit(self.executor.pool.allocator);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Background pool.
 
@@ -282,15 +411,18 @@ const Pool = struct {
     cond: Io.Condition = .init,
     /// Signalled when a timer is added or on shutdown.
     timer_cond: Io.Condition = .init,
-    queue: RunQueue = .{},
+    /// One FIFO per `Priority`, indexed by `@intFromEnum`.
+    queues: [3]RunQueue = .{ .{}, .{}, .{} },
     timers: RunQueue = .{},
     shutdown: bool = false,
     started: bool = false,
     threads: []std.Thread = &.{},
     timer_thread: ?std.Thread = null,
+    /// The thread that created the app, which is the platform's main thread.
+    main_thread: std.Thread.Id = undefined,
 
-    /// Queues work. Starts the workers on first use.
-    fn submit(self: *Pool, r: *Runnable) void {
+    /// Queues work at `priority`. Starts the workers on first use.
+    fn submit(self: *Pool, r: *Runnable, priority: Priority) void {
         const io = sync_io();
         self.mutex.lockUncancelable(io);
         if (!self.started) self.start_workers();
@@ -300,9 +432,24 @@ const Pool = struct {
             r.run(true);
             return;
         }
-        self.queue.push(r);
+        self.queues[@backingInt(priority)].push(r);
         self.mutex.unlock(io);
         self.cond.signal(io);
+    }
+
+    /// Takes the runnable of the highest priority that has one. Caller holds the mutex.
+    fn pop_next(self: *Pool) ?*Runnable {
+        for (&self.queues) |*q| {
+            if (q.pop()) |r| return r;
+        }
+        return null;
+    }
+
+    fn has_work(self: *const Pool) bool {
+        for (self.queues) |q| {
+            if (q.head != null) return true;
+        }
+        return false;
     }
 
     /// Queues a timer. `r.deadline` is the awake-clock time it fires at.
@@ -333,10 +480,10 @@ const Pool = struct {
         const io = sync_io();
         while (true) {
             self.mutex.lockUncancelable(io);
-            while (self.queue.head == null and !self.shutdown) {
+            while (!self.has_work() and !self.shutdown) {
                 self.cond.waitUncancelable(io, &self.mutex);
             }
-            const r = self.queue.pop();
+            const r = self.pop_next();
             self.mutex.unlock(io);
             // Queue empty and shutting down: exit.
             const job = r orelse return;
@@ -468,6 +615,7 @@ pub const BackgroundExecutor = struct {
         pool.* = .{
             .allocator = allocator,
             .thread_count = std.Thread.getCpuCount() catch 1,
+            .main_thread = std.Thread.getCurrentId(),
         };
         return .{ .pool = pool };
     }
@@ -479,9 +627,33 @@ pub const BackgroundExecutor = struct {
 
     /// Runs `f(args...)` on a worker thread.
     pub fn spawn(self: *BackgroundExecutor, comptime f: anytype, args: anytype) Task(ReturnType(f)) {
+        return self.spawn_with_priority(.medium, f, args);
+    }
+
+    /// Runs `f(args...)` on a worker thread, taking it before lower-priority work that is queued.
+    pub fn spawn_with_priority(self: *BackgroundExecutor, priority: Priority, comptime f: anytype, args: anytype) Task(ReturnType(f)) {
         const r, const state = spawn_node(f, args, self.pool.allocator);
-        self.pool.submit(r);
+        self.pool.submit(r, priority);
         return .{ .state = state };
+    }
+
+    /// Whether the calling thread is the one that created the app (GPUI `is_main_thread`).
+    pub fn is_main_thread(self: *const BackgroundExecutor) bool {
+        return std.Thread.getCurrentId() == self.pool.main_thread;
+    }
+
+    /// Calls `scheduler(ctx, scope)`, then waits for every task it spawned before returning, so the
+    /// tasks may borrow from the caller's stack (GPUI `scoped`). Zig has no closures, so the state
+    /// the scheduler needs goes in `ctx` (pass `{}` for none). Tasks get medium priority.
+    pub fn scoped(self: *BackgroundExecutor, ctx: anytype, comptime scheduler: anytype) void {
+        self.scoped_priority(.medium, ctx, scheduler);
+    }
+
+    /// Like `scoped`, with the priority given to every task spawned on the scope (GPUI `scoped_priority`).
+    pub fn scoped_priority(self: *BackgroundExecutor, priority: Priority, ctx: anytype, comptime scheduler: anytype) void {
+        var scope: Scope = .{ .executor = self, .priority = priority };
+        defer scope.wait_all();
+        scheduler(ctx, &scope);
     }
 
     /// Runs `work(args...)` on a worker, then `on_done(ctx, result)` on the main
@@ -544,7 +716,7 @@ pub const BackgroundExecutor = struct {
             .args = args,
             .ctx = ctx,
         };
-        self.pool.submit(&node.bg);
+        self.pool.submit(&node.bg, .medium);
         return .{ .state = state };
     }
 
@@ -599,11 +771,21 @@ pub const BackgroundExecutor = struct {
         self.pool.submit_timer(&node.timer);
     }
 
-    /// Waits for `task` on the calling thread and returns its result. Consumes `task`.
-    pub fn block(self: *BackgroundExecutor, task: anytype) @TypeOf(task).Value {
+    /// Waits for `task` on the calling thread and returns its result. Consumes `task`. On the main
+    /// thread, queued main-thread work runs while it waits (GPUI `block_on`, which takes a future).
+    pub fn block_on(self: *BackgroundExecutor, task: anytype) @TypeOf(task).Value {
         _ = self;
         var t = task;
         return t.wait();
+    }
+
+    /// Waits up to `timeout_ns` for `task`. Returns its result, or hands the task back still
+    /// running (GPUI `block_with_timeout`, which returns `Err(future)`).
+    pub fn block_with_timeout(self: *BackgroundExecutor, timeout_ns: u64, task: anytype) BlockWithTimeout(@TypeOf(task).Value, @TypeOf(task)) {
+        _ = self;
+        var t = task;
+        if (t.wait_for(timeout_ns)) return .{ .ok = t.wait() };
+        return .{ .pending = t };
     }
 
     /// Number of CPUs, used as the worker count.
@@ -647,6 +829,33 @@ pub const ForegroundExecutor = struct {
         return .{ .state = state };
     }
 
+    /// Queues `f(args...)` on the main thread. The priority is ignored: foreground work runs in
+    /// order, as in GPUI.
+    pub fn spawn_with_priority(self: *ForegroundExecutor, priority: Priority, comptime f: anytype, args: anytype) Task(ReturnType(f)) {
+        _ = priority;
+        return self.spawn(f, args);
+    }
+
+    /// Queues `f(args...)` for the main thread's idle time (GPUI `spawn_when_idle`). ZUI cannot
+    /// meter idle time on any platform yet, so this is ordinary main-thread work, and `timeout` is
+    /// ignored. GPUI does the same on platforms without idle support.
+    pub fn spawn_when_idle(self: *ForegroundExecutor, timeout_ns: ?u64, comptime f: anytype, args: anytype) Task(ReturnType(f)) {
+        _ = timeout_ns;
+        return self.spawn(f, args);
+    }
+
+    /// Time left in the current idle slice (GPUI `idle_time_remaining`). Null, because idle time
+    /// is not metered, which GPUI reports the same way.
+    pub fn idle_time_remaining(self: *const ForegroundExecutor) ?u64 {
+        _ = self;
+        return null;
+    }
+
+    /// A handle that can queue main-thread work from any thread (GPUI `SendForegroundExecutor`).
+    pub fn to_send(self: *const ForegroundExecutor) SendForegroundExecutor {
+        return .{ .core = self.core };
+    }
+
     /// Runs the work queued so far on the main thread. Returns how many items ran.
     /// Call from the main thread (the platform run loop).
     pub fn run_pending(self: *ForegroundExecutor) usize {
@@ -681,6 +890,19 @@ pub const ForegroundExecutor = struct {
             .func = func,
         };
         self.core.enqueue(&node.runnable);
+    }
+};
+
+/// A foreground executor that can be used from any thread (GPUI `SendForegroundExecutor`). Work
+/// still runs on the main thread, at its next `run_pending`. Its tasks are not pumped by `wait`:
+/// a thread that waits on one blocks until the main thread runs it.
+pub const SendForegroundExecutor = struct {
+    core: *ForegroundCore,
+
+    pub fn spawn(self: SendForegroundExecutor, comptime f: anytype, args: anytype) Task(ReturnType(f)) {
+        const r, const state = spawn_node(f, args, self.core.allocator);
+        self.core.enqueue(r);
+        return .{ .state = state };
     }
 };
 
@@ -756,10 +978,160 @@ test "ready task" {
     try testing.expectEqual(@as(i32, 3), t.wait());
 }
 
-test "block waits for a task" {
+test "block_on waits for a task" {
     var bg = BackgroundExecutor.init(testing.allocator, {});
     defer bg.deinit();
-    try testing.expectEqual(@as(i32, 9), bg.block(bg.spawn(add, .{ 4, 5 })));
+    try testing.expectEqual(@as(i32, 9), bg.block_on(bg.spawn(add, .{ 4, 5 })));
+}
+
+test "block_with_timeout returns the result when it is in time" {
+    var bg = BackgroundExecutor.init(testing.allocator, {});
+    defer bg.deinit();
+    switch (bg.block_with_timeout(5 * std.time.ns_per_s, bg.spawn(add, .{ 1, 2 }))) {
+        .ok => |v| try testing.expectEqual(@as(i32, 3), v),
+        .pending => return error.TestUnexpectedResult,
+    }
+}
+
+test "block_with_timeout hands back a task that is still running" {
+    var bg = BackgroundExecutor.init(testing.allocator, {});
+    defer bg.deinit();
+    const Gate = struct {
+        fn wait_for_flag(flag: *std.atomic.Value(bool)) i32 {
+            while (!flag.load(.acquire)) sleep_ns(100 * std.time.ns_per_us);
+            return 11;
+        }
+    };
+    var flag = std.atomic.Value(bool).init(false);
+    const t = bg.spawn(Gate.wait_for_flag, .{&flag});
+    var pending = switch (bg.block_with_timeout(2 * std.time.ns_per_ms, t)) {
+        .ok => return error.TestUnexpectedResult,
+        .pending => |task| task,
+    };
+    // The handed-back task is still the same computation: it finishes once released.
+    flag.store(true, .release);
+    try testing.expectEqual(@as(i32, 11), pending.wait());
+}
+
+test "scoped waits for every task before it returns" {
+    var bg = BackgroundExecutor.init(testing.allocator, {});
+    defer bg.deinit();
+    const Bump = struct {
+        fn run(counter: *std.atomic.Value(u32), by: u32) void {
+            sleep_ns(200 * std.time.ns_per_us);
+            _ = counter.fetchAdd(by, .seq_cst);
+        }
+    };
+    var counter = std.atomic.Value(u32).init(0);
+    const Scheduler = struct {
+        fn schedule(c: *std.atomic.Value(u32), scope: *Scope) void {
+            var i: u32 = 1;
+            while (i <= 8) : (i += 1) scope.spawn(Bump.run, .{ c, i });
+        }
+    };
+    bg.scoped_priority(.high, &counter, Scheduler.schedule);
+    // Every task borrowed `counter` from this stack frame, and all of them have run.
+    try testing.expectEqual(@as(u32, 36), counter.load(.seq_cst));
+}
+
+test "is_main_thread is true here and false on a worker" {
+    var bg = BackgroundExecutor.init(testing.allocator, {});
+    defer bg.deinit();
+    const Probe = struct {
+        fn on_worker(e: *BackgroundExecutor) bool {
+            return e.is_main_thread();
+        }
+    };
+    try testing.expect(bg.is_main_thread());
+    try testing.expect(!bg.block_on(bg.spawn(Probe.on_worker, .{&bg})));
+}
+
+test "priority: the queue hands out higher priorities first" {
+    // A pool whose workers never start: its queues are inspected directly.
+    var pool: Pool = .{ .allocator = testing.allocator, .thread_count = 0 };
+    var low: Runnable = .{ .run_fn = undefined };
+    var medium: Runnable = .{ .run_fn = undefined };
+    var high: Runnable = .{ .run_fn = undefined };
+    pool.queues[@backingInt(Priority.low)].push(&low);
+    pool.queues[@backingInt(Priority.medium)].push(&medium);
+    pool.queues[@backingInt(Priority.high)].push(&high);
+    try testing.expectEqual(&high, pool.pop_next().?);
+    try testing.expectEqual(&medium, pool.pop_next().?);
+    try testing.expectEqual(&low, pool.pop_next().?);
+    try testing.expectEqual(@as(?*Runnable, null), pool.pop_next());
+}
+
+test "spawn_with_priority runs the work" {
+    var bg = BackgroundExecutor.init(testing.allocator, {});
+    defer bg.deinit();
+    try testing.expectEqual(@as(i32, 7), bg.block_on(bg.spawn_with_priority(.high, add, .{ 3, 4 })));
+    try testing.expectEqual(@as(i32, 9), bg.block_on(bg.spawn_with_priority(.low, add, .{ 4, 5 })));
+}
+
+test "detach_and_log_err reports an error once, when the task fails" {
+    var bg = BackgroundExecutor.init(testing.allocator, {});
+    defer bg.deinit();
+    const Fail = struct {
+        fn f(fail: bool) error{Boom}!u8 {
+            if (fail) return error.Boom;
+            return 1;
+        }
+    };
+    const Count = struct {
+        var reported: std.atomic.Value(usize) = .init(0);
+        fn sink(err: anyerror) void {
+            std.testing.expectEqualStrings("Boom", @errorName(err)) catch unreachable;
+            _ = reported.fetchAdd(1, .seq_cst);
+        }
+    };
+    const saved = task_error_sink;
+    task_error_sink = Count.sink;
+    defer task_error_sink = saved;
+    Count.reported.store(0, .seq_cst);
+    const before = Count.reported.load(.seq_cst);
+    // A task that succeeds logs nothing.
+    var ok = bg.spawn(Fail.f, .{false});
+    ok.detach_and_log_err();
+    // A ready error is logged at once.
+    var ready = Task(error{Boom}!u8).ready(error.Boom);
+    ready.detach_and_log_err();
+    try testing.expectEqual(before + 1, Count.reported.load(.seq_cst));
+    // A failing background task is logged when it completes. Wait for that, with a bound.
+    var failing = bg.spawn(Fail.f, .{true});
+    failing.detach_and_log_err();
+    var waited: u64 = 0;
+    while (Count.reported.load(.seq_cst) < before + 2 and waited < 5 * std.time.ns_per_s) {
+        sleep_ns(std.time.ns_per_ms);
+        waited += std.time.ns_per_ms;
+    }
+    try testing.expectEqual(before + 2, Count.reported.load(.seq_cst));
+}
+
+test "foreground spawn_when_idle runs on run_pending and has no idle budget" {
+    var fg = ForegroundExecutor.init(testing.allocator, {});
+    defer fg.deinit();
+    try testing.expectEqual(@as(?u64, null), fg.idle_time_remaining());
+    var t = fg.spawn_when_idle(null, add, .{ 2, 2 });
+    try testing.expect(!t.is_ready());
+    _ = fg.run_pending();
+    try testing.expectEqual(@as(?i32, 4), t.get());
+}
+
+test "SendForegroundExecutor queues work from another thread" {
+    var fg = ForegroundExecutor.init(testing.allocator, {});
+    defer fg.deinit();
+    const send = fg.to_send();
+    const Off = struct {
+        fn spawn_from(s: SendForegroundExecutor, out: *?Task(i32)) void {
+            out.* = s.spawn(add, .{ 20, 22 });
+        }
+    };
+    var slot: ?Task(i32) = null;
+    const thread = try std.Thread.spawn(.{}, Off.spawn_from, .{ send, &slot });
+    thread.join();
+    try testing.expect(fg.has_pending());
+    _ = fg.run_pending();
+    try testing.expectEqual(@as(i32, 42), slot.?.get().?);
 }
 
 test "foreground spawn and run_pending" {
