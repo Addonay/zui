@@ -2125,6 +2125,8 @@ test "notifications: a response from the platform reaches the registered handler
     cx.app.dispatch_system_notification_response(.{ .tag = "t", .action_id = "open" });
     try std.testing.expectEqualStrings("t", Seen.tag[0..Seen.tag_len]);
     try std.testing.expectEqualStrings("open", Seen.action[0..Seen.action_len]);
+}
+
 /// A decoded image of one 1x1 frame per entry of `delays_ms` (a GIF has one such frame per picture).
 fn image_with_delays(allocator: std.mem.Allocator, delays_ms: []const u32) !*assets_mod.RenderImage {
     const frames = try allocator.alloc(assets_mod.Frame, delays_ms.len);
