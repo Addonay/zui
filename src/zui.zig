@@ -293,6 +293,7 @@ pub const KeyUpEvent = interactive.KeyUpEvent;
 pub const ModifiersChangedEvent = interactive.ModifiersChangedEvent;
 pub const PlatformInput = interactive.PlatformInput;
 pub const KeyBinding = keymap.KeyBinding;
+pub const KeystrokeEvent = app.KeystrokeEvent;
 pub const KeyContext = key_dispatch.KeyContext;
 pub const Action = action.Action;
 pub const ClipboardItem = platform.ClipboardItem;

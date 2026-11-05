@@ -558,6 +558,195 @@ test "actions: key binding dispatches to on_action on the focused element" {
     try std.testing.expectEqual(@as(usize, 1), state.saves);
 }
 
+fn wait_until_flushed(vcx: *VisualTestContext) !void {
+    for (0..200) |_| {
+        vcx.run_until_parked();
+        if (!vcx.window.has_pending_keystrokes()) return;
+        @import("../executor.zig").sleep_ns(5 * std.time.ns_per_ms);
+    }
+    return error.PendingInputNeverFlushed;
+}
+
+test "multi-stroke: a sequence runs its action and its keys reach nobody else" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("g s", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expect(vcx.window.has_pending_keystrokes());
+    try std.testing.expectEqual(@as(usize, 1), vcx.window.pending_input_keystrokes().?.len);
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, Editor.read_state, .{}).keys);
+
+    vcx.simulate_keystrokes("s");
+    const state = cx.read_entity(view, Editor.read_state, .{});
+    try std.testing.expectEqual(@as(usize, 1), state.saves);
+    try std.testing.expectEqual(@as(usize, 0), state.keys);
+    try std.testing.expect(!vcx.window.has_pending_keystrokes());
+}
+
+test "multi-stroke: a wrong second key replays the first, in order" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("g s", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g x");
+    const state = cx.read_entity(view, Editor.read_state, .{});
+    try std.testing.expectEqual(@as(usize, 0), state.saves);
+    try std.testing.expectEqual(@as(usize, 2), state.keys);
+    const last = view.read(cx.app);
+    try std.testing.expectEqualStrings("x", last.last_key[0..last.last_key_len]);
+    try std.testing.expect(!vcx.window.has_pending_keystrokes());
+}
+
+test "multi-stroke: a binding that is also a prefix fires after the timeout" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{ KeyBinding.new("g", Editor.Save{}, "Editor"), KeyBinding.new("g g", Editor.Outside{}, "Editor") });
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, Editor.read_state, .{}).saves);
+    try wait_until_flushed(vcx);
+    const state = cx.read_entity(view, Editor.read_state, .{});
+    try std.testing.expectEqual(@as(usize, 1), state.saves);
+    try std.testing.expectEqual(@as(usize, 0), state.keys);
+}
+
+test "multi-stroke: without a binding of its own a prefix waits for the next key" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("ctrl-k ctrl-c", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("ctrl-k");
+    @import("../executor.zig").sleep_ns(200 * std.time.ns_per_ms);
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.has_pending_keystrokes());
+    vcx.simulate_keystrokes("ctrl-c");
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+}
+
+test "multi-stroke: moving focus drops pending input" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("g s", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expect(vcx.window.has_pending_keystrokes());
+    vcx.window.blur();
+    try std.testing.expect(!vcx.window.has_pending_keystrokes());
+    view.read(cx.app).focus.focus(vcx.window);
+    vcx.simulate_keystrokes("s");
+    const state = cx.read_entity(view, Editor.read_state, .{});
+    try std.testing.expectEqual(@as(usize, 0), state.saves);
+    try std.testing.expectEqual(@as(usize, 1), state.keys);
+}
+
+const KeystrokeLog = struct {
+    var observed: usize = 0;
+    var last_had_action: bool = false;
+    var intercepted: usize = 0;
+    var stop: bool = false;
+    var pending_changes: usize = 0;
+
+    fn observe(event: *const app_mod.KeystrokeEvent, _: *Window, _: *App) void {
+        observed += 1;
+        last_had_action = event.action != null;
+    }
+    fn intercept(_: *const app_mod.KeystrokeEvent, window: *Window, _: *App) void {
+        intercepted += 1;
+        if (stop) window.stop_propagation();
+    }
+    fn pending_changed(_: *Window, _: *App) void {
+        pending_changes += 1;
+    }
+};
+
+test "keystroke observers see the action; interceptors run first and can stop bindings" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    KeystrokeLog.observed = 0;
+    KeystrokeLog.intercepted = 0;
+    KeystrokeLog.stop = false;
+    cx.app.bind_keys(&.{KeyBinding.new("cmd-s", Editor.Save{}, "Editor")});
+    _ = cx.app.observe_keystrokes(KeystrokeLog.observe);
+    const interceptor = cx.app.intercept_keystrokes(KeystrokeLog.intercept);
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("cmd-s");
+    try std.testing.expectEqual(@as(usize, 1), KeystrokeLog.observed);
+    try std.testing.expect(KeystrokeLog.last_had_action);
+    try std.testing.expectEqual(@as(usize, 1), KeystrokeLog.intercepted);
+
+    vcx.simulate_keystrokes("a");
+    try std.testing.expectEqual(@as(usize, 2), KeystrokeLog.observed);
+    try std.testing.expect(!KeystrokeLog.last_had_action);
+
+    KeystrokeLog.stop = true;
+    vcx.simulate_keystrokes("cmd-s");
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+
+    KeystrokeLog.stop = false;
+    interceptor.unsubscribe();
+    vcx.simulate_keystrokes("cmd-s");
+    try std.testing.expectEqual(@as(usize, 2), cx.read_entity(view, Editor.read_state, .{}).saves);
+    try std.testing.expectEqual(@as(usize, 3), KeystrokeLog.intercepted);
+}
+
+test "pending input observers run as a sequence starts and ends" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    KeystrokeLog.pending_changes = 0;
+    cx.app.bind_keys(&.{KeyBinding.new("g s", Editor.Save{}, "Editor")});
+    _, const vcx = cx.add_window_view(Editor.build);
+    _ = cx.app.observe_pending_input(vcx.window, KeystrokeLog.pending_changed);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expectEqual(@as(usize, 1), KeystrokeLog.pending_changes);
+    vcx.simulate_keystrokes("s");
+    try std.testing.expectEqual(@as(usize, 2), KeystrokeLog.pending_changes);
+}
+
+test "a modifier tapped alone is a keystroke; used with another key it is not" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("shift", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const send = struct {
+        fn modifiers(w: *Window, app: *App, shift: bool, control: bool) void {
+            _ = w.dispatch_event(.{ .modifiers_changed = .{ .modifiers = .{ .shift = shift, .control = control } } }, app);
+        }
+    }.modifiers;
+
+    send(vcx.window, cx.app, true, false);
+    send(vcx.window, cx.app, false, false);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+
+    send(vcx.window, cx.app, true, false);
+    vcx.simulate_keystrokes("shift-a");
+    send(vcx.window, cx.app, false, false);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+
+    send(vcx.window, cx.app, true, false);
+    send(vcx.window, cx.app, true, true);
+    send(vcx.window, cx.app, false, false);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+}
+
 test "actions: dispatch_action reaches on_action on the focus path" {
     var cx = TestAppContext.init();
     defer cx.deinit();

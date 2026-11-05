@@ -14,6 +14,7 @@ const text_system_mod = @import("text_system.zig");
 const executor_mod = @import("executor.zig");
 const keymap_mod = @import("keymap.zig");
 const action_mod = @import("action.zig");
+const keystroke_mod = @import("keystroke.zig");
 const assets_mod = @import("assets.zig");
 const uniform_list_mod = @import("elements/uniform_list.zig");
 const list_mod = @import("elements/list.zig");
@@ -371,6 +372,44 @@ pub fn Context(comptime T: type) type {
         }
 
         /// Observes global `G`: `f(this, cx)` runs when it changes.
+        /// Runs `f(this, event, window, cx)` after any keystroke has been handled.
+        pub fn observe_keystrokes(self: *Self, comptime f: anytype) Subscription {
+            return self.keystroke_subscriber(KeystrokeObserverKey, f);
+        }
+
+        /// Runs `f(this, event, window, cx)` before a keystroke is handled.
+        pub fn intercept_keystrokes(self: *Self, comptime f: anytype) Subscription {
+            return self.keystroke_subscriber(KeystrokeInterceptorKey, f);
+        }
+
+        fn keystroke_subscriber(self: *Self, comptime Key: type, comptime f: anytype) Subscription {
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                    const id = EntityId.from_u64(ctx);
+                    const state = app.entities.get(id) orelse return false;
+                    const p: *const KeystrokePayload = @ptrCast(@alignCast(payload.?));
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    f(@as(*T, @ptrCast(@alignCast(state))), p.event, p.window, &c);
+                    return true;
+                }
+            };
+            return self.app.add_global_observer(type_id(Key), self.entity_id_.as_u64(), S.call);
+        }
+
+        /// Runs `f(this, window, cx)` when `window`'s pending keystrokes change.
+        pub fn observe_pending_input(self: *Self, window: *Window, comptime f: anytype) Subscription {
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                    const id = EntityId.from_u64(ctx);
+                    const state = app.entities.get(id) orelse return false;
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    f(@as(*T, @ptrCast(@alignCast(state))), @constCast(@as(*const Window, @ptrCast(@alignCast(payload.?)))), &c);
+                    return true;
+                }
+            };
+            return self.app.add_subscriber(.{ .kind = .global, .emitter = @intFromPtr(window), .event_type = type_id(PendingInputObserverKey), .ctx = self.entity_id_.as_u64(), .func = S.call, .id = 0 });
+        }
+
         pub fn observe_global(self: *Self, comptime G: type, comptime f: anytype) Subscription {
             const S = struct {
                 fn call(app: *App, _: EntityId, ctx: usize, _: ?*const anyopaque) bool {
@@ -572,6 +611,19 @@ pub const Subscription = struct {
 
 // ---------------------------------------------------------------------------
 // Effects.
+
+/// What a keystroke did (GPUI `KeystrokeEvent`). Valid during the call.
+pub const KeystrokeEvent = struct {
+    keystroke: keystroke_mod.Keystroke,
+    /// The action it resolved to. Always null for interceptors, which run first.
+    action: ?action_mod.AnyAction = null,
+    context_stack: []const keymap_mod.KeyContext = &.{},
+};
+
+const KeystrokeObserverKey = struct {};
+const KeystrokeInterceptorKey = struct {};
+const PendingInputObserverKey = struct {};
+const KeystrokePayload = struct { event: *const KeystrokeEvent, window: *Window };
 
 const Effect = union(enum) {
     notify: EntityId,
@@ -982,6 +1034,67 @@ pub const App = struct {
     }
 
     /// Observes global `G` from outside an entity: `f(cx)`.
+    /// Runs `f(event, window, cx)` after any keystroke in any window has been handled.
+    pub fn observe_keystrokes(self: *App, comptime f: anytype) Subscription {
+        return self.add_keystroke_subscriber(KeystrokeObserverKey, f);
+    }
+
+    /// Runs `f(event, window, cx)` before a keystroke is handled. `window.stop_propagation()`
+    /// keeps it from matching key bindings.
+    pub fn intercept_keystrokes(self: *App, comptime f: anytype) Subscription {
+        return self.add_keystroke_subscriber(KeystrokeInterceptorKey, f);
+    }
+
+    fn add_keystroke_subscriber(self: *App, comptime Key: type, comptime f: anytype) Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const p: *const KeystrokePayload = @ptrCast(@alignCast(payload.?));
+                f(p.event, p.window, app);
+                return true;
+            }
+        };
+        return self.add_global_observer(type_id(Key), 0, S.call);
+    }
+
+    pub fn dispatch_keystroke_observers(self: *App, event: *const KeystrokeEvent, window: *Window) void {
+        self.fire_keystroke_subscribers(KeystrokeObserverKey, event, window);
+    }
+
+    pub fn dispatch_keystroke_interceptors(self: *App, event: *const KeystrokeEvent, window: *Window) void {
+        self.fire_keystroke_subscribers(KeystrokeInterceptorKey, event, window);
+    }
+
+    fn fire_keystroke_subscribers(self: *App, comptime Key: type, event: *const KeystrokeEvent, window: *Window) void {
+        const payload: KeystrokePayload = .{ .event = event, .window = window };
+        var i: usize = 0;
+        // By index: a callback may subscribe.
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != .global or sub.event_type != type_id(Key)) continue;
+            if (!sub.func(self, EntityId.from_u64(0), sub.ctx, &payload)) self.subscribers.items[i].active = false;
+        }
+    }
+
+    /// Runs `f(window, cx)` when `window`'s pending keystrokes change.
+    pub fn observe_pending_input(self: *App, window: *Window, comptime f: anytype) Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                f(@constCast(@as(*const Window, @ptrCast(@alignCast(payload.?)))), app);
+                return true;
+            }
+        };
+        return self.add_subscriber(.{ .kind = .global, .emitter = @intFromPtr(window), .event_type = type_id(PendingInputObserverKey), .ctx = 0, .func = S.call, .id = 0 });
+    }
+
+    pub fn dispatch_pending_input_observers(self: *App, window: *Window) void {
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != .global or sub.emitter != @intFromPtr(window) or sub.event_type != type_id(PendingInputObserverKey)) continue;
+            if (!sub.func(self, EntityId.from_u64(0), sub.ctx, window)) self.subscribers.items[i].active = false;
+        }
+    }
+
     pub fn observe_global(self: *App, comptime G: type, comptime f: anytype) Subscription {
         const S = struct {
             fn call(app: *App, _: EntityId, _: usize, _: ?*const anyopaque) bool {
