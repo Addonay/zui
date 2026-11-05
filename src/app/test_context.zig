@@ -2735,7 +2735,7 @@ test "use_asset: a load runs once per source, even across frames" {
         vcx.run_until_parked();
     }
     try std.testing.expect(SlowView.renders >= 5);
-    try std.testing.expectEqual(@as(u32, 1), Slow.starts.load(.acquire));
+    try Slow.wait_for_starts(1);
 
     Slow.gate.store(true, .release);
     try pump_until(vcx, slow_view_has_value);
