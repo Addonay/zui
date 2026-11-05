@@ -119,7 +119,7 @@ third_party/             stb_image, nanosvg, images.c shim
   (installed at `~/tools/zig-x86_64-linux-0.17.0`, symlinked to `/usr/local/bin/zig`).
   Note: Zig 0.17 changed a lot vs older versions — see §9.
 - `build.zig.zon` dependencies:
-  - `cozmic` — `git+https://github.com/Addonay/cozmic.git#97192f9a4582d4f52f8041155673fcac4136e203`
+  - `cozmic` — `git+https://github.com/Addonay/cozmic.git#9863c0e605a1549127d281b5215c086573d7799f`
     (its own deps: ezi_code, harfbuzz 14.1.0, freetype 2.14.3, zlib 1.3.1, libpng 1.6.50)
   - `zafi` — `git+https://github.com/Addonay/zafi.git#04086f7a21f120a5ea52f921fb2034d75e10264f`
   - `sokol_tools_bin` (lazy) — the `sokol-shdc` binaries, fetched only by
