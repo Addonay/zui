@@ -283,6 +283,7 @@ const KeyDownEvent = interactive.KeyDownEvent;
 const FocusHandle = window_mod.FocusHandle;
 const div = div_mod.div;
 const canvas_mod = @import("../elements/canvas.zig");
+const style_cursor = @import("../style.zig").CursorStyle;
 const img_mod = @import("../elements/img.zig");
 const assets_mod = @import("../assets.zig");
 const element_mod = @import("../element.zig");
@@ -1775,6 +1776,54 @@ fn start_drag(vcx: *VisualTestContext) void {
     vcx.run_until_parked();
 }
 
+const ResizeHandle = struct {
+    fn make_preview(_: *const u8, _: Point(Pixels), _: *Window, app: *App) Entity(Empty) {
+        return app.new(Empty{});
+    }
+    const Empty = struct {
+        pub fn render(_: *Empty, _: *Window, _: *Context(Empty)) *Div {
+            return div();
+        }
+    };
+    pub fn render(_: *ResizeHandle, _: *Window, _: *Context(ResizeHandle)) *Div {
+        const value: u8 = 0;
+        return div().size_full().cursor_text().child(
+            div().id("resize-handle").w(px(4)).h_full().cursor_col_resize().on_drag(value, make_preview),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(ResizeHandle) {
+        return app.new(ResizeHandle{});
+    }
+};
+
+// GPUI `test_drag_cursor_applies_before_next_paint`.
+test "drag: its cursor applies before the next paint, and ends with it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(ResizeHandle.build);
+    vcx.run_until_parked();
+    const hp: *headless.HeadlessPlatform = @fieldParentPtr("platform", cx.platform);
+    const window = vcx.window;
+    const on_handle: Point(Pixels) = .{ .x = 1, .y = 10 };
+    const away: Point(Pixels) = .{ .x = 20, .y = 10 };
+
+    // Dispatched directly, because pumping would paint a frame and hide the bug.
+    _ = window.dispatch_event(.{ .mouse_move = .{ .position = on_handle } }, cx.app);
+    try std.testing.expectEqual(style_cursor.resize_column, hp.cursor);
+    _ = window.dispatch_event(.{ .mouse_down = .{ .position = on_handle, .button = .left } }, cx.app);
+    _ = window.dispatch_event(.{ .mouse_move = .{ .position = away, .pressed_button = .left } }, cx.app);
+    try std.testing.expect(cx.app.has_active_drag());
+    // The pointer is over the text area now, and the frame has not been painted again.
+    try std.testing.expectEqual(style_cursor.resize_column, hp.cursor);
+
+    vcx.run_until_parked();
+    try std.testing.expectEqual(style_cursor.resize_column, hp.cursor);
+    _ = window.dispatch_event(.{ .mouse_up = .{ .position = away, .button = .left } }, cx.app);
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    try std.testing.expectEqual(style_cursor.i_beam, hp.cursor);
+}
+
 test "drag: dropping on a target delivers the value and ends the drag" {
     var cx = TestAppContext.init();
     defer cx.deinit();
@@ -3065,4 +3114,572 @@ test "input: a view without the optional methods gets GPUI's defaults" {
     try std.testing.expect(handler.text_input_editable_range(vcx.window, cx.app) == null);
     handler.set_selected_text_range(.{ .start = 0, .end = 1 }, vcx.window, cx.app);
     try std.testing.expectEqual(platform_mod.TextInputAction.unspecified, handler.text_input_configuration(vcx.window, cx.app).input_action);
+}
+
+// ---------------------------------------------------------------------------
+// Context (GPUI `app/context.rs`): observers, releases, globals, deferred work,
+// focus listeners, quit hooks, and the async contexts that go with them.
+
+/// An entity that observes itself and can be told to stop.
+const SelfWatch = struct {
+    value: usize = 0,
+    self_seen: usize = 0,
+    sub: ?app_mod.Subscription = null,
+
+    fn watch(self: *SelfWatch, cx: *Context(SelfWatch)) void {
+        self.sub = cx.observe_self(on_change);
+    }
+    fn on_change(self: *SelfWatch, _: *Context(SelfWatch)) void {
+        self.self_seen += 1;
+    }
+    fn stop(self: *SelfWatch, _: *Context(SelfWatch)) void {
+        if (self.sub) |s| s.unsubscribe();
+        self.sub = null;
+    }
+    fn bump(self: *SelfWatch, cx: *Context(SelfWatch)) void {
+        self.value += 1;
+        cx.notify();
+    }
+};
+
+test "context: observe_self runs on each notify, until it is unsubscribed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const watch = cx.new(SelfWatch{});
+    cx.update_entity(watch, SelfWatch.watch, .{});
+    cx.update_entity(watch, SelfWatch.bump, .{});
+    cx.update_entity(watch, SelfWatch.bump, .{});
+    try std.testing.expectEqual(@as(usize, 2), watch.read(cx.app).self_seen);
+    cx.update_entity(watch, SelfWatch.stop, .{});
+    cx.update_entity(watch, SelfWatch.bump, .{});
+    try std.testing.expectEqual(@as(usize, 2), watch.read(cx.app).self_seen);
+    try std.testing.expectEqual(@as(usize, 3), watch.read(cx.app).value);
+}
+
+/// An entity that emits, and subscribes to its own events.
+const Chatty = struct {
+    pub const Event = struct { amount: usize };
+    received: usize = 0,
+    sub: ?app_mod.Subscription = null,
+
+    fn watch(self: *Chatty, cx: *Context(Chatty)) void {
+        self.sub = cx.subscribe_self(on_event);
+    }
+    fn on_event(self: *Chatty, ev: *const Event, _: *Context(Chatty)) void {
+        self.received += ev.amount;
+    }
+    fn say(_: *Chatty, cx: *Context(Chatty)) void {
+        cx.emit(.{ .amount = 2 });
+    }
+    fn stop(self: *Chatty, _: *Context(Chatty)) void {
+        if (self.sub) |s| s.unsubscribe();
+        self.sub = null;
+    }
+};
+
+test "context: subscribe_self receives the entity's own events, until unsubscribed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const chatty = cx.new(Chatty{});
+    cx.update_entity(chatty, Chatty.watch, .{});
+    cx.update_entity(chatty, Chatty.say, .{});
+    cx.update_entity(chatty, Chatty.say, .{});
+    try std.testing.expectEqual(@as(usize, 4), chatty.read(cx.app).received);
+    cx.update_entity(chatty, Chatty.stop, .{});
+    cx.update_entity(chatty, Chatty.say, .{});
+    try std.testing.expectEqual(@as(usize, 4), chatty.read(cx.app).received);
+}
+
+const ReleaseTarget = struct {
+    id: u8 = 0,
+};
+
+/// Watches another entity's release, and can stop watching.
+const Mourner = struct {
+    released: usize = 0,
+    sub: ?app_mod.Subscription = null,
+
+    fn watch(self: *Mourner, target: Entity(ReleaseTarget), cx: *Context(Mourner)) void {
+        self.sub = cx.observe_release(target, on_released);
+    }
+    fn on_released(self: *Mourner, released: *ReleaseTarget, _: *Context(Mourner)) void {
+        if (released.id == 9) self.released += 1;
+    }
+    fn stop(self: *Mourner, _: *Context(Mourner)) void {
+        if (self.sub) |s| s.unsubscribe();
+        self.sub = null;
+    }
+};
+
+test "context: observe_release runs once when the entity is released, and not after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const target = cx.new(ReleaseTarget{ .id = 9 });
+    const other = cx.new(ReleaseTarget{ .id = 9 });
+    const mourner = cx.new(Mourner{});
+    cx.update_entity(mourner, Mourner.watch, .{target});
+    // A second mourner that stops before the release must hear nothing.
+    const quiet = cx.new(Mourner{});
+    cx.update_entity(quiet, Mourner.watch, .{other});
+    cx.update_entity(quiet, Mourner.stop, .{});
+
+    target.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), mourner.read(cx.app).released);
+    other.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), quiet.read(cx.app).released);
+}
+
+/// A view that watches things in its window: another entity, a global, and its own release.
+const WindowWatch = struct {
+    window_calls: usize = 0,
+    window_matches: bool = false,
+    sub_a: ?app_mod.Subscription = null,
+    sub_b: ?app_mod.Subscription = null,
+    sub_global: ?app_mod.Subscription = null,
+    expected: ?*Window = null,
+
+    pub fn render(_: *WindowWatch, _: *Window, _: *Context(WindowWatch)) *Div {
+        return div().size_full();
+    }
+
+    fn build(window: *Window, app: *App) Entity(WindowWatch) {
+        return app.new(WindowWatch{ .expected = window });
+    }
+
+    fn note(self: *WindowWatch, window: *Window) void {
+        self.window_calls += 1;
+        self.window_matches = self.window_matches or window == self.expected.?;
+    }
+
+    fn watch_release_in(self: *WindowWatch, a: Entity(ReleaseTarget), b: Entity(ReleaseTarget), window: *Window, cx: *Context(WindowWatch)) void {
+        self.sub_a = cx.observe_release_in(a, window, on_release_a);
+        self.sub_b = cx.observe_release_in(b, window, on_release_a);
+        if (self.sub_b) |s| s.unsubscribe();
+        self.sub_b = null;
+    }
+    fn on_release_a(self: *WindowWatch, _: *ReleaseTarget, window: *Window, _: *Context(WindowWatch)) void {
+        self.note(window);
+    }
+
+    fn watch_global(self: *WindowWatch, window: *Window, cx: *Context(WindowWatch)) void {
+        self.sub_global = cx.observe_global_in(Setting, window, on_global);
+    }
+    fn on_global(self: *WindowWatch, window: *Window, _: *Context(WindowWatch)) void {
+        self.note(window);
+    }
+    fn stop_global(self: *WindowWatch, _: *Context(WindowWatch)) void {
+        if (self.sub_global) |s| s.unsubscribe();
+        self.sub_global = null;
+    }
+};
+
+const Setting = struct { n: u32 = 0 };
+
+test "context: observe_release_in and observe_global_in run with their window, and stop when unsubscribed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(WindowWatch.build);
+    const a = cx.new(ReleaseTarget{ .id = 1 });
+    const b = cx.new(ReleaseTarget{ .id = 2 });
+    cx.update_entity(view, WindowWatch.watch_release_in, .{ a, b, vcx.window });
+
+    // Released with its window open: runs once, with that window.
+    a.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).window_calls);
+    try std.testing.expect(view.read(cx.app).window_matches);
+    // The second watch was unsubscribed before its release, so it never ran.
+    b.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).window_calls);
+
+    // The global observer runs on each change, with the window, until it is unsubscribed.
+    cx.update_entity(view, WindowWatch.watch_global, .{ vcx.window });
+    cx.app.set_global(Setting{ .n = 1 });
+    cx.app.set_global(Setting{ .n = 2 });
+    try std.testing.expectEqual(@as(usize, 3), view.read(cx.app).window_calls);
+    cx.update_entity(view, WindowWatch.stop_global, .{});
+    cx.app.set_global(Setting{ .n = 3 });
+    try std.testing.expectEqual(@as(usize, 3), view.read(cx.app).window_calls);
+}
+
+/// Observes another entity with its window (GPUI `observe_in`).
+const ObserveIn = struct {
+    calls: usize = 0,
+    saw_window: ?*Window = null,
+    sub: ?app_mod.Subscription = null,
+
+    pub fn render(_: *ObserveIn, _: *Window, _: *Context(ObserveIn)) *Div {
+        return div().size_full();
+    }
+    fn watch(self: *ObserveIn, target: Entity(ReleaseTarget), window: *Window, cx: *Context(ObserveIn)) void {
+        self.sub = cx.observe_in(target, window, on_change);
+    }
+    fn on_change(self: *ObserveIn, _: Entity(ReleaseTarget), window: *Window, _: *Context(ObserveIn)) void {
+        self.calls += 1;
+        self.saw_window = window;
+    }
+    fn stop(self: *ObserveIn, _: *Context(ObserveIn)) void {
+        if (self.sub) |s| s.unsubscribe();
+        self.sub = null;
+    }
+    fn build(_: *Window, app: *App) Entity(ObserveIn) {
+        return app.new(ObserveIn{});
+    }
+};
+
+test "context: observe_in runs when the observed entity notifies, with the window it was given" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ObserveIn.build);
+    const target = cx.new(ReleaseTarget{});
+    cx.update_entity(view, ObserveIn.watch, .{ target, vcx.window });
+    cx.update_entity(target, struct {
+        fn poke(_: *ReleaseTarget, c: *Context(ReleaseTarget)) void {
+            c.notify();
+        }
+    }.poke, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).calls);
+    try std.testing.expectEqual(vcx.window, view.read(cx.app).saw_window.?);
+    cx.update_entity(view, ObserveIn.stop, .{});
+    cx.update_entity(target, struct {
+        fn poke(_: *ReleaseTarget, c: *Context(ReleaseTarget)) void {
+            c.notify();
+        }
+    }.poke, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).calls);
+}
+
+/// Defers work to the end of an update, with its window (GPUI `defer_in`).
+const Deferred = struct {
+    ran: usize = 0,
+    ran_with_window: bool = false,
+
+    pub fn render(_: *Deferred, _: *Window, _: *Context(Deferred)) *Div {
+        return div().size_full();
+    }
+    fn build(_: *Window, app: *App) Entity(Deferred) {
+        return app.new(Deferred{});
+    }
+    fn start(self: *Deferred, window: *Window, cx: *Context(Deferred)) void {
+        self.ran = 0;
+        cx.defer_in(window, finish);
+    }
+    fn finish(self: *Deferred, window: *Window, _: *Context(Deferred)) void {
+        self.ran += 1;
+        self.ran_with_window = window.handle_id == 0;
+    }
+};
+
+test "context: defer_in runs at the end of the update, with the window" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Deferred.build);
+    cx.update_entity(view, Deferred.start, .{vcx.window});
+    // The update has ended, so the deferred work has run exactly once.
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).ran);
+    try std.testing.expect(view.read(cx.app).ran_with_window);
+}
+
+/// Holds two focus handles, one inside the other, and a sibling (GPUI focus listeners).
+const FocusWatch = struct {
+    outer: window_mod.FocusHandle,
+    inner: window_mod.FocusHandle,
+    other: window_mod.FocusHandle,
+    focused: usize = 0,
+    blurred: usize = 0,
+    focus_in: usize = 0,
+    focus_out: usize = 0,
+    focus_out_blurred_inner: bool = false,
+    lost: usize = 0,
+    lost_unsubscribed: usize = 0,
+    lost_sub: ?app_mod.Subscription = null,
+
+    pub fn render(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) *Div {
+        return div().size_full()
+            .child(div().id("outer").size(px(100)).track_focus(&self.outer).child(div().id("inner").size(px(20)).track_focus(&self.inner)))
+            .child(div().id("other").size(px(100)).track_focus(&self.other));
+    }
+
+    fn build(_: *Window, app: *App) Entity(FocusWatch) {
+        return app.new(FocusWatch{ .outer = app.focus_handle(), .inner = app.focus_handle(), .other = app.focus_handle() });
+    }
+
+    fn watch(self: *FocusWatch, window: *Window, cx: *Context(FocusWatch)) void {
+        _ = cx.on_focus(self.outer, window, on_focused);
+        _ = cx.on_blur(self.outer, window, on_blurred);
+        _ = cx.on_focus_in(self.outer, window, on_focus_in);
+        _ = cx.on_focus_out(self.outer, window, on_focus_out);
+        _ = cx.on_focus_lost(window, on_lost);
+        self.lost_sub = cx.on_focus_lost(window, on_lost_unsubscribed);
+        if (self.lost_sub) |s| s.unsubscribe();
+        self.lost_sub = null;
+    }
+    fn on_focused(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) void {
+        self.focused += 1;
+    }
+    fn on_blurred(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) void {
+        self.blurred += 1;
+    }
+    fn on_focus_in(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) void {
+        self.focus_in += 1;
+    }
+    fn on_focus_out(self: *FocusWatch, event: app_mod.FocusOutEvent, _: *Window, _: *Context(FocusWatch)) void {
+        self.focus_out += 1;
+        self.focus_out_blurred_inner = event.blurred.id == self.inner.id;
+    }
+    fn on_lost(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) void {
+        self.lost += 1;
+    }
+    fn on_lost_unsubscribed(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) void {
+        self.lost_unsubscribed += 1;
+    }
+};
+
+test "context: focus listeners fire on the focus changes they are for, and only those" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(FocusWatch.build);
+    cx.update_entity(view, FocusWatch.watch, .{vcx.window});
+    const s = view.read(cx.app);
+    const outer = s.outer;
+    const inner = s.inner;
+    const other = s.other;
+
+    // Focus moves into the inner handle. `outer` gains focus from its subtree (on_focus_in), but
+    // the focused element is `inner`, so on_focus(outer) must not fire.
+    vcx.focus(inner);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).focus_in);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).focused);
+
+    // Focus moves to a sibling: `outer` loses focus through its descendant. on_focus_out reports
+    // the element that lost it, the inner handle, and on_blur(outer) does not fire.
+    vcx.focus(other);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).focus_out);
+    try std.testing.expect(view.read(cx.app).focus_out_blurred_inner);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).blurred);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).focus_in);
+
+    // Focus returns to `outer` itself: on_focus fires, and on_focus_in fires again.
+    vcx.focus(outer);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).focused);
+    try std.testing.expectEqual(@as(usize, 2), view.read(cx.app).focus_in);
+
+    // Nothing focused any more: on_blur(outer) and on_focus_lost fire, and the unsubscribed
+    // listener stays silent.
+    vcx.window.blur();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).blurred);
+    try std.testing.expectEqual(@as(usize, 2), view.read(cx.app).focus_out);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).lost);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).lost_unsubscribed);
+}
+
+/// Entity with a quit hook, and a second one that unsubscribes before the quit.
+const Quitter = struct {
+    quits: usize = 0,
+    sub: ?app_mod.Subscription = null,
+
+    fn watch(self: *Quitter, cx: *Context(Quitter)) void {
+        self.sub = cx.on_app_quit(on_quit);
+    }
+    fn on_quit(self: *Quitter, _: *Context(Quitter)) void {
+        self.quits += 1;
+    }
+    fn stop(self: *Quitter, _: *Context(Quitter)) void {
+        if (self.sub) |s| s.unsubscribe();
+        self.sub = null;
+    }
+};
+
+test "context: on_app_quit runs once at shutdown, not on quit, and not after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const kept = cx.new(Quitter{});
+    cx.update_entity(kept, Quitter.watch, .{});
+    const dropped = cx.new(Quitter{});
+    cx.update_entity(dropped, Quitter.watch, .{});
+    cx.update_entity(dropped, Quitter.stop, .{});
+
+    // quit asks the platform to stop; the hooks run at shutdown, when the loop has ended.
+    cx.app.quit();
+    try std.testing.expectEqual(@as(usize, 0), kept.read(cx.app).quits);
+    cx.app.shutdown();
+    try std.testing.expectEqual(@as(usize, 1), kept.read(cx.app).quits);
+    try std.testing.expectEqual(@as(usize, 0), dropped.read(cx.app).quits);
+    // Once only: a second shutdown does nothing.
+    cx.app.shutdown();
+    try std.testing.expectEqual(@as(usize, 1), kept.read(cx.app).quits);
+}
+
+/// A view that starts async work with its window (GPUI `spawn_in`).
+const Spawner = struct {
+    pub fn render(_: *Spawner, _: *Window, _: *Context(Spawner)) *Div {
+        return div().size_full();
+    }
+    fn build(_: *Window, app: *App) Entity(Spawner) {
+        return app.new(Spawner{});
+    }
+    fn start(_: *Spawner, window: *Window, cx: *Context(Spawner)) void {
+        var task = cx.spawn_in(window, Work.run, .{});
+        task.detach();
+    }
+};
+
+const Work = struct {
+    var calls: usize = 0;
+    var err: ?anyerror = null;
+
+    fn note(_: *Window, _: *App) void {
+        calls += 1;
+    }
+    fn run(_: app_mod.WeakEntity(Spawner), wcx: app_mod.AsyncWindowContext) void {
+        wcx.update(note, .{}) catch |e| {
+            err = e;
+            return;
+        };
+    }
+};
+
+test "context: spawn_in runs with a window context, which fails once the window is closed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    Work.calls = 0;
+    Work.err = null;
+
+    // The window is open when the work runs: its update reaches the window.
+    const view, const vcx = cx.add_window_view(Spawner.build);
+    cx.update_entity(view, Spawner.start, .{vcx.window});
+    cx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), Work.calls);
+    try std.testing.expectEqual(@as(?anyerror, null), Work.err);
+
+    // Closed before the work runs: the update fails instead of touching a dead window.
+    const view2, const vcx2 = cx.add_window_view(Spawner.build);
+    cx.update_entity(view2, Spawner.start, .{vcx2.window});
+    cx.app.close_window(vcx2.window);
+    cx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), Work.calls);
+    try std.testing.expectEqual(@as(?anyerror, error.WindowClosed), Work.err);
+}
+
+/// Counts the entities created after it is set up (GPUI `observe_new`).
+const NewProbe = struct {
+    var seen: usize = 0;
+    var seen_without_window: usize = 0;
+
+    fn on_new(m: *Model, window: ?*Window, _: *Context(Model)) void {
+        seen += 1;
+        if (window == null) seen_without_window += 1;
+        m.value = 5;
+    }
+};
+
+test "app: observe_new runs for each new entity of the type, until unsubscribed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    NewProbe.seen = 0;
+    NewProbe.seen_without_window = 0;
+    const sub = cx.app.observe_new(Model, NewProbe.on_new);
+    const first = cx.new(Model{});
+    try std.testing.expectEqual(@as(usize, 5), first.read(cx.app).value);
+    _ = cx.new(Model{});
+    try std.testing.expectEqual(@as(usize, 2), NewProbe.seen);
+    try std.testing.expectEqual(@as(usize, 2), NewProbe.seen_without_window);
+    sub.unsubscribe();
+    _ = cx.new(Model{});
+    try std.testing.expectEqual(@as(usize, 2), NewProbe.seen);
+}
+
+test "entities: AnyWeakEntity upgrades while the entity lives, and not after release" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const model = cx.new(Model{});
+    const weak = model.into_any().downgrade();
+    try std.testing.expect(weak.is_upgradable(cx.app));
+    try std.testing.expect(weak.upgrade(cx.app) != null);
+    try std.testing.expect(weak.downcast(Model) != null);
+    try std.testing.expect(weak.downcast(Chatty) == null);
+    model.release(cx.app);
+    try std.testing.expect(!weak.is_upgradable(cx.app));
+    try std.testing.expect(weak.upgrade(cx.app) == null);
+}
+
+test "app: quit mode decides whether closing the last window quits" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const quit_requested = struct {
+        fn get(c: *TestAppContext) bool {
+            return headless.HeadlessPlatform.from(c.platform).quit_requested;
+        }
+    }.get;
+
+    // Explicit: closing the last window never quits by itself.
+    cx.app.set_quit_mode(.explicit);
+    _, const first = cx.add_window_view(WindowWatch.build);
+    cx.app.close_window(first.window);
+    try std.testing.expect(!quit_requested(&cx));
+
+    // last_window_closed: quits on every platform.
+    cx.app.set_quit_mode(.last_window_closed);
+    _, const second = cx.add_window_view(WindowWatch.build);
+    cx.app.close_window(second.window);
+    try std.testing.expect(quit_requested(&cx));
+}
+
+test "app: find_display returns the display with that id, or null" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const displays = cx.app.displays();
+    try std.testing.expect(displays.len > 0);
+    const found = cx.app.find_display(displays[0].id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(displays[0].id, found.id);
+    try std.testing.expect(cx.app.find_display(displays[0].id +% 1000) == null);
+}
+
+test "async: read_global reads a set global and fails while it is unset" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Read = struct {
+        fn get(s: *const Setting, _: *App) u32 {
+            return s.n;
+        }
+    };
+    const async_app = cx.app.to_async();
+    try std.testing.expectError(error.GlobalNotFound, async_app.read_global(Setting, Read.get, .{}));
+    try std.testing.expectEqual(@as(?u32, null), async_app.try_read_global(Setting, Read.get, .{}));
+    cx.app.set_global(Setting{ .n = 4 });
+    try std.testing.expectEqual(@as(u32, 4), try async_app.read_global(Setting, Read.get, .{}));
+    try std.testing.expectEqual(@as(?u32, 4), async_app.try_read_global(Setting, Read.get, .{}));
+}
+
+test "app: global_mut returns the global for writing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.set_global(Setting{ .n = 1 });
+    cx.app.global_mut(Setting).n = 7;
+    try std.testing.expectEqual(@as(u32, 7), cx.app.global(Setting).n);
+}
+
+test "app: update_default_global sets the default first, then updates it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Bump = struct {
+        fn run(s: *Setting, _: *App) u32 {
+            s.n += 1;
+            return s.n;
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 1), cx.app.update_default_global(Setting, Bump.run));
+    try std.testing.expectEqual(@as(u32, 2), cx.app.update_default_global(Setting, Bump.run));
+}
+
+test "app: background_spawn runs on a worker and its result can be waited for" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Double = struct {
+        fn run(x: u32) u32 {
+            return x * 2;
+        }
+    };
+    var task = cx.app.background_spawn(Double.run, .{@as(u32, 21)});
+    try std.testing.expectEqual(@as(u32, 42), task.wait());
 }

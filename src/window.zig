@@ -21,6 +21,7 @@ const atlas_mod = @import("atlas.zig");
 const view_mod = @import("view.zig");
 const refineable = @import("refineable.zig");
 const prompts = @import("window/prompts.zig");
+const focus_events = @import("window/focus_events.zig");
 const assets_mod = @import("assets.zig");
 const image_cache_mod = @import("image_cache.zig");
 
@@ -264,11 +265,8 @@ pub const WeakFocusHandle = struct {
 /// Sent when a view wants its container to close (GPUI `DismissEvent`).
 pub const DismissEvent = struct {};
 
-/// Sent when a focus leaves an element (GPUI `FocusOutEvent`).
-pub const FocusOutEvent = struct {
-    /// The element that lost focus.
-    blurred: WeakFocusHandle,
-};
+/// Sent when a focus leaves an element (GPUI `FocusOutEvent`); defined with the focus listeners.
+pub const FocusOutEvent = focus_events.FocusOutEvent;
 
 /// Types that can be focused (GPUI `Focusable`): `fn focus_handle(self, cx) FocusHandle`.
 pub fn is_focusable(comptime T: type) bool {
@@ -1629,7 +1627,11 @@ pub const Window = struct {
         self.next_frame.focus = self.focus_id;
         self.next_frame.window_active = self.active;
 
+        // Focus listeners compare the focus path of the frame drawn now with the previous one.
+        const previous_focus = focus_events.focus_path(&self.rendered_frame, self.allocator);
+        const previous_active = self.rendered_frame.window_active;
         std.mem.swap(Frame, &self.rendered_frame, &self.next_frame);
+        focus_events.after_draw(self, cx, previous_focus, previous_active);
         self.text_system().finish_frame();
         std.mem.swap(std.AutoHashMapUnmanaged(EntityId, void), &self.rendered_entities, &self.next_rendered_entities);
         self.gc_element_states();
@@ -1712,7 +1714,12 @@ pub const Window = struct {
         }
     }
 
+    /// A drag can start before the next paint records its cursor in the frame, so it comes first.
     fn update_cursor(self: *Window) void {
+        if (self.app.active_drag_cursor_style()) |drag_style| {
+            self.app.platform.set_cursor_style(drag_style);
+            return;
+        }
         var style: CursorStyle = .arrow;
         var i = self.rendered_frame.cursor_styles.items.len;
         while (i > 0) {
@@ -1892,7 +1899,6 @@ pub const Window = struct {
                 if (!self.propagate_event) break;
             }
         }
-        if (E == interactive.MouseMoveEvent) self.update_cursor();
         // A drag follows the pointer, and any release no element took cancels it.
         if (cx.has_active_drag()) {
             if (E == interactive.MouseMoveEvent) {
@@ -1902,6 +1908,9 @@ pub const Window = struct {
                 self.refresh();
             }
         }
+        // After the listeners, so a drag they started or ended takes effect in this event. Any
+        // earlier would briefly select whatever is under the pointer (GPUI `dispatch_mouse_event`).
+        self.update_cursor();
     }
 
     /// The rendered frame is what events are matched against, so bring it up to date first.
