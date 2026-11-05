@@ -19,6 +19,7 @@ const text_system_mod = @import("text_system.zig");
 const atlas_mod = @import("atlas.zig");
 const view_mod = @import("view.zig");
 const refineable = @import("refineable.zig");
+const prompts = @import("window/prompts.zig");
 const assets_mod = @import("assets.zig");
 const image_cache_mod = @import("image_cache.zig");
 
@@ -47,6 +48,14 @@ pub const ContentMask = scene_mod.ContentMask;
 pub const DispatchPhase = key_dispatch.DispatchPhase;
 pub const KeyContext = key_dispatch.KeyContext;
 pub const AnyView = view_mod.AnyView;
+pub const PromptLevel = prompts.PromptLevel;
+pub const PromptButton = prompts.PromptButton;
+pub const PromptResponse = prompts.PromptResponse;
+pub const PromptHandle = prompts.PromptHandle;
+pub const RenderablePromptHandle = prompts.RenderablePromptHandle;
+pub const PromptBuilder = prompts.PromptBuilder;
+pub const FallbackPromptRenderer = prompts.FallbackPromptRenderer;
+pub const fallback_prompt_renderer = prompts.fallback_prompt_renderer;
 
 pub const WindowId = u32;
 
@@ -566,6 +575,10 @@ pub const Window = struct {
     title: []const u8 = "",
     should_close_handler: ?FrameCallback = null,
     appearance_: platform_mod.WindowAppearance = .light,
+    /// The prompt on screen, if any (GPUI `prompt`).
+    prompt_: ?prompts.ActivePrompt = null,
+    /// The bounds the bounds observers last saw; they run only when these change.
+    observed_bounds: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } },
 
     pub const FrameCallback = struct { ctx: *anyopaque, func: *const fn (*anyopaque, *Window, *App) void };
 
@@ -586,6 +599,7 @@ pub const Window = struct {
         self.scale_factor_ = pw.scale_factor();
         self.viewport_size = pw.content_size();
         self.appearance_ = pw.appearance();
+        self.observed_bounds = pw.bounds();
         if (options.titlebar) |t| if (t.title) |title| {
             self.title = title;
         };
@@ -596,6 +610,7 @@ pub const Window = struct {
             .active_status_change = onActiveStatusChange,
             .hover_status_change = onHoverStatusChange,
             .resize = onResize,
+            .moved = onMoved,
             .should_close = onShouldClose,
             .close = onClose,
             .appearance_changed = onAppearanceChanged,
@@ -606,6 +621,7 @@ pub const Window = struct {
     }
 
     pub fn destroy(self: *Window, app: *App) void {
+        self.close_prompt(app);
         // An entity that another open window now shows (moved between windows) outlives this one.
         if (self.root) |r| {
             if (!app.is_root_of_other_window(r.entity_id, self)) app.release_entity(r.entity_id);
@@ -716,6 +732,79 @@ pub const Window = struct {
     }
     pub fn appearance(self: *const Window) platform_mod.WindowAppearance {
         return self.appearance_;
+    }
+
+    /// Shows a prompt over the window with one button per answer (GPUI `prompt`). Answers are
+    /// strings read as GPUI reads them (`"OK"`, `"Cancel"`) or `PromptButton` values. When one is
+    /// chosen, `listener` (a `Listener(PromptResponse)` or a plain `fn(*const PromptResponse,
+    /// *Window, *App) void`) gets its index. A prompt that is replaced or whose window closes
+    /// is never answered. GPUI's Linux platforms have no native prompt, so this draws the fallback
+    /// unless the app set another builder with `App.set_prompt_builder`.
+    pub fn prompt(
+        self: *Window,
+        level: PromptLevel,
+        message: []const u8,
+        detail: ?[]const u8,
+        answers: anytype,
+        cx: *App,
+        listener: anytype,
+    ) void {
+        self.close_prompt(cx);
+        const gpa = self.allocator;
+        const arena = gpa.create(std.heap.ArenaAllocator) catch oom();
+        arena.* = .init(gpa);
+        const a = arena.allocator();
+        const buttons = prompts.copy_buttons(a, answers);
+        const text = a.dupe(u8, message) catch oom();
+        const detail_text: ?[]const u8 = if (detail) |d| (a.dupe(u8, d) catch oom()) else null;
+
+        const previous_focus = self.focus_id;
+        const builder = cx.prompt_builder orelse prompts.fallback_prompt_renderer;
+        const handle = builder(level, text, detail_text, buttons, .{ .window_id = self.handle_id }, self, cx);
+        self.prompt_ = .{
+            .handle = handle,
+            .listener = app_mod.to_listener(PromptResponse, listener),
+            .previous_focus = previous_focus,
+            .arena = arena,
+        };
+        self.refresh();
+    }
+
+    /// Whether a prompt drawn in this window is open (GPUI `has_active_prompt`). Platform
+    /// prompts are not drawn here, so they do not count.
+    pub fn has_active_prompt(self: *const Window) bool {
+        return self.prompt_ != null;
+    }
+
+    /// Drops the open prompt without an answer, as a replaced or closing window does.
+    fn close_prompt(self: *Window, app: *App) void {
+        const active = self.prompt_ orelse return;
+        self.prompt_ = null;
+        active.handle.subscription.unsubscribe();
+        app.release_entity(active.handle.view.entity_id);
+        prompts.free_arena(self.allocator, active.arena);
+    }
+
+    /// Runs `f(window, cx)` whenever the window moves or is resized (GPUI `observe_window_bounds`).
+    /// `Context.observe_window_bounds` does the same with an entity.
+    pub fn observe_window_bounds(self: *Window, comptime f: fn (*Window, *App) void) app_mod.Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const win: *Window = @ptrCast(@alignCast(@constCast(payload.?)));
+                f(win, app);
+                return true;
+            }
+        };
+        return self.app.add_window_subscriber(.window_bounds, self.handle_id, 0, S.call);
+    }
+
+    /// Compares the platform's bounds with the last ones seen, and tells the observers if they changed.
+    fn bounds_changed(self: *Window) void {
+        const now = self.platform_window.bounds();
+        if (now.origin.x == self.observed_bounds.origin.x and now.origin.y == self.observed_bounds.origin.y and
+            now.size.width == self.observed_bounds.size.width and now.size.height == self.observed_bounds.size.height) return;
+        self.observed_bounds = now;
+        self.app.dispatch_window_observers(.window_bounds, self);
     }
     pub fn text_system(self: *Window) *text_system_mod.TextSystem {
         return self.app.text_system();
@@ -1463,9 +1552,11 @@ pub const Window = struct {
                 .height = .{ .definite = self.viewport_size.height },
             }, self, cx);
             self.prepaint_deferred_draws(cx);
+            const prompt_element = self.prepaint_prompt(cx);
             const overlay = self.prepaint_overlay(cx);
             el.paint(self, cx);
             self.paint_deferred_draws(cx);
+            if (prompt_element) |p| p.paint(self, cx);
             if (overlay) |o| o.paint(self, cx);
         }
         cx.pending_updates -= 1;
@@ -1484,6 +1575,17 @@ pub const Window = struct {
         self.needs_present = true;
         // Effects queued during render (e.g. notify) are processed now.
         cx.flush_effects();
+    }
+
+    /// The prompt covers the window, over the root view and its deferred draws.
+    fn prepaint_prompt(self: *Window, cx: *App) ?element_mod.AnyElement {
+        const active = self.prompt_ orelse return null;
+        const el = active.handle.view.into_any_element();
+        el.prepaint_as_root(.{ .x = 0, .y = 0 }, .{
+            .width = .{ .definite = self.viewport_size.width },
+            .height = .{ .definite = self.viewport_size.height },
+        }, self, cx);
+        return el;
     }
 
     /// The dragged view follows the pointer, and hides any tooltip while it does.
@@ -2042,6 +2144,7 @@ pub const Window = struct {
         const self: *Window = @ptrCast(@alignCast(ctx));
         self.active = active;
         self.refresh();
+        self.app.dispatch_window_observers(.window_activation, self);
     }
 
     fn onHoverStatusChange(ctx: *anyopaque, hovered: bool) void {
@@ -2054,6 +2157,12 @@ pub const Window = struct {
         self.viewport_size = size;
         self.scale_factor_ = scale;
         self.refresh();
+        self.bounds_changed();
+    }
+
+    fn onMoved(ctx: *anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.bounds_changed();
     }
 
     fn onShouldClose(ctx: *anyopaque) bool {
