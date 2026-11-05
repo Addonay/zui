@@ -2639,6 +2639,15 @@ const Slow = struct {
         starts.store(0, .release);
         gate.store(open, .release);
     }
+
+    /// Loads run on workers, which may not have got to one yet when a frame has asked for it.
+    fn wait_for_starts(count: u32) !void {
+        for (0..5000) |_| {
+            if (starts.load(.acquire) >= count) break;
+            executor_mod.sleep_ns(std.time.ns_per_ms);
+        }
+        try std.testing.expectEqual(count, starts.load(.acquire));
+    }
 };
 
 /// An asset whose load always fails.
@@ -2708,7 +2717,7 @@ test "use_asset: none while loading, then the value once the window redraws" {
     SlowView.reset(4);
     _, const vcx = cx.add_window_view(SlowView.build);
     try std.testing.expectEqual(@as(?u32, null), SlowView.seen);
-    try std.testing.expectEqual(@as(u32, 1), Slow.starts.load(.acquire));
+    try Slow.wait_for_starts(1);
 
     Slow.gate.store(true, .release);
     try pump_until(vcx, slow_view_has_value);
@@ -2726,7 +2735,7 @@ test "use_asset: a load runs once per source, even across frames" {
         vcx.run_until_parked();
     }
     try std.testing.expect(SlowView.renders >= 5);
-    try std.testing.expectEqual(@as(u32, 1), Slow.starts.load(.acquire));
+    try Slow.wait_for_starts(1);
 
     Slow.gate.store(true, .release);
     try pump_until(vcx, slow_view_has_value);
@@ -2749,7 +2758,7 @@ test "remove_asset: the next use loads again, and an abandoned load is dropped" 
     try std.testing.expect(!cx.app.has_asset(Slow, 2));
     vcx.window.refresh();
     vcx.run_until_parked();
-    try std.testing.expectEqual(@as(u32, 2), Slow.starts.load(.acquire));
+    try Slow.wait_for_starts(2);
     try std.testing.expectEqual(@as(?u32, null), SlowView.seen);
 
     // Abandon that second load while it runs; its result must not come back into the cache.
