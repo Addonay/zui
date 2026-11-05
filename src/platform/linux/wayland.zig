@@ -1181,7 +1181,8 @@ fn pointerLeave(data: ?*anyopaque, _: *proto.Pointer, _: u32, surface: *proto.Su
     } });
     self.pointer_focus = null;
     self.pressed = null;
-    self.axis_frame = .{ .source = self.axis_frame.source };
+    const source = self.axis_frame.source;
+            self.axis_frame = .{ .source = source };
     w.base.emit_hover(false);
 }
 

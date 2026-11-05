@@ -55,7 +55,7 @@ GPUI's `hello_world.rs` (verified via headless snapshot).
 | div + Interactivity (hover/active/focus/in_focus styles, click, aux click, mouse/key/action listeners, scroll, pinch, groups, track_focus, key_context, drag and drop, file drop, tooltips) | done (pressure and back-gesture listeners, external drag payloads NOT yet) |
 | layout engine on zafi (`taffy.zig`, GPUI's TaffyLayoutEngine) | done |
 | text system on cozmic (shaping+fallback, two-frame line layout cache, LineWrapper, ShapedLine/WrappedLine, StyledText/InteractiveText) | done (some GPUI extras missing, see §8) |
-| keystroke, interactive events, keymap + context predicates, key_dispatch, actions | done (multi-keystroke pending replay, tab groups NOT yet) |
+| keystroke, interactive events, keymap + context predicates, key_dispatch, actions | done, incl. multi-keystroke bindings and keystroke observers (tab groups NOT yet) |
 | executor (Background/Foreground executors, Task(T)) | done (thread pool; no async/await) |
 | scene, bounds_tree, atlas (+CpuAtlas), path_builder | done |
 | CPU renderer (port of GPUI WGSL math; SIMD + multithreaded bands) | done |
@@ -232,7 +232,7 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 - **Mouse dispatch**: capture phase front-to-back over registered listeners,
   then bubble back-to-front, `stop_propagation` stops. Key/action dispatch walks
   the dispatch-tree path to the focused node (capture then bubble), keybindings
-  matched first via `Keymap.binding_for(keystroke, context_stack)`; unhandled
+  matched first via `key_dispatch.dispatch_key` (see multi-stroke bindings below); unhandled
   key-downs with `key_char` go to the platform input handler.
 - Key and action listeners are registered during **prepaint** (when the
   element's dispatch node is pushed), not paint as in GPUI — `element.zig`
@@ -291,8 +291,13 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   shows dead keys inline. Xlib's instantiate callback fires once per registration, so after a
   server dies reconnecting is retried once a second for a minute. Every event must go through
   `XFilterEvent`, also while no server is connected. Not done: `delete_surrounding_text` (we never
-  send surrounding text), content types such as password fields, `observe_keystrokes`,
-  `keyboard_layout`, multi-keystroke replay.
+  send surrounding text), content types such as password fields, `keyboard_layout`.
+- **Multi-stroke bindings**: `Window.dispatch_keystroke` follows GPUI's `dispatch_key_event`. A prefix
+  is held in `pending_keystrokes` (strings owned, since platform buffers are not stable) and its keys
+  reach nobody. A key that breaks the sequence replays what was held. It waits one second only if
+  the prefix is a binding of its own, a text field has focus, or it is a lone modifier; otherwise it
+  waits for the next key forever, as in GPUI. Moving focus drops it. Key events now redraw first
+  when the window is dirty, so they never match against a stale dispatch tree.
 - **X11 pointer and timing**: pointer events come from XInput2 when libXi and XI 2.1 are there,
   and from core events otherwise (selecting XI2 suppresses the core ones for that window). Wheels
   report both through valuators and as emulated buttons 4 to 7: the emulated ones are skipped, or
@@ -357,7 +362,7 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 2. Div: pressure and back-gesture listeners, long-press tooltips, external drag payloads
    (dragging out of the window), `cached` views. `with_animation` is not yet aliased on
    StyledElement (add `pub const with_animation = animation.AnimationExt(*Self).with_animation;` etc.).
-3. Input: multi-keystroke binding replay, tab groups, `Unbind`, `observe_keystrokes`,
+3. Input: tab groups, `Unbind`, `InputPreference`, pausing the pending-input timeout,
    `keyboard_layout` and its change observer, IME content types.
 4. Text: a text-presentation selector (`❤\u{fe0e}`) still draws the color glyph. Also ShapedLine cursor/split APIs, typographic bounds, font enumeration, `add_fonts`
    (every ported example skips GPUI's `load_fonts`), missing-glyph reporting.
@@ -385,6 +390,8 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 - Shadowing is an error: a local/param must not share a name with any decl in
   scope — with 3214 Styled aliases on `StyledElement`, names like `w`, `h`,
   `bg`, `m`, `p`, `active`, `text` cannot be used as locals inside it.
+- `x = .{ .a = x.b, .b = x.a }` writes through the result location: `.b` reads the new `.a`, so a swap
+  collapses both fields with no error. Copy to a local first or use `std.mem.swap`.
 - Optimize mode tags are lowercase (`.debug`).
 - `b.args` doesn't exist in `std.Build` (pass-through run args not wired).
 

@@ -403,6 +403,63 @@ pub fn outline(b: Bounds(Pixels), border_color: anytype, border_style: BorderSty
 // Window.
 
 /// A platform window and its UI state (GPUI `Window`).
+/// How long a partial multi-stroke binding that could also mean something now waits for its next
+/// key (GPUI `PENDING_INPUT_TIMEOUT`).
+const PENDING_INPUT_TIMEOUT_NS: u64 = if (@import("builtin").is_test) 100 * std.time.ns_per_ms else std.time.ns_per_s;
+
+const PendingModifier = struct {
+    modifiers: keystroke_mod.Modifiers = .{},
+    saw_other_input: bool = false,
+};
+
+fn free_keystrokes(gpa: std.mem.Allocator, list: *std.ArrayList(keystroke_mod.Keystroke)) void {
+    for (list.items) |keystroke| {
+        gpa.free(keystroke.key);
+        if (keystroke.key_char) |text| gpa.free(text);
+    }
+    list.deinit(gpa);
+    list.* = .empty;
+}
+
+/// The next key did not come in time: what was typed so far happens now.
+const PendingInputTimer = struct {
+    app: *App,
+    window_id: WindowId,
+    generation: u64,
+
+    fn fire(self: PendingInputTimer) void {
+        const cx = self.app;
+        const window = cx.window_by_id(self.window_id) orelse return;
+        if (window.pending_timeout_generation != self.generation) return;
+        var input = window.pending_keystrokes;
+        window.pending_keystrokes = .empty;
+        window.pending_has_timeout = false;
+        defer free_keystrokes(window.allocator, &input);
+        if (input.items.len == 0) return;
+        if (window.pending_focus != null and window.pending_focus != window.focus_id) return;
+
+        cx.pending_updates += 1;
+        defer {
+            cx.pending_updates -= 1;
+            if (cx.pending_updates == 0) cx.flush_effects();
+        }
+        const prev_arena = current_frame_arena;
+        current_frame_arena = &window.rendered_frame.arena;
+        defer current_frame_arena = prev_arena;
+
+        const tree = &window.rendered_frame.dispatch_tree;
+        const path = tree.dispatch_path(window.focus_id, window.allocator);
+        defer window.allocator.free(path);
+        var arena_state = std.heap.ArenaAllocator.init(window.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const contexts = tree.context_stack(path, arena);
+        const replays = key_dispatch.flush_dispatch(arena, &cx.keymap, input.items, contexts) catch oom();
+        cx.dispatch_pending_input_observers(window);
+        window.replay_pending_input(replays, path, cx);
+    }
+};
+
 pub const Window = struct {
     allocator: std.mem.Allocator,
     app: *App,
@@ -455,7 +512,15 @@ pub const Window = struct {
     default_prevented: bool = false,
     propagate_event: bool = true,
     captured_hitbox: ?HitboxId = null,
+    /// Keystrokes that may still complete a multi-stroke binding. Their strings are owned.
     pending_keystrokes: std.ArrayList(keystroke_mod.Keystroke) = .empty,
+    pending_focus: ?u64 = null,
+    pending_has_timeout: bool = false,
+    /// Timers cannot be cancelled: each carries this, and is stale once it changed.
+    pending_timeout_generation: u64 = 0,
+    /// Pending input was dropped outside dispatch; observers run on the next draw.
+    pending_input_notify: bool = false,
+    pending_modifier: PendingModifier = .{},
     last_input_was_keyboard: bool = false,
     title: []const u8 = "",
     should_close_handler: ?FrameCallback = null,
@@ -521,7 +586,7 @@ pub const Window = struct {
         self.view_stack.deinit(gpa);
         self.mouse_hit_test.ids.deinit(gpa);
         self.next_frame_callbacks.deinit(gpa);
-        self.pending_keystrokes.deinit(gpa);
+        free_keystrokes(gpa, &self.pending_keystrokes);
         self.rem_size_override_stack.deinit(gpa);
         gpa.destroy(self);
     }
@@ -661,10 +726,12 @@ pub const Window = struct {
         if (!self.focus_enabled or self.focus_id == handle.id) return;
         self.focus_id = handle.id;
         self.pending_focus_events = true;
+        self.clear_pending_keystrokes();
         self.refresh();
     }
 
     pub fn blur(self: *Window) void {
+        self.clear_pending_keystrokes();
         if (!self.focus_enabled) return;
         self.focus_id = null;
         self.refresh();
@@ -1257,6 +1324,10 @@ pub const Window = struct {
         self.dirty = false;
         self.animation_requested = false;
         self.frame_count += 1;
+        if (self.pending_input_notify) {
+            self.pending_input_notify = false;
+            cx.dispatch_pending_input_observers(self);
+        }
 
         // Callbacks registered with on_next_frame.
         if (self.next_frame_callbacks.items.len > 0) {
@@ -1470,6 +1541,7 @@ pub const Window = struct {
                 self.modifiers_ = e.modifiers;
                 self.capslock = e.capslock;
                 self.dispatch_mouse(interactive.ModifiersChangedEvent, &e, cx);
+                self.dispatch_modifier_tap(&e, cx);
             },
             .key_down => |e| {
                 self.modifiers_ = e.keystroke.modifiers;
@@ -1558,22 +1630,137 @@ pub const Window = struct {
         }
     }
 
+    /// The rendered frame is what events are matched against, so bring it up to date first.
+    fn draw_if_dirty(self: *Window, cx: *App) void {
+        if (!self.dirty) return;
+        self.draw(cx);
+        current_frame_arena = &self.rendered_frame.arena;
+    }
+
     fn dispatch_key_event(self: *Window, comptime E: type, event: *const E, cx: *App) void {
+        self.draw_if_dirty(cx);
+        if (E == interactive.KeyDownEvent) {
+            self.pending_modifier.saw_other_input = true;
+            self.dispatch_keystroke(E, event, event.keystroke, cx);
+            return;
+        }
+        const path = self.rendered_frame.dispatch_tree.dispatch_path(self.focus_id, self.allocator);
+        defer self.allocator.free(path);
+        self.dispatch_key_listeners(E, event, path, cx);
+    }
+
+    /// Pressing and releasing one modifier alone is a keystroke of its own, such as a binding
+    /// for "shift" (GPUI `pending_modifier`).
+    fn dispatch_modifier_tap(self: *Window, event: *const interactive.ModifiersChangedEvent, cx: *App) void {
+        const held = event.modifiers.number_of_modifiers();
+        const previous = self.pending_modifier.modifiers;
+        const was_clean = !self.pending_modifier.saw_other_input;
+        if (previous.number_of_modifiers() == 0 and held == 1) {
+            self.pending_modifier.saw_other_input = false;
+        } else if (held > 1) {
+            self.pending_modifier.saw_other_input = true;
+        }
+        self.pending_modifier.modifiers = event.modifiers;
+        if (held != 0 or previous.number_of_modifiers() != 1 or !was_clean) return;
+
+        const key: []const u8 = if (previous.shift)
+            "shift"
+        else if (previous.control)
+            "control"
+        else if (previous.alt)
+            "alt"
+        else if (previous.platform)
+            "platform"
+        else if (previous.function)
+            "function"
+        else
+            return;
+        self.draw_if_dirty(cx);
+        self.dispatch_keystroke(interactive.ModifiersChangedEvent, event, .{ .key = key }, cx);
+    }
+
+    /// Matches one keystroke against the keymap and handles the result (the keystroke half of
+    /// GPUI `dispatch_key_event`).
+    fn dispatch_keystroke(self: *Window, comptime E: type, event: *const E, keystroke: keystroke_mod.Keystroke, cx: *App) void {
         const tree = &self.rendered_frame.dispatch_tree;
         const path = tree.dispatch_path(self.focus_id, self.allocator);
         defer self.allocator.free(path);
-        const tid = app_mod.type_id(E);
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const contexts = tree.context_stack(path, arena);
 
-        // Keybindings first (key down only).
-        if (E == interactive.KeyDownEvent) {
-            const contexts = tree.context_stack(path, self.allocator);
-            defer self.allocator.free(contexts);
-            if (cx.keymap.binding_for(event.keystroke, contexts)) |binding| {
-                const action = binding.action;
-                self.dispatch_action_on_path(path, action, cx);
-                if (!self.propagate_event) return;
+        self.propagate_event = true;
+        const intercepted: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .context_stack = contexts };
+        cx.dispatch_keystroke_interceptors(&intercepted, self);
+        if (!self.propagate_event) {
+            self.finish_dispatch_keystroke(E, event, keystroke, contexts, path, cx);
+            return;
+        }
+
+        // Taken out because actions may clear it, and freed last because replays read its strings.
+        var previous = self.pending_keystrokes;
+        self.pending_keystrokes = .empty;
+        defer free_keystrokes(self.allocator, &previous);
+        const stale = self.pending_focus != null and self.pending_focus != self.focus_id;
+        const had_timeout = self.pending_has_timeout and !stale;
+        const had_pending = previous.items.len > 0;
+        self.pending_has_timeout = false;
+        self.pending_timeout_generation +%= 1;
+
+        const input: []const keystroke_mod.Keystroke = if (stale) &.{} else previous.items;
+        const result = key_dispatch.dispatch_key(arena, &cx.keymap, input, keystroke, contexts) catch oom();
+
+        if (result.to_replay.len > 0) {
+            self.replay_pending_input(result.to_replay, path, cx);
+            self.propagate_event = true;
+        }
+
+        if (result.pending.len > 0) {
+            self.store_pending_keystrokes(result.pending);
+            self.pending_focus = self.focus_id;
+            var needs_timeout = had_timeout or result.pending_has_binding;
+            if (!needs_timeout and keystroke.key_char != null) {
+                if (self.platform_window.input_handler()) |h| {
+                    var handler = h;
+                    needs_timeout = handler.accepts_text_input(self, cx);
+                }
+            }
+            if (!needs_timeout and result.pending.len == 1 and result.pending[0].is_modifier_key()) needs_timeout = true;
+            if (needs_timeout) self.start_pending_input_timeout(cx);
+            cx.dispatch_pending_input_observers(self);
+            self.propagate_event = false;
+            return;
+        }
+
+        const pending_changed = had_pending;
+        defer if (pending_changed) cx.dispatch_pending_input_observers(self);
+        for (result.bindings) |binding| {
+            self.dispatch_action_on_path(path, binding.action, cx);
+            if (!self.propagate_event) {
+                const observed: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .action = binding.action, .context_stack = contexts };
+                cx.dispatch_keystroke_observers(&observed, self);
+                return;
             }
         }
+        self.finish_dispatch_keystroke(E, event, keystroke, contexts, path, cx);
+    }
+
+    fn finish_dispatch_keystroke(self: *Window, comptime E: type, event: *const E, keystroke: keystroke_mod.Keystroke, contexts: []const key_dispatch.KeyContext, path: []const key_dispatch.DispatchNodeId, cx: *App) void {
+        if (E == interactive.KeyDownEvent) {
+            self.dispatch_key_listeners(E, event, path, cx);
+            if (!self.propagate_event) return;
+            self.deliver_key_text(keystroke, cx);
+        } else if (!self.propagate_event) {
+            return;
+        }
+        const observed: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .context_stack = contexts };
+        cx.dispatch_keystroke_observers(&observed, self);
+    }
+
+    fn dispatch_key_listeners(self: *Window, comptime E: type, event: *const E, path: []const key_dispatch.DispatchNodeId, cx: *App) void {
+        const tree = &self.rendered_frame.dispatch_tree;
+        const tid = app_mod.type_id(E);
         // Capture.
         for (path) |nid| {
             for (tree.node(nid).key_listeners.items) |l| {
@@ -1592,18 +1779,70 @@ pub const Window = struct {
                 if (!self.propagate_event) return;
             }
         }
-        // Unhandled key-down: deliver text to the input handler.
-        if (E == interactive.KeyDownEvent) {
-            if (event.keystroke.key_char) |text| {
-                if (!event.keystroke.modifiers.control and !event.keystroke.modifiers.platform) {
-                    if (self.platform_window.input_handler()) |h| {
-                        var handler = h;
-                        self.ime_position_dirty = true;
-                        handler.replace_text_in_range(null, text, self, cx);
-                    }
+    }
+
+    /// An unhandled key press types its text into the focused field.
+    fn deliver_key_text(self: *Window, keystroke: keystroke_mod.Keystroke, cx: *App) void {
+        const text = keystroke.key_char orelse return;
+        if (keystroke.modifiers.control or keystroke.modifiers.platform) return;
+        var handler = self.platform_window.input_handler() orelse return;
+        self.ime_position_dirty = true;
+        handler.replace_text_in_range(null, text, self, cx);
+    }
+
+    /// Handles keystrokes that did not become a sequence as if they had been typed alone.
+    fn replay_pending_input(self: *Window, replays: []const key_dispatch.Replay, path: []const key_dispatch.DispatchNodeId, cx: *App) void {
+        next: for (replays) |replay| {
+            const event: interactive.KeyDownEvent = .{ .keystroke = replay.keystroke };
+            self.propagate_event = true;
+            for (replay.bindings) |binding| {
+                self.dispatch_action_on_path(path, binding.action, cx);
+                if (!self.propagate_event) {
+                    const observed: app_mod.KeystrokeEvent = .{ .keystroke = replay.keystroke, .action = binding.action };
+                    cx.dispatch_keystroke_observers(&observed, self);
+                    continue :next;
                 }
             }
+            self.dispatch_key_listeners(interactive.KeyDownEvent, &event, path, cx);
+            if (!self.propagate_event) continue;
+            self.deliver_key_text(replay.keystroke, cx);
         }
+    }
+
+    fn store_pending_keystrokes(self: *Window, keystrokes: []const keystroke_mod.Keystroke) void {
+        for (keystrokes) |keystroke| {
+            var owned = keystroke;
+            owned.key = self.allocator.dupe(u8, keystroke.key) catch oom();
+            if (keystroke.key_char) |text| owned.key_char = self.allocator.dupe(u8, text) catch oom();
+            self.pending_keystrokes.append(self.allocator, owned) catch oom();
+        }
+    }
+
+    fn start_pending_input_timeout(self: *Window, cx: *App) void {
+        self.pending_has_timeout = true;
+        const timer: PendingInputTimer = .{ .app = cx, .window_id = self.window_handle_id(), .generation = self.pending_timeout_generation };
+        cx.background_executor().after(cx.foreground_executor(), PENDING_INPUT_TIMEOUT_NS, PendingInputTimer.fire, timer);
+    }
+
+    /// Whether a potential multi-stroke binding is in progress.
+    pub fn has_pending_keystrokes(self: *const Window) bool {
+        return self.pending_input_keystrokes() != null;
+    }
+
+    /// The input that can still complete a multi-stroke binding. Input left over from a previous
+    /// focus never can.
+    pub fn pending_input_keystrokes(self: *const Window) ?[]const keystroke_mod.Keystroke {
+        if (self.pending_keystrokes.items.len == 0) return null;
+        if (self.pending_focus != null and self.pending_focus != self.focus_id) return null;
+        return self.pending_keystrokes.items;
+    }
+
+    pub fn clear_pending_keystrokes(self: *Window) void {
+        if (self.pending_keystrokes.items.len == 0) return;
+        free_keystrokes(self.allocator, &self.pending_keystrokes);
+        self.pending_has_timeout = false;
+        self.pending_timeout_generation +%= 1;
+        self.pending_input_notify = true;
     }
 
     /// Dispatches a boxed action along the focus path, then globally.

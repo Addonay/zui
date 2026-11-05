@@ -229,7 +229,7 @@ const TextInput = struct {
         }
         if (self.selected_range.end < self.selected_range.start) {
             self.selection_reversed = !self.selection_reversed;
-            self.selected_range = .{ .start = self.selected_range.end, .end = self.selected_range.start };
+            std.mem.swap(usize, &self.selected_range.start, &self.selected_range.end);
         }
         window.invalidate_character_coordinates();
         cx.notify();

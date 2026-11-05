@@ -14,8 +14,69 @@ const app_mod = @import("app.zig");
 const Window = @import("window.zig").Window;
 const App = app_mod.App;
 const TypeId = app_mod.TypeId;
+const keymap_mod = @import("keymap.zig");
+const Keymap = keymap_mod.Keymap;
+const KeyBinding = keymap_mod.KeyBinding;
+const Keystroke = @import("keystroke.zig").Keystroke;
 
 pub const KeyContext = @import("keymap_context.zig").KeyContext;
+
+/// A keystroke that turned out not to complete a sequence, to be handled as if typed alone.
+pub const Replay = struct {
+    keystroke: Keystroke,
+    bindings: []const KeyBinding = &.{},
+};
+
+pub const DispatchResult = struct {
+    /// Non-empty when the input may still complete a longer binding.
+    pending: []const Keystroke = &.{},
+    /// The pending input is also a complete binding of its own.
+    pending_has_binding: bool = false,
+    bindings: []const KeyBinding = &.{},
+    to_replay: []const Replay = &.{},
+};
+
+/// Matches `keystroke` after the pending `input` (GPUI `DispatchTree::dispatch_key`). `arena` owns
+/// everything returned; the keystrokes are not copied.
+pub fn dispatch_key(arena: Allocator, keymap: *const Keymap, input: []const Keystroke, keystroke: Keystroke, contexts: []const KeyContext) Allocator.Error!DispatchResult {
+    const full = try arena.alloc(Keystroke, input.len + 1);
+    @memcpy(full[0..input.len], input);
+    full[input.len] = keystroke;
+    const found = try keymap.bindings_for_input(arena, full, contexts);
+    if (found.pending) return .{ .pending = full, .pending_has_binding = found.bindings.len > 0 };
+    if (found.bindings.len > 0) return .{ .bindings = found.bindings };
+    if (input.len == 0) return .{};
+
+    var to_replay: std.ArrayList(Replay) = .empty;
+    const suffix = try replay_prefix(arena, keymap, input, contexts, &to_replay);
+    var result = try dispatch_key(arena, keymap, suffix, keystroke, contexts);
+    try to_replay.appendSlice(arena, result.to_replay);
+    result.to_replay = to_replay.items;
+    return result;
+}
+
+/// Turns input that waited too long into replays (GPUI `DispatchTree::flush_dispatch`).
+pub fn flush_dispatch(arena: Allocator, keymap: *const Keymap, input: []const Keystroke, contexts: []const KeyContext) Allocator.Error![]const Replay {
+    var to_replay: std.ArrayList(Replay) = .empty;
+    var rest = input;
+    while (rest.len > 0) rest = try replay_prefix(arena, keymap, rest, contexts, &to_replay);
+    return to_replay.items;
+}
+
+/// Replays the longest prefix of `input` that is a binding, or else its first keystroke, and
+/// returns the rest.
+fn replay_prefix(arena: Allocator, keymap: *const Keymap, input: []const Keystroke, contexts: []const KeyContext, to_replay: *std.ArrayList(Replay)) Allocator.Error![]const Keystroke {
+    var end = input.len;
+    while (end > 0) : (end -= 1) {
+        const found = try keymap.bindings_for_input(arena, input[0..end], contexts);
+        if (found.bindings.len > 0) {
+            try to_replay.append(arena, .{ .keystroke = input[end - 1], .bindings = found.bindings });
+            return input[end..];
+        }
+    }
+    try to_replay.append(arena, .{ .keystroke = input[0] });
+    return input[1..];
+}
 
 /// Index of a node within a `DispatchTree`. Not stable across frames.
 pub const DispatchNodeId = u32;
@@ -424,4 +485,54 @@ test "clear reuses node storage" {
     b.tree.push_node();
     try testing.expectEqual(@as(DispatchNodeId, 0), b.tree.active_node_id());
     try testing.expect(b.tree.nodes.capacity >= cap_before);
+}
+
+test "dispatch_key: sequences, prefixes and replays" {
+    const action_mod = @import("action.zig");
+    const A = action_mod.Action("test", "DispatchA");
+    const AB = action_mod.Action("test", "DispatchAB");
+    var keymap = Keymap.init(std.testing.allocator);
+    defer keymap.deinit();
+    try keymap.add_bindings(&.{ KeyBinding.new("a", A{}, null), KeyBinding.new("a b", AB{}, null), KeyBinding.new("x y z", AB{}, null) });
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const key = struct {
+        fn of(comptime name: []const u8) Keystroke {
+            return .{ .key = name };
+        }
+    }.of;
+    const none: []const KeyContext = &.{};
+
+    // Nothing bound.
+    var r = try dispatch_key(arena, &keymap, &.{}, key("q"), none);
+    try std.testing.expect(r.pending.len == 0 and r.bindings.len == 0 and r.to_replay.len == 0);
+
+    // A binding that is also a prefix waits.
+    r = try dispatch_key(arena, &keymap, &.{}, key("a"), none);
+    try std.testing.expect(r.pending.len == 1 and r.pending_has_binding);
+
+    // It completes.
+    r = try dispatch_key(arena, &keymap, &.{key("a")}, key("b"), none);
+    try std.testing.expect(r.pending.len == 0 and r.bindings.len == 1 and r.to_replay.len == 0);
+
+    // Or falls back: "a" runs its own binding, then "q" is an ordinary key.
+    r = try dispatch_key(arena, &keymap, &.{key("a")}, key("q"), none);
+    try std.testing.expectEqual(@as(usize, 1), r.to_replay.len);
+    try std.testing.expectEqual(@as(usize, 1), r.to_replay[0].bindings.len);
+    try std.testing.expectEqualStrings("a", r.to_replay[0].keystroke.key);
+    try std.testing.expect(r.pending.len == 0 and r.bindings.len == 0);
+
+    // A failed prefix replays key by key, and the new key can start another sequence.
+    r = try dispatch_key(arena, &keymap, &.{ key("x"), key("y") }, key("a"), none);
+    try std.testing.expectEqual(@as(usize, 2), r.to_replay.len);
+    try std.testing.expectEqualStrings("x", r.to_replay[0].keystroke.key);
+    try std.testing.expectEqualStrings("y", r.to_replay[1].keystroke.key);
+    try std.testing.expect(r.pending.len == 1 and r.pending_has_binding);
+
+    // A timeout flushes everything.
+    const flushed = try flush_dispatch(arena, &keymap, &.{ key("x"), key("y") }, none);
+    try std.testing.expectEqual(@as(usize, 2), flushed.len);
+    const bound = try flush_dispatch(arena, &keymap, &.{key("a")}, none);
+    try std.testing.expect(bound.len == 1 and bound[0].bindings.len == 1);
 }
