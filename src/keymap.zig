@@ -11,6 +11,9 @@ const ctx_mod = @import("keymap_context.zig");
 const keystroke_mod = @import("keystroke.zig");
 const action_mod = @import("action.zig");
 
+/// GPUI `KeyBindingMetaIndex`: a key into a caller-owned store of binding metadata.
+pub const KeyBindingMetaIndex = struct { value: u32 };
+
 pub const KeyContext = ctx_mod.KeyContext;
 pub const KeyBindingContextPredicate = ctx_mod.KeyBindingContextPredicate;
 pub const Keystroke = keystroke_mod.Keystroke;
@@ -32,10 +35,17 @@ pub const LoadError = error{
 };
 
 /// A keystroke sequence bound to an action, with an optional context predicate.
+/// Fields named after GPUI's getters (`keystrokes`, `action`, `meta`, `action_input`) are the
+/// getters: Zig cannot have a method and a field with one name.
 pub const KeyBinding = struct {
     keystrokes: []const Keystroke,
     action: AnyAction,
     context_predicate: ?*const KeyBindingContextPredicate = null,
+    /// GPUI `meta`: a caller-defined index into its own metadata store, such as the source of the
+    /// binding. Null when unset.
+    meta: ?KeyBindingMetaIndex = null,
+    /// GPUI `action_input`: the data the keymap passed to the action. Null when there is none.
+    action_input: ?[]const u8 = null,
 
     /// GPUI `KeyBinding::new("cmd-s", Save, Some("Editor"))`. Panics on invalid input, like GPUI.
     /// `keystrokes` is a space-separated sequence such as `"ctrl-k ctrl-s"`.
@@ -50,7 +60,7 @@ pub const KeyBinding = struct {
     pub fn load(allocator: Allocator, keystrokes: []const u8, action: AnyAction, context: ?[]const u8) LoadError!KeyBinding {
         const parsed_keystrokes = try parse_keystrokes(allocator, keystrokes);
         errdefer allocator.free(parsed_keystrokes);
-        var predicate: ?*const KeyBindingContextPredicate = null;
+        var context_predicate: ?*const KeyBindingContextPredicate = null;
         if (context) |source| {
             const value = KeyBindingContextPredicate.parse(allocator, source) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -58,9 +68,26 @@ pub const KeyBinding = struct {
             };
             const boxed = try allocator.create(KeyBindingContextPredicate);
             boxed.* = value;
-            predicate = boxed;
+            context_predicate = boxed;
         }
-        return .{ .keystrokes = parsed_keystrokes, .action = action, .context_predicate = predicate };
+        return .{ .keystrokes = parsed_keystrokes, .action = action, .context_predicate = context_predicate };
+    }
+
+    /// GPUI `KeyBinding::with_meta`.
+    pub fn with_meta(self: KeyBinding, meta: KeyBindingMetaIndex) KeyBinding {
+        var out = self;
+        out.meta = meta;
+        return out;
+    }
+
+    /// GPUI `KeyBinding::set_meta`.
+    pub fn set_meta(self: *KeyBinding, meta: KeyBindingMetaIndex) void {
+        self.meta = meta;
+    }
+
+    /// GPUI `KeyBinding::predicate`: the context this binding requires, or null for any context.
+    pub fn predicate(self: *const KeyBinding) ?*const KeyBindingContextPredicate {
+        return self.context_predicate;
     }
 
     /// Whether the typed keystrokes are a prefix of (`true`) or exactly (`false`) this binding's
@@ -91,6 +118,15 @@ fn same_keystrokes(a: []const Keystroke, b: []const Keystroke) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (!x.eql(y)) return false;
     return true;
+}
+
+/// Whether two bindings are the same one, as copies made by dispatch compare. The action pointer
+/// alone is not enough: zero-sized actions all share one address, so the action type is checked too.
+pub fn same_binding(a: *const KeyBinding, b: *const KeyBinding) bool {
+    return a.action.type_id == b.action.type_id and
+        a.action.ptr == b.action.ptr and
+        a.context_predicate == b.context_predicate and
+        same_keystrokes(a.keystrokes, b.keystrokes);
 }
 
 /// Whether a disabling binding's context covers the context of the binding it disables.
@@ -240,6 +276,34 @@ pub const Keymap = struct {
         }
 
         return .{ .bindings = try out.toOwnedSlice(allocator), .pending = pending_seqs.items.len > 0 };
+    }
+
+    /// Bindings that could follow `input`: longer sequences that extend it and would dispatch for
+    /// their full keystrokes in `contexts`, highest precedence first. Bindings disabled by a
+    /// `NoAction` are left out. Caller frees the result with `allocator`.
+    /// GPUI `Keymap::possible_next_bindings_for_input`.
+    pub fn possible_next_bindings_for_input(self: *const Keymap, allocator: Allocator, input: []const Keystroke, contexts: []const KeyContext) ![]KeyBinding {
+        var found: std.ArrayList(Match) = .empty;
+        defer found.deinit(allocator);
+        var ix = self.entries.items.len;
+        while (ix > 0) {
+            ix -= 1;
+            const binding = &self.entries.items[ix];
+            if (action_mod.is_no_action(binding.action)) continue;
+            const pending = binding.match_keystrokes(input) orelse continue;
+            if (!pending) continue;
+            const depth = binding_enabled(binding, contexts) orelse continue;
+            // The binding must win at its full keystrokes, not merely be a candidate.
+            const winner = try self.bindings_for_input(allocator, binding.keystrokes, contexts);
+            defer allocator.free(winner.bindings);
+            if (winner.bindings.len == 0) continue;
+            if (!same_binding(&winner.bindings[0], binding)) continue;
+            try found.append(allocator, .{ .depth = depth, .ix = ix });
+        }
+        std.mem.sort(Match, found.items, {}, Match.less);
+        const out = try allocator.alloc(KeyBinding, found.items.len);
+        for (found.items, out) |m, *slot| slot.* = self.entries.items[m.ix];
+        return out;
     }
 
     /// Bindings that dispatch `action` (by action type), newest first, skipping bindings disabled
@@ -513,6 +577,92 @@ test "keymap: load reports invalid input" {
     const ok = try KeyBinding.load(arena.allocator(), "ctrl-k ctrl-s", any, "editor");
     try testing.expectEqual(@as(usize, 2), ok.keystrokes.len);
     try testing.expect(ok.context_predicate != null);
+}
+
+test "keymap: possible_next_bindings excludes bindings that a NoAction disables" {
+    const bindings = [_]KeyBinding{
+        KeyBinding.new("ctrl-k a", ActionAlpha{}, "Editor"),
+        KeyBinding.new("ctrl-k b", ActionBeta{}, "Editor"),
+        KeyBinding.new("ctrl-k a", NoAction{}, "Editor"),
+    };
+    var keymap = Keymap.init(testing.allocator);
+    defer keymap.deinit();
+    try keymap.add_bindings(&bindings);
+    const next = try keymap.possible_next_bindings_for_input(testing.allocator, &.{ks("ctrl-k")}, &.{kc("Editor")});
+    defer testing.allocator.free(next);
+    try testing.expectEqual(@as(usize, 1), next.len);
+    try testing.expect(is_action(next[0], ActionBeta));
+    try testing.expectEqualStrings("b", next[0].keystrokes[1].key);
+}
+
+test "keymap: possible_next_bindings drops a chord disabled in a deeper context" {
+    const bindings = [_]KeyBinding{
+        KeyBinding.new("space w w", ActionAlpha{}, "Workspace"),
+        KeyBinding.new("space w x", ActionBeta{}, "Workspace"),
+        KeyBinding.new("space w w", NoAction{}, "AgentPanel"),
+    };
+    var keymap = Keymap.init(testing.allocator);
+    defer keymap.deinit();
+    try keymap.add_bindings(&bindings);
+    const contexts = [_]KeyContext{ kc("Workspace"), kc("AgentPanel") };
+    for ([_][]const Keystroke{ &.{ks("space")}, &.{ ks("space"), ks("w") } }) |input| {
+        const next = try keymap.possible_next_bindings_for_input(testing.allocator, input, &contexts);
+        defer testing.allocator.free(next);
+        try testing.expectEqual(@as(usize, 1), next.len);
+        try testing.expect(is_action(next[0], ActionBeta));
+    }
+}
+
+test "keymap: possible_next_bindings is empty when nothing extends the input" {
+    const bindings = [_]KeyBinding{KeyBinding.new("ctrl-k a", ActionAlpha{}, "Editor")};
+    var keymap = Keymap.init(testing.allocator);
+    defer keymap.deinit();
+    try keymap.add_bindings(&bindings);
+    const next = try keymap.possible_next_bindings_for_input(testing.allocator, &.{ks("ctrl-k")}, &.{kc("Workspace")});
+    defer testing.allocator.free(next);
+    try testing.expectEqual(@as(usize, 0), next.len);
+}
+
+test "keymap: possible_next_bindings leaves out a binding that a deeper one with the same keys shadows" {
+    const bindings = [_]KeyBinding{
+        KeyBinding.new("ctrl-k a", ActionAlpha{}, "Workspace"),
+        KeyBinding.new("ctrl-k a", ActionBeta{}, "Editor"),
+        KeyBinding.new("ctrl-k b", ActionGamma{}, "Editor"),
+    };
+    var keymap = Keymap.init(testing.allocator);
+    defer keymap.deinit();
+    try keymap.add_bindings(&bindings);
+    // Beta is deeper, so "ctrl-k a" dispatches Beta and Alpha can never be the next binding.
+    // Beta itself is still a next binding: its own key completes it. Gamma comes first, being newer.
+    const next = try keymap.possible_next_bindings_for_input(testing.allocator, &.{ks("ctrl-k")}, &.{ kc("Workspace"), kc("Editor") });
+    defer testing.allocator.free(next);
+    try testing.expectEqual(@as(usize, 2), next.len);
+    try testing.expect(is_action(next[0], ActionGamma));
+    try testing.expect(is_action(next[1], ActionBeta));
+}
+
+test "keymap: binding meta, predicate and action_input" {
+    var binding = KeyBinding.new("ctrl-a", ActionAlpha{}, "Editor");
+    try testing.expect(binding.meta == null);
+    try testing.expect(binding.predicate() != null);
+    try testing.expect(KeyBinding.new("ctrl-a", ActionAlpha{}, null).predicate() == null);
+
+    const tagged = binding.with_meta(.{ .value = 7 });
+    try testing.expectEqual(@as(u32, 7), tagged.meta.?.value);
+    try testing.expect(binding.meta == null);
+
+    binding.set_meta(.{ .value = 3 });
+    try testing.expectEqual(@as(u32, 3), binding.meta.?.value);
+
+    // Metadata and input survive the copies that dispatch makes.
+    binding.action_input = "{\"n\":1}";
+    var keymap = Keymap.init(testing.allocator);
+    defer keymap.deinit();
+    try keymap.add_bindings(&.{binding});
+    const found = try keymap.bindings_for_input(testing.allocator, &.{ks("ctrl-a")}, &.{kc("Editor")});
+    defer testing.allocator.free(found.bindings);
+    try testing.expectEqual(@as(u32, 3), found.bindings[0].meta.?.value);
+    try testing.expectEqualStrings("{\"n\":1}", found.bindings[0].action_input.?);
 }
 
 fn box(action: anytype) AnyAction {

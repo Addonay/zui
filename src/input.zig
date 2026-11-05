@@ -69,6 +69,12 @@ pub fn ElementInputHandler(comptime V: type) type {
             .bounds_for_range = bounds_for_range,
             .character_index_for_point = character_index_for_point,
             .accepts_text_input = accepts_text_input,
+            .paste = paste,
+            .selection_bounds_for_range = selection_bounds_for_range,
+            .set_selected_text_range = set_selected_text_range,
+            .text_length_utf16 = text_length_utf16,
+            .text_input_configuration = text_input_configuration,
+            .text_input_editable_range = text_input_editable_range,
         };
 
         fn from(ctx: *anyopaque) *Self {
@@ -112,6 +118,40 @@ pub fn ElementInputHandler(comptime V: type) type {
             const view = from(ctx).view.upgrade(cx) orelse return false;
             if (!@hasDecl(V, "accepts_text_input")) return true;
             return view.update_in(window, cx, V.accepts_text_input, .{});
+        }
+        // The optional methods below use GPUI's trait defaults when the view does not define them.
+        fn paste(ctx: *anyopaque, item: platform.ClipboardItem, window: *Window, cx: *App) void {
+            const view = from(ctx).view.upgrade(cx) orelse return;
+            if (@hasDecl(V, "paste")) {
+                view.update_in(window, cx, V.paste, .{item});
+            } else if (item.text()) |text| {
+                view.update_in(window, cx, V.replace_text_in_range, .{ @as(?Range, null), text });
+            }
+        }
+        fn selection_bounds_for_range(ctx: *anyopaque, range: Range, element_bounds: Bounds(Pixels), window: *Window, cx: *App) []const Bounds(Pixels) {
+            const view = from(ctx).view.upgrade(cx) orelse return &.{};
+            if (!@hasDecl(V, "selection_bounds_for_range")) return &.{};
+            return view.update_in(window, cx, V.selection_bounds_for_range, .{ range, element_bounds });
+        }
+        fn set_selected_text_range(ctx: *anyopaque, range: Range, window: *Window, cx: *App) void {
+            const view = from(ctx).view.upgrade(cx) orelse return;
+            if (!@hasDecl(V, "set_selected_text_range")) return;
+            view.update_in(window, cx, V.set_selected_text_range, .{range});
+        }
+        fn text_length_utf16(ctx: *anyopaque, window: *Window, cx: *App) ?usize {
+            const view = from(ctx).view.upgrade(cx) orelse return null;
+            if (!@hasDecl(V, "text_length_utf16")) return null;
+            return view.update_in(window, cx, V.text_length_utf16, .{});
+        }
+        fn text_input_configuration(ctx: *anyopaque, window: *Window, cx: *App) platform.TextInputConfiguration {
+            const view = from(ctx).view.upgrade(cx) orelse return .{};
+            if (!@hasDecl(V, "text_input_configuration")) return .{};
+            return view.update_in(window, cx, V.text_input_configuration, .{});
+        }
+        fn text_input_editable_range(ctx: *anyopaque, window: *Window, cx: *App) ?Range {
+            const view = from(ctx).view.upgrade(cx) orelse return null;
+            if (!@hasDecl(V, "text_input_editable_range")) return null;
+            return view.update_in(window, cx, V.text_input_editable_range, .{});
         }
     };
 }

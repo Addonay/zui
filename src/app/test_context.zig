@@ -2902,6 +2902,229 @@ test "img: an image in image_cache() loads through that cache, then redraws" {
     try std.testing.expectEqual(@as(usize, 0), cx.app.asset_cache.images.count());
 }
 
+test "keymap: highest_precedence_binding_for_action is the newest binding that wins in the focus context" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{
+        KeyBinding.new("cmd-s", Editor.Save{}, "Editor"),
+        KeyBinding.new("cmd-t", Editor.Save{}, "Editor"),
+    });
+    _, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const found = vcx.window.highest_precedence_binding_for_action(Editor.Save{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("t", found.keystrokes[0].key);
+}
+
+test "keymap: a NoAction on a newer binding shadows it, so the older one is the highest precedence" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const NoAction = action_mod.NoAction;
+    cx.app.bind_keys(&.{
+        KeyBinding.new("cmd-s", Editor.Save{}, "Editor"),
+        KeyBinding.new("cmd-t", Editor.Save{}, "Editor"),
+        KeyBinding.new("cmd-t", NoAction{}, "Editor"),
+    });
+    _, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const found = vcx.window.highest_precedence_binding_for_action(Editor.Save{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("s", found.keystrokes[0].key);
+}
+
+test "keymap: an action whose keys a newer, different action takes has no highest precedence" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    // Both actions are zero-sized, so only the action type tells them apart.
+    cx.app.bind_keys(&.{
+        KeyBinding.new("cmd-s", Editor.Save{}, "Editor"),
+        KeyBinding.new("cmd-s", Editor.Outside{}, "Editor"),
+    });
+    _, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expect(vcx.window.highest_precedence_binding_for_action(Editor.Save{}) == null);
+    const found = vcx.window.highest_precedence_binding_for_action(Editor.Outside{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("s", found.keystrokes[0].key);
+}
+
+test "keymap: highest_precedence_binding_for_action is null when the context or the binding is missing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("cmd-s", Editor.Save{}, "Terminal")});
+    _, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expect(vcx.window.highest_precedence_binding_for_action(Editor.Save{}) == null);
+    try std.testing.expect(vcx.window.highest_precedence_binding_for_action(Editor.Outside{}) == null);
+}
+
+test "actions: available_actions lists the actions on the focus path that the registry builds" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expectEqual(@as(usize, 0), vcx.window.available_actions(cx.app).len);
+    try cx.app.actions.register(Editor.Save);
+    const available = vcx.window.available_actions(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), available.len);
+    try std.testing.expectEqualStrings("test::Save", available[0].name);
+}
+
+test "window: capslock follows modifier events, and client inset and pointer capture read back" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    try std.testing.expect(!vcx.window.capslock().on);
+    _ = vcx.window.dispatch_event(.{ .modifiers_changed = .{ .capslock = .{ .on = true } } }, cx.app);
+    try std.testing.expect(vcx.window.capslock().on);
+    _ = vcx.window.dispatch_event(.{ .modifiers_changed = .{ .capslock = .{ .on = false } } }, cx.app);
+    try std.testing.expect(!vcx.window.capslock().on);
+
+    try std.testing.expect(vcx.window.client_inset() == null);
+    vcx.window.set_client_inset(12);
+    try std.testing.expectEqual(@as(?Pixels, 12), vcx.window.client_inset());
+
+    try std.testing.expect(vcx.window.captured_hitbox() == null);
+    vcx.window.capture_pointer(42);
+    try std.testing.expectEqual(@as(?u64, 42), vcx.window.captured_hitbox());
+    vcx.window.release_pointer();
+    try std.testing.expect(vcx.window.captured_hitbox() == null);
+}
+
+test "focus: a weak handle upgrades only while its element is rendered" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const handle = view.read(cx.app).focus;
+    const weak = handle.downgrade();
+    try std.testing.expect(weak.upgrade(vcx.window) != null);
+    try std.testing.expect((window_mod.WeakFocusHandle{ .id = handle.id +% 1000 }).upgrade(vcx.window) == null);
+}
+
+test "focus: a ManagedView needs focus_handle and render" {
+    const Popover = struct {
+        pub fn focus_handle(_: *const @This()) void {}
+        pub fn render(_: *@This()) void {}
+    };
+    comptime window_mod.assert_managed_view(Popover);
+    try std.testing.expect(window_mod.is_managed_view(Popover));
+    try std.testing.expect(!window_mod.is_managed_view(u8));
+}
+
+/// A text view with every optional `EntityInputHandler` method, so each one can be seen reaching it.
+const RichField = struct {
+    focus: FocusHandle,
+    buffer: [64]u8 = @splat(0),
+    len: usize = 0,
+    selection: platform_mod.Range = .{ .start = 0, .end = 0 },
+    pasted: usize = 0,
+    rect: geometry.Bounds(Pixels) = undefined,
+
+    pub fn render(self: *RichField, _: *Window, _: *Context(RichField)) *Div {
+        return div().id("rich").w(px(100)).h(px(30)).track_focus(&self.focus);
+    }
+    pub fn text_for_range(self: *RichField, range: platform_mod.Range, _: *?platform_mod.Range, _: *Window, _: *Context(RichField)) ?[]const u8 {
+        return self.buffer[range.start..range.end];
+    }
+    pub fn selected_text_range(self: *RichField, _: bool, _: *Window, _: *Context(RichField)) ?platform_mod.UTF16Selection {
+        return .{ .range = self.selection, .reversed = false };
+    }
+    pub fn marked_text_range(_: *RichField, _: *Window, _: *Context(RichField)) ?platform_mod.Range {
+        return null;
+    }
+    pub fn unmark_text(_: *RichField, _: *Window, _: *Context(RichField)) void {}
+    pub fn replace_text_in_range(self: *RichField, _: ?platform_mod.Range, text: []const u8, _: *Window, _: *Context(RichField)) void {
+        const n = @min(text.len, self.buffer.len - self.len);
+        @memcpy(self.buffer[self.len..][0..n], text[0..n]);
+        self.len += n;
+        self.selection = .{ .start = self.len, .end = self.len };
+    }
+    pub fn replace_and_mark_text_in_range(_: *RichField, _: ?platform_mod.Range, _: []const u8, _: ?platform_mod.Range, _: *Window, _: *Context(RichField)) void {}
+    pub fn bounds_for_range(_: *RichField, _: platform_mod.Range, element_bounds: geometry.Bounds(Pixels), _: *Window, _: *Context(RichField)) ?geometry.Bounds(Pixels) {
+        return element_bounds;
+    }
+    pub fn character_index_for_point(_: *RichField, _: Point(Pixels), _: *Window, _: *Context(RichField)) ?usize {
+        return null;
+    }
+    pub fn paste(self: *RichField, item: platform_mod.ClipboardItem, window: *Window, cx: *Context(RichField)) void {
+        self.pasted += 1;
+        if (item.text()) |text| self.replace_text_in_range(null, text, window, cx);
+    }
+    /// One rectangle per selected character, ten pixels wide, starting at the character's offset.
+    pub fn selection_bounds_for_range(self: *RichField, range: platform_mod.Range, element_bounds: geometry.Bounds(Pixels), _: *Window, _: *Context(RichField)) []const geometry.Bounds(Pixels) {
+        self.rect = .{
+            .origin = .{ .x = element_bounds.origin.x + @as(Pixels, @floatFromInt(range.start)) * 10, .y = element_bounds.origin.y },
+            .size = .{ .width = @as(Pixels, @floatFromInt(range.end - range.start)) * 10, .height = element_bounds.size.height },
+        };
+        return (&self.rect)[0..1];
+    }
+    pub fn set_selected_text_range(self: *RichField, range: platform_mod.Range, _: *Window, _: *Context(RichField)) void {
+        self.selection = range;
+    }
+    pub fn text_length_utf16(self: *RichField, _: *Window, _: *Context(RichField)) ?usize {
+        return self.len;
+    }
+    pub fn text_input_configuration(_: *RichField, _: *Window, _: *Context(RichField)) platform_mod.TextInputConfiguration {
+        return .{ .input_action = .search };
+    }
+    pub fn text_input_editable_range(self: *RichField, _: *Window, _: *Context(RichField)) ?platform_mod.Range {
+        return .{ .start = 0, .end = self.len };
+    }
+    fn build(_: *Window, app: *App) Entity(RichField) {
+        return app.new(RichField{ .focus = app.focus_handle() });
+    }
+    fn read_text(s: *const RichField, _: *const App) []const u8 {
+        return s.buffer[0..s.len];
+    }
+    fn pasted_count(s: *const RichField, _: *const App) usize {
+        return s.pasted;
+    }
+};
+
+test "input: paste, selection, length and configuration reach the view's own methods" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(RichField.build);
+    vcx.run_until_parked();
+    const bounds: geometry.Bounds(Pixels) = .{ .origin = .{ .x = 5, .y = 6 }, .size = .{ .width = 100, .height = 20 } };
+    var handler = input_mod.ElementInputHandler(RichField).new(bounds, view).platform_input_handler();
+
+    handler.paste(platform_mod.ClipboardItem.new_string("abcd"), vcx.window, cx.app);
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, RichField.pasted_count, .{}));
+    try std.testing.expectEqualStrings("abcd", cx.read_entity(view, RichField.read_text, .{}));
+    try std.testing.expectEqual(@as(?usize, 4), handler.text_length_utf16(vcx.window, cx.app));
+
+    handler.set_selected_text_range(.{ .start = 1, .end = 3 }, vcx.window, cx.app);
+    const selection = handler.selected_text_range(true, vcx.window, cx.app).?;
+    try std.testing.expectEqual(@as(usize, 1), selection.range.start);
+    try std.testing.expectEqual(@as(usize, 3), selection.range.end);
+
+    const rects = handler.selection_bounds_for_range(.{ .start = 1, .end = 3 }, bounds, vcx.window, cx.app);
+    try std.testing.expectEqual(@as(usize, 1), rects.len);
+    try std.testing.expectEqual(@as(Pixels, 15), rects[0].origin.x);
+    try std.testing.expectEqual(@as(Pixels, 20), rects[0].size.width);
+
+    try std.testing.expectEqual(platform_mod.TextInputAction.search, handler.text_input_configuration(vcx.window, cx.app).input_action);
+    const editable = handler.text_input_editable_range(vcx.window, cx.app).?;
+    try std.testing.expectEqual(@as(usize, 4), editable.end);
+}
+
+test "input: a view without the optional methods gets GPUI's defaults" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    vcx.run_until_parked();
+    const bounds: geometry.Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 100, .height = 20 } };
+    var handler = input_mod.ElementInputHandler(ImeField).new(bounds, view).platform_input_handler();
+
+    // The default paste replaces the range with the clipboard text.
+    handler.paste(platform_mod.ClipboardItem.new_string("abc"), vcx.window, cx.app);
+    try std.testing.expectEqualStrings("abc", cx.read_entity(view, ImeField.read_text, .{}));
+    try std.testing.expect(handler.text_length_utf16(vcx.window, cx.app) == null);
+    try std.testing.expectEqual(@as(usize, 0), handler.selection_bounds_for_range(.{ .start = 0, .end = 1 }, bounds, vcx.window, cx.app).len);
+    try std.testing.expect(handler.text_input_editable_range(vcx.window, cx.app) == null);
+    handler.set_selected_text_range(.{ .start = 0, .end = 1 }, vcx.window, cx.app);
+    try std.testing.expectEqual(platform_mod.TextInputAction.unspecified, handler.text_input_configuration(vcx.window, cx.app).input_action);
+}
+
 // ---------------------------------------------------------------------------
 // Context (GPUI `app/context.rs`): observers, releases, globals, deferred work,
 // focus listeners, quit hooks, and the async contexts that go with them.
