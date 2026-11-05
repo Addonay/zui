@@ -31,6 +31,7 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 - [ ] `ImageCache` trait, provider, `RetainAllImageCache` and LRU; `image_gallery`'s second gallery is a plain copy
 - [ ] Generic `Asset` with `use_asset` and `remove_asset`; `image_loading` drops its custom loaders and forced failure
 - [ ] `image_loading`: the loading state and click handlers have never been checked live
+- [ ] `testing`: `test_allow_parking` is not ported, since ZUI has no parking check
 - [ ] `run_until_parked` never parks while a GIF is on screen, and spins to its 10,000-iteration guard
 - [ ] WebP, TIFF, ICO, PNM decoders
 - [ ] EXIF orientation in PNG (JPEG is done)
@@ -56,13 +57,14 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 ## Elements and input
 
-- [ ] Pressure and back-gesture listeners
+- [ ] Back-gesture listeners; no platform emits pressure yet (macOS will)
 - [ ] Long-press tooltips
 - [ ] External drag payloads (dragging out of the window)
 - [ ] `cached` views
 - [ ] Alias `with_animation` on `StyledElement`
 - [ ] `container_query`, `percentage`
-- [ ] `set_menus`, `init_colors`
+- [ ] `init_colors`; `set_menus` is stored but only macOS will draw it
+- [ ] Linux notifications: the API exists, but posting needs a D-Bus client, which ZUI lacks
 - [ ] Scroll: ZUI stops propagation in the scroll listener and GPUI does not, so nested scrollers differ
 - [ ] `Unbind`, `InputPreference`, pausing the pending-input timeout
 - [ ] `keyboard_layout` and its change observer
@@ -96,10 +98,8 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 Each must run headless with a correct snapshot, and be driven for real: first frames hide most bugs.
 
-- [ ] mouse_pressure
 - [ ] toggle_headless: needs switching windowing modes at runtime (`request_windowing`)
-- [ ] set_menus, system_notifications, layer_shell, a11y
-- [ ] paths_bench, testing
+- [ ] layer_shell, a11y
 
 ## Performance (after API parity)
 
@@ -108,6 +108,8 @@ Each must run headless with a correct snapshot, and be driven for real: first fr
 - [ ] X11 XShm presentation
 - [ ] SIMD gradients in the CPU renderer
 - [ ] Benchmarks against GPUI
+- [ ] `paths_bench` has no numbers: a Debug build drew no first frame in 25 s on the CPU renderer. Measure
+      it in release, on the GPU too, since 2000 path stars that slow may be a real problem
 
 ## Project
 
