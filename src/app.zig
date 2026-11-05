@@ -342,6 +342,22 @@ pub fn Context(comptime T: type) type {
             return self.app.add_observer(observed.entity_id(), me.as_u64(), S.call);
         }
 
+        /// Runs `f(this, window, cx)` when the appearance of `window` changes (GPUI `observe_window_appearance`).
+        pub fn observe_window_appearance(self: *Self, window: *Window, comptime f: anytype) Subscription {
+            const me = self.entity_id_;
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                    const id = EntityId.from_u64(ctx);
+                    const state = app.entities.get(id) orelse return false;
+                    const win: *Window = @ptrCast(@alignCast(@constCast(payload.?)));
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    f(@as(*T, @ptrCast(@alignCast(state))), win, &c);
+                    return true;
+                }
+            };
+            return self.app.add_subscriber(.{ .kind = .window_appearance, .emitter = window.handle_id, .ctx = me.as_u64(), .func = S.call, .id = 0 });
+        }
+
         /// Subscribes to events emitted by `emitter`: `f(this, emitter, event, cx)`.
         pub fn subscribe(self: *Self, emitter: anytype, comptime f: anytype) Subscription {
             const EH = @TypeOf(emitter);
@@ -554,7 +570,7 @@ pub fn EntityTypeOf(comptime I: type) type {
 /// Callback shape for observers/subscribers; returns false to unsubscribe.
 const SubscriberFn = *const fn (app: *App, emitter: EntityId, ctx: usize, payload: ?*const anyopaque) bool;
 
-const SubscriberKind = enum { observe, event, release, global };
+const SubscriberKind = enum { observe, event, release, global, window_closed, window_appearance };
 
 const Subscriber = struct {
     kind: SubscriberKind,
@@ -632,6 +648,7 @@ const Effect = union(enum) {
     global_changed: TypeId,
     deferred: struct { ctx: usize, func: *const fn (*App, usize) void },
     refresh_windows,
+    close_window: window_mod.WindowId,
 };
 
 // ---------------------------------------------------------------------------
@@ -887,6 +904,7 @@ pub const App = struct {
                 .global_changed => |tid| self.apply_global_changed(tid),
                 .deferred => |d| d.func(self, d.ctx),
                 .refresh_windows => for (self.windows.items) |w| if (w) |win| win.refresh(),
+                .close_window => |id| if (self.window_by_id(id)) |win| self.close_window(win),
             }
         }
         self.pending_effects.clearRetainingCapacity();
@@ -1152,13 +1170,64 @@ pub const App = struct {
     }
 
     pub fn close_window(self: *App, win: *Window) void {
+        var index: ?usize = null;
         for (self.windows.items, 0..) |w, i| if (w == win) {
-            self.windows.items[i] = null;
+            index = i;
         };
+        // Already closed: the window is gone and must not be destroyed twice.
+        const i = index orelse return;
+        self.windows.items[i] = null;
+        const id = win.handle_id;
         win.destroy(self);
+        self.dispatch_window_closed(id);
         var any_open = false;
         for (self.windows.items) |w| any_open = any_open or w != null;
         if (!any_open and self.platform.quit_when_last_window_closes()) self.quit();
+    }
+
+    /// Closes the window with this handle once the current update ends (GPUI `remove_window`).
+    pub fn close_window_later(self: *App, win: *Window) void {
+        self.push_effect(.{ .close_window = win.handle_id });
+    }
+
+    /// How many windows are open (GPUI `cx.windows().len()`).
+    pub fn window_count(self: *App) usize {
+        var n: usize = 0;
+        for (self.windows.items) |w| if (w != null) {
+            n += 1;
+        };
+        return n;
+    }
+
+    /// Runs `f(cx, window_id)` after a window closes (GPUI `cx.on_window_closed`).
+    pub fn on_window_closed(self: *App, comptime f: anytype) Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const id: *const window_mod.WindowId = @ptrCast(@alignCast(payload.?));
+                f(app, id.*);
+                return true;
+            }
+        };
+        return self.add_subscriber(.{ .kind = .window_closed, .emitter = 0, .ctx = 0, .func = S.call, .id = 0 });
+    }
+
+    fn dispatch_window_closed(self: *App, id: window_mod.WindowId) void {
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != .window_closed) continue;
+            if (!sub.func(self, EntityId.from_u64(0), sub.ctx, &id)) self.subscribers.items[i].active = false;
+        }
+    }
+
+    /// Runs the appearance observers of `win` (its appearance has changed).
+    pub fn dispatch_window_appearance(self: *App, win: *Window) void {
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != .window_appearance or sub.emitter != @as(u64, win.handle_id)) continue;
+            if (!sub.func(self, EntityId.from_u64(0), sub.ctx, win)) self.subscribers.items[i].active = false;
+        }
     }
 
     pub fn refresh_windows(self: *App) void {

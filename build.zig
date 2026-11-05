@@ -25,6 +25,9 @@ const examples = [_][]const u8{
     "tab_stop",
     "popover",
     "anchor",
+    "on_window_close_quit",
+    "window_movable",
+    "window_shadow",
 };
 
 pub fn build(b: *std.Build) void {

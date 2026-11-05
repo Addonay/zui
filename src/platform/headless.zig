@@ -131,6 +131,21 @@ pub const HeadlessWindow = struct {
     ime_enabled: bool = false,
     ime_enabled_changes: u32 = 0,
     ime_position: ?geometry.Bounds(Pixels) = null,
+    /// The app draws the frame (no server decorations are asked for). Nothing is moved or
+    /// resized by a compositor here, so `start_window_resize` and `show_window_menu` do nothing.
+    client_decorations: bool = false,
+    client_inset: Pixels = 0,
+
+    fn windowDecorations(p: *PlatformWindow) window_mod.Decorations {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        if (self.client_decorations) return .{ .client = .{ .tiling = .{} } };
+        return .server;
+    }
+
+    fn setClientInset(p: *PlatformWindow, inset: Pixels) void {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        self.client_inset = inset;
+    }
 
     fn updateImeEnabled(p: *PlatformWindow, enabled: bool) void {
         const self: *HeadlessWindow = @fieldParentPtr("base", p);
@@ -155,13 +170,15 @@ pub const HeadlessWindow = struct {
         .set_title = setTitle,
         .resize = resize,
         .close = close,
+        .window_decorations = windowDecorations,
+        .set_client_inset = setClientInset,
     };
 
     fn create(owner: *HeadlessPlatform, options: window_mod.WindowOptions) !*HeadlessWindow {
         const a = owner.allocator;
         const self = try a.create(HeadlessWindow);
         const b = if (options.window_bounds) |wb| wb.get_bounds() else geometry.Bounds(Pixels){ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 800, .height = 600 } };
-        self.* = .{ .owner = owner, .size = b.size, .atlas = atlas_mod.CpuAtlas.init(a) };
+        self.* = .{ .owner = owner, .size = b.size, .atlas = atlas_mod.CpuAtlas.init(a), .client_decorations = options.window_decorations == .client };
         if (std.c.getenv("ZUI_SCALE")) |s| self.scale = std.fmt.parseFloat(f32, std.mem.span(s)) catch 1;
         return self;
     }

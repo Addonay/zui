@@ -43,6 +43,32 @@ pub const WindowAppearance = enum {
     }
 };
 
+/// The edge or corner a window resize starts from (GPUI `ResizeEdge`).
+pub const ResizeEdge = enum { top_left, top, top_right, right, bottom_right, bottom, bottom_left, left };
+
+/// Which edges of a client-decorated window the compositor has tiled against (GPUI `Tiling`).
+pub const Tiling = struct {
+    top: bool = false,
+    left: bool = false,
+    right: bool = false,
+    bottom: bool = false,
+
+    pub fn tiled() Tiling {
+        return .{ .top = true, .left = true, .right = true, .bottom = true };
+    }
+
+    pub fn is_tiled(self: Tiling) bool {
+        return self.top or self.left or self.right or self.bottom;
+    }
+};
+
+/// Who draws the window frame (GPUI `Decorations`). With `client`, the app draws its own
+/// titlebar, borders and shadow, and calls `set_client_inset` for the shadow area.
+pub const Decorations = union(enum) {
+    server,
+    client: struct { tiling: Tiling },
+};
+
 /// Clipboard contents (GPUI `ClipboardItem`), text only for now.
 pub const ClipboardItem = struct {
     text_: []const u8,
@@ -215,7 +241,34 @@ pub const PlatformWindow = struct {
         /// with false first, because some protocols must be told about each field.
         update_ime_enabled: *const fn (*PlatformWindow, bool) void = noopImeEnabled,
         play_system_bell: *const fn (*PlatformWindow) void = noop,
+        /// Who draws the frame, as decided for this window (GPUI `window_decorations`).
+        window_decorations: *const fn (*PlatformWindow) Decorations = serverDecorations,
+        /// Shadow area of a client-decorated window, in logical pixels (GPUI `set_client_inset`).
+        set_client_inset: *const fn (*PlatformWindow, Pixels) void = noopInset,
+        start_window_resize: *const fn (*PlatformWindow, ResizeEdge) void = noopEdge,
+        /// Asks the compositor for its window menu at a position (GPUI `show_window_menu`).
+        show_window_menu: *const fn (*PlatformWindow, Point(Pixels)) void = noopPoint,
     };
+
+    fn serverDecorations(_: *PlatformWindow) Decorations {
+        return .server;
+    }
+    fn noopInset(_: *PlatformWindow, _: Pixels) void {}
+    fn noopEdge(_: *PlatformWindow, _: ResizeEdge) void {}
+    fn noopPoint(_: *PlatformWindow, _: Point(Pixels)) void {}
+
+    pub fn window_decorations(self: *PlatformWindow) Decorations {
+        return self.vtable.window_decorations(self);
+    }
+    pub fn set_client_inset(self: *PlatformWindow, inset: Pixels) void {
+        self.vtable.set_client_inset(self, inset);
+    }
+    pub fn start_window_resize(self: *PlatformWindow, edge: ResizeEdge) void {
+        self.vtable.start_window_resize(self, edge);
+    }
+    pub fn show_window_menu(self: *PlatformWindow, position: Point(Pixels)) void {
+        self.vtable.show_window_menu(self, position);
+    }
 
     fn defaultAppearance(_: *PlatformWindow) WindowAppearance {
         return .light;
