@@ -119,7 +119,7 @@ third_party/             stb_image, nanosvg, images.c shim
   (installed at `~/tools/zig-x86_64-linux-0.17.0`, symlinked to `/usr/local/bin/zig`).
   Note: Zig 0.17 changed a lot vs older versions — see §9.
 - `build.zig.zon` dependencies:
-  - `cozmic` — `git+https://github.com/Addonay/cozmic.git#a59bca9bec6dd8eb0b41ccd637732978590382f2`
+  - `cozmic` — `git+https://github.com/Addonay/cozmic.git#97192f9a4582d4f52f8041155673fcac4136e203`
     (its own deps: ezi_code, harfbuzz 14.1.0, freetype 2.14.3, zlib 1.3.1, libpng 1.6.50)
   - `zafi` — `git+https://github.com/Addonay/zafi.git#04086f7a21f120a5ea52f921fb2034d75e10264f`
   - `sokol_tools_bin` (lazy) — the `sokol-shdc` binaries, fetched only by
@@ -242,6 +242,8 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 - **Layout**: zafi tree cleared per frame (like GPUI), styles converted to
   device pixels (scale factor), rounding disabled, bounds snapped with
   round-half-toward-zero; measure functions via a threadlocal trampoline.
+- **Color glyphs**: cozmic renders COLRv1 through the bundled HarfBuzz's `hb-raster` and the rest
+  through FreeType. `-Dsystem-libs` builds of cozmic have no COLRv1.
 - **Text**: cozmic shapes each `layout_line` directly (one AttrsList span per
   run, no cozmic wrapping); GPUI's `LineWrapper` wraps. FontId = index into a
   resolved-face table (fallback faces get their own ids). Glyph rasterization
@@ -357,9 +359,7 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
    StyledElement (add `pub const with_animation = animation.AnimationExt(*Self).with_animation;` etc.).
 3. Input: multi-keystroke binding replay, tab groups, `Unbind`, `observe_keystrokes`,
    `keyboard_layout` and its change observer, IME content types.
-4. Text: **COLRv1 color fonts draw nothing**, so emoji are blank wherever that is the system's
-   emoji font, as on current Fedora. cozmic rasterizes them to a zero-size glyph; it needs a COLRv1
-   renderer. Also ShapedLine cursor/split APIs, typographic bounds, font enumeration, `add_fonts`
+4. Text: a text-presentation selector (`❤\u{fe0e}`) still draws the color glyph. Also ShapedLine cursor/split APIs, typographic bounds, font enumeration, `add_fonts`
    (every ported example skips GPUI's `load_fonts`), missing-glyph reporting.
 5. Async: assets/images load synchronously; GIF animation; WebP.
 6. Port the remaining GPUI examples (image_gallery, image_loading, gif_viewer, popover, anchor,
