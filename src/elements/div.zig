@@ -3544,6 +3544,38 @@ fn schedule_tooltip_timer(st: *InteractiveElementState, comptime f: fn (TooltipT
     cx.background_executor().after(cx.foreground_executor(), delay_ns, f, timer);
 }
 
+fn clamp_scroll(offset: Point(Pixels), max: Size(Pixels)) Point(Pixels) {
+    return .{ .x = std.math.clamp(offset.x, -max.width, 0), .y = std.math.clamp(offset.y, -max.height, 0) };
+}
+
+/// How far the children can scroll inside `bounds`, with the box's padding (GPUI
+/// `clamp_scroll_position`).
+fn scroll_max(bounds: Bounds(Pixels), s: *const Style, child_layout_ids: []const LayoutId, window: *Window) Size(Pixels) {
+    if (child_layout_ids.len == 0) return .{ .width = 0, .height = 0 };
+    const inf = std.math.inf(f32);
+    var min_x = inf;
+    var min_y = inf;
+    var max_x = -inf;
+    var max_y = -inf;
+    for (child_layout_ids) |lid| {
+        const child = window.layout_bounds(lid);
+        min_x = @min(min_x, child.left());
+        min_y = @min(min_y, child.top());
+        max_x = @max(max_x, child.right());
+        max_y = @max(max_y, child.bottom());
+    }
+    const rem = window.rem_size();
+    const basis_x: geometry.AbsoluteLength = .{ .pixels = bounds.size.width };
+    const basis_y: geometry.AbsoluteLength = .{ .pixels = bounds.size.height };
+    const width = (max_x - min_x) + s.padding.left.to_pixels(basis_x, rem) + s.padding.right.to_pixels(basis_x, rem);
+    const height = (max_y - min_y) + s.padding.top.to_pixels(basis_y, rem) + s.padding.bottom.to_pixels(basis_y, rem);
+    // Layout results differ after about five decimals, which must not make a box scrollable.
+    return .{
+        .width = @max(0, @round((width - bounds.size.width) * 100) / 100),
+        .height = @max(0, @round((height - bounds.size.height) * 100) / 100),
+    };
+}
+
 pub const InteractiveElementState = struct {
     focus_handle: ?FocusHandle = null,
     pending_mouse_down: ?MouseDownEvent = null,
@@ -3552,6 +3584,8 @@ pub const InteractiveElementState = struct {
     group_hovered: bool = false,
     active: bool = false,
     scroll_offset: Point(Pixels) = .{ .x = 0, .y = 0 },
+    /// How far the content could scroll in the last frame.
+    scroll_max: ?Size(Pixels) = null,
     hover_listener_state: bool = false,
     /// Set in capture, fired in bubble, so stopped propagation cannot leave it stuck.
     captured_mouse_down: ?MouseDownEvent = null,
@@ -4132,12 +4166,25 @@ pub fn StyledElement(comptime Ext: type) type {
             if (has_text) window.push_text_style(s.text);
             defer if (has_text) window.pop_text_style();
 
-            // Scroll offset.
+            // Scroll offset, clamped before the children use it (GPUI `clamp_scroll_position`):
+            // a wheel event past the end must not paint a frame out there.
             var scroll: Point(Pixels) = .{ .x = 0, .y = 0 };
             if (s.overflow.x == .scroll or s.overflow.y == .scroll) {
+                const max = scroll_max(bounds, s, rl.child_layout_ids, window);
                 if (it.tracked_scroll_handle) |sh| {
-                    scroll = sh.offset();
-                } else if (pp.state) |st| scroll = st.scroll_offset;
+                    sh.state.max_offset = max;
+                    sh.state.bounds = bounds;
+                    sh.state.child_bounds.clearRetainingCapacity();
+                    const allocator = sh.state.allocator orelse std.heap.page_allocator;
+                    for (rl.child_layout_ids) |lid| sh.state.child_bounds.append(allocator, window.layout_bounds(lid)) catch oom();
+                    scroll = clamp_scroll(sh.offset(), max);
+                    sh.set_offset(scroll);
+                }
+                if (pp.state) |st| {
+                    st.scroll_max = max;
+                    if (it.tracked_scroll_handle == null) scroll = clamp_scroll(st.scroll_offset, max);
+                    st.scroll_offset = scroll;
+                }
             }
             pp.scroll_offset = scroll;
 
@@ -4149,31 +4196,6 @@ pub fn StyledElement(comptime Ext: type) type {
             for (self.children_list.items) |c| c.prepaint(window, cx);
             window.pop_element_offset();
 
-            // Content size for scroll clamping.
-            if (s.overflow.x == .scroll or s.overflow.y == .scroll) {
-                var content = bounds;
-                for (rl.child_layout_ids) |lid| {
-                    const cb = window.layout_bounds(lid);
-                    content = content.@"union"(cb.@"union"(cb));
-                }
-                const pad_r = s.padding.right.to_pixels(.{ .pixels = bounds.size.width }, window.rem_size());
-                const pad_b = s.padding.bottom.to_pixels(.{ .pixels = bounds.size.height }, window.rem_size());
-                const max: Size(Pixels) = .{
-                    .width = @max(0, content.right() + pad_r - bounds.right()),
-                    .height = @max(0, content.bottom() + pad_b - bounds.bottom()),
-                };
-                if (it.tracked_scroll_handle) |sh| {
-                    sh.state.max_offset = max;
-                    sh.state.bounds = bounds;
-                    sh.state.child_bounds.clearRetainingCapacity();
-                    const a = sh.state.allocator orelse std.heap.page_allocator;
-                    for (rl.child_layout_ids) |lid| sh.state.child_bounds.append(a, window.layout_bounds(lid)) catch oom();
-                }
-                if (pp.state) |st| {
-                    st.scroll_offset.x = std.math.clamp(st.scroll_offset.x, -max.width, 0);
-                    st.scroll_offset.y = std.math.clamp(st.scroll_offset.y, -max.height, 0);
-                }
-            }
             return pp;
         }
 
@@ -4423,18 +4445,19 @@ pub fn StyledElement(comptime Ext: type) type {
             const s = it.base_style.overflow;
             if (s.x != .scroll and s.y != .scroll) return;
             const delta = e.delta.pixel_delta(window.line_height());
-            var off: Point(Pixels) = if (it.tracked_scroll_handle) |sh| sh.offset() else if (c.state) |st| st.scroll_offset else return;
+            const old: Point(Pixels) = if (it.tracked_scroll_handle) |sh| sh.offset() else if (c.state) |st| st.scroll_offset else return;
+            var off = old;
             if (s.x == .scroll) off.x += delta.x;
             if (s.y == .scroll) off.y += delta.y;
-            if (it.tracked_scroll_handle) |sh| {
-                const max = sh.max_offset();
-                off.x = std.math.clamp(off.x, -max.width, 0);
-                off.y = std.math.clamp(off.y, -max.height, 0);
-                sh.set_offset(off);
-            }
+            // Unknown until the first frame; prepaint clamps again in any case.
+            const max: ?Size(Pixels) = if (it.tracked_scroll_handle) |sh| sh.max_offset() else if (c.state) |st| st.scroll_max else null;
+            if (max) |limit| off = clamp_scroll(off, limit);
+            window.stop_propagation();
+            // At the limit nothing moved, so nothing needs drawing.
+            if (off.x == old.x and off.y == old.y) return;
+            if (it.tracked_scroll_handle) |sh| sh.set_offset(off);
             if (c.state) |st| st.scroll_offset = off;
             window.refresh();
-            window.stop_propagation();
         }
 
         // Styled methods (generated from styled.zig).

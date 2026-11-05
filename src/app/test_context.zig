@@ -276,6 +276,7 @@ const ClickEvent = interactive.ClickEvent;
 const KeyDownEvent = interactive.KeyDownEvent;
 const FocusHandle = window_mod.FocusHandle;
 const div = div_mod.div;
+const canvas_mod = @import("../elements/canvas.zig");
 const px = geometry.px;
 const rgb = @import("../color.zig").rgb;
 const red = @import("../color.zig").red;
@@ -745,6 +746,59 @@ test "a modifier tapped alone is a keystroke; used with another key it is not" {
     send(vcx.window, cx.app, false, false);
     vcx.run_until_parked();
     try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+}
+
+const OverscrollView = struct {
+    var child_y: [64]f32 = undefined;
+    var frames: usize = 0;
+
+    fn record(_: void, bounds: geometry.Bounds(Pixels), _: *Window, _: *App) void {
+        if (frames < child_y.len) child_y[frames] = bounds.origin.y;
+        frames += 1;
+    }
+
+    pub fn render(_: *OverscrollView, _: *Window, _: *Context(OverscrollView)) *Div {
+        return div().id("scroller").w(px(100)).h(px(100)).overflow_y_scroll().child(
+            div().w(px(100)).h(px(300)).child(canvas_mod.canvas_fn({}, record).size_full()),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(OverscrollView) {
+        return app.new(OverscrollView{});
+    }
+};
+
+test "scroll: no frame is painted past either end, and scrolling at a limit draws nothing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    OverscrollView.frames = 0;
+    _, const vcx = cx.add_window_view(OverscrollView.build);
+    vcx.run_until_parked();
+    const pos: Point(Pixels) = .{ .x = 10, .y = 10 };
+
+    // A first event at the top, before any limit could be known by an event.
+    const at_rest = OverscrollView.frames;
+    try std.testing.expect(at_rest > 0);
+    vcx.simulate_scroll(pos, .{ .x = 0, .y = 50 });
+    vcx.run_until_parked();
+    try std.testing.expectEqual(at_rest, OverscrollView.frames);
+
+    // Far past the bottom in one event stops exactly at the end.
+    vcx.simulate_scroll(pos, .{ .x = 0, .y = -1000 });
+    vcx.run_until_parked();
+    try std.testing.expect(OverscrollView.frames > at_rest);
+    const top = OverscrollView.child_y[0];
+    try std.testing.expectEqual(top - 200, OverscrollView.child_y[OverscrollView.frames - 1]);
+
+    // Past the bottom again: no frame.
+    const at_end = OverscrollView.frames;
+    vcx.simulate_scroll(pos, .{ .x = 0, .y = -50 });
+    vcx.run_until_parked();
+    try std.testing.expectEqual(at_end, OverscrollView.frames);
+
+    // No frame ever left the range.
+    for (OverscrollView.child_y[0..OverscrollView.frames]) |y| {
+        try std.testing.expect(y <= top and y >= top - 200);
+    }
 }
 
 test "actions: dispatch_action reaches on_action on the focus path" {

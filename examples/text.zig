@@ -253,9 +253,13 @@ const TextExample = struct {
         const step_up_5 = step_up_4 * type_scale;
         const step_up_6 = step_up_5 * type_scale;
 
+        // A flex column, unlike GPUI's example: there the scroll area is as tall as the window
+        // below the header, so its last lines can never be reached.
         return div()
             .font_family(self.font_family)
             .size_full()
+            .flex()
+            .flex_col()
             .child(
                 div()
                     .bg(gpui.white())
