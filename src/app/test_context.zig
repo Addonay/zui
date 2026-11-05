@@ -2700,6 +2700,11 @@ test "remove_asset: the next use loads again, and an abandoned load is dropped" 
     try std.testing.expect(!cx.app.has_asset(Slow, 2));
     vcx.window.refresh();
     vcx.run_until_parked();
+    // The load runs on a worker, which may not have got to it yet.
+    for (0..2000) |_| {
+        if (Slow.starts.load(.acquire) >= 2) break;
+        executor_mod.sleep_ns(std.time.ns_per_ms);
+    }
     try std.testing.expectEqual(@as(u32, 2), Slow.starts.load(.acquire));
     try std.testing.expectEqual(@as(?u32, null), SlowView.seen);
 
