@@ -1,0 +1,23 @@
+Test images for src/wuffs.zig.
+
+Each file is copied from Wuffs' test/data directory (https://github.com/google/wuffs,
+commit b36a81d, licensed Apache-2.0 OR MIT), unchanged.
+
+  hippopotamus.lossy.webp                  lossy WebP, 36x28
+  hippopotamus.lossless.webp               lossless WebP, 36x28
+  animated-red-blue.webp                   animated WebP, 64x48, 4 frames (10, 20, 30, 40 cs)
+  animated-red-blue.gif                    animated GIF, 64x48, 4 frames (10, 20, 30, 40 cs)
+  animated-red-blue.apng                   APNG, 64x48
+  hippopotamus.masked-with-muybridge.png   PNG with alpha, 36x28
+  hippopotamus.jpeg                        JPEG, 36x28
+  mona-lisa.21x32.qoi                      QOI, 21x32
+  bricks-gray.tga                          TGA, 160x120, 8-bit grey
+  hippopotamus.bmp                         BMP, 24-bit, 36x28
+  hippopotamus.ppm                         PPM (P6), 36x28
+  hippopotamus.regular.gif                 GIF, 36x28, one frame
+
+The .rgba files are ImageMagick's output for the file of the same name, as straight-alpha RGBA:
+  magick <file> -depth 8 rgba:-        (single-frame files)
+They are compared exactly for lossless, PNG, QOI, BMP, PPM and GIF, and within a tolerance of 2 for
+lossy WebP and JPEG (libwebp and libjpeg round differently from Wuffs). The animations are compared by
+colour counts of the frames of `magick <file> -coalesce`, as the tests say.
