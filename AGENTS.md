@@ -94,7 +94,7 @@ src/input.zig            ElementInputHandler: a view's EntityInputHandler method
 src/executor.zig         BackgroundExecutor, ForegroundExecutor, Task(T)
 src/scene.zig bounds_tree.zig atlas.zig path_builder.zig
 src/assets.zig svg_renderer.zig spring.zig
-src/http_client.zig image_disk_cache.zig   remote images: HTTP client and on-disk copies
+src/http_client.zig http_native.zig image_disk_cache.zig   remote images: HTTP client and on-disk copies
 src/platform.zig         Platform / PlatformWindow vtable interfaces + shared types
 src/platform/headless.zig  headless/test platform
 src/platform/linux.zig + linux/{wayland,wayland_proto,x11,x11_proto,xkb,input,dl}.zig
@@ -300,7 +300,9 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   not thread-safe. A copy is kept in the per-user cache directory (`with_image_cache`, off in tests)
   and shown first, then the fetch still runs and replaces it if the bytes changed. Measured on 2026-11-05:
   curl takes 1.0 to 1.4 s for these URLs, `std.http` the same in release and about 0.9 s more in Debug,
-  decoding 25 to 60 ms. So only the saved copy can make it fast.
+  decoding 25 to 60 ms. So the HTTP client is a static library, `http_native.zig`, built optimized even in
+  Debug, because `std` is compiled per artifact. It has its own `Io` and a C ABI, and callers poll a job
+  from their own `Io` so that cancelling them cancels the fetch.
 - **Window prompts**: `window/prompts.zig` follows GPUI's fallback prompt, with one addition: GPUI handles
   no keys there, and ZUI takes arrows, Tab, Enter, Space and Escape (which picks the Cancel button).
   Answers go to a listener. A replaced prompt, or one whose window closed, is never answered.
