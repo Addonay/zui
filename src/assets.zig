@@ -587,7 +587,7 @@ const RemoteImages = struct {
             .threaded = Io.Threaded.init(cache.allocator, .{}),
             .client = undefined,
         };
-        self.client = .init();
+        self.client = .shared();
         self.disk_dir = switch (config.disk_cache) {
             .off => null,
             .dir => |dir| try cache.allocator.dupe(u8, dir),
@@ -601,7 +601,6 @@ const RemoteImages = struct {
         self.group.cancel(io);
         for (self.finished.items) |*f| self.free_finished(f);
         self.finished.deinit(self.cache.allocator);
-        self.client.deinit();
         self.threaded.deinit();
         if (self.disk_dir) |dir| self.cache.allocator.free(dir);
         self.cache.allocator.destroy(self);
@@ -856,8 +855,7 @@ pub fn load_detached(allocator: std.mem.Allocator, io: Io, source: AssetSource, 
 
 fn fetch_detached(allocator: std.mem.Allocator, io: Io, http: ?http_client_mod.HttpClient, url: []const u8) anyerror![]u8 {
     if (http) |client| return client.get(allocator, io, url);
-    var client = http_client_mod.StdClient.init();
-    defer client.deinit();
+    var client = http_client_mod.StdClient.shared();
     return client.get(allocator, io, url);
 }
 
