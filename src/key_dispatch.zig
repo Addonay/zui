@@ -271,6 +271,21 @@ pub const DispatchTree = struct {
         return path.toOwnedSlice(allocator) catch oom();
     }
 
+    /// Focus ids from the root down to `focus_id`, one per node that has one (GPUI `focus_path`).
+    /// Empty if the id is unknown. The caller frees the slice with `allocator`.
+    pub fn focus_path(self: *const DispatchTree, focus_id: u64, allocator: Allocator) Allocator.Error![]u64 {
+        var out: std.ArrayList(u64) = .empty;
+        errdefer out.deinit(allocator);
+        var current = self.focusable.get(focus_id);
+        while (current) |id| {
+            const dn = &self.nodes.items[id];
+            if (dn.focus_id) |fid| try out.append(allocator, fid);
+            current = dn.parent;
+        }
+        std.mem.reverse(u64, out.items);
+        return out.toOwnedSlice(allocator);
+    }
+
     /// The key contexts along `path`, root first. The caller frees the slice with `allocator`.
     pub fn context_stack(self: *const DispatchTree, path: []const DispatchNodeId, allocator: Allocator) []KeyContext {
         var out: std.ArrayList(KeyContext) = .empty;
@@ -367,6 +382,36 @@ pub const DispatchTree = struct {
 // Tests (ported from GPUI tab_stop.rs, plus path and focus checks)
 
 const testing = std.testing;
+
+test "focus_path: root to focused, skipping nodes without a focus id" {
+    var b = Builder.init();
+    defer b.deinit();
+    // root(0) -> outer(focus 1) -> { plain, inner(focus 2) -> child(focus 3) }
+    b.tree.push_node();
+    b.tree.set_focus_id(1, 0, false);
+    b.tree.push_node();
+    b.tree.pop_node();
+    b.tree.push_node();
+    b.tree.set_focus_id(2, 0, false);
+    b.tree.push_node();
+    b.tree.set_focus_id(3, 0, false);
+    b.tree.pop_node();
+    b.tree.pop_node();
+    b.tree.pop_node();
+    b.tree.pop_node();
+
+    const inner = try b.tree.focus_path(2, testing.allocator);
+    defer testing.allocator.free(inner);
+    try testing.expectEqualSlices(u64, &.{ 1, 2 }, inner);
+
+    const deepest = try b.tree.focus_path(3, testing.allocator);
+    defer testing.allocator.free(deepest);
+    try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, deepest);
+
+    const unknown = try b.tree.focus_path(99, testing.allocator);
+    defer testing.allocator.free(unknown);
+    try testing.expectEqual(@as(usize, 0), unknown.len);
+}
 
 /// Builds a flat tree: root node 0 with one child per focus handle.
 const Builder = struct {
