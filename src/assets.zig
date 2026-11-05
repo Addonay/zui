@@ -17,6 +17,8 @@ const disk_cache = @import("image_disk_cache.zig");
 const log = std.log.scoped(.zui_assets);
 const geometry = @import("geometry.zig");
 const svg_mod = @import("svg_renderer.zig");
+const window_mod = @import("window.zig");
+const app_mod = @import("app.zig");
 
 const Pixels = geometry.Pixels;
 const DevicePixels = geometry.DevicePixels;
@@ -754,9 +756,18 @@ pub const ImageSource = union(enum) {
     render: *RenderImage,
     /// Encoded bytes held in memory; the caller keeps them alive.
     image: *const Image,
+    /// Asked for each time the element is laid out (GPUI `ImageSource::Custom`). Built by `from`
+    /// from a pointer to a type with `use_image(self, *Window, *App) ?ImageCacheError!*RenderImage`.
+    custom: Custom,
+
+    pub const Custom = struct {
+        ptr: *anyopaque,
+        load_fn: *const fn (ptr: *anyopaque, window: *window_mod.Window, cx: *app_mod.App) ?ImageCacheError!*RenderImage,
+    };
 
     /// Converts strings (URL if it starts with `http://`, `https://` or `file://`,
-    /// otherwise an embedded asset name), `Resource`, `*RenderImage`, and `*Image`.
+    /// otherwise an embedded asset name), `Resource`, `*RenderImage`, `*Image`, and pointers to
+    /// types with `use_image` (see `custom`).
     pub fn from(value: anytype) ImageSource {
         const T = @TypeOf(value);
         if (T == ImageSource) return value;
@@ -764,6 +775,14 @@ pub const ImageSource = union(enum) {
         switch (@typeInfo(T)) {
             .pointer => |p| {
                 if (p.size == .slice and p.child == u8) return from_string(value);
+                // The loader is asked through a mutable pointer, so a `*const` one is cast back; its
+                // `use_image` must not write through it unless it was given a mutable pointer.
+                if (comptime (p.size == .one and has_use_image(p.child))) return .{ .custom = .{ .ptr = @constCast(value), .load_fn = struct {
+                    fn call(ptr: *anyopaque, window: *window_mod.Window, cx: *app_mod.App) ?ImageCacheError!*RenderImage {
+                        const self: *p.child = @ptrCast(@alignCast(ptr));
+                        return self.use_image(window, cx);
+                    }
+                }.call } };
                 if (p.size == .one) {
                     if (p.child == RenderImage) return .{ .render = value };
                     if (p.child == Image) return .{ .image = value };
@@ -781,14 +800,74 @@ pub const ImageSource = union(enum) {
     }
 
     /// Returns the decoded image, loading it through `cache` if needed (GPUI `use_data`).
+    /// `custom` sources need a window, so `img` calls them itself: this is `unreachable` for them.
     pub fn use_data(self: ImageSource, cache: *AssetCache, source: AssetSource) ImageCacheError!*RenderImage {
         return switch (self) {
             .resource => |r| cache.load_resource(source, r),
             .render => |r| r,
             .image => |i| cache.load_image(i),
+            .custom => unreachable,
+        };
+    }
+
+    fn has_use_image(comptime T: type) bool {
+        return switch (@typeInfo(T)) {
+            .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, "use_image"),
+            else => false,
         };
     }
 };
+
+/// The atlas key of one frame of a decoded image: a hash of the image id and frame index.
+pub fn image_atlas_key(id: u64, frame: usize) u64 {
+    const parts = [_]u64{ id, frame };
+    return std.hash.Wyhash.hash(0x696d6720, std.mem.sliceAsBytes(&parts));
+}
+
+/// Loads and decodes `resource` without touching any shared state, so it can run on a worker
+/// thread (GPUI `ImageAssetLoader`). URLs go through `http` if set, otherwise through a new client
+/// on `io`. Unlike `AssetCache`, nothing is saved to disk and nothing is kept.
+pub fn load_detached(allocator: std.mem.Allocator, io: Io, source: AssetSource, http: ?http_client_mod.HttpClient, resource: Resource) ImageCacheError!*RenderImage {
+    switch (resource) {
+        .embedded => |name| {
+            const bytes = source.load(name) orelse return error.AssetNotFound;
+            return decode_detached(allocator, bytes);
+        },
+        .path => |path| {
+            const bytes = try read_file(allocator, path);
+            defer allocator.free(bytes);
+            return decode_detached(allocator, bytes);
+        },
+        .uri => |uri| {
+            if (std.mem.startsWith(u8, uri, "file://")) {
+                const bytes = try read_file(allocator, uri["file://".len..]);
+                defer allocator.free(bytes);
+                return decode_detached(allocator, bytes);
+            }
+            const bytes = fetch_detached(allocator, io, http, uri) catch |err| {
+                log.warn("could not fetch image {s}: {s}", .{ uri, @errorName(err) });
+                return error.FetchFailed;
+            };
+            defer allocator.free(bytes);
+            return decode_detached(allocator, bytes);
+        },
+    }
+}
+
+fn fetch_detached(allocator: std.mem.Allocator, io: Io, http: ?http_client_mod.HttpClient, url: []const u8) anyerror![]u8 {
+    if (http) |client| return client.get(allocator, io, url);
+    var client = http_client_mod.StdClient.init(allocator, io);
+    defer client.deinit();
+    return client.get(allocator, url);
+}
+
+/// Decodes `bytes` with a rasterizer of its own, so it is safe on any thread.
+fn decode_detached(allocator: std.mem.Allocator, bytes: []const u8) ImageCacheError!*RenderImage {
+    const format = ImageFormat.guess(bytes) orelse .svg;
+    var renderer = svg_mod.SvgRenderer.init() catch return error.OutOfMemory;
+    defer renderer.deinit();
+    return decode(allocator, &renderer, format, bytes);
+}
 
 /// Extensions the `img` element accepts (GPUI `Img::extensions`).
 pub fn supported_extensions() []const []const u8 {

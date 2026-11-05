@@ -230,6 +230,17 @@ pub const RenderImage = assets.RenderImage;
 pub const AssetSource = assets.AssetSource;
 pub const Resource = assets.Resource;
 pub const ImageCacheError = assets.ImageCacheError;
+/// Background asset loads (GPUI `asset_cache`): `LoadContext`, `CachedLoad`, and `hash`.
+pub const asset_cache = @import("asset_cache.zig");
+pub const LoadContext = asset_cache.LoadContext;
+pub const hash = asset_cache.hash;
+/// Image caches (GPUI `elements/image_cache`).
+pub const image_cache_mod = @import("image_cache.zig");
+pub const image_cache = image_cache_mod.image_cache;
+pub const AnyImageCache = image_cache_mod.AnyImageCache;
+pub const ImageCacheProvider = image_cache_mod.ImageCacheProvider;
+pub const ImageCacheItem = image_cache_mod.ImageCacheItem;
+pub const RetainAllImageCache = image_cache_mod.RetainAllImageCache;
 pub const SvgRenderer = svg_renderer.SvgRenderer;
 
 // -- anchored / deferred / canvas -------------------------------------------

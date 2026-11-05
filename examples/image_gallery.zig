@@ -1,16 +1,14 @@
 //! Port of GPUI's `examples/image_gallery.rs`: a grid of remote images that can be replaced all at once.
 //!
 //! Differences from the Rust version:
-//! - Both `image_cache(...)` sections are not ported. ZUI has no `ImageCache` trait, no `image_cache`
-//!   element, no `RetainAllImageCache`, no `ImageCacheProvider` and no `ImageCacheItem` yet, so every
-//!   image uses the app's own `AssetCache`, which keeps decoded images for the life of the app. The
-//!   "Next Photos" button clears nothing; it only changes the URLs.
-//! - The second gallery is kept, with the same images, so the page scrolls as in GPUI, but it is not
-//!   managed by an LRU cache.
+//! - The second gallery's LRU cache takes its size from `use_keyed_state`, which needs a comptime
+//!   initializer, so `max_items` is fixed at `IMAGES_IN_GALLERY`. GPUI rebuilds the cache when the size
+//!   changes; this one never changes size.
 //! - The key that busts the URLs is a counter, not a millisecond timestamp.
-//! - No `ReqwestClient`: ZUI has a built-in HTTP client, and `with_http_client` replaces it.
+//! - No `ReqwestClient`: ZUI has a built-in HTTP client.
 //! - `set_menus` and `example_support::load_fonts` are not ported.
 
+const std = @import("std");
 const gpui = @import("zui");
 const App = gpui.App;
 const Bounds = gpui.Bounds;
@@ -20,6 +18,7 @@ const Div = gpui.Div;
 const Window = gpui.Window;
 const WindowOptions = gpui.WindowOptions;
 const div = gpui.div;
+const image_cache = gpui.image_cache;
 const img = gpui.img;
 const px = gpui.px;
 const rgb = gpui.rgb;
@@ -31,8 +30,10 @@ const ImageGallery = struct {
     image_key: u64 = 0,
     items_count: usize = IMAGES_IN_GALLERY,
     total_count: usize = 0,
+    image_cache: gpui.Entity(gpui.RetainAllImageCache),
 
     fn on_next_image(self: *ImageGallery, _: *const ClickEvent, _: *Window, cx: *Context(ImageGallery)) void {
+        self.image_cache.as_mut(cx.app).clear(cx.app);
         self.total_count += self.items_count;
         self.image_key += 1;
         cx.notify();
@@ -77,6 +78,7 @@ const ImageGallery = struct {
         );
 
         const first = div()
+            .image_cache(self.image_cache)
             .id("main")
             .text_color(gpui.black())
             .bg(rgb(0xE9E9E9))
@@ -107,10 +109,65 @@ const ImageGallery = struct {
             .flex()
             .flex_col()
             .text_color(gpui.white())
-            .child("Image gallery (without an image cache, see the top of this file):")
+            .child("Manually managed image cache:")
             .child(first)
-            .child("Second gallery, same images:")
-            .child(second);
+            .child("Automatically managed image cache:")
+            .child(image_cache(SimpleLruCacheProvider{ .id = "lru-cache" }).child(second));
+    }
+};
+
+/// GPUI's `SimpleLruCacheProvider`: the cache for the second gallery, kept in element state.
+const SimpleLruCacheProvider = struct {
+    id: []const u8,
+
+    pub fn provide(self: *SimpleLruCacheProvider, window: *Window, cx: *App) gpui.AnyImageCache {
+        const cache = window.use_keyed_state(self.id, cx, SimpleLruCache.new);
+        return gpui.AnyImageCache.from(cache, cx);
+    }
+};
+
+/// Keeps the `max_items` most recently used images and releases the others (GPUI `SimpleLruCache`).
+const SimpleLruCache = struct {
+    allocator: std.mem.Allocator,
+    max_items: usize,
+    /// The keys of `cache`, most recently used first.
+    usages: std.ArrayList(u64) = .empty,
+    cache: std.AutoHashMapUnmanaged(u64, gpui.ImageCacheItem) = .empty,
+
+    fn new(cx: *Context(SimpleLruCache)) SimpleLruCache {
+        return .{ .allocator = cx.app.allocator, .max_items = IMAGES_IN_GALLERY };
+    }
+
+    /// Called when the entity is released: releases every image.
+    pub fn deinit(self: *SimpleLruCache, app: *App) void {
+        var it = self.cache.valueIterator();
+        while (it.next()) |item| item.release(app);
+        self.cache.deinit(self.allocator);
+        self.usages.deinit(self.allocator);
+    }
+
+    pub fn load(self: *SimpleLruCache, resource: gpui.Resource, window: *Window, cx: *App) ?gpui.ImageCacheError!*gpui.RenderImage {
+        const key = gpui.hash(resource);
+
+        if (self.cache.get(key)) |item| {
+            const index = std.mem.indexOfScalar(u64, self.usages.items, key).?;
+            _ = self.usages.orderedRemove(index);
+            self.usages.insert(self.allocator, 0, key) catch return error.OutOfMemory;
+            return item.use_image(window);
+        }
+
+        if (self.usages.items.len == self.max_items) {
+            const oldest = self.usages.pop().?;
+            const evicted = self.cache.fetchRemove(oldest).?.value;
+            evicted.release(cx);
+        }
+        const item = gpui.ImageCacheItem.new(resource, cx) catch return error.OutOfMemory;
+        self.cache.put(self.allocator, key, item) catch {
+            item.release(cx);
+            return error.OutOfMemory;
+        };
+        self.usages.insert(self.allocator, 0, key) catch return error.OutOfMemory;
+        return item.use_image(window);
     }
 };
 
@@ -135,7 +192,7 @@ fn run_example(cx: *App) void {
 
     _ = cx.open_window(window_options, struct {
         fn build(_: *Window, app: *App) gpui.Entity(ImageGallery) {
-            return app.new(ImageGallery{});
+            return app.new(ImageGallery{ .image_cache = gpui.RetainAllImageCache.new(app) });
         }
     }.build) catch unreachable;
 }
