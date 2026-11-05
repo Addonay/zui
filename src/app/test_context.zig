@@ -629,7 +629,8 @@ test "multi-stroke: without a binding of its own a prefix waits for the next key
     vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
 
     vcx.simulate_keystrokes("ctrl-k");
-    @import("../executor.zig").sleep_ns(200 * std.time.ns_per_ms);
+    // Past the timeout a prefix with a binding of its own would have fired by.
+    @import("../executor.zig").sleep_ns(700 * std.time.ns_per_ms);
     vcx.run_until_parked();
     try std.testing.expect(vcx.window.has_pending_keystrokes());
     vcx.simulate_keystrokes("ctrl-c");
