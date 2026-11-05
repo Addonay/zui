@@ -90,6 +90,8 @@ pub const LinuxPlatform = struct {
     /// True once a window has been opened; the loop exits when the last one closes.
     ever_opened: bool = false,
     app: ?*app_mod.App = null,
+    /// Menus are stored, as in GPUI's Linux platform, but Linux has no menu bar to draw them in.
+    menus: platform.app_menu.MenuStore = .{},
 
     const vtable: platform.Platform.VTable = .{
         .run = run,
@@ -103,7 +105,17 @@ pub const LinuxPlatform = struct {
         .read_from_clipboard = readClipboard,
         .write_to_primary = writePrimary,
         .read_from_primary = readPrimary,
+        .set_menus = setMenus,
+        .get_menus = getMenus,
     };
+
+    fn setMenus(p: *platform.Platform, menus: []const platform.app_menu.Menu) void {
+        from(p).menus.set(from(p).allocator, menus);
+    }
+
+    fn getMenus(p: *platform.Platform) ?[]const platform.app_menu.OwnedMenu {
+        return from(p).menus.get();
+    }
 
     pub fn from(p: *platform.Platform) *LinuxPlatform {
         return @fieldParentPtr("platform", p);
@@ -160,6 +172,7 @@ pub const LinuxPlatform = struct {
         const self = from(p);
         self.backend.deinit();
         _ = std.os.linux.close(self.wake_fd);
+        self.menus.deinit();
         self.allocator.destroy(self);
     }
 

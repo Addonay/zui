@@ -33,6 +33,11 @@ const examples = [_][]const u8{
     "on_window_close_quit",
     "window_movable",
     "window_shadow",
+    "mouse_pressure",
+    "set_menus",
+    "paths_bench",
+    "system_notifications",
+    "testing",
     "window",
     "window_positioning",
     "move_entity_between_windows",
@@ -96,6 +101,16 @@ pub fn build(b: *std.Build) void {
         const run = b.addRunArtifact(exe);
         b.step("run-" ++ name, "Run the " ++ name ++ " example").dependOn(&run.step);
     }
+    // The example tests (examples/testing.zig) run with `zig build test`.
+    const example_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/testing.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zui", .module = zui }},
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(example_tests).step);
 
     // Shader regeneration: compiles renderer/shaders.glsl for every backend and rewrites the
     // committed renderer/shaders_gen.zig. Everyone else needs no shader compiler.

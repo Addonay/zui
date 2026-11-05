@@ -23,6 +23,7 @@ pub const HeadlessPlatform = struct {
     clipboard: ?[]u8 = null,
     displays_: [1]platform.Display = .{.{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } } }},
     cursor: platform.CursorStyle = .arrow,
+    menus: platform.app_menu.MenuStore = .{},
 
     const vtable: Platform.VTable = .{
         .run = run,
@@ -35,7 +36,18 @@ pub const HeadlessPlatform = struct {
         .write_to_clipboard = writeClipboard,
         .read_from_clipboard = readClipboard,
         .quit_when_last_window_closes = noQuitOnClose,
+        .set_menus = setMenus,
+        .get_menus = getMenus,
     };
+
+    fn setMenus(p: *Platform, menus: []const platform.app_menu.Menu) void {
+        const self = from(p);
+        self.menus.set(self.allocator, menus);
+    }
+
+    fn getMenus(p: *Platform) ?[]const platform.app_menu.OwnedMenu {
+        return from(p).menus.get();
+    }
 
     pub fn create(allocator: std.mem.Allocator) *Platform {
         const self = allocator.create(HeadlessPlatform) catch @panic("OOM");
@@ -79,6 +91,7 @@ pub const HeadlessPlatform = struct {
         for (self.windows.items) |w| w.destroy();
         self.windows.deinit(self.allocator);
         if (self.clipboard) |c| self.allocator.free(c);
+        self.menus.deinit();
         self.allocator.destroy(self);
     }
 

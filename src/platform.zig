@@ -13,6 +13,7 @@ const atlas_mod = @import("atlas.zig");
 const interactive = @import("interactive.zig");
 const window_mod = @import("window.zig");
 const app_mod = @import("app.zig");
+pub const app_menu = @import("platform/app_menu.zig");
 
 const Pixels = geometry.Pixels;
 const Point = geometry.Point;
@@ -411,7 +412,20 @@ pub const Platform = struct {
         read_from_primary: *const fn (*Platform) ?ClipboardItem = noClip,
         open_url: *const fn (*Platform, []const u8) void = noopStr,
         quit_when_last_window_closes: *const fn (*Platform) bool = yes,
+        /// Replaces the menu bar (GPUI `set_menus`). Platforms with no menu bar only store them.
+        set_menus: *const fn (*Platform, []const app_menu.Menu) void = noopMenus,
+        get_menus: *const fn (*Platform) ?[]const app_menu.OwnedMenu = noGetMenus,
+        set_app_identity: *const fn (*Platform, []const u8, []const u8) void = noopIdentity,
+        show_system_notification: *const fn (*Platform, SystemNotification) void = noopNotification,
+        dismiss_system_notification: *const fn (*Platform, []const u8) void = noopStr,
     };
+
+    fn noopMenus(_: *Platform, _: []const app_menu.Menu) void {}
+    fn noGetMenus(_: *Platform) ?[]const app_menu.OwnedMenu {
+        return null;
+    }
+    fn noopIdentity(_: *Platform, _: []const u8, _: []const u8) void {}
+    fn noopNotification(_: *Platform, _: SystemNotification) void {}
 
     fn noop(_: *Platform) void {}
     fn noopBool(_: *Platform, _: bool) void {}
@@ -478,6 +492,43 @@ pub const Platform = struct {
     pub fn quit_when_last_window_closes(self: *Platform) bool {
         return self.vtable.quit_when_last_window_closes(self);
     }
+    pub fn set_menus(self: *Platform, menus: []const app_menu.Menu) void {
+        self.vtable.set_menus(self, menus);
+    }
+    pub fn get_menus(self: *Platform) ?[]const app_menu.OwnedMenu {
+        return self.vtable.get_menus(self);
+    }
+    pub fn set_app_identity(self: *Platform, identifier: []const u8, name: []const u8) void {
+        self.vtable.set_app_identity(self, identifier, name);
+    }
+    pub fn show_system_notification(self: *Platform, notification: SystemNotification) void {
+        self.vtable.show_system_notification(self, notification);
+    }
+    pub fn dismiss_system_notification(self: *Platform, tag: []const u8) void {
+        self.vtable.dismiss_system_notification(self, tag);
+    }
+};
+
+/// A system notification to post (GPUI `SystemNotification`).
+pub const SystemNotification = struct {
+    /// Posting a notification with the tag of an earlier one replaces it where supported.
+    tag: []const u8,
+    title: []const u8,
+    body: []const u8,
+    actions: []const SystemNotificationAction = &.{},
+};
+
+/// A button of a `SystemNotification` (GPUI `SystemNotificationAction`).
+pub const SystemNotificationAction = struct {
+    id: []const u8,
+    label: []const u8,
+};
+
+/// What the user did with a notification (GPUI `SystemNotificationResponse`). `action_id` is
+/// null when the notification body was clicked.
+pub const SystemNotificationResponse = struct {
+    tag: []const u8,
+    action_id: ?[]const u8 = null,
 };
 
 pub const headless = @import("platform/headless.zig");
