@@ -16,6 +16,7 @@ const taffy = @import("../taffy.zig");
 const interactive = @import("../interactive.zig");
 const key_dispatch = @import("../key_dispatch.zig");
 const action_mod = @import("../action.zig");
+const image_cache_mod = @import("../image_cache.zig");
 
 const App = app_mod.App;
 const Window = window_mod.Window;
@@ -42,6 +43,7 @@ const MouseMoveEvent = interactive.MouseMoveEvent;
 const ScrollWheelEvent = interactive.ScrollWheelEvent;
 const ClickEvent = interactive.ClickEvent;
 const PinchEvent = interactive.PinchEvent;
+const MousePressureEvent = interactive.MousePressureEvent;
 const KeyDownEvent = interactive.KeyDownEvent;
 const KeyUpEvent = interactive.KeyUpEvent;
 const ModifiersChangedEvent = interactive.ModifiersChangedEvent;
@@ -3621,6 +3623,8 @@ pub const Interactivity = struct {
     aux_click_listeners: List(Listener(ClickEvent)) = .empty,
     pinch_listeners: List(Listener(PinchEvent)) = .empty,
     capture_pinch_listeners: List(Listener(PinchEvent)) = .empty,
+    mouse_pressure_listeners: List(Listener(MousePressureEvent)) = .empty,
+    capture_mouse_pressure_listeners: List(Listener(MousePressureEvent)) = .empty,
     drop_listeners: List(DropL) = .empty,
     can_drop_predicate: ?*const fn (value: app_mod.AnyDragValue, window: *Window, cx: *App) bool = null,
     drag_listener: ?DragListener = null,
@@ -3650,6 +3654,7 @@ pub const Interactivity = struct {
             self.mouse_move_listeners.items.len > 0 or self.scroll_wheel_listeners.items.len > 0 or self.click_listeners.items.len > 0 or
             self.hover_listener != null or self.base_style.mouse_cursor != null or
             self.aux_click_listeners.items.len > 0 or self.pinch_listeners.items.len > 0 or self.capture_pinch_listeners.items.len > 0 or
+            self.mouse_pressure_listeners.items.len > 0 or self.capture_mouse_pressure_listeners.items.len > 0 or
             self.drop_listeners.items.len > 0 or self.drag_listener != null or self.drag_over_styles.items.len > 0 or
             self.tooltip_builder != null or self.mouse_up_out_listeners.items.len > 0;
     }
@@ -3739,6 +3744,8 @@ pub fn StyledElement(comptime Ext: type) type {
         interactivity: Interactivity = .{},
         children_list: element_mod.Children = .empty,
         ext: Ext = .{},
+        /// The image cache for the images under this element (set with `image_cache`).
+        image_cache_provider: ?image_cache_mod.ImageCacheProvider = null,
 
         pub const RequestLayoutState = DivFrameState;
         pub const PrepaintState = DivPrepaintState;
@@ -3755,6 +3762,13 @@ pub fn StyledElement(comptime Ext: type) type {
 
         pub fn children_mut(self: *Self) *element_mod.Children {
             return &self.children_list;
+        }
+
+        /// Sets the image cache for the images under this element (GPUI `image_cache`). Those images
+        /// load through it instead of the app's own cache; see `image_cache.zig`.
+        pub fn image_cache(self: *Self, provider: anytype) *Self {
+            self.image_cache_provider = image_cache_mod.ImageCacheProvider.from(provider);
+            return self;
         }
 
         pub fn element_id(self: *Self) ?ElementId {
@@ -4008,6 +4022,19 @@ pub fn StyledElement(comptime Ext: type) type {
             return self;
         }
 
+        /// Pressure changes over this element (GPUI `on_mouse_pressure`). Only macOS trackpads
+        /// report pressure; no other platform emits these events.
+        pub fn on_mouse_pressure(self: *Self, listener: anytype) *Self {
+            self.interactivity.mouse_pressure_listeners.append(arena(), app_mod.to_listener(MousePressureEvent, listener)) catch oom();
+            return self;
+        }
+
+        /// The capture-phase form of `on_mouse_pressure` (GPUI `capture_mouse_pressure`).
+        pub fn capture_mouse_pressure(self: *Self, listener: anytype) *Self {
+            self.interactivity.capture_mouse_pressure_listeners.append(arena(), app_mod.to_listener(MousePressureEvent, listener)) catch oom();
+            return self;
+        }
+
         /// Makes this element draggable once the pointer moves past a small threshold.
         /// `constructor(value, cursor_offset, window, cx)` returns the entity to show under the
         /// pointer. `value` is copied for the length of the drag. The element needs an id.
@@ -4111,6 +4138,13 @@ pub fn StyledElement(comptime Ext: type) type {
             const has_text = s.text_style() != null;
             if (has_text) window.push_text_style(s.text);
             defer if (has_text) window.pop_text_style();
+
+            // Set before the element's own hook and its children, so `img` sees its own cache on top.
+            const pushed_cache = if (self.image_cache_provider) |provider| blk: {
+                window.push_image_cache(provider.provide(window, cx));
+                break :blk true;
+            } else false;
+            defer if (pushed_cache) window.pop_image_cache();
 
             if (@hasDecl(Ext, "request_layout_ext")) {
                 if (Ext.request_layout_ext(self, gid, &s, window, cx)) |lid| return .{ lid, .{} };
@@ -4298,6 +4332,7 @@ pub fn StyledElement(comptime Ext: type) type {
                 it.aux_click_listeners.items.len > 0 or it.drag_listener != null or it.tooltip_builder != null;
             if (needs_down) window.on_mouse_event(MouseDownEvent, ctx, onMouseDown);
             if (it.pinch_listeners.items.len > 0 or it.capture_pinch_listeners.items.len > 0) window.on_mouse_event(PinchEvent, ctx, onPinch);
+            if (it.mouse_pressure_listeners.items.len > 0 or it.capture_mouse_pressure_listeners.items.len > 0) window.on_mouse_event(MousePressureEvent, ctx, onMousePressure);
             if (it.drop_listeners.items.len > 0 or it.aux_click_listeners.items.len > 0 or it.drag_listener != null or it.tooltip_builder != null or it.mouse_up_out_listeners.items.len > 0 or it.mouse_up_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or it.group != null)
                 window.on_mouse_event(MouseUpEvent, ctx, onMouseUp);
             if (it.drag_listener != null or it.tooltip_builder != null or it.drag_over_styles.items.len > 0 or it.mouse_move_listeners.items.len > 0 or it.hover_style != null or it.hover_listener != null or it.group_hover_style != null or it.group != null)
@@ -4445,6 +4480,14 @@ pub fn StyledElement(comptime Ext: type) type {
             const it = &c.self.interactivity;
             if (!c.hitbox.is_hovered(window)) return;
             const list = if (phase == .capture) it.capture_pinch_listeners.items else it.pinch_listeners.items;
+            for (list) |l| l.call(e, window, cx);
+        }
+
+        fn onMousePressure(raw: *anyopaque, e: *const MousePressureEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
+            const c: *MouseCtx = @ptrCast(@alignCast(raw));
+            const it = &c.self.interactivity;
+            if (!c.hitbox.is_hovered(window)) return;
+            const list = if (phase == .capture) it.capture_mouse_pressure_listeners.items else it.mouse_pressure_listeners.items;
             for (list) |l| l.call(e, window, cx);
         }
 

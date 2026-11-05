@@ -17,6 +17,7 @@ const action_mod = @import("action.zig");
 const keystroke_mod = @import("keystroke.zig");
 const http_client_mod = @import("http_client.zig");
 const assets_mod = @import("assets.zig");
+const asset_cache_mod = @import("asset_cache.zig");
 const uniform_list_mod = @import("elements/uniform_list.zig");
 const list_mod = @import("elements/list.zig");
 
@@ -706,11 +707,20 @@ const Effect = union(enum) {
 const GlobalSlot = struct { ptr: *anyopaque, destroy: *const fn (std.mem.Allocator, *anyopaque) void };
 
 /// The global application state (GPUI `App`).
+/// A type-erased `on_system_notification_response` handler: `func(ctx, response, app)`.
+const SystemNotificationHandler = struct {
+    ctx: *anyopaque,
+    func: *const fn (*anyopaque, platform_mod.SystemNotificationResponse, *App) void,
+    /// Frees `ctx`, which was allocated with the app's allocator.
+    free: *const fn (std.mem.Allocator, *anyopaque) void,
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     /// The drag following the pointer, across all windows.
     active_drag: ?AnyDrag = null,
     platform: *platform_mod.Platform,
+    system_notification_response: ?SystemNotificationHandler = null,
     entities: EntityMap = .{},
     windows: std.ArrayList(?*Window) = .empty,
     globals: std.AutoHashMapUnmanaged(TypeId, GlobalSlot) = .empty,
@@ -728,6 +738,8 @@ pub const App = struct {
     asset_source: assets_mod.AssetSource = assets_mod.AssetSource.empty,
     /// Decoded images, decoded once per source.
     asset_cache: assets_mod.AssetCache,
+    /// Background loads of `use_asset` and of image caches (GPUI `loading_assets`).
+    asset_loads: asset_cache_mod.AssetLoads = undefined,
     background_executor_: executor_mod.BackgroundExecutor,
     foreground_executor_: executor_mod.ForegroundExecutor,
     keymap: keymap_mod.Keymap,
@@ -753,6 +765,7 @@ pub const App = struct {
         };
         app.async_app = .{ .app = app };
         app.foreground_executor_.app = app;
+        app.asset_loads = asset_cache_mod.AssetLoads.init(allocator, app, &app.foreground_executor_);
         app.asset_cache.fetch_config = .{
             .foreground = &app.foreground_executor_,
             .on_settled_ctx = app,
@@ -767,6 +780,8 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.system_notification_response) |h| h.free(self.allocator, h.ctx);
+        self.system_notification_response = null;
         // Each slot is cleared before its window is destroyed, as close_window does, so a window
         // being destroyed is never seen again by is_root_of_other_window.
         for (self.windows.items) |*slot| {
@@ -774,10 +789,13 @@ pub const App = struct {
             slot.* = null;
             win.destroy(self);
         }
-        self.windows.deinit(self.allocator);
         for (self.entities.slots.items) |*s| if (s.ptr) |p| {
             if (s.destroy) |d| d(self, p);
         };
+        // After the entities: a released image cache releases its loads itself. The window list is
+        // still needed then (drop_image walks it), so it is freed last.
+        self.asset_loads.deinit();
+        self.windows.deinit(self.allocator);
         self.entities.slots.deinit(self.allocator);
         self.entities.free.deinit(self.allocator);
         var it = self.globals.valueIterator();
@@ -1361,6 +1379,29 @@ pub const App = struct {
         return &self.foreground_executor_;
     }
 
+    /// The loaded `A` for `source`, or null while it loads; starts the load if needed. Does not redraw
+    /// anything when it arrives (GPUI `fetch_asset`). Windows use `Window.use_asset` instead.
+    pub fn fetch_asset(self: *App, comptime A: type, source: A.Source) ?A.Output {
+        return self.asset_loads.entry(A, source).get();
+    }
+
+    /// Drops the cached `A` for `source`, abandoning a running load (GPUI `remove_asset`). The next
+    /// `use_asset` for it loads again. Views are not redrawn; they redraw on their next frame.
+    pub fn remove_asset(self: *App, comptime A: type, source: A.Source) void {
+        self.asset_loads.remove(A, source);
+    }
+
+    /// Whether `source` is cached or loading (GPUI `has_asset`, which is test-only there).
+    pub fn has_asset(self: *App, comptime A: type, source: A.Source) bool {
+        return self.asset_loads.contains(A, source);
+    }
+
+    /// Removes `image`'s tiles from every window's sprite atlas, before the image is freed (GPUI
+    /// `drop_image`, which also takes the window being drawn; here all windows are cleaned).
+    pub fn drop_image(self: *App, image: *const assets_mod.RenderImage) void {
+        for (self.windows.items) |slot| if (slot) |w| w.forget_image(image);
+    }
+
     /// Spawns a foreground task `f(async_cx, args...)`.
     pub fn spawn(self: *App, comptime f: anytype, args: anytype) executor_mod.Task(ReturnOf(f)) {
         return self.foreground_executor_.spawn(f, .{self.to_async()} ++ args);
@@ -1382,6 +1423,62 @@ pub const App = struct {
 
     pub fn hide(self: *App) void {
         self.platform.hide();
+    }
+
+    /// Replaces the menu bar (GPUI `App::set_menus`). The menus are copied, so the slice may be
+    /// discarded afterwards. Platforms without a menu bar keep them for `get_menus`.
+    pub fn set_menus(self: *App, menus: []const platform_mod.app_menu.Menu) void {
+        self.platform.set_menus(menus);
+    }
+
+    /// The menus last given to `set_menus`, or null if none were set (GPUI `App::get_menus`).
+    pub fn get_menus(self: *App) ?[]const platform_mod.app_menu.OwnedMenu {
+        return self.platform.get_menus();
+    }
+
+    /// Sets the process-wide identity and user-visible name (GPUI `App::set_app_identity`).
+    /// Call it once, early, before posting notifications. No platform uses it yet.
+    pub fn set_app_identity(self: *App, identifier: []const u8, name: []const u8) void {
+        self.platform.set_app_identity(identifier, name);
+    }
+
+    /// Posts a system notification (GPUI `App::show_system_notification`). A tag that matches an
+    /// earlier one replaces it where supported. No platform delivers notifications yet, so this
+    /// does nothing; see `on_system_notification_response`.
+    pub fn show_system_notification(self: *App, notification: platform_mod.SystemNotification) void {
+        self.platform.show_system_notification(notification);
+    }
+
+    /// Removes the notification with this tag (GPUI `App::dismiss_system_notification`).
+    pub fn dismiss_system_notification(self: *App, tag: []const u8) void {
+        self.platform.dismiss_system_notification(tag);
+    }
+
+    /// Registers the handler for notification responses (GPUI `App::on_system_notification_response`).
+    /// `f(ctx, response, app)` runs when a platform reports one through
+    /// `dispatch_system_notification_response`. Registering again replaces the handler.
+    pub fn on_system_notification_response(self: *App, ctx: anytype, comptime f: fn (@TypeOf(ctx), platform_mod.SystemNotificationResponse, *App) void) void {
+        const C = @TypeOf(ctx);
+        const boxed = self.allocator.create(C) catch @panic("out of memory");
+        boxed.* = ctx;
+        const Thunk = struct {
+            fn call(raw: *anyopaque, response: platform_mod.SystemNotificationResponse, app: *App) void {
+                const held: *const C = @ptrCast(@alignCast(raw));
+                f(held.*, response, app);
+            }
+            fn free(a: std.mem.Allocator, raw: *anyopaque) void {
+                a.destroy(@as(*C, @ptrCast(@alignCast(raw))));
+            }
+        };
+        if (self.system_notification_response) |old| old.free(self.allocator, old.ctx);
+        self.system_notification_response = .{ .ctx = boxed, .func = Thunk.call, .free = Thunk.free };
+    }
+
+    /// Delivers a response from the platform to the handler registered with
+    /// `on_system_notification_response`.
+    pub fn dispatch_system_notification_response(self: *App, response: platform_mod.SystemNotificationResponse) void {
+        const handler = self.system_notification_response orelse return;
+        handler.func(handler.ctx, response, self);
     }
 
     pub fn displays(self: *App) []const platform_mod.Display {

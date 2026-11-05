@@ -28,9 +28,10 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
   - [ ] `prefetch(url)`, so an app can start loading before the image is on screen
 - [ ] Load local files and embedded assets in the background, as GPUI does
 - [ ] Size limit on a download; today a huge response is read whole into memory
-- [ ] `ImageCache` trait, provider, `RetainAllImageCache` and LRU; `image_gallery`'s second gallery is a plain copy
-- [ ] Generic `Asset` with `use_asset` and `remove_asset`; `image_loading` drops its custom loaders and forced failure
-- [ ] `image_loading`: the loading state and click handlers have never been checked live
+- [ ] `retain_all(id)`; URLs in an `ImageCacheItem` skip the disk copy and do not share entries with `AssetCache`
+- [ ] Removing a path from the default `AssetCache`; `image_loading`'s image 4 has no click handler without it
+- [ ] Quitting waits for a `use_asset` load that never checks `LoadContext.is_cancelled`
+- [ ] Atlas and memory behaviour over many image changes, such as repeated "Next Photos", is unmeasured
 - [ ] `testing`: `test_allow_parking` is not ported, since ZUI has no parking check
 - [ ] `run_until_parked` never parks while a GIF is on screen, and spins to its 10,000-iteration guard
 - [ ] WebP, TIFF, ICO, PNM decoders

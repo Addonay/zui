@@ -238,6 +238,17 @@ pub const RenderImage = assets.RenderImage;
 pub const AssetSource = assets.AssetSource;
 pub const Resource = assets.Resource;
 pub const ImageCacheError = assets.ImageCacheError;
+/// Background asset loads (GPUI `asset_cache`): `LoadContext`, `CachedLoad`, and `hash`.
+pub const asset_cache = @import("asset_cache.zig");
+pub const LoadContext = asset_cache.LoadContext;
+pub const hash = asset_cache.hash;
+/// Image caches (GPUI `elements/image_cache`).
+pub const image_cache_mod = @import("image_cache.zig");
+pub const image_cache = image_cache_mod.image_cache;
+pub const AnyImageCache = image_cache_mod.AnyImageCache;
+pub const ImageCacheProvider = image_cache_mod.ImageCacheProvider;
+pub const ImageCacheItem = image_cache_mod.ImageCacheItem;
+pub const RetainAllImageCache = image_cache_mod.RetainAllImageCache;
 pub const SvgRenderer = svg_renderer.SvgRenderer;
 
 // -- anchored / deferred / canvas -------------------------------------------
@@ -317,6 +328,20 @@ pub const HttpClient = http_client.HttpClient;
 pub const KeyContext = key_dispatch.KeyContext;
 pub const Action = action.Action;
 pub const ClipboardItem = platform.ClipboardItem;
+pub const NoAction = action.NoAction;
+pub const PressureStage = interactive.PressureStage;
+pub const MousePressureEvent = interactive.MousePressureEvent;
+pub const app_menu = platform.app_menu;
+pub const Menu = app_menu.Menu;
+pub const MenuItem = app_menu.MenuItem;
+pub const OwnedMenu = app_menu.OwnedMenu;
+pub const OwnedMenuItem = app_menu.OwnedMenuItem;
+pub const OsMenu = app_menu.OsMenu;
+pub const OsAction = app_menu.OsAction;
+pub const SystemMenuType = app_menu.SystemMenuType;
+pub const SystemNotification = platform.SystemNotification;
+pub const SystemNotificationAction = platform.SystemNotificationAction;
+pub const SystemNotificationResponse = platform.SystemNotificationResponse;
 
 /// Common imports (GPUI `prelude`).
 pub const prelude = struct {
@@ -353,5 +378,6 @@ test {
     _ = @import("elements/anchored.zig");
     _ = @import("elements/deferred.zig");
     _ = @import("elements/canvas.zig");
+    _ = @import("platform/app_menu.zig");
     _ = @import("elements/animation.zig");
 }

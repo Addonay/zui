@@ -1709,6 +1709,8 @@ const DragPage = struct {
     file_name_len: usize = 0,
     allow: bool = true,
     pinches: usize = 0,
+    pressures: usize = 0,
+    last_stage: interactive.PressureStage = .zero,
 
     var allow_drop: bool = true;
 
@@ -1738,6 +1740,10 @@ const DragPage = struct {
     fn on_pinch(self: *DragPage, _: *const interactive.PinchEvent, _: *Window, _: *Context(DragPage)) void {
         self.pinches += 1;
     }
+    fn on_pressure(self: *DragPage, e: *const interactive.MousePressureEvent, _: *Window, _: *Context(DragPage)) void {
+        self.pressures += 1;
+        self.last_stage = e.stage;
+    }
     pub fn render(_: *DragPage, _: *Window, cx: *Context(DragPage)) *Div {
         return div().size(px(300)).child(
             div().id("source").absolute().left(px(0)).top(px(0)).w(px(50)).h(px(50))
@@ -1748,7 +1754,8 @@ const DragPage = struct {
             div().id("target").absolute().left(px(100)).top(px(0)).w(px(50)).h(px(50))
                 .on_drop(Payload, cx.listener(on_drop))
                 .on_drop(interactive.ExternalPaths, cx.listener(on_files))
-                .on_pinch(cx.listener(on_pinch)),
+                .on_pinch(cx.listener(on_pinch))
+                .on_mouse_pressure(cx.listener(on_pressure)),
         ).child(
             div().id("picky").absolute().left(px(200)).top(px(0)).w(px(50)).h(px(50))
                 .can_drop(refuse)
@@ -1890,6 +1897,19 @@ test "file drags: leaving the window ends the drag and drops nothing" {
     vcx.run_until_parked();
     try std.testing.expect(!cx.app.has_active_drag());
     try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).files);
+}
+
+test "pressure: reaches the element under the pointer with its stage" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    vcx.simulate_mouse_move(.{ .x = 120, .y = 10 }, null, .{});
+    vcx.simulate_event(.{ .mouse_pressure = .{ .position = .{ .x = 120, .y = 10 }, .pressure = 0.5, .stage = .normal } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).pressures);
+    try std.testing.expectEqual(interactive.PressureStage.normal, view.read(cx.app).last_stage);
+    vcx.simulate_mouse_move(.{ .x = 280, .y = 280 }, null, .{});
+    vcx.simulate_event(.{ .mouse_pressure = .{ .position = .{ .x = 280, .y = 280 }, .pressure = 0.9, .stage = .force } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).pressures);
 }
 
 test "pinch: reaches the element under the pointer" {
@@ -2064,6 +2084,53 @@ test "TestAppContext: public API compiles and an extra window opens" {
     _ = cx.foreground_executor();
     _ = cx.background_executor();
     try std.testing.expectEqual(@as(usize, 1), cx.app.windows.items.len);
+}
+
+test "menus: set_menus stores copies that get_menus returns" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    try std.testing.expect(cx.app.get_menus() == null);
+    const Toggle = action_mod.Action("test", "Toggle");
+    var name: [4]u8 = "File".*;
+    const items = [_]platform_mod.app_menu.MenuItem{
+        platform_mod.app_menu.MenuItem.action("Toggle", Toggle{}).checked(true),
+        platform_mod.app_menu.MenuItem.separator_item(),
+    };
+    cx.app.set_menus(&.{platform_mod.app_menu.Menu.new(&name).items(&items)});
+    // The stored menus are copies: changing the caller's name does not change them.
+    name[0] = 'X';
+    const menus = cx.app.get_menus().?;
+    try std.testing.expectEqualStrings("File", menus[0].name);
+    try std.testing.expectEqual(@as(usize, 2), menus[0].items.len);
+    try std.testing.expect(menus[0].items[0].action_item.checked);
+}
+
+test "notifications: a response from the platform reaches the registered handler" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Seen = struct {
+        var tag: [16]u8 = undefined;
+        var tag_len: usize = 0;
+        var action: [16]u8 = undefined;
+        var action_len: usize = 0;
+        fn on_response(_: u8, response: platform_mod.SystemNotificationResponse, _: *App) void {
+            @memcpy(tag[0..response.tag.len], response.tag);
+            tag_len = response.tag.len;
+            if (response.action_id) |id| {
+                @memcpy(action[0..id.len], id);
+                action_len = id.len;
+            }
+        }
+    };
+    cx.app.set_app_identity("dev.test", "Test");
+    // Posting and dismissing are accepted on every platform; without a backend they do nothing.
+    cx.app.show_system_notification(.{ .tag = "t", .title = "T", .body = "B", .actions = &.{.{ .id = "open", .label = "Open" }} });
+    cx.app.dismiss_system_notification("t");
+    cx.app.dispatch_system_notification_response(.{ .tag = "none" });
+    cx.app.on_system_notification_response(@as(u8, 0), Seen.on_response);
+    cx.app.dispatch_system_notification_response(.{ .tag = "t", .action_id = "open" });
+    try std.testing.expectEqualStrings("t", Seen.tag[0..Seen.tag_len]);
+    try std.testing.expectEqualStrings("open", Seen.action[0..Seen.action_len]);
 }
 
 /// A decoded image of one 1x1 frame per entry of `delays_ms` (a GIF has one such frame per picture).
@@ -2494,4 +2561,284 @@ test "window activation: observers hear each change, and a resize is not one" {
 
     vcx.simulate_resize(.{ .width = 320, .height = 240 });
     try std.testing.expectEqual(@as(usize, 2), cx.read_entity(view, BoundsWatch.read_activations, .{}));
+}
+
+// -- asset loads and image caches ----------------------------------------
+
+const asset_cache_mod = @import("../asset_cache.zig");
+const image_cache_mod = @import("../image_cache.zig");
+const executor_mod = @import("../executor.zig");
+
+/// An asset whose load waits for `gate`, then answers `source * 10`. Counts its starts.
+const Slow = struct {
+    pub const Source = u32;
+    pub const Output = u32;
+    var starts: std.atomic.Value(u32) = .init(0);
+    var gate: std.atomic.Value(bool) = .init(false);
+
+    pub fn load(source: Source, cx: *asset_cache_mod.LoadContext) Output {
+        _ = starts.fetchAdd(1, .acq_rel);
+        while (!gate.load(.acquire)) {
+            if (cx.is_cancelled()) return 0;
+            executor_mod.sleep_ns(std.time.ns_per_ms);
+        }
+        return source * 10;
+    }
+
+    fn reset(open: bool) void {
+        starts.store(0, .release);
+        gate.store(open, .release);
+    }
+};
+
+/// An asset whose load always fails.
+const Broken = struct {
+    pub const Source = u32;
+    pub const Output = anyerror!u32;
+
+    pub fn load(_: Source, _: *asset_cache_mod.LoadContext) Output {
+        return error.LoadFailed;
+    }
+};
+
+const SlowView = struct {
+    var source: u32 = 1;
+    var seen: ?u32 = null;
+    var renders: usize = 0;
+
+    pub fn render(_: *SlowView, window: *Window, cx: *Context(SlowView)) *Div {
+        renders += 1;
+        seen = window.use_asset(Slow, source, cx.app);
+        return div();
+    }
+    fn build(_: *Window, app: *App) Entity(SlowView) {
+        return app.new(SlowView{});
+    }
+    fn reset(s: u32) void {
+        source = s;
+        seen = null;
+        renders = 0;
+    }
+};
+
+const BrokenView = struct {
+    var seen: ?anyerror!u32 = null;
+
+    pub fn render(_: *BrokenView, window: *Window, cx: *Context(BrokenView)) *Div {
+        seen = window.use_asset(Broken, 1, cx.app);
+        return div();
+    }
+    fn build(_: *Window, app: *App) Entity(BrokenView) {
+        return app.new(BrokenView{});
+    }
+};
+
+/// Runs the app until `done` holds, for at most about five seconds.
+fn pump_until(vcx: *VisualTestContext, done: *const fn () bool) !void {
+    for (0..1000) |_| {
+        vcx.run_until_parked();
+        if (done()) return;
+        executor_mod.sleep_ns(5 * std.time.ns_per_ms);
+    }
+    return error.TimedOut;
+}
+
+fn slow_view_has_value() bool {
+    return SlowView.seen != null;
+}
+
+fn broken_view_has_value() bool {
+    return BrokenView.seen != null;
+}
+
+test "use_asset: none while loading, then the value once the window redraws" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    Slow.reset(false);
+    SlowView.reset(4);
+    _, const vcx = cx.add_window_view(SlowView.build);
+    try std.testing.expectEqual(@as(?u32, null), SlowView.seen);
+    try std.testing.expectEqual(@as(u32, 1), Slow.starts.load(.acquire));
+
+    Slow.gate.store(true, .release);
+    try pump_until(vcx, slow_view_has_value);
+    try std.testing.expectEqual(@as(?u32, 40), SlowView.seen);
+}
+
+test "use_asset: a load runs once per source, even across frames" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    Slow.reset(false);
+    SlowView.reset(7);
+    _, const vcx = cx.add_window_view(SlowView.build);
+    for (0..5) |_| {
+        vcx.window.refresh();
+        vcx.run_until_parked();
+    }
+    try std.testing.expect(SlowView.renders >= 5);
+    try std.testing.expectEqual(@as(u32, 1), Slow.starts.load(.acquire));
+
+    Slow.gate.store(true, .release);
+    try pump_until(vcx, slow_view_has_value);
+    try std.testing.expectEqual(@as(?u32, 70), SlowView.seen);
+    try std.testing.expectEqual(@as(u32, 1), Slow.starts.load(.acquire));
+}
+
+test "remove_asset: the next use loads again, and an abandoned load is dropped" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    Slow.reset(true);
+    SlowView.reset(2);
+    _, const vcx = cx.add_window_view(SlowView.build);
+    try pump_until(vcx, slow_view_has_value);
+    try std.testing.expectEqual(@as(?u32, 20), SlowView.seen);
+
+    // Close the gate, drop the entry, and render again: a new load starts and has no value yet.
+    Slow.gate.store(false, .release);
+    cx.app.remove_asset(Slow, 2);
+    try std.testing.expect(!cx.app.has_asset(Slow, 2));
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(u32, 2), Slow.starts.load(.acquire));
+    try std.testing.expectEqual(@as(?u32, null), SlowView.seen);
+
+    // Abandon that second load while it runs; its result must not come back into the cache.
+    cx.app.remove_asset(Slow, 2);
+    Slow.gate.store(true, .release);
+    vcx.window.refresh();
+    try pump_until(vcx, slow_view_has_value);
+    try std.testing.expectEqual(@as(?u32, 20), SlowView.seen);
+    try std.testing.expectEqual(@as(u32, 3), Slow.starts.load(.acquire));
+}
+
+test "use_asset: a failing load is reported as a failure" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    BrokenView.seen = null;
+    _, const vcx = cx.add_window_view(BrokenView.build);
+    try pump_until(vcx, broken_view_has_value);
+    try std.testing.expectError(error.LoadFailed, BrokenView.seen.?);
+}
+
+/// Serves one embedded image, `pixel.png`, and counts how often it is asked for.
+const PixelAssets = struct {
+    var loads: std.atomic.Value(u32) = .init(0);
+
+    pub fn load(_: *PixelAssets, path: []const u8) ?[]const u8 {
+        if (!std.mem.eql(u8, path, "pixel.png")) return null;
+        _ = loads.fetchAdd(1, .acq_rel);
+        return tiny_png;
+    }
+};
+
+fn wait_for_image(cache: *image_cache_mod.RetainAllImageCache, vcx: *VisualTestContext, resource: assets_mod.Resource) !*assets_mod.RenderImage {
+    for (0..1000) |_| {
+        vcx.run_until_parked();
+        if (cache.load(resource, vcx.window, vcx.cx.app)) |result| {
+            vcx.run_until_parked();
+            return result;
+        }
+        executor_mod.sleep_ns(5 * std.time.ns_per_ms);
+    }
+    return error.TimedOut;
+}
+
+test "RetainAllImageCache: keeps each image, and releases them when cleared" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    var pixels: PixelAssets = .{};
+    cx.app.asset_source = assets_mod.AssetSource.from(&pixels);
+    _, const vcx = cx.add_window_view(SlowView.build);
+
+    const cache_handle = image_cache_mod.RetainAllImageCache.new(cx.app);
+    const cache = cache_handle.as_mut(cx.app);
+    const resource: assets_mod.Resource = .{ .embedded = "pixel.png" };
+    try std.testing.expectEqual(@as(?image_cache_mod.ImageResult, null), cache.load(resource, vcx.window, cx.app));
+
+    const first = try wait_for_image(cache, vcx, resource);
+    try std.testing.expectEqual(@as(usize, 1), cache.len());
+    const again = (cache.load(resource, vcx.window, cx.app).?) catch unreachable;
+    try std.testing.expectEqual(first, again);
+    try std.testing.expectEqual(@as(u32, 1), PixelAssets.loads.load(.acquire));
+
+    // Clearing frees the load: one live entry fewer, not just an empty table.
+    const live_before = cx.app.asset_loads.live.count();
+    cache.clear(cx.app);
+    try std.testing.expect(cache.is_empty());
+    try std.testing.expectEqual(live_before - 1, cx.app.asset_loads.live.count());
+    // The next load starts over and decodes again.
+    _ = try wait_for_image(cache, vcx, resource);
+    try std.testing.expectEqual(@as(u32, 2), PixelAssets.loads.load(.acquire));
+    cache_handle.release(cx.app);
+}
+
+test "RetainAllImageCache: released with its entity, even while an image loads" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    var pixels: PixelAssets = .{};
+    cx.app.asset_source = assets_mod.AssetSource.from(&pixels);
+    _, const vcx = cx.add_window_view(SlowView.build);
+
+    const cache_handle = image_cache_mod.RetainAllImageCache.new(cx.app);
+    const cache = cache_handle.as_mut(cx.app);
+    const resource: assets_mod.Resource = .{ .embedded = "pixel.png" };
+    _ = cache.load(resource, vcx.window, cx.app);
+    // Release while the worker may still be decoding: the late image must be freed, not kept.
+    // The testing allocator reports it if it is not.
+    cache_handle.release(cx.app);
+    vcx.run_until_parked();
+    executor_mod.sleep_ns(50 * std.time.ns_per_ms);
+    vcx.run_until_parked();
+}
+
+/// An `img` inside `image_cache(...)`: the image loads through that cache, not the app's own.
+const CachedImageView = struct {
+    var loadings: usize = 0;
+    var fallbacks: usize = 0;
+
+    cache: Entity(image_cache_mod.RetainAllImageCache),
+
+    pub fn render(self: *CachedImageView, _: *Window, _: *Context(CachedImageView)) *Div {
+        return div().child(image_cache_mod.image_cache(self.cache).child(img_mod.img("pixel.png").with_loading(on_loading).with_fallback(on_fallback)));
+    }
+    fn on_loading() element_mod.AnyElement {
+        loadings += 1;
+        return div().into_any_element();
+    }
+    fn on_fallback() element_mod.AnyElement {
+        fallbacks += 1;
+        return div().into_any_element();
+    }
+    fn build(_: *Window, app: *App) Entity(CachedImageView) {
+        return app.new(CachedImageView{ .cache = image_cache_mod.RetainAllImageCache.new(app) });
+    }
+};
+
+test "img: an image in image_cache() loads through that cache, then redraws" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    var pixels: PixelAssets = .{};
+    cx.app.asset_source = assets_mod.AssetSource.from(&pixels);
+    const view, const vcx = cx.add_window_view(CachedImageView.build);
+    try std.testing.expect(CachedImageView.loadings > 0);
+
+    const cache = view.read(cx.app).cache.as_mut(cx.app);
+    // The image arrives in the cache, which is what the img asked for.
+    for (0..1000) |_| {
+        vcx.run_until_parked();
+        if (cache.len() == 1) {
+            var items = cache.items.valueIterator();
+            const item = items.next().?.*;
+            if (item.get()) |result| {
+                const image = try result;
+                try std.testing.expectEqual(@as(i32, 1), image.size(0).width);
+                break;
+            }
+        }
+        executor_mod.sleep_ns(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cache.len());
+    try std.testing.expectEqual(@as(usize, 0), CachedImageView.fallbacks);
+    // The app's own cache was not used for it.
+    try std.testing.expectEqual(@as(usize, 0), cx.app.asset_cache.images.count());
 }
