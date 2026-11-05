@@ -1294,6 +1294,8 @@ fn rasterize_triangle(acc: []F4, r: PixelRect, bp: *const BgPrep, ox: f32, oy: f
     const py0: usize = @max(r.y0, @as(usize, @intFromFloat(std.math.clamp(@floor(min_y), 0, 1e9))));
     const px1: usize = @min(r.x1, @as(usize, @intFromFloat(std.math.clamp(@ceil(max_x) + 1, 0, 1e9))));
     const py1: usize = @min(r.y1, @as(usize, @intFromFloat(std.math.clamp(@ceil(max_y) + 1, 0, 1e9))));
+    // The triangle lies outside the clip rect: `py0..py1` would have a negative length.
+    if (px1 <= px0 or py1 <= py0) return;
     const w = r.x1 - r.x0;
 
     for (py0..py1) |py_i| {

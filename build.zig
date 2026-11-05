@@ -18,6 +18,8 @@ const examples = [_][]const u8{
     "text",
     "text_wrapper",
     "grid_layout",
+    "painting",
+    "data_table",
     "uniform_list",
     "list_example",
     "animation",
