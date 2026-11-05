@@ -297,6 +297,19 @@ pub const TextSystem = struct {
     // -- font resolution -------------------------------------------------
 
     /// Resolves `font` to a `FontId`, reusing an earlier resolution of an equal font.
+    /// Adds in-memory font files, usable by family name from then on (GPUI `add_fonts`). The bytes
+    /// are copied. Fonts resolved earlier keep their result until asked for again; text laid out
+    /// with them stays valid.
+    pub fn add_fonts(self: *TextSystem, fonts: []const []const u8) !void {
+        for (fonts) |bytes| {
+            const before = self.fs.fontIds().len;
+            _ = try self.fs.addFontBytes(bytes);
+            if (self.raster) |*raster| try raster.addFromFontSystem(&self.fs, self.fs.fontIds()[before..]);
+        }
+        // A family asked for before may now resolve to a new face.
+        self.font_index.clearRetainingCapacity();
+    }
+
     pub fn font_id(self: *TextSystem, f: *const Font) !FontId {
         var h = std.hash.Wyhash.init(0);
         f.hash(&h);
@@ -1196,4 +1209,43 @@ test "shape_text wraps long text at the given width" {
 test "underline offset sits below the baseline" {
     const off = underline_y_offset(20, 15, 4);
     try testing.expect(off > 15);
+}
+
+test "add_fonts: a font from memory resolves by family name, shapes and rasterizes" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    const io = testing.io;
+    // cozmic's test font, from the fetched package. Absent if packages live elsewhere.
+    var pkg = std.Io.Dir.cwd().openDir(io, "zig-pkg", .{ .iterate = true }) catch return error.SkipZigTest;
+    defer pkg.close(io);
+    var bytes: ?[]u8 = null;
+    defer if (bytes) |b| testing.allocator.free(b);
+    var it = pkg.iterate();
+    while (try it.next(io)) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "cozmic-")) continue;
+        var path_buffer: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, "{s}/tests/fonts/FiraMono-Medium.ttf", .{entry.name});
+        const file = pkg.openFile(io, path, .{}) catch continue;
+        defer file.close(io);
+        const data = try testing.allocator.alloc(u8, @intCast(try file.length(io)));
+        _ = try file.readPositionalAll(io, data, 0);
+        bytes = data;
+        break;
+    }
+    const font_bytes = bytes orelse return error.SkipZigTest;
+    // Installed already, this test would prove nothing.
+    if (ts.fs.db.query(.{ .name = "Fira Mono" }, 500, .normal, .normal) != null) return error.SkipZigTest;
+
+    const f = font("Fira Mono");
+    const before = try ts.font_id(&f);
+    try ts.add_fonts(&.{font_bytes});
+    const after = try ts.font_id(&f);
+    try testing.expect(before != after);
+    const face = ts.fs.db.query(.{ .name = "Fira Mono" }, 500, .normal, .normal).?;
+    try testing.expectEqual(face, ts.fonts.items[after].face);
+
+    const runs = [_]FontRun{.{ .len = 1, .font_id = after }};
+    const layout = try ts.layout_cache.layout_line("A", 16, &runs, null);
+    try testing.expect(layout.width > 0);
+    try testing.expect((try ts.raster.?.ensureFace(face)) != null);
 }

@@ -5,8 +5,8 @@
     .fingerprint = 0xc00160dbcf146dfd,
     .dependencies = .{
         .cozmic = .{
-            .url = "git+https://github.com/Addonay/cozmic.git#9863c0e605a1549127d281b5215c086573d7799f",
-            .hash = "cozmic-0.2.0-wv6CLVkadwANvJhkERvi7vJx5fVCgCtF-gDc4rXrKfoV",
+            .url = "git+https://github.com/Addonay/cozmic.git#bd7e29cf11b9db0c046647dd58d8c8622c9b8683",
+            .hash = "cozmic-0.2.0-wv6CLQUidwAW-ZNtlZz-YKrUjiiwt5PYnNmwrxeV7nZQ",
         },
         // Only for `-Dregen-shaders=true`; the generated module is committed.
         .sokol_tools_bin = .{
