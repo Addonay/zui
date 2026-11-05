@@ -21,6 +21,16 @@ fn sync_io() Io {
     return sync_threaded.io();
 }
 
+/// Monotonic time in nanoseconds; does not advance while the system sleeps.
+pub fn now_ns() u64 {
+    return @intCast(Io.Clock.awake.now(sync_io()).nanoseconds);
+}
+
+/// Blocks the calling thread.
+pub fn sleep_ns(duration_ns: u64) void {
+    sync_io().sleep(.fromNanoseconds(@intCast(duration_ns)), .awake) catch {};
+}
+
 fn oom() noreturn {
     @panic("out of memory");
 }
