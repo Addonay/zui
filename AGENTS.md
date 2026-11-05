@@ -63,7 +63,7 @@ GPUI's `hello_world.rs` (verified via headless snapshot).
 | Linux platform: Wayland + X11 (dlopen, no link deps) | done; verified on Xvfb and an isolated real compositor (see §7); IME on both |
 | Text input: `EntityInputHandler`, `ElementInputHandler`, IME (text-input-v3, XIM), dead keys | done; verified with a real input method on both (see §7) |
 | TestAppContext / VisualTestContext + end-to-end tests | done |
-| img / svg / assets (stb_image, nanosvg) | done (sync loading; GIF first frame only) |
+| img / svg / assets (stb_image, nanosvg) | done (local files load synchronously, URLs in the background; GIF first frame only) |
 | anchored, deferred, canvas, animation (+easings), spring | done |
 | list (variable height), uniform_list | done (agent stopped right after tests passed; verify) |
 | GPU layer (`src/gpu/`, vendored from zicr at `87fe622`; zicr dependency removed) | done |
@@ -94,6 +94,7 @@ src/input.zig            ElementInputHandler: a view's EntityInputHandler method
 src/executor.zig         BackgroundExecutor, ForegroundExecutor, Task(T)
 src/scene.zig bounds_tree.zig atlas.zig path_builder.zig
 src/assets.zig svg_renderer.zig spring.zig
+src/http_client.zig image_disk_cache.zig   remote images: HTTP client and on-disk copies
 src/platform.zig         Platform / PlatformWindow vtable interfaces + shared types
 src/platform/headless.zig  headless/test platform
 src/platform/linux.zig + linux/{wayland,wayland_proto,x11,x11_proto,xkb,input,dl}.zig
@@ -292,6 +293,14 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   server dies reconnecting is retried once a second for a minute. Every event must go through
   `XFilterEvent`, also while no server is connected. Not done: `delete_surrounding_text` (we never
   send surrounding text), `keyboard_layout`. GPUI has no content types either: it always sends none/normal.
+- **Remote images**: `AssetCache` starts a fetch on first use and returns `error.Loading`, which `img`
+  shows as `with_loading`, and the windows refresh when it settles. Each fetch runs on a `std.Io.Threaded`
+  of its own in an `Io.Group`, not on the background executor, so quitting can cancel a download stuck on
+  a slow server. Raster decoding happens on that thread, SVG on the main thread since its renderer is
+  not thread-safe. A copy is kept in the per-user cache directory (`with_image_cache`, off in tests)
+  and shown first, then the fetch still runs and replaces it if the bytes changed. Measured on 2026-11-05:
+  curl takes 1.0 to 1.4 s for these URLs, `std.http` the same in release and about 0.9 s more in Debug,
+  decoding 25 to 60 ms. So only the saved copy can make it fast.
 - **Multi-stroke bindings**: `Window.dispatch_keystroke` follows GPUI's `dispatch_key_event`. A prefix
   is held in `pending_keystrokes` (strings owned, since platform buffers are not stable) and its keys
   reach nobody. A key that breaks the sequence replays what was held. It waits one second only if
@@ -357,8 +366,7 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 1. Other GPU platforms, using the backends already in `src/gpu/`: macOS (Metal), Windows
    (D3D12, Vulkan fallback), GL/GLES fallback, web (WebGPU) — GPUI's `gpui_macos` /
    `gpui_windows` are the references; old ZUI had cocoa/win32 skeletons in history.
-   `.github/workflows` is stale (`zig build smoke`, Windows/macOS checks, `-Daccesskit`)
-   and predates the port.
+   CI compile-checks those targets, on the headless platform only.
 2. Div: pressure and back-gesture listeners, long-press tooltips, external drag payloads
    (dragging out of the window), `cached` views. `with_animation` is not yet aliased on
    StyledElement (add `pub const with_animation = animation.AnimationExt(*Self).with_animation;` etc.).
@@ -366,12 +374,13 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
    `keyboard_layout` and its change observer.
 4. Text: a text-presentation selector (`❤\u{fe0e}`) still draws the color glyph. Also ShapedLine cursor/split APIs, typographic bounds, font enumeration, `add_fonts`
    (every ported example skips GPUI's `load_fonts`), missing-glyph reporting.
-5. Async: assets/images load synchronously; GIF animation; WebP.
+5. Images: local files still load synchronously; GIF animation; WebP; PNG EXIF orientation; no size
+   limit on a download; the `with_loading` delay GPUI has.
 6. Port the remaining GPUI examples (image_gallery, image_loading, gif_viewer, popover, anchor,
    painting, data_table, mouse_pressure, window*, set_menus, ...). Each must run headless and
    produce a correct snapshot, and should be driven for real: first frames hide most bugs. Missing
    APIs the ported ones work around: `container_query` (grid_layout writes it out), `set_menus`,
-   `init_colors`, an HTTP client for remote images, `percentage`.
+   `init_colors`, `percentage`.
 7. Performance (owner's phase 2 goal: beat GPUI): view caching (`AnyView::cached`
    with replayed scene ranges — `Scene.replay` exists), avoiding full layout
    when nothing changed, X11 XShm presentation, SIMD gradients in the CPU

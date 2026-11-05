@@ -2,12 +2,19 @@
 //! `Resource`, encoded `Image`s and `ImageFormat`, decoded `RenderImage`s, and
 //! the per-app `AssetCache` that decodes every image source once.
 //!
-//! Loading is synchronous: the first frame that asks for a source decodes it
-//! inline (GPUI loads on a background task and re-renders when done).
+//! Paths and embedded assets load synchronously: the first frame that asks decodes them inline.
+//! URLs load in the background and the windows redraw when they arrive, showing a copy saved on
+//! disk meanwhile if there is one. GPUI does all of them in the background, and saves nothing.
 //! Image pixels use GPUI's layout: BGRA, row-major, straight (non-premultiplied)
 //! alpha, which is what the renderers blend.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const Io = std.Io;
+const executor_mod = @import("executor.zig");
+const http_client_mod = @import("http_client.zig");
+const disk_cache = @import("image_disk_cache.zig");
+const log = std.log.scoped(.zui_assets);
 const geometry = @import("geometry.zig");
 const svg_mod = @import("svg_renderer.zig");
 
@@ -25,8 +32,12 @@ extern fn stbi_image_free(ptr: ?*anyopaque) void;
 pub const ImageCacheError = error{
     /// The embedded name is not known to the app's `AssetSource`.
     AssetNotFound,
-    /// URLs are not fetched yet; only paths and embedded assets load.
+    /// This cache cannot fetch URLs, because it does not belong to an app.
     UnsupportedUri,
+    /// A URL is still being fetched; the windows redraw when it arrives.
+    Loading,
+    /// A URL could not be fetched. The reason is in the log.
+    FetchFailed,
     /// A file could not be read.
     ReadFailed,
     /// The format is recognized but has no decoder (WebP, TIFF, ICO, PNM).
@@ -99,7 +110,7 @@ pub const AssetSource = struct {
 pub const Resource = union(enum) {
     /// A file on disk.
     path: []const u8,
-    /// A URL. Fetching is not implemented; loading fails with `UnsupportedUri`.
+    /// A URL, fetched in the background. `file://` is read directly.
     uri: []const u8,
     /// A name resolved through the app's `AssetSource`.
     embedded: []const u8,
@@ -273,14 +284,15 @@ pub fn decode(allocator: std.mem.Allocator, renderer: *svg_mod.SvgRenderer, form
     };
     const frames: []Frame = switch (format) {
         .gif => try decode_gif(allocator, bytes),
-        .png, .jpeg, .bmp => try decode_static(allocator, bytes),
+        .jpeg => try decode_static(allocator, bytes, jpeg_orientation(bytes)),
+        .png, .bmp => try decode_static(allocator, bytes, 1),
         .webp, .tiff, .ico, .pnm => return error.UnsupportedFormat,
         .svg => unreachable,
     };
     return RenderImage.new(allocator, frames) catch error.OutOfMemory;
 }
 
-fn decode_static(allocator: std.mem.Allocator, bytes: []const u8) ImageCacheError![]Frame {
+fn decode_static(allocator: std.mem.Allocator, bytes: []const u8, orientation: u8) ImageCacheError![]Frame {
     const len = std.math.cast(c_int, bytes.len) orelse return error.DecodeFailed;
     var w: c_int = 0;
     var h: c_int = 0;
@@ -291,8 +303,78 @@ fn decode_static(allocator: std.mem.Allocator, bytes: []const u8) ImageCacheErro
     const n = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
     const frames = allocator.alloc(Frame, 1) catch return error.OutOfMemory;
     errdefer allocator.free(frames);
-    frames[0] = try frame_from_rgba_copy(allocator, px[0..n], @intCast(w), @intCast(h), 0);
+    if (orientation <= 1 or orientation > 8) {
+        frames[0] = try frame_from_rgba_copy(allocator, px[0..n], @intCast(w), @intCast(h), 0);
+        return frames;
+    }
+    const upright = allocator.alloc(u8, n) catch return error.OutOfMemory;
+    defer allocator.free(upright);
+    const size_ = apply_orientation(px[0..n], upright, @intCast(w), @intCast(h), orientation);
+    frames[0] = try frame_from_rgba_copy(allocator, upright, size_[0], size_[1], 0);
     return frames;
+}
+
+/// The EXIF orientation of a JPEG, 1 (upright) if it has none. Tolerates truncated or malformed
+/// data, since it comes from untrusted files.
+fn jpeg_orientation(bytes: []const u8) u8 {
+    if (bytes.len < 4 or bytes[0] != 0xFF or bytes[1] != 0xD8) return 1;
+    var i: usize = 2;
+    while (i + 4 <= bytes.len) {
+        if (bytes[i] != 0xFF) return 1;
+        const marker = bytes[i + 1];
+        // Start of scan: the metadata is over.
+        if (marker == 0xDA or marker == 0xD9) return 1;
+        const len = std.mem.readInt(u16, bytes[i + 2 ..][0..2], .big);
+        if (len < 2 or i + 2 + len > bytes.len) return 1;
+        const body = bytes[i + 4 .. i + 2 + len];
+        if (marker == 0xE1 and std.mem.startsWith(u8, body, "Exif\x00\x00")) return tiff_orientation(body[6..]);
+        i += 2 + @as(usize, len);
+    }
+    return 1;
+}
+
+fn tiff_orientation(tiff: []const u8) u8 {
+    if (tiff.len < 8) return 1;
+    const endian: std.lang.Endian = if (std.mem.eql(u8, tiff[0..2], "II"))
+        .little
+    else if (std.mem.eql(u8, tiff[0..2], "MM"))
+        .big
+    else
+        return 1;
+    const ifd = std.mem.readInt(u32, tiff[4..8], endian);
+    if (ifd > tiff.len or tiff.len - ifd < 2) return 1;
+    const count = std.mem.readInt(u16, tiff[ifd..][0..2], endian);
+    var entry = @as(usize, ifd) + 2;
+    for (0..count) |_| {
+        if (entry + 12 > tiff.len) return 1;
+        if (std.mem.readInt(u16, tiff[entry..][0..2], endian) == 0x0112) {
+            const value = std.mem.readInt(u16, tiff[entry + 8 ..][0..2], endian);
+            return if (value >= 1 and value <= 8) @intCast(value) else 1;
+        }
+        entry += 12;
+    }
+    return 1;
+}
+
+/// Writes `src` to `dst` turned upright for an EXIF orientation, and returns the new size.
+fn apply_orientation(src: []const u8, dst: []u8, w: u32, h: u32, orientation: u8) [2]u32 {
+    const swaps = orientation >= 5;
+    const out_w = if (swaps) h else w;
+    const out_h = if (swaps) w else h;
+    for (0..h) |y| for (0..w) |x| {
+        const ox: usize, const oy: usize = switch (orientation) {
+            2 => .{ w - 1 - x, y },
+            3 => .{ w - 1 - x, h - 1 - y },
+            4 => .{ x, h - 1 - y },
+            5 => .{ y, x },
+            6 => .{ h - 1 - y, x },
+            7 => .{ h - 1 - y, w - 1 - x },
+            8 => .{ y, w - 1 - x },
+            else => .{ x, y },
+        };
+        @memcpy(dst[(oy * out_w + ox) * 4..][0..4], src[(y * w + x) * 4..][0..4]);
+    };
+    return .{ out_w, out_h };
 }
 
 fn decode_gif(allocator: std.mem.Allocator, bytes: []const u8) ImageCacheError![]Frame {
@@ -346,17 +428,27 @@ pub const AssetCache = struct {
     allocator: std.mem.Allocator,
     images: std.AutoHashMapUnmanaged(u64, ImageCacheError!*RenderImage) = .empty,
     svg: ?svg_mod.SvgRenderer = null,
+    /// Set by the app; without it URLs fail with `UnsupportedUri`.
+    fetch_config: ?FetchConfig = null,
+    remote: ?*RemoteImages = null,
+    /// Images a newer download replaced. A frame may still refer to them, so they stay until the
+    /// end. Only a URL whose content changed adds one, at most once per launch.
+    replaced: std.ArrayList(*RenderImage) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) AssetCache {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *AssetCache) void {
+        // First: it cancels downloads, which could otherwise outlive what they write to.
+        if (self.remote) |remote| remote.destroy();
         var it = self.images.valueIterator();
         while (it.next()) |entry| {
             if (entry.*) |img| img.deinit() else |_| {}
         }
         self.images.deinit(self.allocator);
+        for (self.replaced.items) |image| image.deinit();
+        self.replaced.deinit(self.allocator);
         if (self.svg) |*r| r.deinit();
     }
 
@@ -370,12 +462,21 @@ pub const AssetCache = struct {
     pub fn load_resource(self: *AssetCache, source: AssetSource, resource: Resource) ImageCacheError!*RenderImage {
         const key = resource_key(resource);
         if (self.images.get(key)) |cached| return cached;
-        const result = self.decode_resource(source, resource);
+        const result = if (is_remote(resource)) self.start_fetch(key, resource.uri) else self.decode_resource(source, resource);
         self.store(key, result) catch |err| {
             if (result) |img| img.deinit() else |_| {}
             return err;
         };
         return result;
+    }
+
+    fn start_fetch(self: *AssetCache, key: u64, uri: []const u8) ImageCacheError!*RenderImage {
+        if (self.remote == null) {
+            const config = self.fetch_config orelse return error.UnsupportedUri;
+            self.remote = RemoteImages.create(self, config) catch return error.OutOfMemory;
+        }
+        try self.remote.?.fetch(key, uri);
+        return error.Loading;
     }
 
     /// Decodes (or returns the cached) image for an encoded `Image`.
@@ -396,7 +497,12 @@ pub const AssetCache = struct {
 
     fn decode_resource(self: *AssetCache, source: AssetSource, resource: Resource) ImageCacheError!*RenderImage {
         switch (resource) {
-            .uri => return error.UnsupportedUri,
+            .uri => |uri| {
+                if (!std.mem.startsWith(u8, uri, "file://")) return error.UnsupportedUri;
+                const bytes = try read_file(self.allocator, uri["file://".len..]);
+                defer self.allocator.free(bytes);
+                return decode_guessed(self, bytes);
+            },
             .embedded => |name| {
                 const bytes = source.load(name) orelse return error.AssetNotFound;
                 return decode_guessed(self, bytes);
@@ -413,6 +519,222 @@ pub const AssetCache = struct {
     fn decode_guessed(self: *AssetCache, bytes: []const u8) ImageCacheError!*RenderImage {
         const format = ImageFormat.guess(bytes) orelse .svg;
         return decode(self.allocator, try self.svg_renderer(), format, bytes);
+    }
+};
+
+fn is_remote(resource: Resource) bool {
+    return switch (resource) {
+        .uri => |uri| !std.mem.startsWith(u8, uri, "file://"),
+        else => false,
+    };
+}
+
+/// What an app gives its cache so URLs can load.
+pub const FetchConfig = struct {
+    foreground: *executor_mod.ForegroundExecutor,
+    /// Runs on the main thread when an image arrived or failed.
+    on_settled_ctx: *anyopaque,
+    on_settled: *const fn (*anyopaque) void,
+    /// Null means the built-in client.
+    http_client: ?http_client_mod.HttpClient = null,
+    disk_cache: DiskCache = .default,
+    disk_cache_max_bytes: u64 = disk_cache.MAX_TOTAL_BYTES,
+};
+
+/// Where downloaded images are saved (`Application.with_image_cache`).
+pub const DiskCache = union(enum) {
+    /// The platform's per-user cache directory. Tests get no disk cache by default.
+    default,
+    off,
+    dir: []const u8,
+};
+
+/// Fetches URLs on their own threads and hands the results to the main thread (GPUI's
+/// `ImageAssetLoader`). The threads belong to a `std.Io` of their own so that quitting can cancel a
+/// download stuck on a slow server, which a thread of the background executor could not.
+const RemoteImages = struct {
+    cache: *AssetCache,
+    config: FetchConfig,
+    threaded: Io.Threaded,
+    group: Io.Group = .init,
+    client: http_client_mod.StdClient,
+    mutex: Io.Mutex = .init,
+    finished: std.ArrayList(Finished) = .empty,
+    /// Where downloads are saved, if anywhere.
+    disk_dir: ?[]const u8 = null,
+
+    const Finished = struct {
+        key: u64,
+        uri: []u8,
+        result: FetchedImage,
+    };
+
+    /// Raster images are decoded on the download's thread. SVG waits for the main thread,
+    /// because the renderer is not thread-safe.
+    const FetchedImage = union(enum) {
+        decoded: *RenderImage,
+        svg: []u8,
+        failed: anyerror,
+    };
+
+    fn create(cache: *AssetCache, config: FetchConfig) error{OutOfMemory}!*RemoteImages {
+        const self = try cache.allocator.create(RemoteImages);
+        self.* = .{
+            .cache = cache,
+            .config = config,
+            .threaded = Io.Threaded.init(cache.allocator, .{}),
+            .client = undefined,
+        };
+        self.client = .init(cache.allocator, self.threaded.io());
+        self.disk_dir = switch (config.disk_cache) {
+            .off => null,
+            .dir => |dir| try cache.allocator.dupe(u8, dir),
+            .default => if (builtin.is_test) null else try disk_cache.default_dir(cache.allocator),
+        };
+        return self;
+    }
+
+    fn destroy(self: *RemoteImages) void {
+        const io = self.threaded.io();
+        self.group.cancel(io);
+        for (self.finished.items) |*f| self.free_finished(f);
+        self.finished.deinit(self.cache.allocator);
+        self.client.deinit();
+        self.threaded.deinit();
+        if (self.disk_dir) |dir| self.cache.allocator.free(dir);
+        self.cache.allocator.destroy(self);
+    }
+
+    fn free_finished(self: *RemoteImages, f: *Finished) void {
+        const a = self.cache.allocator;
+        a.free(f.uri);
+        switch (f.result) {
+            .decoded => |image| image.deinit(),
+            .svg => |bytes| a.free(bytes),
+            .failed => {},
+        }
+    }
+
+    fn fetch(self: *RemoteImages, key: u64, uri: []const u8) ImageCacheError!void {
+        // The caller's string may live only for this frame.
+        const owned = self.cache.allocator.dupe(u8, uri) catch return error.OutOfMemory;
+        errdefer self.cache.allocator.free(owned);
+        self.group.concurrent(self.threaded.io(), run, .{ self, key, owned }) catch return error.OutOfMemory;
+    }
+
+    fn run(self: *RemoteImages, key: u64, uri: []u8) Io.Cancelable!void {
+        const io = self.threaded.io();
+        const a = self.cache.allocator;
+        defer a.free(uri);
+
+        // The saved copy first, so the window has something while the network takes its second.
+        const saved = self.read_saved(key);
+        defer if (saved) |bytes| a.free(bytes);
+        if (saved) |bytes| show_saved: {
+            const copy = a.dupe(u8, bytes) catch break :show_saved;
+            const result = decode_fetched(a, copy);
+            // A damaged entry just does not count: the download below replaces it.
+            if (result != .failed) self.publish(key, uri, result);
+        }
+
+        const fetched = if (self.config.http_client) |client|
+            client.get(a, io, uri)
+        else
+            self.client.get(a, uri);
+        const body = fetched catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            self.publish(key, uri, .{ .failed = err });
+            return;
+        };
+        if (saved) |bytes| if (std.mem.eql(u8, bytes, body)) {
+            a.free(body);
+            return;
+        };
+        if (self.disk_dir) |dir| disk_cache.write(io, dir, key, body, self.config.disk_cache_max_bytes);
+        self.publish(key, uri, decode_fetched(a, body));
+    }
+
+    fn read_saved(self: *RemoteImages, key: u64) ?[]u8 {
+        const dir = self.disk_dir orelse return null;
+        const a = self.cache.allocator;
+        const path = disk_cache.entry_path(a, dir, key) catch return null;
+        defer a.free(path);
+        return read_file(a, path) catch null;
+    }
+
+    /// Decodes `body`, which it takes ownership of.
+    fn decode_fetched(a: std.mem.Allocator, body: []u8) FetchedImage {
+        // Anything unrecognized is treated as SVG, as for local files.
+        const format = ImageFormat.guess(body) orelse .svg;
+        if (format == .svg) return .{ .svg = body };
+        defer a.free(body);
+        const frames = switch (format) {
+            .jpeg => decode_static(a, body, jpeg_orientation(body)),
+            .png, .bmp => decode_static(a, body, 1),
+            .gif => decode_gif(a, body),
+            else => error.UnsupportedFormat,
+        } catch |err| return .{ .failed = err };
+        return .{ .decoded = RenderImage.new(a, frames) catch |err| return .{ .failed = err } };
+    }
+
+    /// Hands a result to the main thread. Takes ownership of `result`.
+    fn publish(self: *RemoteImages, key: u64, uri: []const u8, result: FetchedImage) void {
+        const io = self.threaded.io();
+        const a = self.cache.allocator;
+        var entry: Finished = .{ .key = key, .uri = a.dupe(u8, uri) catch &.{}, .result = result };
+        {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.finished.append(a, entry) catch {
+                self.free_finished(&entry);
+                return;
+            };
+        }
+        // The task handle is not needed: the queue, not the arguments, holds the data.
+        var task = self.config.foreground.spawn(settle, .{self});
+        task.detach();
+    }
+
+    /// Main thread.
+    fn settle(self: *RemoteImages) void {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        var finished = self.finished;
+        self.finished = .empty;
+        self.mutex.unlock(io);
+        const a = self.cache.allocator;
+        defer finished.deinit(a);
+        for (finished.items) |*f| {
+            defer a.free(f.uri);
+            const result: ImageCacheError!*RenderImage = switch (f.result) {
+                .decoded => |image| image,
+                .svg => |bytes| svg: {
+                    defer a.free(bytes);
+                    const renderer = self.cache.svg_renderer() catch |err| break :svg err;
+                    break :svg decode(a, renderer, .svg, bytes);
+                },
+                .failed => |err| failed: {
+                    log.warn("could not load image {s}: {s}", .{ f.uri, @errorName(err) });
+                    break :failed error.FetchFailed;
+                },
+            };
+            if (result) |_| {} else |err| if (err != error.FetchFailed) {
+                log.warn("could not decode image {s}: {s}", .{ f.uri, @errorName(err) });
+            }
+            const previous: ?*RenderImage = if (self.cache.images.get(f.key)) |entry| (entry catch null) else null;
+            if (previous) |old| {
+                // A saved copy on screen beats nothing, if the download behind it failed.
+                _ = result catch continue;
+                self.cache.replaced.append(a, old) catch {
+                    if (result) |image| image.deinit() else |_| {}
+                    continue;
+                };
+            }
+            self.cache.store(f.key, result) catch {
+                if (result) |image| image.deinit() else |_| {}
+            };
+        }
+        self.config.on_settled(self.config.on_settled_ctx);
     }
 };
 
@@ -476,6 +798,44 @@ pub fn supported_extensions() []const []const u8 {
 // -- tests -------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "EXIF orientation: read from JPEG and TIFF headers, with bad data ignored" {
+    const big = "\xFF\xD8\xFF\xE1\x00\x1EExif\x00\x00MM\x00\x2A\x00\x00\x00\x08\x00\x01\x01\x12\x00\x03\x00\x00\x00\x01\x00\x03\x00\x00\xFF\xDA";
+    try testing.expectEqual(@as(u8, 3), jpeg_orientation(big));
+    const little = "\xFF\xD8\xFF\xE1\x00\x1EExif\x00\x00II\x2A\x00\x08\x00\x00\x00\x01\x00\x12\x01\x03\x00\x01\x00\x00\x00\x06\x00\x00\x00\xFF\xDA";
+    try testing.expectEqual(@as(u8, 6), jpeg_orientation(little));
+    // Every prefix is safe, and none finds a value it should not.
+    for (0..big.len) |n| {
+        const found = jpeg_orientation(big[0..n]);
+        try testing.expect(found == 1 or found == 3);
+    }
+    try testing.expectEqual(@as(u8, 1), jpeg_orientation("\xFF\xD8\xFF\xDA"));
+    try testing.expectEqual(@as(u8, 1), jpeg_orientation("not a jpeg"));
+}
+
+test "EXIF orientation: all eight transforms" {
+    // A B C
+    // D E F, one byte standing for each pixel.
+    const source = "ABCDEF";
+    var src: [24]u8 = undefined;
+    for (source, 0..) |c, i| src[i * 4] = c;
+    const expected = [_]struct { o: u8, w: u32, text: []const u8 }{
+        .{ .o = 1, .w = 3, .text = "ABCDEF" },
+        .{ .o = 2, .w = 3, .text = "CBAFED" },
+        .{ .o = 3, .w = 3, .text = "FEDCBA" },
+        .{ .o = 4, .w = 3, .text = "DEFABC" },
+        .{ .o = 5, .w = 2, .text = "ADBECF" },
+        .{ .o = 6, .w = 2, .text = "DAEBFC" },
+        .{ .o = 7, .w = 2, .text = "FCEBDA" },
+        .{ .o = 8, .w = 2, .text = "CFBEAD" },
+    };
+    for (expected) |e| {
+        var dst: [24]u8 = undefined;
+        const out = apply_orientation(&src, &dst, 3, 2, e.o);
+        try testing.expectEqual(e.w, out[0]);
+        for (e.text, 0..) |c, i| try testing.expectEqual(c, dst[i * 4]);
+    }
+}
 
 fn append_be32(list: *std.ArrayList(u8), v: u32) !void {
     try list.appendSlice(testing.allocator, &.{ @intCast(v >> 24), @intCast((v >> 16) & 0xff), @intCast((v >> 8) & 0xff), @intCast(v & 0xff) });

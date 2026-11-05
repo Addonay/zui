@@ -85,9 +85,10 @@ pub const ImgExt = struct {
         e.replacement = null;
         const source = e.source orelse return null;
 
-        const data = source.use_data(&cx.asset_cache, cx.asset_source) catch {
-            if (e.fallback_) |fallback| {
-                const rep = fallback();
+        const data = source.use_data(&cx.asset_cache, cx.asset_source) catch |err| {
+            const placeholder = if (err == error.Loading) e.loading_ else e.fallback_;
+            if (placeholder) |build| {
+                const rep = build();
                 const child = rep.request_layout(window, cx);
                 e.replacement = rep;
                 return window.request_layout(s, &.{child}, cx);

@@ -277,6 +277,9 @@ const KeyDownEvent = interactive.KeyDownEvent;
 const FocusHandle = window_mod.FocusHandle;
 const div = div_mod.div;
 const canvas_mod = @import("../elements/canvas.zig");
+const img_mod = @import("../elements/img.zig");
+const assets_mod = @import("../assets.zig");
+const element_mod = @import("../element.zig");
 const px = geometry.px;
 const rgb = @import("../color.zig").rgb;
 const red = @import("../color.zig").red;
@@ -799,6 +802,270 @@ test "scroll: no frame is painted past either end, and scrolling at a limit draw
     for (OverscrollView.child_y[0..OverscrollView.frames]) |y| {
         try std.testing.expect(y <= top and y >= top - 200);
     }
+}
+
+const RemoteImageView = struct {
+    var url: []const u8 = "";
+    var fallbacks: usize = 0;
+    var loadings: usize = 0;
+
+    fn on_fallback() element_mod.AnyElement {
+        fallbacks += 1;
+        return div().into_any_element();
+    }
+    fn on_loading() element_mod.AnyElement {
+        loadings += 1;
+        return div().into_any_element();
+    }
+
+    pub fn render(_: *RemoteImageView, _: *Window, _: *Context(RemoteImageView)) *Div {
+        return div().w(px(100)).h(px(100)).child(img_mod.img(url).with_loading(on_loading).with_fallback(on_fallback));
+    }
+    fn build(_: *Window, app: *App) Entity(RemoteImageView) {
+        return app.new(RemoteImageView{});
+    }
+    fn reset(new_url: []const u8) void {
+        url = new_url;
+        fallbacks = 0;
+        loadings = 0;
+    }
+    fn wait(vcx: *VisualTestContext, cache: *assets_mod.AssetCache) assets_mod.ImageCacheError!*assets_mod.RenderImage {
+        const resource: assets_mod.Resource = .{ .uri = url };
+        for (0..1000) |_| {
+            vcx.run_until_parked();
+            const result = cache.load_resource(.empty, resource);
+            if (result != error.Loading) {
+                vcx.run_until_parked();
+                return result;
+            }
+            @import("../executor.zig").sleep_ns(5 * std.time.ns_per_ms);
+        }
+        return error.Loading;
+    }
+};
+
+/// A 1x1 PNG.
+const tiny_png = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0d\x49\x44\x41\x54\x78\x9c\x63\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99\x3d\x1d\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+/// A 2x1 PNG.
+const wide_png = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x02\x00\x00\x00\x01\x08\x06\x00\x00\x00\xf4\x22\x7f\x8a\x00\x00\x00\x0e\x49\x44\x41\x54\x78\x9c\x63\xf8\xcf\xc0\xf0\x1f\x04\x01\x10\xf8\x03\xfd\x4e\x95\xc1\x6f\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+const FakeHttp = struct {
+    var released: std.atomic.Value(bool) = .init(false);
+    var served: std.atomic.Value(u32) = .init(0);
+    var body: []const u8 = tiny_png;
+
+    /// Answers `body` once released.
+    fn gated(_: ?*anyopaque, allocator: std.mem.Allocator, _: std.Io, _: []const u8) anyerror![]u8 {
+        while (!released.load(.acquire)) @import("../executor.zig").sleep_ns(std.time.ns_per_ms);
+        defer _ = served.fetchAdd(1, .release);
+        return allocator.dupe(u8, body);
+    }
+
+    /// Answers once the test has seen the loading state.
+    fn ok(_: ?*anyopaque, allocator: std.mem.Allocator, _: std.Io, _: []const u8) anyerror![]u8 {
+        while (!released.load(.acquire)) @import("../executor.zig").sleep_ns(std.time.ns_per_ms);
+        return allocator.dupe(u8, tiny_png);
+    }
+    fn broken(_: ?*anyopaque, _: std.mem.Allocator, _: std.Io, _: []const u8) anyerror![]u8 {
+        return error.ConnectionRefused;
+    }
+};
+
+test "img: a URL shows the loading placeholder, then the image in a redrawn frame" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.ok };
+    FakeHttp.released.store(false, .release);
+    RemoteImageView.reset("https://example.test/a.png");
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    const first_frames = vcx.window.frame_count;
+    try std.testing.expect(RemoteImageView.loadings > 0);
+    FakeHttp.released.store(true, .release);
+    const image = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    try std.testing.expectEqual(@as(i32, 1), image.size(0).width);
+    try std.testing.expect(vcx.window.frame_count > first_frames);
+    try std.testing.expectEqual(@as(usize, 0), RemoteImageView.fallbacks);
+}
+
+test "img: a failed URL shows the fallback and is not fetched again every frame" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.broken };
+    RemoteImageView.reset("https://example.test/gone.png");
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    try std.testing.expectError(error.FetchFailed, RemoteImageView.wait(vcx, &cx.app.asset_cache));
+    try std.testing.expect(RemoteImageView.fallbacks > 0);
+}
+
+const DiskCacheFixture = struct {
+    tmp: std.testing.TmpDir,
+    dir: []u8,
+
+    fn init() !DiskCacheFixture {
+        const tmp = std.testing.tmpDir(.{});
+        return .{ .tmp = tmp, .dir = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path }) };
+    }
+    fn deinit(self: *DiskCacheFixture) void {
+        std.testing.allocator.free(self.dir);
+        self.tmp.cleanup();
+    }
+    /// Loads the URL once in a throwaway app, so its bytes end up on disk.
+    fn seed(self: *DiskCacheFixture, png: []const u8) !void {
+        var cx = TestAppContext.init();
+        defer cx.deinit();
+        cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.gated };
+        cx.app.asset_cache.fetch_config.?.disk_cache = .{ .dir = self.dir };
+        FakeHttp.body = png;
+        FakeHttp.released.store(true, .release);
+        _, const vcx = cx.add_window_view(RemoteImageView.build);
+        _ = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    }
+    fn wait_served(vcx: *VisualTestContext, count: u32) void {
+        while (FakeHttp.served.load(.acquire) < count) @import("../executor.zig").sleep_ns(std.time.ns_per_ms);
+        // Long enough for the task to publish after answering.
+        @import("../executor.zig").sleep_ns(50 * std.time.ns_per_ms);
+        vcx.run_until_parked();
+    }
+};
+
+test "img: a URL seen before shows at once, before the network answers" {
+    var disk = try DiskCacheFixture.init();
+    defer disk.deinit();
+    RemoteImageView.reset("https://example.test/saved.png");
+    try disk.seed(tiny_png);
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.gated };
+    cx.app.asset_cache.fetch_config.?.disk_cache = .{ .dir = disk.dir };
+    FakeHttp.released.store(false, .release);
+    defer FakeHttp.released.store(true, .release);
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    const first = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    try std.testing.expectEqual(@as(i32, 1), first.size(0).width);
+
+    // The same bytes come back: the image stays, and nothing is redrawn for it.
+    FakeHttp.served.store(0, .release);
+    const frames = vcx.window.frame_count;
+    FakeHttp.released.store(true, .release);
+    DiskCacheFixture.wait_served(vcx, 1);
+    try std.testing.expectEqual(first, try cx.app.asset_cache.load_resource(.empty, .{ .uri = RemoteImageView.url }));
+    try std.testing.expectEqual(frames, vcx.window.frame_count);
+}
+
+test "img: a saved copy is replaced when the URL's content changed" {
+    var disk = try DiskCacheFixture.init();
+    defer disk.deinit();
+    RemoteImageView.reset("https://example.test/changes.png");
+    try disk.seed(tiny_png);
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.gated };
+    cx.app.asset_cache.fetch_config.?.disk_cache = .{ .dir = disk.dir };
+    FakeHttp.released.store(false, .release);
+    defer FakeHttp.released.store(true, .release);
+    FakeHttp.body = wide_png;
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    const first = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    try std.testing.expectEqual(@as(i32, 1), first.size(0).width);
+
+    FakeHttp.served.store(0, .release);
+    FakeHttp.released.store(true, .release);
+    DiskCacheFixture.wait_served(vcx, 1);
+    const second = try cx.app.asset_cache.load_resource(.empty, .{ .uri = RemoteImageView.url });
+    try std.testing.expectEqual(@as(i32, 2), second.size(0).width);
+}
+
+test "img: a saved copy stays when the network fails" {
+    var disk = try DiskCacheFixture.init();
+    defer disk.deinit();
+    RemoteImageView.reset("https://example.test/offline.png");
+    try disk.seed(tiny_png);
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.broken };
+    cx.app.asset_cache.fetch_config.?.disk_cache = .{ .dir = disk.dir };
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    const first = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    @import("../executor.zig").sleep_ns(50 * std.time.ns_per_ms);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(first, try cx.app.asset_cache.load_resource(.empty, .{ .uri = RemoteImageView.url }));
+    try std.testing.expectEqual(@as(usize, 0), RemoteImageView.fallbacks);
+}
+
+/// Answers one HTTP request with a PNG, with a redirect first.
+const LocalServer = struct {
+    fn respond(server: *std.Io.net.Server, io: std.Io, reply: []const u8) !void {
+        var stream = try server.accept(io);
+        defer stream.close(io);
+        var read_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(io, &read_buffer);
+        var seen: usize = 0;
+        while (seen < 4) {
+            const byte = try reader.interface.takeByte();
+            seen = switch (byte) {
+                '\r' => if (seen == 2) 3 else 1,
+                '\n' => if (seen == 3) 4 else if (seen == 1) 2 else 0,
+                else => 0,
+            };
+        }
+        var write_buffer: [4096]u8 = undefined;
+        var writer = stream.writer(io, &write_buffer);
+        try writer.interface.writeAll(reply);
+        try writer.interface.flush();
+    }
+
+    fn serve(server: *std.Io.net.Server, io: std.Io, port: u16) void {
+        var redirect_buffer: [256]u8 = undefined;
+        const redirect = std.fmt.bufPrint(&redirect_buffer, "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/real.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{port}) catch unreachable;
+        respond(server, io, redirect) catch return;
+        var reply_buffer: [512]u8 = undefined;
+        const reply = std.fmt.bufPrint(&reply_buffer, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ tiny_png.len, tiny_png }) catch unreachable;
+        respond(server, io, reply) catch return;
+    }
+};
+
+test "img: the built-in client fetches over a real socket and follows a redirect" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+    const thread = try std.Thread.spawn(.{}, LocalServer.serve, .{ &server, io, port });
+    defer thread.join();
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    var url_buffer: [64]u8 = undefined;
+    RemoteImageView.reset(try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/a.png", .{port}));
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    const image = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    try std.testing.expectEqual(@as(i32, 1), image.size(0).width);
+}
+
+test "img: quitting does not wait for a server that never answers" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    // Connections complete in the backlog and then nothing is ever read or sent.
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+
+    var cx = TestAppContext.init();
+    var url_buffer: [64]u8 = undefined;
+    RemoteImageView.reset(try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/a.png", .{server.socket.address.getPort()}));
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    vcx.run_until_parked();
+    @import("../executor.zig").sleep_ns(50 * std.time.ns_per_ms);
+    const start = @import("../executor.zig").now_ns();
+    cx.deinit();
+    try std.testing.expect(@import("../executor.zig").now_ns() - start < 2 * std.time.ns_per_s);
 }
 
 test "actions: dispatch_action reaches on_action on the focus path" {
