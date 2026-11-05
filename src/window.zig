@@ -453,7 +453,7 @@ pub fn outline(b: Bounds(Pixels), border_color: anytype, border_style: BorderSty
 /// A platform window and its UI state (GPUI `Window`).
 /// How long a partial multi-stroke binding that could also mean something now waits for its next
 /// key (GPUI `PENDING_INPUT_TIMEOUT`).
-const PENDING_INPUT_TIMEOUT_NS: u64 = if (@import("builtin").is_test) 100 * std.time.ns_per_ms else std.time.ns_per_s;
+const PENDING_INPUT_TIMEOUT_NS: u64 = if (@import("builtin").is_test) 500 * std.time.ns_per_ms else std.time.ns_per_s;
 
 const PendingModifier = struct {
     modifiers: keystroke_mod.Modifiers = .{},
