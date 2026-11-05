@@ -151,6 +151,34 @@ pub fn WindowHandle(comptime V: type) type {
     };
 }
 
+/// The numeric id of a window (GPUI `WindowId`, which has `as_u64`).
+pub const WindowIdValue = struct {
+    raw: WindowId,
+
+    pub fn as_u64(self: WindowIdValue) u64 {
+        return self.raw;
+    }
+};
+
+/// A handle to a window whose root view type is not part of the handle (GPUI `AnyWindowHandle`).
+pub const AnyWindowHandle = struct {
+    id: WindowId,
+
+    pub fn window_id(self: AnyWindowHandle) WindowIdValue {
+        return .{ .raw = self.id };
+    }
+
+    /// Runs `f(window, cx, args...)` in the window, or fails with `error.WindowClosed`. Unlike
+    /// GPUI's closure, `f` gets no root view: that type is not known through this handle.
+    pub fn update(self: AnyWindowHandle, cx: anytype, comptime f: anytype, args: anytype) !@typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        const app = app_mod.app_of(cx);
+        const win = app.window_by_id(self.id) orelse return error.WindowClosed;
+        const result = @call(.auto, f, .{ win, app } ++ args);
+        app.flush_effects();
+        return result;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Focus.
 
@@ -574,7 +602,10 @@ pub const Window = struct {
     }
 
     pub fn destroy(self: *Window, app: *App) void {
-        if (self.root) |r| app.release_entity(r.entity_id);
+        // An entity that another open window now shows (moved between windows) outlives this one.
+        if (self.root) |r| {
+            if (!app.is_root_of_other_window(r.entity_id, self)) app.release_entity(r.entity_id);
+        }
         self.platform_window.close();
         const gpa = self.allocator;
         self.layout_engine.deinit();
@@ -732,6 +763,9 @@ pub const Window = struct {
     }
     pub fn window_handle_id(self: *const Window) WindowId {
         return self.handle_id;
+    }
+    pub fn window_handle(self: *const Window) AnyWindowHandle {
+        return .{ .id = self.handle_id };
     }
     pub fn prevent_default(self: *Window) void {
         self.default_prevented = true;

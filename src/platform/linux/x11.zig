@@ -62,6 +62,9 @@ const Atoms = struct {
     net_wm_sync_request: Atom = 0,
     net_wm_sync_request_counter: Atom = 0,
     gtk_show_window_menu: Atom = 0,
+    net_wm_window_type: Atom = 0,
+    net_wm_window_type_notification: Atom = 0,
+    net_wm_window_type_dialog: Atom = 0,
     net_wm_cm_s0: Atom = 0,
     xdnd_aware: Atom = 0,
     xdnd_enter: Atom = 0,
@@ -204,6 +207,9 @@ pub const X11Connection = struct {
             .net_wm_sync_request = api.XInternAtom(dpy, "_NET_WM_SYNC_REQUEST", 0),
             .net_wm_sync_request_counter = api.XInternAtom(dpy, "_NET_WM_SYNC_REQUEST_COUNTER", 0),
             .gtk_show_window_menu = api.XInternAtom(dpy, "_GTK_SHOW_WINDOW_MENU", 0),
+            .net_wm_window_type = api.XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", 0),
+            .net_wm_window_type_notification = api.XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NOTIFICATION", 0),
+            .net_wm_window_type_dialog = api.XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", 0),
             .net_wm_cm_s0 = api.XInternAtom(dpy, "_NET_WM_CM_S0", 0),
             .xdnd_aware = api.XInternAtom(dpy, "XdndAware", 0),
             .xdnd_enter = api.XInternAtom(dpy, "XdndEnter", 0),
@@ -391,6 +397,7 @@ pub const X11Connection = struct {
             .allocator = self.allocator,
             .conn = self,
             .size = b.size,
+            .origin = b.origin,
             .scale = self.scale,
             .atlas = atlas_mod.CpuAtlas.init(self.allocator),
             .renderer = cpu.CpuRenderer.init(self.allocator),
@@ -403,6 +410,17 @@ pub const X11Connection = struct {
         const oy: c_int = @intFromFloat(@round(b.origin.y * self.scale));
         const x = a.XCreateSimpleWindow(self.display, self.root, ox, oy, pw, ph, 0, 0, 0);
         w.x_window = x;
+        // Kinds as GPUI's X11 platform maps them. Floating needs a parent window to do anything,
+        // and no window has one here, so it opens like a normal window.
+        switch (options.kind) {
+            .popup => {
+                var attributes: proto.SetWindowAttributes = .{ .override_redirect = 1 };
+                _ = a.XChangeWindowAttributes(self.display, x, proto.CW_OVERRIDE_REDIRECT, &attributes);
+                self.set_window_type(x, self.atoms.net_wm_window_type_notification);
+            },
+            .dialog => self.set_window_type(x, self.atoms.net_wm_window_type_dialog),
+            .normal, .floating => {},
+        }
         var title_buf: [512]u8 = undefined;
         const title_src: []const u8 = if (options.titlebar) |t| (t.title orelse "ZUI") else "ZUI";
         const tn = @min(title_src.len, title_buf.len - 1);
@@ -456,6 +474,10 @@ pub const X11Connection = struct {
             self.compositor_running = self.api.XGetSelectionOwner(self.display, self.atoms.net_wm_cm_s0) != 0;
         }
         return self.compositor_running.?;
+    }
+
+    fn set_window_type(self: *X11Connection, x: XWindow, window_type: Atom) void {
+        _ = self.api.XChangeProperty(self.display, x, self.atoms.net_wm_window_type, proto.XA_ATOM, 32, 0, @ptrCast(&window_type), 1);
     }
 
     /// Motif hints: turn off the window manager's frame (decorations = 0).
@@ -584,6 +606,7 @@ pub const X11Connection = struct {
             proto.ConfigureNotify => {
                 const cfg = ev.xconfigure;
                 w.on_configure(@intCast(@max(0, cfg.width)), @intCast(@max(0, cfg.height)));
+                w.origin = .{ .x = @as(f32, @floatFromInt(cfg.x)) / w.scale, .y = @as(f32, @floatFromInt(cfg.y)) / w.scale };
                 w.update_frame_interval();
             },
             proto.VisibilityNotify => {
@@ -1397,6 +1420,8 @@ pub const X11Window = struct {
     x_window: XWindow = 0,
     /// Logical size; the OS window and buffers are `size * scale` physical pixels.
     size: PxSize,
+    /// Logical position on the root window, from ConfigureNotify (GPUI's `bounds().origin`).
+    origin: PxPoint = .{ .x = 0, .y = 0 },
     scale: f32,
     /// XImage whose data is malloc'd (XDestroyImage frees it).
     image: ?*proto.XImage = null,
@@ -1576,7 +1601,7 @@ pub const X11Window = struct {
     }
 
     fn bounds(p: *platform.PlatformWindow) PxBounds {
-        return .{ .origin = .{ .x = 0, .y = 0 }, .size = from(p).size };
+        return .{ .origin = from(p).origin, .size = from(p).size };
     }
     fn contentSize(p: *platform.PlatformWindow) PxSize {
         return from(p).size;
