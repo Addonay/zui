@@ -1012,6 +1012,12 @@ pub fn pixels_to_i32(value: Pixels) i32 {
     return @intFromFloat(value);
 }
 
+test "percentage is a fraction of a full turn" {
+    try std.testing.expectApproxEqAbs(std.math.pi, percentage(0.5).to_radians(), 1e-6);
+    try std.testing.expectApproxEqAbs(std.math.tau, percentage(1).to_radians(), 1e-6);
+    try std.testing.expectEqual(@as(f32, 2.0), to_radians(@as(f32, 2.0)));
+}
+
 test "pixels_to_i32" {
     const cases = [_]struct { f32, i32 }{
         .{ 12.9, 12 },

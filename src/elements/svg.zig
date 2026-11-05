@@ -211,6 +211,12 @@ test "transformation without rotation or scale only moves the origin" {
     try std.testing.expectApproxEqAbs(@as(f32, 10), p.y, 1e-4);
 }
 
+test "rotate takes radians or a percentage of a turn" {
+    const geometry_mod = @import("../geometry.zig");
+    try std.testing.expectApproxEqAbs(std.math.pi / 2.0, Transformation.rotate(geometry_mod.percentage(0.25)).rotation, 1e-6);
+    try std.testing.expectEqual(@as(f32, 0.5), Transformation.rotate(@as(f32, 0.5)).rotation);
+}
+
 test "svg key depends on source and size" {
     const a = svg_key(.{ .asset = "a.svg" }, .{ .width = 16, .height = 16 });
     const b = svg_key(.{ .asset = "a.svg" }, .{ .width = 32, .height = 16 });
