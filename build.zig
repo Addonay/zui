@@ -67,6 +67,21 @@ pub fn build(b: *std.Build) void {
     });
     zui.addImport("build_options", build_options.createModule());
 
+    // The HTTP client, optimized even in Debug: Debug TLS adds about 0.9 s to each connection.
+    const http_native = b.createModule(.{
+        .root_source_file = b.path("src/http_native.zig"),
+        .target = target,
+        .optimize = if (optimize == .debug) .fast else optimize,
+        .link_libc = true,
+    });
+    // `extern "crypt32"` in `std` names its library only for the artifact it is compiled into, and a
+    // static library does not pass that on.
+    if (target.result.os.tag == .windows) {
+        http_native.linkSystemLibrary("crypt32", .{});
+        http_native.linkSystemLibrary("ws2_32", .{});
+    }
+    zui.linkLibrary(b.addLibrary(.{ .name = "zui_http", .linkage = .static, .root_module = http_native }));
+
     // Vendored C backends: nanosvg (SVG parse + rasterize) and stb_image (decode).
     zui.addIncludePath(b.path("third_party"));
     zui.addCSourceFile(.{ .file = b.path("third_party/images.c"), .flags = &.{"-std=c99"} });

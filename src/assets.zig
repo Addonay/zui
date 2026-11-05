@@ -587,7 +587,7 @@ const RemoteImages = struct {
             .threaded = Io.Threaded.init(cache.allocator, .{}),
             .client = undefined,
         };
-        self.client = .init(cache.allocator, self.threaded.io());
+        self.client = .init();
         self.disk_dir = switch (config.disk_cache) {
             .off => null,
             .dir => |dir| try cache.allocator.dupe(u8, dir),
@@ -642,7 +642,7 @@ const RemoteImages = struct {
         const fetched = if (self.config.http_client) |client|
             client.get(a, io, uri)
         else
-            self.client.get(a, uri);
+            self.client.get(a, io, uri);
         const body = fetched catch |err| {
             if (err == error.Canceled) return error.Canceled;
             self.publish(key, uri, .{ .failed = err });
@@ -856,9 +856,9 @@ pub fn load_detached(allocator: std.mem.Allocator, io: Io, source: AssetSource, 
 
 fn fetch_detached(allocator: std.mem.Allocator, io: Io, http: ?http_client_mod.HttpClient, url: []const u8) anyerror![]u8 {
     if (http) |client| return client.get(allocator, io, url);
-    var client = http_client_mod.StdClient.init(allocator, io);
+    var client = http_client_mod.StdClient.init();
     defer client.deinit();
-    return client.get(allocator, url);
+    return client.get(allocator, io, url);
 }
 
 /// Decodes `bytes` with a rasterizer of its own, so it is safe on any thread.
