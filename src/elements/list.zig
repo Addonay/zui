@@ -255,6 +255,8 @@ const StateInner = struct {
     scroll_handler: ?ScrollHandler = null,
     measuring_behavior: ListMeasuringBehavior = .visible,
     follow_state: FollowState = .normal,
+    /// Content height when a scrollbar drag began; null when no drag is in progress.
+    scrollbar_drag_start_height: ?Pixels = null,
 
     fn count(self: *const StateInner) usize {
         return self.items.items.len;
@@ -739,6 +741,48 @@ pub const ListState = struct {
         const start_pixel = state.scroll_top_px(current);
         const new_pixel = @max(start_pixel + distance, 0);
         state.set_scroll_anchor(state.offset_for_height(new_pixel));
+    }
+
+    /// Called when the user starts dragging the scrollbar. The content height is frozen until
+    /// `scrollbar_drag_ended`, so the thumb stays put while items are measured (GPUI `scrollbar_drag_started`).
+    pub fn scrollbar_drag_started(self: ListState) void {
+        self.inner.scrollbar_drag_start_height = self.inner.total_height();
+    }
+
+    /// Called when the user stops dragging the scrollbar (GPUI `scrollbar_drag_ended`).
+    pub fn scrollbar_drag_ended(self: ListState) void {
+        self.inner.scrollbar_drag_start_height = null;
+    }
+
+    /// Whether a scrollbar drag is in progress (GPUI `is_scrollbar_dragging`).
+    pub fn is_scrollbar_dragging(self: ListState) bool {
+        return self.inner.scrollbar_drag_start_height != null;
+    }
+
+    /// Scrolls to the position the scrollbar thumb is at. `point.y` is the non-positive offset from
+    /// `scroll_px_offset_for_scrollbar`. Dragging to the frozen end resumes following the tail, if
+    /// the list follows it (GPUI `set_offset_from_scrollbar`).
+    pub fn set_offset_from_scrollbar(self: ListState, offset: Point(Pixels)) void {
+        const state = self.inner;
+        const bounds = state.last_layout_bounds orelse return;
+        const padding = state.last_padding orelse Edges(Pixels){};
+        // The drag maps positions with the height it started with, so the thumb stays consistent.
+        const content_height = state.scrollbar_drag_start_height orelse state.total_height();
+        const scroll_max = @max(content_height + padding.top + padding.bottom - bounds.size.height, 0);
+        const new_scroll_top = std.math.clamp(-offset.y, 0, scroll_max);
+        // Content may have grown during the drag, so the frozen end can be above the live one.
+        const dragged_to_end = scroll_max > 0 and new_scroll_top >= @max(scroll_max - 1, 0);
+        if (dragged_to_end and state.follow_state != .normal) {
+            state.follow_state = .tail_following;
+            state.set_scroll_anchor(.{ .item_ix = state.count(), .offset_in_item = 0 });
+            return;
+        }
+        state.follow_state.stop_following();
+        if (state.alignment == .bottom and new_scroll_top == scroll_max) {
+            state.set_scroll_anchor(null);
+        } else {
+            state.set_scroll_anchor(state.offset_for_height(new_scroll_top));
+        }
     }
 
     /// Scrolls to the very end, past the last item. Layout walks back from the end, so the
@@ -4435,4 +4479,65 @@ test "list: remeasure keeps the proportional scroll position" {
     offset = state.logical_scroll_top();
     try std.testing.expectEqual(@as(usize, 2), offset.item_ix);
     try std.testing.expectEqual(@as(Pixels, 20), offset.offset_in_item);
+}
+
+test "list: a scrollbar drag moves the list and reports that it is dragging" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    // 10 items of 50px in a 200px viewport: the scroll range is 300px.
+    const state = ListState.new(10, .top, 0).measure_all();
+    _ = open_list(&cx, state, 50, 100, 200);
+
+    try std.testing.expect(!state.is_scrollbar_dragging());
+    state.scrollbar_drag_started();
+    try std.testing.expect(state.is_scrollbar_dragging());
+    state.set_offset_from_scrollbar(.{ .x = 0, .y = -150 });
+    state.scrollbar_drag_ended();
+    try std.testing.expect(!state.is_scrollbar_dragging());
+
+    const offset = state.logical_scroll_top();
+    try std.testing.expectEqual(@as(usize, 3), offset.item_ix);
+    try std.testing.expectEqual(@as(Pixels, 0), offset.offset_in_item);
+}
+
+test "list: a scrollbar drag is clamped to the content height it started with" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const state = ListState.new(10, .top, 0).measure_all();
+    const opened = open_list(&cx, state, 50, 100, 200);
+
+    state.scrollbar_drag_started();
+    // Items grow to 100px during the drag, so the live range is 1000px. The thumb must still
+    // map to the 300px range it started with: a drag far past the end clamps to 300px, which is
+    // item 3 at 100px per item. Without the freeze it would reach 600px, item 6.
+    cx.update_entity(opened.view, TestListView.set_item_height, .{@as(Pixels, 100)});
+    state.remeasure();
+    resize_list(opened.vcx, 100, 200);
+    state.set_offset_from_scrollbar(.{ .x = 0, .y = -600 });
+    state.scrollbar_drag_ended();
+
+    const offset = state.logical_scroll_top();
+    try std.testing.expectEqual(@as(usize, 3), offset.item_ix);
+    try std.testing.expectEqual(@as(Pixels, 0), offset.offset_in_item);
+}
+
+test "list: dragging the scrollbar away from the tail stops following, and back to the end resumes" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const state = ListState.new(10, .top, 0).measure_all();
+    _ = open_list(&cx, state, 50, 100, 200);
+
+    state.set_follow_mode(.tail);
+    try std.testing.expect(state.is_following_tail());
+
+    state.scrollbar_drag_started();
+    state.set_offset_from_scrollbar(.{ .x = 0, .y = -150 });
+    state.scrollbar_drag_ended();
+    try std.testing.expect(!state.is_following_tail());
+    try std.testing.expectEqual(@as(usize, 3), state.logical_scroll_top().item_ix);
+
+    state.scrollbar_drag_started();
+    state.set_offset_from_scrollbar(.{ .x = 0, .y = -300 });
+    state.scrollbar_drag_ended();
+    try std.testing.expect(state.is_following_tail());
 }

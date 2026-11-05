@@ -10,6 +10,7 @@ const scene_mod = @import("scene.zig");
 const taffy = @import("taffy.zig");
 const element_mod = @import("element.zig");
 const app_mod = @import("app.zig");
+const keymap_mod = @import("keymap.zig");
 const platform_mod = @import("platform.zig");
 const interactive = @import("interactive.zig");
 const keystroke_mod = @import("keystroke.zig");
@@ -240,11 +241,54 @@ pub const FocusHandle = struct {
     pub fn eql(a: FocusHandle, b: FocusHandle) bool {
         return a.id == b.id;
     }
+    /// GPUI `downgrade`.
+    pub fn downgrade(self: FocusHandle) WeakFocusHandle {
+        return .{ .id = self.id };
+    }
 };
+
+/// A focus handle that does not keep its element alive (GPUI `WeakFocusHandle`). Without
+/// reference counts it is only valid while the element is in the last rendered frame.
+pub const WeakFocusHandle = struct {
+    id: FocusId,
+
+    /// The focus handle, if the element is still in the last rendered frame (GPUI `upgrade`).
+    pub fn upgrade(self: WeakFocusHandle, window: *const Window) ?FocusHandle {
+        if (!window.rendered_frame.dispatch_tree.focusable.contains(self.id)) return null;
+        return .{ .id = self.id };
+    }
+    pub fn eql(a: WeakFocusHandle, b: WeakFocusHandle) bool {
+        return a.id == b.id;
+    }
+};
+
+/// Sent when a view wants its container to close (GPUI `DismissEvent`).
+pub const DismissEvent = struct {};
+
+/// Sent when a focus leaves an element (GPUI `FocusOutEvent`); defined with the focus listeners.
+pub const FocusOutEvent = focus_events.FocusOutEvent;
 
 /// Types that can be focused (GPUI `Focusable`): `fn focus_handle(self, cx) FocusHandle`.
 pub fn is_focusable(comptime T: type) bool {
-    return @hasDecl(T, "focus_handle");
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, "focus_handle"),
+        else => false,
+    };
+}
+
+/// Views a window can host as a popover, modal or menu (GPUI `ManagedView`): focusable, rendered,
+/// and able to emit `DismissEvent`. Zig cannot check the emitter at compile time, so it is only
+/// checked by `assert_managed_view`'s `render` and `focus_handle` declarations.
+pub fn is_managed_view(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, "focus_handle") and @hasDecl(T, "render"),
+        else => false,
+    };
+}
+
+/// Compile error unless `T` is a `ManagedView`.
+pub fn assert_managed_view(comptime T: type) void {
+    if (!is_managed_view(T)) @compileError(@typeName(T) ++ " must implement focus_handle and render to be a ManagedView");
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +581,10 @@ pub const Window = struct {
     mouse_hit_test: HitTest = .{},
     mouse_position_: Point(Pixels) = .{ .x = 0, .y = 0 },
     modifiers_: keystroke_mod.Modifiers = .{},
-    capslock: keystroke_mod.Capslock = .{},
+    /// Last known state of the capslock key; read it with `capslock()`.
+    capslock_state: keystroke_mod.Capslock = .{},
+    /// Shadow area of a client-decorated window; read it with `client_inset()`.
+    client_inset_value: ?Pixels = null,
     scale_factor_: f32 = 1,
     rem_size_: Pixels = 16,
     rem_size_override_stack: std.ArrayList(Pixels) = .empty,
@@ -562,7 +609,8 @@ pub const Window = struct {
     frame_count: u64 = 0,
     default_prevented: bool = false,
     propagate_event: bool = true,
-    captured_hitbox: ?HitboxId = null,
+    /// Hitbox that captured the pointer; read it with `captured_hitbox()`.
+    pointer_capture: ?HitboxId = null,
     /// Keystrokes that may still complete a multi-stroke binding. Their strings are owned.
     pending_keystrokes: std.ArrayList(keystroke_mod.Keystroke) = .empty,
     pending_focus: ?u64 = null,
@@ -840,6 +888,7 @@ pub const Window = struct {
     }
     /// The shadow area of a client-decorated window, in logical pixels (GPUI `set_client_inset`).
     pub fn set_client_inset(self: *Window, inset: Pixels) void {
+        self.client_inset_value = inset;
         self.platform_window.set_client_inset(inset);
     }
     /// Starts an interactive resize from an edge, as a press on that edge would (GPUI `start_window_resize`).
@@ -872,11 +921,23 @@ pub const Window = struct {
     pub fn stop_propagation(self: *Window) void {
         self.propagate_event = false;
     }
+    /// The current state of the keyboard's capslock (GPUI `capslock`).
+    pub fn capslock(self: *const Window) keystroke_mod.Capslock {
+        return self.capslock_state;
+    }
+    /// The hitbox that has captured the pointer, if any (GPUI `captured_hitbox`).
+    pub fn captured_hitbox(self: *const Window) ?HitboxId {
+        return self.pointer_capture;
+    }
+    /// The shadow area last set with `set_client_inset`, or null if never set (GPUI `client_inset`).
+    pub fn client_inset(self: *const Window) ?Pixels {
+        return self.client_inset_value;
+    }
     pub fn capture_pointer(self: *Window, hitbox_id: HitboxId) void {
-        self.captured_hitbox = hitbox_id;
+        self.pointer_capture = hitbox_id;
     }
     pub fn release_pointer(self: *Window) void {
-        self.captured_hitbox = null;
+        self.pointer_capture = null;
     }
 
     // -- focus -------------------------------------------------------
@@ -1176,7 +1237,7 @@ pub const Window = struct {
     }
 
     fn hitbox_is_hovered(self: *const Window, id: HitboxId) bool {
-        if (self.captured_hitbox) |c| return c == id;
+        if (self.pointer_capture) |c| return c == id;
         const ht = &self.mouse_hit_test;
         for (ht.ids.items[0..ht.hover_hitbox_count]) |h| if (h == id) return true;
         return false;
@@ -1754,7 +1815,7 @@ pub const Window = struct {
             },
             .modifiers_changed => |e| {
                 self.modifiers_ = e.modifiers;
-                self.capslock = e.capslock;
+                self.capslock_state = e.capslock;
                 self.dispatch_mouse(interactive.ModifiersChangedEvent, &e, cx);
                 self.dispatch_modifier_tap(&e, cx);
             },
@@ -2096,6 +2157,53 @@ pub const Window = struct {
             }
         }
         cx.dispatch_global_action(action);
+    }
+
+    /// The actions that have a listener on the focus path, built from the app's action registry
+    /// (GPUI `available_actions`). An action the registry cannot build is left out. Allocated in
+    /// the frame arena.
+    pub fn available_actions(self: *const Window, cx: *const App) []action_mod.AnyAction {
+        const arena = frame_arena();
+        const tree = &self.rendered_frame.dispatch_tree;
+        const path = tree.dispatch_path(self.focus_id, self.allocator);
+        defer self.allocator.free(path);
+        var out: std.ArrayList(action_mod.AnyAction) = .empty;
+        for (path) |nid| for (tree.node(nid).action_listeners.items) |l| {
+            var seen = false;
+            for (out.items) |a| {
+                if (a.type_id == l.action_type) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            const action = cx.actions.build_action_type(l.action_type, arena) catch continue;
+            out.append(arena, action) catch oom();
+        };
+        return out.toOwnedSlice(arena) catch oom();
+    }
+
+    /// The highest-precedence binding that dispatches `action` in the focused element's context,
+    /// or null if it is unbound or shadowed (GPUI `highest_precedence_binding_for_action`).
+    /// Actions match by type, as `Keymap.bindings_for_action` does, not by value.
+    pub fn highest_precedence_binding_for_action(self: *Window, action: anytype) ?keymap_mod.KeyBinding {
+        const T = @TypeOf(action);
+        const probe: action_mod.AnyAction = .{ .type_id = app_mod.type_id(T), .ptr = &action, .name = action_mod.action_name(T) };
+        const keymap = &self.app.keymap;
+        const tree = &self.rendered_frame.dispatch_tree;
+        const path = tree.dispatch_path(self.focus_id, self.allocator);
+        defer self.allocator.free(path);
+        const contexts = tree.context_stack(path, self.allocator);
+        defer self.allocator.free(contexts);
+        const candidates = keymap.bindings_for_action(self.allocator, probe) catch oom();
+        defer self.allocator.free(candidates);
+        // Newest first: the first binding that wins at its own keystrokes is the highest precedence.
+        for (candidates) |binding| {
+            const found = keymap.bindings_for_input(self.allocator, binding.keystrokes, contexts) catch oom();
+            defer self.allocator.free(found.bindings);
+            if (found.bindings.len > 0 and keymap_mod.same_binding(&found.bindings[0], &binding)) return binding;
+        }
+        return null;
     }
 
     pub fn is_action_available(self: *Window, action_type: app_mod.TypeId) bool {

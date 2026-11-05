@@ -111,6 +111,22 @@ pub const UTF16Selection = struct {
     reversed: bool = false,
 };
 
+/// Automatic capitalization applied by software keyboards (GPUI `Autocapitalize`).
+pub const Autocapitalize = enum { none, words, sentences, characters };
+
+/// The action a software keyboard advertises on its confirm key (GPUI `TextInputAction`).
+pub const TextInputAction = enum { unspecified, enter, done, go, next, previous, search, send };
+
+/// Hints a text field gives the platform's input method (GPUI `TextInputConfiguration`).
+pub const TextInputConfiguration = struct {
+    /// Whether the platform may correct entered text automatically.
+    autocorrect: bool = false,
+    autocapitalize: Autocapitalize = .none,
+    /// Whether software keyboards may offer word suggestions and spellcheck.
+    suggestions: bool = false,
+    input_action: TextInputAction = .unspecified,
+};
+
 /// Text input target (GPUI `PlatformInputHandler`), backed by an element's
 /// `EntityInputHandler` implementation. Ranges are in UTF-16 code units, as in GPUI.
 pub const PlatformInputHandler = struct {
@@ -127,7 +143,46 @@ pub const PlatformInputHandler = struct {
         bounds_for_range: *const fn (*anyopaque, Range, *Window, *App) ?Bounds(Pixels),
         character_index_for_point: *const fn (*anyopaque, Point(Pixels), *Window, *App) ?usize,
         accepts_text_input: *const fn (*anyopaque, *Window, *App) bool,
+        // Optional, as GPUI's trait defaults: a null entry behaves as the default does.
+        paste: ?*const fn (*anyopaque, ClipboardItem, *Window, *App) void = null,
+        selection_bounds_for_range: ?*const fn (*anyopaque, Range, Bounds(Pixels), *Window, *App) []const Bounds(Pixels) = null,
+        set_selected_text_range: ?*const fn (*anyopaque, Range, *Window, *App) void = null,
+        text_length_utf16: ?*const fn (*anyopaque, *Window, *App) ?usize = null,
+        text_input_configuration: ?*const fn (*anyopaque, *Window, *App) TextInputConfiguration = null,
+        text_input_editable_range: ?*const fn (*anyopaque, *Window, *App) ?Range = null,
     };
+
+    /// Inserts clipboard contents at the caret (GPUI `paste`). Does nothing without a handler entry.
+    pub fn paste(self: *PlatformInputHandler, item: ClipboardItem, window: *Window, cx: *App) void {
+        const f = self.vtable.paste orelse return;
+        f(self.ctx, item, window, cx);
+    }
+    /// Rectangles covering the selection, one per line or run (GPUI `selection_bounds_for_range`).
+    /// Empty by default. The slice must live until the caller is done with it.
+    pub fn selection_bounds_for_range(self: *PlatformInputHandler, range: Range, element_bounds: Bounds(Pixels), window: *Window, cx: *App) []const Bounds(Pixels) {
+        const f = self.vtable.selection_bounds_for_range orelse return &.{};
+        return f(self.ctx, range, element_bounds, window, cx);
+    }
+    /// Moves the selection (GPUI `set_selected_text_range`). Does nothing by default.
+    pub fn set_selected_text_range(self: *PlatformInputHandler, range: Range, window: *Window, cx: *App) void {
+        const f = self.vtable.set_selected_text_range orelse return;
+        f(self.ctx, range, window, cx);
+    }
+    /// The length of the text in UTF-16 code units, or null if the handler does not say (GPUI `text_length_utf16`).
+    pub fn text_length_utf16(self: *PlatformInputHandler, window: *Window, cx: *App) ?usize {
+        const f = self.vtable.text_length_utf16 orelse return null;
+        return f(self.ctx, window, cx);
+    }
+    /// Software keyboard hints (GPUI `text_input_configuration`). The defaults apply without a handler entry.
+    pub fn text_input_configuration(self: *PlatformInputHandler, window: *Window, cx: *App) TextInputConfiguration {
+        const f = self.vtable.text_input_configuration orelse return .{};
+        return f(self.ctx, window, cx);
+    }
+    /// The range the user may edit, or null for no limit (GPUI `text_input_editable_range`).
+    pub fn text_input_editable_range(self: *PlatformInputHandler, window: *Window, cx: *App) ?Range {
+        const f = self.vtable.text_input_editable_range orelse return null;
+        return f(self.ctx, window, cx);
+    }
 
     pub fn selected_text_range(self: *PlatformInputHandler, ignore_disabled_input: bool, window: *Window, cx: *App) ?UTF16Selection {
         return self.vtable.selected_text_range(self.ctx, ignore_disabled_input, window, cx);
