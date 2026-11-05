@@ -352,7 +352,7 @@ const AnchoredTestView = struct {
                 .child(deferred(anchored()
                     .snap_to_window()
                     .position(test_anchor_position)
-                    .child(div_mod.div().id("menu").w(geometry.px(200)).h(geometry.px(300)))).with_priority(1)),
+                    .child(div_mod.div().id("menu").w(geometry.px(200)).h(geometry.px(300)))).priority(1)),
         );
     }
 
