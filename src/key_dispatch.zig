@@ -118,6 +118,9 @@ pub const DispatchNode = struct {
     focus_id: ?u64 = null,
     tab_index: isize = 0,
     tab_stop: bool = false,
+    /// This node and its descendants sort as one block at this index, and their own indices
+    /// only order them inside it (GPUI `TabStopMap::begin_group`).
+    tab_group: ?isize = null,
 
     /// Clears the node for reuse, keeping listener capacity.
     fn reset(self: *DispatchNode, parent: ?DispatchNodeId) void {
@@ -128,6 +131,7 @@ pub const DispatchNode = struct {
         self.focus_id = null;
         self.tab_index = 0;
         self.tab_stop = false;
+        self.tab_group = null;
     }
 };
 
@@ -216,6 +220,11 @@ pub const DispatchTree = struct {
         self.focusable.put(self.gpa, id, node_id) catch oom();
     }
 
+    /// Makes the active node a tab group.
+    pub fn set_tab_group(self: *DispatchTree, tab_index: isize) void {
+        self.active_node().tab_group = tab_index;
+    }
+
     /// Attaches a key listener to the active node.
     pub fn on_key_event(self: *DispatchTree, listener: KeyListener) void {
         self.active_node().key_listeners.append(self.gpa, listener) catch oom();
@@ -273,12 +282,13 @@ pub const DispatchTree = struct {
     }
 
     /// The next (`forward`) or previous focusable tab stop after `current`, wrapping around.
-    /// Stops are ordered by `tab_index`, then by tree order, as in GPUI's tab_stop.rs. Without a
+    /// Stops are ordered by their tab groups and `tab_index`, then by tree order, as in GPUI's
+    /// tab_stop.rs. Without a
     /// current focus (or if it is unknown) this returns the first, or last when going backward.
     pub fn next_tab_stop(self: *const DispatchTree, current: ?u64, forward: bool) ?u64 {
         const cur: ?TabKey = if (current) |fid| blk: {
             const nid = self.focusable.get(fid) orelse break :blk null;
-            break :blk TabKey.of(&self.nodes.items[nid], nid);
+            break :blk self.tab_key(nid);
         } else null;
 
         var nearest: ?Candidate = null;
@@ -286,7 +296,7 @@ pub const DispatchTree = struct {
         for (self.nodes.items[0..self.count], 0..) |*n, i| {
             if (!n.tab_stop) continue;
             const focus = n.focus_id orelse continue;
-            const key = TabKey.of(n, @intCast(i));
+            const key = self.tab_key(@intCast(i));
             const cand = Candidate{ .key = key, .focus = focus };
 
             // Overall extreme: first stop going forward, last going backward (wrap target).
@@ -315,16 +325,37 @@ pub const DispatchTree = struct {
         return null;
     }
 
+    /// The groups enclosing a node, outermost first, then its own index. The node's own group
+    /// counts: a focusable group container sorts inside its group, so moving on from it enters
+    /// the group rather than jumping past every sibling group.
+    fn tab_key(self: *const DispatchTree, id: DispatchNodeId) TabKey {
+        var reversed: [TabKey.MAX_DEPTH]isize = undefined;
+        reversed[0] = self.nodes.items[id].tab_index;
+        var count: usize = 1;
+        var current: ?DispatchNodeId = id;
+        while (current) |nid| : (current = self.nodes.items[nid].parent) {
+            const group = self.nodes.items[nid].tab_group orelse continue;
+            // Groups nested this deep lose their outermost levels.
+            if (count == reversed.len) break;
+            reversed[count] = group;
+            count += 1;
+        }
+        var key: TabKey = .{ .len = count, .node = id };
+        for (0..count) |i| key.path[i] = reversed[count - 1 - i];
+        return key;
+    }
+
     const TabKey = struct {
-        tab_index: isize,
+        const MAX_DEPTH = 16;
+        path: [MAX_DEPTH]isize = undefined,
+        len: usize,
         node: DispatchNodeId,
 
-        fn of(n: *const DispatchNode, id: DispatchNodeId) TabKey {
-            return .{ .tab_index = n.tab_index, .node = id };
-        }
-
         fn less(a: TabKey, b: TabKey) bool {
-            if (a.tab_index != b.tab_index) return a.tab_index < b.tab_index;
+            for (a.path[0..@min(a.len, b.len)], b.path[0..@min(a.len, b.len)]) |x, y| {
+                if (x != y) return x < y;
+            }
+            if (a.len != b.len) return a.len < b.len;
             return a.node < b.node;
         }
     };
@@ -368,6 +399,92 @@ const Builder = struct {
         self.tree.pop_node();
     }
 };
+
+/// Each stop is given its expected place in the order, as in GPUI's `TabStopMapTest`.
+const GroupTest = struct {
+    builder: Builder,
+    by_order: [16]u64 = @splat(0),
+    count: usize = 0,
+
+    fn stop(self: *GroupTest, tab_index: isize, order: usize) void {
+        self.by_order[order] = self.builder.handle(tab_index, true);
+        self.count += 1;
+    }
+    fn begin(self: *GroupTest, tab_index: isize) void {
+        self.builder.tree.push_node();
+        self.builder.tree.set_tab_group(tab_index);
+    }
+    fn end(self: *GroupTest) void {
+        self.builder.tree.pop_node();
+    }
+    fn check(self: *GroupTest) !void {
+        defer self.builder.deinit();
+        const tree = &self.builder.tree;
+        try testing.expectEqual(@as(?u64, self.by_order[0]), tree.next_tab_stop(null, true));
+        try testing.expectEqual(@as(?u64, self.by_order[self.count - 1]), tree.next_tab_stop(null, false));
+        for (0..self.count) |i| {
+            const after = self.by_order[(i + 1) % self.count];
+            try testing.expectEqual(@as(?u64, after), tree.next_tab_stop(self.by_order[i], true));
+            try testing.expectEqual(@as(?u64, self.by_order[i]), tree.next_tab_stop(after, false));
+        }
+    }
+};
+
+test "tab groups: siblings" {
+    var t = GroupTest{ .builder = Builder.init() };
+    t.stop(0, 0);
+    t.stop(1, 1);
+    t.begin(2);
+    t.stop(0, 2);
+    t.stop(1, 3);
+    t.end();
+    t.stop(3, 4);
+    t.stop(4, 5);
+    t.begin(6);
+    t.stop(0, 6);
+    t.stop(1, 7);
+    t.end();
+    t.stop(7, 8);
+    t.stop(8, 9);
+    try t.check();
+}
+
+test "tab groups: nested" {
+    var t = GroupTest{ .builder = Builder.init() };
+    t.stop(0, 0);
+    t.stop(1, 1);
+    t.begin(2);
+    t.begin(0);
+    t.stop(0, 2);
+    t.stop(1, 3);
+    t.end();
+    t.stop(1, 4);
+    t.end();
+    t.stop(3, 5);
+    t.stop(4, 6);
+    try t.check();
+}
+
+test "tab groups: sibling nested groups, out of order" {
+    var t = GroupTest{ .builder = Builder.init() };
+    t.stop(9, 9);
+    t.stop(8, 8);
+    t.begin(7);
+    t.stop(0, 2);
+    t.stop(2, 5);
+    t.begin(3);
+    t.stop(1, 7);
+    t.stop(0, 6);
+    t.end();
+    t.begin(1);
+    t.stop(0, 3);
+    t.stop(1, 4);
+    t.end();
+    t.end();
+    t.stop(3, 0);
+    t.stop(4, 1);
+    try t.check();
+}
 
 test "tab handles follow tab_index then tree order" {
     var b = Builder.init();

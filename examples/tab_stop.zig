@@ -2,7 +2,6 @@
 //!
 //! Differences from the Rust version:
 //! - Font loading (`example_support::load_fonts`) is not ported (no `TextSystem::add_fonts` yet).
-//! - `Div::tab_group()` is not in ZUI yet, so the two tab groups are plain `tab_index` containers.
 
 const gpui = @import("zui");
 const App = gpui.App;
@@ -143,11 +142,11 @@ const Example = struct {
                             .on_click(cx.listener(Example.on_button2_click)),
                     ),
             )
-            // Missing: `.tab_group()` on the two groups below (not in ZUI yet).
             .child(
                 div()
                     .id("group-1")
                     .tab_index(6)
+                    .tab_group()
                     .tab_stop(false)
                     .child(button("group-1-button-1").tab_index(1).child("Tab index [6, 1]"))
                     .child(button("group-1-button-2").tab_index(2).child("Tab index [6, 2]"))
@@ -157,6 +156,7 @@ const Example = struct {
                 div()
                     .id("group-2")
                     .tab_index(7)
+                    .tab_group()
                     .tab_stop(false)
                     .child(button("group-2-button-1").tab_index(1).child("Tab index [7, 1]"))
                     .child(button("group-2-button-2").tab_index(2).child("Tab index [7, 2]"))
