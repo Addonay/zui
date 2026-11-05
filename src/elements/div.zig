@@ -3641,6 +3641,7 @@ pub const Interactivity = struct {
     block_mouse_except_scroll_: bool = false,
     tab_index: ?isize = null,
     tab_stop: ?bool = null,
+    tab_group_: bool = false,
 
     fn needs_hitbox(self: *const Interactivity) bool {
         return self.element_id != null or self.focusable or self.tracked_focus_handle != null or self.hover_style != null or
@@ -3811,8 +3812,19 @@ pub fn StyledElement(comptime Ext: type) type {
             return self;
         }
 
+        /// Sets where this element comes in tab order, which makes it focusable and a tab stop.
         pub fn tab_index(self: *Self, index: isize) *Self {
+            self.interactivity.focusable = true;
             self.interactivity.tab_index = index;
+            self.interactivity.tab_stop = true;
+            return self;
+        }
+
+        /// Gives this element one place in the tab order, inside which its children's tab
+        /// indices start over.
+        pub fn tab_group(self: *Self) *Self {
+            self.interactivity.tab_group_ = true;
+            if (self.interactivity.tab_index == null) self.interactivity.tab_index = 0;
             return self;
         }
 
@@ -4127,6 +4139,7 @@ pub fn StyledElement(comptime Ext: type) type {
                 if (it.tab_stop) |ts| hh.tab_stop_ = ts;
                 window.set_focus_handle(&hh, cx);
             }
+            if (it.tab_group_) window.next_frame.dispatch_tree.set_tab_group(it.tab_index.?);
             if (it.key_context) |kc| window.set_key_context(kc);
 
             // A tooltip that is showing asks to be drawn at the end of the frame.

@@ -55,7 +55,7 @@ GPUI's `hello_world.rs` (verified via headless snapshot).
 | div + Interactivity (hover/active/focus/in_focus styles, click, aux click, mouse/key/action listeners, scroll, pinch, groups, track_focus, key_context, drag and drop, file drop, tooltips) | done (pressure and back-gesture listeners, external drag payloads NOT yet) |
 | layout engine on zafi (`taffy.zig`, GPUI's TaffyLayoutEngine) | done |
 | text system on cozmic (shaping+fallback, two-frame line layout cache, LineWrapper, ShapedLine/WrappedLine, StyledText/InteractiveText) | done (some GPUI extras missing, see §8) |
-| keystroke, interactive events, keymap + context predicates, key_dispatch, actions | done, incl. multi-keystroke bindings and keystroke observers (tab groups NOT yet) |
+| keystroke, interactive events, keymap + context predicates, key_dispatch, actions | done, incl. multi-keystroke bindings, keystroke observers and tab groups |
 | executor (Background/Foreground executors, Task(T)) | done (thread pool; no async/await) |
 | scene, bounds_tree, atlas (+CpuAtlas), path_builder | done |
 | CPU renderer (port of GPUI WGSL math; SIMD + multithreaded bands) | done |
@@ -291,7 +291,7 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   shows dead keys inline. Xlib's instantiate callback fires once per registration, so after a
   server dies reconnecting is retried once a second for a minute. Every event must go through
   `XFilterEvent`, also while no server is connected. Not done: `delete_surrounding_text` (we never
-  send surrounding text), content types such as password fields, `keyboard_layout`.
+  send surrounding text), `keyboard_layout`. GPUI has no content types either: it always sends none/normal.
 - **Multi-stroke bindings**: `Window.dispatch_keystroke` follows GPUI's `dispatch_key_event`. A prefix
   is held in `pending_keystrokes` (strings owned, since platform buffers are not stable) and its keys
   reach nobody. A key that breaks the sequence replays what was held. It waits one second only if
@@ -362,8 +362,8 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 2. Div: pressure and back-gesture listeners, long-press tooltips, external drag payloads
    (dragging out of the window), `cached` views. `with_animation` is not yet aliased on
    StyledElement (add `pub const with_animation = animation.AnimationExt(*Self).with_animation;` etc.).
-3. Input: tab groups, `Unbind`, `InputPreference`, pausing the pending-input timeout,
-   `keyboard_layout` and its change observer, IME content types.
+3. Input: `Unbind`, `InputPreference`, pausing the pending-input timeout,
+   `keyboard_layout` and its change observer.
 4. Text: a text-presentation selector (`❤\u{fe0e}`) still draws the color glyph. Also ShapedLine cursor/split APIs, typographic bounds, font enumeration, `add_fonts`
    (every ported example skips GPUI's `load_fonts`), missing-glyph reporting.
 5. Async: assets/images load synchronously; GIF animation; WebP.
@@ -371,7 +371,7 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
    painting, data_table, mouse_pressure, window*, set_menus, ...). Each must run headless and
    produce a correct snapshot, and should be driven for real: first frames hide most bugs. Missing
    APIs the ported ones work around: `container_query` (grid_layout writes it out), `set_menus`,
-   `init_colors`, an HTTP client for remote images, `tab_group`, `percentage`.
+   `init_colors`, an HTTP client for remote images, `percentage`.
 7. Performance (owner's phase 2 goal: beat GPUI): view caching (`AnyView::cached`
    with replayed scene ranges — `Scene.replay` exists), avoiding full layout
    when nothing changed, X11 XShm presentation, SIMD gradients in the CPU
