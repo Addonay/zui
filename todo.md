@@ -28,7 +28,10 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
   - [ ] `prefetch(url)`, so an app can start loading before the image is on screen
 - [ ] Load local files and embedded assets in the background, as GPUI does
 - [ ] Size limit on a download; today a huge response is read whole into memory
-- [ ] GIF animation (only the first frame draws)
+- [ ] `ImageCache` trait, provider, `RetainAllImageCache` and LRU; `image_gallery`'s second gallery is a plain copy
+- [ ] Generic `Asset` with `use_asset` and `remove_asset`; `image_loading` drops its custom loaders and forced failure
+- [ ] `image_loading`: the loading state and click handlers have never been checked live
+- [ ] `run_until_parked` never parks while a GIF is on screen, and spins to its 10,000-iteration guard
 - [ ] WebP, TIFF, ICO, PNM decoders
 - [ ] EXIF orientation in PNG (JPEG is done)
 - [ ] GPUI's delay before `with_loading` appears, so fast loads do not flash a placeholder
@@ -93,10 +96,9 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 Each must run headless with a correct snapshot, and be driven for real: first frames hide most bugs.
 
-- [ ] image_gallery, image_loading, gif_viewer
 - [ ] mouse_pressure
-- [ ] window, window_movable, window_positioning, window_shadow
-- [ ] move_entity_between_windows, on_window_close_quit, toggle_headless
+- [ ] window, window_positioning
+- [ ] move_entity_between_windows, toggle_headless
 - [ ] set_menus, system_notifications, layer_shell, a11y
 - [ ] paths_bench, testing
 

@@ -30,6 +30,9 @@ const examples = [_][]const u8{
     "gif_viewer",
     "image_gallery",
     "image_loading",
+    "on_window_close_quit",
+    "window_movable",
+    "window_shadow",
 };
 
 pub fn build(b: *std.Build) void {
