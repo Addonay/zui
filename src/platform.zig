@@ -198,6 +198,43 @@ pub const ImeInput = union(enum) {
     delete_text,
 };
 
+/// How urgent a prompt is (GPUI `PromptLevel`).
+pub const PromptLevel = enum {
+    /// Something the user should know.
+    info,
+    /// A possible problem the user should be warned about.
+    warning,
+    /// A critical problem.
+    critical,
+};
+
+/// A button of a prompt (GPUI `PromptButton`). Build one with a tagged literal,
+/// `.{ .ok = "OK" }`, `.{ .cancel = "Cancel" }` or `.{ .other = "Later" }`, or let
+/// `PromptButton.from` read a label the way GPUI reads `&str` answers.
+pub const PromptButton = union(enum) {
+    ok: []const u8,
+    cancel: []const u8,
+    other: []const u8,
+
+    /// GPUI `From<&str>`: "ok" and "cancel" (any case) make the matching kind, labelled
+    /// "OK" or "Cancel"; anything else is an ordinary button with that label.
+    pub fn from(text: []const u8) PromptButton {
+        if (std.ascii.eqlIgnoreCase(text, "ok")) return .{ .ok = "OK" };
+        if (std.ascii.eqlIgnoreCase(text, "cancel")) return .{ .cancel = "Cancel" };
+        return .{ .other = text };
+    }
+
+    pub fn label(self: PromptButton) []const u8 {
+        return switch (self) {
+            inline else => |l| l,
+        };
+    }
+
+    pub fn is_cancel(self: PromptButton) bool {
+        return std.meta.activeTag(self) == .cancel;
+    }
+};
+
 /// Callbacks a window registers with its platform window.
 pub const WindowCallbacks = struct {
     ctx: *anyopaque,
@@ -206,6 +243,8 @@ pub const WindowCallbacks = struct {
     active_status_change: *const fn (*anyopaque, bool) void,
     hover_status_change: *const fn (*anyopaque, bool) void,
     resize: *const fn (*anyopaque, Size(Pixels), f32) void,
+    /// The window's origin changed (GPUI `on_moved`). Wayland never reports this.
+    moved: *const fn (*anyopaque) void,
     should_close: *const fn (*anyopaque) bool,
     close: *const fn (*anyopaque) void,
     appearance_changed: *const fn (*anyopaque) void,
@@ -376,6 +415,9 @@ fn noopIme(_: *PlatformWindow, _: Bounds(Pixels)) void {}
     }
     pub fn emit_resize(self: *PlatformWindow, size: Size(Pixels), scale: f32) void {
         if (self.callbacks) |c| c.resize(c.ctx, size, scale);
+    }
+    pub fn emit_moved(self: *PlatformWindow) void {
+        if (self.callbacks) |c| c.moved(c.ctx);
     }
     pub fn emit_should_close(self: *PlatformWindow) bool {
         if (self.callbacks) |c| return c.should_close(c.ctx);

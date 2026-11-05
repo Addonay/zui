@@ -195,6 +195,14 @@ pub const quad = window.quad;
 pub const fill = window.fill;
 pub const outline = window.outline;
 pub const format = window.format;
+pub const PromptLevel = window.PromptLevel;
+pub const PromptButton = window.PromptButton;
+pub const PromptResponse = window.PromptResponse;
+pub const PromptHandle = window.PromptHandle;
+pub const RenderablePromptHandle = window.RenderablePromptHandle;
+pub const PromptBuilder = window.PromptBuilder;
+pub const FallbackPromptRenderer = window.FallbackPromptRenderer;
+pub const fallback_prompt_renderer = window.fallback_prompt_renderer;
 pub const AnyView = view.AnyView;
 
 // -- elements ---------------------------------------------------------------

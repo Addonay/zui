@@ -605,8 +605,12 @@ pub const X11Connection = struct {
             },
             proto.ConfigureNotify => {
                 const cfg = ev.xconfigure;
+                // The origin is set first, so a resize observer sees where the window is now.
+                const origin: PxPoint = .{ .x = @as(f32, @floatFromInt(cfg.x)) / w.scale, .y = @as(f32, @floatFromInt(cfg.y)) / w.scale };
+                const moved = origin.x != w.origin.x or origin.y != w.origin.y;
+                w.origin = origin;
                 w.on_configure(@intCast(@max(0, cfg.width)), @intCast(@max(0, cfg.height)));
-                w.origin = .{ .x = @as(f32, @floatFromInt(cfg.x)) / w.scale, .y = @as(f32, @floatFromInt(cfg.y)) / w.scale };
+                if (moved) w.base.emit_moved();
                 w.update_frame_interval();
             },
             proto.VisibilityNotify => {
