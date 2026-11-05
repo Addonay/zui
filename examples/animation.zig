@@ -3,7 +3,6 @@
 //! Differences from the Rust version:
 //! - Assets are embedded with `@embedFile` (see `Assets`), keyed by the same relative path.
 //! - Font loading (`example_support::load_fonts`) is not ported (no `TextSystem::add_fonts` yet).
-//! - `percentage(delta)` is written as `delta * tau` (radians). ZUI has no `percentage` yet.
 //! - `Div::debug_selector` is left out; only the Rust test uses it.
 
 const std = @import("std");
@@ -109,8 +108,7 @@ const AnimationExample = struct {
 
     /// `.with_animation("image_circle", ..., |svg, delta| svg.with_transformation(rotate(percentage(delta))))`.
     fn spin(icon: *gpui.Svg, delta: f32) *gpui.Svg {
-        // GPUI's `percentage(delta)` is `delta` of a full turn; `Transformation.rotate` takes radians.
-        return icon.with_transformation(Transformation.rotate(delta * std.math.tau));
+        return icon.with_transformation(Transformation.rotate(gpui.percentage(delta)));
     }
 
     pub fn render(self: *AnimationExample, _: *Window, cx: *Context(AnimationExample)) *Div {
@@ -214,24 +212,22 @@ const AnimationExample = struct {
                                     .child(
                                         div().relative().h(px(32.0)).w_full().child(
                                             // Missing: `.debug_selector("spring-position")` (only used by the Rust test).
-                                            // `with_spring` is the free function: `StyledElement` has no alias for it yet.
-                                            gpui.with_spring(
-                                                div()
-                                                    .absolute()
-                                                    .top_1()
-                                                    .size(px(24.0))
-                                                    .rounded_full()
-                                                    .bg(rgba(0x3b82f6ff))
-                                                    .cursor_pointer(),
-                                                "spring-position",
-                                                SpringAnimation.new(spring).to(spring_position).with_epsilon(0.25),
-                                                position_animator,
-                                            ),
+                                            div()
+                                                .absolute()
+                                                .top_1()
+                                                .size(px(24.0))
+                                                .rounded_full()
+                                                .bg(rgba(0x3b82f6ff))
+                                                .cursor_pointer()
+                                                .with_spring(
+                                                    "spring-position",
+                                                    SpringAnimation.new(spring).to(spring_position).with_epsilon(0.25),
+                                                    position_animator,
+                                                ),
                                         ),
                                     )
                                     .child(
-                                        gpui.with_spring(
-                                            div().h(px(24.0)).rounded_sm(),
+                                        div().h(px(24.0)).rounded_sm().with_spring(
                                             "spring-phase",
                                             SpringAnimation.new(spring)
                                                 .to(AnimationPhase{ .value = @floatFromInt(spring_phase) })
@@ -241,16 +237,16 @@ const AnimationExample = struct {
                                     ),
                             )
                             .child(
-                                gpui.with_animation(
-                                    svg()
-                                        .size_20()
-                                        .overflow_hidden()
-                                        .path(ARROW_CIRCLE_SVG)
-                                        .text_color(gpui.black()),
-                                    "image_circle",
-                                    gpui.Animation.new(2000).repeat().with_easing(gpui.bounce(gpui.ease_in_out)),
-                                    spin,
-                                ),
+                                svg()
+                                    .size_20()
+                                    .overflow_hidden()
+                                    .path(ARROW_CIRCLE_SVG)
+                                    .text_color(gpui.black())
+                                    .with_animation(
+                                        "image_circle",
+                                        gpui.Animation.new(2000).repeat().with_easing(gpui.bounce(gpui.ease_in_out)),
+                                        spin,
+                                    ),
                             ),
                     )
                     .child(

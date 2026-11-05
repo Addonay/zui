@@ -17,6 +17,7 @@ const interactive = @import("../interactive.zig");
 const key_dispatch = @import("../key_dispatch.zig");
 const action_mod = @import("../action.zig");
 const image_cache_mod = @import("../image_cache.zig");
+const animation_mod = @import("animation.zig");
 
 const App = app_mod.App;
 const Window = window_mod.Window;
@@ -4241,6 +4242,7 @@ pub fn StyledElement(comptime Ext: type) type {
             window.push_element_offset(scroll);
             for (self.children_list.items) |c| c.prepaint(window, cx);
             window.pop_element_offset();
+            if (@hasDecl(Ext, "prepaint_ext")) Ext.prepaint_ext(self, bounds, window, cx);
 
             return pp;
         }
@@ -7743,6 +7745,11 @@ pub fn StyledElement(comptime Ext: type) type {
         pub const external_path = if (@hasDecl(Ext, "external_path")) Ext.external_path else {};
         pub const data = if (@hasDecl(Ext, "data")) Ext.data else {};
         pub const with_transformation = if (@hasDecl(Ext, "with_transformation")) Ext.with_transformation else {};
+
+        // -- GPUI `AnimationExt` for every styled element.
+        pub const with_animation = animation_mod.AnimationExt(*Self).with_animation;
+        pub const with_animations = animation_mod.AnimationExt(*Self).with_animations;
+        pub const with_spring = animation_mod.AnimationExt(*Self).with_spring;
     };
 }
 

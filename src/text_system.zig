@@ -440,6 +440,26 @@ pub const TextSystem = struct {
         return id;
     }
 
+    /// Every family name in the font database, sorted, without duplicates (GPUI `all_font_names`).
+    /// The caller frees the slice; the names belong to the text system and live as long as it does.
+    pub fn all_font_names(self: *TextSystem, allocator: Allocator) ![]const []const u8 {
+        var names: std.ArrayList([]const u8) = .empty;
+        errdefer names.deinit(allocator);
+        for (self.fs.db.faces.items) |face| {
+            for (face.families) |family| try names.append(allocator, family);
+        }
+        std.mem.sort([]const u8, names.items, {}, less_than_name);
+        var unique: usize = 0;
+        for (names.items, 0..) |name, i| {
+            if (i == 0 or !std.mem.eql(u8, names.items[unique - 1], name)) {
+                names.items[unique] = name;
+                unique += 1;
+            }
+        }
+        names.shrinkRetainingCapacity(unique);
+        return names.toOwnedSlice(allocator);
+    }
+
     // -- metrics ----------------------------------------------------------
 
     /// Metrics of `fid`, read from the face the first time and cached.
@@ -1082,6 +1102,21 @@ fn be32(b: []const u8, at: usize) ?usize {
 // Tests. They need a font: when the host has none, they check the zero-width path instead.
 
 const testing = std.testing;
+
+fn less_than_name(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+test "all_font_names is sorted and has no duplicates" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    const names = try ts.all_font_names(testing.allocator);
+    defer testing.allocator.free(names);
+    try testing.expect(names.len > 0);
+    for (names[1..], names[0 .. names.len - 1]) |next, prev| {
+        try testing.expect(std.mem.lessThan(u8, prev, next));
+    }
+}
 
 test "text system creates, resolves and shapes without crashing" {
     const ts = try TextSystem.create(testing.allocator);

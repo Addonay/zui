@@ -13,6 +13,7 @@ const element_mod = @import("element.zig");
 const text_system_mod = @import("text_system.zig");
 const executor_mod = @import("executor.zig");
 const keymap_mod = @import("keymap.zig");
+const colors_mod = @import("colors.zig");
 const action_mod = @import("action.zig");
 const keystroke_mod = @import("keystroke.zig");
 const http_client_mod = @import("http_client.zig");
@@ -1120,6 +1121,16 @@ pub const App = struct {
         return self.globals.contains(type_id(G));
     }
 
+    /// Initializes GPUI's default colors (GPUI `init_colors`). Read them with `default_colors`.
+    pub fn init_colors(self: *App) void {
+        self.set_global(colors_mod.GlobalColors{ .value = colors_mod.Colors.default });
+    }
+
+    /// The colors set by `init_colors` (GPUI `default_colors`). Panics if `init_colors` was not called.
+    pub fn default_colors(self: *App) *const colors_mod.Colors {
+        return &self.global(colors_mod.GlobalColors).value;
+    }
+
     /// Returns the global, inserting `G{}` if missing.
     pub fn default_global(self: *App, comptime G: type) *G {
         if (self.try_global(G) == null) self.set_global(G{});
@@ -1664,4 +1675,15 @@ pub const Application = struct {
 fn default_allocator() std.mem.Allocator {
     if (builtin.is_test) return std.testing.allocator;
     return std.heap.smp_allocator;
+}
+
+const TestAppContext = @import("app/test_context.zig").TestAppContext;
+
+test "init_colors installs the default colors" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.init_colors();
+    const expected = colors_mod.Colors.default;
+    try std.testing.expectEqual(expected.background.to_u32(), cx.app.default_colors().background.to_u32());
+    try std.testing.expectEqual(expected.text.to_u32(), cx.app.default_colors().text.to_u32());
 }

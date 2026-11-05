@@ -443,12 +443,13 @@ fn record_spring(element: *Div, value: f32) *Div {
 /// A view whose box is animated with a repeating animation.
 const AnimationTestView = struct {
     pub fn render(_: *AnimationTestView, _: *Window, _: *Context(AnimationTestView)) *Div {
-        return div_mod.div().size_full().child(with_animation(
-            div_mod.div().id("box").w(geometry.px(10)).h(geometry.px(10)),
-            "box-animation",
-            Animation.new(60 * std.time.ns_per_s).repeat(),
-            grow_box,
-        ));
+        return div_mod.div().size_full().child(
+            div_mod.div().id("box").w(geometry.px(10)).h(geometry.px(10)).with_animation(
+                "box-animation",
+                Animation.new(60 * std.time.ns_per_s).repeat(),
+                grow_box,
+            ),
+        );
     }
 
     fn build(_: *Window, app: *App) app_mod.Entity(AnimationTestView) {
@@ -462,12 +463,13 @@ const SpringTestView = struct {
         const animation = spring.SpringAnimation.new(spring.SpringConfig.new(100, 2, 1))
             .to(@as(f32, 100))
             .from(@as(f32, 0));
-        return div_mod.div().size_full().child(with_spring(
-            div_mod.div().id("spring-box").w(geometry.px(10)).h(geometry.px(10)),
-            "spring-animation",
-            animation,
-            record_spring,
-        ));
+        return div_mod.div().size_full().child(
+            div_mod.div().id("spring-box").w(geometry.px(10)).h(geometry.px(10)).with_spring(
+                "spring-animation",
+                animation,
+                record_spring,
+            ),
+        );
     }
 
     fn build(_: *Window, app: *App) app_mod.Entity(SpringTestView) {

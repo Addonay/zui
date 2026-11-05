@@ -84,8 +84,7 @@ fn loading_element() AnyElement {
         .flex_none()
         .p_0p5()
         .rounded_xs()
-        .child(gpui.with_animation(
-            div().size_full(),
+        .child(div().size_full().with_animation(
             "loading-bg",
             gpui.Animation.new(3_000_000_000).repeat().with_easing(gpui.pulsating_between(0.04, 0.24)),
             pulse,

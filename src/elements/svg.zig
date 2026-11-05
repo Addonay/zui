@@ -47,9 +47,9 @@ pub const Transformation = struct {
         return .{ .translation = t };
     }
 
-    /// Rotates by `radians` around the element center.
-    pub fn rotate(radians: f32) Transformation {
-        return .{ .rotation = radians };
+    /// Rotates around the element center by radians, or by a `Percentage` of a full turn.
+    pub fn rotate(angle: anytype) Transformation {
+        return .{ .rotation = geometry.to_radians(angle) };
     }
 
     pub fn with_scaling(self: Transformation, s: Size(f32)) Transformation {
@@ -64,9 +64,9 @@ pub const Transformation = struct {
         return t;
     }
 
-    pub fn with_rotation(self: Transformation, radians: f32) Transformation {
+    pub fn with_rotation(self: Transformation, angle: anytype) Transformation {
         var t = self;
-        t.rotation = radians;
+        t.rotation = geometry.to_radians(angle);
         return t;
     }
 
@@ -209,6 +209,12 @@ test "transformation without rotation or scale only moves the origin" {
     const p = m.apply(.{ .x = 10, .y = 10 });
     try std.testing.expectApproxEqAbs(@as(f32, 14), p.x, 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 10), p.y, 1e-4);
+}
+
+test "rotate takes radians or a percentage of a turn" {
+    const geometry_mod = @import("../geometry.zig");
+    try std.testing.expectApproxEqAbs(std.math.pi / 2.0, Transformation.rotate(geometry_mod.percentage(0.25)).rotation, 1e-6);
+    try std.testing.expectEqual(@as(f32, 0.5), Transformation.rotate(@as(f32, 0.5)).rotation);
 }
 
 test "svg key depends on source and size" {
