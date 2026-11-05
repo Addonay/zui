@@ -3727,7 +3727,7 @@ pub const DivPrepaintState = struct {
 /// The shared implementation of every styled element.
 ///
 /// `Ext` adds element-specific state and hooks:
-/// - `fn request_layout_ext(self: *StyledElement(Ext), style: *Style, window, cx) ?LayoutId` (e.g. measured images)
+/// - `fn request_layout_ext(self: *StyledElement(Ext), gid: ?*const GlobalElementId, style: *Style, window, cx) ?LayoutId` (e.g. measured images; `gid` is null without an element id)
 /// - `fn paint_ext(self: *StyledElement(Ext), bounds, style: *const Style, window, cx) void` (painted after background, before children)
 pub fn StyledElement(comptime Ext: type) type {
     return struct {
@@ -4106,7 +4106,6 @@ pub fn StyledElement(comptime Ext: type) type {
         // -- Element protocol ---------------------------------------------
 
         pub fn request_layout(self: *Self, gid: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, DivFrameState } {
-            _ = gid;
             var s: Style = .{};
             s.refine(&self.interactivity.base_style);
             const has_text = s.text_style() != null;
@@ -4114,7 +4113,7 @@ pub fn StyledElement(comptime Ext: type) type {
             defer if (has_text) window.pop_text_style();
 
             if (@hasDecl(Ext, "request_layout_ext")) {
-                if (Ext.request_layout_ext(self, &s, window, cx)) |lid| return .{ lid, .{} };
+                if (Ext.request_layout_ext(self, gid, &s, window, cx)) |lid| return .{ lid, .{} };
             }
             const ids = arena().alloc(LayoutId, self.children_list.items.len) catch oom();
             for (self.children_list.items, 0..) |c, i| ids[i] = c.request_layout(window, cx);

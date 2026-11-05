@@ -27,6 +27,9 @@ const examples = [_][]const u8{
     "tab_stop",
     "popover",
     "anchor",
+    "gif_viewer",
+    "image_gallery",
+    "image_loading",
 };
 
 pub fn build(b: *std.Build) void {

@@ -14,6 +14,7 @@ const window_mod = @import("../window.zig");
 const app_mod = @import("../app.zig");
 const atlas = @import("../atlas.zig");
 const assets = @import("../assets.zig");
+const executor = @import("../executor.zig");
 const div = @import("div.zig");
 
 const Window = window_mod.Window;
@@ -24,6 +25,7 @@ const DevicePixels = geometry.DevicePixels;
 const Size = geometry.Size;
 const Bounds = geometry.Bounds;
 const AnyElement = element_mod.AnyElement;
+const GlobalElementId = element_mod.GlobalElementId;
 const LayoutId = taffy.LayoutId;
 
 /// An image element (GPUI `Img`).
@@ -54,6 +56,8 @@ pub const ImgExt = struct {
     data: ?*assets.RenderImage = null,
     /// The fallback element, when loading failed and a fallback was set.
     replacement: ?AnyElement = null,
+    /// The frame of a multi-frame image to paint this frame (GPUI `ImgLayoutState::frame_index`).
+    frame_index: usize = 0,
 
     /// How the image fits its bounds (GPUI `object_fit`).
     pub fn object_fit(self: anytype, v: style_mod.ObjectFit) @TypeOf(self) {
@@ -79,10 +83,11 @@ pub const ImgExt = struct {
         return self;
     }
 
-    pub fn request_layout_ext(self: anytype, s: *Style, window: *Window, cx: *App) ?LayoutId {
+    pub fn request_layout_ext(self: anytype, gid: ?*const GlobalElementId, s: *Style, window: *Window, cx: *App) ?LayoutId {
         const e = &self.ext;
         e.data = null;
         e.replacement = null;
+        e.frame_index = 0;
         const source = e.source orelse return null;
 
         const data = source.use_data(&cx.asset_cache, cx.asset_source) catch |err| {
@@ -96,10 +101,11 @@ pub const ImgExt = struct {
             return window.request_layout(s, &.{}, cx);
         };
         e.data = data;
+        e.frame_index = advance_frame(data, gid, window, cx);
 
         // Intrinsic size in logical pixels; the measure callback fills whichever dimension is auto.
         const measure = window_mod.frame_arena().create(Measure) catch @panic("OOM");
-        measure.* = .{ .intrinsic = data.render_size(0) };
+        measure.* = .{ .intrinsic = data.render_size(e.frame_index) };
         return window.request_measured_layout(s, .{ .ctx = measure, .func = Measure.measure });
     }
 
@@ -107,7 +113,7 @@ pub const ImgExt = struct {
         const e = &self.ext;
         if (e.data) |data| {
             if (data.frame_count() == 0) return;
-            const frame: usize = 0;
+            const frame = e.frame_index;
             const new_bounds = e.object_fit_.get_bounds(bounds, data.size(frame));
             const visible = bounds.intersect(new_bounds);
             if (visible.size.width <= 0 or visible.size.height <= 0) return;
@@ -125,6 +131,39 @@ pub const ImgExt = struct {
         }
     }
 };
+
+/// Per-element animation state of a multi-frame image (GPUI `ImgState`).
+const ImgState = struct {
+    frame_index: usize = 0,
+    /// Awake-clock time the current frame started; null while the image is not animating.
+    last_frame_time: ?u64 = null,
+};
+
+/// Moves a GIF on to its next frame once the current frame's delay has passed, and asks the window
+/// for another frame while it does. Without an element id there is no state, so nothing animates.
+fn advance_frame(data: *assets.RenderImage, gid: ?*const GlobalElementId, window: *Window, cx: *App) usize {
+    const frame_count = data.frame_count();
+    const state = window.element_state(ImgState, (gid orelse return 0).*, .{});
+    state.frame_index = @min(state.frame_index, frame_count -| 1);
+
+    const animating = frame_count > 1 and window.is_window_active() and !cx.reduce_motion;
+    if (!animating) {
+        state.last_frame_time = null;
+        return state.frame_index;
+    }
+    const now = executor.now_ns();
+    if (state.last_frame_time) |last| {
+        const frame_duration = @as(u64, data.delay(state.frame_index)) * std.time.ns_per_ms;
+        if (now -| last >= frame_duration) {
+            state.frame_index = (state.frame_index + 1) % frame_count;
+            state.last_frame_time = last + frame_duration;
+        }
+    } else {
+        state.last_frame_time = now;
+    }
+    window.request_animation_frame();
+    return state.frame_index;
+}
 
 const Measure = struct {
     intrinsic: Size(Pixels),
