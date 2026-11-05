@@ -95,8 +95,8 @@ Each must run headless with a correct snapshot, and be driven for real: first fr
 
 - [ ] image_gallery, image_loading, gif_viewer
 - [ ] mouse_pressure
-- [ ] window, window_movable, window_positioning, window_shadow
-- [ ] move_entity_between_windows, on_window_close_quit, toggle_headless
+- [ ] window, window_positioning
+- [ ] move_entity_between_windows, toggle_headless
 - [ ] set_menus, system_notifications, layer_shell, a11y
 - [ ] paths_bench, testing
 
