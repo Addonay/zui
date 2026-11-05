@@ -146,7 +146,7 @@ third_party/             stb_image, nanosvg, images.c shim
 
 | Path | Source | Why |
 | --- | --- | --- |
-| `.references/gpui` (local name; `.references/zed` in the cloud container) | `https://github.com/zed-industries/zed` (sparse: `crates/gpui`, `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_wgpu`, `gpui_web`, `gpui_platform`, `gpui_macros`) at `f816e1f` (2026-11-01) | THE reference. Every port follows these files. |
+| `.references/gpui` (local name; `.references/zed` in the cloud container) | `https://github.com/zed-industries/zed` (sparse: `crates/gpui`, `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_wgpu`, `gpui_web`, `gpui_platform`, `gpui_macros`) kept up to date with `git pull`; last checked at `4a6121b` (2026-11-06) | THE reference. Every port follows these files. |
 | `.references/zafi` | `https://github.com/Addonay/zafi` | layout API |
 | `.references/cozmic` | `https://github.com/Addonay/cozmic` | text API |
 | `.references/zicr` | `https://github.com/Addonay/zicr` | GPU layer, shader pipeline, Vulkan bootstrap example (`tools/vk_smoke.zig`) |

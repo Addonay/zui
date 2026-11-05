@@ -304,7 +304,7 @@ types: Prompt
 - [ ] `testing`: `test_allow_parking` is not ported, since ZUI has no parking check
 - [ ] Flaky test? `remove_asset` failed once in a run that touched no asset code; not reproduced
 - [ ] `run_until_parked` never parks while a GIF is on screen, and spins to its 10,000-iteration guard
-- [ ] WebP, TIFF, ICO, PNM decoders
+- [ ] WebP, TIFF, ICO, PNM decoders; WebP animates in GPUI since `635026f`, with GPUI's test data for it in `platform.rs`
 - [ ] EXIF orientation in PNG (JPEG is done)
 - [ ] GPUI's delay before `with_loading` appears, so fast loads do not flash a placeholder
 - [ ] Atlas tiles of images replaced by a newer download are never freed
@@ -313,8 +313,8 @@ types: Prompt
 
 ## Platforms
 
-- [ ] macOS (Metal), reference `gpui_macos`
-- [ ] Windows (D3D12, Vulkan fallback), reference `gpui_windows`
+- [ ] macOS (Metal), reference `gpui_macos`. Use `d01f125`'s key equivalents for backspace and delete
+- [ ] Windows (D3D12, Vulkan fallback), reference `gpui_windows`. GPUI composites COLR on the CPU since `4a6121b`
 - [ ] GL / GLES fallback
 - [ ] Web (WebGPU), reference `gpui_web`
 - [ ] Link libobjc on macOS: `zig build check` only analyzes the tests there, without linking
