@@ -657,11 +657,20 @@ const Effect = union(enum) {
 const GlobalSlot = struct { ptr: *anyopaque, destroy: *const fn (std.mem.Allocator, *anyopaque) void };
 
 /// The global application state (GPUI `App`).
+/// A type-erased `on_system_notification_response` handler: `func(ctx, response, app)`.
+const SystemNotificationHandler = struct {
+    ctx: *anyopaque,
+    func: *const fn (*anyopaque, platform_mod.SystemNotificationResponse, *App) void,
+    /// Frees `ctx`, which was allocated with the app's allocator.
+    free: *const fn (std.mem.Allocator, *anyopaque) void,
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     /// The drag following the pointer, across all windows.
     active_drag: ?AnyDrag = null,
     platform: *platform_mod.Platform,
+    system_notification_response: ?SystemNotificationHandler = null,
     entities: EntityMap = .{},
     windows: std.ArrayList(?*Window) = .empty,
     globals: std.AutoHashMapUnmanaged(TypeId, GlobalSlot) = .empty,
@@ -716,6 +725,8 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.system_notification_response) |h| h.free(self.allocator, h.ctx);
+        self.system_notification_response = null;
         for (self.windows.items) |w| if (w) |win| win.destroy(self);
         self.windows.deinit(self.allocator);
         for (self.entities.slots.items) |*s| if (s.ptr) |p| {
@@ -1275,6 +1286,62 @@ pub const App = struct {
 
     pub fn hide(self: *App) void {
         self.platform.hide();
+    }
+
+    /// Replaces the menu bar (GPUI `App::set_menus`). The menus are copied, so the slice may be
+    /// discarded afterwards. Platforms without a menu bar keep them for `get_menus`.
+    pub fn set_menus(self: *App, menus: []const platform_mod.app_menu.Menu) void {
+        self.platform.set_menus(menus);
+    }
+
+    /// The menus last given to `set_menus`, or null if none were set (GPUI `App::get_menus`).
+    pub fn get_menus(self: *App) ?[]const platform_mod.app_menu.OwnedMenu {
+        return self.platform.get_menus();
+    }
+
+    /// Sets the process-wide identity and user-visible name (GPUI `App::set_app_identity`).
+    /// Call it once, early, before posting notifications. No platform uses it yet.
+    pub fn set_app_identity(self: *App, identifier: []const u8, name: []const u8) void {
+        self.platform.set_app_identity(identifier, name);
+    }
+
+    /// Posts a system notification (GPUI `App::show_system_notification`). A tag that matches an
+    /// earlier one replaces it where supported. No platform delivers notifications yet, so this
+    /// does nothing; see `on_system_notification_response`.
+    pub fn show_system_notification(self: *App, notification: platform_mod.SystemNotification) void {
+        self.platform.show_system_notification(notification);
+    }
+
+    /// Removes the notification with this tag (GPUI `App::dismiss_system_notification`).
+    pub fn dismiss_system_notification(self: *App, tag: []const u8) void {
+        self.platform.dismiss_system_notification(tag);
+    }
+
+    /// Registers the handler for notification responses (GPUI `App::on_system_notification_response`).
+    /// `f(ctx, response, app)` runs when a platform reports one through
+    /// `dispatch_system_notification_response`. Registering again replaces the handler.
+    pub fn on_system_notification_response(self: *App, ctx: anytype, comptime f: fn (@TypeOf(ctx), platform_mod.SystemNotificationResponse, *App) void) void {
+        const C = @TypeOf(ctx);
+        const boxed = self.allocator.create(C) catch @panic("out of memory");
+        boxed.* = ctx;
+        const Thunk = struct {
+            fn call(raw: *anyopaque, response: platform_mod.SystemNotificationResponse, app: *App) void {
+                const held: *const C = @ptrCast(@alignCast(raw));
+                f(held.*, response, app);
+            }
+            fn free(a: std.mem.Allocator, raw: *anyopaque) void {
+                a.destroy(@as(*C, @ptrCast(@alignCast(raw))));
+            }
+        };
+        if (self.system_notification_response) |old| old.free(self.allocator, old.ctx);
+        self.system_notification_response = .{ .ctx = boxed, .func = Thunk.call, .free = Thunk.free };
+    }
+
+    /// Delivers a response from the platform to the handler registered with
+    /// `on_system_notification_response`.
+    pub fn dispatch_system_notification_response(self: *App, response: platform_mod.SystemNotificationResponse) void {
+        const handler = self.system_notification_response orelse return;
+        handler.func(handler.ctx, response, self);
     }
 
     pub fn displays(self: *App) []const platform_mod.Display {

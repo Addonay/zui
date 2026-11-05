@@ -1703,6 +1703,8 @@ const DragPage = struct {
     file_name_len: usize = 0,
     allow: bool = true,
     pinches: usize = 0,
+    pressures: usize = 0,
+    last_stage: interactive.PressureStage = .zero,
 
     var allow_drop: bool = true;
 
@@ -1732,6 +1734,10 @@ const DragPage = struct {
     fn on_pinch(self: *DragPage, _: *const interactive.PinchEvent, _: *Window, _: *Context(DragPage)) void {
         self.pinches += 1;
     }
+    fn on_pressure(self: *DragPage, e: *const interactive.MousePressureEvent, _: *Window, _: *Context(DragPage)) void {
+        self.pressures += 1;
+        self.last_stage = e.stage;
+    }
     pub fn render(_: *DragPage, _: *Window, cx: *Context(DragPage)) *Div {
         return div().size(px(300)).child(
             div().id("source").absolute().left(px(0)).top(px(0)).w(px(50)).h(px(50))
@@ -1742,7 +1748,8 @@ const DragPage = struct {
             div().id("target").absolute().left(px(100)).top(px(0)).w(px(50)).h(px(50))
                 .on_drop(Payload, cx.listener(on_drop))
                 .on_drop(interactive.ExternalPaths, cx.listener(on_files))
-                .on_pinch(cx.listener(on_pinch)),
+                .on_pinch(cx.listener(on_pinch))
+                .on_mouse_pressure(cx.listener(on_pressure)),
         ).child(
             div().id("picky").absolute().left(px(200)).top(px(0)).w(px(50)).h(px(50))
                 .can_drop(refuse)
@@ -1884,6 +1891,19 @@ test "file drags: leaving the window ends the drag and drops nothing" {
     vcx.run_until_parked();
     try std.testing.expect(!cx.app.has_active_drag());
     try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).files);
+}
+
+test "pressure: reaches the element under the pointer with its stage" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    vcx.simulate_mouse_move(.{ .x = 120, .y = 10 }, null, .{});
+    vcx.simulate_event(.{ .mouse_pressure = .{ .position = .{ .x = 120, .y = 10 }, .pressure = 0.5, .stage = .normal } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).pressures);
+    try std.testing.expectEqual(interactive.PressureStage.normal, view.read(cx.app).last_stage);
+    vcx.simulate_mouse_move(.{ .x = 280, .y = 280 }, null, .{});
+    vcx.simulate_event(.{ .mouse_pressure = .{ .position = .{ .x = 280, .y = 280 }, .pressure = 0.9, .stage = .force } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).pressures);
 }
 
 test "pinch: reaches the element under the pointer" {
@@ -2058,4 +2078,51 @@ test "TestAppContext: public API compiles and an extra window opens" {
     _ = cx.foreground_executor();
     _ = cx.background_executor();
     try std.testing.expectEqual(@as(usize, 1), cx.app.windows.items.len);
+}
+
+test "menus: set_menus stores copies that get_menus returns" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    try std.testing.expect(cx.app.get_menus() == null);
+    const Toggle = action_mod.Action("test", "Toggle");
+    var name: [4]u8 = "File".*;
+    const items = [_]platform_mod.app_menu.MenuItem{
+        platform_mod.app_menu.MenuItem.action("Toggle", Toggle{}).checked(true),
+        platform_mod.app_menu.MenuItem.separator_item(),
+    };
+    cx.app.set_menus(&.{platform_mod.app_menu.Menu.new(&name).items(&items)});
+    // The stored menus are copies: changing the caller's name does not change them.
+    name[0] = 'X';
+    const menus = cx.app.get_menus().?;
+    try std.testing.expectEqualStrings("File", menus[0].name);
+    try std.testing.expectEqual(@as(usize, 2), menus[0].items.len);
+    try std.testing.expect(menus[0].items[0].action_item.checked);
+}
+
+test "notifications: a response from the platform reaches the registered handler" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Seen = struct {
+        var tag: [16]u8 = undefined;
+        var tag_len: usize = 0;
+        var action: [16]u8 = undefined;
+        var action_len: usize = 0;
+        fn on_response(_: u8, response: platform_mod.SystemNotificationResponse, _: *App) void {
+            @memcpy(tag[0..response.tag.len], response.tag);
+            tag_len = response.tag.len;
+            if (response.action_id) |id| {
+                @memcpy(action[0..id.len], id);
+                action_len = id.len;
+            }
+        }
+    };
+    cx.app.set_app_identity("dev.test", "Test");
+    // Posting and dismissing are accepted on every platform; without a backend they do nothing.
+    cx.app.show_system_notification(.{ .tag = "t", .title = "T", .body = "B", .actions = &.{.{ .id = "open", .label = "Open" }} });
+    cx.app.dismiss_system_notification("t");
+    cx.app.dispatch_system_notification_response(.{ .tag = "none" });
+    cx.app.on_system_notification_response(@as(u8, 0), Seen.on_response);
+    cx.app.dispatch_system_notification_response(.{ .tag = "t", .action_id = "open" });
+    try std.testing.expectEqualStrings("t", Seen.tag[0..Seen.tag_len]);
+    try std.testing.expectEqualStrings("open", Seen.action[0..Seen.action_len]);
 }

@@ -307,6 +307,20 @@ pub const HttpClient = http_client.HttpClient;
 pub const KeyContext = key_dispatch.KeyContext;
 pub const Action = action.Action;
 pub const ClipboardItem = platform.ClipboardItem;
+pub const NoAction = action.NoAction;
+pub const PressureStage = interactive.PressureStage;
+pub const MousePressureEvent = interactive.MousePressureEvent;
+pub const app_menu = platform.app_menu;
+pub const Menu = app_menu.Menu;
+pub const MenuItem = app_menu.MenuItem;
+pub const OwnedMenu = app_menu.OwnedMenu;
+pub const OwnedMenuItem = app_menu.OwnedMenuItem;
+pub const OsMenu = app_menu.OsMenu;
+pub const OsAction = app_menu.OsAction;
+pub const SystemMenuType = app_menu.SystemMenuType;
+pub const SystemNotification = platform.SystemNotification;
+pub const SystemNotificationAction = platform.SystemNotificationAction;
+pub const SystemNotificationResponse = platform.SystemNotificationResponse;
 
 /// Common imports (GPUI `prelude`).
 pub const prelude = struct {
@@ -343,5 +357,6 @@ test {
     _ = @import("elements/anchored.zig");
     _ = @import("elements/deferred.zig");
     _ = @import("elements/canvas.zig");
+    _ = @import("platform/app_menu.zig");
     _ = @import("elements/animation.zig");
 }

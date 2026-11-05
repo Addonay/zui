@@ -1623,6 +1623,11 @@ pub const Window = struct {
                 self.modifiers_ = e.modifiers;
                 self.dispatch_mouse(interactive.PinchEvent, &e, cx);
             },
+            .mouse_pressure => |e| {
+                self.mouse_position_ = e.position;
+                self.modifiers_ = e.modifiers;
+                self.dispatch_mouse(interactive.MousePressureEvent, &e, cx);
+            },
             else => {},
         }
         return !self.propagate_event or self.default_prevented;
