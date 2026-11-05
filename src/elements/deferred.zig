@@ -25,8 +25,8 @@ pub const Deferred = struct {
     priority_value: usize = 0,
 
     /// Sets the drawing order relative to other deferred elements; higher values draw on top.
-    pub fn with_priority(self: *Deferred, priority: usize) *Deferred {
-        self.priority_value = priority;
+    pub fn priority(self: *Deferred, value: usize) *Deferred {
+        self.priority_value = value;
         return self;
     }
 
@@ -53,7 +53,7 @@ pub fn deferred(child: anytype) *Deferred {
 
 test "deferred stores its child and priority" {
     var element: Deferred = .{};
-    _ = element.with_priority(3);
+    _ = element.priority(3);
     try std.testing.expectEqual(@as(usize, 3), element.priority_value);
     try std.testing.expect(element.child == null);
 }
@@ -65,7 +65,7 @@ const div_mod = @import("div.zig");
 const DeferredTestView = struct {
     pub fn render(_: *DeferredTestView, _: *Window, _: *app_mod.Context(DeferredTestView)) *div_mod.Div {
         return div_mod.div().size_full().child(
-            deferred(div_mod.div().id("deferred-child").w(geometry.px(50)).h(geometry.px(40))).with_priority(2),
+            deferred(div_mod.div().id("deferred-child").w(geometry.px(50)).h(geometry.px(40))).priority(2),
         );
     }
 

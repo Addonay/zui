@@ -23,6 +23,8 @@ const examples = [_][]const u8{
     "animation",
     "focus_visible",
     "tab_stop",
+    "popover",
+    "anchor",
 };
 
 pub fn build(b: *std.Build) void {

@@ -90,6 +90,7 @@ pub const Edges = geometry.Edges;
 pub const Corners = geometry.Corners;
 pub const Corner = geometry.Corner;
 pub const Axis = geometry.Axis;
+pub const Anchor = geometry.Anchor;
 pub const px = geometry.px;
 pub const half = geometry.half;
 pub const rems = geometry.rems;
