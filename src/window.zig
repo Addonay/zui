@@ -1653,7 +1653,12 @@ pub const Window = struct {
         }
     }
 
+    /// A drag can start before the next paint records its cursor in the frame, so it comes first.
     fn update_cursor(self: *Window) void {
+        if (self.app.active_drag_cursor_style()) |drag_style| {
+            self.app.platform.set_cursor_style(drag_style);
+            return;
+        }
         var style: CursorStyle = .arrow;
         var i = self.rendered_frame.cursor_styles.items.len;
         while (i > 0) {
@@ -1833,7 +1838,6 @@ pub const Window = struct {
                 if (!self.propagate_event) break;
             }
         }
-        if (E == interactive.MouseMoveEvent) self.update_cursor();
         // A drag follows the pointer, and any release no element took cancels it.
         if (cx.has_active_drag()) {
             if (E == interactive.MouseMoveEvent) {
@@ -1843,6 +1847,9 @@ pub const Window = struct {
                 self.refresh();
             }
         }
+        // After the listeners, so a drag they started or ended takes effect in this event. Any
+        // earlier would briefly select whatever is under the pointer (GPUI `dispatch_mouse_event`).
+        self.update_cursor();
     }
 
     /// The rendered frame is what events are matched against, so bring it up to date first.

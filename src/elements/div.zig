@@ -4256,7 +4256,12 @@ pub fn StyledElement(comptime Ext: type) type {
 
             if (pp.hitbox) |*hb| {
                 self.register_mouse_listeners(hb, pp.state, window);
-                if (s.mouse_cursor) |c| window.set_cursor_style(c, hb);
+                // During a drag its cursor applies everywhere, not just over this element.
+                if (cx.active_drag) |drag| {
+                    if (drag.cursor_style) |c| window.set_window_cursor_style(c);
+                } else if (s.mouse_cursor) |c| {
+                    window.set_cursor_style(c, hb);
+                }
             }
 
             const has_text = s.text_style() != null;
@@ -4456,7 +4461,9 @@ pub fn StyledElement(comptime Ext: type) type {
                         st.active = false;
                         st.pending_mouse_down = null;
                         const offset: Point(Pixels) = .{ .x = e.position.x - c.hitbox.bounds.origin.x, .y = e.position.y - c.hitbox.bounds.origin.y };
-                        cx.set_active_drag(listener.start(listener.value, offset, window, cx));
+                        var drag = listener.start(listener.value, offset, window, cx);
+                        drag.cursor_style = it.base_style.mouse_cursor;
+                        cx.set_active_drag(drag);
                         window.refresh();
                         window.stop_propagation();
                         return;

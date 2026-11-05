@@ -283,6 +283,7 @@ const KeyDownEvent = interactive.KeyDownEvent;
 const FocusHandle = window_mod.FocusHandle;
 const div = div_mod.div;
 const canvas_mod = @import("../elements/canvas.zig");
+const style_cursor = @import("../style.zig").CursorStyle;
 const img_mod = @import("../elements/img.zig");
 const assets_mod = @import("../assets.zig");
 const element_mod = @import("../element.zig");
@@ -1773,6 +1774,54 @@ fn start_drag(vcx: *VisualTestContext) void {
     vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .left, .{});
     vcx.simulate_mouse_move(.{ .x = 30, .y = 10 }, .left, .{});
     vcx.run_until_parked();
+}
+
+const ResizeHandle = struct {
+    fn make_preview(_: *const u8, _: Point(Pixels), _: *Window, app: *App) Entity(Empty) {
+        return app.new(Empty{});
+    }
+    const Empty = struct {
+        pub fn render(_: *Empty, _: *Window, _: *Context(Empty)) *Div {
+            return div();
+        }
+    };
+    pub fn render(_: *ResizeHandle, _: *Window, _: *Context(ResizeHandle)) *Div {
+        const value: u8 = 0;
+        return div().size_full().cursor_text().child(
+            div().id("resize-handle").w(px(4)).h_full().cursor_col_resize().on_drag(value, make_preview),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(ResizeHandle) {
+        return app.new(ResizeHandle{});
+    }
+};
+
+// GPUI `test_drag_cursor_applies_before_next_paint`.
+test "drag: its cursor applies before the next paint, and ends with it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(ResizeHandle.build);
+    vcx.run_until_parked();
+    const hp: *headless.HeadlessPlatform = @fieldParentPtr("platform", cx.platform);
+    const window = vcx.window;
+    const on_handle: Point(Pixels) = .{ .x = 1, .y = 10 };
+    const away: Point(Pixels) = .{ .x = 20, .y = 10 };
+
+    // Dispatched directly, because pumping would paint a frame and hide the bug.
+    _ = window.dispatch_event(.{ .mouse_move = .{ .position = on_handle } }, cx.app);
+    try std.testing.expectEqual(style_cursor.resize_column, hp.cursor);
+    _ = window.dispatch_event(.{ .mouse_down = .{ .position = on_handle, .button = .left } }, cx.app);
+    _ = window.dispatch_event(.{ .mouse_move = .{ .position = away, .pressed_button = .left } }, cx.app);
+    try std.testing.expect(cx.app.has_active_drag());
+    // The pointer is over the text area now, and the frame has not been painted again.
+    try std.testing.expectEqual(style_cursor.resize_column, hp.cursor);
+
+    vcx.run_until_parked();
+    try std.testing.expectEqual(style_cursor.resize_column, hp.cursor);
+    _ = window.dispatch_event(.{ .mouse_up = .{ .position = away, .button = .left } }, cx.app);
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    try std.testing.expectEqual(style_cursor.i_beam, hp.cursor);
 }
 
 test "drag: dropping on a target delivers the value and ends the drag" {
