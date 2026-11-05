@@ -359,6 +359,32 @@ pub fn Context(comptime T: type) type {
             return self.app.add_subscriber(.{ .kind = .window_appearance, .emitter = window.handle_id, .ctx = me.as_u64(), .func = S.call, .id = 0 });
         }
 
+        /// Runs `f(this, window, cx)` when the bounds of `window` change: it moved or was resized
+        /// (GPUI `observe_window_bounds`).
+        pub fn observe_window_bounds(self: *Self, window: *Window, comptime f: anytype) Subscription {
+            return self.window_subscriber(.window_bounds, window, f);
+        }
+
+        /// Runs `f(this, window, cx)` when `window` is activated or deactivated (GPUI `observe_window_activation`).
+        pub fn observe_window_activation(self: *Self, window: *Window, comptime f: anytype) Subscription {
+            return self.window_subscriber(.window_activation, window, f);
+        }
+
+        fn window_subscriber(self: *Self, comptime kind: SubscriberKind, window: *Window, comptime f: anytype) Subscription {
+            const me = self.entity_id_;
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                    const id = EntityId.from_u64(ctx);
+                    const state = app.entities.get(id) orelse return false;
+                    const win: *Window = @ptrCast(@alignCast(@constCast(payload.?)));
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    f(@as(*T, @ptrCast(@alignCast(state))), win, &c);
+                    return true;
+                }
+            };
+            return self.app.add_window_subscriber(kind, window.handle_id, me.as_u64(), S.call);
+        }
+
         /// Subscribes to events emitted by `emitter`, with the window the subscriber is rendered in:
         /// `f(this, emitter, event, window, cx)`. The window is looked up when the event fires, so
         /// the callback follows the entity to another window, as GPUI's does. Events that arrive
@@ -594,7 +620,7 @@ pub fn EntityTypeOf(comptime I: type) type {
 /// Callback shape for observers/subscribers; returns false to unsubscribe.
 const SubscriberFn = *const fn (app: *App, emitter: EntityId, ctx: usize, payload: ?*const anyopaque) bool;
 
-const SubscriberKind = enum { observe, event, release, global, window_closed, window_appearance };
+const SubscriberKind = enum { observe, event, release, global, window_closed, window_appearance, window_bounds, window_activation };
 
 const Subscriber = struct {
     kind: SubscriberKind,
@@ -706,6 +732,8 @@ pub const App = struct {
     /// Arena for effect payloads; reset after each flush.
     effect_arena: std.heap.ArenaAllocator,
     text_system_: *text_system_mod.TextSystem,
+    /// Replaces the in-window prompt (GPUI `prompt_builder`). Null means GPUI's fallback.
+    prompt_builder: ?window_mod.PromptBuilder = null,
     /// Named assets for `img()` and `svg()` (set with `Application.with_assets`).
     asset_source: assets_mod.AssetSource = assets_mod.AssetSource.empty,
     /// Decoded images, decoded once per source.
@@ -1296,6 +1324,35 @@ pub const App = struct {
             if (!sub.active or sub.kind != .window_appearance or sub.emitter != @as(u64, win.handle_id)) continue;
             if (!sub.func(self, EntityId.from_u64(0), sub.ctx, win)) self.subscribers.items[i].active = false;
         }
+    }
+
+    pub fn add_window_subscriber(self: *App, kind: SubscriberKind, window_id: window_mod.WindowId, ctx: usize, func: SubscriberFn) Subscription {
+        return self.add_subscriber(.{ .kind = kind, .emitter = @as(u64, window_id), .ctx = ctx, .func = func, .id = 0 });
+    }
+
+    /// Runs the `kind` observers of `win` with `win` as the payload, then flushes what they queued.
+    pub fn dispatch_window_observers(self: *App, kind: SubscriberKind, win: *Window) void {
+        self.pending_updates += 1;
+        defer {
+            self.pending_updates -= 1;
+            if (self.pending_updates == 0) self.flush_effects();
+        }
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != kind or sub.emitter != @as(u64, win.handle_id)) continue;
+            if (!sub.func(self, EntityId.from_u64(0), sub.ctx, win)) self.subscribers.items[i].active = false;
+        }
+    }
+
+    /// Sets the function that builds in-window prompts (GPUI `set_prompt_builder`).
+    pub fn set_prompt_builder(self: *App, builder: window_mod.PromptBuilder) void {
+        self.prompt_builder = builder;
+    }
+
+    /// Goes back to GPUI's fallback prompt (GPUI `reset_prompt_builder`).
+    pub fn reset_prompt_builder(self: *App) void {
+        self.prompt_builder = null;
     }
 
     pub fn refresh_windows(self: *App) void {
