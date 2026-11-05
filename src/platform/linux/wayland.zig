@@ -485,7 +485,9 @@ pub const WaylandConnection = struct {
             .scale = scale,
             .atlas = atlas_mod.CpuAtlas.init(self.allocator),
             .renderer = cpu.CpuRenderer.init(self.allocator),
-            .decorated = options.titlebar != null,
+            // Server decorations unless the app asks for client ones; without a request,
+            // a window with a titlebar gets the compositor's frame and one without gets none.
+            .decorated = if (options.window_decorations) |d| d == .server else options.titlebar != null,
         };
         w.create_surface(options) catch |err| {
             w.closed = true;
@@ -1562,10 +1564,15 @@ const PendingConfigure = struct {
     maximized: bool = false,
     fullscreen: bool = false,
     resizing: bool = false,
+    tiling: platform.Tiling = .{},
 };
 
 pub const WaylandWindow = struct {
     base: platform.PlatformWindow = .{ .vtable = &vtable },
+    /// Which edges the compositor tiled the window against (xdg_toplevel states 5 to 8).
+    tiling: platform.Tiling = .{},
+    /// Shadow area of a client-decorated window (set_client_inset); null when never set.
+    client_inset: ?f32 = null,
     allocator: std.mem.Allocator,
     conn: *WaylandConnection,
     surface: ?*proto.Surface = null,
@@ -1634,6 +1641,10 @@ pub const WaylandWindow = struct {
         .zoom = zoom,
         .toggle_fullscreen = toggleFullscreen,
         .start_window_move = startWindowMove,
+        .start_window_resize = startWindowResize,
+        .show_window_menu = showWindowMenu,
+        .window_decorations = windowDecorations,
+        .set_client_inset = setClientInset,
         .close = close,
     };
 
@@ -1919,6 +1930,70 @@ pub const WaylandWindow = struct {
         self.conn.flush();
     }
 
+    /// xdg_toplevel.resize from the last press (GPUI `start_window_resize`).
+    fn startWindowResize(p: *platform.PlatformWindow, edge: platform.ResizeEdge) void {
+        const self = from(p);
+        const top = self.xdg_toplevel orelse return;
+        const seat = self.conn.seat orelse return;
+        const a = self.api();
+        _ = a.wl_proxy_marshal_flags(@ptrCast(top), 6, null, a.wl_proxy_get_version(@ptrCast(top)), 0, @as(*anyopaque, @ptrCast(seat)), self.conn.last_serial, resize_edge_code(edge));
+        self.conn.flush();
+    }
+
+    /// xdg_toplevel.resize_edge values (GPUI `ResizeEdgeWaylandExt::to_xdg`).
+    fn resize_edge_code(edge: platform.ResizeEdge) u32 {
+        return switch (edge) {
+            .top => 1,
+            .bottom => 2,
+            .left => 4,
+            .top_left => 5,
+            .bottom_left => 6,
+            .right => 8,
+            .top_right => 9,
+            .bottom_right => 10,
+        };
+    }
+
+    /// xdg_toplevel.show_window_menu at a position in the window (GPUI `show_window_menu`).
+    fn showWindowMenu(p: *platform.PlatformWindow, position: PxPoint) void {
+        const self = from(p);
+        const top = self.xdg_toplevel orelse return;
+        const seat = self.conn.seat orelse return;
+        const a = self.api();
+        _ = a.wl_proxy_marshal_flags(@ptrCast(top), 4, null, a.wl_proxy_get_version(@ptrCast(top)), 0, @as(*anyopaque, @ptrCast(seat)), self.conn.last_serial, @as(i32, @intFromFloat(position.x)), @as(i32, @intFromFloat(position.y)));
+        self.conn.flush();
+    }
+
+    fn windowDecorations(p: *platform.PlatformWindow) platform.Decorations {
+        const self = from(p);
+        // Without a decoration object the compositor draws nothing, so the app must.
+        if (self.decorated and self.decoration != null) return .server;
+        return .{ .client = .{ .tiling = self.tiling } };
+    }
+
+    fn setClientInset(p: *platform.PlatformWindow, inset: Pixels) void {
+        const self = from(p);
+        self.client_inset = inset;
+        self.apply_window_geometry();
+        self.conn.flush();
+    }
+
+    /// xdg_surface.set_window_geometry: the window without the client-drawn shadow. Tiled edges
+    /// have no shadow, so they keep their full extent.
+    fn apply_window_geometry(self: *WaylandWindow) void {
+        const inset = self.client_inset orelse return;
+        const xs = self.xdg_surface orelse return;
+        const left: f32 = if (self.tiling.left) 0 else inset;
+        const right: f32 = if (self.tiling.right) 0 else inset;
+        const top: f32 = if (self.tiling.top) 0 else inset;
+        const bottom: f32 = if (self.tiling.bottom) 0 else inset;
+        const w = self.size.width - left - right;
+        const h = self.size.height - top - bottom;
+        if (w <= 0 or h <= 0) return;
+        const a = self.api();
+        _ = a.wl_proxy_marshal_flags(@ptrCast(xs), 3, null, a.wl_proxy_get_version(@ptrCast(xs)), 0, @as(i32, @intFromFloat(left)), @as(i32, @intFromFloat(top)), @as(i32, @intFromFloat(w)), @as(i32, @intFromFloat(h)));
+    }
+
     fn draw(p: *platform.PlatformWindow, scene: *const scene_mod.Scene) void {
         const self = from(p);
         if (self.closed or !self.configured) return;
@@ -2031,10 +2106,12 @@ pub const WaylandWindow = struct {
         const pending = self.pending_configure;
         self.maximized = pending.maximized;
         self.fullscreen = pending.fullscreen;
+        self.tiling = pending.tiling;
         if (!(pending.resizing and self.resize_throttle)) {
             if (pending.resizing) self.resize_throttle = true;
             self.apply_configured_size(pending.width, pending.height);
         }
+        self.apply_window_geometry();
         _ = a.wl_proxy_marshal_flags(@ptrCast(xs), 4, null, a.wl_proxy_get_version(@ptrCast(xs)), 0, serial);
         const first = !self.configured;
         self.configured = true;
@@ -2068,6 +2145,10 @@ pub const WaylandWindow = struct {
                     proto.XDG_STATE_MAXIMIZED => pending.maximized = true,
                     2 => pending.fullscreen = true, // xdg_toplevel.state.fullscreen
                     3 => pending.resizing = true, // xdg_toplevel.state.resizing
+                    5 => pending.tiling.left = true, // xdg_toplevel.state.tiled_left
+                    6 => pending.tiling.right = true, // xdg_toplevel.state.tiled_right
+                    7 => pending.tiling.top = true, // xdg_toplevel.state.tiled_top
+                    8 => pending.tiling.bottom = true, // xdg_toplevel.state.tiled_bottom
                     else => {},
                 };
             }

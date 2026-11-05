@@ -100,12 +100,21 @@ pub const WindowOptions = struct {
     is_movable: bool = true,
     is_resizable: bool = true,
     is_minimizable: bool = true,
+    /// Whether the app draws the titlebar and handles its drags itself. Like GPUI, the Linux
+    /// platforms accept it without acting on it: the window manager keeps its own titlebar.
+    app_owns_titlebar_drag: bool = false,
     display_id: ?u32 = null,
     window_background: WindowBackgroundAppearance = .@"opaque",
     app_id: ?[]const u8 = null,
     window_min_size: ?Size(Pixels) = null,
+    /// `null` means server-side decorations, unless `titlebar` is null (then the platform
+    /// draws none and the app is expected to draw its own).
     window_decorations: ?WindowDecorations = null,
 };
+
+pub const Tiling = platform_mod.Tiling;
+pub const Decorations = platform_mod.Decorations;
+pub const ResizeEdge = platform_mod.ResizeEdge;
 
 /// The root view type returned by an `open_window` builder.
 pub fn RootViewType(comptime build: anytype) type {
@@ -694,8 +703,29 @@ pub const Window = struct {
     pub fn start_window_move(self: *Window) void {
         self.platform_window.start_window_move();
     }
+    /// Closes this window (GPUI `remove_window`). The close waits until the current update
+    /// ends, so an action can close the window it is running in.
     pub fn remove_window(self: *Window) void {
-        self.app.close_window(self);
+        self.app.close_window_later(self);
+    }
+    /// Who draws the frame (GPUI `window_decorations`).
+    pub fn window_decorations(self: *const Window) Decorations {
+        return self.platform_window.window_decorations();
+    }
+    /// The shadow area of a client-decorated window, in logical pixels (GPUI `set_client_inset`).
+    pub fn set_client_inset(self: *Window, inset: Pixels) void {
+        self.platform_window.set_client_inset(inset);
+    }
+    /// Starts an interactive resize from an edge, as a press on that edge would (GPUI `start_window_resize`).
+    pub fn start_window_resize(self: *Window, edge: ResizeEdge) void {
+        self.platform_window.start_window_resize(edge);
+    }
+    /// Shows the compositor's window menu at `position` (GPUI `show_window_menu`).
+    pub fn show_window_menu(self: *Window, position: Point(Pixels)) void {
+        self.platform_window.show_window_menu(position);
+    }
+    pub fn window_bounds(self: *const Window) WindowBounds {
+        return .{ .windowed = self.bounds() };
     }
     pub fn resize(self: *Window, size: Size(Pixels)) void {
         self.platform_window.resize(size);
@@ -1962,6 +1992,7 @@ pub const Window = struct {
     fn onAppearanceChanged(ctx: *anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(ctx));
         self.appearance_ = self.platform_window.appearance();
+        self.app.dispatch_window_appearance(self);
         self.refresh();
     }
 };

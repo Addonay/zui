@@ -65,8 +65,21 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 - [ ] `keyboard_layout` and its change observer
 - [ ] `delete_surrounding_text`; we never send surrounding text
 - [ ] Linux: `xdg_activation`
+- [ ] `on_window_closed`; `painting` skips it (the app already quits on the last window)
+- [ ] Hover `text_color` does not change text: `anchor` draws black on black when hovered. Runs are
+      captured at layout with the non-hover style, and GPUI seems to do the same; check against a
+      real GPUI build
+- [ ] `data_table`: the visible-range text and scrollbar thumb lag a frame behind a wheel scroll;
+      check against GPUI, and try dragging the thumb, which has never been exercised
 - [ ] X11: drop lists sent with INCR are refused
 - [ ] Entities in a replayed action can outlive a keymap that an action cleared
+
+## Paths
+
+- [ ] **Fill self-intersecting paths**: the ear-clipping in `path_builder.zig` drops them, so `painting`
+      has no lightning bolt. Lyon fills them; a general tessellator is needed
+- [ ] `painting`'s Rust logo needs lyon's path data, about 800 lines
+- [ ] `painting` has only run on the CPU renderer
 
 ## Text
 
@@ -80,8 +93,6 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 Each must run headless with a correct snapshot, and be driven for real: first frames hide most bugs.
 
-- [ ] popover, anchor
-- [ ] painting, data_table
 - [ ] image_gallery, image_loading, gif_viewer
 - [ ] mouse_pressure
 - [ ] window, window_positioning
