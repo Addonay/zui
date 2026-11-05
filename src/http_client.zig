@@ -35,6 +35,20 @@ pub const StdClient = struct {
         return .{ .native = zui_http_create() };
     }
 
+    var shared_native: std.atomic.Value(?*NativeClient) = .init(null);
+
+    /// The client for this process. Sharing one is what lets fetches to a host reuse a connection
+    /// and the loaded certificates. It lives until exit, so do not `deinit` it.
+    pub fn shared() StdClient {
+        if (shared_native.load(.acquire)) |native| return .{ .native = native };
+        const created = zui_http_create();
+        if (shared_native.cmpxchgStrong(null, created, .acq_rel, .acquire)) |winner| {
+            if (created) |native| zui_http_destroy(native);
+            return .{ .native = winner };
+        }
+        return .{ .native = created };
+    }
+
     /// Every `get` must have returned.
     pub fn deinit(self: *StdClient) void {
         if (self.native) |native| zui_http_destroy(native);
