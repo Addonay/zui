@@ -305,9 +305,14 @@ pub const Hitbox = struct {
     content_mask: ContentMask(Pixels),
     behavior: HitboxBehavior = .normal,
 
-    /// True if the mouse is over this hitbox and nothing above blocks it.
+    /// True if the mouse is over this hitbox and nothing above blocks it. After keyboard input
+    /// nothing is hovered until the mouse moves (GPUI `Hitbox::is_hovered`).
     pub fn is_hovered(self: *const Hitbox, window: *const Window) bool {
         return window.hitbox_is_hovered(self.id);
+    }
+    /// Like `is_hovered`, whatever the last input was (GPUI `HitboxId::is_hovered_ignoring_last_input`).
+    pub fn is_hovered_ignoring_last_input(self: *const Hitbox, window: *const Window) bool {
+        return window.hitbox_is_hovered_ignoring_last_input(self.id);
     }
     /// True if a scroll event at the mouse position should go to this hitbox.
     pub fn should_handle_scroll(self: *const Hitbox, window: *const Window) bool {
@@ -619,6 +624,9 @@ pub const Window = struct {
     pending_timeout_generation: u64 = 0,
     /// Pending input was dropped outside dispatch; observers run on the next draw.
     pending_input_notify: bool = false,
+    /// Set during prepaint by `request_autoscroll`, taken by the scrolling container (GPUI
+    /// `requested_autoscroll`).
+    requested_autoscroll: ?Bounds(Pixels) = null,
     pending_modifier: PendingModifier = .{},
     last_input_was_keyboard: bool = false,
     title: []const u8 = "",
@@ -750,6 +758,52 @@ pub const Window = struct {
 
     pub fn scale_factor(self: *const Window) f32 {
         return self.scale_factor_;
+    }
+
+    /// Rounds half toward zero (GPUI `round_half_toward_zero`), which is how device pixels are chosen.
+    fn round_half_toward_zero(value: f32) f32 {
+        return std.math.copysign(@ceil(@abs(value) - 0.5), value);
+    }
+    fn round_half_toward_zero_f64(value: f64) f64 {
+        return std.math.copysign(@ceil(@abs(value) - 0.5), value);
+    }
+
+    /// Asks the scrolling containers around the element being prepainted to scroll `bounds` into
+    /// view. They prepaint again with the new offset (GPUI `request_autoscroll`).
+    pub fn request_autoscroll(self: *Window, area: Bounds(Pixels)) void {
+        self.requested_autoscroll = area;
+    }
+
+    /// Returns and clears the request from `request_autoscroll` (GPUI `take_autoscroll`).
+    pub fn take_autoscroll(self: *Window) ?Bounds(Pixels) {
+        const r = self.requested_autoscroll;
+        self.requested_autoscroll = null;
+        return r;
+    }
+
+    /// Snaps `value` to the nearest device pixel (GPUI `pixel_snap`).
+    pub fn pixel_snap(self: *const Window, value: Pixels) Pixels {
+        const sf = self.scale_factor();
+        return round_half_toward_zero(value * sf) / sf;
+    }
+
+    /// The f64 form of `pixel_snap` (GPUI `pixel_snap_f64`).
+    pub fn pixel_snap_f64(self: *const Window, value: f64) f64 {
+        const sf: f64 = self.scale_factor();
+        return round_half_toward_zero_f64(value * sf) / sf;
+    }
+
+    /// Snaps a point's coordinates to device pixels (GPUI `pixel_snap_point`).
+    pub fn pixel_snap_point(self: *const Window, position: Point(Pixels)) Point(Pixels) {
+        return .{ .x = self.pixel_snap(position.x), .y = self.pixel_snap(position.y) };
+    }
+
+    /// Snaps the origin and size of `bounds` to device pixels (GPUI `pixel_snap_bounds`).
+    pub fn pixel_snap_bounds(self: *const Window, area: Bounds(Pixels)) Bounds(Pixels) {
+        return .{ .origin = self.pixel_snap_point(area.origin), .size = .{
+            .width = self.pixel_snap(area.size.width),
+            .height = self.pixel_snap(area.size.height),
+        } };
     }
     pub fn rem_size(self: *const Window) Pixels {
         if (self.rem_size_override_stack.items.len > 0) return self.rem_size_override_stack.items[self.rem_size_override_stack.items.len - 1];
@@ -1237,6 +1291,12 @@ pub const Window = struct {
     }
 
     fn hitbox_is_hovered(self: *const Window, id: HitboxId) bool {
+        if (self.pointer_capture) |c| return c == id;
+        if (self.last_input_was_keyboard) return false;
+        return self.hitbox_is_hovered_ignoring_last_input(id);
+    }
+
+    fn hitbox_is_hovered_ignoring_last_input(self: *const Window, id: HitboxId) bool {
         if (self.pointer_capture) |c| return c == id;
         const ht = &self.mouse_hit_test;
         for (ht.ids.items[0..ht.hover_hitbox_count]) |h| if (h == id) return true;
@@ -1726,7 +1786,7 @@ pub const Window = struct {
             i -= 1;
             const r = self.rendered_frame.cursor_styles.items[i];
             if (r.hitbox_id) |hid| {
-                if (self.hitbox_is_hovered(hid)) {
+                if (self.hitbox_is_hovered_ignoring_last_input(hid)) {
                     style = r.style;
                     break;
                 }
