@@ -31,6 +31,7 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 - [ ] Quitting waits for a `use_asset` load that never checks `LoadContext.is_cancelled`
 - [ ] Atlas and memory behaviour over many image changes, such as repeated "Next Photos", is unmeasured
 - [ ] `testing`: `test_allow_parking` is not ported, since ZUI has no parking check
+- [ ] Flaky test? `remove_asset` failed once in a run that touched no asset code; not reproduced
 - [ ] `run_until_parked` never parks while a GIF is on screen, and spins to its 10,000-iteration guard
 - [ ] WebP, TIFF, ICO, PNM decoders
 - [ ] EXIF orientation in PNG (JPEG is done)
@@ -60,12 +61,12 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 - [ ] Long-press tooltips
 - [ ] External drag payloads (dragging out of the window)
 - [ ] `cached` views
-- [ ] Alias `with_animation` on `StyledElement`
-- [ ] `container_query`, `percentage`
-- [ ] `init_colors`; `set_menus` is stored but only macOS will draw it
+- [ ] `ContainerQuery` is a styled element with an id and interactivity, which GPUI's is not; `Percentage`
+      arithmetic and a `Radians` type are not ported
+- [ ] `set_menus` is stored but only macOS will draw it
 - [ ] Linux notifications: the API exists, but posting needs a D-Bus client, which ZUI lacks
 - [ ] Scroll: ZUI stops propagation in the scroll listener and GPUI does not, so nested scrollers differ
-- [ ] `Unbind`, `InputPreference`, pausing the pending-input timeout
+- [ ] `Unbind` (needs GPUI's binding precedence model), `InputPreference`, pausing the pending-input timeout
 - [ ] `keyboard_layout` and its change observer
 - [ ] `delete_surrounding_text`; we never send surrounding text
 - [ ] Linux: `xdg_activation`
@@ -88,8 +89,7 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 ## Text
 
 - [ ] Text-presentation selector: `❤\u{fe0e}` draws the color heart
-- [ ] ShapedLine cursor and split APIs, typographic bounds
-- [ ] Font enumeration
+- [ ] `split_at` on ShapedLine and LineLayout, typographic bounds
 - [ ] Missing-glyph reporting
 - [ ] cozmic `-Dsystem-libs` builds have no COLRv1, since hb-raster is a separate shared library
 
