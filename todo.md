@@ -70,7 +70,6 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 ## Text
 
-- [ ] `add_fonts` (every ported example skips `load_fonts`)
 - [ ] Text-presentation selector: `❤\u{fe0e}` draws the color heart
 - [ ] ShapedLine cursor and split APIs, typographic bounds
 - [ ] Font enumeration
