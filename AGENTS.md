@@ -301,6 +301,9 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   and shown first, then the fetch still runs and replaces it if the bytes changed. Measured on 2026-11-05:
   curl takes 1.0 to 1.4 s for these URLs, `std.http` the same in release and about 0.9 s more in Debug,
   decoding 25 to 60 ms. So only the saved copy can make it fast.
+- **Window prompts**: `window/prompts.zig` follows GPUI's fallback prompt, with one addition: GPUI handles
+  no keys there, and ZUI takes arrows, Tab, Enter, Space and Escape (which picks the Cancel button).
+  Answers go to a listener. A replaced prompt, or one whose window closed, is never answered.
 - **Multi-stroke bindings**: `Window.dispatch_keystroke` follows GPUI's `dispatch_key_event`. A prefix
   is held in `pending_keystrokes` (strings owned, since platform buffers are not stable) and its keys
   reach nobody. A key that breaks the sequence replays what was held. It waits one second only if

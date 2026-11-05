@@ -226,6 +226,12 @@ pub const VisualTestContext = struct {
         self.cx.run_until_parked();
     }
 
+    /// Moves the window and reports it, as a window manager does (GPUI `on_moved`).
+    pub fn simulate_move(self: *VisualTestContext, origin: Point(Pixels)) void {
+        headless.HeadlessWindow.from(self.window.platform_window).move_to(origin);
+        self.cx.run_until_parked();
+    }
+
     pub fn dispatch_action(self: *VisualTestContext, action: anytype) void {
         self.cx.dispatch_action(self.window, action);
     }
@@ -629,7 +635,8 @@ test "multi-stroke: without a binding of its own a prefix waits for the next key
     vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
 
     vcx.simulate_keystrokes("ctrl-k");
-    @import("../executor.zig").sleep_ns(200 * std.time.ns_per_ms);
+    // Past the timeout a prefix with a binding of its own would have fired by.
+    @import("../executor.zig").sleep_ns(700 * std.time.ns_per_ms);
     vcx.run_until_parked();
     try std.testing.expect(vcx.window.has_pending_keystrokes());
     vcx.simulate_keystrokes("ctrl-c");
@@ -2228,6 +2235,333 @@ test "gif: frames advance after their delay, and frames are requested only while
     reduced.window.active = false;
     reduced.window.draw(cx.app);
     try std.testing.expect(!reduced.window.animation_requested);
+}
+
+// ---------------------------------------------------------------------------
+// Prompts (GPUI `window/prompts.rs`) and window observers.
+
+/// Where the last answer went, and how often. Listeners are plain functions, so the tests share
+/// these; tests run one after another.
+const PromptProbe = struct {
+    var answered: ?usize = null;
+    var calls: usize = 0;
+    var other_calls: usize = 0;
+    var builder_calls: usize = 0;
+
+    fn reset() void {
+        answered = null;
+        calls = 0;
+        other_calls = 0;
+        builder_calls = 0;
+    }
+
+    fn on_answer(response: *const window_mod.PromptResponse, _: *Window, _: *App) void {
+        answered = response.index;
+        calls += 1;
+    }
+
+    fn on_other_answer(_: *const window_mod.PromptResponse, _: *Window, _: *App) void {
+        other_calls += 1;
+    }
+
+    fn counting_builder(
+        level: window_mod.PromptLevel,
+        message: []const u8,
+        detail: ?[]const u8,
+        answers: []const window_mod.PromptButton,
+        handle: window_mod.PromptHandle,
+        window: *Window,
+        app: *App,
+    ) window_mod.RenderablePromptHandle {
+        builder_calls += 1;
+        return window_mod.fallback_prompt_renderer(level, message, detail, answers, handle, window, app);
+    }
+};
+
+/// Two areas that open prompts: the first has a cancel button, the second has none.
+const PromptHost = struct {
+    focus: window_mod.FocusHandle,
+
+    pub fn render(self: *PromptHost, _: *Window, cx: *Context(PromptHost)) *Div {
+        return div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(div()
+                .id("open")
+                .track_focus(&self.focus)
+                .w(px(100))
+                .h(px(40))
+                .on_click(cx.listener(open_with_cancel)))
+            .child(div()
+                .id("open-plain")
+                .w(px(100))
+                .h(px(40))
+                .on_click(cx.listener(open_without_cancel)));
+    }
+
+    fn open_with_cancel(_: *PromptHost, _: *const ClickEvent, window: *Window, cx: *Context(PromptHost)) void {
+        window.prompt(.info, "Are you sure?", null, &.{ "OK", "Cancel" }, cx.app, PromptProbe.on_answer);
+    }
+
+    fn open_without_cancel(_: *PromptHost, _: *const ClickEvent, window: *Window, cx: *Context(PromptHost)) void {
+        window.prompt(.warning, "Keep going?", "Nothing to cancel here.", &.{ "Yes", "No" }, cx.app, PromptProbe.on_answer);
+    }
+
+    fn build(_: *Window, app: *App) Entity(PromptHost) {
+        return app.new(PromptHost{ .focus = app.focus_handle() });
+    }
+
+    fn read_focus(self: *const PromptHost, _: *const App) window_mod.FocusHandle {
+        return self.focus;
+    }
+};
+
+/// The centres of the two prompt buttons. They are the last hitboxes a frame draws, since the
+/// prompt is prepainted after the root view.
+fn prompt_button_centers(window: *Window) [2]Point(Pixels) {
+    const boxes = window.rendered_frame.hitboxes.items;
+    std.debug.assert(boxes.len >= 2);
+    return .{ center_of(boxes[boxes.len - 2].bounds), center_of(boxes[boxes.len - 1].bounds) };
+}
+
+fn center_of(b: geometry.Bounds(Pixels)) Point(Pixels) {
+    return .{ .x = b.origin.x + b.size.width / 2, .y = b.origin.y + b.size.height / 2 };
+}
+
+test "prompt: a click answers with the button's index, closes the prompt and gives focus back" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(PromptHost.build);
+    const focus = view.read(cx.app).focus;
+    vcx.focus(focus);
+
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expect(vcx.window.has_active_prompt());
+    try std.testing.expect(!focus.is_focused(vcx.window));
+    try std.testing.expectEqual(@as(?usize, null), PromptProbe.answered);
+
+    const buttons = prompt_button_centers(vcx.window);
+    vcx.simulate_click(buttons[1], .{});
+    try std.testing.expectEqual(@as(?usize, 1), PromptProbe.answered);
+    try std.testing.expectEqual(@as(usize, 1), PromptProbe.calls);
+    try std.testing.expect(!vcx.window.has_active_prompt());
+    try std.testing.expect(focus.is_focused(vcx.window));
+}
+
+test "prompt: the first button is index 0, and an answer is delivered once" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const buttons = prompt_button_centers(vcx.window);
+    vcx.simulate_click(buttons[0], .{});
+    try std.testing.expectEqual(@as(?usize, 0), PromptProbe.answered);
+    // The prompt is gone, so a second click on the same spot answers nothing.
+    vcx.simulate_click(buttons[0], .{});
+    try std.testing.expectEqual(@as(usize, 1), PromptProbe.calls);
+}
+
+test "prompt: the keyboard moves the selection with right and enter chooses it" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expect(vcx.window.has_active_prompt());
+
+    vcx.simulate_keystrokes("right enter");
+    try std.testing.expectEqual(@as(?usize, 1), PromptProbe.answered);
+    try std.testing.expect(!vcx.window.has_active_prompt());
+}
+
+test "prompt: enter alone chooses the first button, and left wraps to the last" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.simulate_keystrokes("left enter");
+    try std.testing.expectEqual(@as(?usize, 1), PromptProbe.answered);
+}
+
+test "prompt: escape chooses the cancel button" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.simulate_keystrokes("escape");
+    try std.testing.expectEqual(@as(?usize, 1), PromptProbe.answered);
+    try std.testing.expect(!vcx.window.has_active_prompt());
+}
+
+test "prompt: escape without a cancel button leaves the prompt open" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 50 }, .{});
+    try std.testing.expect(vcx.window.has_active_prompt());
+    vcx.simulate_keystrokes("escape");
+    try std.testing.expectEqual(@as(?usize, null), PromptProbe.answered);
+    try std.testing.expect(vcx.window.has_active_prompt());
+    // Enter still answers, with the first button.
+    vcx.simulate_keystrokes("enter");
+    try std.testing.expectEqual(@as(?usize, 0), PromptProbe.answered);
+}
+
+fn replace_prompt(window: *Window, app: *App) void {
+    window.prompt(.critical, "Second", null, &.{ "Only", "Me" }, app, PromptProbe.on_other_answer);
+}
+
+test "prompt: a prompt replaced before its answer is never answered" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.update(replace_prompt, .{});
+    vcx.run_until_parked();
+    vcx.simulate_click(prompt_button_centers(vcx.window)[0], .{});
+    try std.testing.expectEqual(@as(usize, 0), PromptProbe.calls);
+    try std.testing.expectEqual(@as(usize, 1), PromptProbe.other_calls);
+}
+
+fn close_window_now(window: *Window, app: *App) void {
+    app.close_window(window);
+}
+
+test "prompt: closing the window with a prompt open frees everything it held" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expect(vcx.window.has_active_prompt());
+    // std.testing.allocator reports any arena left behind when the test ends.
+    vcx.update(close_window_now, .{});
+    try std.testing.expectEqual(@as(usize, 0), PromptProbe.calls);
+}
+
+test "prompt: a custom builder replaces the fallback, and the window still delivers the answer" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.set_prompt_builder(PromptProbe.counting_builder);
+    defer cx.app.reset_prompt_builder();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expectEqual(@as(usize, 1), PromptProbe.builder_calls);
+    vcx.simulate_click(prompt_button_centers(vcx.window)[0], .{});
+    try std.testing.expectEqual(@as(?usize, 0), PromptProbe.answered);
+}
+
+/// Counts what a view hears about its window (GPUI `cx.observe_window_bounds` and
+/// `cx.observe_window_activation`).
+const BoundsWatch = struct {
+    changes: usize = 0,
+    activations: usize = 0,
+
+    pub fn render(_: *BoundsWatch, _: *Window, _: *Context(BoundsWatch)) *Div {
+        return div().size_full();
+    }
+
+    fn watch(_: *BoundsWatch, window: *Window, cx: *Context(BoundsWatch)) void {
+        _ = cx.observe_window_bounds(window, on_bounds);
+        _ = cx.observe_window_activation(window, on_activation);
+    }
+
+    fn on_bounds(self: *BoundsWatch, _: *Window, _: *Context(BoundsWatch)) void {
+        self.changes += 1;
+    }
+
+    fn on_activation(self: *BoundsWatch, _: *Window, _: *Context(BoundsWatch)) void {
+        self.activations += 1;
+    }
+
+    fn build(window: *Window, app: *App) Entity(BoundsWatch) {
+        const view = app.new(BoundsWatch{});
+        view.update(app, BoundsWatch.watch, .{window});
+        return view;
+    }
+
+    fn read_changes(s: *const BoundsWatch, _: *const App) usize {
+        return s.changes;
+    }
+
+    fn read_activations(s: *const BoundsWatch, _: *const App) usize {
+        return s.activations;
+    }
+};
+
+test "window bounds: a resize calls the observer, and a resize to the same size does not" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(BoundsWatch.build);
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+
+    vcx.simulate_resize(.{ .width = 320, .height = 240 });
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+
+    // Nothing changed, so the observer stays quiet, even though the platform reported a resize.
+    vcx.simulate_resize(.{ .width = 320, .height = 240 });
+    vcx.simulate_mouse_move(.{ .x = 5, .y = 5 }, null, .{});
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+}
+
+const WindowMoves = struct {
+    var moves: usize = 0;
+    var last: geometry.Point(Pixels) = .{ .x = -1, .y = -1 };
+
+    fn on_move(window: *Window, _: *App) void {
+        moves += 1;
+        last = window.bounds().origin;
+    }
+};
+
+test "window bounds: a move reaches window observers with the new origin, and a repeat does not" {
+    WindowMoves.moves = 0;
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(BoundsWatch.build);
+    const subscription = vcx.window.observe_window_bounds(WindowMoves.on_move);
+    defer subscription.unsubscribe();
+
+    vcx.simulate_move(.{ .x = 40, .y = 25 });
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+    try std.testing.expectEqual(@as(usize, 1), WindowMoves.moves);
+    try std.testing.expectEqual(@as(Pixels, 40), WindowMoves.last.x);
+    try std.testing.expectEqual(@as(Pixels, 25), WindowMoves.last.y);
+
+    // The same origin again is not a change.
+    vcx.simulate_move(.{ .x = 40, .y = 25 });
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+    try std.testing.expectEqual(@as(usize, 1), WindowMoves.moves);
+
+    // A move and then a resize are two changes; the window observer hears both.
+    vcx.simulate_move(.{ .x = 1, .y = 1 });
+    vcx.simulate_resize(.{ .width = 300, .height = 300 });
+    try std.testing.expectEqual(@as(usize, 3), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+    try std.testing.expectEqual(@as(usize, 3), WindowMoves.moves);
+}
+
+test "window activation: observers hear each change, and a resize is not one" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(BoundsWatch.build);
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, BoundsWatch.read_activations, .{}));
+
+    vcx.window.platform_window.emit_active(false);
+    vcx.window.platform_window.emit_active(true);
+    try std.testing.expectEqual(@as(usize, 2), cx.read_entity(view, BoundsWatch.read_activations, .{}));
+    try std.testing.expect(vcx.window.is_window_active());
+
+    vcx.simulate_resize(.{ .width = 320, .height = 240 });
+    try std.testing.expectEqual(@as(usize, 2), cx.read_entity(view, BoundsWatch.read_activations, .{}));
 }
 
 // -- asset loads and image caches ----------------------------------------

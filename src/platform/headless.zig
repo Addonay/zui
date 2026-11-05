@@ -132,6 +132,8 @@ pub const HeadlessWindow = struct {
     base: PlatformWindow = .{ .vtable = &vtable },
     owner: *HeadlessPlatform,
     size: geometry.Size(Pixels),
+    /// Where the window sits; tests move it with `move_to`.
+    origin: geometry.Point(Pixels) = .{ .x = 0, .y = 0 },
     scale: f32 = 1,
     title: []const u8 = "",
     frame_requested: bool = true,
@@ -206,7 +208,13 @@ pub const HeadlessWindow = struct {
     }
 
     fn bounds(p: *PlatformWindow) geometry.Bounds(Pixels) {
-        return .{ .origin = .{ .x = 0, .y = 0 }, .size = from(p).size };
+        return .{ .origin = from(p).origin, .size = from(p).size };
+    }
+    /// Moves the window and reports it as the platform does: only a real change is reported.
+    pub fn move_to(self: *HeadlessWindow, origin: geometry.Point(Pixels)) void {
+        if (self.origin.x == origin.x and self.origin.y == origin.y) return;
+        self.origin = origin;
+        self.base.emit_moved();
     }
     fn contentSize(p: *PlatformWindow) geometry.Size(Pixels) {
         return from(p).size;
