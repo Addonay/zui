@@ -47,9 +47,9 @@ pub const Transformation = struct {
         return .{ .translation = t };
     }
 
-    /// Rotates by `radians` around the element center.
-    pub fn rotate(radians: f32) Transformation {
-        return .{ .rotation = radians };
+    /// Rotates around the element center by radians, or by a `Percentage` of a full turn.
+    pub fn rotate(angle: anytype) Transformation {
+        return .{ .rotation = geometry.to_radians(angle) };
     }
 
     pub fn with_scaling(self: Transformation, s: Size(f32)) Transformation {
@@ -64,9 +64,9 @@ pub const Transformation = struct {
         return t;
     }
 
-    pub fn with_rotation(self: Transformation, radians: f32) Transformation {
+    pub fn with_rotation(self: Transformation, angle: anytype) Transformation {
         var t = self;
-        t.rotation = radians;
+        t.rotation = geometry.to_radians(angle);
         return t;
     }
 

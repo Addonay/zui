@@ -3,8 +3,7 @@
 //! Differences from the Rust version:
 //! - Font loading (`add_fonts`) is not ported: ZUI has no `TextSystem::add_fonts` yet,
 //!   so the font families are resolved by the system.
-//! - `set_menus` and `init_colors` / `default_colors` are not in ZUI yet. The container
-//!   color comes from the light defaults in `colors.Colors`.
+//! - `set_menus` is not in ZUI yet.
 //! - `Specimen` and `CharacterGrid` are `RenderOnce` in Rust. Here they are plain structs
 //!   with a `render(self, window, cx)` method, called directly where the Rust version
 //!   passes them to `.child(...)`, because a value-level `into_element` cannot reach the
@@ -236,8 +235,7 @@ const TextExample = struct {
 
     pub fn render(self: *TextExample, window: *Window, cx: *Context(TextExample)) *Div {
         const tcx = text_context(cx.app);
-        // App::default_colors is not in ZUI yet; the light defaults stand in for it.
-        const colors = gpui.colors.Colors.default;
+        const colors = cx.app.default_colors().*;
 
         const font_size = tcx.font_size;
         const line_height = tcx.line_height;
@@ -324,8 +322,8 @@ fn specimen(self: *TextExample, window: *Window, cx: *App, scale: f32, invert: b
 }
 
 fn run_example(cx: *App) void {
-    // cx.set_menus(...), cx.text_system().add_fonts(...) and cx.init_colors() are not
-    // ported: they are not in ZUI yet.
+    // cx.set_menus(...) and cx.text_system().add_fonts(...) are not ported: they are not in ZUI yet.
+    cx.init_colors();
     cx.set_global(GlobalTextContext{ .value = TextContext.default() });
 
     _ = cx.open_window(

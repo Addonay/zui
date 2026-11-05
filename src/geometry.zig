@@ -943,6 +943,30 @@ pub inline fn auto() Length {
     return .auto;
 }
 
+/// A fraction of a full turn (GPUI `Percentage`). Arithmetic on it is not ported.
+pub const Percentage = struct {
+    value: f32,
+
+    /// The angle in radians: a full turn is `tau`.
+    pub fn to_radians(self: Percentage) f32 {
+        return self.value * std.math.tau;
+    }
+};
+
+/// A fraction of a full turn, from 0 to 1 (GPUI `percentage`).
+pub fn percentage(value: f32) Percentage {
+    std.debug.assert(value >= 0 and value <= 1);
+    return .{ .value = value };
+}
+
+/// An angle in radians from a plain `f32` or a `Percentage` (GPUI `Into<Radians>`).
+pub fn to_radians(value: anytype) f32 {
+    return switch (@TypeOf(value)) {
+        Percentage => value.to_radians(),
+        else => value,
+    };
+}
+
 /// Converts a pixel value, length type or number to `Length`.
 pub fn to_length(value: anytype) Length {
     const Value = @TypeOf(value);

@@ -66,6 +66,7 @@ pub const elements = struct {
     pub const deferred = @import("elements/deferred.zig");
     pub const canvas = @import("elements/canvas.zig");
     pub const animation = @import("elements/animation.zig");
+    pub const container_query = @import("elements/container_query.zig");
     pub const img = @import("elements/img.zig");
     pub const svg = @import("elements/svg.zig");
     pub const uniform_list = @import("elements/uniform_list.zig");
@@ -95,6 +96,8 @@ pub const px = geometry.px;
 pub const half = geometry.half;
 pub const rems = geometry.rems;
 pub const relative = geometry.relative;
+pub const percentage = geometry.percentage;
+pub const Percentage = geometry.Percentage;
 pub const phi = geometry.phi;
 pub const auto = geometry.auto;
 pub const point = geometry.point;
@@ -253,6 +256,8 @@ pub const deferred = elements.deferred.deferred;
 pub const Canvas = elements.canvas.Canvas;
 pub const canvas = elements.canvas.canvas;
 pub const canvas_fn = elements.canvas.canvas_fn;
+pub const ContainerQuery = elements.container_query.ContainerQuery;
+pub const container_query = elements.container_query.container_query;
 
 // -- uniform_list / list ----------------------------------------------------
 pub const uniform_list = elements.uniform_list.uniform_list;
