@@ -27,6 +27,9 @@ const examples = [_][]const u8{
     "tab_stop",
     "popover",
     "anchor",
+    "gif_viewer",
+    "image_gallery",
+    "image_loading",
     "on_window_close_quit",
     "window_movable",
     "window_shadow",
@@ -35,6 +38,9 @@ const examples = [_][]const u8{
     "paths_bench",
     "system_notifications",
     "testing",
+    "window",
+    "window_positioning",
+    "move_entity_between_windows",
 };
 
 pub fn build(b: *std.Build) void {

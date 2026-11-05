@@ -616,6 +616,26 @@ pub const MappingNotify: c_int = 34;
 pub const XA_PRIMARY: Atom = 1;
 pub const XA_ATOM: Atom = 4;
 pub const XA_CARDINAL: Atom = 6;
+pub const CW_OVERRIDE_REDIRECT: c_ulong = 1 << 9;
+
+/// Xlib's `XSetWindowAttributes`, in the C layout Xlib reads.
+pub const SetWindowAttributes = extern struct {
+    background_pixmap: c_ulong = 0,
+    background_pixel: c_ulong = 0,
+    border_pixmap: c_ulong = 0,
+    border_pixel: c_ulong = 0,
+    bit_gravity: c_int = 0,
+    win_gravity: c_int = 0,
+    backing_store: c_int = 0,
+    backing_planes: c_ulong = 0,
+    backing_pixel: c_ulong = 0,
+    save_under: c_int = 0,
+    event_mask: c_long = 0,
+    do_not_propagate_mask: c_long = 0,
+    override_redirect: c_int = 0,
+    colormap: c_ulong = 0,
+    cursor: c_ulong = 0,
+};
 pub const XA_STRING: Atom = 31;
 pub const XA_ANY_PROPERTY_TYPE: Atom = 0;
 pub const PROP_MODE_REPLACE: c_int = 0;
@@ -733,6 +753,7 @@ pub const Api = struct {
     XkbSetDetectableAutoRepeat: ?*const fn (*Display, c_int, ?*c_int) callconv(.c) c_int,
     XKeycodeToKeysym: ?*const fn (*Display, c_uint, c_int) callconv(.c) c_ulong = null,
     XChangeProperty: *const fn (*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int,
+    XChangeWindowAttributes: *const fn (*Display, Window, c_ulong, *const SetWindowAttributes) callconv(.c) c_int,
     XDeleteProperty: *const fn (*Display, Window, Atom) callconv(.c) c_int,
     XGetWindowProperty: *const fn (*Display, Window, Atom, c_long, c_long, Bool, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *[*]u8) callconv(.c) c_int,
     XFree: *const fn (*anyopaque) callconv(.c) c_int,
@@ -785,6 +806,7 @@ pub const Api = struct {
             .XLookupString = lib.lookup(*const fn (*XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int, "XLookupString") orelse return null,
             .XKeycodeToKeysym = lib.lookup(*const fn (*Display, c_uint, c_int) callconv(.c) c_ulong, "XKeycodeToKeysym"),
             .XChangeProperty = lib.lookup(*const fn (*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int, "XChangeProperty") orelse return null,
+            .XChangeWindowAttributes = lib.lookup(*const fn (*Display, Window, c_ulong, *const SetWindowAttributes) callconv(.c) c_int, "XChangeWindowAttributes") orelse return null,
             .XDeleteProperty = lib.lookup(*const fn (*Display, Window, Atom) callconv(.c) c_int, "XDeleteProperty") orelse return null,
             .XGetWindowProperty = lib.lookup(*const fn (*Display, Window, Atom, c_long, c_long, Bool, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *[*]u8) callconv(.c) c_int, "XGetWindowProperty") orelse return null,
             .XFree = lib.lookup(*const fn (*anyopaque) callconv(.c) c_int, "XFree") orelse return null,

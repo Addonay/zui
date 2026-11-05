@@ -358,6 +358,29 @@ pub fn Context(comptime T: type) type {
             return self.app.add_subscriber(.{ .kind = .window_appearance, .emitter = window.handle_id, .ctx = me.as_u64(), .func = S.call, .id = 0 });
         }
 
+        /// Subscribes to events emitted by `emitter`, with the window the subscriber is rendered in:
+        /// `f(this, emitter, event, window, cx)`. The window is looked up when the event fires, so
+        /// the callback follows the entity to another window, as GPUI's does. Events that arrive
+        /// while the entity is in no window are dropped; the subscription stays. The `window`
+        /// argument of the call is not stored: GPUI's `subscribe_in` takes it only to start there.
+        pub fn subscribe_in(self: *Self, emitter: anytype, window: *Window, comptime f: anytype) Subscription {
+            _ = window;
+            const EH = @TypeOf(emitter);
+            const Ev = EH.Type.Event;
+            const S = struct {
+                fn call(app: *App, from: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                    const id = EntityId.from_u64(ctx);
+                    const state = app.entities.get(id) orelse return false;
+                    const current = app.window_for_entity(id) orelse return true;
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    const ev: *const Ev = @ptrCast(@alignCast(payload.?));
+                    f(@as(*T, @ptrCast(@alignCast(state))), EH{ .entity_id_ = from }, ev, current, &c);
+                    return true;
+                }
+            };
+            return self.app.add_event_listener(emitter.entity_id(), type_id(Ev), self.entity_id_.as_u64(), S.call);
+        }
+
         /// Subscribes to events emitted by `emitter`: `f(this, emitter, event, cx)`.
         pub fn subscribe(self: *Self, emitter: anytype, comptime f: anytype) Subscription {
             const EH = @TypeOf(emitter);
@@ -727,7 +750,13 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         if (self.system_notification_response) |h| h.free(self.allocator, h.ctx);
         self.system_notification_response = null;
-        for (self.windows.items) |w| if (w) |win| win.destroy(self);
+        // Each slot is cleared before its window is destroyed, as close_window does, so a window
+        // being destroyed is never seen again by is_root_of_other_window.
+        for (self.windows.items) |*slot| {
+            const win = slot.* orelse continue;
+            slot.* = null;
+            win.destroy(self);
+        }
         self.windows.deinit(self.allocator);
         for (self.entities.slots.items) |*s| if (s.ptr) |p| {
             if (s.destroy) |d| d(self, p);
@@ -1162,6 +1191,27 @@ pub const App = struct {
         self.flush_effects();
         _ = V;
         return .{ .window_id = win.handle_id, .entity_id_ = root.entity_id() };
+    }
+
+    /// Whether an open window other than `closing` has `id` as its root view.
+    pub fn is_root_of_other_window(self: *App, id: EntityId, closing: *Window) bool {
+        for (self.windows.items) |maybe_window| {
+            const win = maybe_window orelse continue;
+            if (win == closing) continue;
+            const root = win.root orelse continue;
+            if (root.entity_id == id) return true;
+        }
+        return false;
+    }
+
+    /// The open window that rendered `id` in its last frame, if any. An entity moved to another
+    /// window is found there once that window has drawn it.
+    pub fn window_for_entity(self: *App, id: EntityId) ?*Window {
+        for (self.windows.items) |maybe_window| {
+            const win = maybe_window orelse continue;
+            if (win.rendered_entities.contains(id)) return win;
+        }
+        return null;
     }
 
     pub fn window_by_id(self: *App, id: window_mod.WindowId) ?*Window {

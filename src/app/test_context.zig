@@ -2125,4 +2125,105 @@ test "notifications: a response from the platform reaches the registered handler
     cx.app.dispatch_system_notification_response(.{ .tag = "t", .action_id = "open" });
     try std.testing.expectEqualStrings("t", Seen.tag[0..Seen.tag_len]);
     try std.testing.expectEqualStrings("open", Seen.action[0..Seen.action_len]);
+/// A decoded image of one 1x1 frame per entry of `delays_ms` (a GIF has one such frame per picture).
+fn image_with_delays(allocator: std.mem.Allocator, delays_ms: []const u32) !*assets_mod.RenderImage {
+    const frames = try allocator.alloc(assets_mod.Frame, delays_ms.len);
+    var built: usize = 0;
+    errdefer {
+        for (frames[0..built]) |f| allocator.free(f.pixels);
+        allocator.free(frames);
+    }
+    while (built < delays_ms.len) : (built += 1) {
+        const pixels = try allocator.alloc(u8, 4);
+        @memset(pixels, @intCast(built + 1));
+        frames[built] = .{ .width = 1, .height = 1, .delay_ms = delays_ms[built], .pixels = pixels };
+    }
+    return assets_mod.RenderImage.new(allocator, frames);
+}
+
+const AnimatedView = struct {
+    var image: *assets_mod.RenderImage = undefined;
+    var with_id: bool = true;
+    var last: ?*img_mod.Img = null;
+
+    pub fn render(_: *AnimatedView, _: *Window, _: *Context(AnimatedView)) *Div {
+        const i = img_mod.img(image).size(px(10));
+        last = if (with_id) i.id("gif") else i;
+        return div().child(last.?);
+    }
+    fn build(_: *Window, app: *App) Entity(AnimatedView) {
+        return app.new(AnimatedView{});
+    }
+    fn frame() usize {
+        return last.?.ext.frame_index;
+    }
+};
+
+/// Opens a window without pumping frames. `add_window` runs `run_until_parked`, which keeps drawing
+/// while an animation asks for frames, so a GIF would advance before the test looked at it.
+fn open_unpumped(cx: *TestAppContext) struct { window: *Window } {
+    const handle = cx.app.open_window(.{}, AnimatedView.build) catch unreachable;
+    const window = handle.window(cx.app) orelse unreachable;
+    window.draw(cx.app);
+    return .{ .window = window };
+}
+
+test "gif: frames advance after their delay, and frames are requested only while animating" {
+    const allocator = std.testing.allocator;
+    const sleep = @import("../executor.zig").sleep_ns;
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+
+    // Each frame lasts 150 ms, so the first draws happen well inside its delay.
+    const animated = try image_with_delays(allocator, &.{ 150, 150 });
+    defer animated.deinit();
+    AnimatedView.image = animated;
+
+    AnimatedView.with_id = true;
+    const vcx = open_unpumped(&cx);
+    try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
+    try std.testing.expect(vcx.window.animation_requested);
+    vcx.window.draw(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
+
+    sleep(200 * std.time.ns_per_ms);
+    vcx.window.draw(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), AnimatedView.frame());
+    try std.testing.expect(vcx.window.animation_requested);
+
+    sleep(200 * std.time.ns_per_ms);
+    vcx.window.draw(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
+
+    // Without an element id there is no state to advance: frame 0 forever, and no frame requests.
+    AnimatedView.with_id = false;
+    const anonymous = open_unpumped(&cx);
+    try std.testing.expect(!anonymous.window.animation_requested);
+    sleep(200 * std.time.ns_per_ms);
+    anonymous.window.draw(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
+    try std.testing.expect(!anonymous.window.animation_requested);
+
+    // A single-frame image never animates, even with an id.
+    AnimatedView.with_id = true;
+    const single = try image_with_delays(allocator, &.{150});
+    defer single.deinit();
+    AnimatedView.image = single;
+    const still = open_unpumped(&cx);
+    try std.testing.expect(!still.window.animation_requested);
+
+    // Reduced motion holds the current frame and asks for nothing.
+    cx.app.set_reduce_motion(true);
+    AnimatedView.image = animated;
+    const reduced = open_unpumped(&cx);
+    sleep(200 * std.time.ns_per_ms);
+    reduced.window.draw(cx.app);
+    try std.testing.expect(!reduced.window.animation_requested);
+    try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
+    cx.app.set_reduce_motion(false);
+
+    // A window that is not active holds its frame too.
+    reduced.window.active = false;
+    reduced.window.draw(cx.app);
+    try std.testing.expect(!reduced.window.animation_requested);
 }
