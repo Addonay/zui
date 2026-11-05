@@ -1,9 +1,11 @@
 //! Port of GPUI `elements/img.rs`: the `img()` element, a styled element that
 //! paints a decoded image with object-fit, grayscale and fallback support.
 //!
-//! Loads are synchronous (see `assets.zig`), so the `loading` state is stored
-//! for API parity but never shown. The fallback element is laid out and painted
-//! from `paint_ext`, since `StyledElement` has no prepaint hook for extensions.
+//! URLs load in the background (see `assets.zig`); `with_loading` shows while they do. GPUI waits
+//! `LOADING_DELAY` before showing it, which ZUI does not yet. Images load through the image cache
+//! in scope (`image_cache`, see `image_cache.zig`), or else through the app's own cache. The fallback
+//! element is laid out and painted from `paint_ext`, since `StyledElement` has no prepaint hook for
+//! extensions.
 
 const std = @import("std");
 const geometry = @import("../geometry.zig");
@@ -77,7 +79,7 @@ pub const ImgExt = struct {
         return self;
     }
 
-    /// Element shown while loading (GPUI `with_loading`). Loads are synchronous, so it is not shown yet.
+    /// Element shown while loading (GPUI `with_loading`).
     pub fn with_loading(self: anytype, f: *const fn () AnyElement) @TypeOf(self) {
         self.ext.loading_ = f;
         return self;
@@ -90,7 +92,7 @@ pub const ImgExt = struct {
         e.frame_index = 0;
         const source = e.source orelse return null;
 
-        const data = source.use_data(&cx.asset_cache, cx.asset_source) catch |err| {
+        const data = load_image(source, window, cx) catch |err| {
             const placeholder = if (err == error.Loading) e.loading_ else e.fallback_;
             if (placeholder) |build| {
                 const rep = build();
@@ -120,7 +122,7 @@ pub const ImgExt = struct {
             if (new_bounds.size.width <= 0 or new_bounds.size.height <= 0) return;
 
             var builder = ImageTile{ .image = data, .frame = frame };
-            const key = atlas.AtlasKey{ .image = image_key(data.id, frame) };
+            const key = atlas.AtlasKey{ .image = assets.image_atlas_key(data.id, frame) };
             const tile = (window.sprite_atlas.get_or_insert_with(key, .{ .context = &builder, .build_fn = ImageTile.build }) catch return) orelse return;
 
             const radii = s.corner_radii.to_pixels(window.rem_size()).clamp_radii_for_quad_size(visible.size);
@@ -202,10 +204,18 @@ const ImageTile = struct {
     }
 };
 
-/// Atlas key for one frame of an image: a hash of the image id and frame index.
-fn image_key(id: u64, frame: usize) u64 {
-    const parts = [_]u64{ id, frame };
-    return std.hash.Wyhash.hash(0x696d6720, std.mem.sliceAsBytes(&parts));
+/// Loads `source` (GPUI `ImageSource::use_data`). A URL, file or asset name goes through the image
+/// cache in scope, if an ancestor set one: that is where `null` means "still loading". Otherwise it
+/// goes through the app's own cache. A custom source is always asked, with this window.
+fn load_image(source: assets.ImageSource, window: *Window, cx: *App) assets.ImageCacheError!*assets.RenderImage {
+    switch (source) {
+        .resource => |resource| if (window.current_image_cache()) |cache| {
+            return cache.load(resource, window, cx) orelse error.Loading;
+        },
+        .custom => |custom| return custom.load_fn(custom.ptr, window, cx) orelse error.Loading,
+        else => {},
+    }
+    return source.use_data(&cx.asset_cache, cx.asset_source);
 }
 
 /// The part of `tile` that shows `visible`, where `image` is the full drawn rectangle (GPUI's sub-tile for clipped images).

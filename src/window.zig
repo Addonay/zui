@@ -19,6 +19,8 @@ const text_system_mod = @import("text_system.zig");
 const atlas_mod = @import("atlas.zig");
 const view_mod = @import("view.zig");
 const refineable = @import("refineable.zig");
+const assets_mod = @import("assets.zig");
+const image_cache_mod = @import("image_cache.zig");
 
 const App = app_mod.App;
 const EntityId = app_mod.EntityId;
@@ -519,6 +521,8 @@ pub const Window = struct {
     rendered_entities: std.AutoHashMapUnmanaged(EntityId, void) = .empty,
     next_rendered_entities: std.AutoHashMapUnmanaged(EntityId, void) = .empty,
     view_stack: std.ArrayList(EntityId) = .empty,
+    /// The image caches of the elements being laid out, innermost last (GPUI `image_cache_stack`).
+    image_cache_stack: std.ArrayList(image_cache_mod.AnyImageCache) = .empty,
     next_hitbox_id: HitboxId = 1,
     mouse_hit_test: HitTest = .{},
     mouse_position_: Point(Pixels) = .{ .x = 0, .y = 0 },
@@ -624,6 +628,7 @@ pub const Window = struct {
         self.rendered_entities.deinit(gpa);
         self.next_rendered_entities.deinit(gpa);
         self.view_stack.deinit(gpa);
+        self.image_cache_stack.deinit(gpa);
         self.mouse_hit_test.ids.deinit(gpa);
         self.next_frame_callbacks.deinit(gpa);
         free_keystrokes(gpa, &self.pending_keystrokes);
@@ -928,6 +933,40 @@ pub const Window = struct {
     pub fn current_view(self: *const Window) ?EntityId {
         if (self.view_stack.items.len == 0) return null;
         return self.view_stack.items[self.view_stack.items.len - 1];
+    }
+
+    // -- image caches and assets -----------------------------------------
+
+    pub fn push_image_cache(self: *Window, cache: image_cache_mod.AnyImageCache) void {
+        self.image_cache_stack.append(self.allocator, cache) catch oom();
+    }
+    pub fn pop_image_cache(self: *Window) void {
+        _ = self.image_cache_stack.pop();
+    }
+    /// The image cache in scope, if an ancestor set one (GPUI `image_cache_stack.last()`).
+    pub fn current_image_cache(self: *const Window) ?image_cache_mod.AnyImageCache {
+        const stack = self.image_cache_stack.items;
+        return if (stack.len == 0) null else stack[stack.len - 1];
+    }
+
+    /// The loaded `A` for `source`, or null while it loads. The current view is redrawn when it
+    /// arrives, and a load starts only once per source (GPUI `use_asset`).
+    pub fn use_asset(self: *Window, comptime A: type, source: A.Source, cx: *App) ?A.Output {
+        return cx.asset_loads.entry(A, source).use_by(self.current_view());
+    }
+
+    /// The loaded `A` for `source`, or null while it loads. Starts the load if needed, but does not
+    /// redraw when it arrives (GPUI `get_asset`).
+    pub fn get_asset(self: *Window, comptime A: type, source: A.Source, cx: *App) ?A.Output {
+        _ = self;
+        return cx.fetch_asset(A, source);
+    }
+
+    /// Removes this window's sprite atlas tiles for `image` (see `App.drop_image`).
+    pub fn forget_image(self: *Window, image: *const assets_mod.RenderImage) void {
+        for (0..image.frame_count()) |frame| {
+            self.sprite_atlas.remove(.{ .image = assets_mod.image_atlas_key(image.id, frame) });
+        }
     }
     /// Records that the current frame depends on `id` (redraws when it notifies).
     pub fn observe_entity_for_redraw(self: *Window, id: EntityId) void {

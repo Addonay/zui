@@ -16,6 +16,7 @@ const taffy = @import("../taffy.zig");
 const interactive = @import("../interactive.zig");
 const key_dispatch = @import("../key_dispatch.zig");
 const action_mod = @import("../action.zig");
+const image_cache_mod = @import("../image_cache.zig");
 
 const App = app_mod.App;
 const Window = window_mod.Window;
@@ -3743,6 +3744,8 @@ pub fn StyledElement(comptime Ext: type) type {
         interactivity: Interactivity = .{},
         children_list: element_mod.Children = .empty,
         ext: Ext = .{},
+        /// The image cache for the images under this element (set with `image_cache`).
+        image_cache_provider: ?image_cache_mod.ImageCacheProvider = null,
 
         pub const RequestLayoutState = DivFrameState;
         pub const PrepaintState = DivPrepaintState;
@@ -3759,6 +3762,13 @@ pub fn StyledElement(comptime Ext: type) type {
 
         pub fn children_mut(self: *Self) *element_mod.Children {
             return &self.children_list;
+        }
+
+        /// Sets the image cache for the images under this element (GPUI `image_cache`). Those images
+        /// load through it instead of the app's own cache; see `image_cache.zig`.
+        pub fn image_cache(self: *Self, provider: anytype) *Self {
+            self.image_cache_provider = image_cache_mod.ImageCacheProvider.from(provider);
+            return self;
         }
 
         pub fn element_id(self: *Self) ?ElementId {
@@ -4128,6 +4138,13 @@ pub fn StyledElement(comptime Ext: type) type {
             const has_text = s.text_style() != null;
             if (has_text) window.push_text_style(s.text);
             defer if (has_text) window.pop_text_style();
+
+            // Set before the element's own hook and its children, so `img` sees its own cache on top.
+            const pushed_cache = if (self.image_cache_provider) |provider| blk: {
+                window.push_image_cache(provider.provide(window, cx));
+                break :blk true;
+            } else false;
+            defer if (pushed_cache) window.pop_image_cache();
 
             if (@hasDecl(Ext, "request_layout_ext")) {
                 if (Ext.request_layout_ext(self, gid, &s, window, cx)) |lid| return .{ lid, .{} };
