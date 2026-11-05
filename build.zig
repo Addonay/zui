@@ -33,6 +33,9 @@ const examples = [_][]const u8{
     "on_window_close_quit",
     "window_movable",
     "window_shadow",
+    "window",
+    "window_positioning",
+    "move_entity_between_windows",
 };
 
 pub fn build(b: *std.Build) void {
