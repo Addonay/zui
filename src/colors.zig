@@ -65,6 +65,11 @@ pub const Colors = struct {
     }
 };
 
+/// The global holding the default colors (GPUI `GlobalColors`), set by `App.init_colors`.
+pub const GlobalColors = struct {
+    value: Colors,
+};
+
 test "light and dark palettes differ in background" {
     try std.testing.expect(Colors.light().background.to_u32() != Colors.dark().background.to_u32());
     try std.testing.expectEqual(@as(u32, 0xffffffff), Colors.default.background.to_u32());
