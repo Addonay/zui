@@ -97,8 +97,7 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 Each must run headless with a correct snapshot, and be driven for real: first frames hide most bugs.
 
 - [ ] mouse_pressure
-- [ ] window, window_positioning
-- [ ] move_entity_between_windows, toggle_headless
+- [ ] toggle_headless: needs switching windowing modes at runtime (`request_windowing`)
 - [ ] set_menus, system_notifications, layer_shell, a11y
 - [ ] paths_bench, testing
 
