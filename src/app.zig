@@ -15,6 +15,7 @@ const executor_mod = @import("executor.zig");
 const keymap_mod = @import("keymap.zig");
 const action_mod = @import("action.zig");
 const keystroke_mod = @import("keystroke.zig");
+const http_client_mod = @import("http_client.zig");
 const assets_mod = @import("assets.zig");
 const uniform_list_mod = @import("elements/uniform_list.zig");
 const list_mod = @import("elements/list.zig");
@@ -684,6 +685,16 @@ pub const App = struct {
         };
         app.async_app = .{ .app = app };
         app.foreground_executor_.app = app;
+        app.asset_cache.fetch_config = .{
+            .foreground = &app.foreground_executor_,
+            .on_settled_ctx = app,
+            .on_settled = struct {
+                fn redraw(ctx: *anyopaque) void {
+                    const self: *App = @ptrCast(@alignCast(ctx));
+                    self.refresh_windows();
+                }
+            }.redraw,
+        };
         return app;
     }
 
@@ -1337,6 +1348,20 @@ pub const Application = struct {
 
     /// Sets the source of named assets (GPUI `with_assets`). `source` is a pointer to a type with
     /// `load(path) ?[]const u8`, or an `assets.AssetSource`; it must outlive the app.
+    /// Sets the client that fetches remote images (GPUI `with_http_client`). The default is
+    /// built on `std.http`.
+    pub fn with_http_client(self: Application, client: http_client_mod.HttpClient) Application {
+        self.app.asset_cache.fetch_config.?.http_client = client;
+        return self;
+    }
+
+    /// Sets where downloaded images are saved so they show at once next time. The default is the
+    /// platform's per-user cache directory; `.off` saves nothing.
+    pub fn with_image_cache(self: Application, cache: assets_mod.DiskCache) Application {
+        self.app.asset_cache.fetch_config.?.disk_cache = cache;
+        return self;
+    }
+
     pub fn with_assets(self: Application, source: anytype) Application {
         self.app.asset_source = if (@TypeOf(source) == assets_mod.AssetSource) source else assets_mod.AssetSource.from(source);
         return self;

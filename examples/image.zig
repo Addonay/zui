@@ -3,9 +3,7 @@
 //! Differences from the Rust version:
 //! - Assets are embedded with `@embedFile` (see `Assets`) instead of read from `examples/`.
 //!   The local file is therefore loaded as an embedded asset, not as a path.
-//! - Remote images (`https://...`) are not fetched yet: ZUI's `Resource.uri` fails with
-//!   `UnsupportedUri`, so those `img` elements draw nothing.
-//! - `ReqwestClient` / `with_http_client` are not ported (no HTTP client in ZUI yet).
+//! - No `ReqwestClient`: ZUI has a built-in HTTP client, and `with_http_client` replaces it.
 //! - `set_menus` is not ported (not in ZUI yet).
 //! - Font loading (`example_support::load_fonts`) is not ported (no `TextSystem::add_fonts` yet).
 
