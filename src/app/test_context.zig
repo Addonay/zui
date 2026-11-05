@@ -1419,8 +1419,7 @@ fn wait_for_tooltip(vcx: *VisualTestContext, wanted: bool) !void {
     for (0..200) |_| {
         vcx.run_until_parked();
         if ((vcx.window.tooltip_bounds != null) == wanted) return;
-        var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
-        _ = std.os.linux.nanosleep(&ts, null);
+        @import("../executor.zig").sleep_ns(5 * std.time.ns_per_ms);
     }
     return error.TooltipTimedOut;
 }
@@ -1443,8 +1442,7 @@ test "tooltip: leaving before the delay means it never shows" {
     _, const vcx = cx.add_window_view(TooltipPage.build);
     vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
     vcx.simulate_mouse_move(.{ .x = 200, .y = 200 }, null, .{});
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 40 * std.time.ns_per_ms };
-    _ = std.os.linux.nanosleep(&ts, null);
+    @import("../executor.zig").sleep_ns(40 * std.time.ns_per_ms);
     vcx.run_until_parked();
     try std.testing.expect(vcx.window.tooltip_bounds == null);
 }
@@ -1482,8 +1480,7 @@ test "tooltip: a timer firing after its element is gone does nothing" {
     vcx.run_until_parked();
     vcx.window.refresh();
     vcx.run_until_parked();
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 30 * std.time.ns_per_ms };
-    _ = std.os.linux.nanosleep(&ts, null);
+    @import("../executor.zig").sleep_ns(30 * std.time.ns_per_ms);
     vcx.run_until_parked();
     try std.testing.expect(vcx.window.tooltip_bounds == null);
 }

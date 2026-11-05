@@ -165,7 +165,7 @@ pub fn AnimationElement(comptime E: type, comptime animator: anytype) type {
         }
 
         pub fn request_layout(self: *Self, gid: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, AnyElement } {
-            const now = now_ns();
+            const now = @import("../executor.zig").now_ns();
             const state = window.element_state(AnimationState, (gid orelse unreachable).*, .{ .start_ns = now });
             const frame = advance_animation(self.animations, state, now, cx.reduce_motion);
             const eased = self.animations[frame.animation_ix].easing(frame.delta);
@@ -218,7 +218,7 @@ pub fn SpringAnimationElement(comptime E: type, comptime T: type, comptime anima
         }
 
         pub fn request_layout(self: *Self, gid: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, AnyElement } {
-            const now = now_ns();
+            const now = @import("../executor.zig").now_ns();
             const target_value = spring.spring_target(self.target);
             const initial = self.initial orelse target_value;
             const state = window.element_state(SpringElementState, (gid orelse unreachable).*, .{
@@ -343,15 +343,6 @@ fn new_animation_element(comptime E: type, comptime animator: anytype, element: 
     const created = window_mod.frame_arena().create(Element) catch oom();
     created.* = .{ .key = ElementId.from(id), .element = element, .animations = animations };
     return created;
-}
-
-/// Monotonic time in nanoseconds, used to measure animation progress.
-fn now_ns() u64 {
-    var ts = std.mem.zeroes(std.os.linux.timespec);
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    const seconds: u64 = @intCast(ts.sec);
-    const nanoseconds: u64 = @intCast(ts.nsec);
-    return seconds * std.time.ns_per_s + nanoseconds;
 }
 
 fn oom() noreturn {

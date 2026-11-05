@@ -61,7 +61,13 @@ pub fn build(b: *std.Build) void {
 
     // Examples: `zig build run-<name>`.
     const check = b.step("check", "Compile everything without running");
-    check.dependOn(&tests.step);
+    if (target.result.os.tag == .macos) {
+        // The tests reach the Metal backend, whose libobjc is not available
+        // when cross-linking. Analyze them without linking until macOS is ported.
+        check.dependOn(&b.addTest(.{ .root_module = zui, .emit_object = true }).step);
+    } else {
+        check.dependOn(&tests.step);
+    }
     inline for (examples) |name| {
         const exe = b.addExecutable(.{
             .name = name,

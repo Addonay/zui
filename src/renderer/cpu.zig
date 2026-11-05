@@ -1503,11 +1503,7 @@ pub fn write_ppm(fb: Framebuffer, writer: anytype) !void {
 // Benchmark
 // ---------------------------------------------------------------------------
 
-fn now_ns() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-}
+const now_ns = @import("../executor.zig").now_ns;
 
 /// Builds `quad_count` random quads over a 1920x1080 scene and returns the mean nanoseconds per `draw`.
 /// Meaningful only in ReleaseFast builds.
