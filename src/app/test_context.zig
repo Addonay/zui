@@ -2639,6 +2639,15 @@ const Slow = struct {
         starts.store(0, .release);
         gate.store(open, .release);
     }
+
+    /// Loads run on workers, which may not have got to one yet when a frame has asked for it.
+    fn wait_for_starts(count: u32) !void {
+        for (0..5000) |_| {
+            if (starts.load(.acquire) >= count) break;
+            executor_mod.sleep_ns(std.time.ns_per_ms);
+        }
+        try std.testing.expectEqual(count, starts.load(.acquire));
+    }
 };
 
 /// An asset whose load always fails.
@@ -2708,7 +2717,7 @@ test "use_asset: none while loading, then the value once the window redraws" {
     SlowView.reset(4);
     _, const vcx = cx.add_window_view(SlowView.build);
     try std.testing.expectEqual(@as(?u32, null), SlowView.seen);
-    try std.testing.expectEqual(@as(u32, 1), Slow.starts.load(.acquire));
+    try Slow.wait_for_starts(1);
 
     Slow.gate.store(true, .release);
     try pump_until(vcx, slow_view_has_value);
@@ -2726,7 +2735,7 @@ test "use_asset: a load runs once per source, even across frames" {
         vcx.run_until_parked();
     }
     try std.testing.expect(SlowView.renders >= 5);
-    try std.testing.expectEqual(@as(u32, 1), Slow.starts.load(.acquire));
+    try Slow.wait_for_starts(1);
 
     Slow.gate.store(true, .release);
     try pump_until(vcx, slow_view_has_value);
@@ -2749,7 +2758,7 @@ test "remove_asset: the next use loads again, and an abandoned load is dropped" 
     try std.testing.expect(!cx.app.has_asset(Slow, 2));
     vcx.window.refresh();
     vcx.run_until_parked();
-    try std.testing.expectEqual(@as(u32, 2), Slow.starts.load(.acquire));
+    try Slow.wait_for_starts(2);
     try std.testing.expectEqual(@as(?u32, null), SlowView.seen);
 
     // Abandon that second load while it runs; its result must not come back into the cache.
@@ -3682,4 +3691,379 @@ test "app: background_spawn runs on a worker and its result can be waited for" {
     };
     var task = cx.app.background_spawn(Double.run, .{@as(u32, 21)});
     try std.testing.expectEqual(@as(u32, 42), task.wait());
+}
+
+// -- div: GPUI's listener and scroll APIs ---------------------------------
+
+/// A panel that hears drags of `Payload` from outside itself, leaving, file drops and scrolls.
+const MoveProbe = struct {
+    moves: usize = 0,
+    last_x: Pixels = -1,
+    last_bounds_x: Pixels = -1,
+    last_drag_n: u32 = 0,
+    exits: usize = 0,
+    file_exits: usize = 0,
+
+    fn on_drag_move(self: *MoveProbe, e: *const div_mod.DragMoveEvent(Payload), _: *Window, cx: *Context(MoveProbe)) void {
+        self.moves += 1;
+        self.last_x = e.event.position.x;
+        self.last_bounds_x = e.bounds.origin.x;
+        self.last_drag_n = e.drag(cx.app).n;
+    }
+    fn on_exit(self: *MoveProbe, _: *const interactive.MouseExitEvent, _: *Window, _: *Context(MoveProbe)) void {
+        self.exits += 1;
+    }
+    fn on_file_exit(self: *MoveProbe, _: *const interactive.FileDropEvent, _: *Window, _: *Context(MoveProbe)) void {
+        self.file_exits += 1;
+    }
+    fn make_preview(value: *const Payload, _: Point(Pixels), _: *Window, cx: *App) Entity(DragPreview) {
+        return cx.new(DragPreview{ .n = value.n });
+    }
+    fn make_other_preview(_: *const u8, _: Point(Pixels), _: *Window, cx: *App) Entity(DragPreview) {
+        return cx.new(DragPreview{ .n = 0 });
+    }
+    pub fn render(_: *MoveProbe, _: *Window, cx: *Context(MoveProbe)) *Div {
+        return div().size(px(300)).child(
+            div().id("source").absolute().left(px(0)).top(px(0)).w(px(50)).h(px(50))
+                .on_drag(Payload{ .n = 7 }, make_preview),
+        ).child(
+            div().id("other").absolute().left(px(0)).top(px(60)).w(px(50)).h(px(50))
+                .on_drag(@as(u8, 1), make_other_preview),
+        ).child(
+            div().id("panel").absolute().left(px(100)).top(px(0)).w(px(100)).h(px(100))
+                .on_drag_move(Payload, cx.listener(on_drag_move))
+                .on_mouse_exit(cx.listener(on_exit))
+                .on_file_drop_exit(cx.listener(on_file_exit)),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(MoveProbe) {
+        return app.new(MoveProbe{});
+    }
+};
+
+test "drag move: reaches the listener while the pointer is outside its element, with that element's bounds" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(MoveProbe.build);
+    start_drag(vcx);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).moves);
+    vcx.simulate_mouse_move(.{ .x = 180, .y = 150 }, .left, .{});
+    vcx.run_until_parked();
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), page.moves);
+    try std.testing.expectEqual(@as(Pixels, 180), page.last_x);
+    try std.testing.expectEqual(@as(Pixels, 100), page.last_bounds_x);
+    try std.testing.expectEqual(@as(u32, 7), page.last_drag_n);
+    vcx.simulate_mouse_up(.{ .x = 180, .y = 150 }, .left, .{});
+    vcx.run_until_parked();
+}
+
+test "drag move: keeps hearing moves until the drag ends, and not after the release" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(MoveProbe.build);
+    start_drag(vcx);
+    vcx.simulate_mouse_move(.{ .x = 150, .y = 50 }, .left, .{});
+    vcx.simulate_mouse_move(.{ .x = 260, .y = 250 }, .left, .{});
+    try std.testing.expectEqual(@as(usize, 2), view.read(cx.app).moves);
+    vcx.simulate_mouse_up(.{ .x = 260, .y = 250 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    vcx.simulate_mouse_move(.{ .x = 150, .y = 50 }, null, .{});
+    try std.testing.expectEqual(@as(usize, 2), view.read(cx.app).moves);
+}
+
+test "drag move: a drag of another type never reaches the listener" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(MoveProbe.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 70 }, null, .{});
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 70 }, .left, .{});
+    vcx.simulate_mouse_move(.{ .x = 30, .y = 70 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expect(cx.app.has_active_drag());
+    vcx.simulate_mouse_move(.{ .x = 150, .y = 50 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).moves);
+    vcx.simulate_mouse_up(.{ .x = 150, .y = 50 }, .left, .{});
+    vcx.run_until_parked();
+}
+
+test "mouse exit: fires when the pointer leaves from inside the element, and not from outside it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(MoveProbe.build);
+    vcx.simulate_mouse_move(.{ .x = 150, .y = 50 }, null, .{});
+    vcx.simulate_event(.{ .mouse_exited = .{ .position = .{ .x = 150, .y = 50 } } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).exits);
+    vcx.simulate_event(.{ .mouse_exited = .{ .position = .{ .x = 290, .y = 290 } } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).exits);
+}
+
+test "file drop exit: fires when a file drag leaves while over the element only" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(MoveProbe.build);
+    const paths = [_][]const u8{"/tmp/a.txt"};
+    vcx.simulate_event(.{ .file_drop = .{ .entered = .{ .position = .{ .x = 290, .y = 290 }, .paths = .{ .items = &paths } } } });
+    vcx.simulate_event(.{ .file_drop = .exited });
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).file_exits);
+    vcx.simulate_event(.{ .file_drop = .{ .entered = .{ .position = .{ .x = 150, .y = 50 }, .paths = .{ .items = &paths } } } });
+    vcx.simulate_event(.{ .file_drop = .exited });
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).file_exits);
+}
+
+/// Two scroll containers, one inside the other.
+const NestedScroll = struct {
+    outer: div_mod.ScrollHandle,
+    inner: div_mod.ScrollHandle,
+
+    pub fn render(self: *NestedScroll, _: *Window, _: *Context(NestedScroll)) *Div {
+        return div().size(px(300)).child(
+            div().id("outer").absolute().left(px(0)).top(px(0)).w(px(100)).h(px(100)).overflow_y_scroll().track_scroll(&self.outer).child(
+                div().w(px(100)).h(px(300)).child(
+                    div().id("inner").w(px(100)).h(px(100)).overflow_y_scroll().track_scroll(&self.inner).child(
+                        div().w(px(100)).h(px(300)),
+                    ),
+                ),
+            ),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(NestedScroll) {
+        return app.new(NestedScroll{
+            .outer = div_mod.ScrollHandle.new(std.heap.page_allocator),
+            .inner = div_mod.ScrollHandle.new(std.heap.page_allocator),
+        });
+    }
+};
+
+test "scroll: a wheel over nested scrollers moves both, as GPUI does, since neither stops it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(NestedScroll.build);
+    vcx.simulate_scroll(.{ .x = 10, .y = 10 }, .{ .x = 0, .y = -30 });
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(Pixels, -30), page.inner.offset().y);
+    try std.testing.expectEqual(@as(Pixels, -30), page.outer.offset().y);
+}
+
+/// Scroll containers that differ only in the axis rules.
+const AxisScroll = struct {
+    plain: div_mod.ScrollHandle,
+    restricted: div_mod.ScrollHandle,
+    dominant: div_mod.ScrollHandle,
+    concurrent: div_mod.ScrollHandle,
+
+    pub fn render(self: *AxisScroll, _: *Window, _: *Context(AxisScroll)) *Div {
+        return div().size(px(400)).child(
+            div().id("plain").absolute().left(px(0)).top(px(0)).w(px(100)).h(px(100)).overflow_x_scroll().track_scroll(&self.plain).child(div().w(px(300)).h(px(300))),
+        ).child(
+            div().id("restricted").absolute().left(px(120)).top(px(0)).w(px(100)).h(px(100)).overflow_x_scroll().restrict_scroll_to_axis().track_scroll(&self.restricted).child(div().w(px(300)).h(px(300))),
+        ).child(
+            div().id("dominant").absolute().left(px(0)).top(px(150)).w(px(100)).h(px(100)).overflow_scroll().track_scroll(&self.dominant).child(div().w(px(300)).h(px(300))),
+        ).child(
+            div().id("concurrent").absolute().left(px(120)).top(px(150)).w(px(100)).h(px(100)).overflow_scroll().allow_concurrent_scroll().track_scroll(&self.concurrent).child(div().w(px(300)).h(px(300))),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(AxisScroll) {
+        return app.new(AxisScroll{
+            .plain = div_mod.ScrollHandle.new(std.heap.page_allocator),
+            .restricted = div_mod.ScrollHandle.new(std.heap.page_allocator),
+            .dominant = div_mod.ScrollHandle.new(std.heap.page_allocator),
+            .concurrent = div_mod.ScrollHandle.new(std.heap.page_allocator),
+        });
+    }
+};
+
+test "scroll: a vertical wheel moves a horizontal-only container, unless it is restricted to its axis" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(AxisScroll.build);
+    vcx.simulate_scroll(.{ .x = 10, .y = 10 }, .{ .x = 0, .y = -30 });
+    vcx.simulate_scroll(.{ .x = 130, .y = 10 }, .{ .x = 0, .y = -30 });
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(Pixels, -30), page.plain.offset().x);
+    try std.testing.expectEqual(@as(Pixels, 0), page.restricted.offset().x);
+}
+
+test "scroll: only the dominant axis moves unless concurrent scrolling is allowed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(AxisScroll.build);
+    vcx.simulate_scroll(.{ .x = 10, .y = 160 }, .{ .x = -10, .y = -30 });
+    vcx.simulate_scroll(.{ .x = 130, .y = 160 }, .{ .x = -10, .y = -30 });
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(Pixels, 0), page.dominant.offset().x);
+    try std.testing.expectEqual(@as(Pixels, -30), page.dominant.offset().y);
+    try std.testing.expectEqual(@as(Pixels, -10), page.concurrent.offset().x);
+    try std.testing.expectEqual(@as(Pixels, -30), page.concurrent.offset().y);
+}
+
+/// A 10-item scroll container of 100px, its items 50px each.
+const ItemScroll = struct {
+    scroll: div_mod.ScrollHandle,
+
+    pub fn render(self: *ItemScroll, _: *Window, _: *Context(ItemScroll)) *Div {
+        var d = div().id("items").w(px(100)).h(px(100)).overflow_y_scroll().track_scroll(&self.scroll);
+        for (0..10) |_| d = d.child(div().w(px(100)).h(px(50)));
+        return d;
+    }
+    fn build(_: *Window, app: *App) Entity(ItemScroll) {
+        return app.new(ItemScroll{ .scroll = div_mod.ScrollHandle.new(std.heap.page_allocator) });
+    }
+};
+
+test "scroll handle: scroll_to_item, scroll_to_top_of_item and scroll_to_bottom move the list in the next frame" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ItemScroll.build);
+    vcx.run_until_parked();
+    const handle = view.read(cx.app).scroll;
+
+    // Child 5 spans 250 to 300: scrolling the least needed puts its bottom at the viewport's bottom.
+    handle.scroll_to_item(5);
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(Pixels, -200), handle.offset().y);
+
+    handle.scroll_to_top_of_item(3);
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(Pixels, -150), handle.offset().y);
+
+    handle.scroll_to_bottom();
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(Pixels, -400), handle.offset().y);
+}
+
+test "scroll handle: top_item, bottom_item and logical_scroll_top read the items at each offset" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ItemScroll.build);
+    vcx.run_until_parked();
+    const handle = view.read(cx.app).scroll;
+    // Offset 175 puts the top at 175, in item 3 (150 to 200), and the bottom at 275, in item 5 (250 to 300).
+    handle.set_offset(.{ .x = 0, .y = -175 });
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 3), handle.top_item());
+    try std.testing.expectEqual(@as(usize, 5), handle.bottom_item());
+    const top_ix, const top_px = handle.logical_scroll_top();
+    try std.testing.expectEqual(@as(usize, 3), top_ix);
+    try std.testing.expectEqual(@as(Pixels, -25), top_px);
+}
+
+/// A tall scroll container with an element far down it, which an anchor brings into view.
+const AnchoredScroll = struct {
+    handle: div_mod.ScrollHandle,
+    anchor: div_mod.ScrollAnchor,
+
+    pub fn render(self: *AnchoredScroll, _: *Window, _: *Context(AnchoredScroll)) *Div {
+        return div().id("scroll").w(px(100)).h(px(100)).overflow_y_scroll().track_scroll(&self.handle).child(
+            div().w(px(100)).h(px(250)),
+        ).child(
+            div().id("target").w(px(100)).h(px(50)).anchor_scroll(self.anchor),
+        ).child(
+            div().w(px(100)).h(px(300)),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(AnchoredScroll) {
+        const handle = div_mod.ScrollHandle.new(std.heap.page_allocator);
+        return app.new(AnchoredScroll{ .handle = handle, .anchor = div_mod.ScrollAnchor.for_handle(handle) });
+    }
+};
+
+test "anchor: scroll_to brings the anchored element to the top of the scroll container" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(AnchoredScroll.build);
+    vcx.run_until_parked();
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(Pixels, 0), page.handle.offset().y);
+    page.anchor.scroll_to(vcx.window, cx.app);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(Pixels, -250), page.handle.offset().y);
+}
+
+/// Three canvases in wrappers, whose prepaint order and bounds a parent records.
+const Children = struct {
+    /// What a canvas does when prepainted: note its id in the owner's order.
+    const Tag = struct { owner: *Children, id: usize };
+
+    tags: [3]Tag = undefined,
+    /// The canvas ids in the order they prepainted in the last frame.
+    frame_order: [3]usize = .{ 99, 99, 99 },
+    /// Filled while the frame prepaints, then copied into `frame_order` by the listener.
+    order_now: [3]usize = undefined,
+    order_count: usize = 0,
+    bounds_count: usize = 0,
+    bounds_y: [3]Pixels = .{ -1, -1, -1 },
+
+    fn on_tag(tag: *Tag, _: geometry.Bounds(Pixels), _: *Window, _: *App) void {
+        tag.owner.order_now[tag.owner.order_count] = tag.id;
+        tag.owner.order_count += 1;
+    }
+    fn paint_tag(_: *Tag, _: geometry.Bounds(Pixels), _: *void, _: *Window, _: *App) void {}
+
+    fn on_prepainted(self: *Children, e: *const div_mod.PrepaintedChildren, _: *Window, _: *Context(Children)) void {
+        self.bounds_count = e.bounds.len;
+        for (e.bounds, 0..) |b, i| self.bounds_y[i] = b.origin.y;
+        self.frame_order = self.order_now;
+        self.order_count = 0;
+    }
+    fn order(_: *Window, _: *App) []const usize {
+        return &.{ 2, 0, 1 };
+    }
+    pub fn render(self: *Children, _: *Window, cx: *Context(Children)) *Div {
+        var d = div().flex_col().size(px(100)).on_children_prepainted(cx.listener(on_prepainted)).with_dynamic_prepaint_order(order);
+        for (0..3) |i| {
+            self.tags[i] = .{ .owner = self, .id = i };
+            d = d.child(div().w(px(20)).h(px(20)).child(canvas_mod.canvas(&self.tags[i], on_tag, paint_tag)));
+        }
+        return d;
+    }
+    fn build(_: *Window, app: *App) Entity(Children) {
+        return app.new(Children{});
+    }
+};
+
+test "children: on_children_prepainted hears the bounds of every child, in child order" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Children.build);
+    vcx.run_until_parked();
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(usize, 3), page.bounds_count);
+    try std.testing.expectEqual(@as(Pixels, 0), page.bounds_y[0]);
+    try std.testing.expectEqual(@as(Pixels, 20), page.bounds_y[1]);
+    try std.testing.expectEqual(@as(Pixels, 40), page.bounds_y[2]);
+}
+
+test "children: with_dynamic_prepaint_order prepaints the children in the order returned" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Children.build);
+    vcx.run_until_parked();
+    try std.testing.expectEqualSlices(usize, &.{ 2, 0, 1 }, &view.read(cx.app).frame_order);
+}
+
+test "pixel_snap: values round half toward zero to the device pixel" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Children.build);
+    const win = vcx.window;
+    const sf = win.scale_factor();
+    // In device pixels: 10.4 rounds to 10, and -10.4 to -10.
+    const x: Pixels = 10.4 / sf;
+    try std.testing.expectApproxEqAbs(@as(f32, 10) / sf, win.pixel_snap(x), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -10) / sf, win.pixel_snap(-x), 0.0001);
+    // Exactly half rounds toward zero: 2.5 to 2, and -2.5 to -2 (scale 1 or 2 keeps it exact).
+    try std.testing.expectEqual(@as(f64, 2) / @as(f64, sf), win.pixel_snap_f64(2.5 / @as(f64, sf)));
+    const b = win.pixel_snap_bounds(.{ .origin = .{ .x = 1.6 / sf, .y = 0 }, .size = .{ .width = 2.4 / sf, .height = 2.6 / sf } });
+    try std.testing.expectApproxEqAbs(@as(f32, 2) / sf, b.origin.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2) / sf, b.size.width, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3) / sf, b.size.height, 0.0001);
 }

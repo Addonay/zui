@@ -106,6 +106,8 @@ pub const UniformListScrollState = struct {
     deferred_scroll_to_item: ?DeferredScrollToItem = null,
     /// Size of the item, captured during last layout.
     last_item_size: ?ItemSize = null,
+    /// The height of one item, from the last layout.
+    item_height: Pixels = 0,
     /// Whether the list was vertically flipped during last layout.
     y_flipped: bool = false,
 };
@@ -163,6 +165,18 @@ pub const UniformListScrollHandle = struct {
 
     pub fn scroll_to_bottom(self: UniformListScrollHandle) void {
         self.scroll_to_item(std.math.maxInt(usize), .bottom);
+    }
+
+    /// The item at the top of the list, or the item a pending scroll is going to (GPUI
+    /// `logical_scroll_top_index`, which is test-only there). GPUI reads this from the child bounds of
+    /// the visible items; items here are uniform, so the offset and the item height give the same index.
+    pub fn logical_scroll_top_index(self: UniformListScrollHandle) usize {
+        if (self.state.deferred_scroll_to_item) |deferred| return deferred.item_index;
+        const item_height = self.state.item_height;
+        if (item_height <= 0) return 0;
+        const offset = self.state.base_handle.offset();
+        const index = @floor(-offset.y / item_height);
+        return if (index <= 0) 0 else @intFromFloat(index);
     }
 };
 
@@ -363,6 +377,7 @@ pub const UniformList = struct {
         var shared_scroll_to_item: ?DeferredScrollToItem = null;
         if (self.scroll_handle) |handle| {
             handle.state.last_item_size = .{ .item = padded_bounds.size, .contents = content_size };
+            handle.state.item_height = longest_item_size.height;
             shared_scroll_to_item = handle.state.deferred_scroll_to_item;
             handle.state.deferred_scroll_to_item = null;
         }
@@ -3919,6 +3934,47 @@ test "uniform_list: scroll strategy nearest only scrolls when the selection leav
         try std.testing.expectEqual(ix, v.index);
         try std.testing.expectEqual(Range{ .start = ix, .end = ix + 10 }, v.visible_range);
     }
+}
+
+test "uniform_list: logical_scroll_top_index is the pending target, then the first visible item" {
+    const TestView = struct {
+        const Self = @This();
+        scroll_handle: UniformListScrollHandle,
+        visible_range: Range = .{},
+
+        fn build(_: *Window, app: *App) Entity(Self) {
+            return app.new(Self{ .scroll_handle = UniformListScrollHandle.new() });
+        }
+
+        fn render_items(self: *Self, range: Range, _: *Window, _: *Context(Self)) []AnyElement {
+            self.visible_range = range;
+            const items = window_mod.frame_arena().alloc(AnyElement, range.len()) catch oom();
+            for (range.start..range.end, 0..) |ix, i| {
+                items[i] = div.div().id(ix).h(geometry.px(20)).child(window_mod.format("Item {d}", .{ix})).into_any_element();
+            }
+            return items;
+        }
+
+        pub fn render(self: *Self, _: *Window, cx: *Context(Self)) *Div {
+            return div.div().size_full().child(uniform_list("entries", 47, cx.processor(render_items))
+                .track_scroll(&self.scroll_handle)
+                .h(geometry.px(200)));
+        }
+    };
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(TestView.build);
+    vcx.run_until_parked();
+    const handle = view.read(cx.app).scroll_handle;
+    // Before the frame that scrolls, the answer is the item asked for.
+    handle.scroll_to_item(20, .top);
+    try std.testing.expectEqual(@as(usize, 20), handle.logical_scroll_top_index());
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    // Once it is drawn, the top visible item is.
+    try std.testing.expectEqual(@as(usize, 20), view.read(cx.app).visible_range.start);
+    try std.testing.expectEqual(@as(usize, 20), handle.logical_scroll_top_index());
 }
 
 test "uniform_list: item positions stay exact far down a 10 million item list" {
