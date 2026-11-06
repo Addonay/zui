@@ -928,6 +928,12 @@ pub const Connection = struct {
         return connect(allocator, address);
     }
 
+    /// Connects to the system bus named by DBUS_SYSTEM_BUS_ADDRESS, or to its default socket.
+    pub fn connect_system(allocator: std.mem.Allocator) Error!*Connection {
+        if (std.c.getenv("DBUS_SYSTEM_BUS_ADDRESS")) |v| return connect(allocator, std.mem.span(v));
+        return connect(allocator, "unix:path=/var/run/dbus/system_bus_socket");
+    }
+
     pub fn deinit(self: *Connection) void {
         if (self.fd >= 0) _ = linux.close(self.fd);
         self.out.deinit(self.allocator);

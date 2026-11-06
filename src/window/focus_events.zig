@@ -90,6 +90,8 @@ pub fn after_draw(window: *Window, cx: *App, previous: []FocusId, previous_activ
     // GPUI runs the lost listeners first, and it does so on the raw paths: an inactive window
     // still counts as losing its focus.
     if (previous.len > 0 and current.len == 0) {
+        window.focus_lost_path = previous;
+        defer window.focus_lost_path = &.{};
         cx.dispatch_window_payload(.focus_lost, window, &payload);
     }
     cx.dispatch_window_payload(.focus, window, &payload);

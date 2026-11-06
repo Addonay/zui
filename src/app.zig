@@ -979,6 +979,8 @@ const SubscriberKind = enum {
     global,
     window_closed,
     window_appearance,
+    /// The titlebar button layout of a window changed (`Window.observe_button_layout_changed`).
+    window_button_layout,
     window_bounds,
     window_activation,
     /// A window's focus changed (`Context.on_focus` and its siblings).
@@ -1168,6 +1170,8 @@ pub const App = struct {
     /// The drag following the pointer, across all windows.
     active_drag: ?AnyDrag = null,
     platform: *platform_mod.Platform,
+    /// The last power mode the platform reported (GPUI `App::power_mode`), kept current by the listener.
+    power_mode_: platform_mod.PowerMode = .unknown,
     system_notification_response: ?SystemNotificationHandler = null,
     /// The binary `restart` starts instead of this one (GPUI `set_restart_path`). Owned.
     restart_path: ?[]u8 = null,
@@ -1234,6 +1238,7 @@ pub const App = struct {
             .actions = action_mod.ActionRegistry.init(allocator),
         };
         app.async_app = .{ .app = app };
+        platform.on_power_mode_change(.{ .ctx = app, .func = App.on_power_mode_changed });
         app.synced_animation_epoch = executor_mod.now_ns();
         app.foreground_executor_.app = app;
         app.asset_loads = asset_cache_mod.AssetLoads.init(allocator, app, &app.foreground_executor_);
@@ -2096,6 +2101,15 @@ pub const App = struct {
         }
     }
 
+    pub fn dispatch_window_button_layout(self: *App, win: *Window) void {
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != .window_button_layout or sub.emitter != @as(u64, win.handle_id)) continue;
+            if (!sub.func(self, EntityId.from_u64(0), sub.ctx, win)) self.subscribers.items[i].active = false;
+        }
+    }
+
     pub fn add_window_subscriber(self: *App, kind: SubscriberKind, window_id: window_mod.WindowId, ctx: usize, func: SubscriberFn) Subscription {
         return self.add_subscriber(.{ .kind = kind, .emitter = @as(u64, window_id), .ctx = ctx, .func = func, .id = 0 });
     }
@@ -2429,6 +2443,16 @@ pub const App = struct {
     }
 
     /// The host OS and application target (GPUI `platform_info`).
+    /// The operating system's power mode, or `unknown` where the platform cannot tell (GPUI `App::power_mode`).
+    pub fn power_mode(self: *App) platform_mod.PowerMode {
+        return self.power_mode_;
+    }
+
+    fn on_power_mode_changed(raw: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(raw));
+        self.power_mode_ = self.platform.power_mode();
+    }
+
     pub fn platform_info(self: *App) platform_mod.PlatformInfo {
         return self.platform.platform_info();
     }

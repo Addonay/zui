@@ -28,6 +28,8 @@ const color_scheme_key = "color-scheme";
 const desktop_namespace = "org.gnome.desktop.interface";
 const cursor_theme_key = "cursor-theme";
 const cursor_size_key = "cursor-size";
+const wm_namespace = "org.gnome.desktop.wm.preferences";
+const button_layout_key = "button-layout";
 
 const response_rule = "type='signal',sender='org.freedesktop.portal.Desktop'," ++
     "interface='org.freedesktop.portal.Request',member='Response'";
@@ -66,6 +68,9 @@ pub const Setting = union(enum) {
     /// The cursor theme's name. Valid during the callback only.
     cursor_theme: []const u8,
     cursor_size: u32,
+    /// The titlebar button layout, as the desktop writes it (`close,minimize:maximize`). Valid during
+    /// the callback only.
+    button_layout: []const u8,
 };
 
 /// Receives settings as they are read and as they change. Valid for the state's lifetime.
@@ -267,6 +272,7 @@ pub const State = struct {
         try read_setting(bus, appearance_namespace, color_scheme_key, dbus.Handler.of(self, on_read_color_scheme));
         try read_setting(bus, desktop_namespace, cursor_theme_key, dbus.Handler.of(self, on_read_cursor_theme));
         try read_setting(bus, desktop_namespace, cursor_size_key, dbus.Handler.of(self, on_read_cursor_size));
+        try read_setting(bus, wm_namespace, button_layout_key, dbus.Handler.of(self, on_read_button_layout));
     }
 
     fn read_setting(bus: *dbus.Connection, namespace: []const u8, key: []const u8, handler: dbus.Handler) dbus.Error!void {
@@ -476,6 +482,10 @@ pub const State = struct {
         self.on_read(desktop_namespace, cursor_theme_key, msg);
     }
 
+    fn on_read_button_layout(self: *State, msg: *const dbus.Message) void {
+        self.on_read(wm_namespace, button_layout_key, msg);
+    }
+
     fn on_read_cursor_size(self: *State, msg: *const dbus.Message) void {
         self.on_read(desktop_namespace, cursor_size_key, msg);
     }
@@ -563,6 +573,9 @@ fn to_setting(namespace: []const u8, key: []const u8, value: dbus.Value) ?Settin
     }
     if (std.mem.eql(u8, namespace, desktop_namespace) and std.mem.eql(u8, key, cursor_theme_key)) {
         return .{ .cursor_theme = as_string(value) orelse return null };
+    }
+    if (std.mem.eql(u8, namespace, wm_namespace) and std.mem.eql(u8, key, button_layout_key)) {
+        return .{ .button_layout = as_string(value) orelse return null };
     }
     if (std.mem.eql(u8, namespace, desktop_namespace) and std.mem.eql(u8, key, cursor_size_key)) {
         const size = switch (value) {
@@ -838,6 +851,13 @@ fn answer_read(server: *Server, msg: dbus.Message, script: *Script) !void {
         try enc.end_variant();
         try enc.end_variant();
         try server.reply(msg, "v", enc.written());
+    } else if (std.mem.eql(u8, ns, wm_namespace) and std.mem.eql(u8, key, button_layout_key)) {
+        try enc.begin_variant("v");
+        try enc.begin_variant("s");
+        try enc.string("close,minimize,maximize:");
+        try enc.end_variant();
+        try enc.end_variant();
+        try server.reply(msg, "v", enc.written());
     } else if (std.mem.eql(u8, ns, desktop_namespace) and std.mem.eql(u8, key, cursor_size_key)) {
         try enc.begin_variant("v");
         try enc.begin_variant("i");
@@ -1019,6 +1039,8 @@ const Settings = struct {
     scheme_count: usize = 0,
     theme: [64]u8 = undefined,
     theme_len: ?usize = null,
+    layout: [64]u8 = undefined,
+    layout_len: ?usize = null,
     size: ?u32 = null,
 
     fn on_setting(ctx: *anyopaque, setting: Setting) void {
@@ -1033,6 +1055,10 @@ const Settings = struct {
                 self.theme_len = name.len;
             },
             .cursor_size => |n| self.size = n,
+            .button_layout => |text| {
+                @memcpy(self.layout[0..text.len], text);
+                self.layout_len = text.len;
+            },
         }
     }
 
@@ -1286,6 +1312,7 @@ test "portal: the color scheme is read, then followed when it changes" {
     try testing.expectEqual(platform.WindowAppearance.light, settings.scheme.?);
     try testing.expectEqualStrings("Adwaita", settings.theme[0..settings.theme_len.?]);
     try testing.expectEqual(@as(?u32, 24), settings.size);
+    try testing.expectEqualStrings("close,minimize,maximize:", settings.layout[0..settings.layout_len.?]);
 }
 
 test "portal: a malformed color scheme reply is ignored, the other settings still arrive" {
@@ -1319,4 +1346,10 @@ test "portal: file URIs become paths, percent-decoded, and other URIs are not pa
     try testing.expectEqual(@as(?[]const u8, null), file_uri_to_path("https://example.com/a", &buf));
     try testing.expectEqual(@as(?[]const u8, null), file_uri_to_path("file:relative", &buf));
     try testing.expectEqual(@as(?[]const u8, null), file_uri_to_path("file:///long", buf[0..3]));
+}
+
+test "settings: the titlebar button layout is a string setting, and anything else is ignored" {
+    const layout = to_setting(wm_namespace, button_layout_key, .{ .string = "close:maximize" }).?;
+    try std.testing.expectEqualStrings("close:maximize", layout.button_layout);
+    try std.testing.expect(to_setting(wm_namespace, button_layout_key, .{ .uint32 = 1 }) == null);
 }
