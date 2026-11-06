@@ -34,6 +34,62 @@ const Hsla = color.Hsla;
 /// Window background used when a frame is cleared (GPUI default dark theme).
 const clear_color: Hsla = color.to_hsla(color.rgb(0x0e0e13));
 
+/// The clear of a frame: the window color for an opaque window, transparent for others (GPUI clears
+/// a transparent window to transparent and leaves the content to the app).
+fn frame_clear(background: window_mod.WindowBackgroundAppearance) Hsla {
+    return if (background == .@"opaque") clear_color else color.transparent_black();
+}
+
+/// A pixel rectangle in surface coordinates.
+pub const IRect = struct { x: i32, y: i32, width: i32, height: i32 };
+
+fn clamp_radius(radius: f32, area: IRect) i32 {
+    // Pixels::to_i32 truncates. The radius is capped to what fits in the area; the cap of 2^30 keeps
+    // the float-to-int conversion in range for any radius (NaN and negatives mean none).
+    const r: i32 = if (radius > 0) @intFromFloat(@min(radius, 1 << 30)) else 0;
+    return @min(r, @min(@divTrunc(area.width, 2), @divTrunc(area.height, 2)));
+}
+
+/// How far a rounded corner of `radius` cuts into row `row` from its outer edge.
+fn corner_inset(radius: i32, row: i32) i32 {
+    if (row >= radius) return 0;
+    const r: f64 = @floatFromInt(radius);
+    const y = r - (@as(f64, @floatFromInt(row)) + 0.5);
+    const x = @sqrt(r * r - y * y);
+    return @intFromFloat(@ceil(r - x - 0.5));
+}
+
+/// Calls `add` with rectangles covering `area` with its corners rounded by `radii` (GPUI
+/// `add_rounded_rect`): one-pixel rows along each rounded edge, then the middle band.
+pub fn add_rounded_rect(area: IRect, radii: geometry.Corners(f32), context: anytype, comptime add: fn (@TypeOf(context), IRect) void) void {
+    if (area.width <= 0 or area.height <= 0) return;
+    const top_left = clamp_radius(radii.top_left, area);
+    const top_right = clamp_radius(radii.top_right, area);
+    const bottom_left = clamp_radius(radii.bottom_left, area);
+    const bottom_right = clamp_radius(radii.bottom_right, area);
+
+    const corners = [2]struct { left: i32, right: i32, bottom: bool }{
+        .{ .left = top_left, .right = top_right, .bottom = false },
+        .{ .left = bottom_left, .right = bottom_right, .bottom = true },
+    };
+    for (corners) |corner| {
+        var row: i32 = 0;
+        while (row < @max(corner.left, corner.right)) : (row += 1) {
+            const left_inset = corner_inset(corner.left, row);
+            const right_inset = corner_inset(corner.right, row);
+            const width = area.width - left_inset - right_inset;
+            if (width <= 0) continue;
+            const y = if (corner.bottom) area.y + area.height - row - 1 else area.y + row;
+            add(context, .{ .x = area.x + left_inset, .y = y, .width = width, .height = 1 });
+        }
+    }
+
+    const top_height = @max(top_left, top_right);
+    const bottom_height = @max(bottom_left, bottom_right);
+    const height = area.height - top_height - bottom_height;
+    if (height > 0) add(context, .{ .x = area.x, .y = area.y + top_height, .width = area.width, .height = height });
+}
+
 /// wl_output events (version 3 is bound: geometry, mode, done, scale).
 const OutputListener = extern struct {
     geometry: ?*const fn (?*anyopaque, *anyopaque, i32, i32, i32, i32, i32, ?[*:0]const u8, ?[*:0]const u8, i32) callconv(.c) void = null,
@@ -73,6 +129,10 @@ const SurfaceListener = extern struct {
 };
 
 const surface_listener: SurfaceListener = .{ .enter = surfaceEnter, .leave = surfaceLeave };
+
+const background_effect_manager_listener: proto.BackgroundEffectManagerListener = .{ .capabilities = backgroundEffectCapabilities };
+
+fn backgroundEffectCapabilities(_: ?*anyopaque, _: *anyopaque, _: u32) callconv(.c) void {}
 
 /// Clipboard and selection MIME types we offer and accept.
 const MIME_UTF8: [*:0]const u8 = "text/plain;charset=utf-8";
@@ -172,6 +232,8 @@ pub const WaylandConnection = struct {
     dec_manager: ?*proto.DecorationManager = null,
     viewporter: ?*anyopaque = null,
     frac_manager: ?*anyopaque = null,
+    /// ext-background-effect-v1's manager, for blurred windows. Null when the compositor lacks it.
+    background_effects: ?*anyopaque = null,
     outputs: [max_outputs]Output = @splat(.{}),
     displays_: [max_outputs]Display = undefined,
     display_count: usize = 0,
@@ -528,6 +590,7 @@ pub const WaylandConnection = struct {
         if (self.data_device) |dd| self.api.wl_proxy_destroy(@ptrCast(dd));
         if (self.ddm) |m| self.api.wl_proxy_destroy(@ptrCast(m));
         if (self.dec_manager) |m| self.api.wl_proxy_destroy(@ptrCast(m));
+        if (self.background_effects) |m| self.api.wl_proxy_destroy(m);
         if (self.cursor_surface) |s| self.api.wl_proxy_destroy(@ptrCast(s));
         if (self.cursor_theme) |t| if (self.cursor_api) |c| c.theme_destroy(t);
         if (self.cursor_lib) |*c| c.close();
@@ -552,7 +615,7 @@ pub const WaylandConnection = struct {
             self.gpu_context = window_renderer.GpuContext.create(self.allocator, .wayland);
         }
         const ctx = self.gpu_context orelse return null;
-        return window_renderer.GpuWindow.create(ctx, .{ .wayland = .{ .display = @ptrCast(self.display), .surface = @ptrCast(w.surface.?) } }, w.phys_w(), w.phys_h(), .{ .externally_paced = true });
+        return window_renderer.GpuWindow.create(ctx, .{ .wayland = .{ .display = @ptrCast(self.display), .surface = @ptrCast(w.surface.?) } }, w.phys_w(), w.phys_h(), .{ .externally_paced = true, .transparent = w.background_appearance != .@"opaque" });
     }
 
     pub fn open_window(self: *WaylandConnection, options: window_mod.WindowOptions, parent: ?*platform.PlatformWindow) !*WaylandWindow {
@@ -570,6 +633,7 @@ pub const WaylandConnection = struct {
             // Server decorations unless the app asks for client ones; without a request,
             // a window with a titlebar gets the compositor's frame and one without gets none.
             .decorated = if (options.window_decorations) |d| d == .server else options.titlebar != null,
+            .background_appearance = options.window_background,
         };
         w.create_surface(options, if (parent) |p| WaylandWindow.from(p) else null) catch |err| {
             w.closed = true;
@@ -1191,6 +1255,12 @@ fn registryGlobal(data: ?*anyopaque, reg: *proto.Registry, name: u32, iface: [*:
         self.dec_manager = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.decoration_manager_interface, @as(u32, 1), 0, name, proto.decoration_manager_interface.name, @as(u32, 1), &proto.decoration_manager_interface));
     } else if (std.mem.eql(u8, iface_name, "wp_viewporter")) {
         self.viewporter = api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.viewporter_interface, @as(u32, 1), 0, name, proto.viewporter_interface.name, @as(u32, 1), &proto.viewporter_interface);
+    } else if (std.mem.eql(u8, iface_name, "ext_background_effect_manager_v1")) {
+        const manager = api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.background_effect_manager_interface, @as(u32, 1), 0, name, proto.background_effect_manager_interface.name, @as(u32, 1), &proto.background_effect_manager_interface);
+        if (manager) |m| {
+            self.background_effects = m;
+            _ = api.wl_proxy_add_listener(m, &background_effect_manager_listener, null);
+        }
     } else if (std.mem.eql(u8, iface_name, "wp_fractional_scale_manager_v1")) {
         self.frac_manager = api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.fractional_scale_manager_interface, @as(u32, 1), 0, name, proto.fractional_scale_manager_interface.name, @as(u32, 1), &proto.fractional_scale_manager_interface);
     } else if (std.mem.eql(u8, iface_name, "xdg_system_bell_v1")) {
@@ -1755,6 +1825,12 @@ pub const WaylandWindow = struct {
     viewport: ?*anyopaque = null,
     frac_scale: ?*anyopaque = null,
     opaque_region: ?*proto.Region = null,
+    /// The window's background (GPUI `window_background`, then `set_background_appearance`).
+    background_appearance: window_mod.WindowBackgroundAppearance = .@"opaque",
+    /// ext-background-effect's object for this surface, while the window is blurred.
+    background_effect: ?*anyopaque = null,
+    /// Corner radii of the client-drawn window, for the blur region (`set_client_corner_radii`).
+    client_corner_radii: geometry.Corners(Pixels) = .{},
     frame_callback: ?*proto.Callback = null,
     bufs: [2]ShmBuffer = .{ .{}, .{} },
     /// Logical size as configured by the compositor (or requested at creation).
@@ -1827,6 +1903,9 @@ pub const WaylandWindow = struct {
         .show_window_menu = showWindowMenu,
         .window_decorations = windowDecorations,
         .set_client_inset = setClientInset,
+        .set_background_appearance = setBackgroundAppearance,
+        .background_appearance = backgroundAppearance,
+        .set_client_corner_radii = setClientCornerRadii,
         .close = close,
         .visibility = windowVisibility,
         .display_id = windowDisplayId,
@@ -1871,7 +1950,7 @@ pub const WaylandWindow = struct {
         self.fractional = self.viewport != null;
         if (!self.fractional) self.scale = @max(1, @round(self.scale));
 
-        self.update_opaque_region();
+        self.update_regions();
 
         const xs_raw = a.wl_proxy_marshal_flags(@ptrCast(wm_base), 2, &proto.xdg_surface_interface, a.wl_proxy_get_version(@ptrCast(wm_base)), 0, @as(?*anyopaque, null), @as(*anyopaque, @ptrCast(surface)));
         self.xdg_surface = @ptrCast(xs_raw orelse return error.CannotCreateXdgSurface);
@@ -1981,7 +2060,14 @@ pub const WaylandWindow = struct {
         }
     }
 
-    /// Declares the whole surface opaque so compositors skip blending it.
+    /// The surface's opaque and blur regions, as they must be for its background (GPUI `update_window`).
+    fn update_regions(self: *WaylandWindow) void {
+        self.update_opaque_region();
+        self.update_blur_region();
+    }
+
+    /// Declares the whole surface opaque so compositors skip blending it. A transparent or blurred
+    /// window has no such area: the region is cleared, so the compositor blends the whole surface.
     fn update_opaque_region(self: *WaylandWindow) void {
         const surface = self.surface orelse return;
         const c = self.conn;
@@ -1991,6 +2077,10 @@ pub const WaylandWindow = struct {
             _ = a.wl_proxy_marshal_flags(@ptrCast(r), 0, null, a.wl_proxy_get_version(@ptrCast(r)), 1);
             self.opaque_region = null;
         }
+        if (self.background_appearance != .@"opaque") {
+            _ = a.wl_proxy_marshal_flags(@ptrCast(surface), 4, null, a.wl_proxy_get_version(@ptrCast(surface)), 0, @as(?*anyopaque, null));
+            return;
+        }
         const reg_raw = a.wl_proxy_marshal_flags(@ptrCast(compositor), 1, a.wl_region_interface, a.wl_proxy_get_version(@ptrCast(compositor)), 0, @as(?*anyopaque, null));
         const region: *proto.Region = @ptrCast(reg_raw orelse return);
         self.opaque_region = region;
@@ -1998,6 +2088,48 @@ pub const WaylandWindow = struct {
         const h: i32 = @intFromFloat(self.size.height);
         _ = a.wl_proxy_marshal_flags(@ptrCast(region), 1, null, a.wl_proxy_get_version(@ptrCast(region)), 0, @as(i32, 0), @as(i32, 0), w, h);
         _ = a.wl_proxy_marshal_flags(@ptrCast(surface), 4, null, a.wl_proxy_get_version(@ptrCast(surface)), 0, @as(?*anyopaque, @ptrCast(region)));
+    }
+
+    /// The blur behind a blurred window: its visible area with the client's corner radii, through
+    /// ext-background-effect (GPUI `update_window`). Without the protocol the window is only
+    /// transparent, as in GPUI; the kde-blur fallback GPUI has is not ported.
+    fn update_blur_region(self: *WaylandWindow) void {
+        const surface = self.surface orelse return;
+        const c = self.conn;
+        const a = &c.api;
+        const manager = c.background_effects orelse return;
+        if (self.background_appearance != .blurred) {
+            if (self.background_effect) |effect| {
+                _ = a.wl_proxy_marshal_flags(effect, 0, null, a.wl_proxy_get_version(effect), 1);
+                self.background_effect = null;
+            }
+            return;
+        }
+        if (self.background_effect == null) {
+            self.background_effect = a.wl_proxy_marshal_flags(manager, 1, &proto.background_effect_surface_interface, a.wl_proxy_get_version(manager), 0, @as(?*anyopaque, null), @as(*anyopaque, @ptrCast(surface)));
+        }
+        const effect = self.background_effect orelse return;
+        const compositor = c.compositor orelse return;
+        const region_raw = a.wl_proxy_marshal_flags(@ptrCast(compositor), 1, a.wl_region_interface, a.wl_proxy_get_version(@ptrCast(compositor)), 0, @as(?*anyopaque, null));
+        const region: *proto.Region = @ptrCast(region_raw orelse return);
+        const geo = self.window_geometry();
+        const area: IRect = .{
+            .x = @intFromFloat(geo.origin.x),
+            .y = @intFromFloat(geo.origin.y),
+            .width = @max(0, @as(i32, @intFromFloat(geo.size.width))),
+            .height = @max(0, @as(i32, @intFromFloat(geo.size.height))),
+        };
+        const Adder = struct {
+            a: *const proto.WaylandApi,
+            region: *proto.Region,
+            fn add(self_: @This(), r: IRect) void {
+                _ = self_.a.wl_proxy_marshal_flags(@ptrCast(self_.region), 1, null, self_.a.wl_proxy_get_version(@ptrCast(self_.region)), 0, r.x, r.y, r.width, r.height);
+            }
+        };
+        add_rounded_rect(area, self.client_corner_radii, Adder{ .a = a, .region = region }, Adder.add);
+        // set_blur_region copies the region, so it can be destroyed at once.
+        _ = a.wl_proxy_marshal_flags(effect, 1, null, a.wl_proxy_get_version(effect), 0, @as(*anyopaque, @ptrCast(region)));
+        _ = a.wl_proxy_marshal_flags(@ptrCast(region), 0, null, a.wl_proxy_get_version(@ptrCast(region)), 1);
     }
 
     fn apply_buffer_scale(self: *WaylandWindow) void {
@@ -2265,6 +2397,29 @@ pub const WaylandWindow = struct {
         self.conn.flush();
     }
 
+    /// GPUI `set_background_appearance`. The renderer, the opaque region and the blur follow.
+    fn setBackgroundAppearance(p: *platform.PlatformWindow, appearance: window_mod.WindowBackgroundAppearance) void {
+        const self = from(p);
+        if (self.background_appearance == appearance) return;
+        self.background_appearance = appearance;
+        if (self.gpu_window) |*g| g.set_transparent(appearance != .@"opaque");
+        self.update_regions();
+        self.conn.flush();
+    }
+
+    fn backgroundAppearance(p: *platform.PlatformWindow) window_mod.WindowBackgroundAppearance {
+        return from(p).background_appearance;
+    }
+
+    /// GPUI `set_client_corner_radii`: only the blur region uses them.
+    fn setClientCornerRadii(p: *platform.PlatformWindow, radii: geometry.Corners(Pixels)) void {
+        const self = from(p);
+        if (std.meta.eql(self.client_corner_radii, radii)) return;
+        self.client_corner_radii = radii;
+        self.update_blur_region();
+        self.conn.flush();
+    }
+
     /// xdg_surface.set_window_geometry: the window without the client-drawn shadow. Tiled edges
     /// have no shadow, so they keep their full extent.
     fn apply_window_geometry(self: *WaylandWindow) void {
@@ -2288,7 +2443,7 @@ pub const WaylandWindow = struct {
         const ph = self.phys_h();
         if (self.gpu_window) |*g| {
             // The present commits the surface, including the frame callback of emit_frame.
-            if (g.draw(scene, clear_color, pw, ph)) self.drew = true else self.frame_wanted = true;
+            if (g.draw(scene, frame_clear(self.background_appearance), pw, ph)) self.drew = true else self.frame_wanted = true;
             self.conn.flush();
             return;
         }
@@ -2298,7 +2453,7 @@ pub const WaylandWindow = struct {
         };
         const pixels = entry.pixels.?;
         const fb: cpu.Framebuffer = .{ .pixels = pixels, .width = pw, .height = ph, .stride = pw * 4, .format = .bgra8 };
-        self.renderer.draw(scene, &self.atlas, fb, clear_color);
+        self.renderer.draw(scene, &self.atlas, fb, frame_clear(self.background_appearance));
         const a = self.api();
         const surface = self.surface orelse return;
         _ = a.wl_proxy_marshal_flags(@ptrCast(surface), 1, null, a.wl_proxy_get_version(@ptrCast(surface)), 0, @as(?*anyopaque, @ptrCast(entry.buf.?)), @as(i32, 0), @as(i32, 0));
@@ -2370,6 +2525,11 @@ pub const WaylandWindow = struct {
             _ = a.wl_proxy_marshal_flags(@ptrCast(xs), 0, null, a.wl_proxy_get_version(@ptrCast(xs)), 1);
             self.xdg_surface = null;
         }
+        // The effect object must go before the surface it belongs to.
+        if (self.background_effect) |effect| {
+            _ = a.wl_proxy_marshal_flags(effect, 0, null, a.wl_proxy_get_version(effect), 1);
+            self.background_effect = null;
+        }
         if (self.opaque_region) |r| {
             _ = a.wl_proxy_marshal_flags(@ptrCast(r), 0, null, a.wl_proxy_get_version(@ptrCast(r)), 1);
             self.opaque_region = null;
@@ -2413,7 +2573,7 @@ pub const WaylandWindow = struct {
         const first = !self.configured;
         self.configured = true;
         if (first) {
-            self.update_opaque_region();
+            self.update_regions();
             self.frame_wanted = true;
         }
     }
@@ -2457,7 +2617,7 @@ pub const WaylandWindow = struct {
         if (w == self.size.width and h == self.size.height) return;
         self.size = .{ .width = w, .height = h };
         self.apply_buffer_scale();
-        self.update_opaque_region();
+        self.update_regions();
         self.base.emit_resize(self.size, self.scale);
         // Arms the frame callback that releases `resize_throttle`.
         self.frame_wanted = true;
@@ -2583,5 +2743,69 @@ test "popup anchor rectangle is taken in the parent's window geometry" {
     const anchor: PxBounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 20, .height = 20 } };
     const r = platform.popup.anchor_rect_in_geometry(anchor, geo);
     try std.testing.expectEqual([4]i32{ 0, 0, 10, 10 }, r);
+}
+
+const RoundedCollector = struct {
+    gpa: std.mem.Allocator,
+    list: std.ArrayList(IRect) = .empty,
+
+    fn add(self: *RoundedCollector, r: IRect) void {
+        self.list.append(self.gpa, r) catch unreachable;
+    }
+
+    fn deinit(self: *RoundedCollector) void {
+        self.list.deinit(self.gpa);
+    }
+};
+
+fn rounded_rects(area: IRect, radii: geometry.Corners(f32)) ![]IRect {
+    var c: RoundedCollector = .{ .gpa = std.testing.allocator };
+    defer c.deinit();
+    add_rounded_rect(area, radii, &c, RoundedCollector.add);
+    return std.testing.allocator.dupe(IRect, c.list.items);
+}
+
+test "rounded blur rects: square corners give one rectangle" {
+    const rects = try rounded_rects(.{ .x = 10, .y = 20, .width = 8, .height = 8 }, .{});
+    defer std.testing.allocator.free(rects);
+    try std.testing.expectEqualSlices(IRect, &.{.{ .x = 10, .y = 20, .width = 8, .height = 8 }}, rects);
+}
+
+test "rounded blur rects: independent corners, as gpui_linux" {
+    const rects = try rounded_rects(.{ .x = 10, .y = 20, .width = 8, .height = 8 }, .{ .top_left = 4, .top_right = 0, .bottom_left = 0, .bottom_right = 4 });
+    defer std.testing.allocator.free(rects);
+    const want = [_]IRect{
+        .{ .x = 12, .y = 20, .width = 6, .height = 1 },
+        .{ .x = 11, .y = 21, .width = 7, .height = 1 },
+        .{ .x = 10, .y = 22, .width = 8, .height = 1 },
+        .{ .x = 10, .y = 23, .width = 8, .height = 1 },
+        .{ .x = 10, .y = 27, .width = 6, .height = 1 },
+        .{ .x = 10, .y = 26, .width = 7, .height = 1 },
+        .{ .x = 10, .y = 25, .width = 8, .height = 1 },
+        .{ .x = 10, .y = 24, .width = 8, .height = 1 },
+    };
+    try std.testing.expectEqualSlices(IRect, &want, rects);
+}
+
+test "rounded blur rects: radii are clamped to the area and negative radii mean none" {
+    const area: IRect = .{ .x = 10, .y = 20, .width = 10, .height = 6 };
+    const huge = try rounded_rects(area, .{ .top_left = 100, .top_right = 100, .bottom_left = 100, .bottom_right = 100 });
+    defer std.testing.allocator.free(huge);
+    const three = try rounded_rects(area, .{ .top_left = 3, .top_right = 3, .bottom_left = 3, .bottom_right = 3 });
+    defer std.testing.allocator.free(three);
+    try std.testing.expectEqualSlices(IRect, three, huge);
+    const negative = try rounded_rects(area, .{ .top_left = -1, .top_right = -1, .bottom_left = -1, .bottom_right = -1 });
+    defer std.testing.allocator.free(negative);
+    const none = try rounded_rects(area, .{});
+    defer std.testing.allocator.free(none);
+    try std.testing.expectEqualSlices(IRect, none, negative);
+}
+
+test "rounded blur rects: an empty area has no rectangles" {
+    for ([_][2]i32{ .{ 0, 10 }, .{ 10, 0 }, .{ -1, 10 }, .{ 10, -1 } }) |d| {
+        const rects = try rounded_rects(.{ .x = 10, .y = 20, .width = d[0], .height = d[1] }, .{ .top_left = 4, .top_right = 4, .bottom_left = 4, .bottom_right = 4 });
+        defer std.testing.allocator.free(rects);
+        try std.testing.expectEqual(@as(usize, 0), rects.len);
+    }
 }
 

@@ -641,6 +641,26 @@ pub const XkbStateNotifyMask: c_ulong = 1 << 2;
 pub const XkbUseCoreKbd: c_uint = 0x0100;
 pub const XA_CARDINAL: Atom = 6;
 pub const CW_OVERRIDE_REDIRECT: c_ulong = 1 << 9;
+pub const CW_BORDER_PIXEL: c_ulong = 1 << 3;
+pub const CW_COLORMAP: c_ulong = 1 << 13;
+pub const INPUT_OUTPUT: c_uint = 1;
+pub const TRUE_COLOR: c_int = 4;
+pub const ALLOC_NONE: c_int = 0;
+pub const Colormap = c_ulong;
+
+/// Xlib's `XVisualInfo` (Xutil.h), in the C layout Xlib writes.
+pub const VisualInfo = extern struct {
+    visual: *Visual,
+    visualid: c_ulong,
+    screen: c_int,
+    depth: c_uint,
+    class: c_int,
+    red_mask: c_ulong,
+    green_mask: c_ulong,
+    blue_mask: c_ulong,
+    colormap_size: c_int,
+    bits_per_rgb: c_int,
+};
 
 /// Xlib's `XSetWindowAttributes`, in the C layout Xlib reads.
 pub const SetWindowAttributes = extern struct {
@@ -761,6 +781,12 @@ pub const Api = struct {
     XDefaultGC: *const fn (*Display, c_int) callconv(.c) GC,
     XDefaultVisual: *const fn (*Display, c_int) callconv(.c) *Visual,
     XDefaultDepth: *const fn (*Display, c_int) callconv(.c) c_int,
+    XMatchVisualInfo: *const fn (*Display, c_int, c_int, c_int, *VisualInfo) callconv(.c) Status,
+    XCreateColormap: *const fn (*Display, Window, *Visual, c_int) callconv(.c) Colormap,
+    XFreeColormap: *const fn (*Display, Colormap) callconv(.c) c_int,
+    XCreateWindow: *const fn (*Display, Window, c_int, c_int, c_uint, c_uint, c_uint, c_int, c_uint, *Visual, c_ulong, *const SetWindowAttributes) callconv(.c) Window,
+    XCreateGC: *const fn (*Display, Drawable, c_ulong, ?*anyopaque) callconv(.c) GC,
+    XFreeGC: *const fn (*Display, GC) callconv(.c) c_int,
     XCreateImage: *const fn (*Display, *Visual, c_uint, c_int, c_int, ?[*]u8, c_uint, c_uint, c_int, c_int) callconv(.c) ?*XImage,
     XDestroyImage: *const fn (*XImage) callconv(.c) c_int,
     XPutImage: *const fn (*Display, Drawable, GC, *XImage, c_int, c_int, c_int, c_int, c_uint, c_uint) callconv(.c) c_int,
@@ -820,6 +846,12 @@ pub const Api = struct {
             .XDefaultGC = lib.lookup(*const fn (*Display, c_int) callconv(.c) GC, "XDefaultGC") orelse return null,
             .XDefaultVisual = lib.lookup(*const fn (*Display, c_int) callconv(.c) *Visual, "XDefaultVisual") orelse return null,
             .XDefaultDepth = lib.lookup(*const fn (*Display, c_int) callconv(.c) c_int, "XDefaultDepth") orelse return null,
+            .XMatchVisualInfo = lib.lookup(*const fn (*Display, c_int, c_int, c_int, *VisualInfo) callconv(.c) Status, "XMatchVisualInfo") orelse return null,
+            .XCreateColormap = lib.lookup(*const fn (*Display, Window, *Visual, c_int) callconv(.c) Colormap, "XCreateColormap") orelse return null,
+            .XFreeColormap = lib.lookup(*const fn (*Display, Colormap) callconv(.c) c_int, "XFreeColormap") orelse return null,
+            .XCreateWindow = lib.lookup(*const fn (*Display, Window, c_int, c_int, c_uint, c_uint, c_uint, c_int, c_uint, *Visual, c_ulong, *const SetWindowAttributes) callconv(.c) Window, "XCreateWindow") orelse return null,
+            .XCreateGC = lib.lookup(*const fn (*Display, Drawable, c_ulong, ?*anyopaque) callconv(.c) GC, "XCreateGC") orelse return null,
+            .XFreeGC = lib.lookup(*const fn (*Display, GC) callconv(.c) c_int, "XFreeGC") orelse return null,
             .XCreateImage = lib.lookup(*const fn (*Display, *Visual, c_uint, c_int, c_int, ?[*]u8, c_uint, c_uint, c_int, c_int) callconv(.c) ?*XImage, "XCreateImage") orelse return null,
             .XDestroyImage = lib.lookup(*const fn (*XImage) callconv(.c) c_int, "XDestroyImage") orelse return null,
             .XPutImage = lib.lookup(*const fn (*Display, Drawable, GC, *XImage, c_int, c_int, c_int, c_int, c_uint, c_uint) callconv(.c) c_int, "XPutImage") orelse return null,

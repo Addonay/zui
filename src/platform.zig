@@ -558,6 +558,14 @@ pub const PlatformWindow = struct {
         window_decorations: *const fn (*PlatformWindow) Decorations = serverDecorations,
         /// Shadow area of a client-decorated window, in logical pixels (GPUI `set_client_inset`).
         set_client_inset: *const fn (*PlatformWindow, Pixels) void = noopInset,
+        /// Whether the window surface is opaque, transparent or blurred behind (GPUI
+        /// `set_background_appearance`). Each platform sets it from `WindowOptions.window_background`
+        /// at creation. Required: a platform that cannot do it must say so by storing the value.
+        set_background_appearance: *const fn (*PlatformWindow, window_mod.WindowBackgroundAppearance) void,
+        background_appearance: *const fn (*PlatformWindow) window_mod.WindowBackgroundAppearance,
+        /// Corner radii of the client-drawn window, so a blur matches its shape (GPUI
+        /// `set_client_corner_radii`). Only the blur region uses them.
+        set_client_corner_radii: *const fn (*PlatformWindow, geometry.Corners(Pixels)) void,
         start_window_resize: *const fn (*PlatformWindow, ResizeEdge) void = noopEdge,
         /// Asks the compositor for its window menu at a position (GPUI `show_window_menu`).
         show_window_menu: *const fn (*PlatformWindow, Point(Pixels)) void = noopPoint,
@@ -632,6 +640,15 @@ pub const PlatformWindow = struct {
     }
     pub fn set_client_inset(self: *PlatformWindow, inset: Pixels) void {
         self.vtable.set_client_inset(self, inset);
+    }
+    pub fn set_background_appearance(self: *PlatformWindow, background: window_mod.WindowBackgroundAppearance) void {
+        self.vtable.set_background_appearance(self, background);
+    }
+    pub fn background_appearance(self: *PlatformWindow) window_mod.WindowBackgroundAppearance {
+        return self.vtable.background_appearance(self);
+    }
+    pub fn set_client_corner_radii(self: *PlatformWindow, radii: geometry.Corners(Pixels)) void {
+        self.vtable.set_client_corner_radii(self, radii);
     }
     pub fn start_window_resize(self: *PlatformWindow, edge: ResizeEdge) void {
         self.vtable.start_window_resize(self, edge);

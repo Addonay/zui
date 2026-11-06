@@ -1187,6 +1187,20 @@ pub const Window = struct {
         self.client_inset_value = inset;
         self.platform_window.set_client_inset(inset);
     }
+    /// Sets the window's background appearance (GPUI `set_background_appearance`). The frame is
+    /// redrawn, since transparent windows clear to transparent.
+    pub fn set_background_appearance(self: *Window, background: WindowBackgroundAppearance) void {
+        self.platform_window.set_background_appearance(background);
+        self.refresh();
+    }
+    /// The background appearance last set, or given at creation (GPUI `WindowOptions::window_background`).
+    pub fn background_appearance(self: *const Window) WindowBackgroundAppearance {
+        return self.platform_window.background_appearance();
+    }
+    /// Corner radii of a client-drawn window, so a blur matches its shape (GPUI `set_client_corner_radii`).
+    pub fn set_client_corner_radii(self: *Window, radii: Corners(Pixels)) void {
+        self.platform_window.set_client_corner_radii(radii);
+    }
     /// Starts an interactive resize from an edge, as a press on that edge would (GPUI `start_window_resize`).
     pub fn start_window_resize(self: *Window, edge: ResizeEdge) void {
         self.platform_window.start_window_resize(edge);

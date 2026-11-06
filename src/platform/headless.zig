@@ -277,6 +277,10 @@ pub const HeadlessWindow = struct {
     /// the next pump, so `run_until_idle` parks instead of drawing the animation until its guard.
     frame_requested_by_draw: bool = false,
     closed: bool = false,
+    /// Set by `set_background_appearance`; a transparent window clears to transparent.
+    background: window_mod.WindowBackgroundAppearance = .@"opaque",
+    /// Set by `set_client_corner_radii`. Nothing here blurs, so it is only kept for the platform's answer.
+    corner_radii: geometry.Corners(Pixels) = .{},
     atlas: atlas_mod.CpuAtlas,
     /// The last presented scene (borrowed from the window's rendered frame).
     last_scene: ?*const scene_mod.Scene = null,
@@ -314,6 +318,18 @@ pub const HeadlessWindow = struct {
     fn setClientInset(p: *PlatformWindow, inset: Pixels) void {
         const self: *HeadlessWindow = @fieldParentPtr("base", p);
         self.client_inset = inset;
+    }
+
+    fn setBackgroundAppearance(p: *PlatformWindow, appearance: window_mod.WindowBackgroundAppearance) void {
+        from(p).background = appearance;
+    }
+
+    fn backgroundAppearance(p: *PlatformWindow) window_mod.WindowBackgroundAppearance {
+        return from(p).background;
+    }
+
+    fn setClientCornerRadii(p: *PlatformWindow, radii: geometry.Corners(Pixels)) void {
+        from(p).corner_radii = radii;
     }
 
     fn toggleFullscreen(p: *PlatformWindow) void {
@@ -359,6 +375,9 @@ pub const HeadlessWindow = struct {
         .close = close,
         .window_decorations = windowDecorations,
         .set_client_inset = setClientInset,
+        .set_background_appearance = setBackgroundAppearance,
+        .background_appearance = backgroundAppearance,
+        .set_client_corner_radii = setClientCornerRadii,
         .toggle_fullscreen = toggleFullscreen,
         .is_fullscreen = isFullscreen,
         .is_maximized = isMaximized,
@@ -393,7 +412,7 @@ pub const HeadlessWindow = struct {
         const a = owner.allocator;
         const self = try a.create(HeadlessWindow);
         const b = if (options.window_bounds) |wb| wb.get_bounds() else geometry.Bounds(Pixels){ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 800, .height = 600 } };
-        self.* = .{ .owner = owner, .size = b.size, .atlas = atlas_mod.CpuAtlas.init(a), .client_decorations = options.window_decorations == .client };
+        self.* = .{ .owner = owner, .size = b.size, .atlas = atlas_mod.CpuAtlas.init(a), .client_decorations = options.window_decorations == .client, .background = options.window_background };
         if (std.c.getenv("ZUI_SCALE")) |s| self.scale = std.fmt.parseFloat(f32, std.mem.span(s)) catch 1;
         return self;
     }
@@ -446,13 +465,34 @@ pub const HeadlessWindow = struct {
         var r = cpu.CpuRenderer.init(a);
         defer r.deinit();
         const fb: cpu.Framebuffer = .{ .pixels = pixels, .width = w, .height = h, .stride = w * 4, .format = .rgba8 };
-        r.draw(scene, &self.atlas, fb, @import("../color.zig").white());
+        const color = @import("../color.zig");
+        if (self.background == .@"opaque") {
+            r.draw(scene, &self.atlas, fb, color.white());
+        } else {
+            r.draw(scene, &self.atlas, fb, color.transparent_black());
+        }
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(a);
-        try out.print(a, "P6\n{d} {d}\n255\n", .{ w, h });
-        try out.ensureUnusedCapacity(a, @as(usize, w) * h * 3);
-        var i: usize = 0;
-        while (i < pixels.len) : (i += 4) out.appendSliceAssumeCapacity(pixels[i .. i + 3]);
+        if (self.background == .@"opaque") {
+            try out.print(a, "P6\n{d} {d}\n255\n", .{ w, h });
+            try out.ensureUnusedCapacity(a, @as(usize, w) * h * 3);
+            var i: usize = 0;
+            while (i < pixels.len) : (i += 4) out.appendSliceAssumeCapacity(pixels[i .. i + 3]);
+        } else {
+            // A transparent window is written as PAM (RGB_ALPHA) with straight alpha, since PPM has
+            // no alpha. The renderer keeps premultiplied pixels, so they are divided by alpha here.
+            try out.print(a, "P7\nWIDTH {d}\nHEIGHT {d}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", .{ w, h });
+            try out.ensureUnusedCapacity(a, pixels.len);
+            var i: usize = 0;
+            while (i < pixels.len) : (i += 4) {
+                const alpha = pixels[i + 3];
+                for (0..3) |c| {
+                    const v: u32 = if (alpha == 0) 0 else @min(255, (@as(u32, pixels[i + c]) * 255 + alpha / 2) / alpha);
+                    out.appendAssumeCapacity(@intCast(v));
+                }
+                out.appendAssumeCapacity(alpha);
+            }
+        }
         const zpath = try a.dupeSentinel(u8, path, 0);
         defer a.free(zpath);
         const f = std.c.fopen(zpath, "wb") orelse return error.OpenFailed;

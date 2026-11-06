@@ -25,8 +25,12 @@ pub const GpuContext = struct {
     vk: vulkan.Context,
     device: gpu.Device,
     atlas: renderer.GpuAtlas,
-    /// Created with the first swapchain, whose format every later window must share.
-    renderer: ?renderer.GpuRenderer = null,
+    /// The format every window of this context shares, set by the first swapchain.
+    color_format: ?gpu.PixelFormat = null,
+    /// Indexed by `premultiplied`: 0 for opaque windows (straight alpha), 1 for transparent ones.
+    /// The second is created only when a transparent window exists, so opaque windows
+    /// compile the same pipelines as before.
+    renderers: [2]?renderer.GpuRenderer = .{ null, null },
 
     /// Null when the configuration or the machine calls for the CPU renderer.
     pub fn create(allocator: std.mem.Allocator, window_system: vulkan.WindowSystem) ?*GpuContext {
@@ -43,7 +47,8 @@ pub const GpuContext = struct {
         const self = try allocator.create(GpuContext);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
-        self.renderer = null;
+        self.color_format = null;
+        self.renderers = .{ null, null };
         self.vk = try vulkan.Context.init(window_system, selection);
         errdefer self.vk.deinit();
         var backend = self.vk.device_options();
@@ -61,7 +66,7 @@ pub const GpuContext = struct {
     /// All windows must have released their `GpuWindow`s.
     pub fn destroy(self: *GpuContext) void {
         self.vk.wait_idle();
-        if (self.renderer) |*r| r.deinit();
+        for (&self.renderers) |*r| if (r.*) |*renderer_| renderer_.deinit();
         self.atlas.deinit();
         self.device.deinit();
         self.vk.deinit();
@@ -72,12 +77,16 @@ pub const GpuContext = struct {
         return self.atlas.platform_atlas();
     }
 
-    fn ensure_renderer(self: *GpuContext, format: gpu.PixelFormat) !void {
-        if (self.renderer) |*r| {
-            if (r.color_format != format) return error.MixedSwapchainFormats;
-            return;
+    /// The renderer for windows of `format` with the given alpha, created on first use.
+    fn renderer_for(self: *GpuContext, format: gpu.PixelFormat, premultiplied: bool) !*renderer.GpuRenderer {
+        if (self.color_format) |f| {
+            if (f != format) return error.MixedSwapchainFormats;
+        } else self.color_format = format;
+        const slot = &self.renderers[@intFromBool(premultiplied)];
+        if (slot.* == null) {
+            slot.* = try renderer.GpuRenderer.initWithOptions(self.allocator, &self.device, format, .{ .premultiplied_alpha = premultiplied });
         }
-        self.renderer = try renderer.GpuRenderer.init(self.allocator, &self.device, format);
+        return &slot.*.?;
     }
 };
 
@@ -102,7 +111,8 @@ pub const GpuWindow = struct {
     fn create_with(ctx: *GpuContext, native: vulkan.NativeSurface, width: u32, height: u32, options: vulkan.WindowSwapchain.Options) !GpuWindow {
         var swapchain = try vulkan.WindowSwapchain.init(&ctx.vk, native, width, height, options);
         errdefer swapchain.deinit();
-        try ctx.ensure_renderer(swapchain.color_format);
+        _ = try ctx.renderer_for(swapchain.color_format, swapchain.premultiplied());
+        log.debug("swapchain composite alpha: {s}", .{if (swapchain.premultiplied()) "premultiplied" else "opaque"});
         return .{ .ctx = ctx, .swapchain = swapchain };
     }
 
@@ -110,6 +120,11 @@ pub const GpuWindow = struct {
     pub fn deinit(self: *GpuWindow) void {
         self.swapchain.deinit();
         self.* = undefined;
+    }
+
+    /// Switches between opaque and transparent. Takes effect at the next frame.
+    pub fn set_transparent(self: *GpuWindow, transparent: bool) void {
+        self.swapchain.set_transparent(transparent);
     }
 
     /// Draws and presents. False means no frame was shown and another should be requested.
@@ -122,7 +137,10 @@ pub const GpuWindow = struct {
 
     fn draw_inner(self: *GpuWindow, scene: *const scene_mod.Scene, clear: color.Hsla, width: u32, height: u32) !bool {
         const image = (try self.swapchain.acquire(width, height)) orelse return false;
-        try self.ctx.renderer.?.draw(scene, &self.ctx.atlas, .{ .swapchain = image }, clear);
+        // The renderer follows the composite alpha of this frame, which a background change may
+        // have just switched (acquire recreates the swapchain then).
+        const r = try self.ctx.renderer_for(self.swapchain.color_format, self.swapchain.premultiplied());
+        try r.draw(scene, &self.ctx.atlas, .{ .swapchain = image }, clear);
         self.ctx.device.commit();
         try self.swapchain.present();
         return true;

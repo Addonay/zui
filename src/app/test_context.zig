@@ -5668,3 +5668,25 @@ test "input preference: an interceptor can consume a key that prefers character 
     try std.testing.expect(!propagated);
     try std.testing.expectEqual(@as(usize, 0), AltGrProbe.actions);
 }
+
+test "window background: set at creation, then changed, and read back" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Plain = struct {
+        pub fn render(_: *@This(), _: *Window, _: *app_mod.Context(@This())) *div_mod.Div {
+            return div();
+        }
+    };
+    const handle = cx.app.open_window(.{ .window_background = .transparent }, struct {
+        fn build(_: *Window, app: *App) Entity(Plain) {
+            return app.new(Plain{});
+        }
+    }.build) catch unreachable;
+    const window = handle.window(cx.app) orelse unreachable;
+    try std.testing.expectEqual(window_mod.WindowBackgroundAppearance.transparent, window.background_appearance());
+    window.set_background_appearance(.blurred);
+    try std.testing.expectEqual(window_mod.WindowBackgroundAppearance.blurred, window.background_appearance());
+    window.set_background_appearance(.@"opaque");
+    try std.testing.expectEqual(window_mod.WindowBackgroundAppearance.@"opaque", window.background_appearance());
+    window.set_client_corner_radii(.{ .top_left = 8, .top_right = 8, .bottom_left = 8, .bottom_right = 8 });
+}

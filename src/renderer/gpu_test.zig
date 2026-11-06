@@ -212,3 +212,55 @@ test "GPU renderer matches the CPU renderer" {
     try testing.expect(!failed);
     try testing.expectEqual(gpu.DeviceStatus.ready, device.status());
 }
+
+test "GPU renderer matches the CPU renderer on a transparent window" {
+    var ctx = vulkan.Context.init(.headless, .any) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    var device = gpu.Device.init(testing.allocator, .{
+        .backend = ctx.device_options(),
+        .defaults = .{ .color_format = .rgba8, .depth_format = .none, .sample_count = 1 },
+    }) catch return error.SkipZigTest;
+    defer device.deinit();
+
+    // The renderer a transparent window uses: premultiplied output and a premultiplied clear.
+    var renderer = try gpu_renderer.GpuRenderer.initWithOptions(testing.allocator, &device, .rgba8, .{ .premultiplied_alpha = true });
+    defer renderer.deinit();
+    var gpu_atlas = gpu_renderer.GpuAtlas.init(testing.allocator, &device);
+    defer gpu_atlas.deinit();
+    var cpu_atlas = atlas.CpuAtlas.init(testing.allocator);
+    defer cpu_atlas.deinit();
+    var cpu_renderer = cpu.CpuRenderer.init(testing.allocator);
+    defer cpu_renderer.deinit();
+
+    const image = try device.createImage(.{ .width = size, .height = size, .format = .rgba8, .usage = .{ .color_attachment = true, .copy_src = true } });
+    defer device.destroy(image);
+    const view = try device.createView(.{ .color_attachment = .{ .image = image } });
+    defer device.destroy(view);
+
+    // A half-transparent clear, and a half-transparent red quad over part of it.
+    const clear = color.hsla(0.6, 0.2, 0.15, 0.5);
+    var sc = Scene.init(testing.allocator);
+    defer sc.deinit();
+    try sc.insert_primitive(.{ .quad = .{ .bounds = rect(20, 20, 60, 60), .content_mask = mask(0, 0, size, size), .background = color.solid_background(color.hsla(0, 1, 0.5, 0.5)) } });
+    sc.finish();
+
+    var gpu_pixels: [size * size * 4]u8 = undefined;
+    try renderer.draw(&sc, &gpu_atlas, .{ .attachment = .{ .view = view, .width = size, .height = size } }, clear);
+    device.commit();
+    try device.readImage(image, .{}, &gpu_pixels, .{});
+
+    var cpu_pixels: [size * size * 4]u8 = undefined;
+    cpu_renderer.draw(&sc, &cpu_atlas, .{ .pixels = &cpu_pixels, .width = size, .height = size, .stride = size * 4, .format = .rgba8 }, clear);
+
+    // Corner: the clear alone, premultiplied (alpha 128). Centre: the red quad over it.
+    for ([_]usize{ 0, (size * 64 + 64) * 4 }) |off| {
+        for (0..4) |c| {
+            const diff = @max(gpu_pixels[off + c], cpu_pixels[off + c]) - @min(gpu_pixels[off + c], cpu_pixels[off + c]);
+            try testing.expect(diff <= 2);
+        }
+    }
+    try testing.expectEqual(@as(u8, 128), gpu_pixels[3]);
+    try testing.expectEqual(@as(u8, 128), cpu_pixels[3]);
+    try testing.expect(gpu_pixels[(size * 64 + 64) * 4 + 3] > 128);
+    try testing.expectEqual(gpu.DeviceStatus.ready, device.status());
+}

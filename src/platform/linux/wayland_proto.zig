@@ -686,6 +686,43 @@ pub const fractional_scale_manager_interface: Interface = .{
     .events = null,
 };
 
+// ext-background-effect-v1 (staging): a blur behind a surface, for blurred windows. Checked
+// against wayland-protocols' staging/ext-background-effect/ext-background-effect-v1.xml. The
+// manager sends `capabilities` as soon as it is bound, so its event table must be declared
+// even though nothing reads it (GPUI does not check the capabilities either).
+pub const background_effect_manager_events = [_]Message{
+    .{ .name = "capabilities", .signature = "u", .types = null },
+};
+pub const background_effect_manager_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "get_background_effect", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&background_effect_surface_interface), null } },
+};
+pub const background_effect_manager_interface: Interface = .{
+    .name = "ext_background_effect_manager_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&background_effect_manager_methods),
+    .event_count = 1,
+    .events = @ptrCast(&background_effect_manager_events),
+};
+pub const background_effect_surface_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "set_blur_region", .signature = "?o", .types = &[_]?*const anyopaque{null} },
+};
+pub const background_effect_surface_interface: Interface = .{
+    .name = "ext_background_effect_surface_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&background_effect_surface_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+/// ext_background_effect_manager_v1.capabilities (opcode 0). Ignored, as in GPUI.
+pub const BackgroundEffectManagerListener = extern struct {
+    capabilities: ?*const fn (?*anyopaque, *anyopaque, u32) callconv(.c) void = null,
+};
+
 pub const text_input_events = [_]Message{
     .{ .name = "enter", .signature = "o", .types = &[_]?*const anyopaque{null} },
     .{ .name = "leave", .signature = "o", .types = &[_]?*const anyopaque{null} },
