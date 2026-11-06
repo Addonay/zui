@@ -165,6 +165,8 @@ pub const X11Connection = struct {
     helper: XWindow,
     atoms: Atoms,
     windows: std.ArrayList(*X11Window) = .empty,
+    /// The window appearance the desktop asked for (GPUI `common.appearance`).
+    appearance_: platform.WindowAppearance = .light,
     cursors: [@typeInfo(CursorStyle).@"enum".field_names.len]Cursor = @splat(0),
     cursor_style: CursorStyle = .arrow,
     scale: f32 = 1,
@@ -714,6 +716,13 @@ pub const X11Connection = struct {
         const mask = proto.XkbNewKeyboardNotifyMask | proto.XkbMapNotifyMask | proto.XkbStateNotifyMask;
         _ = select(self.display, proto.XkbUseCoreKbd, mask, mask);
         self.xkb_event_base = event_base;
+    }
+
+    /// Tells every window the appearance changed. Each window reads it back from `appearance_`.
+    pub fn set_appearance(self: *X11Connection, appearance: platform.WindowAppearance) void {
+        if (self.appearance_ == appearance) return;
+        self.appearance_ = appearance;
+        for (self.windows.items) |w| w.base.emit_appearance_changed();
     }
 
     /// Windows front to back, read from `_NET_CLIENT_LIST_STACKING` on the root (GPUI `window_stack`).
@@ -1614,7 +1623,13 @@ pub const X11Window = struct {
         return null;
     }
 
+    fn windowAppearance(p: *platform.PlatformWindow) platform.WindowAppearance {
+        const self: *X11Window = @fieldParentPtr("base", p);
+        return self.conn.appearance_;
+    }
+
     const vtable: platform.PlatformWindow.VTable = .{
+        .appearance = windowAppearance,
         .visibility = windowVisibility,
         .display_id = windowDisplayId,
         .gpu_specs = gpuSpecs,

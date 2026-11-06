@@ -37,6 +37,15 @@ pub const HeadlessPlatform = struct {
     cursor_hide_requests: u32 = 0,
     hide_other_apps_requests: u32 = 0,
     unhide_other_apps_requests: u32 = 0,
+    /// The appearance the platform reports. Tests change it with `set_window_appearance`.
+    appearance: platform.WindowAppearance = .light,
+    /// What the app last asked the platform to do, for tests.
+    prompts: u32 = 0,
+    restarts: u32 = 0,
+    /// The binary of the last restart, copied since the app's slice is valid for the call only.
+    restart_binary: [256]u8 = undefined,
+    restart_binary_len: ?usize = null,
+    restart_argument_count: usize = 0,
     const max_displays = 4;
     const default_display: platform.Display = .{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } } };
 
@@ -61,7 +70,46 @@ pub const HeadlessPlatform = struct {
         .keyboard_layout = keyboardLayout,
         .hide = hideApp,
         .should_auto_hide_scrollbars = autoHideScrollbars,
+        .window_appearance = windowAppearance,
+        .prompt_for_paths = promptForPaths,
+        .prompt_for_new_path = promptForNewPath,
+        .restart = restart,
     };
+
+    fn windowAppearance(p: *Platform) platform.WindowAppearance {
+        return from(p).appearance;
+    }
+
+    /// Cancels the dialog: a headless platform has nothing to choose from.
+    fn promptForPaths(p: *Platform, _: platform.PathPromptOptions, completion: platform.PathsCompletion) void {
+        from(p).prompts += 1;
+        completion.call(null);
+    }
+
+    fn promptForNewPath(p: *Platform, _: []const u8, _: ?[]const u8, completion: platform.PathCompletion) void {
+        from(p).prompts += 1;
+        completion.call(null);
+    }
+
+    /// Records the restart instead of starting anything.
+    fn restart(p: *Platform, binary_path: ?[]const u8, arguments: []const []const u8) void {
+        const self = from(p);
+        self.restarts += 1;
+        self.restart_argument_count = arguments.len;
+        self.restart_binary_len = null;
+        if (binary_path) |path| {
+            const n = @min(path.len, self.restart_binary.len);
+            @memcpy(self.restart_binary[0..n], path[0..n]);
+            self.restart_binary_len = n;
+        }
+    }
+
+    /// Changes the appearance and tells every window, as a platform does when the desktop's scheme changes.
+    pub fn set_window_appearance(self: *HeadlessPlatform, appearance: platform.WindowAppearance) void {
+        if (self.appearance == appearance) return;
+        self.appearance = appearance;
+        for (self.windows.items) |w| w.base.emit_appearance_changed();
+    }
 
     fn hideApp(p: *Platform) void {
         from(p).hide_requests += 1;
@@ -229,6 +277,11 @@ pub const HeadlessWindow = struct {
     /// The display the window is on. Tests move it with `move_to_display`.
     display: platform.DisplayId = 0,
 
+    fn windowAppearance(p: *PlatformWindow) platform.WindowAppearance {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        return self.owner.appearance;
+    }
+
     fn windowDecorations(p: *PlatformWindow) window_mod.Decorations {
         const self: *HeadlessWindow = @fieldParentPtr("base", p);
         if (self.client_decorations) return .{ .client = .{ .tiling = .{} } };
@@ -252,6 +305,7 @@ pub const HeadlessWindow = struct {
     }
 
     const vtable: PlatformWindow.VTable = .{
+        .appearance = windowAppearance,
         .update_ime_enabled = updateImeEnabled,
         .update_ime_position = updateImePosition,
         .bounds = bounds,

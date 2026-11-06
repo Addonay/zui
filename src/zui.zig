@@ -386,6 +386,8 @@ test {
         _ = @import("platform/linux/xdnd.zig");
         _ = @import("platform/linux/dbus.zig");
         _ = @import("platform/linux/system_notifications.zig");
+        _ = @import("platform/linux/portal.zig");
+        _ = @import("platform/linux/launch.zig");
         _ = @import("platform/linux/input.zig");
         _ = @import("platform/linux/x11.zig");
         _ = @import("platform/linux/wayland.zig");
