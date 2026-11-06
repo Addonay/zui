@@ -289,6 +289,11 @@ pub fn is_focusable(comptime T: type) bool {
     };
 }
 
+/// Compile error unless `T` is `Focusable` (GPUI's `Focusable` bound, as in `window.focus_view`).
+pub fn assert_focusable(comptime T: type) void {
+    if (comptime !is_focusable(T)) @compileError(@typeName(T) ++ " must implement focus_handle to be Focusable");
+}
+
 /// Views a window can host as a popover, modal or menu (GPUI `ManagedView`): focusable, rendered,
 /// and able to emit `DismissEvent`. Zig cannot check the emitter at compile time, so it is only
 /// checked by `assert_managed_view`'s `render` and `focus_handle` declarations.
@@ -301,7 +306,7 @@ pub fn is_managed_view(comptime T: type) bool {
 
 /// Compile error unless `T` is a `ManagedView`.
 pub fn assert_managed_view(comptime T: type) void {
-    if (!is_managed_view(T)) @compileError(@typeName(T) ++ " must implement focus_handle and render to be a ManagedView");
+    if (comptime !is_managed_view(T)) @compileError(@typeName(T) ++ " must implement focus_handle and render to be a ManagedView");
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +390,7 @@ pub const Frame = struct {
     window_active: bool = false,
     arena: std.heap.ArenaAllocator,
     input_handlers: std.ArrayList(PendingInputHandler) = .empty,
-    tooltip_requests: std.ArrayList(TooltipRequest) = .empty,
+    tooltip_requests: std.ArrayList(AnyTooltip) = .empty,
 
     fn init(gpa: std.mem.Allocator) Frame {
         return .{
@@ -421,7 +426,7 @@ pub const Frame = struct {
     }
 };
 
-/// A tooltip an element wants shown (GPUI `TooltipRequest`). `check_visible` runs as it is
+/// A tooltip an element wants shown (GPUI `AnyTooltip`). `check_visible_and_update` runs as it is
 /// about to be placed, because an element that stopped painting has no mouse handlers
 /// left to notice the pointer moving away.
 /// Just past the pointer, flipping to the other side at the window's edge.
@@ -438,11 +443,11 @@ pub fn tooltip_origin(mouse: Point(Pixels), tooltip_size: Size(Pixels), viewport
     return origin;
 }
 
-pub const TooltipRequest = struct {
+pub const AnyTooltip = struct {
     view: view_mod.AnyView,
     mouse_position: Point(Pixels),
     ctx: *anyopaque,
-    check_visible: *const fn (ctx: *anyopaque, tooltip_bounds: Bounds(Pixels), window: *Window, cx: *App) bool,
+    check_visible_and_update: *const fn (ctx: *anyopaque, tooltip_bounds: Bounds(Pixels), window: *Window, cx: *App) bool,
 };
 
 const PendingInputHandler = struct {
@@ -724,9 +729,11 @@ pub const Window = struct {
     needs_present: bool = false,
     /// Set by `request_animation_frame`; another frame is drawn after this one.
     animation_requested: bool = false,
+    /// A throttled animation frame (`Animation.with_max_fps`) is waiting for its timer.
+    throttled_frame_pending: bool = false,
     next_frame_callbacks: std.ArrayList(FrameCallback) = .empty,
     frame_count: u64 = 0,
-    default_prevented: bool = false,
+    default_prevented_: bool = false,
     propagate_event: bool = true,
     /// Hitbox that captured the pointer; read it with `captured_hitbox()`.
     pointer_capture: ?HitboxId = null,
@@ -1102,6 +1109,15 @@ pub const Window = struct {
         self.notify_display_observers(self.app);
     }
 
+    /// The time between refreshes of the display this window is on, in nanoseconds, as of the
+    /// platform's last display notification. Null when the platform does not report it (GPUI
+    /// `refresh_interval`).
+    pub fn refresh_interval(self: *const Window, cx: *App) ?u64 {
+        const id = self.display_id_ orelse return null;
+        const display = cx.find_display(id) orelse return null;
+        return display.refresh_interval;
+    }
+
     /// Runs the display observers of this window (GPUI `notify_display_observers`).
     pub fn notify_display_observers(self: *Window, app: *App) void {
         app.dispatch_window_observers(.window_display, self);
@@ -1210,10 +1226,10 @@ pub const Window = struct {
         return .{ .id = self.handle_id };
     }
     pub fn prevent_default(self: *Window) void {
-        self.default_prevented = true;
+        self.default_prevented_ = true;
     }
-    pub fn is_default_prevented(self: *const Window) bool {
-        return self.default_prevented;
+    pub fn default_prevented(self: *const Window) bool {
+        return self.default_prevented_;
     }
     /// Stops the current event from propagating (GPUI `cx.stop_propagation`).
     pub fn stop_propagation(self: *Window) void {
@@ -2151,7 +2167,7 @@ pub const Window = struct {
         return self.prepaint_tooltip(cx);
     }
 
-    pub fn set_tooltip(self: *Window, request: TooltipRequest) void {
+    pub fn set_tooltip(self: *Window, request: AnyTooltip) void {
         self.next_frame.tooltip_requests.append(self.allocator, request) catch oom();
     }
 
@@ -2166,7 +2182,7 @@ pub const Window = struct {
             const tooltip_size = el.layout_as_root(taffy_mod.AvailableSpace.min_size(), self, cx);
             const origin = tooltip_origin(request.mouse_position, tooltip_size, self.viewport_size);
             const tooltip_area: Bounds(Pixels) = .{ .origin = origin, .size = tooltip_size };
-            if (!request.check_visible(request.ctx, tooltip_area, self, cx)) continue;
+            if (!request.check_visible_and_update(request.ctx, tooltip_area, self, cx)) continue;
             el.prepaint_at(origin, self, cx);
             self.tooltip_bounds = tooltip_area;
             return el;
@@ -2262,7 +2278,7 @@ pub const Window = struct {
 
     /// Dispatches platform input; returns whether it was handled.
     pub fn dispatch_event(self: *Window, event: interactive.PlatformInput, cx: *App) bool {
-        self.default_prevented = false;
+        self.default_prevented_ = false;
         self.propagate_event = true;
         // Focus-visible styles and hover suppression follow the modality of the last input (GPUI).
         const old_modality = self.last_input_modality;
@@ -2374,7 +2390,7 @@ pub const Window = struct {
             },
             else => {},
         }
-        return !self.propagate_event or self.default_prevented;
+        return !self.propagate_event or self.default_prevented_;
     }
 
     fn dispatch_mouse(self: *Window, comptime E: type, event: *const E, cx: *App) void {
@@ -2911,7 +2927,7 @@ pub const Window = struct {
     fn onInput(ctx: *anyopaque, event: interactive.PlatformInput) platform_mod.DispatchEventResult {
         const self: *Window = @ptrCast(@alignCast(ctx));
         const handled = self.dispatch_event(event, self.app);
-        return .{ .propagate = !handled, .default_prevented = self.default_prevented };
+        return .{ .propagate = !handled, .default_prevented = self.default_prevented_ };
     }
 
     fn onIme(ctx: *anyopaque, ime: platform_mod.ImeInput) void {

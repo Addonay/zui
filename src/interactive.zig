@@ -634,6 +634,48 @@ pub const FileDropEvent = union(enum) {
 };
 
 /// An enum corresponding to all kinds of platform input events.
+fn is_one_of(comptime T: type, comptime types: []const type) bool {
+    inline for (types) |U| {
+        if (T == U) return true;
+    }
+    return false;
+}
+
+/// GPUI's sealed `KeyEvent` trait: the keyboard inputs.
+pub fn is_key_event(comptime T: type) bool {
+    return is_one_of(T, &.{ KeyDownEvent, KeyUpEvent, ModifiersChangedEvent });
+}
+
+/// GPUI's sealed `MouseEvent` trait: the pointer-style inputs, including gestures and file drops.
+pub fn is_mouse_event(comptime T: type) bool {
+    return is_one_of(T, &.{ MouseDownEvent, MouseUpEvent, MousePressureEvent, MouseMoveEvent, ScrollEvent, PinchEvent, MouseExitEvent, FileDropEvent, TouchDragEvent });
+}
+
+/// GPUI's sealed `GestureEvent` trait: the multi-touch and drag gestures.
+pub fn is_gesture_event(comptime T: type) bool {
+    return is_one_of(T, &.{ PinchEvent, TouchDragEvent });
+}
+
+/// GPUI's sealed `InputEvent` trait: every event a platform sends (keys, pointer, gestures and touch).
+pub fn is_input_event(comptime T: type) bool {
+    return is_key_event(T) or is_mouse_event(T) or is_gesture_event(T) or T == TouchEvent;
+}
+
+test "GPUI's input event traits classify the platform events" {
+    const expect = std.testing.expect;
+    try expect(is_key_event(KeyDownEvent));
+    try expect(is_key_event(ModifiersChangedEvent));
+    try expect(!is_key_event(MouseDownEvent));
+    try expect(is_mouse_event(MouseDownEvent));
+    try expect(is_mouse_event(FileDropEvent));
+    try expect(!is_mouse_event(KeyUpEvent));
+    try expect(is_gesture_event(PinchEvent));
+    try expect(!is_gesture_event(ScrollEvent));
+    try expect(is_input_event(TouchEvent));
+    try expect(is_input_event(KeyUpEvent));
+    try expect(!is_input_event(u32));
+}
+
 pub const PlatformInput = union(enum) {
     /// A key was pressed.
     key_down: KeyDownEvent,

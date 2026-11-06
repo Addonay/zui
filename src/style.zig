@@ -424,6 +424,120 @@ test "style refinement" {
     try std.testing.expect(s.text_style() != null);
 }
 
+/// Splits two sets of highlights into non-overlapping segments, each with the fold of every
+/// highlight covering it (GPUI `combine_highlights`). `H` is a record with `range: { start, end }`
+/// and `style: HighlightStyle`, such as `text.Highlight`. GPUI folds the covering styles in hash
+/// order; here they fold in the order given, `a` first, so the result is deterministic.
+/// Empty ranges are dropped, and no segment is emitted where nothing covers the text.
+pub fn combine_highlights(comptime H: type, allocator: std.mem.Allocator, a: []const H, b: []const H) ![]H {
+    const Endpoint = struct { pos: usize, id: usize, start: bool };
+    var endpoints: std.ArrayList(Endpoint) = .empty;
+    defer endpoints.deinit(allocator);
+    var styles: std.ArrayList(HighlightStyle) = .empty;
+    defer styles.deinit(allocator);
+
+    for ([_][]const H{ a, b }) |list| {
+        for (list) |h| {
+            if (h.range.start >= h.range.end) continue;
+            const id = styles.items.len;
+            try styles.append(allocator, h.style);
+            try endpoints.append(allocator, .{ .pos = h.range.start, .id = id, .start = true });
+            try endpoints.append(allocator, .{ .pos = h.range.end, .id = id, .start = false });
+        }
+    }
+    std.mem.sort(Endpoint, endpoints.items, {}, struct {
+        fn less(_: void, x: Endpoint, y: Endpoint) bool {
+            return x.pos < y.pos;
+        }
+    }.less);
+
+    var active: std.ArrayList(usize) = .empty; // ids covering the cursor, ascending
+    defer active.deinit(allocator);
+    var out: std.ArrayList(H) = .empty;
+    errdefer out.deinit(allocator);
+    var cursor: usize = 0;
+    for (endpoints.items) |e| {
+        if (e.pos > cursor and active.items.len > 0) {
+            var style: HighlightStyle = .{};
+            for (active.items) |id| style = style.highlight(styles.items[id]);
+            try out.append(allocator, .{ .range = .{ .start = cursor, .end = e.pos }, .style = style });
+        }
+        cursor = e.pos;
+        if (e.start) {
+            var at: usize = active.items.len;
+            while (at > 0 and active.items[at - 1] > e.id) at -= 1;
+            try active.insert(allocator, at, e.id);
+        } else {
+            for (active.items, 0..) |id, i| {
+                if (id == e.id) {
+                    _ = active.orderedRemove(i);
+                    break;
+                }
+            }
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "combine_highlights splits overlapping ranges as GPUI does" {
+    const Range = struct { start: usize, end: usize };
+    const Hl = struct { range: Range, style: HighlightStyle };
+    const green: HighlightStyle = .{ .color = color_mod.hsla(0.33, 1, 0.5, 1) };
+    const blue: HighlightStyle = .{ .color = color_mod.hsla(0.66, 1, 0.5, 1) };
+    const yellow: HighlightStyle = .{ .color = color_mod.hsla(0.16, 1, 0.5, 1) };
+    const red: HighlightStyle = .{ .color = color_mod.hsla(0.0, 1, 0.5, 1) };
+    const bold: HighlightStyle = .{ .font_weight = .BOLD };
+    const italic: HighlightStyle = .{ .font_style = .italic };
+
+    const a = [_]Hl{
+        .{ .range = .{ .start = 0, .end = 5 }, .style = green },
+        .{ .range = .{ .start = 4, .end = 10 }, .style = bold },
+        .{ .range = .{ .start = 15, .end = 20 }, .style = yellow },
+    };
+    const b = [_]Hl{
+        .{ .range = .{ .start = 2, .end = 6 }, .style = italic },
+        .{ .range = .{ .start = 1, .end = 3 }, .style = blue },
+        .{ .range = .{ .start = 21, .end = 23 }, .style = red },
+    };
+    const out = try combine_highlights(Hl, std.testing.allocator, &a, &b);
+    defer std.testing.allocator.free(out);
+
+    const expected = [_]struct { start: usize, end: usize, style: HighlightStyle }{
+        .{ .start = 0, .end = 1, .style = green },
+        .{ .start = 1, .end = 2, .style = blue },
+        .{ .start = 2, .end = 3, .style = .{ .color = blue.color, .font_style = .italic } },
+        .{ .start = 3, .end = 4, .style = .{ .color = green.color, .font_style = .italic } },
+        .{ .start = 4, .end = 5, .style = .{ .color = green.color, .font_weight = .BOLD, .font_style = .italic } },
+        .{ .start = 5, .end = 6, .style = .{ .font_weight = .BOLD, .font_style = .italic } },
+        .{ .start = 6, .end = 10, .style = bold },
+        .{ .start = 15, .end = 20, .style = yellow },
+        .{ .start = 21, .end = 23, .style = red },
+    };
+    try std.testing.expectEqual(expected.len, out.len);
+    for (expected, out) |want, got| {
+        try std.testing.expectEqual(want.start, got.range.start);
+        try std.testing.expectEqual(want.end, got.range.end);
+        try std.testing.expectEqualDeep(want.style, got.style);
+    }
+}
+
+test "combine_highlights emits no empty segment when ranges start together" {
+    const Hl = struct { range: struct { start: usize, end: usize }, style: HighlightStyle };
+    const bold: HighlightStyle = .{ .font_weight = .BOLD };
+    const italic: HighlightStyle = .{ .font_style = .italic };
+    const a = [_]Hl{.{ .range = .{ .start = 0, .end = 3 }, .style = bold }};
+    const b = [_]Hl{.{ .range = .{ .start = 0, .end = 3 }, .style = italic }};
+    const out = try combine_highlights(Hl, std.testing.allocator, &a, &b);
+    defer std.testing.allocator.free(out);
+
+    // One segment covering both, not a zero-length one where the second range starts.
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqual(@as(usize, 0), out[0].range.start);
+    try std.testing.expectEqual(@as(usize, 3), out[0].range.end);
+    try std.testing.expectEqual(FontStyle.italic, out[0].style.font_style.?);
+    try std.testing.expectEqual(FontWeight.BOLD, out[0].style.font_weight.?);
+}
+
 test "highlight combination" {
     const a: HighlightStyle = .{};
     const b: HighlightStyle = .{ .font_style = .italic, .fade_out = 0 };

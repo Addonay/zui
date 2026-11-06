@@ -45,6 +45,11 @@ pub const AnyView = struct {
         return AnyElement.new(el);
     }
 
+    /// A weak handle to this view (GPUI `AnyView::downgrade`).
+    pub fn downgrade(self: AnyView) AnyWeakView {
+        return .{ .weak = .{ .entity_id_ = self.entity_id, .tid = self.tid }, .render_fn = self.render_fn, .type_name = self.type_name };
+    }
+
     /// GPUI `AnyView::cached`: currently renders every frame (cache key reserved).
     pub fn cached(self: AnyView, style: anytype) AnyView {
         _ = style;
@@ -88,3 +93,24 @@ const ViewElement = struct {
 pub fn into_any_view(entity: anytype) AnyView {
     return AnyView.from(entity);
 }
+
+/// A view that renders nothing (GPUI `EmptyView`).
+pub const EmptyView = struct {
+    pub fn render(_: *EmptyView, _: *Window, _: *app_mod.Context(EmptyView)) AnyElement {
+        return @import("elements/empty.zig").empty();
+    }
+};
+
+/// A weak, type-erased view handle (GPUI `AnyWeakView`). `upgrade` fails once the view's entity is
+/// released. Like the other weak handles in ZUI, it takes the `cx` that can check that.
+pub const AnyWeakView = struct {
+    weak: app_mod.AnyWeakEntity,
+    render_fn: *const fn (EntityId, *Window, *App) AnyElement,
+    type_name: []const u8,
+
+    /// The strong view, if its entity is still alive.
+    pub fn upgrade(self: AnyWeakView, cx: anytype) ?AnyView {
+        if (!self.weak.is_upgradable(cx)) return null;
+        return .{ .entity_id = self.weak.entity_id(), .tid = self.weak.tid, .render_fn = self.render_fn, .type_name = self.type_name };
+    }
+};

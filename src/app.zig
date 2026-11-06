@@ -1192,6 +1192,8 @@ pub const App = struct {
     shut_down: bool = false,
     quit_mode: QuitMode = .default,
     reduce_motion: bool = false,
+    /// When the app's shared animation clock started; `repeat_synced` phases count from here (GPUI `synced_animation_epoch`).
+    synced_animation_epoch: u64 = 0,
     /// Set by `propagate`. A bubble-phase action listener stops propagation by default, and calls
     /// `propagate` to let the action reach the handlers above it.
     propagate_event: bool = true,
@@ -1219,6 +1221,7 @@ pub const App = struct {
             .actions = action_mod.ActionRegistry.init(allocator),
         };
         app.async_app = .{ .app = app };
+        app.synced_animation_epoch = executor_mod.now_ns();
         app.foreground_executor_.app = app;
         app.asset_loads = asset_cache_mod.AssetLoads.init(allocator, app, &app.foreground_executor_);
         app.asset_cache.fetch_config = .{

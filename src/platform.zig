@@ -26,13 +26,62 @@ pub const CursorStyle = style_mod.CursorStyle;
 
 pub const DisplayId = u32;
 
+/// Window size GPUI opens a window at when the display is big enough (GPUI `DEFAULT_WINDOW_SIZE`).
+pub const DEFAULT_WINDOW_SIZE: geometry.Size(Pixels) = .{ .width = 1536, .height = 1095 };
+
+/// The time between a display's refreshes in nanoseconds, from its rate in hertz. Rejects the zero,
+/// negative and non-finite rates platforms use to mean "unknown" (GPUI `refresh_interval_from_hz`).
+pub fn refresh_interval_from_hz(hertz: f64) ?u64 {
+    if (!std.math.isFinite(hertz) or hertz <= 0) return null;
+    return @intFromFloat(1.0 / hertz * std.time.ns_per_s);
+}
+
 /// A physical display (GPUI `PlatformDisplay`).
 pub const Display = struct {
     id: DisplayId,
     bounds: Bounds(Pixels),
     scale_factor: f32 = 1,
     name: []const u8 = "",
+    /// The time between the display's refreshes in nanoseconds: the maximum rate for a variable
+    /// refresh display. Null when the platform does not report it (GPUI `refresh_interval`).
+    refresh_interval: ?u64 = null,
+
+    /// The bounds a window gets when the app does not place it: `DEFAULT_WINDOW_SIZE`, clipped to
+    /// the display and centered on it (GPUI `PlatformDisplay::default_bounds`).
+    pub fn default_bounds(self: Display) Bounds(Pixels) {
+        const clipped: geometry.Size(Pixels) = .{
+            .width = @min(DEFAULT_WINDOW_SIZE.width, self.bounds.size.width),
+            .height = @min(DEFAULT_WINDOW_SIZE.height, self.bounds.size.height),
+        };
+        return Bounds(Pixels).centered_at(self.bounds.center(), clipped);
+    }
 };
+
+test "refresh_interval_from_hz converts rates and rejects unknown ones (GPUI test_refresh_interval_from_hz)" {
+    try std.testing.expectEqual(@as(?u64, 20_000_000), refresh_interval_from_hz(50.0));
+    try std.testing.expectEqual(@as(?u64, 8_333_333), refresh_interval_from_hz(120.0));
+    for ([_]f64{ 0.0, -60.0, std.math.nan(f64), std.math.inf(f64) }) |unknown| {
+        try std.testing.expectEqual(@as(?u64, null), refresh_interval_from_hz(unknown));
+    }
+}
+
+test "default_bounds: 1536x1095 clipped to the display and centered on it" {
+    const big: Display = .{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } } };
+    // Height is clipped to 1080, and the window is centered on (960, 540).
+    const bounds = big.default_bounds();
+    try std.testing.expectEqual(@as(f32, 192), bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 0), bounds.origin.y);
+    try std.testing.expectEqual(@as(f32, 1536), bounds.size.width);
+    try std.testing.expectEqual(@as(f32, 1080), bounds.size.height);
+
+    // A small display is filled exactly, from its top left corner.
+    const small: Display = .{ .id = 1, .bounds = .{ .origin = .{ .x = 10, .y = 20 }, .size = .{ .width = 800, .height = 600 } } };
+    const fill = small.default_bounds();
+    try std.testing.expectEqual(@as(f32, 10), fill.origin.x);
+    try std.testing.expectEqual(@as(f32, 20), fill.origin.y);
+    try std.testing.expectEqual(@as(f32, 800), fill.size.width);
+    try std.testing.expectEqual(@as(f32, 600), fill.size.height);
+}
 
 /// Whether the platform is presenting a window's frames (GPUI `WindowVisibility`). Hidden
 /// while the window is minimized, fully covered (where the platform can tell), or suspended.

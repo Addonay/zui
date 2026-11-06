@@ -383,8 +383,21 @@ pub const X11Connection = struct {
             .id = 0,
             .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = @as(f32, @floatFromInt(w)) / self.scale, .height = @as(f32, @floatFromInt(h)) / self.scale } },
             .scale_factor = self.scale,
+            .refresh_interval = self.fastest_refresh_interval_ns(),
         };
         return out[0..1];
+    }
+
+    /// The shortest interval between refreshes of any monitor, in nanoseconds. X11 reports one
+    /// display for the whole screen, so it gets the fastest rate, the one GPUI's docs call maximum.
+    /// Null before RandR has listed the monitors.
+    fn fastest_refresh_interval_ns(self: *const X11Connection) ?u64 {
+        var fastest: ?i64 = null;
+        for (self.crtc_rates[0..self.crtc_count]) |c| {
+            fastest = if (fastest) |f| @min(f, c.interval_ms) else c.interval_ms;
+        }
+        const ms = fastest orelse return null;
+        return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
     }
 
     pub fn deinit(self: *X11Connection) void {

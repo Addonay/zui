@@ -1,8 +1,11 @@
 //! Port of GPUI `elements/animation.rs`: animates an element over time with
 //! easing functions, or drives it with a stateful spring. Times are nanoseconds.
 //!
-//! Differences from GPUI: animations run on the monotonic clock only (no synced
-//! or `max_fps` throttled variants), and `reduce_motion` is honored through `App`.
+//! `repeat_synced` phases come from the app's shared clock (`App.synced_animation_epoch`), and
+//! `with_max_fps` schedules its frames on a timer. Differences from GPUI: GPUI keeps the timer's
+//! "pending" flag per element, ZUI keeps one per window, so at most one throttled frame is pending
+//! in a window and it is served at the rate of the first throttled animation that asked for it.
+//! `reduce_motion` is honored through `App`.
 
 const std = @import("std");
 const element_mod = @import("../element.zig");
@@ -82,6 +85,10 @@ pub const Animation = struct {
     oneshot: bool = true,
     /// Maps normalized time to the animated value. The output is not clamped.
     easing: EasingFn = &linear,
+    /// Whether the phase comes from the app's shared clock, so animations repeat in step (GPUI `synced`).
+    synced: bool = false,
+    /// The highest frame rate this animation asks for while it runs; null draws every frame (GPUI `max_fps`).
+    max_fps: ?f32 = null,
 
     /// Creates an animation of `duration` nanoseconds, linear and run once.
     pub fn new(duration: u64) Animation {
@@ -101,7 +108,54 @@ pub const Animation = struct {
         copy.easing = easing;
         return copy;
     }
+
+    /// Repeats the animation, with its phase taken from the app's shared clock, so every synced
+    /// animation of the same duration is at the same point at once (GPUI `repeat_synced`).
+    pub fn repeat_synced(self: Animation) Animation {
+        var copy = self;
+        copy.oneshot = false;
+        copy.synced = true;
+        return copy;
+    }
+
+    /// Caps the frame rate while the animation runs: frames come from a timer every `1 / max_fps`
+    /// seconds instead of every display refresh (GPUI `with_max_fps`).
+    pub fn with_max_fps(self: Animation, max_fps: f32) Animation {
+        var copy = self;
+        copy.max_fps = max_fps;
+        return copy;
+    }
 };
+
+/// The interval in nanoseconds between the throttled frames of an animation capped at `max_fps`,
+/// or null when it is not capped. Rates that are not finite and positive mean no cap, as in GPUI.
+pub fn throttle_interval(max_fps: ?f32) ?u64 {
+    const fps = max_fps orelse return null;
+    if (!std.math.isFinite(fps) or fps <= 0) return null;
+    return @intFromFloat(@as(f64, std.time.ns_per_s) / @as(f64, fps));
+}
+
+/// The timer behind a throttled animation frame. When it fires, the window draws again, and the
+/// next animation frame can be requested by the animation as usual.
+const ThrottledFrame = struct {
+    app: *App,
+    window_id: window_mod.WindowId,
+
+    fn fire(self: ThrottledFrame) void {
+        const window = self.app.window_by_id(self.window_id) orelse return;
+        window.throttled_frame_pending = false;
+        window.refresh();
+    }
+};
+
+/// Asks for one frame after `interval` nanoseconds instead of the next refresh. A window has at
+/// most one such frame pending, so animations that throttle do not each start a timer.
+fn request_throttled_frame(window: *Window, cx: *App, interval: u64) void {
+    if (window.throttled_frame_pending) return;
+    window.throttled_frame_pending = true;
+    const timer: ThrottledFrame = .{ .app = cx, .window_id = window.window_handle_id() };
+    cx.background_executor().after(cx.foreground_executor(), interval, ThrottledFrame.fire, timer);
+}
 
 /// Persistent per-element progress through an animation chain.
 const AnimationState = struct {
@@ -117,7 +171,7 @@ const AnimationFrame = struct {
 };
 
 /// Advances `state` to `now` and returns the normalized, un-eased progress.
-fn advance_animation(animations: []const Animation, state: *AnimationState, now: u64, reduce_motion: bool) AnimationFrame {
+fn advance_animation(animations: []const Animation, state: *AnimationState, now: u64, synced_epoch: u64, reduce_motion: bool) AnimationFrame {
     if (reduce_motion) {
         const last = animations.len - 1;
         return .{ .animation_ix = last, .delta = if (animations[last].oneshot) 1.0 else 0.0, .done = true };
@@ -125,7 +179,12 @@ fn advance_animation(animations: []const Animation, state: *AnimationState, now:
 
     const animation_ix = state.animation_ix;
     const animation = animations[animation_ix];
-    const elapsed = now -| state.start_ns;
+    // A synced animation reads the shared clock, reduced modulo its duration first so the f64
+    // conversion keeps sub-millisecond precision for long-running apps (as GPUI does).
+    const elapsed = if (animation.synced and animation.duration != 0)
+        (now -| synced_epoch) % animation.duration
+    else
+        now -| state.start_ns;
     var delta: f32 = if (animation.duration == 0)
         1.0
     else
@@ -167,13 +226,19 @@ pub fn AnimationElement(comptime E: type, comptime animator: anytype) type {
         pub fn request_layout(self: *Self, gid: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, AnyElement } {
             const now = @import("../executor.zig").now_ns();
             const state = window.element_state(AnimationState, (gid orelse unreachable).*, .{ .start_ns = now });
-            const frame = advance_animation(self.animations, state, now, cx.reduce_motion);
+            const frame = advance_animation(self.animations, state, now, cx.synced_animation_epoch, cx.reduce_motion);
             const eased = self.animations[frame.animation_ix].easing(frame.delta);
 
             const element = self.element orelse unreachable;
             self.element = null;
             const any = element_mod.into_any_element(animator(element, frame.animation_ix, eased));
-            if (!frame.done) window.request_animation_frame();
+            if (!frame.done) {
+                if (throttle_interval(self.animations[frame.animation_ix].max_fps)) |interval| {
+                    request_throttled_frame(window, cx, interval);
+                } else {
+                    window.request_animation_frame();
+                }
+            }
             return .{ any.request_layout(window, cx), any };
         }
 
@@ -183,6 +248,12 @@ pub fn AnimationElement(comptime E: type, comptime animator: anytype) type {
 
         pub fn paint(_: *Self, _: ?*const GlobalElementId, _: Bounds(Pixels), element: *AnyElement, _: *void, window: *Window, cx: *App) void {
             element.paint(window, cx);
+        }
+
+        /// Applies `f` to the element this animation wraps (GPUI `map_element`).
+        pub fn map_element(self: *Self, comptime f: fn (E) E) *Self {
+            self.element = f(self.element orelse unreachable);
+            return self;
         }
     };
 }
@@ -277,6 +348,12 @@ pub fn SpringAnimationElement(comptime E: type, comptime T: type, comptime anima
 
         pub fn paint(_: *Self, _: ?*const GlobalElementId, _: Bounds(Pixels), element: *AnyElement, _: *void, window: *Window, cx: *App) void {
             element.paint(window, cx);
+        }
+
+        /// Applies `f` to the element this animation wraps (GPUI `map_element`).
+        pub fn map_element(self: *Self, comptime f: fn (E) E) *Self {
+            self.element = f(self.element orelse unreachable);
+            return self;
         }
     };
 }
@@ -378,11 +455,11 @@ test "oneshot animation reports progress then completes" {
     const animations = [_]Animation{Animation.new(1_000)};
     var state: AnimationState = .{ .start_ns = 0 };
 
-    const halfway = advance_animation(&animations, &state, 500, false);
+    const halfway = advance_animation(&animations, &state, 500, 0, false);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), halfway.delta, 1e-6);
     try std.testing.expect(!halfway.done);
 
-    const finished = advance_animation(&animations, &state, 1_500, false);
+    const finished = advance_animation(&animations, &state, 1_500, 0, false);
     try std.testing.expectEqual(@as(f32, 1.0), finished.delta);
     try std.testing.expect(finished.done);
 }
@@ -390,7 +467,7 @@ test "oneshot animation reports progress then completes" {
 test "repeating animation wraps its phase" {
     const animations = [_]Animation{Animation.new(1_000).repeat()};
     var state: AnimationState = .{ .start_ns = 0 };
-    const wrapped = advance_animation(&animations, &state, 1_250, false);
+    const wrapped = advance_animation(&animations, &state, 1_250, 0, false);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), wrapped.delta, 1e-6);
     try std.testing.expect(!wrapped.done);
 }
@@ -399,12 +476,12 @@ test "animation chain advances to the next stage" {
     const animations = [_]Animation{ Animation.new(1_000), Animation.new(1_000) };
     var state: AnimationState = .{ .start_ns = 0 };
 
-    const first = advance_animation(&animations, &state, 1_200, false);
+    const first = advance_animation(&animations, &state, 1_200, 0, false);
     try std.testing.expectEqual(@as(usize, 0), first.animation_ix);
     try std.testing.expect(!first.done);
     try std.testing.expectEqual(@as(usize, 1), state.animation_ix);
 
-    const second = advance_animation(&animations, &state, 1_700, false);
+    const second = advance_animation(&animations, &state, 1_700, 0, false);
     try std.testing.expectEqual(@as(usize, 1), second.animation_ix);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), second.delta, 1e-6);
 }
@@ -412,13 +489,85 @@ test "animation chain advances to the next stage" {
 test "reduce motion renders a single static frame" {
     const oneshot = [_]Animation{Animation.new(1_000)};
     var state: AnimationState = .{ .start_ns = 0 };
-    const frame = advance_animation(&oneshot, &state, 10, true);
+    const frame = advance_animation(&oneshot, &state, 10, 0, true);
     try std.testing.expectEqual(@as(f32, 1.0), frame.delta);
     try std.testing.expect(frame.done);
 
     const repeating = [_]Animation{Animation.new(1_000).repeat()};
-    const repeated = advance_animation(&repeating, &state, 10, true);
+    const repeated = advance_animation(&repeating, &state, 10, 0, true);
     try std.testing.expectEqual(@as(f32, 0.0), repeated.delta);
+}
+
+test "synced animations take their phase from the shared clock" {
+    const synced = [_]Animation{Animation.new(1_000).repeat_synced()};
+    // Started at different times, but on the shared clock both are half way at 1_500.
+    var early: AnimationState = .{ .start_ns = 0 };
+    var late: AnimationState = .{ .start_ns = 300 };
+    const a = advance_animation(&synced, &early, 1_500, 0, false);
+    const b = advance_animation(&synced, &late, 1_500, 0, false);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), a.delta, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), b.delta, 1e-6);
+
+    // An unsynced repeat counts from its own start: 1_200 ns in, so 0.2.
+    const plain = [_]Animation{Animation.new(1_000).repeat()};
+    var own: AnimationState = .{ .start_ns = 300 };
+    const c = advance_animation(&plain, &own, 1_500, 0, false);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), c.delta, 1e-6);
+}
+
+test "repeat_synced and with_max_fps set their settings" {
+    const synced = Animation.new(1_000).repeat_synced();
+    try std.testing.expect(synced.synced and !synced.oneshot);
+    try std.testing.expect(!Animation.new(1_000).synced);
+    try std.testing.expectEqual(@as(?f32, 10), Animation.new(1_000).with_max_fps(10).max_fps);
+    try std.testing.expectEqual(@as(?f32, null), Animation.new(1_000).max_fps);
+}
+
+test "throttled frames come every 1 / max_fps seconds, or never without a finite positive rate" {
+    try std.testing.expectEqual(@as(?u64, 100_000_000), throttle_interval(10));
+    try std.testing.expectEqual(@as(?u64, 16_666_666), throttle_interval(60));
+    try std.testing.expectEqual(@as(?u64, null), throttle_interval(null));
+    for ([_]f32{ 0, -1, std.math.nan(f32), std.math.inf(f32) }) |fps| {
+        try std.testing.expectEqual(@as(?u64, null), throttle_interval(fps));
+    }
+}
+
+fn double_element(element: u32) u32 {
+    return element * 2;
+}
+
+fn keep_element(element: u32, _: usize, _: f32) u32 {
+    return element;
+}
+
+/// A box animated with a frame-rate cap, to check that the cap replaces the next-frame request.
+const ThrottledTestView = struct {
+    pub fn render(_: *ThrottledTestView, _: *Window, _: *Context(ThrottledTestView)) *Div {
+        const animation = Animation.new(60 * std.time.ns_per_s).repeat().with_max_fps(10);
+        return div_mod.div().size_full().child(
+            div_mod.div().id("throttled-box").w(geometry.px(10)).h(geometry.px(10)).with_animation("throttled-animation", animation, grow_box),
+        );
+    }
+
+    fn build(_: *Window, app: *App) app_mod.Entity(ThrottledTestView) {
+        return app.new(ThrottledTestView{});
+    }
+};
+
+test "with_max_fps: a throttled animation waits on a timer, not on the next refresh" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(ThrottledTestView.build);
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.throttled_frame_pending);
+    try std.testing.expect(!vcx.window.animation_requested);
+}
+
+test "map_element replaces the wrapped element" {
+    const Wrapped = AnimationElement(u32, keep_element);
+    var wrapped: Wrapped = .{ .key = undefined, .element = 21, .animations = &.{} };
+    _ = wrapped.map_element(double_element);
+    try std.testing.expectEqual(@as(?u32, 42), wrapped.element);
 }
 
 // -- window tests -------------------------------------------------------------
