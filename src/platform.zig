@@ -715,7 +715,48 @@ pub const Platform = struct {
         set_activation_policy: *const fn (*Platform, ActivationPolicy) void = noopPolicy,
         hide_other_apps: *const fn (*Platform) void = noop,
         unhide_other_apps: *const fn (*Platform) void = noop,
+        /// The window appearance the platform reports (GPUI `Platform::window_appearance`).
+        window_appearance: *const fn (*Platform) WindowAppearance = lightAppearance,
+        /// Shows a file chooser for paths (GPUI `Platform::prompt_for_paths`). Answers once, through
+        /// `completion`, possibly before this returns when the dialog cannot be shown.
+        prompt_for_paths: *const fn (*Platform, PathPromptOptions, PathsCompletion) void = noPromptForPaths,
+        /// Shows a save dialog (GPUI `Platform::prompt_for_new_path`).
+        prompt_for_new_path: *const fn (*Platform, []const u8, ?[]const u8, PathCompletion) void = noPromptForNewPath,
+        /// Whether one dialog may choose files and directories together (GPUI `can_select_mixed_files_and_dirs`).
+        can_select_mixed_files_and_dirs: *const fn (*Platform) bool = alwaysFalse,
+        /// Shows a path in the file manager (GPUI `Platform::reveal_path`).
+        reveal_path: *const fn (*Platform, []const u8) void = noopStr,
+        /// Opens a path with the system's default application (GPUI `Platform::open_with_system`).
+        open_with_system: *const fn (*Platform, []const u8) void = noopStr,
+        /// Starts the app again: the binary (null for this one) with the arguments (GPUI `Platform::restart`).
+        restart: *const fn (*Platform, ?[]const u8, []const []const u8) void = noRestart,
+        /// The path of this executable (GPUI `Platform::app_path`). Valid until the next call.
+        app_path: *const fn (*Platform) anyerror![]const u8 = noAppPath,
+        /// GPUI `Platform::path_for_auxiliary_executable`.
+        path_for_auxiliary_executable: *const fn (*Platform, []const u8) anyerror![]const u8 = noAuxiliaryExecutable,
+        /// GPUI `Platform::register_url_scheme`.
+        register_url_scheme: *const fn (*Platform, []const u8) anyerror!void = noRegisterUrlScheme,
     };
+
+    fn lightAppearance(_: *Platform) WindowAppearance {
+        return .light;
+    }
+    fn noPromptForPaths(_: *Platform, _: PathPromptOptions, completion: PathsCompletion) void {
+        completion.call(error.PromptsNotSupported);
+    }
+    fn noPromptForNewPath(_: *Platform, _: []const u8, _: ?[]const u8, completion: PathCompletion) void {
+        completion.call(error.PromptsNotSupported);
+    }
+    fn noRestart(_: *Platform, _: ?[]const u8, _: []const []const u8) void {}
+    fn noAppPath(_: *Platform) anyerror![]const u8 {
+        return error.NotSupported;
+    }
+    fn noAuxiliaryExecutable(_: *Platform, _: []const u8) anyerror![]const u8 {
+        return error.NotSupported;
+    }
+    fn noRegisterUrlScheme(_: *Platform, _: []const u8) anyerror!void {
+        return error.NotSupported;
+    }
 
     fn hostPlatformInfo(_: *Platform) PlatformInfo {
         return PlatformInfo.host();
@@ -867,6 +908,36 @@ pub const Platform = struct {
     pub fn hide_other_apps(self: *Platform) void {
         self.vtable.hide_other_apps(self);
     }
+    pub fn window_appearance(self: *Platform) WindowAppearance {
+        return self.vtable.window_appearance(self);
+    }
+    pub fn prompt_for_paths(self: *Platform, options: PathPromptOptions, completion: PathsCompletion) void {
+        self.vtable.prompt_for_paths(self, options, completion);
+    }
+    pub fn prompt_for_new_path(self: *Platform, directory: []const u8, suggested_name: ?[]const u8, completion: PathCompletion) void {
+        self.vtable.prompt_for_new_path(self, directory, suggested_name, completion);
+    }
+    pub fn can_select_mixed_files_and_dirs(self: *Platform) bool {
+        return self.vtable.can_select_mixed_files_and_dirs(self);
+    }
+    pub fn reveal_path(self: *Platform, path: []const u8) void {
+        self.vtable.reveal_path(self, path);
+    }
+    pub fn open_with_system(self: *Platform, path: []const u8) void {
+        self.vtable.open_with_system(self, path);
+    }
+    pub fn restart(self: *Platform, binary_path: ?[]const u8, arguments: []const []const u8) void {
+        self.vtable.restart(self, binary_path, arguments);
+    }
+    pub fn app_path(self: *Platform) anyerror![]const u8 {
+        return self.vtable.app_path(self);
+    }
+    pub fn path_for_auxiliary_executable(self: *Platform, name: []const u8) anyerror![]const u8 {
+        return self.vtable.path_for_auxiliary_executable(self, name);
+    }
+    pub fn register_url_scheme(self: *Platform, scheme: []const u8) anyerror!void {
+        return self.vtable.register_url_scheme(self, scheme);
+    }
     pub fn unhide_other_apps(self: *Platform) void {
         self.vtable.unhide_other_apps(self);
     }
@@ -892,6 +963,37 @@ pub const SystemNotificationAction = struct {
 pub const SystemNotificationResponse = struct {
     tag: []const u8,
     action_id: ?[]const u8 = null,
+};
+
+/// The options of a file chooser (GPUI `PathPromptOptions`). `files` is accepted for parity; the
+/// Linux portal chooses files or directories, as the options say.
+pub const PathPromptOptions = struct {
+    files: bool = true,
+    directories: bool = false,
+    multiple: bool = false,
+    /// The label of the accept button.
+    prompt: ?[]const u8 = null,
+};
+
+/// Receives the answer to `prompt_for_paths`: `null` when the user cancelled, an error when the
+/// dialog could not be shown. The paths are valid during the call only.
+pub const PathsCompletion = struct {
+    ctx: *anyopaque,
+    func: *const fn (*anyopaque, anyerror!?[]const []const u8) void,
+
+    pub fn call(self: PathsCompletion, result: anyerror!?[]const []const u8) void {
+        self.func(self.ctx, result);
+    }
+};
+
+/// Receives the answer to `prompt_for_new_path`: the chosen path, `null` when cancelled.
+pub const PathCompletion = struct {
+    ctx: *anyopaque,
+    func: *const fn (*anyopaque, anyerror!?[]const u8) void,
+
+    pub fn call(self: PathCompletion, result: anyerror!?[]const u8) void {
+        self.func(self.ctx, result);
+    }
 };
 
 pub const headless = @import("platform/headless.zig");

@@ -917,6 +917,45 @@ fn ListenerEventWith(comptime f: anytype) type {
     return @typeInfo(params[2].?).pointer.child;
 }
 
+/// The context of a platform completion that runs an app callback: the app, and the caller's
+/// context. Freed when it runs, so a completion runs once.
+fn PromptCallback(comptime C: type, comptime R: type, comptime f: fn (C, R, *App) void) type {
+    return struct {
+        const Self = @This();
+        app: *App,
+        ctx: C,
+
+        fn complete(raw: *anyopaque, result: R) void {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            const app = self.app;
+            const ctx = self.ctx;
+            app.allocator.destroy(self);
+            f(ctx, result, app);
+        }
+    };
+}
+
+fn dupe_strings(gpa: std.mem.Allocator, items: []const []const u8) std.mem.Allocator.Error![]const []const u8 {
+    if (items.len == 0) return &.{};
+    const out = try gpa.alloc([]const u8, items.len);
+    var done: usize = 0;
+    errdefer {
+        for (out[0..done]) |s| gpa.free(s);
+        gpa.free(out);
+    }
+    for (items, 0..) |item, i| {
+        out[i] = try gpa.dupe(u8, item);
+        done = i + 1;
+    }
+    return out;
+}
+
+fn free_strings(gpa: std.mem.Allocator, items: []const []const u8) void {
+    if (items.len == 0) return;
+    for (items) |s| gpa.free(s);
+    gpa.free(items);
+}
+
 /// The entity type produced by an initializer passed to `cx.new`.
 pub fn EntityTypeOf(comptime I: type) type {
     switch (@typeInfo(I)) {
@@ -959,6 +998,8 @@ const SubscriberKind = enum {
     keyboard_layout,
     /// The app was reopened (`App.on_reopen`).
     reopen,
+    /// The app is about to restart (`App.on_app_restart`).
+    app_restart,
 };
 
 /// When the cursor is hidden in response to typing (GPUI `CursorHideMode`). The cursor comes back
@@ -1113,6 +1154,10 @@ pub const App = struct {
     active_drag: ?AnyDrag = null,
     platform: *platform_mod.Platform,
     system_notification_response: ?SystemNotificationHandler = null,
+    /// The binary `restart` starts instead of this one (GPUI `set_restart_path`). Owned.
+    restart_path: ?[]u8 = null,
+    /// The arguments `restart` passes (GPUI `with_restart_arguments`). Owned, each one too.
+    restart_arguments: []const []const u8 = &.{},
     entities: EntityMap = .{},
     windows: std.ArrayList(?*Window) = .empty,
     globals: std.AutoHashMapUnmanaged(TypeId, GlobalSlot) = .empty,
@@ -1209,6 +1254,10 @@ pub const App = struct {
         self.window_stack_storage.deinit(self.allocator);
         if (self.system_notification_response) |h| h.free(self.allocator, h.ctx);
         self.system_notification_response = null;
+        if (self.restart_path) |path| self.allocator.free(path);
+        self.restart_path = null;
+        free_strings(self.allocator, self.restart_arguments);
+        self.restart_arguments = &.{};
         // Each slot is cleared before its window is destroyed, as close_window does, so a window
         // being destroyed is never seen again by is_root_of_other_window.
         for (self.windows.items) |*slot| {
@@ -2368,6 +2417,107 @@ pub const App = struct {
         self.platform.open_url(url);
     }
 
+    /// The appearance of the application's windows (GPUI `App::window_appearance`).
+    pub fn window_appearance(self: *App) platform_mod.WindowAppearance {
+        return self.platform.window_appearance();
+    }
+
+    /// Whether one file dialog may choose files and directories together (GPUI `can_select_mixed_files_and_dirs`).
+    pub fn can_select_mixed_files_and_dirs(self: *App) bool {
+        return self.platform.can_select_mixed_files_and_dirs();
+    }
+
+    /// Shows a file chooser. `f(ctx, result, app)` runs once: `null` when the user cancelled, or the
+    /// chosen paths, valid during the call only. GPUI returns a receiver; the callback takes its place.
+    pub fn prompt_for_paths(self: *App, options: platform_mod.PathPromptOptions, ctx: anytype, comptime f: fn (@TypeOf(ctx), anyerror!?[]const []const u8, *App) void) void {
+        const Box = PromptCallback(@TypeOf(ctx), anyerror!?[]const []const u8, f);
+        const box = self.allocator.create(Box) catch oom();
+        box.* = .{ .app = self, .ctx = ctx };
+        self.platform.prompt_for_paths(options, .{ .ctx = box, .func = Box.complete });
+    }
+
+    /// Shows a save dialog starting in `directory`. `f(ctx, result, app)` runs once, as for `prompt_for_paths`.
+    pub fn prompt_for_new_path(self: *App, directory: []const u8, suggested_name: ?[]const u8, ctx: anytype, comptime f: fn (@TypeOf(ctx), anyerror!?[]const u8, *App) void) void {
+        const Box = PromptCallback(@TypeOf(ctx), anyerror!?[]const u8, f);
+        const box = self.allocator.create(Box) catch oom();
+        box.* = .{ .app = self, .ctx = ctx };
+        self.platform.prompt_for_new_path(directory, suggested_name, .{ .ctx = box, .func = Box.complete });
+    }
+
+    /// Shows a path in the file manager (GPUI `App::reveal_path`).
+    pub fn reveal_path(self: *App, path: []const u8) void {
+        self.platform.reveal_path(path);
+    }
+
+    /// Opens a path with the system's default application (GPUI `App::open_with_system`).
+    pub fn open_with_system(self: *App, path: []const u8) void {
+        self.platform.open_with_system(path);
+    }
+
+    /// The path of this executable (GPUI `App::app_path`). Valid until the next call.
+    pub fn app_path(self: *App) anyerror![]const u8 {
+        return self.platform.app_path();
+    }
+
+    /// GPUI `App::path_for_auxiliary_executable`.
+    pub fn path_for_auxiliary_executable(self: *App, name: []const u8) anyerror![]const u8 {
+        return self.platform.path_for_auxiliary_executable(name);
+    }
+
+    /// Registers `scheme` for this app's URLs (GPUI `App::register_url_scheme`). Linux does not
+    /// support it yet and answers with an error, as GPUI's Linux platform does.
+    pub fn register_url_scheme(self: *App, scheme: []const u8) executor_mod.Task(anyerror!void) {
+        const result = self.platform.register_url_scheme(scheme);
+        return executor_mod.Task(anyerror!void).ready(result);
+    }
+
+    /// Runs `f(app)` before the app restarts (GPUI `App::on_app_restart`). Kept until dropped.
+    pub fn on_app_restart(self: *App, comptime f: fn (*App) void) Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, _: ?*const anyopaque) bool {
+                f(app);
+                return true;
+            }
+        };
+        return self.add_subscriber(.{ .kind = .app_restart, .emitter = 0, .ctx = 0, .func = S.call, .id = 0 });
+    }
+
+    /// Sets the binary `restart` starts instead of this one (GPUI `App::set_restart_path`).
+    pub fn set_restart_path(self: *App, path: []const u8) std.mem.Allocator.Error!void {
+        const copy = try self.allocator.dupe(u8, path);
+        if (self.restart_path) |old| self.allocator.free(old);
+        self.restart_path = copy;
+    }
+
+    /// Sets the arguments `restart` passes (GPUI `with_restart_arguments`).
+    pub fn set_restart_arguments(self: *App, arguments: []const []const u8) std.mem.Allocator.Error!void {
+        const copy = try dupe_strings(self.allocator, arguments);
+        free_strings(self.allocator, self.restart_arguments);
+        self.restart_arguments = copy;
+    }
+
+    /// Restarts the app (GPUI `App::restart`). The `on_app_restart` observers run first. The
+    /// platform starts the new process and quits this one, if it can.
+    pub fn restart(self: *App) void {
+        self.pending_updates += 1;
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != .app_restart) continue;
+            _ = sub.func(self, EntityId.from_u64(0), sub.ctx, null);
+        }
+        self.pending_updates -= 1;
+        if (self.pending_updates == 0) self.flush_effects();
+
+        const path = self.restart_path;
+        self.restart_path = null;
+        const arguments = self.restart_arguments;
+        self.restart_arguments = &.{};
+        self.platform.restart(path, arguments);
+        if (path) |p| self.allocator.free(p);
+        free_strings(self.allocator, arguments);
+    }
+
     pub fn set_reduce_motion(self: *App, v: bool) void {
         self.reduce_motion = v;
     }
@@ -2531,6 +2681,12 @@ pub const Application = struct {
     /// Sets when the app quits by itself, after its last window closes (GPUI `with_quit_mode`).
     pub fn with_quit_mode(self: Application, mode: QuitMode) Application {
         self.app.set_quit_mode(mode);
+        return self;
+    }
+
+    /// Configures the arguments `restart` passes (GPUI `with_restart_arguments`).
+    pub fn with_restart_arguments(self: Application, arguments: []const []const u8) Application {
+        self.app.set_restart_arguments(arguments) catch oom();
         return self;
     }
 

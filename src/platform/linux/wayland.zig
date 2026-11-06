@@ -183,6 +183,12 @@ pub const WaylandConnection = struct {
     cursor_lib: ?dl.Library = null,
     cursor_api: ?proto.CursorApi = null,
     cursor_theme: ?*proto.CursorTheme = null,
+    /// The cursor theme's name from the desktop settings, NUL-terminated; empty is the default theme.
+    cursor_theme_name: [64:0]u8 = std.mem.zeroes([64:0]u8),
+    /// The cursor size from the desktop settings, in pixels.
+    cursor_size: u32 = 24,
+    /// The window appearance the desktop asked for (GPUI `common.appearance`).
+    appearance_: platform.WindowAppearance = .light,
     cursor_surface: ?*proto.Surface = null,
 
     windows: std.ArrayList(*WaylandWindow) = .empty,
@@ -309,6 +315,40 @@ pub const WaylandConnection = struct {
         return self;
     }
 
+    fn cursor_theme_ptr(self: *const WaylandConnection) ?[*:0]const u8 {
+        if (self.cursor_theme_name[0] == 0) return null;
+        return &self.cursor_theme_name;
+    }
+
+    /// Loads the cursor theme again with the settings' name and size (GPUI `cursor.set_theme` and `set_size`).
+    fn reload_cursor_theme(self: *WaylandConnection) void {
+        const api = self.cursor_api orelse return;
+        const shm = self.shm orelse return;
+        const theme = api.theme_load(self.cursor_theme_ptr(), @intCast(self.cursor_size), shm) orelse return;
+        if (self.cursor_theme) |old| api.theme_destroy(old);
+        self.cursor_theme = theme;
+    }
+
+    pub fn set_cursor_theme(self: *WaylandConnection, name: []const u8) void {
+        const n = @min(name.len, self.cursor_theme_name.len);
+        @memcpy(self.cursor_theme_name[0..n], name[0..n]);
+        self.cursor_theme_name[n] = 0;
+        self.reload_cursor_theme();
+    }
+
+    pub fn set_cursor_size(self: *WaylandConnection, size: u32) void {
+        if (size == self.cursor_size) return;
+        self.cursor_size = size;
+        self.reload_cursor_theme();
+    }
+
+    /// Tells every window the appearance changed. Each window reads it back from `appearance_`.
+    pub fn set_appearance(self: *WaylandConnection, appearance: platform.WindowAppearance) void {
+        if (self.appearance_ == appearance) return;
+        self.appearance_ = appearance;
+        for (self.windows.items) |w| w.base.emit_appearance_changed();
+    }
+
     fn load_cursor_theme(self: *WaylandConnection) void {
         const shm = self.shm orelse return;
         var clib = dl.Library.open(proto.cursor_lib_names) orelse return;
@@ -316,7 +356,7 @@ pub const WaylandConnection = struct {
             clib.close();
             return;
         };
-        const theme = capi.theme_load(null, 24, shm) orelse {
+        const theme = capi.theme_load(self.cursor_theme_ptr(), @intCast(self.cursor_size), shm) orelse {
             clib.close();
             return;
         };
@@ -1738,7 +1778,12 @@ pub const WaylandWindow = struct {
         self.conn.flush();
     }
 
+    fn windowAppearance(p: *platform.PlatformWindow) platform.WindowAppearance {
+        return from_base(p).conn.appearance_;
+    }
+
     const vtable: platform.PlatformWindow.VTable = .{
+        .appearance = windowAppearance,
         .play_system_bell = playSystemBell,
         .update_ime_enabled = updateImeEnabled,
         .update_ime_position = updateImePosition,

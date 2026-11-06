@@ -4616,3 +4616,60 @@ test "app: on_reopen runs each time the app is reopened, and stops after unsubsc
     cx.app.dispatch_reopen();
     try std.testing.expectEqual(@as(usize, 2), S.n);
 }
+
+test "app: restart runs the on_app_restart observers, then the platform restarts with the path and arguments" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    const S = struct {
+        var runs: usize = 0;
+        fn observe(_: *App) void {
+            runs += 1;
+        }
+    };
+    S.runs = 0;
+    const sub = cx.app.on_app_restart(S.observe);
+    defer sub.unsubscribe();
+    try cx.app.set_restart_path("/opt/zui/new-binary");
+    try cx.app.set_restart_arguments(&.{ "--flag", "value" });
+    cx.app.restart();
+    try std.testing.expectEqual(@as(usize, 1), S.runs);
+    try std.testing.expectEqual(@as(u32, 1), hp.restarts);
+    try std.testing.expectEqual(@as(usize, 2), hp.restart_argument_count);
+    const len = hp.restart_binary_len orelse return error.TestExpectedRestartPath;
+    try std.testing.expectEqualStrings("/opt/zui/new-binary", hp.restart_binary[0..len]);
+    // One restart takes the path and the arguments, so the next one has neither.
+    cx.app.restart();
+    try std.testing.expectEqual(@as(?usize, null), hp.restart_binary_len);
+    try std.testing.expectEqual(@as(usize, 0), hp.restart_argument_count);
+}
+
+test "app: window appearance is the platform's, and the platform can change it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    try std.testing.expectEqual(platform_mod.WindowAppearance.light, cx.app.window_appearance());
+    hp.set_window_appearance(.dark);
+    try std.testing.expectEqual(platform_mod.WindowAppearance.dark, cx.app.window_appearance());
+}
+
+test "app: a file dialog the platform cannot show answers cancelled through the callback" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    const S = struct {
+        var calls: usize = 0;
+        var cancelled = false;
+        fn answer(_: void, result: anyerror!?[]const []const u8, _: *App) void {
+            calls += 1;
+            const paths = result catch return;
+            cancelled = paths == null;
+        }
+    };
+    S.calls = 0;
+    S.cancelled = false;
+    cx.app.prompt_for_paths(.{}, {}, S.answer);
+    try std.testing.expectEqual(@as(usize, 1), S.calls);
+    try std.testing.expect(S.cancelled);
+    try std.testing.expectEqual(@as(u32, 1), hp.prompts);
+}
