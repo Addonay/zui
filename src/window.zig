@@ -562,6 +562,24 @@ const PendingInputTimer = struct {
     }
 };
 
+/// Areas the platform covers with system UI, a notch or the keyboard (GPUI `WindowInsets`). No
+/// backend reports them yet; the zero default is what GPUI's Linux backends report too.
+pub const WindowInsets = struct {
+    safe_area: geometry.Edges(Pixels) = .{},
+    ime: geometry.Edges(Pixels) = .{},
+    corner_radii: geometry.Corners(Pixels) = .{},
+
+    /// The combined inset that content should avoid (GPUI `WindowInsets::effective`).
+    pub fn effective(self: WindowInsets) geometry.Edges(Pixels) {
+        return .{
+            .top = @max(self.safe_area.top, self.ime.top),
+            .right = @max(self.safe_area.right, self.ime.right),
+            .bottom = @max(self.safe_area.bottom, self.ime.bottom),
+            .left = @max(self.safe_area.left, self.ime.left),
+        };
+    }
+};
+
 pub const Window = struct {
     allocator: std.mem.Allocator,
     app: *App,
@@ -2373,11 +2391,111 @@ pub const Window = struct {
     }
 
     pub fn is_action_available(self: *Window, action_type: app_mod.TypeId) bool {
+        return self.action_available_from(self.focus_id, action_type);
+    }
+
+    /// Whether `action_type` has a listener on the path to `focus_handle`'s element in the
+    /// rendered frame (GPUI `is_action_available_in`).
+    pub fn is_action_available_in(self: *Window, action_type: app_mod.TypeId, focus_handle: FocusHandle) bool {
+        return self.action_available_from(focus_handle.id, action_type);
+    }
+
+    fn action_available_from(self: *Window, focus_id: ?u64, action_type: app_mod.TypeId) bool {
         const tree = &self.rendered_frame.dispatch_tree;
-        const path = tree.dispatch_path(self.focus_id, self.allocator);
+        const path = tree.dispatch_path(focus_id, self.allocator);
         defer self.allocator.free(path);
         for (path) |nid| for (tree.node(nid).action_listeners.items) |l| if (l.action_type == action_type) return true;
         return false;
+    }
+
+    /// The keystrokes bound to `action` in the focused element's context, displayed for the
+    /// platform and joined with spaces, or the action's name when nothing is bound (GPUI
+    /// `keystroke_text_for`). The text lives in the frame arena.
+    pub fn keystroke_text_for(self: *Window, action: anytype, cx: *App) []const u8 {
+        const T = @TypeOf(action);
+        const binding = self.highest_precedence_binding_for_action(action) orelse return action_mod.action_name(T);
+        const os = cx.platform_info().os;
+        const arena = frame_arena();
+        const parts = arena.alloc([]const u8, binding.keystrokes.len) catch oom();
+        for (binding.keystrokes, parts) |keystroke, *part| part.* = format("{f}", .{keystroke.display(os)});
+        return std.mem.join(arena, " ", parts) catch oom();
+    }
+
+    /// The part of the window the platform shows, in window-local pixels (GPUI
+    /// `visual_viewport_bounds`). Nothing reports a smaller visual viewport yet, so this is the
+    /// whole content area.
+    pub fn visual_viewport_bounds(self: *const Window) Bounds(Pixels) {
+        return .{ .origin = .{}, .size = self.viewport_size };
+    }
+
+    /// The viewport less the insets, clipped to the visual viewport (GPUI `fully_visible_bounds`).
+    pub fn fully_visible_bounds(self: *const Window) Bounds(Pixels) {
+        const avoid = self.insets().effective();
+        const viewport = self.viewport_size;
+        const left = @min(@max(avoid.left, 0), viewport.width);
+        const top = @min(@max(avoid.top, 0), viewport.height);
+        const right = @max(viewport.width - @max(avoid.right, 0), left);
+        const bottom = @max(viewport.height - @max(avoid.bottom, 0), top);
+        const safe_bounds = Bounds(Pixels).from_corners(.{ .x = left, .y = top }, .{ .x = right, .y = bottom });
+        var visible = safe_bounds.intersect(self.visual_viewport_bounds());
+        visible.size.width = @max(visible.size.width, 0);
+        visible.size.height = @max(visible.size.height, 0);
+        return visible;
+    }
+
+    /// The areas the platform covers (GPUI `insets`). No backend reports any yet.
+    pub fn insets(_: *const Window) WindowInsets {
+        return .{};
+    }
+
+    /// Hides the software keyboard (GPUI `dismiss_virtual_keyboard`). Linux has none, so this does
+    /// nothing, as GPUI's Linux backends do.
+    pub fn dismiss_virtual_keyboard(_: *const Window) void {}
+
+    /// The scene of the most recently rendered frame (GPUI `rendered_scene`).
+    pub fn rendered_scene(self: *const Window) *const scene_mod.Scene {
+        return &self.rendered_frame.scene;
+    }
+
+    /// Runs `f(window, args...)` with `mask` intersected into the content mask, or with the mask
+    /// as it is when `mask` is null (GPUI `with_content_mask`).
+    pub fn with_content_mask(self: *Window, mask: ?ContentMask(Pixels), comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        if (mask) |m| self.push_content_mask(m);
+        defer if (mask != null) self.pop_content_mask();
+        return @call(.auto, f, .{self} ++ args);
+    }
+
+    /// Runs `f(window, args...)` with the element offset moved by `offset` (GPUI `with_element_offset`).
+    pub fn with_element_offset(self: *Window, offset: Point(Pixels), comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        self.push_element_offset(offset);
+        defer self.pop_element_offset();
+        return @call(.auto, f, .{self} ++ args);
+    }
+
+    /// Runs `f(window, args...)` with `rem_size` as the rem size, or the current one when it is
+    /// null (GPUI `with_rem_size`).
+    pub fn with_rem_size(self: *Window, override: ?Pixels, comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        if (override) |size| self.rem_size_override_stack.append(self.allocator, size) catch oom();
+        defer if (override != null) {
+            _ = self.rem_size_override_stack.pop();
+        };
+        return @call(.auto, f, .{self} ++ args);
+    }
+
+    /// Runs `f(global_id, window, args...)` with `element_id` pushed onto the element id stack
+    /// (GPUI `with_global_id`).
+    pub fn with_global_id(self: *Window, element_id: anytype, comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        const global_id = self.push_element_id(ElementId.from(element_id));
+        defer self.pop_element_id();
+        return @call(.auto, f, .{ global_id, self } ++ args);
+    }
+
+    /// Runs `f(window, args...)` with `element_id` pushed, so that element ids inside it are
+    /// namespaced by it (GPUI `with_element_namespace`).
+    pub fn with_element_namespace(self: *Window, element_id: anytype, comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        _ = self.push_element_id(ElementId.from(element_id));
+        defer self.pop_element_id();
+        return @call(.auto, f, .{self} ++ args);
     }
 
     // -- platform callbacks ---------------------------------------------

@@ -155,20 +155,12 @@ pub const TestAppContext = struct {
         self.run_until_parked();
     }
 
-    /// Sends a key-down followed by a key-up. Printable keys without command or control
-    /// modifiers also deliver their text, as the platform would.
+    /// Sends a key-down followed by a key-up. Keys the platform would type also deliver their
+    /// text (GPUI `Keystroke::with_simulated_ime`).
     pub fn dispatch_keystroke(self: *TestAppContext, window: *Window, keystroke: Keystroke) void {
-        var ks = keystroke;
-        if (ks.key_char == null and !ks.modifiers.control and !ks.modifiers.platform and ks.key.len == 1) {
-            ks.key_char = if (ks.modifiers.shift and std.ascii.isLower(ks.key[0])) shifted_letter(ks.key[0]) else ks.key;
-        }
+        const ks = keystroke.with_simulated_ime();
         _ = window.dispatch_event(.{ .key_down = .{ .keystroke = ks } }, self.app);
         _ = window.dispatch_event(.{ .key_up = .{ .keystroke = ks } }, self.app);
-    }
-
-    fn shifted_letter(c: u8) []const u8 {
-        const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        return upper[c - 'a' ..][0..1];
     }
 
     pub fn write_to_clipboard(self: *TestAppContext, item: platform_mod.ClipboardItem) void {
@@ -543,6 +535,9 @@ const Editor = struct {
     fn on_save(self: *Editor, _: *const Save, _: *Window, cx: *Context(Editor)) void {
         self.saves += 1;
         cx.notify();
+    }
+    fn note_window(_: *Editor, window: *Window, _: *Context(Editor)) window_mod.WindowId {
+        return window.window_handle_id();
     }
     fn on_key_down(self: *Editor, ev: *const KeyDownEvent, _: *Window, _: *Context(Editor)) void {
         self.keys += 1;
@@ -4672,4 +4667,237 @@ test "app: a file dialog the platform cannot show answers cancelled through the 
     try std.testing.expectEqual(@as(usize, 1), S.calls);
     try std.testing.expect(S.cancelled);
     try std.testing.expectEqual(@as(u32, 1), hp.prompts);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers added with GPUI's `with_window`, `clear_globals`, `all_bindings_for_input`,
+// `update_window_entity`, `read_default_global` and the window closures.
+
+test "app: with_window runs in the window that rendered the entity, and not for others" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    const window_id = vcx.window.window_handle_id();
+
+    const found = cx.app.with_window(view.entity_id(), struct {
+        fn f(win: *Window, _: *App) window_mod.WindowId {
+            return win.window_handle_id();
+        }
+    }.f, .{});
+    try std.testing.expectEqual(@as(?window_mod.WindowId, window_id), found);
+
+    const Plain = struct { n: u8 = 0 };
+    const plain = cx.new(Plain{});
+    const none = cx.app.with_window(plain.entity_id(), struct {
+        fn f(_: *Window, _: *App) bool {
+            return true;
+        }
+    }.f, .{});
+    try std.testing.expect(none == null);
+}
+
+test "app: clear_globals removes every global" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const First = struct { v: u32 = 1 };
+    const Second = struct { v: u32 = 2 };
+    cx.app.set_global(First{});
+    cx.app.set_global(Second{});
+    try std.testing.expect(cx.app.has_global(First));
+    cx.app.clear_globals();
+    try std.testing.expect(!cx.app.has_global(First));
+    try std.testing.expect(!cx.app.has_global(Second));
+    // Setting again after a clear works, so the slots were really dropped.
+    cx.app.set_global(First{ .v = 5 });
+    try std.testing.expectEqual(@as(u32, 5), cx.app.global(First).v);
+}
+
+test "keymap: all_bindings_for_input ignores context and lists the newest first" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{
+        KeyBinding.new("cmd-s", Editor.Save{}, "Editor"),
+        KeyBinding.new("cmd-s", Editor.Outside{}, null),
+    });
+    const input = [_]Keystroke{try Keystroke.parse("cmd-s")};
+    const found = try cx.app.all_bindings_for_input(&input);
+    defer cx.app.allocator.free(found);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expect(found[0].action.is(Editor.Outside));
+    try std.testing.expect(found[1].action.is(Editor.Save));
+    try std.testing.expectEqual(@as(usize, 2), cx.app.key_bindings().bindings().len);
+}
+
+test "window: keystroke_text_for shows the bound keystroke, or the action name when unbound" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Unbound = Action("test", "Unbound");
+    cx.app.bind_keys(&.{KeyBinding.new("cmd-s", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    _ = view;
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    const Shown = struct {
+        fn bound(window: *Window, app: *App) []const u8 {
+            return window.keystroke_text_for(Editor.Save{}, app);
+        }
+        fn unbound(window: *Window, app: *App) []const u8 {
+            return window.keystroke_text_for(Unbound{}, app);
+        }
+    };
+    const os = cx.app.platform_info().os;
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{(Keystroke{ .key = "s", .modifiers = .{ .platform = true } }).display(os)});
+    defer std.testing.allocator.free(expected);
+    const text = vcx.update(Shown.bound, .{});
+    try std.testing.expectEqualStrings(expected, text);
+    try std.testing.expect(std.mem.indexOf(u8, vcx.update(Shown.unbound, .{}), "Unbound") != null);
+}
+
+test "window: is_action_available_in asks the focused element's path" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    const handle = view.read(cx.app).focus;
+    const available = vcx.update(struct {
+        fn f(focus: FocusHandle, window: *Window, _: *App) bool {
+            return window.is_action_available_in(app_mod.type_id(Editor.Save), focus);
+        }
+    }.f, .{handle});
+    try std.testing.expect(available);
+    const not_available = vcx.update(struct {
+        fn f(focus: FocusHandle, window: *Window, _: *App) bool {
+            return window.is_action_available_in(app_mod.type_id(struct {}), focus);
+        }
+    }.f, .{handle});
+    try std.testing.expect(!not_available);
+}
+
+test "window: the visible bounds are the whole viewport when nothing covers it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    const sizes = vcx.update(struct {
+        fn f(window: *Window, _: *App) [2]Size(Pixels) {
+            return .{ window.fully_visible_bounds().size, window.viewport_size };
+        }
+    }.f, .{});
+    try std.testing.expectEqual(sizes[1].width, sizes[0].width);
+    try std.testing.expectEqual(sizes[1].height, sizes[0].height);
+    const origin = vcx.update(struct {
+        fn f(window: *Window, _: *App) Point(Pixels) {
+            return window.fully_visible_bounds().origin;
+        }
+    }.f, .{});
+    try std.testing.expectEqual(@as(Pixels, 0), origin.x);
+    try std.testing.expectEqual(@as(Pixels, 0), origin.y);
+}
+
+test "insets: effective is the larger of the safe area and the keyboard" {
+    const insets = window_mod.WindowInsets{
+        .safe_area = .{ .top = 10, .right = 0, .bottom = 4, .left = 0 },
+        .ime = .{ .top = 0, .right = 0, .bottom = 50, .left = 2 },
+    };
+    const effective = insets.effective();
+    try std.testing.expectEqual(@as(Pixels, 10), effective.top);
+    try std.testing.expectEqual(@as(Pixels, 50), effective.bottom);
+    try std.testing.expectEqual(@as(Pixels, 2), effective.left);
+    try std.testing.expectEqual(@as(Pixels, 0), effective.right);
+}
+
+test "window: with_content_mask, with_element_offset and with_rem_size apply inside only" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    const result = vcx.update(struct {
+        fn f(window: *Window, _: *App) [4]Pixels {
+            const outer_mask = window.content_mask().bounds.origin.x;
+            const mask: window_mod.ContentMask(Pixels) = .{ .bounds = .{ .origin = .{ .x = 5, .y = 5 }, .size = .{ .width = 10, .height = 10 } } };
+            const inside_mask = window.with_content_mask(mask, struct {
+                fn g(w: *Window) Pixels {
+                    return w.content_mask().bounds.origin.x;
+                }
+            }.g, .{});
+            const inside_offset = window.with_element_offset(.{ .x = 3, .y = 4 }, struct {
+                fn g(w: *Window) Pixels {
+                    return w.element_offset().x;
+                }
+            }.g, .{});
+            const inside_rem = window.with_rem_size(20, struct {
+                fn g(w: *Window) Pixels {
+                    return w.rem_size();
+                }
+            }.g, .{});
+            return .{ outer_mask, inside_mask, inside_offset, inside_rem };
+        }
+    }.f, .{});
+    try std.testing.expectEqual(@as(Pixels, 0), result[0]);
+    try std.testing.expectEqual(@as(Pixels, 5), result[1]);
+    try std.testing.expectEqual(@as(Pixels, 3), result[2]);
+    try std.testing.expectEqual(@as(Pixels, 20), result[3]);
+
+    const after = vcx.update(struct {
+        fn f(window: *Window, _: *App) [3]Pixels {
+            return .{ window.content_mask().bounds.origin.x, window.element_offset().x, window.rem_size() };
+        }
+    }.f, .{});
+    try std.testing.expectEqual(@as(Pixels, 0), after[0]);
+    try std.testing.expectEqual(@as(Pixels, 0), after[1]);
+    try std.testing.expectEqual(@as(Pixels, 16), after[2]);
+}
+
+test "window: with_global_id gives the callee its own id, and namespaces restore on return" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    const result = vcx.update(struct {
+        fn f(window: *Window, _: *App) struct { inside: u64, outside: u64, namespaced: u64, restored: u64 } {
+            const outside = window.current_global_id().hash;
+            const inside = window.with_global_id("row", struct {
+                fn g(gid: @import("../element.zig").GlobalElementId, w: *Window) u64 {
+                    std.debug.assert(gid.hash == w.current_global_id().hash);
+                    return gid.hash;
+                }
+            }.g, .{});
+            const namespaced = window.with_element_namespace("list", struct {
+                fn g(w: *Window) u64 {
+                    return w.current_global_id().hash;
+                }
+            }.g, .{});
+            return .{ .inside = inside, .outside = outside, .namespaced = namespaced, .restored = window.current_global_id().hash };
+        }
+    }.f, .{});
+    try std.testing.expect(result.inside != result.outside);
+    try std.testing.expect(result.namespaced != result.outside);
+    try std.testing.expectEqual(result.outside, result.restored);
+}
+
+test "async window context: update_window_entity and update_root reach the window" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    const actx = app_mod.AsyncWindowContext{ .app = cx.app, .window_id = vcx.window.window_handle_id() };
+
+    const seen = try actx.update_window_entity(view, Editor.note_window, .{});
+    try std.testing.expectEqual(vcx.window.window_handle_id(), seen);
+
+    const has_root = try actx.update_root(struct {
+        fn f(_: anytype, _: *Window, _: *App) bool {
+            return true;
+        }
+    }.f, .{});
+    try std.testing.expect(has_root);
+}
+
+test "async app: read_default_global sets the global the first time" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Level = struct { value: u32 = 7 };
+    var actx = app_mod.AsyncApp{ .app = cx.app };
+    const value = actx.read_default_global(Level, struct {
+        fn f(g: *Level, _: *App) u32 {
+            return g.value;
+        }
+    }.f, .{});
+    try std.testing.expectEqual(@as(u32, 7), value);
+    try std.testing.expect(cx.app.has_global(Level));
 }

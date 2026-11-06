@@ -1012,6 +1012,38 @@ pub fn pixels_to_i32(value: Pixels) i32 {
     return @intFromFloat(value);
 }
 
+/// Rounds down to a whole number (GPUI `Pixels::floor`). `Pixels` is `f32`, so this is a free function.
+pub fn floor(value: Pixels) Pixels {
+    return @floor(value);
+}
+
+/// Rounds to the nearest whole number, halfway cases away from zero (GPUI `Pixels::round`).
+pub fn round(value: Pixels) Pixels {
+    return @round(value);
+}
+
+/// Rounds up to a whole number (GPUI `Pixels::ceil`).
+pub fn ceil(value: Pixels) Pixels {
+    return @ceil(value);
+}
+
+/// `value` raised to `exponent` (GPUI `Pixels::pow`).
+pub fn pow(value: Pixels, exponent: f32) Pixels {
+    return math.pow(f32, value, exponent);
+}
+
+test "pixel rounding helpers" {
+    try testing.expectEqual(@as(Pixels, 2), floor(2.9));
+    try testing.expectEqual(@as(Pixels, -3), floor(-2.5));
+    try testing.expectEqual(@as(Pixels, 3), ceil(2.1));
+    try testing.expectEqual(@as(Pixels, -2), ceil(-2.9));
+    try testing.expectEqual(@as(Pixels, 3), round(2.5));
+    try testing.expectEqual(@as(Pixels, -3), round(-2.5));
+    try testing.expectEqual(@as(Pixels, 2), round(2.4));
+    try testing.expectEqual(@as(Pixels, 9), pow(3, 2));
+    try testing.expectEqual(@as(Pixels, 1), pow(5, 0));
+}
+
 test "percentage is a fraction of a full turn" {
     try std.testing.expectApproxEqAbs(std.math.pi, percentage(0.5).to_radians(), 1e-6);
     try std.testing.expectApproxEqAbs(std.math.tau, percentage(1).to_radians(), 1e-6);

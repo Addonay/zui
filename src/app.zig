@@ -1812,6 +1812,13 @@ pub const App = struct {
         if (self.globals.fetchRemove(type_id(G))) |kv| kv.value.destroy(self.allocator, kv.value.ptr);
     }
 
+    /// Removes every global. Does not notify global observers (GPUI `clear_globals`).
+    pub fn clear_globals(self: *App) void {
+        var it = self.globals.valueIterator();
+        while (it.next()) |slot| slot.destroy(self.allocator, slot.ptr);
+        self.globals.clearRetainingCapacity();
+    }
+
     /// Observes global `G` from outside an entity: `f(cx)`.
     /// Runs `f(event, window, cx)` after any keystroke in any window has been handled.
     pub fn observe_keystrokes(self: *App, comptime f: anytype) Subscription {
@@ -1904,6 +1911,17 @@ pub const App = struct {
     }
 
     /// Whether an open window other than `closing` has `id` as its root view.
+    /// The keymap, for reading or changing bindings (GPUI `key_bindings`).
+    pub fn key_bindings(self: *App) *keymap_mod.Keymap {
+        return &self.keymap;
+    }
+
+    /// Every binding that matches `input` in any context, highest precedence first (GPUI
+    /// `all_bindings_for_input`). Caller frees the slice with the app's allocator.
+    pub fn all_bindings_for_input(self: *App, input: []const keystroke_mod.Keystroke) ![]keymap_mod.KeyBinding {
+        return self.keymap.all_bindings_for_input(self.allocator, input);
+    }
+
     pub fn is_root_of_other_window(self: *App, id: EntityId, closing: *Window) bool {
         for (self.windows.items) |maybe_window| {
             const win = maybe_window orelse continue;
@@ -1922,6 +1940,15 @@ pub const App = struct {
             if (win.rendered_entities.contains(id)) return win;
         }
         return null;
+    }
+
+    /// Runs `f(window, app, args...)` in the window that rendered `entity_id` (GPUI `with_window`).
+    /// Null when no open window has rendered it. Effects it queues are flushed afterwards.
+    pub fn with_window(self: *App, entity_id: EntityId, comptime f: anytype, args: anytype) ?ReturnOf(f) {
+        const win = self.window_for_entity(entity_id) orelse return null;
+        const result = @call(.auto, f, .{ win, self } ++ args);
+        self.flush_effects();
+        return result;
     }
 
     pub fn window_by_id(self: *App, id: window_mod.WindowId) ?*Window {
@@ -2601,6 +2628,15 @@ pub const AsyncApp = struct {
         return @call(.auto, f, .{ g, self.app } ++ args);
     }
 
+    /// Runs `f(global, app, args...)` with the global `G`, setting `G{}` first if it is not set
+    /// (GPUI `read_default_global`).
+    pub fn read_default_global(self: *AsyncApp, comptime G: type, comptime f: anytype, args: anytype) ReturnOf(f) {
+        const g = self.app.default_global(G);
+        const result = @call(.auto, f, .{ g, self.app } ++ args);
+        self.app.flush_effects();
+        return result;
+    }
+
     /// Like `read_global`, but null when `G` is not set (GPUI `try_read_global`).
     pub fn try_read_global(self: *AsyncApp, comptime G: type, comptime f: anytype, args: anytype) ?ReturnOf(f) {
         const g = self.app.try_global(G) orelse return null;
@@ -2626,6 +2662,20 @@ pub const AsyncWindowContext = struct {
     /// The window this context is for (GPUI `window_handle`).
     pub fn window_handle(self: AsyncWindowContext) window_mod.AnyWindowHandle {
         return .{ .id = self.window_id };
+    }
+
+    /// Runs `f(root_view, window, app, args...)` in the window (GPUI `update_root`).
+    pub fn update_root(self: AsyncWindowContext, comptime f: anytype, args: anytype) error{WindowClosed}!ReturnOf(f) {
+        return self.app.update_window(self.window_handle(), f, args);
+    }
+
+    /// Runs `f(entity_state, window, context, args...)` on `entity` with the window (GPUI
+    /// `update_window_entity`). Fails when the window is gone.
+    pub fn update_window_entity(self: AsyncWindowContext, entity: anytype, comptime f: anytype, args: anytype) error{WindowClosed}!ReturnOf(f) {
+        const win = self.app.window_by_id(self.window_id) orelse return error.WindowClosed;
+        const result = entity.update_in(win, self.app, f, args);
+        self.app.flush_effects();
+        return result;
     }
 
     pub fn background_executor(self: AsyncWindowContext) *executor_mod.BackgroundExecutor {

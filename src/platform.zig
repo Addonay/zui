@@ -76,7 +76,8 @@ pub const ActivationPolicy = enum {
 };
 
 /// The host operating system (GPUI `OperatingSystem`).
-pub const OperatingSystem = enum { mac, windows, linux, free_bsd, ios, android, unknown };
+/// The same type as `keystroke.OperatingSystem`, so keystrokes can be displayed for the platform.
+pub const OperatingSystem = keystroke_mod.OperatingSystem;
 
 /// How the application is delivered (GPUI `PlatformTarget`).
 pub const PlatformTarget = enum {
