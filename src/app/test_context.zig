@@ -1076,6 +1076,39 @@ test "img: quitting does not wait for a server that never answers" {
     try std.testing.expect(@import("../executor.zig").now_ns() - start < 2 * std.time.ns_per_s);
 }
 
+const PropagatingEditor = struct {
+    focus: FocusHandle,
+    calls: usize = 0,
+    keys: usize = 0,
+    const NotMine = Action("test", "NotMine");
+
+    fn on_not_mine(self: *PropagatingEditor, _: *const NotMine, _: *Window, cx: *Context(PropagatingEditor)) void {
+        self.calls += 1;
+        cx.app.propagate();
+    }
+    fn on_key(self: *PropagatingEditor, _: *const KeyDownEvent, _: *Window, _: *Context(PropagatingEditor)) void {
+        self.keys += 1;
+    }
+    pub fn render(self: *PropagatingEditor, _: *Window, cx: *Context(PropagatingEditor)) *Div {
+        return div().id("propagating").w(px(100)).h(px(100)).key_context("Editor").track_focus(&self.focus)
+            .on_action(NotMine, cx.listener(on_not_mine)).on_key_down(cx.listener(on_key));
+    }
+    fn build(_: *Window, app: *App) Entity(PropagatingEditor) {
+        return app.new(PropagatingEditor{ .focus = app.focus_handle() });
+    }
+};
+
+test "actions: a binding whose handler propagates does not swallow its key" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("a", PropagatingEditor.NotMine{}, "Editor")});
+    const view, const vcx = cx.add_window_view(PropagatingEditor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.simulate_keystrokes("a");
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).calls);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).keys);
+}
+
 test "actions: dispatch_action reaches on_action on the focus path" {
     var cx = TestAppContext.init();
     defer cx.deinit();
@@ -4066,4 +4099,185 @@ test "pixel_snap: values round half toward zero to the device pixel" {
     try std.testing.expectApproxEqAbs(@as(f32, 2) / sf, b.origin.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 2) / sf, b.size.width, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 3) / sf, b.size.height, 0.0001);
+}
+
+/// A view with two nested action listeners on its focus path. The inner one stops the action
+/// unless it calls `App.propagate`, as the bubble phase of GPUI's action dispatch does.
+const Bubbler = struct {
+    focus: FocusHandle,
+    inner_hits: usize = 0,
+    outer_hits: usize = 0,
+    propagate: bool = false,
+
+    const Ping = Action("test", "Ping");
+
+    pub fn render(self: *Bubbler, _: *Window, cx: *Context(Bubbler)) *Div {
+        return div().id("outer").size_full()
+            .on_action(Ping, cx.listener(on_outer))
+            .child(div().id("inner").size_full().track_focus(&self.focus).on_action(Ping, cx.listener(on_inner)));
+    }
+    fn on_inner(self: *Bubbler, _: *const Ping, _: *Window, cx: *Context(Bubbler)) void {
+        self.inner_hits += 1;
+        if (self.propagate) cx.app.propagate();
+    }
+    fn on_outer(self: *Bubbler, _: *const Ping, _: *Window, _: *Context(Bubbler)) void {
+        self.outer_hits += 1;
+    }
+    fn set_propagate(self: *Bubbler, on: bool, _: *Context(Bubbler)) void {
+        self.propagate = on;
+    }
+    fn build(_: *Window, app: *App) Entity(Bubbler) {
+        return app.new(Bubbler{ .focus = app.focus_handle() });
+    }
+    fn read_hits(s: *const Bubbler, _: *const App) struct { inner: usize, outer: usize } {
+        return .{ .inner = s.inner_hits, .outer = s.outer_hits };
+    }
+};
+
+test "actions: a bubble listener stops the action unless it calls App.propagate" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Bubbler.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const focus = view.read(cx.app).focus;
+    try std.testing.expect(focus.is_focused(vcx.window));
+
+    vcx.dispatch_action(Bubbler.Ping{});
+    var hits = cx.read_entity(view, Bubbler.read_hits, .{});
+    try std.testing.expectEqual(@as(usize, 1), hits.inner);
+    try std.testing.expectEqual(@as(usize, 0), hits.outer);
+
+    cx.update_entity(view, Bubbler.set_propagate, .{true});
+    vcx.dispatch_action(Bubbler.Ping{});
+    hits = cx.read_entity(view, Bubbler.read_hits, .{});
+    try std.testing.expectEqual(@as(usize, 2), hits.inner);
+    try std.testing.expectEqual(@as(usize, 1), hits.outer);
+
+    // The flag is per dispatch: once it is cleared, the action stops at the inner listener again.
+    cx.update_entity(view, Bubbler.set_propagate, .{false});
+    vcx.dispatch_action(Bubbler.Ping{});
+    hits = cx.read_entity(view, Bubbler.read_hits, .{});
+    try std.testing.expectEqual(@as(usize, 3), hits.inner);
+    try std.testing.expectEqual(@as(usize, 1), hits.outer);
+}
+
+test "app: observe_release runs once on release and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var fired: usize = 0;
+        var last_id: u8 = 0;
+        fn on_release(released: *ReleaseTarget, _: *App) void {
+            fired += 1;
+            last_id = released.id;
+        }
+    };
+    S.fired = 0;
+    const kept = cx.new(ReleaseTarget{ .id = 3 });
+    const dropped = cx.new(ReleaseTarget{ .id = 4 });
+    const sub_kept = cx.app.observe_release(kept, S.on_release);
+    const sub_dropped = cx.app.observe_release(dropped, S.on_release);
+    sub_dropped.unsubscribe();
+
+    dropped.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), S.fired);
+    kept.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), S.fired);
+    try std.testing.expectEqual(@as(u8, 3), S.last_id);
+    _ = sub_kept;
+}
+
+test "app: observe_release_in passes its window, and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var fired: usize = 0;
+        var window: ?*Window = null;
+        fn on_release(_: *ReleaseTarget, win: *Window, _: *App) void {
+            fired += 1;
+            window = win;
+        }
+    };
+    S.fired = 0;
+    S.window = null;
+    _, const vcx = cx.add_window_view(Counter.build);
+    const a = cx.new(ReleaseTarget{});
+    const b = cx.new(ReleaseTarget{});
+    const sub_a = cx.app.observe_release_in(a, vcx.window, S.on_release);
+    const sub_b = cx.app.observe_release_in(b, vcx.window, S.on_release);
+    sub_b.unsubscribe();
+
+    b.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), S.fired);
+    a.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), S.fired);
+    try std.testing.expectEqual(vcx.window, S.window.?);
+    _ = sub_a;
+}
+
+test "subscriptions: join unsubscribes both halves, and a join that is kept runs both" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var fired: usize = 0;
+        fn on_release(_: *ReleaseTarget, _: *App) void {
+            fired += 1;
+        }
+    };
+    S.fired = 0;
+    const a = cx.new(ReleaseTarget{});
+    const b = cx.new(ReleaseTarget{});
+    const c = cx.new(ReleaseTarget{});
+    const d = cx.new(ReleaseTarget{});
+    const e = cx.new(ReleaseTarget{});
+    // Joining a join with a third subscription keeps all three; unsubscribing stops all three.
+    const joined = app_mod.Subscription.join(cx.app.observe_release(a, S.on_release), cx.app.observe_release(b, S.on_release));
+    const all = app_mod.Subscription.join(joined, cx.app.observe_release(c, S.on_release));
+    all.unsubscribe();
+    // A join that is never unsubscribed keeps both halves running.
+    _ = app_mod.Subscription.join(cx.app.observe_release(d, S.on_release), cx.app.observe_release(e, S.on_release));
+
+    a.release(cx.app);
+    b.release(cx.app);
+    c.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), S.fired);
+    d.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), S.fired);
+    e.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 2), S.fired);
+}
+
+test "windows: App.update_window and App.read_window reach the root view, and fail once closed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const Reader = struct {
+        fn read(view: Entity(Counter), app: *App) usize {
+            return view.read(app).count;
+        }
+    };
+    const Bump = struct {
+        var seen_root: u64 = 0;
+        // Gets the root view as an AnyView, the window and the app, then the extra argument.
+        fn bump(view: view_mod.AnyView, _: *Window, app: *App, by: usize) usize {
+            seen_root = view.entity_id.as_u64();
+            const counter: Entity(Counter) = .{ .entity_id_ = view.entity_id };
+            counter.update(app, add, .{by});
+            return 7;
+        }
+        fn add(self: *Counter, n: usize, _: *Context(Counter)) void {
+            self.count += n;
+        }
+    };
+    Bump.seen_root = 0;
+
+    const window_handle = window_mod.AnyWindowHandle{ .id = handle.window_id };
+    try std.testing.expectEqual(@as(usize, 7), try cx.app.update_window(window_handle, Bump.bump, .{@as(usize, 2)}));
+    try std.testing.expectEqual(handle.entity_id_.as_u64(), Bump.seen_root);
+    try std.testing.expectEqual(@as(usize, 2), try cx.app.read_window(Counter, handle, Reader.read, .{}));
+
+    const gone = window_mod.AnyWindowHandle{ .id = 9999 };
+    try std.testing.expectError(error.WindowClosed, cx.app.update_window(gone, Bump.bump, .{@as(usize, 1)}));
+    const gone_typed: WindowHandle(Counter) = .{ .window_id = 9999, .entity_id_ = handle.entity_id_ };
+    try std.testing.expectError(error.WindowClosed, cx.app.read_window(Counter, gone_typed, Reader.read, .{}));
 }
