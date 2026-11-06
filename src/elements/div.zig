@@ -3605,6 +3605,21 @@ fn to_tooltip_builder(build_tooltip: anytype) TooltipBuilder {
 
 // -- tooltip state machine, ported from GPUI's register_tooltip_mouse_handlers ----
 
+/// Opens the tooltip right away, for a long press at `position` (GPUI `show_tooltip` from the long-press
+/// handler). Returns false if the element has no tooltip to show.
+fn show_long_press_tooltip(st: *InteractiveElementState, position: Point(Pixels), window: *Window, cx: *App) bool {
+    const builder = st.tooltip_builder orelse return false;
+    st.tooltip_generation +%= 1;
+    cx.pending_updates += 1;
+    st.tooltip_view = builder.build(builder.ctx, window, cx);
+    cx.pending_updates -= 1;
+    if (st.tooltip_view == null) return false;
+    st.tooltip_mouse = position;
+    st.tooltip_phase = .visible;
+    window.refresh();
+    return true;
+}
+
 fn clear_tooltip(st: *InteractiveElementState, window: *Window, cx: *App) void {
     st.tooltip_generation +%= 1;
     const had = st.tooltip_phase != .none;
@@ -3652,8 +3667,9 @@ fn tooltip_on_mouse_move(st: *InteractiveElementState, hovered_now: bool, phase:
 /// handlers left, so this is what finally closes its tooltip.
 fn tooltip_check_visible(raw: *anyopaque, tooltip_bounds: Bounds(Pixels), window: *Window, cx: *App) bool {
     const st: *InteractiveElementState = @ptrCast(@alignCast(raw));
+    if (st.long_press_tooltip_active) return true;
     const mouse = window.mouse_position();
-    const hovered = !window.last_input_was_keyboard and st.pending_mouse_down == null and
+    const hovered = !window.last_input_was_keyboard() and st.pending_mouse_down == null and
         (st.tooltip_source_bounds.contains(mouse) or (st.tooltip_hoverable and tooltip_bounds.contains(mouse)));
     switch (st.tooltip_phase) {
         .visible => if (!hovered) {
@@ -3779,6 +3795,8 @@ pub const InteractiveElementState = struct {
     tooltip_builder: ?TooltipBuilder = null,
     tooltip_hoverable: bool = false,
     tooltip_source_bounds: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } },
+    /// The tooltip was opened by a long press and stays until the touch ends (GPUI `long_press_tooltip_active`).
+    long_press_tooltip_active: bool = false,
 };
 
 /// All interactive and stateful behavior of a styled element (GPUI `Interactivity`).
@@ -3858,7 +3876,7 @@ pub const Interactivity = struct {
         if (self.tracked_focus_handle) |h| {
             if (self.in_focus_style) |r| if (h.within_focused(window, cx)) s.refine(r);
             if (self.focus_style) |r| if (h.is_focused(window)) s.refine(r);
-            if (self.focus_visible_style) |r| if (h.is_focused(window) and window.last_input_was_keyboard) s.refine(r);
+            if (self.focus_visible_style) |r| if (h.is_focused(window) and window.last_input_was_keyboard()) s.refine(r);
         }
         if (hitbox) |hb| {
             if (self.hover_style) |r| if (hb.is_hovered(window)) s.refine(r);
@@ -4584,14 +4602,14 @@ pub fn StyledElement(comptime Ext: type) type {
             const rem = window.rem_size();
             const radii = s.corner_radii.to_pixels(rem).clamp_radii_for_quad_size(bounds.size);
 
-            // Shadows and background.
-            window.paint_shadows(bounds, radii, s.box_shadow);
+            window.paint_drop_shadows(bounds, radii, s.box_shadow);
             if (s.background) |bgf| {
                 const bgc = bgf.get_color() orelse color_mod.to_background(color_mod.transparent_black());
                 if (!bgc.is_transparent()) {
                     window.paint_quad(.{ .bounds = bounds, .corner_radii = radii, .background = bgc });
                 }
             }
+            window.paint_inset_shadows(bounds, radii, s.box_shadow);
 
             if (@hasDecl(Ext, "paint_ext")) Ext.paint_ext(self, bounds, s, window, cx);
 
@@ -4659,6 +4677,31 @@ pub fn StyledElement(comptime Ext: type) type {
             if (it.file_drop_exit_listeners.items.len > 0) window.on_mouse_event(FileDropEvent, ctx, onFileDrop);
             if (it.tooltip_builder != null or it.scroll_wheel_listeners.items.len > 0 or it.base_style.overflow.x == .scroll or it.base_style.overflow.y == .scroll)
                 window.on_mouse_event(ScrollWheelEvent, ctx, onScrollWheel);
+            if (it.tooltip_builder != null) window.on_mouse_event(interactive.LongPressEvent, ctx, onLongPress);
+        }
+
+        /// Shows the tooltip at once when a long press starts over this element, and hides it when the
+        /// touch ends (GPUI `register_tooltip_mouse_handlers`, the long-press half).
+        fn onLongPress(raw: *anyopaque, e: *const interactive.LongPressEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
+            const c: *MouseCtx = @ptrCast(@alignCast(raw));
+            const st = c.state orelse return;
+            if (phase != .bubble) return;
+            switch (e.phase) {
+                .started => {
+                    if (window.default_prevented or !c.hitbox.is_hovered_at(e.start_position, window)) return;
+                    if (!show_long_press_tooltip(st, e.start_position, window, cx)) return;
+                    st.long_press_tooltip_active = true;
+                    window.prevent_default();
+                    window.stop_propagation();
+                },
+                .ended, .cancelled => {
+                    if (!st.long_press_tooltip_active) return;
+                    st.long_press_tooltip_active = false;
+                    clear_tooltip(st, window, cx);
+                    window.stop_propagation();
+                },
+                .moved => {},
+            }
         }
 
         fn onMouseDown(raw: *anyopaque, e: *const MouseDownEvent, phase: DispatchPhase, window: *Window, cx: *App) void {

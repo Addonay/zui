@@ -24,11 +24,14 @@ const prompts = @import("window/prompts.zig");
 const focus_events = @import("window/focus_events.zig");
 const assets_mod = @import("assets.zig");
 const image_cache_mod = @import("image_cache.zig");
+const svg_renderer_mod = @import("svg_renderer.zig");
+const executor_mod = @import("executor.zig");
 
 const App = app_mod.App;
 const EntityId = app_mod.EntityId;
 const Pixels = geometry.Pixels;
 const ScaledPixels = geometry.ScaledPixels;
+const DevicePixels = geometry.DevicePixels;
 const Point = geometry.Point;
 const Size = geometry.Size;
 const Bounds = geometry.Bounds;
@@ -60,6 +63,12 @@ pub const FallbackPromptRenderer = prompts.FallbackPromptRenderer;
 pub const fallback_prompt_renderer = prompts.fallback_prompt_renderer;
 
 pub const WindowId = u32;
+
+/// A span of device-space x positions, for `Window.paint_underline_with_exclusions` (GPUI `Range<ScaledPixels>`).
+pub const ScaledRange = struct {
+    start: ScaledPixels,
+    end: ScaledPixels,
+};
 
 // ---------------------------------------------------------------------------
 // Frame arena (GPUI's ELEMENT_ARENA).
@@ -318,6 +327,22 @@ pub const Hitbox = struct {
     pub fn is_hovered_ignoring_last_input(self: *const Hitbox, window: *const Window) bool {
         return window.hitbox_is_hovered_ignoring_last_input(self.id);
     }
+
+    /// Whether this hitbox would be hovered at `position`, whatever the last input was (GPUI `is_hovered_at`).
+    /// It walks the rendered frame the way `Window.hit_test` does, and stops at the first hitbox that
+    /// blocks the mouse, so only hitboxes that stack above it count.
+    pub fn is_hovered_at(self: *const Hitbox, position: Point(Pixels), window: *const Window) bool {
+        const boxes = window.rendered_frame.hitboxes.items;
+        var i = boxes.len;
+        while (i > 0) {
+            i -= 1;
+            const h = boxes[i];
+            if (!h.bounds.contains(position) or !h.content_mask.bounds.contains(position)) continue;
+            if (h.id == self.id) return true;
+            if (h.behavior != .normal) return false;
+        }
+        return false;
+    }
     /// True if a scroll event at the mouse position should go to this hitbox.
     pub fn should_handle_scroll(self: *const Hitbox, window: *const Window) bool {
         return window.hitbox_should_handle_scroll(self.id);
@@ -514,6 +539,73 @@ const PendingModifier = struct {
     saw_other_input: bool = false,
 };
 
+/// The timeout that flushes pending input (GPUI `PendingInputTimeout`). A running timeout has
+/// `started_at_ns` set; a paused one keeps `remaining_ns` and the owner that paused it.
+const PendingTimeout = struct {
+    duration_ns: u64,
+    remaining_ns: u64,
+    started_at_ns: ?u64 = null,
+    pause: ?PendingTimeoutPause = null,
+
+    fn status(self: PendingTimeout) PendingInputTimeoutStatus {
+        return .{
+            .duration_ns = self.duration_ns,
+            .remaining_ns = self.remaining_ns,
+            .started_at_ns = self.started_at_ns,
+            .paused = self.pause != null,
+        };
+    }
+};
+
+/// Who paused a pending-input timeout, and the subscription that resumes it when they are released.
+const PendingTimeoutPause = struct {
+    owner_id: app_mod.EntityId,
+    release: app_mod.Subscription,
+};
+
+/// The timeout state of pending input, read from `Window.pending_input` (GPUI `PendingInputTimeoutStatus`).
+pub const PendingInputTimeoutStatus = struct {
+    duration_ns: u64,
+    remaining_ns: u64,
+    started_at_ns: ?u64,
+    paused: bool,
+
+    /// The full timeout in nanoseconds (GPUI `duration`).
+    pub fn duration(self: PendingInputTimeoutStatus) u64 {
+        return self.duration_ns;
+    }
+
+    /// Nanoseconds left before the pending input is flushed (GPUI `remaining`, which takes the
+    /// clock from `cx`; ZUI's clock is global).
+    pub fn remaining(self: PendingInputTimeoutStatus) u64 {
+        const started = self.started_at_ns orelse return self.remaining_ns;
+        return self.remaining_ns -| (executor_mod.now_ns() -| started);
+    }
+
+    pub fn is_paused(self: PendingInputTimeoutStatus) bool {
+        return self.paused;
+    }
+};
+
+/// Pending input for a potential multi-stroke key binding (GPUI `PendingInputStatus`).
+pub const PendingInputStatus = struct {
+    keystroke_list: []const keystroke_mod.Keystroke,
+    timeout_status: ?PendingInputTimeoutStatus,
+
+    /// The keystrokes entered so far (GPUI `keystrokes`).
+    pub fn keystrokes(self: PendingInputStatus) []const keystroke_mod.Keystroke {
+        return self.keystroke_list;
+    }
+
+    /// The timeout state, if this input needs one to flush (GPUI `timeout`).
+    pub fn timeout(self: PendingInputStatus) ?PendingInputTimeoutStatus {
+        return self.timeout_status;
+    }
+};
+
+/// What the last input event came from. Focus-visible styles and hover depend on it (GPUI `InputModality`).
+const InputModality = enum { mouse, keyboard, touch };
+
 fn free_keystrokes(gpa: std.mem.Allocator, list: *std.ArrayList(keystroke_mod.Keystroke)) void {
     for (list.items) |keystroke| {
         gpa.free(keystroke.key);
@@ -535,7 +627,7 @@ const PendingInputTimer = struct {
         if (window.pending_timeout_generation != self.generation) return;
         var input = window.pending_keystrokes;
         window.pending_keystrokes = .empty;
-        window.pending_has_timeout = false;
+        window.drop_pending_timeout();
         defer free_keystrokes(window.allocator, &input);
         if (input.items.len == 0) return;
         if (window.pending_focus != null and window.pending_focus != window.focus_id) return;
@@ -638,10 +730,12 @@ pub const Window = struct {
     propagate_event: bool = true,
     /// Hitbox that captured the pointer; read it with `captured_hitbox()`.
     pointer_capture: ?HitboxId = null,
+    /// The entity that claimed the current long press (GPUI `long_press_capture`).
+    long_press_capture: ?app_mod.EntityId = null,
     /// Keystrokes that may still complete a multi-stroke binding. Their strings are owned.
     pending_keystrokes: std.ArrayList(keystroke_mod.Keystroke) = .empty,
     pending_focus: ?u64 = null,
-    pending_has_timeout: bool = false,
+    pending_timeout: ?PendingTimeout = null,
     /// Timers cannot be cancelled: each carries this, and is stale once it changed.
     pending_timeout_generation: u64 = 0,
     /// Pending input was dropped outside dispatch; observers run on the next draw.
@@ -650,7 +744,7 @@ pub const Window = struct {
     /// `requested_autoscroll`).
     requested_autoscroll: ?Bounds(Pixels) = null,
     pending_modifier: PendingModifier = .{},
-    last_input_was_keyboard: bool = false,
+    last_input_modality: InputModality = .mouse,
     title: []const u8 = "",
     should_close_handler: ?FrameCallback = null,
     appearance_: platform_mod.WindowAppearance = .light,
@@ -1249,6 +1343,30 @@ pub const Window = struct {
     }
 
     /// Keyed entity state (GPUI `use_keyed_state`): creates the entity on first use.
+    /// State that lives while this element is rendered in consecutive frames, keyed by the call site.
+    /// Pass `@src()`: GPUI's `use_state` gets the same identity from `#[track_caller]`. Use
+    /// `use_keyed_state` when one call site renders many elements (GPUI `use_state`).
+    pub fn use_state(self: *Window, src: std.lang.SourceLocation, cx: *App, comptime init: anytype) app_mod.Entity(app_mod.EntityTypeOf(@TypeOf(init))) {
+        var hash = std.hash.Wyhash.hash(0x75736573, src.file);
+        hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&[_]u32{ src.line, src.column }));
+        return self.use_keyed_state(ElementId{ .code_location = @truncate(hash) }, cx, init);
+    }
+
+    /// Runs `f(arg, window)` during prepaint. If it fails, the hitboxes, tooltips and deferred draws
+    /// it added are removed, so the caller can prepaint again with other values (GPUI `transact`).
+    pub fn transact(self: *Window, arg: anytype, comptime f: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        const hitboxes = self.next_frame.hitboxes.items.len;
+        const tooltips = self.next_frame.tooltip_requests.items.len;
+        const deferred = self.next_frame.deferred_draws.items.len;
+        const result = f(arg, self);
+        if (result) |_| {} else |_| {
+            self.next_frame.hitboxes.shrinkRetainingCapacity(hitboxes);
+            self.next_frame.tooltip_requests.shrinkRetainingCapacity(tooltips);
+            self.next_frame.deferred_draws.shrinkRetainingCapacity(deferred);
+        }
+        return result;
+    }
+
     pub fn use_keyed_state(self: *Window, key: anytype, cx: *App, comptime init: anytype) app_mod.Entity(app_mod.EntityTypeOf(@TypeOf(init))) {
         const T = app_mod.EntityTypeOf(@TypeOf(init));
         const gid = self.push_element_id(ElementId.from(key));
@@ -1447,8 +1565,29 @@ pub const Window = struct {
 
     fn hitbox_is_hovered(self: *const Window, id: HitboxId) bool {
         if (self.pointer_capture) |c| return c == id;
-        if (self.last_input_was_keyboard) return false;
+        if (self.last_input_modality == .keyboard) return false;
         return self.hitbox_is_hovered_ignoring_last_input(id);
+    }
+
+    /// Claims the current long press for `owner`, so that others can see that it was taken (GPUI `capture_long_press`).
+    pub fn capture_long_press(self: *Window, owner: anytype) void {
+        self.long_press_capture = owner.entity_id();
+    }
+
+    /// Whether `owner` claimed the current long press (GPUI `has_long_press_capture`).
+    pub fn has_long_press_capture(self: *const Window, owner: anytype) bool {
+        const id = self.long_press_capture orelse return false;
+        return id.as_u64() == owner.entity_id().as_u64();
+    }
+
+    /// Whether the last input event came from the keyboard (GPUI `last_input_was_keyboard`).
+    pub fn last_input_was_keyboard(self: *const Window) bool {
+        return self.last_input_modality == .keyboard;
+    }
+
+    /// Whether the last input event came from a touch screen (GPUI `last_input_was_touch`).
+    pub fn last_input_was_touch(self: *const Window) bool {
+        return self.last_input_modality == .touch;
     }
 
     fn hitbox_is_hovered_ignoring_last_input(self: *const Window, id: HitboxId) bool {
@@ -1613,10 +1752,13 @@ pub const Window = struct {
         if (!empty) self.next_frame.scene.pop_layer() catch oom();
     }
 
-    /// Paints box shadows outside `bounds`.
-    pub fn paint_shadows(self: *Window, b: Bounds(Pixels), corner_radii: Corners(Pixels), shadows: []const style_mod.BoxShadow) void {
+    /// Paints the drop (non-inset) shadows of `shadows` outside `b` (GPUI `paint_drop_shadows`).
+    /// Paint them before the background; inset shadows go after it.
+    pub fn paint_drop_shadows(self: *Window, b: Bounds(Pixels), corner_radii: Corners(Pixels), shadows: []const style_mod.BoxShadow) void {
         const sf = self.scale_factor_;
         const opacity = self.element_opacity();
+        const element_bounds = b.scale(sf);
+        const element_corner_radii = corner_radii.scale(sf);
         for (shadows) |s| {
             if (s.inset) continue;
             const shadow_bounds = (Bounds(Pixels){ .origin = b.origin.add(s.offset), .size = b.size }).dilate(s.spread_radius);
@@ -1627,6 +1769,40 @@ pub const Window = struct {
                 .content_mask = self.scaled_content_mask(),
                 .corner_radii = corner_radii.scale(sf),
                 .color = s.color.opacity(opacity),
+                .element_bounds = element_bounds,
+                .element_corner_radii = element_corner_radii,
+                .inset = 0,
+            } });
+        }
+    }
+
+    /// Paints the inset shadows of `shadows` inside `b`, after the background so they layer on
+    /// top of the fill (GPUI `paint_inset_shadows`). Drop shadows are skipped.
+    pub fn paint_inset_shadows(self: *Window, b: Bounds(Pixels), corner_radii: Corners(Pixels), shadows: []const style_mod.BoxShadow) void {
+        const sf = self.scale_factor_;
+        const opacity = self.element_opacity();
+        const element_bounds = b.scale(sf);
+        const element_corner_radii = corner_radii.scale(sf);
+        for (shadows) |s| {
+            if (!s.inset) continue;
+            const hole = (Bounds(Pixels){ .origin = b.origin.add(s.offset), .size = b.size }).dilate(-s.spread_radius);
+            // Clamped at zero: a negative radius would break the SDF in the shader.
+            const hole_corner_radii: Corners(Pixels) = .{
+                .top_left = @max(corner_radii.top_left - s.spread_radius, 0),
+                .top_right = @max(corner_radii.top_right - s.spread_radius, 0),
+                .bottom_right = @max(corner_radii.bottom_right - s.spread_radius, 0),
+                .bottom_left = @max(corner_radii.bottom_left - s.spread_radius, 0),
+            };
+            insertPrim(&self.next_frame.scene, .{ .shadow = .{
+                .order = 0,
+                .blur_radius = s.blur_radius * sf,
+                .bounds = hole.scale(sf),
+                .content_mask = self.scaled_content_mask(),
+                .corner_radii = hole_corner_radii.scale(sf),
+                .color = s.color.opacity(opacity),
+                .element_bounds = element_bounds,
+                .element_corner_radii = element_corner_radii,
+                .inset = 1,
             } });
         }
     }
@@ -1657,12 +1833,11 @@ pub const Window = struct {
         insertPrim(&self.next_frame.scene, .{ .path = scaled });
     }
 
-    /// Paints an underline.
-    pub fn paint_underline(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle) void {
+    fn underline_primitive(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle) scene_mod.Underline {
         const sf = self.scale_factor_;
         const height: Pixels = if (style.wavy) style.thickness * 3 else style.thickness;
         const b: Bounds(Pixels) = .{ .origin = origin, .size = .{ .width = width, .height = height } };
-        insertPrim(&self.next_frame.scene, .{ .underline = .{
+        return .{
             .order = 0,
             .pad = 0,
             .bounds = b.scale(sf),
@@ -1670,7 +1845,58 @@ pub const Window = struct {
             .color = (style.color orelse color_mod.black()).opacity(self.element_opacity()),
             .thickness = style.thickness * sf,
             .wavy = .from(style.wavy),
-        } });
+        };
+    }
+
+    /// Paints an underline (GPUI `paint_underline`).
+    pub fn paint_underline(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle) void {
+        insertPrim(&self.next_frame.scene, .{ .underline = self.underline_primitive(origin, width, style) });
+    }
+
+    /// Paints an underline with the device-space horizontal spans in `exclusions` left out, for
+    /// text that must not be underlined where descenders cross (GPUI `paint_underline_with_exclusions`).
+    /// Each span is cut from the underline as ScaledPixels x-ranges.
+    pub fn paint_underline_with_exclusions(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle, exclusions: []const ScaledRange) void {
+        const underline = self.underline_primitive(origin, width, style);
+        if (exclusions.len == 0) return insertPrim(&self.next_frame.scene, .{ .underline = underline });
+
+        const clip = underline.bounds.intersect(underline.content_mask.bounds);
+        if (clip.is_empty()) return;
+        const left = clip.origin.x;
+        const right = clip.origin.x + clip.size.width;
+
+        const spans = self.next_frame.arena.allocator().alloc(ScaledRange, exclusions.len) catch oom();
+        var count: usize = 0;
+        for (exclusions) |span| {
+            const start = @max(span.start, left);
+            const end = @min(span.end, right);
+            if (start < end) {
+                spans[count] = .{ .start = start, .end = end };
+                count += 1;
+            }
+        }
+        if (count == 0) return insertPrim(&self.next_frame.scene, .{ .underline = underline });
+        std.mem.sort(ScaledRange, spans[0..count], {}, struct {
+            fn less(_: void, a: ScaledRange, b: ScaledRange) bool {
+                return a.start < b.start;
+            }
+        }.less);
+
+        var start = left;
+        for (spans[0..count]) |span| {
+            if (start < span.start) self.paint_underline_span(underline, start, span.start, clip);
+            start = @max(start, span.end);
+        }
+        if (start < right) self.paint_underline_span(underline, start, right, clip);
+    }
+
+    fn paint_underline_span(self: *Window, underline: scene_mod.Underline, start: ScaledPixels, end: ScaledPixels, clip: Bounds(ScaledPixels)) void {
+        var piece = underline;
+        piece.content_mask = .{ .bounds = .{
+            .origin = .{ .x = start, .y = clip.origin.y },
+            .size = .{ .width = end - start, .height = clip.size.height },
+        } };
+        insertPrim(&self.next_frame.scene, .{ .underline = piece });
     }
 
     /// Paints a strikethrough.
@@ -1755,28 +1981,72 @@ pub const Window = struct {
         } });
     }
 
-    /// Paints an already-rasterized polychrome image tile.
-    pub fn paint_polychrome_tile(self: *Window, b: Bounds(Pixels), corner_radii: Corners(Pixels), tile: atlas_mod.AtlasTile, grayscale: bool) void {
+    /// Paints `frame_index` of `data` drawn at `image_bounds`, clipped to `b` and rounded by
+    /// `corner_radii` (GPUI `paint_image`). Nothing is painted when the visible part is empty.
+    pub fn paint_image(
+        self: *Window,
+        b: Bounds(Pixels),
+        image_bounds: Bounds(Pixels),
+        corner_radii: Corners(Pixels),
+        data: *assets_mod.RenderImage,
+        frame_index: usize,
+        grayscale: bool,
+    ) !void {
+        const visible = b.intersect(image_bounds);
+        if (visible.size.width <= 0 or visible.size.height <= 0) return;
+        if (image_bounds.size.width <= 0 or image_bounds.size.height <= 0) return;
+
+        var builder = ImageTile{ .image = data, .frame = frame_index };
+        const key = atlas_mod.AtlasKey{ .image = assets_mod.image_atlas_key(data.id, frame_index) };
+        const tile = (try self.sprite_atlas.get_or_insert_with(key, .{ .context = &builder, .build_fn = ImageTile.build })) orelse return;
+
         const sf = self.scale_factor_;
+        const radii = corner_radii.clamp_radii_for_quad_size(visible.size).scale(sf);
         insertPrim(&self.next_frame.scene, .{ .polychrome_sprite = .{
             .order = 0,
             .pad = 0,
             .grayscale = .from(grayscale),
             .opacity = self.element_opacity(),
-            .bounds = b.scale(sf),
+            .bounds = visible.scale(sf),
             .content_mask = self.scaled_content_mask(),
-            .corner_radii = corner_radii.scale(sf),
-            .tile = tile,
+            .corner_radii = radii,
+            .tile = sub_tile(tile, image_bounds, visible),
         } });
     }
 
-    /// Paints a monochrome tile (e.g. a rasterized SVG) tinted with `color`.
-    pub fn paint_monochrome_tile(self: *Window, b: Bounds(Pixels), tile: atlas_mod.AtlasTile, color: Hsla, transformation: scene_mod.TransformationMatrix) void {
+    /// Paints the SVG at `path`, or the bytes `data` when given, as a mask tinted with `color`,
+    /// centred in `b` (GPUI `paint_svg`). The mask is rasterized at SMOOTH_SVG_SCALE_FACTOR
+    /// times the device size and drawn at half of that, which smooths its edges.
+    pub fn paint_svg(
+        self: *Window,
+        b: Bounds(Pixels),
+        path: []const u8,
+        data: ?[]const u8,
+        transformation: scene_mod.TransformationMatrix,
+        color: Hsla,
+        cx: *App,
+    ) !void {
         const sf = self.scale_factor_;
+        const smooth = svg_renderer_mod.SMOOTH_SVG_SCALE_FACTOR;
+        const device_size: Size(DevicePixels) = .{
+            .width = @intFromFloat(@ceil(b.size.width * sf * smooth)),
+            .height = @intFromFloat(@ceil(b.size.height * sf * smooth)),
+        };
+        if (device_size.width <= 0 or device_size.height <= 0) return;
+
+        var builder = SvgTile{ .cache = &cx.asset_cache, .source = cx.asset_source, .path = path, .data = data, .size = device_size };
+        const key = atlas_mod.AtlasKey{ .svg = svg_key(path, data, device_size) };
+        const tile = (try self.sprite_atlas.get_or_insert_with(key, .{ .context = &builder, .build_fn = SvgTile.build })) orelse return;
+
+        const draw_w = @as(f32, @floatFromInt(tile.bounds.size.width)) / smooth;
+        const draw_h = @as(f32, @floatFromInt(tile.bounds.size.height)) / smooth;
+        const center = b.center();
+        const ox = @round(center.x * sf - draw_w / 2.0);
+        const oy = @round(center.y * sf - draw_h / 2.0);
         insertPrim(&self.next_frame.scene, .{ .monochrome_sprite = .{
             .order = 0,
             .pad = 0,
-            .bounds = b.scale(sf),
+            .bounds = .{ .origin = .{ .x = ox, .y = oy }, .size = .{ .width = draw_w, .height = draw_h } },
             .content_mask = self.scaled_content_mask(),
             .color = color.opacity(self.element_opacity()),
             .tile = tile,
@@ -1994,6 +2264,15 @@ pub const Window = struct {
     pub fn dispatch_event(self: *Window, event: interactive.PlatformInput, cx: *App) bool {
         self.default_prevented = false;
         self.propagate_event = true;
+        // Focus-visible styles and hover suppression follow the modality of the last input (GPUI).
+        const old_modality = self.last_input_modality;
+        self.last_input_modality = switch (event) {
+            .key_down => .keyboard,
+            .mouse_move, .mouse_down => .mouse,
+            .touch => .touch,
+            else => self.last_input_modality,
+        };
+        if (self.last_input_modality != old_modality) self.refresh();
         cx.pending_updates += 1;
         defer {
             cx.pending_updates -= 1;
@@ -2006,13 +2285,11 @@ pub const Window = struct {
             .mouse_move => |e| {
                 self.mouse_position_ = e.position;
                 self.modifiers_ = e.modifiers;
-                self.last_input_was_keyboard = false;
                 self.dispatch_mouse(interactive.MouseMoveEvent, &e, cx);
             },
             .mouse_down => |e| {
                 self.mouse_position_ = e.position;
                 self.modifiers_ = e.modifiers;
-                self.last_input_was_keyboard = false;
                 self.dispatch_mouse(interactive.MouseDownEvent, &e, cx);
             },
             .mouse_up => |e| {
@@ -2038,7 +2315,6 @@ pub const Window = struct {
             },
             .key_down => |e| {
                 self.modifiers_ = e.keystroke.modifiers;
-                self.last_input_was_keyboard = true;
                 self.dispatch_key_event(interactive.KeyDownEvent, &e, cx);
             },
             .key_up => |e| {
@@ -2047,6 +2323,11 @@ pub const Window = struct {
             },
             // A file drag behaves like a drag started inside the window, so elements handle
             // both the same way, as in GPUI.
+            .long_press => |e| {
+                self.mouse_position_ = if (e.phase == .started) e.start_position else e.position;
+                if (e.phase == .started) self.long_press_capture = null;
+                self.dispatch_mouse(interactive.LongPressEvent, &e, cx);
+            },
             .file_drop => |e| switch (e) {
                 .entered => |d| {
                     self.mouse_position_ = d.position;
@@ -2205,9 +2486,9 @@ pub const Window = struct {
         self.pending_keystrokes = .empty;
         defer free_keystrokes(self.allocator, &previous);
         const stale = self.pending_focus != null and self.pending_focus != self.focus_id;
-        const had_timeout = self.pending_has_timeout and !stale;
+        const had_timeout = self.pending_timeout != null and !stale;
         const had_pending = previous.items.len > 0;
-        self.pending_has_timeout = false;
+        self.drop_pending_timeout();
         self.pending_timeout_generation +%= 1;
 
         const input: []const keystroke_mod.Keystroke = if (stale) &.{} else previous.items;
@@ -2321,9 +2602,88 @@ pub const Window = struct {
     }
 
     fn start_pending_input_timeout(self: *Window, cx: *App) void {
-        self.pending_has_timeout = true;
-        const timer: PendingInputTimer = .{ .app = cx, .window_id = self.window_handle_id(), .generation = self.pending_timeout_generation };
-        cx.background_executor().after(cx.foreground_executor(), PENDING_INPUT_TIMEOUT_NS, PendingInputTimer.fire, timer);
+        self.drop_pending_timeout();
+        self.pending_timeout = .{ .duration_ns = PENDING_INPUT_TIMEOUT_NS, .remaining_ns = PENDING_INPUT_TIMEOUT_NS };
+        self.run_pending_timeout(cx);
+    }
+
+    /// Starts a timer for the time left on the timeout, and records when it started. Each timer
+    /// carries a generation, so one started before a pause or a new key is ignored when it fires.
+    fn run_pending_timeout(self: *Window, cx: *App) void {
+        if (self.pending_timeout) |*timeout| {
+            self.pending_timeout_generation +%= 1;
+            timeout.started_at_ns = executor_mod.now_ns();
+            const timer: PendingInputTimer = .{ .app = cx, .window_id = self.window_handle_id(), .generation = self.pending_timeout_generation };
+            cx.background_executor().after(cx.foreground_executor(), timeout.remaining_ns, PendingInputTimer.fire, timer);
+        }
+    }
+
+    /// Forgets the timeout, and the pause subscription it held (if any).
+    fn drop_pending_timeout(self: *Window) void {
+        if (self.pending_timeout) |timeout| {
+            if (timeout.pause) |pause| pause.release.unsubscribe();
+        }
+        self.pending_timeout = null;
+    }
+
+    /// The timeout of the pending input, when that input belongs to the focus that is current.
+    fn focused_pending_timeout(self: *Window) ?*PendingTimeout {
+        if (self.pending_keystrokes.items.len == 0) return null;
+        if (self.pending_focus != null and self.pending_focus != self.focus_id) return null;
+        if (self.pending_timeout) |*timeout| return timeout;
+        return null;
+    }
+
+    /// The pending input that can still complete a multi-stroke binding, with its timeout (GPUI `pending_input`).
+    pub fn pending_input(self: *const Window) ?PendingInputStatus {
+        if (self.pending_keystrokes.items.len == 0) return null;
+        if (self.pending_focus != null and self.pending_focus != self.focus_id) return null;
+        return .{
+            .keystroke_list = self.pending_keystrokes.items,
+            .timeout_status = if (self.pending_timeout) |timeout| timeout.status() else null,
+        };
+    }
+
+    /// Pauses or resumes the pending-input timeout on behalf of `owner`. A paused timeout resumes by
+    /// itself when `owner` is released. Returns whether the state changed. A timeout paused by one
+    /// owner cannot be resumed by another (GPUI `set_pending_input_timeout_paused`).
+    pub fn set_pending_input_timeout_paused(self: *Window, owner: anytype, paused: bool, cx: *App) bool {
+        const owner_id = owner.entity_id();
+        if (!paused) return self.resume_pending_input_timeout(owner_id, cx);
+
+        const timeout = self.focused_pending_timeout() orelse return false;
+        if (timeout.pause != null) return false;
+        const release = cx.observe_release_in(owner, self, end_pending_timeout_pause);
+        if (timeout.started_at_ns) |started| {
+            timeout.remaining_ns -|= executor_mod.now_ns() -| started;
+        }
+        timeout.started_at_ns = null;
+        timeout.pause = .{ .owner_id = owner_id, .release = release };
+        // The timer that is running must not flush while paused.
+        self.pending_timeout_generation +%= 1;
+        self.pending_input_notify = true;
+        return true;
+    }
+
+    fn resume_pending_input_timeout(self: *Window, owner_id: app_mod.EntityId, cx: *App) bool {
+        const timeout = self.focused_pending_timeout() orelse return false;
+        const pause = timeout.pause orelse return false;
+        if (pause.owner_id != owner_id) return false;
+        pause.release.unsubscribe();
+        timeout.pause = null;
+        self.run_pending_timeout(cx);
+        self.pending_input_notify = true;
+        return true;
+    }
+
+    /// Runs when the owner of a pause is released. Only the current pause can fire: the subscriptions
+    /// of earlier pauses are unsubscribed when they end.
+    fn end_pending_timeout_pause(_: anytype, window: *Window, cx: *App) void {
+        const timeout = window.focused_pending_timeout() orelse return;
+        if (timeout.pause == null) return;
+        timeout.pause = null;
+        window.run_pending_timeout(cx);
+        window.pending_input_notify = true;
     }
 
     /// Whether a potential multi-stroke binding is in progress.
@@ -2342,7 +2702,7 @@ pub const Window = struct {
     pub fn clear_pending_keystrokes(self: *Window) void {
         if (self.pending_keystrokes.items.len == 0) return;
         free_keystrokes(self.allocator, &self.pending_keystrokes);
-        self.pending_has_timeout = false;
+        self.drop_pending_timeout();
         self.pending_timeout_generation +%= 1;
         self.pending_input_notify = true;
     }
@@ -2642,6 +3002,91 @@ fn oom() noreturn {
     @panic("out of memory");
 }
 
+/// Atlas builder for one frame of a decoded image. The pixels stay owned by the `RenderImage`.
+const ImageTile = struct {
+    image: *assets_mod.RenderImage,
+    frame: usize,
+
+    fn build(raw: *anyopaque) anyerror!?atlas_mod.TileData {
+        const self: *const ImageTile = @ptrCast(@alignCast(raw));
+        const bytes = self.image.as_bytes(self.frame) orelse return null;
+        return .{ .size = self.image.size(self.frame), .bytes = bytes };
+    }
+};
+
+/// The part of the atlas `tile` that shows `visible`, where `image` is the full drawn rectangle.
+fn sub_tile(tile: atlas_mod.AtlasTile, image: Bounds(Pixels), visible: Bounds(Pixels)) atlas_mod.AtlasTile {
+    if (visible.eq(image)) return tile;
+    const iw = image.size.width;
+    const ih = image.size.height;
+    const tw: f32 = @floatFromInt(tile.bounds.size.width);
+    const th: f32 = @floatFromInt(tile.bounds.size.height);
+    var out = tile;
+    const x_off = (visible.origin.x - image.origin.x) / iw;
+    const y_off = (visible.origin.y - image.origin.y) / ih;
+    out.bounds.origin.x = tile.bounds.origin.x + @as(DevicePixels, @intFromFloat(@round(x_off * tw)));
+    out.bounds.origin.y = tile.bounds.origin.y + @as(DevicePixels, @intFromFloat(@round(y_off * th)));
+    out.bounds.size.width = @max(1, @as(DevicePixels, @intFromFloat(@round(visible.size.width / iw * tw))));
+    out.bounds.size.height = @max(1, @as(DevicePixels, @intFromFloat(@round(visible.size.height / ih * th))));
+    return out;
+}
+
+/// Key for a rasterized SVG mask: its path, its bytes when given inline, and the device size.
+fn svg_key(path: []const u8, data: ?[]const u8, size: Size(DevicePixels)) u64 {
+    var h = std.hash.Wyhash.hash(0x73766700, path);
+    if (data) |bytes| h = std.hash.Wyhash.hash(h, bytes);
+    const dims = [_]u64{ @intCast(size.width), @intCast(size.height) };
+    return std.hash.Wyhash.hash(h, std.mem.sliceAsBytes(&dims));
+}
+
+/// Atlas builder: rasterizes an SVG to an alpha mask. The mask is copied into the atlas right away.
+const SvgTile = struct {
+    cache: *assets_mod.AssetCache,
+    source: assets_mod.AssetSource,
+    path: []const u8,
+    data: ?[]const u8,
+    size: Size(DevicePixels),
+
+    fn build(raw: *anyopaque) anyerror!?atlas_mod.TileData {
+        const self: *SvgTile = @ptrCast(@alignCast(raw));
+        const arena = frame_arena();
+        const bytes = self.data orelse (self.source.load(self.path) orelse return null);
+        const renderer = try self.cache.svg_renderer();
+        const parsed = renderer.parse_svg(arena, bytes) catch return null;
+        defer parsed.deinit();
+        const mask = renderer.render_alpha_mask(arena, parsed, .{ .size = self.size }) catch return null;
+        return .{
+            .size = .{ .width = @intCast(mask.width), .height = @intCast(mask.height) },
+            .bytes = mask.pixels,
+        };
+    }
+};
+
 fn insertPrim(scene: *scene_mod.Scene, p: scene_mod.Primitive) void {
     scene.insert_primitive(p) catch oom();
+}
+
+test "sub_tile crops the atlas tile to the visible part" {
+    const tile: atlas_mod.AtlasTile = .{
+        .texture_id = .{ .index = 0, .kind = .polychrome },
+        .tile_id = .{ .value = 1 },
+        .padding = 0,
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 200, .height = 100 } },
+    };
+    // Image drawn at 200x100 but only the right half is visible.
+    const image: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 200, .height = 100 } };
+    const visible: Bounds(Pixels) = .{ .origin = .{ .x = 100, .y = 0 }, .size = .{ .width = 100, .height = 100 } };
+    const sub = sub_tile(tile, image, visible);
+    try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.origin.x);
+    try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.size.width);
+    try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.size.height);
+}
+
+test "svg key depends on path, inline bytes and size" {
+    const size16: Size(DevicePixels) = .{ .width = 16, .height = 16 };
+    const size32: Size(DevicePixels) = .{ .width = 32, .height = 16 };
+    const a = svg_key("a.svg", null, size16);
+    try std.testing.expect(a != svg_key("a.svg", null, size32));
+    try std.testing.expect(a != svg_key("b.svg", null, size16));
+    try std.testing.expect(svg_key("", "<svg/>", size16) != svg_key("", "<svg></svg>", size16));
 }

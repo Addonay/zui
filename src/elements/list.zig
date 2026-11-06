@@ -154,6 +154,8 @@ const FollowState = enum {
 const ListItem = struct {
     measured: ?Size(Pixels) = null,
     size_hint: ?Size(Pixels) = null,
+    /// Set by `ListState.splice_focusable`. A focused item stays rendered when it scrolls out of view.
+    focus_handle: ?window_mod.FocusHandle = null,
 
     fn current_size_hint(self: ListItem) ?Size(Pixels) {
         return self.measured orelse self.size_hint;
@@ -286,8 +288,10 @@ const StateInner = struct {
     fn set_item(self: *StateInner, ix: usize, item: ListItem) void {
         const old = self.items.items[ix];
         if (old.is_unknown()) self.unknown_count -= 1;
-        if (item.is_unknown()) self.unknown_count += 1;
-        self.items.items[ix] = item;
+        var stored = item;
+        stored.focus_handle = old.focus_handle;
+        if (stored.is_unknown()) self.unknown_count += 1;
+        self.items.items[ix] = stored;
         self.heights.set(ix, item.height());
     }
 
@@ -401,6 +405,14 @@ const StateInner = struct {
             self.set_item(ix, .{ .measured = size_ });
         }
         self.measuring_behavior = .{ .measure = true };
+    }
+
+    fn any_laid_out_item_focused(self: *const StateInner, layouts: []const ItemLayout, window: *const Window, cx: *const App) bool {
+        for (layouts) |layout| {
+            const handle = self.items.items[layout.index].focus_handle orelse continue;
+            if (handle.contains_focused(window, cx)) return true;
+        }
+        return false;
     }
 
     /// Lays out the items that are visible or in overdraw around `scroll_top`, and updates the
@@ -526,6 +538,19 @@ const StateInner = struct {
         }
         for (forward_layouts.items) |layout| item_layouts.append(arena, layout) catch oom();
 
+        // None of the visible items has the focus: render the first focused item past them, so that
+        // it keeps receiving keyboard input. It lies outside the list's bounds, so it is not painted.
+        if (!self.any_laid_out_item_focused(item_layouts.items, window, cx)) {
+            for (self.items.items, 0..) |item, focus_ix| {
+                const handle = item.focus_handle orelse continue;
+                if (!handle.contains_focused(window, cx)) continue;
+                const element = renderer.call(focus_ix, window, cx);
+                const element_size = element.layout_as_root(available_item_space, window, cx);
+                item_layouts.append(arena, .{ .index = focus_ix, .element = element, .size = element_size }) catch oom();
+                break;
+            }
+        }
+
         // Resume following once the user scrolls back to the bottom.
         if (self.follow_state == .tail_stopped) {
             const last_padding = self.last_padding orelse Edges(Pixels){};
@@ -537,6 +562,9 @@ const StateInner = struct {
         return .{ .max_item_width = max_item_width, .scroll_top = scroll_top, .item_layouts = item_layouts };
     }
 
+    /// Lays out and prepaints the visible items. An item that requests autoscroll (GPUI
+    /// `request_autoscroll`) moves the scroll position, and the items are prepainted again from there,
+    /// without autoscroll the second time (GPUI's retry loop around `prepaint_items`).
     fn prepaint_items(
         self: *StateInner,
         bounds: Bounds(Pixels),
@@ -545,30 +573,110 @@ const StateInner = struct {
         window: *Window,
         cx: *App,
     ) LayoutItemsResponse {
-        switch (self.measuring_behavior) {
-            .measure => |has_measured| if (!has_measured) self.layout_all_items(bounds.size.width, renderer, window, cx),
+        var autoscroll = true;
+        while (true) {
+            var attempt: PrepaintAttempt = .{ .state = self, .bounds = bounds, .padding = padding, .autoscroll = autoscroll, .renderer = renderer, .cx = cx };
+            if (window.transact(&attempt, PrepaintAttempt.run)) |_| {
+                return attempt.response;
+            } else |_| {
+                self.set_scroll_anchor(attempt.request);
+                autoscroll = false;
+            }
+        }
+    }
+
+    fn snap_to_end(self: *StateInner) void {
+        self.set_scroll_anchor(.{ .item_ix = self.count(), .offset_in_item = 0 });
+    }
+};
+
+/// One attempt at prepainting the visible items, run inside `Window.transact` so that a retry leaves
+/// nothing from the failed one behind (GPUI's closure in `prepaint_items`).
+const PrepaintAttempt = struct {
+    state: *StateInner,
+    bounds: Bounds(Pixels),
+    padding: Edges(Pixels),
+    autoscroll: bool,
+    renderer: ItemRenderer,
+    cx: *App,
+    response: LayoutItemsResponse = undefined,
+    /// Where to scroll to show the requested area, set when `run` returns `error.Autoscroll`.
+    request: ListOffset = .{ .item_ix = 0, .offset_in_item = 0 },
+
+    fn run(self: *PrepaintAttempt, window: *Window) error{Autoscroll}!void {
+        const state = self.state;
+        switch (state.measuring_behavior) {
+            .measure => |has_measured| if (!has_measured) state.layout_all_items(self.bounds.size.width, self.renderer, window, self.cx),
             .visible => {},
         }
-        var response = self.layout_items(bounds.size.width, bounds.size.height, padding, renderer, window, cx);
+        var response = state.layout_items(self.bounds.size.width, self.bounds.size.height, self.padding, self.renderer, window, self.cx);
+        // A request made while laying out came from outside the items, so it is not ours to honor.
+        _ = window.take_autoscroll();
 
         // Paint only the visible items, when there is space for them past the padding.
-        if (bounds.size.height > padding.top + padding.bottom) {
-            var item_origin = bounds.origin.add(point(@as(Pixels, 0), padding.top));
+        if (self.bounds.size.height > self.padding.top + self.padding.bottom) {
+            var item_origin = self.bounds.origin.add(point(@as(Pixels, 0), self.padding.top));
             item_origin.y -= response.scroll_top.offset_in_item;
             for (response.item_layouts.items) |*item| {
-                window.push_content_mask(.{ .bounds = bounds });
-                item.element.prepaint_at(item_origin, window, cx);
+                window.push_content_mask(.{ .bounds = self.bounds });
+                item.element.prepaint_at(item_origin, window, self.cx);
                 window.pop_content_mask();
+
+                const requested = window.take_autoscroll();
+                if (requested) |area| if (self.autoscroll) {
+                    if (area.origin.y < self.bounds.origin.y) {
+                        self.request = self.top_request(item.index, item_origin.y, area.origin.y, window);
+                        return error.Autoscroll;
+                    }
+                    if (area.origin.y + area.size.height > self.bounds.origin.y + self.bounds.size.height) {
+                        self.request = self.bottom_request(item.index, item_origin.y, area.origin.y + area.size.height, window);
+                        return error.Autoscroll;
+                    }
+                };
                 item_origin.y += item.size.height;
             }
         } else {
             response.item_layouts.clearRetainingCapacity();
         }
-        return response;
+        self.response = response;
     }
 
-    fn snap_to_end(self: *StateInner) void {
-        self.set_scroll_anchor(.{ .item_ix = self.count(), .offset_in_item = 0 });
+    /// The offset that puts the top of the requested area at the top of the list. It walks back
+    /// through earlier items when the area starts above item `item_index` (GPUI's top branch).
+    fn top_request(self: *PrepaintAttempt, item_index: usize, item_origin_y: Pixels, area_top: Pixels, window: *Window) ListOffset {
+        var ix = item_index;
+        var offset = area_top - item_origin_y;
+        while (offset < 0) {
+            if (ix == 0) {
+                offset = 0;
+                break;
+            }
+            ix -= 1;
+            offset += self.item_height(ix, window);
+        }
+        return .{ .item_ix = ix, .offset_in_item = offset };
+    }
+
+    /// The offset that puts the bottom of the requested area at the bottom of the list, walking back
+    /// through earlier items to fill the space above it (GPUI's bottom branch).
+    fn bottom_request(self: *PrepaintAttempt, item_index: usize, item_origin_y: Pixels, area_bottom: Pixels, window: *Window) ListOffset {
+        var ix = item_index;
+        var height = self.bounds.size.height - self.padding.top - self.padding.bottom;
+        height -= area_bottom - item_origin_y;
+        while (height > 0) {
+            if (ix == 0) break;
+            ix -= 1;
+            height -= self.item_height(ix, window);
+        }
+        return .{ .item_ix = ix, .offset_in_item = if (height < 0) -height else 0 };
+    }
+
+    /// The height of item `ix`: its measured one, or one it is laid out for now (GPUI `size` or `layout_as_root`).
+    fn item_height(self: *PrepaintAttempt, ix: usize, window: *Window) Pixels {
+        if (self.state.items.items[ix].measured) |measured| return measured.height;
+        const element = self.renderer.call(ix, window, self.cx);
+        const laid_out = element.layout_as_root(.{ .width = .{ .definite = self.bounds.size.width }, .height = .min_content }, window, self.cx);
+        return laid_out.height;
     }
 };
 
@@ -719,6 +827,20 @@ pub const ListState = struct {
             } else if (end <= anchor.position.item_ix) {
                 anchor.position.item_ix = anchor.position.item_ix - (end - start) + count;
             }
+        }
+    }
+
+    /// Like `splice`, and gives each new item its focus handle (`null` for an item that cannot take
+    /// focus). A focused item that scrolls out of view is still rendered after the visible ones, so
+    /// keyboard interaction with it continues (GPUI `splice_focusable`; a slice takes the place of
+    /// its iterator).
+    pub fn splice_focusable(self: ListState, old_range: Range, focus_handles: []const ?window_mod.FocusHandle) void {
+        self.splice(old_range, focus_handles.len);
+        const state = self.inner;
+        const start = @min(old_range.start, state.count());
+        for (focus_handles, 0..) |handle, i| {
+            if (start + i >= state.count()) break;
+            state.items.items[start + i].focus_handle = handle;
         }
     }
 
@@ -991,7 +1113,7 @@ pub const List = struct {
 
         // A new width invalidates every cached height, since text wraps differently.
         if (state.last_layout_bounds == null or state.last_layout_bounds.?.size.width != bounds.size.width) {
-            for (state.items.items) |*item| item.* = .{};
+            for (state.items.items) |*item| item.* = .{ .focus_handle = item.focus_handle };
             state.rebuild_heights();
             state.measuring_behavior.reset();
         }
@@ -4274,6 +4396,7 @@ const VisualTestContext = @import("../app/test_context.zig").VisualTestContext;
 const Context = app_mod.Context;
 const Entity = app_mod.Entity;
 const div_mod = @import("div.zig");
+const canvas_mod = @import("canvas.zig");
 const Div = div_mod.Div;
 
 /// Set by each test before it opens a window, read by `TestListView.build`.
@@ -4540,4 +4663,135 @@ test "list: dragging the scrollbar away from the tail stops following, and back 
     state.set_offset_from_scrollbar(.{ .x = 0, .y = -300 });
     state.scrollbar_drag_ended();
     try std.testing.expect(state.is_following_tail());
+}
+
+/// Which items the focus test rendered in the last frame, and the handle of the focused one.
+var focus_test_rendered: [100]bool = @splat(false);
+var focus_test_state: ?ListState = null;
+
+var focus_test_handle: ?window_mod.FocusHandle = null;
+
+const FocusTestView = struct {
+    state: ListState,
+    focus: window_mod.FocusHandle,
+
+    fn build(_: *Window, app: *App) app_mod.Entity(FocusTestView) {
+        return app.new(FocusTestView{ .state = focus_test_state.?, .focus = focus_test_handle.? });
+    }
+
+    pub fn render(self: *FocusTestView, _: *Window, cx: *Context(FocusTestView)) *div_mod.Div {
+        return div_mod.div().w_full().h_full().child(list(self.state, cx.item_processor(render_item)).w_full().h_full());
+    }
+
+    fn render_item(self: *FocusTestView, ix: usize, _: *Window, _: *Context(FocusTestView)) AnyElement {
+        focus_test_rendered[ix] = true;
+        const item = div_mod.div().h(geometry.px(50)).w_full();
+        if (ix == 80) _ = item.track_focus(&self.focus);
+        return item.into_any_element();
+    }
+};
+
+test "list: a focused item scrolled out of view is still rendered, after the visible items" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    focus_test_rendered = @splat(false);
+    // Item 80 takes the focus. It is rendered while it is in view, so the next frame knows it is focused.
+    const state = ListState.new(0, .top, 0);
+    focus_test_state = state;
+    const handle = cx.app.focus_handle();
+    focus_test_handle = handle;
+    var handles: [100]?window_mod.FocusHandle = @splat(null);
+    handles[80] = handle;
+    state.splice_focusable(.{ .start = 0, .end = 0 }, &handles);
+    const vcx = open_focus_test(&cx);
+    state.scroll_to(.{ .item_ix = 80, .offset_in_item = 0 });
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(focus_test_rendered[80]);
+    // Focus only takes a handle the last frame drew, so this comes after the frame above.
+    vcx.window.focus(handle);
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.focus_id == handle.id);
+
+    // Scrolled back to the top, item 80 is out of view, but it keeps being rendered.
+    focus_test_rendered = @splat(false);
+    state.scroll_to(.{ .item_ix = 0, .offset_in_item = 0 });
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(focus_test_rendered[80]);
+    try std.testing.expect(focus_test_rendered[0]);
+    try std.testing.expect(!focus_test_rendered[50]);
+}
+
+test "list: splice_focusable gives the new items their handles, and measuring an item keeps its handle" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const state = ListState.new(3, .top, 0);
+    const handle = cx.app.focus_handle();
+    // Items 1 and 2 are replaced by null and the handle, so the handle lands at index 2.
+    state.splice_focusable(.{ .start = 1, .end = 2 }, &.{ null, handle });
+    try std.testing.expect(state.inner.items.items[0].focus_handle == null);
+    try std.testing.expect(state.inner.items.items[1].focus_handle == null);
+    try std.testing.expect(state.inner.items.items[2].focus_handle != null);
+    try std.testing.expect(state.inner.items.items[3].focus_handle == null);
+
+    state.inner.set_item(2, .{ .measured = .{ .width = 10, .height = 10 } });
+    try std.testing.expect(state.inner.items.items[2].focus_handle != null);
+}
+
+/// Item 1 is 100 pixels tall and asks for autoscroll to its own bounds, which reach past the viewport.
+var autoscroll_test_requested: bool = false;
+
+const AutoscrollTestView = struct {
+    state: ListState,
+
+    fn build(_: *Window, app: *App) app_mod.Entity(AutoscrollTestView) {
+        return app.new(AutoscrollTestView{ .state = focus_test_state.? });
+    }
+
+    pub fn render(self: *AutoscrollTestView, _: *Window, cx: *Context(AutoscrollTestView)) *div_mod.Div {
+        return div_mod.div().w_full().h_full().child(list(self.state, cx.item_processor(render_item)).w_full().h_full());
+    }
+
+    fn render_item(_: *AutoscrollTestView, ix: usize, _: *Window, _: *Context(AutoscrollTestView)) AnyElement {
+        if (ix != 1) return div_mod.div().h(geometry.px(50)).w_full().into_any_element();
+        return div_mod.div().h(geometry.px(100)).w_full().child(canvas_mod.canvas({}, request_own_bounds, paint_nothing).size_full()).into_any_element();
+    }
+
+    fn request_own_bounds(_: void, bounds: Bounds(Pixels), window: *Window, _: *App) void {
+        if (autoscroll_test_requested) window.request_autoscroll(bounds);
+    }
+
+    fn paint_nothing(_: void, _: Bounds(Pixels), _: *void, _: *Window, _: *App) void {}
+};
+
+test "list: an autoscroll request from an item scrolls the list so the requested area is visible" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const state = ListState.new(10, .top, 0);
+    focus_test_state = state;
+    autoscroll_test_requested = true;
+    defer autoscroll_test_requested = false;
+    const handle = cx.add_window_with_options(.{
+        .window_bounds = .{ .windowed = geometry.bounds(geometry.point(geometry.px(0), geometry.px(0)), geometry.size(geometry.px(100), geometry.px(100))) },
+    }, AutoscrollTestView.build);
+    const vcx = cx.allocator.create(VisualTestContext) catch @panic("OOM");
+    vcx.* = .{ .window = handle.window(cx.app) orelse unreachable, .cx = &cx };
+    cx.visual_contexts.append(cx.allocator, vcx) catch @panic("OOM");
+    vcx.run_until_parked();
+
+    // Item 1 starts at 50 and runs to 150, past the bottom at 100. Scrolling to item 1 at offset 0 shows it.
+    try std.testing.expectEqual(@as(usize, 1), state.logical_scroll_top().item_ix);
+    try std.testing.expectEqual(@as(Pixels, 0), state.logical_scroll_top().offset_in_item);
+}
+
+fn open_focus_test(cx: *TestAppContext) *VisualTestContext {
+    const handle = cx.add_window_with_options(.{
+        .window_bounds = .{ .windowed = geometry.bounds(geometry.point(geometry.px(0), geometry.px(0)), geometry.size(geometry.px(100), geometry.px(100))) },
+    }, FocusTestView.build);
+    const visual = cx.allocator.create(VisualTestContext) catch @panic("OOM");
+    visual.* = .{ .window = handle.window(cx.app) orelse unreachable, .cx = cx };
+    cx.visual_contexts.append(cx.allocator, visual) catch @panic("OOM");
+    return visual;
 }

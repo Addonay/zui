@@ -5104,3 +5104,346 @@ test "async app: read_default_global sets the global the first time" {
     try std.testing.expectEqual(@as(u32, 7), value);
     try std.testing.expect(cx.app.has_global(Level));
 }
+
+const scene_mod = @import("../scene.zig");
+
+/// Paints through the window's paint_* helpers from a canvas. `mode` picks the case for the next window.
+const PaintCase = struct {
+    var mode: enum { underline_exclusions, shadows, image, svg, missing_svg, hitboxes, transact, use_state } = .underline_exclusions;
+    var image: ?*assets_mod.RenderImage = null;
+    /// Hitboxes the `hitboxes` mode inserts: `bottom` covers the whole box, `top` its left half and blocks the mouse.
+    var bottom: ?window_mod.Hitbox = null;
+    var top: ?window_mod.Hitbox = null;
+    /// Hitboxes added by a failed and a successful `transact` in the `transact` mode.
+    var added_by_failed: usize = 0;
+    var added_by_ok: usize = 0;
+    /// The entities the `use_state` mode got from two call sites in the last frame.
+    var first_site: ?app_mod.EntityId = null;
+    var second_site: ?app_mod.EntityId = null;
+    const UseStateValue = struct { n: u32 = 0 };
+
+    fn fail_after_inserting(_: void, window: *Window) error{Refused}!void {
+        _ = window.insert_hitbox(.{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 5, .height = 5 } }, .normal);
+        return error.Refused;
+    }
+
+    fn insert_one(_: void, window: *Window) error{Refused}!void {
+        _ = window.insert_hitbox(.{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 5, .height = 5 } }, .normal);
+    }
+    const svg_source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>";
+
+    fn paint(_: void, bounds: geometry.Bounds(Pixels), window: *Window, cx: *App) void {
+        const ox = bounds.origin.x;
+        const oy = bounds.origin.y;
+        const no_radii: geometry.Corners(Pixels) = geometry.Corners(Pixels).all(0);
+        switch (mode) {
+            .underline_exclusions => {
+                const style: style_mod.UnderlineStyle = .{ .thickness = 1, .color = color_mod.black() };
+                // Unsorted, one span inside, one reaching past the left edge, one outside.
+                const exclusions = [_]window_mod.ScaledRange{
+                    .{ .start = ox + 15, .end = ox + 25 },
+                    .{ .start = ox + 3, .end = ox + 12 },
+                    .{ .start = ox + 40, .end = ox + 50 },
+                };
+                window.paint_underline_with_exclusions(.{ .x = ox + 10, .y = oy + 10 }, 20, &style, &exclusions);
+            },
+            .shadows => {
+                const b: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox + 10, .y = oy + 10 }, .size = .{ .width = 20, .height = 20 } };
+                const shadows = [_]style_mod.BoxShadow{
+                    .{ .color = color_mod.black(), .offset = .{ .x = 2, .y = 3 }, .blur_radius = 4, .spread_radius = 1 },
+                    .{ .color = color_mod.black(), .offset = .{ .x = 0, .y = 0 }, .blur_radius = 1, .spread_radius = 2, .inset = true },
+                };
+                const radii = geometry.Corners(Pixels).all(5);
+                window.paint_drop_shadows(b, radii, &shadows);
+                window.paint_inset_shadows(b, radii, &shadows);
+            },
+            .image => {
+                const data = image orelse return;
+                const at: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox + 10, .y = oy }, .size = .{ .width = 20, .height = 40 } };
+                const clipped_left: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox - 10, .y = oy }, .size = .{ .width = 40, .height = 40 } };
+                const outside: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox + 200, .y = oy }, .size = .{ .width = 20, .height = 40 } };
+                const whole: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox, .y = oy }, .size = .{ .width = 40, .height = 40 } };
+                window.paint_image(whole, at, no_radii, data, 0, false) catch @panic("paint_image");
+                window.paint_image(whole, clipped_left, no_radii, data, 0, false) catch @panic("paint_image");
+                window.paint_image(whole, outside, no_radii, data, 0, false) catch @panic("paint_image");
+            },
+            .hitboxes => {
+                bottom = window.insert_hitbox(.{ .origin = .{ .x = ox, .y = oy }, .size = .{ .width = 40, .height = 40 } }, .normal);
+                top = window.insert_hitbox(.{ .origin = .{ .x = ox, .y = oy }, .size = .{ .width = 20, .height = 40 } }, .block_mouse);
+            },
+            .transact => {
+                const none: void = {};
+                const start = window.next_frame.hitboxes.items.len;
+                if (window.transact(none, fail_after_inserting)) |_| @panic("transact should have failed") else |_| {}
+                added_by_failed = window.next_frame.hitboxes.items.len - start;
+                const before_ok = window.next_frame.hitboxes.items.len;
+                window.transact(none, insert_one) catch @panic("insert_one cannot fail");
+                added_by_ok = window.next_frame.hitboxes.items.len - before_ok;
+            },
+            .use_state => {
+                first_site = window.use_state(@src(), cx, UseStateValue{}).entity_id();
+                second_site = window.use_state(@src(), cx, UseStateValue{}).entity_id();
+            },
+            .svg, .missing_svg => {
+                const b: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox, .y = oy }, .size = .{ .width = 10, .height = 10 } };
+                const identity = scene_mod.TransformationMatrix.unit();
+                if (mode == .svg) {
+                    window.paint_svg(b, "test.svg", svg_source, identity, color_mod.black(), cx) catch @panic("paint_svg");
+                } else {
+                    window.paint_svg(b, "missing.svg", null, identity, color_mod.black(), cx) catch @panic("paint_svg");
+                }
+            },
+        }
+    }
+};
+
+const PaintRoot = struct {
+    pub fn render(_: *@This(), _: *Window, _: *Context(@This())) *Div {
+        return div().size_full().child(canvas_mod.canvas_fn({}, PaintCase.paint).size_full());
+    }
+};
+
+fn build_paint_root(_: *Window, app: *App) Entity(PaintRoot) {
+    return app.new(PaintRoot{});
+}
+
+test "paint_underline_with_exclusions cuts the spans out, in any order, and clips them to the underline" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .underline_exclusions;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const underlines = vcx.window.rendered_frame.scene.underlines.items;
+    // The underline covers x 10..30. Excluded: 15..25 and 3..12 (clipped to 10..12). 40..50 is outside.
+    try std.testing.expectEqual(@as(usize, 2), underlines.len);
+    try std.testing.expectEqual(@as(f32, 12), underlines[0].content_mask.bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 3), underlines[0].content_mask.bounds.size.width);
+    try std.testing.expectEqual(@as(f32, 25), underlines[1].content_mask.bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 5), underlines[1].content_mask.bounds.size.width);
+    // Each piece keeps the geometry of the whole underline.
+    try std.testing.expectEqual(@as(f32, 10), underlines[0].bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 20), underlines[0].bounds.size.width);
+}
+
+test "paint_drop_shadows and paint_inset_shadows paint their own kind, the inset hole shrinks by the spread" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .shadows;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const shadows = vcx.window.rendered_frame.scene.shadows.items;
+    try std.testing.expectEqual(@as(usize, 2), shadows.len);
+
+    // The drop shadow: the box moved by its offset, then grown by the spread. It is outside the element.
+    const drop = shadows[0];
+    try std.testing.expectEqual(@as(u32, 0), drop.inset);
+    try std.testing.expectEqual(@as(f32, 11), drop.bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 12), drop.bounds.origin.y);
+    try std.testing.expectEqual(@as(f32, 22), drop.bounds.size.width);
+    try std.testing.expectEqual(@as(f32, 4), drop.blur_radius);
+
+    // The inset shadow: the hole is the box shrunk by the spread, with radii shrunk by it too.
+    const inset = shadows[1];
+    try std.testing.expectEqual(@as(u32, 1), inset.inset);
+    try std.testing.expectEqual(@as(f32, 12), inset.bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 16), inset.bounds.size.width);
+    try std.testing.expectEqual(@as(f32, 3), inset.corner_radii.top_left);
+    // The element is what the inset shadow lies inside of, so the shader clips to it.
+    try std.testing.expectEqual(@as(f32, 10), inset.element_bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 20), inset.element_bounds.size.width);
+    try std.testing.expectEqual(@as(f32, 5), inset.element_corner_radii.top_left);
+}
+
+test "paint_image crops the atlas tile to the visible part and paints nothing outside the bounds" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const allocator = std.testing.allocator;
+    const frames = try allocator.alloc(assets_mod.Frame, 1);
+    frames[0] = .{ .width = 4, .height = 4, .pixels = try allocator.alloc(u8, 4 * 4 * 4) };
+    @memset(frames[0].pixels, 255);
+    const image = try assets_mod.RenderImage.new(allocator, frames);
+    defer image.deinit();
+    PaintCase.image = image;
+    defer PaintCase.image = null;
+    PaintCase.mode = .image;
+
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const sprites = vcx.window.rendered_frame.scene.polychrome_sprites.items;
+    // The third image lies outside its bounds, so nothing is drawn for it.
+    try std.testing.expectEqual(@as(usize, 2), sprites.len);
+    // Fully visible: the whole tile at 10..30.
+    try std.testing.expectEqual(@as(f32, 10), sprites[0].bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 20), sprites[0].bounds.size.width);
+    const whole_tile = sprites[0].tile;
+    try std.testing.expectEqual(@as(i32, 4), whole_tile.bounds.size.width);
+    // Clipped on the left: the visible 0..30 is three quarters of the 40-wide image, so three of its four columns.
+    try std.testing.expectEqual(@as(f32, 0), sprites[1].bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 30), sprites[1].bounds.size.width);
+    try std.testing.expectEqual(whole_tile.bounds.origin.x + 1, sprites[1].tile.bounds.origin.x);
+    try std.testing.expectEqual(@as(i32, 3), sprites[1].tile.bounds.size.width);
+}
+
+test "paint_svg draws the artwork centred in its bounds, and paints nothing for a missing asset" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .svg;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const sprites = vcx.window.rendered_frame.scene.monochrome_sprites.items;
+    try std.testing.expectEqual(@as(usize, 1), sprites.len);
+    // Rasterized at twice the size and drawn at half of that, so the 10x10 box is covered exactly.
+    try std.testing.expectApproxEqAbs(@as(f32, 0), sprites[0].bounds.origin.x, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), sprites[0].bounds.origin.y, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), sprites[0].bounds.size.width, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), sprites[0].bounds.size.height, 1e-3);
+
+    PaintCase.mode = .missing_svg;
+    _, const missing = cx.add_window_view(build_paint_root);
+    try std.testing.expectEqual(@as(usize, 0), missing.window.rendered_frame.scene.monochrome_sprites.items.len);
+}
+
+test "hitbox: is_hovered_at finds the hitbox under a point, and only a blocking hitbox above it hides it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .hitboxes;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const bottom = PaintCase.bottom.?;
+    const top = PaintCase.top.?;
+    // The left half is covered by the blocking hitbox above, so the one below is not hovered there.
+    try std.testing.expect(top.is_hovered_at(.{ .x = 5, .y = 5 }, vcx.window));
+    try std.testing.expect(!bottom.is_hovered_at(.{ .x = 5, .y = 5 }, vcx.window));
+    // The right half is only the bottom hitbox.
+    try std.testing.expect(bottom.is_hovered_at(.{ .x = 30, .y = 5 }, vcx.window));
+    try std.testing.expect(!top.is_hovered_at(.{ .x = 30, .y = 5 }, vcx.window));
+    try std.testing.expect(!bottom.is_hovered_at(.{ .x = 100, .y = 100 }, vcx.window));
+}
+
+test "transact: a failed prepaint keeps none of the hitboxes it added, a successful one keeps its own" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .transact;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    try std.testing.expectEqual(@as(usize, 0), PaintCase.added_by_failed);
+    try std.testing.expectEqual(@as(usize, 1), PaintCase.added_by_ok);
+    try std.testing.expectEqual(@as(usize, 1), vcx.window.rendered_frame.hitboxes.items.len);
+}
+
+test "use_state: one call site keeps its entity across frames, and two call sites get two entities" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .use_state;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const first = PaintCase.first_site.?.as_u64();
+    const second = PaintCase.second_site.?.as_u64();
+    try std.testing.expect(first != second);
+
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(first, PaintCase.first_site.?.as_u64());
+    try std.testing.expectEqual(second, PaintCase.second_site.?.as_u64());
+}
+
+test "last input: a touch sets the touch modality, and a click or a key sets the others" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(build_paint_root);
+    try std.testing.expect(!vcx.window.last_input_was_touch());
+
+    vcx.simulate_event(.{ .touch = .{ .phase = .started, .position = .{ .x = 5, .y = 5 } } });
+    try std.testing.expect(vcx.window.last_input_was_touch());
+    try std.testing.expect(!vcx.window.last_input_was_keyboard());
+
+    vcx.simulate_click(.{ .x = 5, .y = 5 }, .{});
+    try std.testing.expect(!vcx.window.last_input_was_touch());
+
+    vcx.simulate_keystrokes("a");
+    try std.testing.expect(vcx.window.last_input_was_keyboard());
+    try std.testing.expect(!vcx.window.last_input_was_touch());
+}
+
+test "pending input: a paused timeout does not flush until it is resumed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{ KeyBinding.new("g", Editor.Save{}, "Editor"), KeyBinding.new("g g", Editor.Outside{}, "Editor") });
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expect(!vcx.window.pending_input().?.timeout().?.is_paused());
+    try std.testing.expect(vcx.window.set_pending_input_timeout_paused(view, true, cx.app));
+    try std.testing.expect(vcx.window.pending_input().?.timeout().?.is_paused());
+    // Already paused by this owner: nothing changes, and another owner cannot resume it.
+    try std.testing.expect(!vcx.window.set_pending_input_timeout_paused(view, true, cx.app));
+    const Other = struct { n: u8 = 0 };
+    const other = cx.app.new(Other{});
+    try std.testing.expect(!vcx.window.set_pending_input_timeout_paused(other, false, cx.app));
+    try std.testing.expect(vcx.window.pending_input().?.timeout().?.is_paused());
+
+    @import("../executor.zig").sleep_ns(700 * std.time.ns_per_ms);
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.has_pending_keystrokes());
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, Editor.read_state, .{}).saves);
+
+    try std.testing.expect(vcx.window.set_pending_input_timeout_paused(view, false, cx.app));
+    try wait_until_flushed(vcx);
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+}
+
+test "pending input: releasing the owner of a pause resumes its timeout" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Owner = struct { n: u8 = 0 };
+    cx.app.bind_keys(&.{ KeyBinding.new("g", Editor.Save{}, "Editor"), KeyBinding.new("g g", Editor.Outside{}, "Editor") });
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const owner = cx.app.new(Owner{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expect(vcx.window.set_pending_input_timeout_paused(owner, true, cx.app));
+    owner.release(cx.app);
+    try std.testing.expect(!vcx.window.pending_input().?.timeout().?.is_paused());
+    try wait_until_flushed(vcx);
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+}
+
+test "long press: a press that starts over an element with a tooltip shows it at once, and its end hides it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds == null);
+
+    vcx.simulate_event(.{ .long_press = .{ .phase = .started, .start_position = .{ .x = 10, .y = 10 }, .position = .{ .x = 10, .y = 10 } } });
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds != null);
+    // The long press took the event, so nothing else heard it.
+    try std.testing.expect(vcx.window.default_prevented);
+
+    vcx.simulate_event(.{ .long_press = .{ .phase = .ended, .start_position = .{ .x = 10, .y = 10 }, .position = .{ .x = 10, .y = 10 } } });
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds == null);
+}
+
+test "long press: a press outside every tooltip element shows nothing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_event(.{ .long_press = .{ .phase = .started, .start_position = .{ .x = 200, .y = 200 }, .position = .{ .x = 200, .y = 200 } } });
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds == null);
+}
+
+test "long press capture: a claim holds until the next long press starts" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Owner = struct { n: u8 = 0 };
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const owner = cx.app.new(Owner{});
+    const other = cx.app.new(Owner{});
+
+    try std.testing.expect(!vcx.window.has_long_press_capture(owner));
+    vcx.window.capture_long_press(owner);
+    try std.testing.expect(vcx.window.has_long_press_capture(owner));
+    try std.testing.expect(!vcx.window.has_long_press_capture(other));
+
+    // A long press starting releases the claim, whoever made it.
+    vcx.simulate_event(.{ .long_press = .{ .phase = .started, .start_position = .{ .x = 5, .y = 5 }, .position = .{ .x = 5, .y = 5 } } });
+    try std.testing.expect(!vcx.window.has_long_press_capture(owner));
+}
