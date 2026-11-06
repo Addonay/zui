@@ -17,18 +17,18 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 ## API parity
 
-The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1195 of 1413
-functions that should be ported (84.6%)**. Of GPUI's 1642, 229 are set aside below because they should not be ported now: 35 mean nothing in Zig,
-135 are debug tooling and accessibility, 51 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: 268 of 458, not sorted yet.
+The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1233 of 1413
+functions that should be ported (87.3%)**. Of GPUI's 1642, 229 are set aside below because they should not be ported now: 35 mean nothing in Zig,
+135 are debug tooling and accessibility, 51 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: 269 of 458, not sorted yet.
 A name-only comparison: coincidences flatter it, and it says nothing about behaviour. Port a name or move it, and delete it either way.
 
 <details><summary>Still to port, by GPUI file</summary>
 
-#### window.rs (76)
-capture_long_press, default_prevented, defer, dismiss_virtual_keyboard, focus_lost_restore_target, frame_duration_snapshot, fully_visible_bounds, has_image_atlas_entry, has_long_press_capture, inner_window_bounds, input_latency_snapshot, insets, invalidate_view, is_action_available_in, is_fullscreen, is_high_rate, is_hovered_at, is_maximized, is_minimizable, is_paused, is_resizable, is_simple_fullscreen, keystroke_text_for, keystrokes, last_input_was_keyboard, last_input_was_touch, native_window_state, not_drawing, paint_drop_shadows, paint_image, paint_inset_shadows, paint_surface, paint_svg, paint_underline_with_exclusions, painted_quads, painted_underlines, present_if_needed, record_input, refresh_interval, rendered_scene, replace_views, request_decorations, restore_native_window_state, set_app_id, set_background_appearance, set_client_corner_radii, set_dirty, set_document_path, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, set_view_id, set_window_edited, simulate_next_frame, take_views, touch_prediction_enabled, transact, underline_bounds, update_count, use_state, viewport_size, visual_viewport_bounds, wake_platform, window_controls, with_content_mask, with_element_namespace, with_element_offset, with_global_id, with_optional_element_state, with_rem_size, with_tab_group
+#### window.rs (63)
+capture_long_press, default_prevented, defer, focus_lost_restore_target, frame_duration_snapshot, has_image_atlas_entry, has_long_press_capture, inner_window_bounds, input_latency_snapshot, invalidate_view, is_fullscreen, is_high_rate, is_hovered_at, is_maximized, is_minimizable, is_paused, is_resizable, is_simple_fullscreen, keystrokes, last_input_was_keyboard, last_input_was_touch, native_window_state, not_drawing, paint_drop_shadows, paint_image, paint_inset_shadows, paint_surface, paint_svg, paint_underline_with_exclusions, painted_quads, painted_underlines, present_if_needed, record_input, refresh_interval, replace_views, request_decorations, restore_native_window_state, set_app_id, set_background_appearance, set_client_corner_radii, set_dirty, set_document_path, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, set_window_edited, simulate_next_frame, take_views, touch_prediction_enabled, transact, underline_bounds, update_count, use_state, viewport_size, wake_platform, window_controls, with_optional_element_state, with_tab_group
 
-#### app.rs (29)
-action_deprecation_messages, action_documentation, action_schema_by_name, action_schemas, all_bindings_for_input, asset_source, clear_globals, defer, deprecated_actions_to_preferred_actions, foreground_journal, get_name, init_visible, is_test, key_bindings, new_inaccessible, read_from_clipboard_async, reduce_motion, register_inspector_element, request_windowing, run_embedded, set_inspector_renderer, set_text_rendering_mode, start_hang_monitor, test, text_rendering_mode, update_last_active, with_platform, with_window, with_windowing
+#### app.rs (25)
+action_deprecation_messages, action_documentation, action_schema_by_name, action_schemas, asset_source, defer, deprecated_actions_to_preferred_actions, foreground_journal, get_name, init_visible, is_test, new_inaccessible, read_from_clipboard_async, reduce_motion, register_inspector_element, request_windowing, run_embedded, set_inspector_renderer, set_text_rendering_mode, start_hang_monitor, test, text_rendering_mode, update_last_active, with_platform, with_windowing
 
 #### platform.rs (18)
 default_bounds, detect, gestures, linux_default, metadata, on_app_menu_action, on_displays_changed, on_power_mode_change, on_validate_app_menu_command, on_will_open_app_menu, read_from_clipboard_async, refresh_interval, refresh_interval_from_hz, request_windowing, set_initial_windowing, stream, uuid, visible_bounds
@@ -39,20 +39,8 @@ advance_clock, allow_parking, block_test, forbid_parking, is_test, rng, set_bloc
 #### action.rs (9)
 action_json_schema, action_schema_by_name, action_schemas, deprecated_aliases, deprecation_message, deprecation_messages, documentation, generate_list_of_all_registered_actions, is_unbind
 
-#### key_dispatch.rs (8)
-contains_focus, focusable_node_id, refresh_node_id, reuse_subtree, root_node_id, set_active_node, set_view_id, view_path_reversed
-
-#### platform/keystroke.rs (7)
-as_keystroke, from_keystroke, new_with_mapper, remove_key_char, set_key, set_modifiers, with_simulated_ime
-
 #### elements/div.rs (4)
 external_drag_payload, interactivity, on_a11y_action, on_back_gesture
-
-#### geometry.rs (4)
-ceil, floor, pow, round
-
-#### app/async_context.rs (3)
-is_test, read_default_global, update_root
 
 #### arena.rs (3)
 alloc, begin_scope, end_scope
@@ -62,6 +50,9 @@ map_element, repeat_synced, with_max_fps
 
 #### gestures.rs (3)
 android, filter, ios
+
+#### key_dispatch.rs (3)
+contains_focus, refresh_node_id, reuse_subtree
 
 #### keymap/binding.rs (3)
 action_input, keystrokes, meta
@@ -90,14 +81,14 @@ set_item_measurement_readiness, splice_focusable
 #### elements/text.rs (2)
 __hash_text_macro_location_unstable_do_not_use, new_inaccessible
 
-#### gpui.rs (2)
-update_window_entity, with_window
-
 #### path_builder.rs (2)
 dash_array, transform
 
 #### subscription.rs (2)
 insert_pending, retain
+
+#### app/async_context.rs (1)
+is_test
 
 #### app/entity_map.rs (1)
 restore_accessed
@@ -110,9 +101,6 @@ with_priority
 
 #### elements/image_cache.rs (1)
 retain_all
-
-#### keymap.rs (1)
-all_bindings_for_input
 
 #### keymap/context.rs (1)
 new_with_defaults
@@ -142,7 +130,7 @@ with_timeout
 
 <details><summary>Types not found in ZUI</summary>
 
-ActivityGuard, Along, AnchoredState, AnyTooltip, AnyWeakView, AppCell, AppContext, AppRef, AppRefMut, ApplicationHandle, Arena, ArenaBox, ArenaClearNeeded, AsKeystroke, Asset, AssetLogger, BindingIndex, BorrowAppContext, DebugBelow, DebugFrameOverlayMode, DefaultColors, DivInspectorState, DummyKeyboardMapper, ElementClickedState, ElementHoverState, EmptyView, EntityInputHandler, EventEmitter, ExternalDragPayload, ExternalDragPayloadSource, FileDragPaths, Focusable, FontFamilyId, FutureExt, GestureEvent, GestureTuning, GlyphRasterData, GpuiBorrow, Half, ImageCache, ImageCacheElement, ImageId, ImageStyle, ImgLayoutState, ImgResourceLoader, InputEvent, InputPreference, InteractiveElement, Interpolate, IntoElement, InvalidKeystrokeError, IsZero, KeyEvent, KeybindingKeystroke, KeyboardInteractivity, KeymapVersion, Layer, LayerShellNotSupportedError, LayerShellOptions, LeakDetectorSnapshot, MacroActionBuilder, MacroActionData, ManagedView, MissingGlyphSink, MouseEvent, OngoingScroll, OwnedOsMenu, PathVertex_ScaledPixels, PendingInputStatus, PendingInputTimeoutStatus, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformScheduler, PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupNotSupportedError, PopupOptions, PowerMode, Prompt, Radians, ReadGlobal, Render, RenderImageParams, RenderOnce, RenderSvgParams, RetainAllImageCacheProvider, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, ScrollPhysics, Sealed, SharedUri, SourceMetadata, SpringTarget, StatefulInteractiveElement, StyledImage, SurfaceSource, SystemWindowTab, SystemWindowTabController, TabStopCount, TabStopOperation, TabStopOrderNodeSummary, TaskExt, Text, ThermalState, ThreadedDispatcher, Timeout, TooltipId, Unbind, UniformListFrameState, UpdateGlobal, View, VisualContext, WindowButton, WindowButtonLayout, WindowControlArea, WindowControls, WindowingModes, WindowingRequest, WithTimeout
+ActivityGuard, Along, AnchoredState, AnyTooltip, AnyWeakView, AppCell, AppContext, AppRef, AppRefMut, ApplicationHandle, Arena, ArenaBox, ArenaClearNeeded, AsKeystroke, Asset, AssetLogger, BindingIndex, BorrowAppContext, DebugBelow, DebugFrameOverlayMode, DefaultColors, DivInspectorState, DummyKeyboardMapper, ElementClickedState, ElementHoverState, EmptyView, EntityInputHandler, EventEmitter, ExternalDragPayload, ExternalDragPayloadSource, FileDragPaths, Focusable, FontFamilyId, FutureExt, GestureEvent, GestureTuning, GlyphRasterData, GpuiBorrow, Half, ImageCache, ImageCacheElement, ImageId, ImageStyle, ImgLayoutState, ImgResourceLoader, InputEvent, InputPreference, InteractiveElement, Interpolate, IntoElement, InvalidKeystrokeError, IsZero, KeyEvent, KeyboardInteractivity, KeymapVersion, Layer, LayerShellNotSupportedError, LayerShellOptions, LeakDetectorSnapshot, MacroActionBuilder, MacroActionData, ManagedView, MissingGlyphSink, MouseEvent, OngoingScroll, OwnedOsMenu, PathVertex_ScaledPixels, PendingInputStatus, PendingInputTimeoutStatus, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformScheduler, PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupNotSupportedError, PopupOptions, PowerMode, Prompt, Radians, ReadGlobal, Render, RenderImageParams, RenderOnce, RenderSvgParams, RetainAllImageCacheProvider, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, ScrollPhysics, Sealed, SharedUri, SourceMetadata, SpringTarget, StatefulInteractiveElement, StyledImage, SurfaceSource, SystemWindowTab, SystemWindowTabController, TabStopCount, TabStopOperation, TabStopOrderNodeSummary, TaskExt, Text, ThermalState, ThreadedDispatcher, Timeout, TooltipId, Unbind, UniformListFrameState, UpdateGlobal, View, VisualContext, WindowButton, WindowButtonLayout, WindowControlArea, WindowControls, WindowingModes, WindowingRequest, WithTimeout
 
 </details>
 
