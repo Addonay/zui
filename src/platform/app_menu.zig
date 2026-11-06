@@ -54,15 +54,18 @@ pub const ActionItem = struct {
 
 /// The different kinds of items that can be in a menu (GPUI `MenuItem`).
 pub const MenuItem = union(enum) {
-    separator,
+    // Trailing underscore: `separator` is the GPUI constructor below, which a tag of the same name would clash with.
+    separator_,
     submenu_item: Menu,
     system_menu: OsMenu,
     action_item: ActionItem,
 
     /// A separator between items (GPUI `MenuItem::separator`).
-    pub fn separator_item() MenuItem {
-        return .separator;
+    pub fn separator() MenuItem {
+        return .separator_;
     }
+    /// The name `separator` had before it matched GPUI.
+    pub const separator_item = separator;
 
     /// A submenu (GPUI `MenuItem::submenu`).
     pub fn submenu(menu: Menu) MenuItem {
@@ -126,7 +129,7 @@ pub const MenuItem = union(enum) {
     /// shared, since it is immutable once boxed.
     pub fn owned(self: MenuItem, allocator: Allocator) error{OutOfMemory}!OwnedMenuItem {
         return switch (self) {
-            .separator => .separator,
+            .separator_ => .separator,
             .submenu_item => |s| .{ .submenu_item = try s.owned(allocator) },
             .system_menu => |s| .{ .system_menu = .{ .name = try allocator.dupe(u8, s.name), .menu_type = s.menu_type } },
             .action_item => |a| .{ .action_item = .{

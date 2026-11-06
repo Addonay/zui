@@ -29,6 +29,8 @@ pub const Deferred = struct {
         self.priority_value = value;
         return self;
     }
+    /// GPUI name for `priority`.
+    pub const with_priority = priority;
 
     pub fn request_layout(self: *Deferred, _: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, void } {
         const child = self.child orelse unreachable;
@@ -55,6 +57,8 @@ test "deferred stores its child and priority" {
     var element: Deferred = .{};
     _ = element.priority(3);
     try std.testing.expectEqual(@as(usize, 3), element.priority_value);
+    _ = element.with_priority(5);
+    try std.testing.expectEqual(@as(usize, 5), element.priority_value);
     try std.testing.expect(element.child == null);
 }
 

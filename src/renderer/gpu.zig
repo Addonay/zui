@@ -209,7 +209,7 @@ fn backgroundFields(bg: Background) BackgroundFields {
     return .{
         .meta = .{
             @floatFromInt(@intFromEnum(bg.tag)),
-            @floatFromInt(@intFromEnum(bg.color_space)),
+            @floatFromInt(@intFromEnum(bg.color_space_)),
             bg.gradient_angle_or_pattern_height,
             bg.colors[0].percentage,
         },

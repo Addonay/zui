@@ -236,7 +236,7 @@ pub fn CachedLoad(comptime A: type) type {
                 .loads = loads,
                 .refs = 2,
                 .source = owned,
-                .asset_source = loads.app.asset_source,
+                .asset_source = loads.app.asset_source().*,
                 .http_client = if (loads.app.asset_cache.fetch_config) |c| c.http_client else null,
             };
             try loads.live.put(a, @intFromPtr(self), .{ .ptr = self, .release = release_erased });

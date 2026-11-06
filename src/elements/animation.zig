@@ -226,7 +226,7 @@ pub fn AnimationElement(comptime E: type, comptime animator: anytype) type {
         pub fn request_layout(self: *Self, gid: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, AnyElement } {
             const now = @import("../executor.zig").now_ns();
             const state = window.element_state(AnimationState, (gid orelse unreachable).*, .{ .start_ns = now });
-            const frame = advance_animation(self.animations, state, now, cx.synced_animation_epoch, cx.reduce_motion);
+            const frame = advance_animation(self.animations, state, now, cx.synced_animation_epoch, cx.reduce_motion());
             const eased = self.animations[frame.animation_ix].easing(frame.delta);
 
             const element = self.element orelse unreachable;
@@ -309,7 +309,7 @@ pub fn SpringAnimationElement(comptime E: type, comptime T: type, comptime anima
             state.target = target_value;
 
             const done = switch (self.playback_mode) {
-                .running => if (cx.reduce_motion) blk: {
+                .running => if (cx.reduce_motion()) blk: {
                     state.spring = .{ .position = state.target, .velocity = 0 };
                     break :blk true;
                 } else blk: {

@@ -264,7 +264,7 @@ const BgPrep = struct {
                 p.dir_len = @sqrt(dir[0] * dir[0] + dir[1] * dir[1]);
                 p.long_x = @abs(dir[0]) > @abs(dir[1]);
                 p.stop_pct = .{ bg.colors[0].percentage, bg.colors[1].percentage };
-                p.oklab = bg.color_space == .oklab;
+                p.oklab = bg.color_space_ == .oklab;
                 for (0..2) |i| {
                     const c = hsla_to_rgba(bg.colors[i].color);
                     if (p.oklab) {
