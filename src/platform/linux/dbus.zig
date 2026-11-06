@@ -1023,7 +1023,8 @@ pub const Connection = struct {
     fn flush(self: *Connection) void {
         while (self.out_pos < self.out.items.len) {
             const rest = self.out.items[self.out_pos..];
-            const rc = linux.write(self.fd, rest.ptr, rest.len);
+            // Not `write`: on a socket whose peer has gone, that raises SIGPIPE and kills the app.
+            const rc = linux.sendto(self.fd, rest.ptr, rest.len, linux.MSG.NOSIGNAL, null, 0);
             switch (linux.errno(rc)) {
                 .SUCCESS => self.out_pos += rc,
                 .AGAIN => return,
@@ -1142,6 +1143,19 @@ pub const Connection = struct {
 // Tests
 
 const testing = std.testing;
+
+test "writing to a bus that has gone fails the connection instead of raising SIGPIPE" {
+    var fds: [2]i32 = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)));
+    _ = linux.close(fds[1]);
+    const connection = try testing.allocator.create(Connection);
+    connection.* = .{ .allocator = testing.allocator, .fd = fds[0], .state = .ready };
+    defer connection.deinit();
+    try connection.out.appendSlice(testing.allocator, "bytes for nobody");
+    // With `write`, the test process dies here.
+    connection.flush();
+    try testing.expect(connection.is_failed());
+}
 
 fn unhex(comptime hex: []const u8) [hex.len / 2]u8 {
     @setEvalBranchQuota(10_000);
