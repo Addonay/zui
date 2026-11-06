@@ -17,21 +17,21 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 ## API parity
 
-The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1114 of 1405
-functions that should be ported (79.3%)**. Of GPUI's 1642, 237 are set aside below because they should not be ported now: 35 mean nothing in Zig,
-135 are debug tooling and accessibility, 51 wait on macOS or Windows, and 16 wait on portal work over D-Bus. Types: 256 of 458, not sorted yet.
+The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1183 of 1413
+functions that should be ported (83.7%)**. Of GPUI's 1642, 229 are set aside below because they should not be ported now: 35 mean nothing in Zig,
+135 are debug tooling and accessibility, 51 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: 265 of 458, not sorted yet.
 A name-only comparison: coincidences flatter it, and it says nothing about behaviour. Port a name or move it, and delete it either way.
 
 <details><summary>Still to port, by GPUI file</summary>
 
-#### window.rs (81)
-capture_long_press, default_prevented, defer, dismiss_virtual_keyboard, focus_lost_restore_target, frame_duration_snapshot, fully_visible_bounds, has_image_atlas_entry, has_long_press_capture, inner_window_bounds, input_latency_snapshot, insets, invalidate_view, is_action_available_in, is_fullscreen, is_high_rate, is_hovered_at, is_maximized, is_minimizable, is_paused, is_resizable, is_simple_fullscreen, is_visible, keystroke_text_for, keystrokes, last_input_was_keyboard, last_input_was_touch, native_window_state, not_drawing, observe_window_display, observe_window_visibility, paint_drop_shadows, paint_image, paint_inset_shadows, paint_surface, paint_svg, paint_underline_with_exclusions, painted_quads, painted_underlines, present_if_needed, record_input, refresh_interval, rendered_scene, replace_root, replace_views, request_decorations, restore_native_window_state, set_app_id, set_background_appearance, set_client_corner_radii, set_dirty, set_document_path, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, set_view_id, set_window_edited, simulate_next_frame, take_views, touch_prediction_enabled, transact, underline_bounds, update_count, use_state, viewport_size, visibility, visual_viewport_bounds, wake_platform, window_controls, with_content_mask, with_element_namespace, with_element_offset, with_global_id, with_optional_element_state, with_rem_size, with_tab_group
+#### window.rs (76)
+capture_long_press, default_prevented, defer, dismiss_virtual_keyboard, focus_lost_restore_target, frame_duration_snapshot, fully_visible_bounds, has_image_atlas_entry, has_long_press_capture, inner_window_bounds, input_latency_snapshot, insets, invalidate_view, is_action_available_in, is_fullscreen, is_high_rate, is_hovered_at, is_maximized, is_minimizable, is_paused, is_resizable, is_simple_fullscreen, keystroke_text_for, keystrokes, last_input_was_keyboard, last_input_was_touch, native_window_state, not_drawing, paint_drop_shadows, paint_image, paint_inset_shadows, paint_surface, paint_svg, paint_underline_with_exclusions, painted_quads, painted_underlines, present_if_needed, record_input, refresh_interval, rendered_scene, replace_views, request_decorations, restore_native_window_state, set_app_id, set_background_appearance, set_client_corner_radii, set_dirty, set_document_path, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, set_view_id, set_window_edited, simulate_next_frame, take_views, touch_prediction_enabled, transact, underline_bounds, update_count, use_state, viewport_size, visual_viewport_bounds, wake_platform, window_controls, with_content_mask, with_element_namespace, with_element_offset, with_global_id, with_optional_element_state, with_rem_size, with_tab_group
 
-#### app.rs (57)
-action_deprecation_messages, action_documentation, action_schema_by_name, action_schemas, all_bindings_for_input, app_path, asset_source, clear_globals, compositor_name, cursor_hide_mode, defer, deprecated_actions_to_preferred_actions, foreground_journal, get_name, graphical_environment, hide_other_apps, init_visible, is_cursor_visible, is_test, is_visible, key_bindings, keyboard_layout, keyboard_mapper, new_inaccessible, observe_displays, on_app_restart, on_keyboard_layout_change, on_missing_glyphs, on_reopen, open_with_system, path_for_auxiliary_executable, platform_info, read_from_clipboard_async, reduce_motion, register_inspector_element, register_url_scheme, request_windowing, reveal_path, run_embedded, set_activation_policy, set_cursor_hide_mode, set_inspector_renderer, set_restart_path, set_text_rendering_mode, set_visible, set_window_appearance, should_auto_hide_scrollbars, start_hang_monitor, test, text_rendering_mode, unhide_other_apps, update_last_active, window_stack, with_platform, with_restart_arguments, with_window, with_windowing
+#### app.rs (30)
+action_deprecation_messages, action_documentation, action_schema_by_name, action_schemas, all_bindings_for_input, asset_source, clear_globals, defer, deprecated_actions_to_preferred_actions, foreground_journal, get_name, init_visible, is_test, key_bindings, new_inaccessible, on_missing_glyphs, read_from_clipboard_async, reduce_motion, register_inspector_element, request_windowing, run_embedded, set_inspector_renderer, set_text_rendering_mode, start_hang_monitor, test, text_rendering_mode, update_last_active, with_platform, with_window, with_windowing
 
-#### platform.rs (40)
-app_path, compositor_name, default_bounds, detect, gestures, graphical_environment, guess_compositor, hide_cursor_until_mouse_moves, hide_other_apps, is_cursor_visible, is_visible, keyboard_layout, keyboard_mapper, linux_default, metadata, on_app_menu_action, on_displays_changed, on_keyboard_layout_change, on_power_mode_change, on_reopen, on_validate_app_menu_command, on_will_open_app_menu, open_with_system, path_for_auxiliary_executable, platform_info, read_from_clipboard_async, refresh_interval, refresh_interval_from_hz, register_url_scheme, request_windowing, reveal_path, set_activation_policy, set_initial_windowing, set_window_appearance, should_auto_hide_scrollbars, stream, unhide_other_apps, uuid, visible_bounds, window_stack
+#### platform.rs (18)
+default_bounds, detect, gestures, linux_default, metadata, on_app_menu_action, on_displays_changed, on_power_mode_change, on_validate_app_menu_command, on_will_open_app_menu, read_from_clipboard_async, refresh_interval, refresh_interval_from_hz, request_windowing, set_initial_windowing, stream, uuid, visible_bounds
 
 #### executor.rs (10)
 advance_clock, allow_parking, block_test, forbid_parking, is_test, rng, set_block_on_ticks, set_num_cpus, simulate_random_delay, tick
@@ -57,14 +57,8 @@ external_drag_payload, interactivity, on_a11y_action, on_back_gesture
 #### geometry.rs (4)
 ceil, floor, pow, round
 
-#### gpui.rs (4)
-new_window_entity, replace_root_view, update_window_entity, with_window
-
 #### app/async_context.rs (3)
 is_test, read_default_global, update_root
-
-#### app/context.rs (3)
-observe_window_display, observe_window_visibility, on_app_restart
 
 #### arena.rs (3)
 alloc, begin_scope, end_scope
@@ -99,14 +93,14 @@ image_style, is_asset_cached
 #### elements/list.rs (2)
 set_item_measurement_readiness, splice_focusable
 
+#### gpui.rs (2)
+update_window_entity, with_window
+
 #### keymap.rs (2)
 all_bindings_for_input, version
 
 #### path_builder.rs (2)
 dash_array, transform
-
-#### platform/keyboard.rs (2)
-get_key_equivalents, map_key_equivalent
 
 #### subscription.rs (2)
 insert_pending, retain
@@ -132,8 +126,8 @@ new_with_defaults
 #### platform/app_menu.rs (1)
 separator
 
-#### platform/platform_info.rs (1)
-is_mac
+#### platform/keyboard.rs (1)
+get_key_equivalents
 
 #### platform/scap_screen_capture.rs (1)
 scap_screen_sources
@@ -154,7 +148,7 @@ with_timeout
 
 <details><summary>Types not found in ZUI</summary>
 
-ActivationPolicy, ActivityGuard, Along, AnchoredState, AnyTooltip, AnyWeakView, AppCell, AppContext, AppRef, AppRefMut, ApplicationHandle, Arena, ArenaBox, ArenaClearNeeded, AsKeystroke, Asset, AssetLogger, BindingIndex, BorrowAppContext, CursorHideMode, DebugBelow, DebugFrameOverlayMode, DefaultColors, DisplayChanges, DisplayEvent, DivInspectorState, DummyKeyboardMapper, ElementClickedState, ElementHoverState, EmptyView, EntityInputHandler, EventEmitter, ExternalDragPayload, ExternalDragPayloadSource, FallbackFontClass, FileDragPaths, Focusable, FontFamilyId, FutureExt, GestureEvent, GestureTuning, GlyphRasterData, GpuSpecs, GpuiBorrow, GraphicalEnvironment, Half, ImageCache, ImageCacheElement, ImageId, ImageStyle, ImgLayoutState, ImgResourceLoader, InputEvent, InputPreference, InteractiveElement, Interpolate, IntoElement, InvalidKeystrokeError, IsZero, KeyEvent, KeybindingKeystroke, KeyboardInteractivity, KeymapVersion, Layer, LayerShellNotSupportedError, LayerShellOptions, LeakDetectorSnapshot, MacroActionBuilder, MacroActionData, ManagedView, MissingGlyph, MissingGlyphSink, MouseEvent, OngoingScroll, OwnedOsMenu, PathVertex_ScaledPixels, PendingInputStatus, PendingInputTimeoutStatus, PlatformDisplay, PlatformInfo, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformScheduler, PlatformTarget, PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupNotSupportedError, PopupOptions, PowerMode, Prompt, Radians, ReadGlobal, Render, RenderImageParams, RenderOnce, RenderSvgParams, RetainAllImageCacheProvider, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, ScrollPhysics, Sealed, ShapedLineCursor, SharedUri, SourceMetadata, SpringTarget, StatefulInteractiveElement, StyledImage, SurfaceSource, SystemWindowTab, SystemWindowTabController, TabStopCount, TabStopOperation, TabStopOrderNodeSummary, TaskExt, Text, ThermalState, ThreadedDispatcher, Timeout, TooltipId, Unbind, UniformListFrameState, UpdateGlobal, View, VisualContext, WindowButton, WindowButtonLayout, WindowControlArea, WindowControls, WindowVisibility, WindowingModes, WindowingRequest, WithTimeout
+ActivityGuard, Along, AnchoredState, AnyTooltip, AnyWeakView, AppCell, AppContext, AppRef, AppRefMut, ApplicationHandle, Arena, ArenaBox, ArenaClearNeeded, AsKeystroke, Asset, AssetLogger, BindingIndex, BorrowAppContext, DebugBelow, DebugFrameOverlayMode, DefaultColors, DivInspectorState, DummyKeyboardMapper, ElementClickedState, ElementHoverState, EmptyView, EntityInputHandler, EventEmitter, ExternalDragPayload, ExternalDragPayloadSource, FallbackFontClass, FileDragPaths, Focusable, FontFamilyId, FutureExt, GestureEvent, GestureTuning, GlyphRasterData, GpuiBorrow, Half, ImageCache, ImageCacheElement, ImageId, ImageStyle, ImgLayoutState, ImgResourceLoader, InputEvent, InputPreference, InteractiveElement, Interpolate, IntoElement, InvalidKeystrokeError, IsZero, KeyEvent, KeybindingKeystroke, KeyboardInteractivity, KeymapVersion, Layer, LayerShellNotSupportedError, LayerShellOptions, LeakDetectorSnapshot, MacroActionBuilder, MacroActionData, ManagedView, MissingGlyph, MissingGlyphSink, MouseEvent, OngoingScroll, OwnedOsMenu, PathVertex_ScaledPixels, PendingInputStatus, PendingInputTimeoutStatus, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformScheduler, PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupNotSupportedError, PopupOptions, PowerMode, Prompt, Radians, ReadGlobal, Render, RenderImageParams, RenderOnce, RenderSvgParams, RetainAllImageCacheProvider, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, ScrollPhysics, Sealed, ShapedLineCursor, SharedUri, SourceMetadata, SpringTarget, StatefulInteractiveElement, StyledImage, SurfaceSource, SystemWindowTab, SystemWindowTabController, TabStopCount, TabStopOperation, TabStopOrderNodeSummary, TaskExt, Text, ThermalState, ThreadedDispatcher, Timeout, TooltipId, Unbind, UniformListFrameState, UpdateGlobal, View, VisualContext, WindowButton, WindowButtonLayout, WindowControlArea, WindowControls, WindowingModes, WindowingRequest, WithTimeout
 
 </details>
 
@@ -164,7 +158,7 @@ ActivationPolicy, ActivityGuard, Along, AnchoredState, AnyTooltip, AnyWeakView, 
 
 **Waiting on macOS or Windows:** add_recent_document, add_tab, button_layout, get_next_tab_group_window, get_prev_tab_group_window, insert_window_control_hitbox, is_screen_capture_supported, merge_all_windows, move_tab_to_new_window, observe_button_layout_changed, on_app_lifecycle, on_memory_warning, on_system_sleep, on_system_wake, on_thermal_state_change, perform_dock_menu_action, power_mode, prevent_app_nap, prevent_idle_sleep, read_from_find_pasteboard, remove_tab, screen_capture_sources, select_next_tab, select_previous_tab, set_dock_menu, tab_groups, tabs, thermal_state, update_jump_list, update_tab_position, update_tab_title, window_control_area, write_to_find_pasteboard
 
-**Waiting on portal work over D-Bus:** can_select_mixed_files_and_dirs, delete_credentials, prompt_for_new_path, prompt_for_paths, read_credentials, window_appearance, write_credentials, write_credentials_if_not_exists
+**Waiting on portal work over D-Bus:** delete_credentials, read_credentials, write_credentials, write_credentials_if_not_exists
 
 **Debug tooling and accessibility** (each its own project): the profiler, inspector, bench and randomized tree harnesses, `aria_*` and `a11y_*`.
 
@@ -227,7 +221,12 @@ ActivationPolicy, ActivityGuard, Along, AnchoredState, AnyTooltip, AnyWeakView, 
 - [ ] `set_menus` is stored but only macOS will draw it
 - [ ] Notifications on the real GNOME Shell: only a fake server has been tested. A server that never answers leaves
       that tag waiting forever (no timeout). The first post connects synchronously, blocking for up to 1 s
-- [ ] File dialogs (`prompt_for_paths`), credentials and `window_appearance` can now build on `linux/dbus.zig`
+- [ ] Try file dialogs, dark mode following the desktop and `open_url` on a real desktop: tests use a fake portal
+- [ ] File dialogs have no parent window: `wayland:<handle>` via xdg_foreign, or `x11:<xid>`
+- [ ] Credentials: a Secret Service client on `dbus.zig` (OpenSession, SearchItems, CreateItem, GetSecret, Prompt), about 600 lines
+- [ ] `reveal_path`'s OpenDirectory portal: file descriptors over D-Bus (`h`, UNIX_FDS, SCM_RIGHTS). The launcher fallback works
+- [ ] Portal cursor size ignores the window scale; `file_uri_to_path` does not normalise `.` and `..`
+- [ ] Wayland keyboard layout has not run with a real keyboard: a headless compositor has none
 - [ ] Scroll: ZUI stops propagation in the scroll listener and GPUI does not, so nested scrollers differ
 - [ ] `Unbind` (needs GPUI's binding precedence model), `InputPreference`, pausing the pending-input timeout
 - [ ] `keyboard_layout` and its change observer
