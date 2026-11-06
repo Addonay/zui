@@ -7,6 +7,7 @@ const platform = @import("../platform.zig");
 const app_mod = @import("../app.zig");
 const window_mod = @import("../window.zig");
 const input = @import("linux/input.zig");
+const system_notifications = @import("linux/system_notifications.zig");
 pub const wayland = @import("linux/wayland.zig");
 pub const x11 = @import("linux/x11.zig");
 
@@ -92,6 +93,9 @@ pub const LinuxPlatform = struct {
     app: ?*app_mod.App = null,
     /// Menus are stored, as in GPUI's Linux platform, but Linux has no menu bar to draw them in.
     menus: platform.app_menu.MenuStore = .{},
+    /// System notifications over the session bus. Connects on the first notification, and any
+    /// failure there stays inside it: nothing here can close a window.
+    notifications: system_notifications.State,
 
     const vtable: platform.Platform.VTable = .{
         .run = run,
@@ -107,7 +111,28 @@ pub const LinuxPlatform = struct {
         .read_from_primary = readPrimary,
         .set_menus = setMenus,
         .get_menus = getMenus,
+        .set_app_identity = setAppIdentity,
+        .show_system_notification = showNotification,
+        .dismiss_system_notification = dismissNotification,
     };
+
+    fn setAppIdentity(p: *platform.Platform, _: []const u8, name: []const u8) void {
+        from(p).notifications.set_app_name(name);
+    }
+
+    fn showNotification(p: *platform.Platform, notification: platform.SystemNotification) void {
+        from(p).notifications.show(notification);
+    }
+
+    fn dismissNotification(p: *platform.Platform, tag: []const u8) void {
+        from(p).notifications.dismiss(tag);
+    }
+
+    /// Where notification responses go: to the app, on the main thread, from the event loop.
+    fn deliverNotification(raw: *anyopaque, response: platform.SystemNotificationResponse) void {
+        const self: *LinuxPlatform = @ptrCast(@alignCast(raw));
+        if (self.app) |app| app.dispatch_system_notification_response(response);
+    }
 
     fn setMenus(p: *platform.Platform, menus: []const platform.app_menu.Menu) void {
         from(p).menus.set(from(p).allocator, menus);
@@ -146,16 +171,18 @@ pub const LinuxPlatform = struct {
         const timeout = self.backend.timeout(now) orelse -1;
         const has_pending = self.backend.prepare_wait();
         // Poll ignores a negative descriptor.
-        var fds = [3]std.posix.pollfd{
+        var fds = [4]std.posix.pollfd{
             .{ .fd = self.backend.fd(), .events = std.posix.POLL.IN, .revents = 0 },
             .{ .fd = self.wake_fd, .events = std.posix.POLL.IN, .revents = 0 },
             .{ .fd = self.backend.extra_fd(), .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = self.notifications.bus_socket(), .events = self.notifications.bus_events(), .revents = 0 },
         };
         if (!has_pending) {
             _ = std.posix.poll(&fds, timeout) catch 0;
         }
         self.backend.finish_wait(fds[0].revents != 0);
         if (fds[2].revents != 0) self.backend.on_extra_fd();
+        if (fds[3].revents != 0) self.notifications.on_bus_poll(fds[3].revents);
         if (fds[1].revents != 0) {
             var buf: u64 = 0;
             _ = std.os.linux.read(self.wake_fd, @ptrCast(&buf), 8);
@@ -173,6 +200,7 @@ pub const LinuxPlatform = struct {
         self.backend.deinit();
         _ = std.os.linux.close(self.wake_fd);
         self.menus.deinit();
+        self.notifications.deinit();
         self.allocator.destroy(self);
     }
 
@@ -262,6 +290,11 @@ pub fn create(allocator: std.mem.Allocator) !*platform.Platform {
     const efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (efd < 0) return error.EventFdFailed;
     const self = try allocator.create(LinuxPlatform);
-    self.* = .{ .allocator = allocator, .backend = backend, .wake_fd = efd };
+    self.* = .{
+        .allocator = allocator,
+        .backend = backend,
+        .wake_fd = efd,
+        .notifications = system_notifications.State.init(allocator, self, LinuxPlatform.deliverNotification),
+    };
     return &self.platform;
 }

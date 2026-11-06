@@ -3,12 +3,13 @@
 //!
 //! Differences from the Rust version:
 //! - `example_support::load_fonts` is a no-op on native platforms, so it is not called.
-//! - NOT WORKING ON LINUX YET. The API is complete (`App.show_system_notification`,
-//!   `dismiss_system_notification`, `set_app_identity`, `on_system_notification_response`), but no
-//!   platform delivers anything: GPUI's Linux platform posts through the freedesktop D-Bus
-//!   notification service (via `notify-rust`), and ZUI has no D-Bus client yet. Clicking the
-//!   buttons updates the status line, and nothing appears on the desktop. Responses only reach
-//!   the handler when a platform calls `App.dispatch_system_notification_response`.
+//! - Linux posts through the freedesktop notification service (`org.freedesktop.Notifications`)
+//!   on the session bus, with ZUI's own D-Bus client (`platform/linux/dbus.zig`). GPUI does the
+//!   same through `notify-rust`. The bus is connected on the first notification. Without a session
+//!   bus or a notification server nothing appears and the status line still updates; the first
+//!   failure is logged once. Posting again with the same tag replaces the notification, and
+//!   Dismiss closes it. Clicks on the body or a button reach the handler through
+//!   `App.dispatch_system_notification_response`, from the event loop.
 //! - `on_system_notification_response` is registered in `build_root`, because Zig closures cannot
 //!   capture the view. The handler receives the entity as its context.
 //! - Strings sent to `show_system_notification` are only valid during the call, so the title is
