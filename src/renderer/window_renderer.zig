@@ -6,6 +6,7 @@
 //! `ZUI_RENDERER=cpu` forces the CPU renderer. `ZUI_RENDERER=gpu` also accepts software
 //! Vulkan devices, which the default rejects because the CPU renderer beats them.
 const std = @import("std");
+const platform_specs = @import("../platform.zig");
 const gpu = @import("../gpu/root.zig");
 const vulkan = @import("vulkan.zig");
 const renderer = @import("gpu.zig");
@@ -84,6 +85,12 @@ pub const GpuContext = struct {
 pub const GpuWindow = struct {
     ctx: *GpuContext,
     swapchain: vulkan.WindowSwapchain,
+
+    /// The GPU this window renders with (GPUI `gpu_specs`). The driver fields stay empty: the
+    /// driver properties are not read yet.
+    pub fn gpu_specs(self: *const GpuWindow) platform_specs.GpuSpecs {
+        return .{ .is_software_emulated = self.ctx.vk.is_software, .device_name = self.ctx.vk.device_label() };
+    }
 
     pub fn create(ctx: *GpuContext, native: vulkan.NativeSurface, width: u32, height: u32, options: vulkan.WindowSwapchain.Options) ?GpuWindow {
         return create_with(ctx, native, width, height, options) catch |err| {

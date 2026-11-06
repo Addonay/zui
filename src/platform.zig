@@ -13,6 +13,7 @@ const atlas_mod = @import("atlas.zig");
 const interactive = @import("interactive.zig");
 const window_mod = @import("window.zig");
 const app_mod = @import("app.zig");
+const keystroke_mod = @import("keystroke.zig");
 pub const app_menu = @import("platform/app_menu.zig");
 
 const Pixels = geometry.Pixels;
@@ -31,6 +32,136 @@ pub const Display = struct {
     bounds: Bounds(Pixels),
     scale_factor: f32 = 1,
     name: []const u8 = "",
+};
+
+/// Whether the platform is presenting a window's frames (GPUI `WindowVisibility`). Hidden
+/// while the window is minimized, fully covered (where the platform can tell), or suspended.
+pub const WindowVisibility = enum {
+    visible,
+    hidden,
+
+    /// Whether frames drawn for the window will be shown.
+    pub fn is_visible(self: WindowVisibility) bool {
+        return self == .visible;
+    }
+};
+
+/// Which properties of a display changed (GPUI `DisplayChanges`).
+pub const DisplayChanges = struct {
+    /// The display's bounds changed.
+    bounds: bool = false,
+
+    pub fn is_empty(self: DisplayChanges) bool {
+        return !self.bounds;
+    }
+};
+
+/// A change to the connected displays (GPUI `DisplayEvent`).
+pub const DisplayEvent = union(enum) {
+    /// A display was connected.
+    added: DisplayId,
+    /// A display was disconnected. Windows on it are moved to another display by the platform.
+    removed: DisplayId,
+    /// A connected display's properties changed.
+    changed: struct { id: DisplayId, changes: DisplayChanges },
+};
+
+/// Whether the application takes part in the system's foreground UI (GPUI `ActivationPolicy`).
+/// Only macOS acts on it; other platforms accept and ignore it.
+pub const ActivationPolicy = enum {
+    /// Participate in foreground application UI, such as the Dock and menu bar on macOS.
+    regular,
+    /// Run without foreground application UI while retaining the ability to open windows.
+    accessory,
+};
+
+/// The host operating system (GPUI `OperatingSystem`).
+pub const OperatingSystem = enum { mac, windows, linux, free_bsd, ios, android, unknown };
+
+/// How the application is delivered (GPUI `PlatformTarget`).
+pub const PlatformTarget = enum {
+    /// A native application, including headless execution.
+    native,
+    /// An application running in a browser.
+    web,
+};
+
+/// The host OS and application target (GPUI `PlatformInfo`).
+pub const PlatformInfo = struct {
+    os: OperatingSystem,
+    target: PlatformTarget,
+
+    pub fn is_mac(self: PlatformInfo) bool {
+        return self.os == .mac;
+    }
+
+    /// The identity of the OS this binary was built for, as a native application.
+    pub fn host() PlatformInfo {
+        return .{ .os = switch (builtin.os.tag) {
+            .macos => .mac,
+            .windows => .windows,
+            .freebsd => .free_bsd,
+            .ios => .ios,
+            .linux => if (builtin.abi == .android) .android else .linux,
+            else => .unknown,
+        }, .target = .native };
+    }
+};
+
+/// The graphical session a platform is connected to (GPUI `GraphicalEnvironment`): the variables
+/// that locate its display server, as some process sees them. Slices are borrowed.
+pub const GraphicalEnvironment = struct {
+    /// `WAYLAND_DISPLAY`: a socket name relative to `xdg_runtime_dir`, or an absolute path.
+    wayland_display: ?[]const u8 = null,
+    /// `DISPLAY`: the X11 display name.
+    x11_display: ?[]const u8 = null,
+    /// `XDG_RUNTIME_DIR`: the directory containing Wayland sockets.
+    xdg_runtime_dir: ?[]const u8 = null,
+    /// `XDG_ACTIVATION_TOKEN`: lets the first window take focus on Wayland.
+    activation_token: ?[]const u8 = null,
+
+    /// The compositor this environment selects: Wayland, then X11, then headless. Does not
+    /// attempt to connect to it (GPUI `GraphicalEnvironment::guess_compositor`).
+    pub fn guess_compositor(self: GraphicalEnvironment) []const u8 {
+        if (is_set(self.wayland_display)) return "Wayland";
+        if (is_set(self.x11_display)) return "X11";
+        return "Headless";
+    }
+
+    fn is_set(value: ?[]const u8) bool {
+        const v = value orelse return false;
+        return v.len > 0;
+    }
+};
+
+/// A keyboard layout (GPUI `PlatformKeyboardLayout`).
+pub const KeyboardLayout = struct {
+    /// Unique to the layout.
+    id: []const u8,
+    /// For display, such as "English (US)".
+    name: []const u8,
+};
+
+/// Maps key equivalents to the platform's representation (GPUI `PlatformKeyboardMapper`).
+/// Linux and the headless platform use GPUI's `DummyKeyboardMapper`, which maps nothing.
+pub const KeyboardMapper = struct {
+    pub fn map_key_equivalent(self: KeyboardMapper, keystroke: keystroke_mod.Keystroke, use_key_equivalents: bool) keystroke_mod.Keystroke {
+        _ = self;
+        _ = use_key_equivalents;
+        return keystroke;
+    }
+};
+
+/// What the GPU renders with (GPUI `GpuSpecs`). Slices are owned by the platform.
+pub const GpuSpecs = struct {
+    /// Whether the GPU is really a fake (like `llvmpipe`) running on the CPU.
+    is_software_emulated: bool = false,
+    /// The name of the device, as reported by Vulkan.
+    device_name: []const u8 = "",
+    /// The name of the driver, as reported by Vulkan.
+    driver_name: []const u8 = "",
+    /// Further information about the driver, as reported by Vulkan.
+    driver_info: []const u8 = "",
 };
 
 pub const WindowAppearance = enum {
@@ -306,6 +437,22 @@ pub const WindowCallbacks = struct {
     appearance_changed: *const fn (*anyopaque) void,
     ime: *const fn (*anyopaque, ImeInput) void,
     ime_area: *const fn (*anyopaque) ?Bounds(Pixels),
+    /// The window's visibility may have changed (GPUI `on_visibility_change`). The window reads
+    /// `PlatformWindow.visibility` again, so only changes are reported.
+    visibility_changed: ?*const fn (*anyopaque) void = null,
+    /// The window may be on another display, or that display changed (GPUI `on_display_changed`).
+    display_changed: ?*const fn (*anyopaque) void = null,
+};
+
+/// What the platform reports to the app as a whole (GPUI's `on_displays_changed` and
+/// `on_keyboard_layout_change` callbacks). Set once with `Platform.set_callbacks`.
+pub const PlatformCallbacks = struct {
+    ctx: *anyopaque,
+    /// The displays may have been added, removed or changed. Calls may be spurious: the app
+    /// rereads `Platform.displays` to learn what changed.
+    displays_changed: *const fn (*anyopaque) void,
+    /// The current keyboard layout changed.
+    keyboard_layout_changed: *const fn (*anyopaque) void,
 };
 
 /// The OS window interface (GPUI `PlatformWindow`).
@@ -343,7 +490,38 @@ pub const PlatformWindow = struct {
         start_window_resize: *const fn (*PlatformWindow, ResizeEdge) void = noopEdge,
         /// Asks the compositor for its window menu at a position (GPUI `show_window_menu`).
         show_window_menu: *const fn (*PlatformWindow, Point(Pixels)) void = noopPoint,
+        /// Whether frames drawn for the window will be shown (GPUI `PlatformWindow::visibility`).
+        visibility: *const fn (*PlatformWindow) WindowVisibility = defaultVisibility,
+        /// The display the window is on, if the platform can tell (GPUI `PlatformWindow::display`).
+        display_id: *const fn (*PlatformWindow) ?DisplayId = noDisplayId,
+        /// The GPU the window renders with, if any (GPUI `gpu_specs`).
+        gpu_specs: *const fn (*PlatformWindow) ?GpuSpecs = noGpuSpecs,
     };
+
+    fn defaultVisibility(_: *PlatformWindow) WindowVisibility {
+        return .visible;
+    }
+    fn noDisplayId(_: *PlatformWindow) ?DisplayId {
+        return null;
+    }
+    fn noGpuSpecs(_: *PlatformWindow) ?GpuSpecs {
+        return null;
+    }
+    pub fn visibility(self: *PlatformWindow) WindowVisibility {
+        return self.vtable.visibility(self);
+    }
+    pub fn display_id(self: *PlatformWindow) ?DisplayId {
+        return self.vtable.display_id(self);
+    }
+    pub fn gpu_specs(self: *PlatformWindow) ?GpuSpecs {
+        return self.vtable.gpu_specs(self);
+    }
+    pub fn emit_visibility_changed(self: *PlatformWindow) void {
+        if (self.callbacks) |c| if (c.visibility_changed) |f| f(c.ctx);
+    }
+    pub fn emit_display_changed(self: *PlatformWindow) void {
+        if (self.callbacks) |c| if (c.display_changed) |f| f(c.ctx);
+    }
 
     fn serverDecorations(_: *PlatformWindow) Decorations {
         return .server;
@@ -490,6 +668,7 @@ fn noopIme(_: *PlatformWindow, _: Bounds(Pixels)) void {}
 /// The OS application interface (GPUI `Platform`).
 pub const Platform = struct {
     vtable: *const VTable,
+    callbacks: ?PlatformCallbacks = null,
 
     pub const VTable = struct {
         /// Runs the event loop until quit, calling `on_launch(app)` once ready.
@@ -515,7 +694,51 @@ pub const Platform = struct {
         set_app_identity: *const fn (*Platform, []const u8, []const u8) void = noopIdentity,
         show_system_notification: *const fn (*Platform, SystemNotification) void = noopNotification,
         dismiss_system_notification: *const fn (*Platform, []const u8) void = noopStr,
+        /// The host OS and target (GPUI `Platform::platform_info`). Defaults to the build's OS.
+        platform_info: *const fn (*Platform) PlatformInfo = hostPlatformInfo,
+        /// The current keyboard layout (GPUI `Platform::keyboard_layout`).
+        keyboard_layout: *const fn (*Platform) KeyboardLayout = unknownKeyboardLayout,
+        /// The compositor in use, for Linux (GPUI `Platform::compositor_name`). Empty elsewhere.
+        compositor_name: *const fn (*Platform) []const u8 = noCompositorName,
+        /// The display server's environment, or null while headless (GPUI `Platform::graphical_environment`).
+        graphical_environment: *const fn (*Platform) ?GraphicalEnvironment = noGraphicalEnvironment,
+        /// Front to back (GPUI `Platform::window_stack`). Null when the platform cannot say. The
+        /// slice is valid until the next call.
+        window_stack: *const fn (*Platform) ?[]const *PlatformWindow = noWindowStack,
+        /// Hides the cursor until the mouse moves over one of the app's windows (GPUI `hide_cursor_until_mouse_moves`).
+        hide_cursor_until_mouse_moves: *const fn (*Platform) void = noop,
+        /// Whether the cursor is visible (GPUI `is_cursor_visible`).
+        is_cursor_visible: *const fn (*Platform) bool = alwaysTrue,
+        /// Whether the user wants scrollbars to hide themselves (GPUI `should_auto_hide_scrollbars`).
+        should_auto_hide_scrollbars: *const fn (*Platform) bool = alwaysFalse,
+        /// Sets the activation policy (GPUI `Platform::set_activation_policy`). Only macOS acts on it.
+        set_activation_policy: *const fn (*Platform, ActivationPolicy) void = noopPolicy,
+        hide_other_apps: *const fn (*Platform) void = noop,
+        unhide_other_apps: *const fn (*Platform) void = noop,
     };
+
+    fn hostPlatformInfo(_: *Platform) PlatformInfo {
+        return PlatformInfo.host();
+    }
+    fn unknownKeyboardLayout(_: *Platform) KeyboardLayout {
+        return .{ .id = "unknown", .name = "unknown" };
+    }
+    fn noCompositorName(_: *Platform) []const u8 {
+        return "";
+    }
+    fn noGraphicalEnvironment(_: *Platform) ?GraphicalEnvironment {
+        return null;
+    }
+    fn noWindowStack(_: *Platform) ?[]const *PlatformWindow {
+        return null;
+    }
+    fn alwaysTrue(_: *Platform) bool {
+        return true;
+    }
+    fn alwaysFalse(_: *Platform) bool {
+        return false;
+    }
+    fn noopPolicy(_: *Platform, _: ActivationPolicy) void {}
 
     fn noopMenus(_: *Platform, _: []const app_menu.Menu) void {}
     fn noGetMenus(_: *Platform) ?[]const app_menu.OwnedMenu {
@@ -603,6 +826,49 @@ pub const Platform = struct {
     }
     pub fn dismiss_system_notification(self: *Platform, tag: []const u8) void {
         self.vtable.dismiss_system_notification(self, tag);
+    }
+    pub fn set_callbacks(self: *Platform, cbs: PlatformCallbacks) void {
+        self.callbacks = cbs;
+    }
+    /// Backends call these when the displays or the keyboard layout changed.
+    pub fn emit_displays_changed(self: *Platform) void {
+        if (self.callbacks) |c| c.displays_changed(c.ctx);
+    }
+    pub fn emit_keyboard_layout_changed(self: *Platform) void {
+        if (self.callbacks) |c| c.keyboard_layout_changed(c.ctx);
+    }
+    pub fn platform_info(self: *Platform) PlatformInfo {
+        return self.vtable.platform_info(self);
+    }
+    pub fn keyboard_layout(self: *Platform) KeyboardLayout {
+        return self.vtable.keyboard_layout(self);
+    }
+    pub fn compositor_name(self: *Platform) []const u8 {
+        return self.vtable.compositor_name(self);
+    }
+    pub fn graphical_environment(self: *Platform) ?GraphicalEnvironment {
+        return self.vtable.graphical_environment(self);
+    }
+    pub fn window_stack(self: *Platform) ?[]const *PlatformWindow {
+        return self.vtable.window_stack(self);
+    }
+    pub fn hide_cursor_until_mouse_moves(self: *Platform) void {
+        self.vtable.hide_cursor_until_mouse_moves(self);
+    }
+    pub fn is_cursor_visible(self: *Platform) bool {
+        return self.vtable.is_cursor_visible(self);
+    }
+    pub fn should_auto_hide_scrollbars(self: *Platform) bool {
+        return self.vtable.should_auto_hide_scrollbars(self);
+    }
+    pub fn set_activation_policy(self: *Platform, policy: ActivationPolicy) void {
+        self.vtable.set_activation_policy(self, policy);
+    }
+    pub fn hide_other_apps(self: *Platform) void {
+        self.vtable.hide_other_apps(self);
+    }
+    pub fn unhide_other_apps(self: *Platform) void {
+        self.vtable.unhide_other_apps(self);
     }
 };
 

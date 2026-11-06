@@ -241,6 +241,18 @@ pub const VisualTestContext = struct {
         self.cx.run_until_parked();
     }
 
+    /// Creates an entity with access to the window, as `build(window, cx)` (GPUI `new_window_entity`).
+    pub fn new_window_entity(self: *VisualTestContext, comptime build: anytype) Entity(@typeInfo(@TypeOf(build)).@"fn".return_type.?) {
+        return self.window.new_window_entity(self.cx.app, build);
+    }
+
+    /// Replaces the window's root view with a new one, built by `build(window, cx)` (GPUI `replace_root_view`).
+    pub fn replace_root_view(self: *VisualTestContext, comptime build: anytype) Entity(@typeInfo(@TypeOf(build)).@"fn".return_type.?) {
+        const view = self.window.replace_root(self.cx.app, build);
+        self.cx.run_until_parked();
+        return view;
+    }
+
     /// Runs `f(window, app)` against the window (GPUI `update`).
     pub fn update(self: *VisualTestContext, comptime f: anytype, args: anytype) ReturnOf(f) {
         const r = @call(.auto, f, args ++ .{ self.window, self.cx.app });
@@ -4362,4 +4374,327 @@ test "paint_with_underline_handler hands each underline's bytes to the handler, 
     vcx.run_until_parked();
     try std.testing.expectEqual(@as(usize, 0), UnderlineHandlerView.calls);
     try std.testing.expectEqual(@as(usize, 2), vcx.window.rendered_frame.scene.underlines.items.len);
+}
+
+fn test_display(id: platform_mod.DisplayId, w: f32, h: f32) platform_mod.Display {
+    return .{ .id = id, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = w, .height = h } } };
+}
+
+test "windows: visibility observers hear each change once, see the new state, and stop after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const S = struct {
+        var seen: [8]platform_mod.WindowVisibility = undefined;
+        var n: usize = 0;
+        var stored_matches = true;
+        fn on(v: platform_mod.WindowVisibility, win: *Window, _: *App) void {
+            seen[n] = v;
+            n += 1;
+            if (win.visibility() != v) stored_matches = false;
+        }
+    };
+    S.n = 0;
+    S.stored_matches = true;
+    const win = handle.window(cx.app).?;
+    try std.testing.expect(win.is_visible());
+    const sub = win.observe_window_visibility(S.on);
+    const hw = headless_mod.HeadlessWindow.from(win.platform_window);
+
+    hw.set_visibility(.hidden);
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+    try std.testing.expectEqual(platform_mod.WindowVisibility.hidden, S.seen[0]);
+    try std.testing.expect(!win.is_visible());
+
+    // The platform may report the same state again: observers only see changes.
+    hw.set_visibility(.hidden);
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+
+    hw.set_visibility(.visible);
+    try std.testing.expectEqual(@as(usize, 2), S.n);
+    try std.testing.expectEqual(platform_mod.WindowVisibility.visible, S.seen[1]);
+    try std.testing.expect(win.is_visible());
+    try std.testing.expect(S.stored_matches);
+
+    sub.unsubscribe();
+    hw.set_visibility(.hidden);
+    try std.testing.expectEqual(@as(usize, 2), S.n);
+}
+
+test "windows: an entity's visibility observer gets the window, and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const Watcher = struct {
+        seen: usize = 0,
+        last: platform_mod.WindowVisibility = .visible,
+        sub: ?app_mod.Subscription = null,
+        fn start(self: *@This(), win: *Window, cx_: *Context(@This())) void {
+            self.sub = cx_.observe_window_visibility(win, on);
+        }
+        fn on(self: *@This(), v: platform_mod.WindowVisibility, win: *Window, _: *Context(@This())) void {
+            std.debug.assert(win.visibility() == v);
+            self.seen += 1;
+            self.last = v;
+        }
+        fn stop(self: *@This(), _: *Context(@This())) void {
+            self.sub.?.unsubscribe();
+        }
+    };
+    const watcher = cx.new(Watcher{});
+    const win = handle.window(cx.app).?;
+    watcher.update(cx.app, Watcher.start, .{win});
+
+    const hw = headless_mod.HeadlessWindow.from(win.platform_window);
+    hw.set_visibility(.hidden);
+    try std.testing.expectEqual(@as(usize, 1), watcher.read(cx.app).seen);
+    try std.testing.expectEqual(platform_mod.WindowVisibility.hidden, watcher.read(cx.app).last);
+
+    watcher.update(cx.app, Watcher.stop, .{});
+    hw.set_visibility(.visible);
+    try std.testing.expectEqual(@as(usize, 1), watcher.read(cx.app).seen);
+}
+
+test "displays: observe_displays reports additions, changes and removals, and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var events: [8]platform_mod.DisplayEvent = undefined;
+        var n: usize = 0;
+        fn on(event: platform_mod.DisplayEvent, _: *App) void {
+            events[n] = event;
+            n += 1;
+        }
+    };
+    S.n = 0;
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    const sub = cx.app.observe_displays(S.on);
+    const other = test_display(2, 800, 600);
+
+    hp.set_displays(&.{ test_display(0, 1920, 1080), other });
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+    try std.testing.expectEqual(platform_mod.DisplayEvent{ .added = 2 }, S.events[0]);
+
+    // Removed events come first, then added and changed ones, in the platform's order.
+    hp.set_displays(&.{ test_display(0, 1280, 720), other, test_display(3, 640, 480) });
+    try std.testing.expectEqual(@as(usize, 3), S.n);
+    try std.testing.expectEqual(platform_mod.DisplayEvent{ .changed = .{ .id = 0, .changes = .{ .bounds = true } } }, S.events[1]);
+    try std.testing.expectEqual(platform_mod.DisplayEvent{ .added = 3 }, S.events[2]);
+
+    // The same displays again change nothing.
+    hp.set_displays(&.{ test_display(0, 1280, 720), other, test_display(3, 640, 480) });
+    try std.testing.expectEqual(@as(usize, 3), S.n);
+
+    // Two removals, in the order the app last saw the displays.
+    hp.set_displays(&.{test_display(0, 1280, 720)});
+    try std.testing.expectEqual(@as(usize, 5), S.n);
+    try std.testing.expectEqual(platform_mod.DisplayEvent{ .removed = 2 }, S.events[3]);
+    try std.testing.expectEqual(platform_mod.DisplayEvent{ .removed = 3 }, S.events[4]);
+
+    sub.unsubscribe();
+    hp.set_displays(&.{ test_display(0, 1280, 720), test_display(4, 1024, 768) });
+    try std.testing.expectEqual(@as(usize, 5), S.n);
+}
+
+test "windows: a window hears when it moves to another display, not when the move is no move" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const S = struct {
+        var seen: [8]platform_mod.DisplayId = undefined;
+        var n: usize = 0;
+        fn on(win: *Window, _: *App) void {
+            seen[n] = win.display_id_ orelse 999;
+            n += 1;
+        }
+    };
+    S.n = 0;
+    const win = handle.window(cx.app).?;
+    const sub = win.observe_window_display(S.on);
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    const hw = headless_mod.HeadlessWindow.from(win.platform_window);
+
+    // A display connecting is not a move: the window stays where it was.
+    hp.set_displays(&.{ test_display(0, 1920, 1080), test_display(2, 800, 600) });
+    try std.testing.expectEqual(@as(usize, 0), S.n);
+
+    hw.move_to_display(2);
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+    try std.testing.expectEqual(@as(platform_mod.DisplayId, 2), S.seen[0]);
+
+    // Platforms may report a move that isn't one.
+    hw.move_to_display(2);
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+
+    // A change to a display the window is not on does not notify it.
+    hp.set_displays(&.{ test_display(0, 1280, 720), test_display(2, 800, 600) });
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+
+    // A change to the window's own display does.
+    hp.set_displays(&.{ test_display(0, 1280, 720), test_display(2, 1024, 768) });
+    try std.testing.expectEqual(@as(usize, 2), S.n);
+    try std.testing.expectEqual(@as(platform_mod.DisplayId, 2), S.seen[1]);
+
+    sub.unsubscribe();
+    hw.move_to_display(0);
+    try std.testing.expectEqual(@as(usize, 2), S.n);
+}
+
+test "windows: replace_root swaps the root view and releases the old one; new_window_entity sees the window" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const old, const vcx = cx.add_window_view(Counter.build);
+    const S = struct {
+        var old_released = false;
+        var seen_window: ?*Window = null;
+        fn on_release(_: *Counter, _: *App) void {
+            old_released = true;
+        }
+    };
+    S.old_released = false;
+    const sub = cx.app.observe_release(old, S.on_release);
+    sub.detach();
+
+    const Marker = struct {
+        tag: u32 = 0,
+        fn init(win: *Window, _: *Context(@This())) @This() {
+            S.seen_window = win;
+            return .{ .tag = 7 };
+        }
+        pub fn render(_: *@This(), _: *Window, _: *Context(@This())) *div_mod.Div {
+            return div();
+        }
+    };
+
+    const created = vcx.new_window_entity(Marker.init);
+    try std.testing.expectEqual(@as(u32, 7), created.read(cx.app).tag);
+    try std.testing.expect(S.seen_window == vcx.window);
+    try std.testing.expect(!S.old_released);
+
+    const marker = vcx.replace_root_view(Marker.init);
+    try std.testing.expect(S.old_released);
+    try std.testing.expectEqual(@as(u32, 7), marker.read(cx.app).tag);
+    try std.testing.expect(vcx.window.root_view(Marker) != null);
+}
+
+test "keyboard: on_keyboard_layout_change runs on each change of layout, and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var n: usize = 0;
+        var last: []const u8 = "";
+        fn on(app: *App) void {
+            n += 1;
+            last = app.keyboard_layout().name;
+        }
+    };
+    S.n = 0;
+    S.last = "";
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    try std.testing.expectEqualStrings("unknown", cx.app.keyboard_layout().name);
+    const sub = cx.app.on_keyboard_layout_change(S.on);
+
+    hp.set_keyboard_layout("German");
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+    try std.testing.expectEqualStrings("German", S.last);
+    try std.testing.expectEqualStrings("German", cx.app.keyboard_layout().id);
+
+    // The same layout again is no change.
+    hp.set_keyboard_layout("German");
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+
+    sub.unsubscribe();
+    hp.set_keyboard_layout("English (US)");
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+    try std.testing.expectEqualStrings("English (US)", cx.app.keyboard_layout().name);
+}
+
+test "keyboard: the keyboard mapper leaves keystrokes as they are, as GPUI's Linux mapper does" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const ks = try keystroke_mod.Keystroke.parse("cmd-shift-z");
+    const mapped = cx.app.keyboard_mapper().map_key_equivalent(ks, true);
+    try std.testing.expectEqualStrings(ks.key, mapped.key);
+    try std.testing.expectEqual(ks.modifiers, mapped.modifiers);
+}
+
+test "cursor: typing hides the cursor only in the modes that hide it on typing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const vcx = cx.add_window_view(Counter.build)[1];
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    try std.testing.expectEqual(app_mod.CursorHideMode.on_typing_and_action, cx.app.cursor_hide_mode());
+
+    cx.app.set_cursor_hide_mode(.never);
+    vcx.simulate_keystrokes("a");
+    try std.testing.expectEqual(@as(u32, 0), hp.cursor_hide_requests);
+    try std.testing.expect(cx.app.is_cursor_visible());
+
+    cx.app.set_cursor_hide_mode(.on_typing);
+    vcx.simulate_keystrokes("a");
+    try std.testing.expectEqual(@as(u32, 1), hp.cursor_hide_requests);
+    try std.testing.expect(!cx.app.is_cursor_visible());
+
+    // A key that types no text does not hide it.
+    hp.cursor_visible = true;
+    vcx.simulate_keystrokes("escape");
+    try std.testing.expectEqual(@as(u32, 1), hp.cursor_hide_requests);
+    try std.testing.expect(cx.app.is_cursor_visible());
+}
+
+test "platform: the headless platform reports the host OS, and no display server, window stack or GPU" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const info = cx.app.platform_info();
+    try std.testing.expectEqual(platform_mod.PlatformInfo.host().os, info.os);
+    try std.testing.expectEqual(platform_mod.PlatformTarget.native, info.target);
+    try std.testing.expect(cx.app.graphical_environment() == null);
+    try std.testing.expect(cx.app.window_stack() == null);
+    try std.testing.expect(handle.window(cx.app).?.gpu_specs() == null);
+}
+
+test "platform: hide, hide_other_apps, unhide_other_apps and the activation policy reach the platform" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    try std.testing.expect(hp.activation_policy == null);
+
+    cx.app.hide();
+    cx.app.hide_other_apps();
+    cx.app.unhide_other_apps();
+    try std.testing.expectEqual(@as(u32, 1), hp.hide_requests);
+    try std.testing.expectEqual(@as(u32, 1), hp.hide_other_apps_requests);
+    try std.testing.expectEqual(@as(u32, 1), hp.unhide_other_apps_requests);
+
+    cx.app.set_activation_policy(.accessory);
+    try std.testing.expectEqual(platform_mod.ActivationPolicy.accessory, hp.activation_policy.?);
+}
+
+test "app: should_auto_hide_scrollbars reports the platform's setting" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    try std.testing.expect(!cx.app.should_auto_hide_scrollbars());
+    hp.auto_hide_scrollbars = true;
+    try std.testing.expect(cx.app.should_auto_hide_scrollbars());
+}
+
+test "app: on_reopen runs each time the app is reopened, and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var n: usize = 0;
+        fn on(_: *App) void {
+            n += 1;
+        }
+    };
+    S.n = 0;
+    const sub = cx.app.on_reopen(S.on);
+    cx.app.dispatch_reopen();
+    cx.app.dispatch_reopen();
+    try std.testing.expectEqual(@as(usize, 2), S.n);
+    sub.unsubscribe();
+    cx.app.dispatch_reopen();
+    try std.testing.expectEqual(@as(usize, 2), S.n);
 }

@@ -45,7 +45,10 @@ const OutputListener = extern struct {
 const max_outputs = 8;
 
 const Output = struct {
+    /// Null for a free slot. A removed output's slot is cleared, never shifted: its address is the
+    /// listener's data.
     proxy: ?*anyopaque = null,
+    /// The registry name of the global. It is stable for the output's life, so it is the display id.
     name: u32 = 0,
     width: i32 = 0,
     height: i32 = 0,
@@ -53,7 +56,20 @@ const Output = struct {
     /// Pending mode values, committed on `done`.
     pending_w: i32 = 0,
     pending_h: i32 = 0,
+    /// The connection that owns this output; `done` reports changes through it.
+    conn: ?*WaylandConnection = null,
 };
+
+/// wl_surface events, so a window learns which outputs it is on (GPUI `display`).
+const SurfaceListener = extern struct {
+    enter: ?*const fn (?*anyopaque, *anyopaque, *anyopaque) callconv(.c) void = null,
+    leave: ?*const fn (?*anyopaque, *anyopaque, *anyopaque) callconv(.c) void = null,
+    // Versions 4 and 6 add two more events. The listener must list them, since libwayland indexes by opcode.
+    preferred_buffer_scale: ?*const fn (?*anyopaque, *anyopaque, i32) callconv(.c) void = null,
+    preferred_buffer_transform: ?*const fn (?*anyopaque, *anyopaque, u32) callconv(.c) void = null,
+};
+
+const surface_listener: SurfaceListener = .{ .enter = surfaceEnter, .leave = surfaceLeave };
 
 /// Clipboard and selection MIME types we offer and accept.
 const MIME_UTF8: [*:0]const u8 = "text/plain;charset=utf-8";
@@ -154,9 +170,14 @@ pub const WaylandConnection = struct {
     viewporter: ?*anyopaque = null,
     frac_manager: ?*anyopaque = null,
     outputs: [max_outputs]Output = @splat(.{}),
-    output_count: usize = 0,
     displays_: [max_outputs]Display = undefined,
     display_count: usize = 0,
+    /// The platform to report display changes to, once it is connected (see `LinuxPlatform.create`).
+    platform_: ?*platform.Platform = null,
+    /// The layout of the keymap the compositor sent, as last reported.
+    layout: xkb.LayoutName = .{},
+    /// Set by `hide_cursor_until_mouse_moves`; mouse motion clears it.
+    cursor_hidden: bool = false,
 
     xkb: ?xkb.Xkb = null,
     cursor_lib: ?dl.Library = null,
@@ -399,15 +420,28 @@ pub const WaylandConnection = struct {
         return n;
     }
 
+    /// Reads the layout now in effect and tells the app if it changed (GPUI `handle_keyboard_layout_change`).
+    fn refresh_keyboard_layout(self: *WaylandConnection) void {
+        const name: []const u8 = if (self.xkb) |*x| x.layout_name() orelse "unknown" else "unknown";
+        if (!self.layout.set(name)) return;
+        if (self.platform_) |p| p.emit_keyboard_layout_changed();
+    }
+
+    /// The layout in effect, as of the last keymap or modifiers event.
+    pub fn keyboard_layout(self: *const WaylandConnection) platform.KeyboardLayout {
+        return self.layout.get();
+    }
+
     /// Outputs as displays. Falls back to one 1920x1080 display before any
     /// wl_output mode has arrived.
     pub fn displays(self: *WaylandConnection) []const Display {
         self.display_count = 0;
-        for (self.outputs[0..self.output_count], 0..) |out, i| {
+        for (self.outputs) |out| {
+            if (out.proxy == null) continue;
             const scale: f32 = @floatFromInt(out.scale);
             const w: f32 = if (out.width > 0) @as(f32, @floatFromInt(out.width)) / scale else 1920;
             const h: f32 = if (out.height > 0) @as(f32, @floatFromInt(out.height)) / scale else 1080;
-            self.displays_[self.display_count] = .{ .id = @intCast(i), .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = w, .height = h } }, .scale_factor = scale };
+            self.displays_[self.display_count] = .{ .id = out.name, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = w, .height = h } }, .scale_factor = scale };
             self.display_count += 1;
         }
         if (self.display_count == 0) {
@@ -505,7 +539,9 @@ pub const WaylandConnection = struct {
     /// until fractional-scale-v1 reports the preferred one.
     fn max_output_scale(self: *const WaylandConnection) f32 {
         var best: i32 = 1;
-        for (self.outputs[0..self.output_count]) |out| best = @max(best, out.scale);
+        for (self.outputs) |out| {
+            if (out.proxy != null) best = @max(best, out.scale);
+        }
         return @floatFromInt(best);
     }
 
@@ -731,10 +767,21 @@ pub const WaylandConnection = struct {
         self.pointer_pos = .{ .x = proto.wlFixedToFloat(sx), .y = proto.wlFixedToFloat(sy) };
     }
 
+    /// Hides the cursor until the pointer moves (GPUI `hide_cursor_until_mouse_moves`).
+    pub fn hide_cursor_until_mouse_moves(self: *WaylandConnection) void {
+        if (self.cursor_hidden or self.pointer_focus == null) return;
+        self.cursor_hidden = true;
+        self.apply_cursor();
+    }
+
+    pub fn is_cursor_visible(self: *const WaylandConnection) bool {
+        return !self.cursor_hidden;
+    }
+
     fn apply_cursor(self: *WaylandConnection) void {
         const pointer = self.pointer orelse return;
         if (self.pointer_enter_serial == 0 or self.pointer_focus == null) return;
-        if (self.cursor_style == .none) {
+        if (self.cursor_style == .none or self.cursor_hidden) {
             _ = self.api.wl_proxy_marshal_flags(@ptrCast(pointer), 0, null, self.api.wl_proxy_get_version(@ptrCast(pointer)), 0, self.pointer_enter_serial, @as(?*anyopaque, null), @as(i32, 0), @as(i32, 0));
             return;
         }
@@ -1105,20 +1152,39 @@ fn registryGlobal(data: ?*anyopaque, reg: *proto.Registry, name: u32, iface: [*:
     } else if (std.mem.eql(u8, iface_name, "zwp_primary_selection_device_manager_v1")) {
         self.primary_manager = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.primary_device_manager_interface, @as(u32, 1), 0, name, proto.primary_device_manager_interface.name, @as(u32, 1), @as(?*anyopaque, null)));
     } else if (std.mem.eql(u8, iface_name, "wl_output")) {
-        if (self.output_count < max_outputs) {
+        if (free_output_slot(self)) |slot| {
             const ver: u32 = @min(version, 3);
             const out_iface = self.lib.lookup(*const proto.Interface, "wl_output_interface") orelse return;
             const proxy = api.wl_proxy_marshal_flags(@ptrCast(reg), 0, out_iface, ver, 0, name, out_iface.name, ver, out_iface);
             if (proxy) |p| {
-                self.outputs[self.output_count] = .{ .proxy = p, .name = name };
-                _ = api.wl_proxy_add_listener(p, &WaylandConnection.output_listener, &self.outputs[self.output_count]);
-                self.output_count += 1;
+                self.outputs[slot] = .{ .proxy = p, .name = name, .conn = self };
+                _ = api.wl_proxy_add_listener(p, &WaylandConnection.output_listener, &self.outputs[slot]);
             }
         }
     }
 }
 
-fn registryGlobalRemove(_: ?*anyopaque, _: *proto.Registry, _: u32) callconv(.c) void {}
+fn registryGlobalRemove(data: ?*anyopaque, _: *proto.Registry, name: u32) callconv(.c) void {
+    const self: *WaylandConnection = @ptrCast(@alignCast(data.?));
+    for (&self.outputs) |*out| {
+        if (out.proxy == null or out.name != name) continue;
+        // Compositors send `leave` for the windows on it first, so no window still names it.
+        self.api.wl_proxy_destroy(out.proxy.?);
+        out.* = .{};
+        report_displays_changed(self);
+        return;
+    }
+}
+
+fn free_output_slot(self: *WaylandConnection) ?usize {
+    for (self.outputs, 0..) |out, i| if (out.proxy == null) return i;
+    return null;
+}
+
+/// Tells the platform the outputs changed, so the app can diff its displays.
+fn report_displays_changed(self: *WaylandConnection) void {
+    if (self.platform_) |p| p.emit_displays_changed();
+}
 
 fn seatCapabilities(data: ?*anyopaque, _: *proto.Seat, caps: u32) callconv(.c) void {
     const self: *WaylandConnection = @ptrCast(@alignCast(data.?));
@@ -1140,8 +1206,39 @@ fn outputMode(data: ?*anyopaque, _: *anyopaque, flags: u32, w: i32, h: i32, _: i
 
 fn outputDone(data: ?*anyopaque, _: *anyopaque) callconv(.c) void {
     const out: *Output = @ptrCast(@alignCast(data.?));
+    const changed = out.width != out.pending_w or out.height != out.pending_h;
     out.width = out.pending_w;
     out.height = out.pending_h;
+    if (changed) if (out.conn) |c| report_displays_changed(c);
+}
+
+/// The registry name of the output with this `wl_output` proxy, if it is one we know.
+fn output_name(self: *WaylandConnection, proxy: *anyopaque) ?u32 {
+    for (self.outputs) |out| if (out.proxy != null and out.proxy == proxy) return out.name;
+    return null;
+}
+
+fn surfaceEnter(data: ?*anyopaque, _: *anyopaque, output: *anyopaque) callconv(.c) void {
+    const self: *WaylandWindow = @ptrCast(@alignCast(data.?));
+    const name = output_name(self.conn, output) orelse return;
+    for (self.entered_outputs[0..self.entered_count]) |n| if (n == name) return;
+    if (self.entered_count == self.entered_outputs.len) return;
+    self.entered_outputs[self.entered_count] = name;
+    self.entered_count += 1;
+    self.update_display_id();
+}
+
+fn surfaceLeave(data: ?*anyopaque, _: *anyopaque, output: *anyopaque) callconv(.c) void {
+    const self: *WaylandWindow = @ptrCast(@alignCast(data.?));
+    const name = output_name(self.conn, output) orelse return;
+    for (self.entered_outputs[0..self.entered_count], 0..) |n, i| {
+        if (n != name) continue;
+        var j = i;
+        while (j + 1 < self.entered_count) : (j += 1) self.entered_outputs[j] = self.entered_outputs[j + 1];
+        self.entered_count -= 1;
+        self.update_display_id();
+        return;
+    }
 }
 
 fn outputScale(data: ?*anyopaque, _: *anyopaque, factor: i32) callconv(.c) void {
@@ -1190,6 +1287,10 @@ fn pointerLeave(data: ?*anyopaque, _: *proto.Pointer, _: u32, surface: *proto.Su
 
 fn pointerMotion(data: ?*anyopaque, _: *proto.Pointer, _: u32, sx: i32, sy: i32) callconv(.c) void {
     const self = pointerConn(data);
+    if (self.cursor_hidden) {
+        self.cursor_hidden = false;
+        self.apply_cursor();
+    }
     const w = self.pointer_focus orelse return;
     self.set_pointer_position(sx, sy);
     _ = w.base.emit_input(.{ .mouse_move = .{
@@ -1266,6 +1367,7 @@ fn keyboardKeymap(data: ?*anyopaque, _: *proto.Keyboard, format: u32, fd_: i32, 
     x.setKeymapBuffer(bytes, size) catch {
         self.xkb = null;
     };
+    self.refresh_keyboard_layout();
 }
 
 fn keyboardEnter(data: ?*anyopaque, _: *proto.Keyboard, serial: u32, surface: *proto.Surface, _: ?*anyopaque) callconv(.c) void {
@@ -1300,6 +1402,8 @@ fn keyboardModifiers(data: ?*anyopaque, _: *proto.Keyboard, _: u32, depressed: u
     const self = pointerConn(data);
     self.mods = depressed | latched;
     if (self.xkb) |*x| x.syncModifiers(depressed, latched, locked, group);
+    // The group is part of the modifiers, so a layout switch arrives here.
+    self.refresh_keyboard_layout();
     self.emit_modifiers();
 }
 
@@ -1564,6 +1668,7 @@ const PendingConfigure = struct {
     maximized: bool = false,
     fullscreen: bool = false,
     resizing: bool = false,
+    suspended: bool = false,
     tiling: platform.Tiling = .{},
 };
 
@@ -1571,6 +1676,13 @@ pub const WaylandWindow = struct {
     base: platform.PlatformWindow = .{ .vtable = &vtable },
     /// Which edges the compositor tiled the window against (xdg_toplevel states 5 to 8).
     tiling: platform.Tiling = .{},
+    /// `hidden` while the compositor says the window is suspended (xdg_toplevel state 9).
+    visibility_: platform.WindowVisibility = .visible,
+    /// The outputs the surface is on, in the order it entered them. The first is its display.
+    entered_outputs: [max_outputs]u32 = undefined,
+    entered_count: usize = 0,
+    /// The display id of `entered_outputs[0]`, as last reported to the platform window's callbacks.
+    display_id_: ?u32 = null,
     /// Shadow area of a client-decorated window (set_client_inset); null when never set.
     client_inset: ?f32 = null,
     allocator: std.mem.Allocator,
@@ -1646,6 +1758,9 @@ pub const WaylandWindow = struct {
         .window_decorations = windowDecorations,
         .set_client_inset = setClientInset,
         .close = close,
+        .visibility = windowVisibility,
+        .display_id = windowDisplayId,
+        .gpu_specs = windowGpuSpecs,
     };
 
     const xs_listener: proto.XdgSurfaceListener = .{ .configure = xdgSurfaceConfigure };
@@ -1671,6 +1786,7 @@ pub const WaylandWindow = struct {
         const surf_raw = a.wl_proxy_marshal_flags(@ptrCast(compositor), 0, a.wl_surface_interface, a.wl_proxy_get_version(@ptrCast(compositor)), 0, @as(?*anyopaque, null));
         self.surface = @ptrCast(surf_raw orelse return error.CannotCreateSurface);
         const surface = self.surface.?;
+        _ = a.wl_proxy_add_listener(@ptrCast(surface), &surface_listener, self);
 
         if (c.viewporter) |vm| {
             const vp = a.wl_proxy_marshal_flags(@ptrCast(vm), 1, &proto.viewport_interface, a.wl_proxy_get_version(@ptrCast(vm)), 0, @as(?*anyopaque, null), @as(*anyopaque, @ptrCast(surface)));
@@ -2107,6 +2223,7 @@ pub const WaylandWindow = struct {
         self.maximized = pending.maximized;
         self.fullscreen = pending.fullscreen;
         self.tiling = pending.tiling;
+        self.set_visibility(if (pending.suspended) .hidden else .visible);
         if (!(pending.resizing and self.resize_throttle)) {
             if (pending.resizing) self.resize_throttle = true;
             self.apply_configured_size(pending.width, pending.height);
@@ -2119,6 +2236,38 @@ pub const WaylandWindow = struct {
             self.update_opaque_region();
             self.frame_wanted = true;
         }
+    }
+
+    fn set_visibility(self: *WaylandWindow, v: platform.WindowVisibility) void {
+        if (self.visibility_ == v) return;
+        self.visibility_ = v;
+        self.base.emit_visibility_changed();
+    }
+
+    /// The display is the output the surface entered first. Reports a change.
+    fn update_display_id(self: *WaylandWindow) void {
+        const now: ?u32 = if (self.entered_count > 0) self.entered_outputs[0] else null;
+        if (now == self.display_id_) return;
+        self.display_id_ = now;
+        self.base.emit_display_changed();
+    }
+
+    fn windowVisibility(p: *platform.PlatformWindow) platform.WindowVisibility {
+        return from_base(p).visibility_;
+    }
+
+    fn windowDisplayId(p: *platform.PlatformWindow) ?platform.DisplayId {
+        return from_base(p).display_id_;
+    }
+
+    fn windowGpuSpecs(p: *platform.PlatformWindow) ?platform.GpuSpecs {
+        const self = from_base(p);
+        if (self.gpu_window) |*g| return g.gpu_specs();
+        return null;
+    }
+
+    fn from_base(p: *platform.PlatformWindow) *WaylandWindow {
+        return @fieldParentPtr("base", p);
     }
 
     fn apply_configured_size(self: *WaylandWindow, width: i32, height: i32) void {
@@ -2149,6 +2298,7 @@ pub const WaylandWindow = struct {
                     6 => pending.tiling.right = true, // xdg_toplevel.state.tiled_right
                     7 => pending.tiling.top = true, // xdg_toplevel.state.tiled_top
                     8 => pending.tiling.bottom = true, // xdg_toplevel.state.tiled_bottom
+                    9 => pending.suspended = true, // xdg_toplevel.state.suspended (xdg-shell v6)
                     else => {},
                 };
             }

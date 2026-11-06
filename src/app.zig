@@ -431,6 +431,29 @@ pub fn Context(comptime T: type) type {
             return self.window_subscriber(.window_activation, window, f);
         }
 
+        /// Runs `f(this, visibility, window, cx)` when the visibility of `window` changes (GPUI
+        /// `observe_window_visibility`). Only changes are reported.
+        pub fn observe_window_visibility(self: *Self, window: *Window, comptime f: anytype) Subscription {
+            const me = self.entity_id_;
+            const S = struct {
+                fn call(app: *App, _: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                    const id = EntityId.from_u64(ctx);
+                    const state = app.entities.get(id) orelse return false;
+                    const win: *Window = @ptrCast(@alignCast(@constCast(payload.?)));
+                    var c: Context(T) = .{ .app = app, .entity_id_ = id };
+                    f(@as(*T, @ptrCast(@alignCast(state))), win.visibility_, win, &c);
+                    return true;
+                }
+            };
+            return self.app.add_window_subscriber(.window_visibility, window.handle_id, me.as_u64(), S.call);
+        }
+
+        /// Runs `f(this, window, cx)` when `window` moves to another display, or the display it is on
+        /// changes (GPUI `observe_window_display`).
+        pub fn observe_window_display(self: *Self, window: *Window, comptime f: anytype) Subscription {
+            return self.window_subscriber(.window_display, window, f);
+        }
+
         fn window_subscriber(self: *Self, comptime kind: SubscriberKind, window: *Window, comptime f: anytype) Subscription {
             const me = self.entity_id_;
             const S = struct {
@@ -928,7 +951,32 @@ const SubscriberKind = enum {
     new_entity,
     /// Graphemes that no font drew (`App.on_missing_glyphs`).
     missing_glyphs,
+    /// A window's visibility changed (`Window.observe_window_visibility`).
+    window_visibility,
+    /// A window moved to another display, or its display changed (`Window.observe_window_display`).
+    window_display,
+    /// A display was added, removed or changed (`App.observe_displays`).
+    displays,
+    /// The keyboard layout changed (`App.on_keyboard_layout_change`).
+    keyboard_layout,
+    /// The app was reopened (`App.on_reopen`).
+    reopen,
 };
+
+/// When the cursor is hidden in response to typing (GPUI `CursorHideMode`). The cursor comes back
+/// when the mouse moves.
+pub const CursorHideMode = enum {
+    /// Never hide the cursor automatically.
+    never,
+    /// Hide on character-producing key presses (typing).
+    on_typing,
+    /// Hide on character-producing key presses, and when a key binding resolves to an action
+    /// that consumes the keystroke.
+    on_typing_and_action,
+};
+
+/// A display's bounds, as the app last saw them. Ids are the platform's.
+const DisplayState = struct { id: platform_mod.DisplayId, bounds: geometry.Bounds(Pixels) };
 
 /// A context allocated for one subscriber. `Subscriber.ctx` is its address, and `free` releases it
 /// when the subscriber goes away.
@@ -1104,6 +1152,12 @@ pub const App = struct {
     propagate_event: bool = true,
     /// The subscription ids each `Subscription.join` made. Freed by `deinit`.
     subscription_groups: std.ArrayList(std.ArrayList(u64)) = .empty,
+    /// The displays as of the last display notification. Diffed to produce `DisplayEvent`s.
+    display_snapshot: std.ArrayList(DisplayState) = .empty,
+    /// Hides the cursor on keyboard input (GPUI `cursor_hide_mode`).
+    cursor_hide_mode_: CursorHideMode = .on_typing_and_action,
+    /// Storage for `window_stack`; its slice is valid until the next call.
+    window_stack_storage: std.ArrayList(window_mod.AnyWindowHandle) = .empty,
     async_app: AsyncApp = undefined,
 
     pub fn init(allocator: std.mem.Allocator, platform: *platform_mod.Platform) !*App {
@@ -1132,11 +1186,31 @@ pub const App = struct {
                 }
             }.redraw,
         };
+        platform.set_callbacks(.{
+            .ctx = app,
+            .displays_changed = struct {
+                fn f(ctx: *anyopaque) void {
+                    const self: *App = @ptrCast(@alignCast(ctx));
+                    self.displays_changed();
+                }
+            }.f,
+            .keyboard_layout_changed = struct {
+                fn f(ctx: *anyopaque) void {
+                    const self: *App = @ptrCast(@alignCast(ctx));
+                    self.dispatch_keyboard_layout_change();
+                }
+            }.f,
+        });
+        app.read_display_snapshot() catch oom();
         return app;
     }
 
     pub fn deinit(self: *App) void {
         self.shutdown();
+        // The platform must not call back into an app that is going away.
+        self.platform.callbacks = null;
+        self.display_snapshot.deinit(self.allocator);
+        self.window_stack_storage.deinit(self.allocator);
         if (self.system_notification_response) |h| h.free(self.allocator, h.ctx);
         self.system_notification_response = null;
         // Each slot is cleared before its window is destroyed, as close_window does, so a window
@@ -2097,6 +2171,210 @@ pub const App = struct {
         handler.func(handler.ctx, response, self);
     }
 
+    /// Runs `f(event, cx)` when a display is connected, disconnected, or its bounds change (GPUI
+    /// `observe_displays`). The platform says when displays may have changed; the app diffs them.
+    pub fn observe_displays(self: *App, comptime f: anytype) Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const event: *const platform_mod.DisplayEvent = @ptrCast(@alignCast(payload.?));
+                f(event.*, app);
+                return true;
+            }
+        };
+        return self.add_subscriber(.{ .kind = .displays, .emitter = 0, .ctx = 0, .func = S.call, .id = 0 });
+    }
+
+    fn read_display_snapshot(self: *App) !void {
+        self.display_snapshot.clearRetainingCapacity();
+        for (self.platform.displays()) |d| try self.display_snapshot.append(self.allocator, .{ .id = d.id, .bounds = d.bounds });
+    }
+
+    /// Whether the app has seen a display with this id, as of its last display notification (GPUI `knows_display`).
+    pub fn knows_display(self: *App, id: platform_mod.DisplayId) bool {
+        return find_display_state(self.display_snapshot.items, id) != null;
+    }
+
+    fn find_display_state(list: []const DisplayState, id: platform_mod.DisplayId) ?DisplayState {
+        for (list) |d| if (d.id == id) return d;
+        return null;
+    }
+
+    /// The platform's displays changed. Diffs them against the last snapshot, tells the windows on
+    /// each changed display, then runs the `observe_displays` observers (GPUI `displays_changed`).
+    pub fn displays_changed(self: *App) void {
+        var current: std.ArrayList(DisplayState) = .empty;
+        defer current.deinit(self.allocator);
+        for (self.platform.displays()) |d| current.append(self.allocator, .{ .id = d.id, .bounds = d.bounds }) catch oom();
+
+        // Removed first, then added and changed, as GPUI orders them.
+        var events: std.ArrayList(platform_mod.DisplayEvent) = .empty;
+        defer events.deinit(self.allocator);
+        for (self.display_snapshot.items) |old| {
+            if (find_display_state(current.items, old.id) == null) events.append(self.allocator, .{ .removed = old.id }) catch oom();
+        }
+        for (current.items) |fresh| {
+            if (find_display_state(self.display_snapshot.items, fresh.id)) |old| {
+                if (!std.meta.eql(old.bounds, fresh.bounds)) events.append(self.allocator, .{ .changed = .{ .id = fresh.id, .changes = .{ .bounds = true } } }) catch oom();
+            } else {
+                events.append(self.allocator, .{ .added = fresh.id }) catch oom();
+            }
+        }
+        std.mem.swap(std.ArrayList(DisplayState), &self.display_snapshot, &current);
+
+        self.pending_updates += 1;
+        defer {
+            self.pending_updates -= 1;
+            if (self.pending_updates == 0) self.flush_effects();
+        }
+        for (events.items) |event| switch (event) {
+            .changed => |c| for (self.windows.items) |maybe_win| {
+                const win = maybe_win orelse continue;
+                if (win.display_id_ == c.id) win.notify_display_observers(self);
+            },
+            else => {},
+        };
+        for (events.items) |*event| {
+            var i: usize = 0;
+            while (i < self.subscribers.items.len) : (i += 1) {
+                const sub = self.subscribers.items[i];
+                if (!sub.active or sub.kind != .displays) continue;
+                if (!sub.func(self, EntityId.from_u64(0), sub.ctx, event)) self.subscribers.items[i].active = false;
+            }
+        }
+    }
+
+    /// Runs the observers of a global kind with `payload`, then flushes what they queued.
+    fn dispatch_global(self: *App, kind: SubscriberKind, payload: ?*const anyopaque) void {
+        self.pending_updates += 1;
+        defer {
+            self.pending_updates -= 1;
+            if (self.pending_updates == 0) self.flush_effects();
+        }
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != kind) continue;
+            if (!sub.func(self, EntityId.from_u64(0), sub.ctx, payload)) self.subscribers.items[i].active = false;
+        }
+    }
+
+    /// The current keyboard layout (GPUI `keyboard_layout`).
+    pub fn keyboard_layout(self: *App) platform_mod.KeyboardLayout {
+        return self.platform.keyboard_layout();
+    }
+
+    /// The keyboard mapper (GPUI `keyboard_mapper`). Linux maps nothing, as GPUI's does.
+    pub fn keyboard_mapper(_: *App) platform_mod.KeyboardMapper {
+        return .{};
+    }
+
+    /// Runs `f(cx)` when the keyboard layout changes (GPUI `on_keyboard_layout_change`).
+    pub fn on_keyboard_layout_change(self: *App, comptime f: fn (*App) void) Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, _: ?*const anyopaque) bool {
+                f(app);
+                return true;
+            }
+        };
+        return self.add_subscriber(.{ .kind = .keyboard_layout, .emitter = 0, .ctx = 0, .func = S.call, .id = 0 });
+    }
+
+    /// The keyboard layout changed: runs the `on_keyboard_layout_change` observers.
+    pub fn dispatch_keyboard_layout_change(self: *App) void {
+        self.dispatch_global(.keyboard_layout, null);
+    }
+
+    /// Runs `f(cx)` when the app is reopened (GPUI `on_reopen`). Only macOS reports reopens, as
+    /// GPUI's Linux platform never calls its reopen callback either.
+    pub fn on_reopen(self: *App, comptime f: fn (*App) void) Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, _: ?*const anyopaque) bool {
+                f(app);
+                return true;
+            }
+        };
+        return self.add_subscriber(.{ .kind = .reopen, .emitter = 0, .ctx = 0, .func = S.call, .id = 0 });
+    }
+
+    /// Runs the `on_reopen` observers. A platform calls it when the user reopens a running app.
+    pub fn dispatch_reopen(self: *App) void {
+        self.dispatch_global(.reopen, null);
+    }
+
+    /// When the cursor is hidden on keyboard input (GPUI `cursor_hide_mode`).
+    pub fn cursor_hide_mode(self: *App) CursorHideMode {
+        return self.cursor_hide_mode_;
+    }
+
+    /// Sets when the cursor is hidden on keyboard input (GPUI `set_cursor_hide_mode`).
+    pub fn set_cursor_hide_mode(self: *App, mode: CursorHideMode) void {
+        self.cursor_hide_mode_ = mode;
+    }
+
+    /// Whether the cursor is visible, as the platform reports it (GPUI `is_cursor_visible`).
+    pub fn is_cursor_visible(self: *App) bool {
+        return self.platform.is_cursor_visible();
+    }
+
+    /// Hides the cursor until the mouse moves over one of the app's windows.
+    pub fn hide_cursor_until_mouse_moves(self: *App) void {
+        self.platform.hide_cursor_until_mouse_moves();
+    }
+
+    /// The display server's environment, or null while headless (GPUI `graphical_environment`).
+    pub fn graphical_environment(self: *App) ?platform_mod.GraphicalEnvironment {
+        return self.platform.graphical_environment();
+    }
+
+    /// The compositor in use on Linux, empty elsewhere (GPUI `compositor_name`).
+    pub fn compositor_name(self: *App) []const u8 {
+        return self.platform.compositor_name();
+    }
+
+    /// The host OS and application target (GPUI `platform_info`).
+    pub fn platform_info(self: *App) platform_mod.PlatformInfo {
+        return self.platform.platform_info();
+    }
+
+    /// Whether the user wants scrollbars to hide themselves (GPUI `should_auto_hide_scrollbars`).
+    pub fn should_auto_hide_scrollbars(self: *App) bool {
+        return self.platform.should_auto_hide_scrollbars();
+    }
+
+    /// Sets whether the app takes part in the system's foreground UI (GPUI `set_activation_policy`).
+    /// Only macOS acts on it.
+    pub fn set_activation_policy(self: *App, policy: platform_mod.ActivationPolicy) void {
+        self.platform.set_activation_policy(policy);
+    }
+
+    /// Hides the other applications (GPUI `hide_other_apps`). Linux ignores it, as GPUI does.
+    pub fn hide_other_apps(self: *App) void {
+        self.platform.hide_other_apps();
+    }
+
+    /// Shows the applications hidden by `hide_other_apps` (GPUI `unhide_other_apps`).
+    pub fn unhide_other_apps(self: *App) void {
+        self.platform.unhide_other_apps();
+    }
+
+    /// The windows ordered front to back, the active one first; null when the platform cannot say
+    /// (GPUI `window_stack`). Windows of other applications are left out. The slice is valid until
+    /// the next call.
+    pub fn window_stack(self: *App) ?[]const window_mod.AnyWindowHandle {
+        const platform_windows = self.platform.window_stack() orelse return null;
+        self.window_stack_storage.clearRetainingCapacity();
+        for (platform_windows) |pw| {
+            for (self.windows.items) |maybe_win| {
+                const win = maybe_win orelse continue;
+                if (win.platform_window == pw) {
+                    self.window_stack_storage.append(self.allocator, .{ .id = win.handle_id }) catch oom();
+                    break;
+                }
+            }
+        }
+        return self.window_stack_storage.items;
+    }
+
     pub fn displays(self: *App) []const platform_mod.Display {
         return self.platform.displays();
     }
@@ -2325,6 +2603,12 @@ pub const Application = struct {
     }
 
     /// Registers a callback for when the app is asked to open URLs.
+    /// Runs `f(app)` when the app is reopened (GPUI `Application::on_reopen`).
+    pub fn on_reopen(self: Application, comptime f: fn (*App) void) Application {
+        _ = self.app.on_reopen(f);
+        return self;
+    }
+
     pub fn on_open_urls(self: Application, comptime f: fn ([]const []const u8, *App) void) Application {
         _ = f;
         return self;
