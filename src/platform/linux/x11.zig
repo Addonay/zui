@@ -429,6 +429,9 @@ pub const X11Connection = struct {
     // -- windows ----------------------------------------------------------
 
     pub fn open_window(self: *X11Connection, options: window_mod.WindowOptions) !*X11Window {
+        // Native popups are not implemented on X11 yet, as in gpui_linux: callers fall back to
+        // an in-window popover.
+        if (options.kind == .anchored_popup) return platform.PopupNotSupportedError;
         try self.windows.ensureUnusedCapacity(self.allocator, 1);
         const b: PxBounds = if (options.window_bounds) |wb| wb.get_bounds() else .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1280, .height = 800 } };
         const w = try self.allocator.create(X11Window);
@@ -458,7 +461,7 @@ pub const X11Connection = struct {
                 self.set_window_type(x, self.atoms.net_wm_window_type_notification);
             },
             .dialog => self.set_window_type(x, self.atoms.net_wm_window_type_dialog),
-            .normal, .floating => {},
+            .normal, .floating, .anchored_popup => {},
         }
         var title_buf: [512]u8 = undefined;
         const title_src: []const u8 = if (options.titlebar) |t| (t.title orelse "ZUI") else "ZUI";

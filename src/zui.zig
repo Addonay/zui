@@ -404,5 +404,7 @@ test {
     _ = @import("elements/deferred.zig");
     _ = @import("elements/canvas.zig");
     _ = @import("platform/app_menu.zig");
+    _ = @import("platform/popup.zig");
+    _ = @import("platform/window_controls.zig");
     _ = @import("elements/animation.zig");
 }

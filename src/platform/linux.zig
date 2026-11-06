@@ -135,6 +135,7 @@ pub const LinuxPlatform = struct {
         .quit = quit,
         .deinit = deinit,
         .open_window = openWindow,
+        .button_layout = buttonLayout,
         .wake = wake,
         .displays = displays,
         .set_cursor_style = setCursorStyle,
@@ -484,10 +485,16 @@ pub const LinuxPlatform = struct {
         _ = std.os.linux.write(self.wake_fd, @ptrCast(&one), 8);
     }
 
-    fn openWindow(p: *platform.Platform, options: window_mod.WindowOptions) anyerror!*platform.PlatformWindow {
+    /// gpui_linux starts from its fallback layout and then takes the desktop's `button-layout`
+    /// from the settings portal. ZUI does not read that setting yet, so it keeps the fallback.
+    fn buttonLayout(_: *platform.Platform) ?platform.WindowButtonLayout {
+        return platform.WindowButtonLayout.linux_default();
+    }
+
+    fn openWindow(p: *platform.Platform, options: window_mod.WindowOptions, parent: ?*platform.PlatformWindow) anyerror!*platform.PlatformWindow {
         const self = from(p);
         const w: *platform.PlatformWindow = switch (self.backend) {
-            .wayland => |c| &(try c.open_window(options)).base,
+            .wayland => |c| &(try c.open_window(options, parent)).base,
             .x11 => |c| &(try c.open_window(options)).base,
         };
         self.ever_opened = true;

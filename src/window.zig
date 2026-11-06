@@ -103,7 +103,17 @@ pub const WindowBounds = union(enum) {
     }
 };
 
-pub const WindowKind = enum { normal, popup, floating, dialog };
+/// What kind of OS window to open (GPUI `WindowKind`).
+pub const WindowKind = union(enum) {
+    normal,
+    /// A window above all others, for alerts. Use sparingly.
+    popup,
+    /// A parent-anchored popup for menus and dropdowns (GPUI `AnchoredPopup`). Platforms without
+    /// a native implementation reject it with `error.PopupNotSupported`.
+    anchored_popup: platform_mod.PopupOptions,
+    floating,
+    dialog,
+};
 pub const WindowBackgroundAppearance = enum { @"opaque", transparent, blurred };
 pub const WindowDecorations = enum { server, client };
 
@@ -769,7 +779,12 @@ pub const Window = struct {
     pub fn create(app: *App, options: WindowOptions) !*Window {
         const gpa = app.allocator;
         const self = try gpa.create(Window);
-        const pw = try app.platform.open_window(options);
+        // An anchored popup names its parent by handle; the platform wants the parent's OS window.
+        const parent: ?*platform_mod.PlatformWindow = switch (options.kind) {
+            .anchored_popup => |popup| (app.window_by_id(popup.parent.id) orelse return error.PopupParentNotFound).platform_window,
+            else => null,
+        };
+        const pw = try app.platform.open_window(options, parent);
         self.* = .{
             .allocator = gpa,
             .app = app,
@@ -1207,6 +1222,11 @@ pub const Window = struct {
     /// Whether the platform reports the window as fullscreen (GPUI `is_fullscreen`).
     pub fn is_fullscreen(self: *const Window) bool {
         return self.platform_window.is_fullscreen();
+    }
+    /// What the window manager lets this window do: fullscreen, maximize, minimize and the window
+    /// menu (GPUI `window_controls`). Wayland reports it from xdg_toplevel.wm_capabilities.
+    pub fn window_controls(self: *const Window) platform_mod.WindowControls {
+        return self.platform_window.window_controls();
     }
     /// Sets the app id: xdg_toplevel's app_id on Wayland, WM_CLASS on X11 (GPUI `set_app_id`).
     pub fn set_app_id(self: *Window, app_id: []const u8) void {
