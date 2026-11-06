@@ -117,16 +117,9 @@ pub const ImgExt = struct {
             if (data.frame_count() == 0) return;
             const frame = e.frame_index;
             const new_bounds = e.object_fit_.get_bounds(bounds, data.size(frame));
-            const visible = bounds.intersect(new_bounds);
-            if (visible.size.width <= 0 or visible.size.height <= 0) return;
-            if (new_bounds.size.width <= 0 or new_bounds.size.height <= 0) return;
-
-            var builder = ImageTile{ .image = data, .frame = frame };
-            const key = atlas.AtlasKey{ .image = assets.image_atlas_key(data.id, frame) };
-            const tile = (window.sprite_atlas.get_or_insert_with(key, .{ .context = &builder, .build_fn = ImageTile.build }) catch return) orelse return;
-
-            const radii = s.corner_radii.to_pixels(window.rem_size()).clamp_radii_for_quad_size(visible.size);
-            window.paint_polychrome_tile(visible, radii, sub_tile(tile, new_bounds, visible), e.grayscale_);
+            window.paint_image(bounds, new_bounds, s.corner_radii.to_pixels(window.rem_size()), data, frame, e.grayscale_) catch |err| {
+                std.log.err("img: paint_image failed: {s}", .{@errorName(err)});
+            };
         } else if (e.replacement) |rep| {
             rep.prepaint(window, cx);
             rep.paint(window, cx);
@@ -191,19 +184,6 @@ const Measure = struct {
     }
 };
 
-/// Atlas builder for one frame of a decoded image. The pixels stay owned by the `RenderImage`.
-const ImageTile = struct {
-    image: *assets.RenderImage,
-    frame: usize,
-
-    fn build(raw: *anyopaque) anyerror!?atlas.TileData {
-        const self: *const ImageTile = @ptrCast(@alignCast(raw));
-        const bytes = self.image.as_bytes(self.frame) orelse return null;
-        const s = self.image.size(self.frame);
-        return .{ .size = s, .bytes = bytes };
-    }
-};
-
 /// Loads `source` (GPUI `ImageSource::use_data`). A URL, file or asset name goes through the image
 /// cache in scope, if an ancestor set one: that is where `null` means "still loading". Otherwise it
 /// goes through the app's own cache. A custom source is always asked, with this window.
@@ -216,23 +196,6 @@ fn load_image(source: assets.ImageSource, window: *Window, cx: *App) assets.Imag
         else => {},
     }
     return source.use_data(&cx.asset_cache, cx.asset_source);
-}
-
-/// The part of `tile` that shows `visible`, where `image` is the full drawn rectangle (GPUI's sub-tile for clipped images).
-fn sub_tile(tile: atlas.AtlasTile, image: Bounds(Pixels), visible: Bounds(Pixels)) atlas.AtlasTile {
-    if (visible.eq(image)) return tile;
-    const iw = image.size.width;
-    const ih = image.size.height;
-    const tw: f32 = @floatFromInt(tile.bounds.size.width);
-    const th: f32 = @floatFromInt(tile.bounds.size.height);
-    var out = tile;
-    const x_off = (visible.origin.x - image.origin.x) / iw;
-    const y_off = (visible.origin.y - image.origin.y) / ih;
-    out.bounds.origin.x = tile.bounds.origin.x + @as(DevicePixels, @intFromFloat(@round(x_off * tw)));
-    out.bounds.origin.y = tile.bounds.origin.y + @as(DevicePixels, @intFromFloat(@round(y_off * th)));
-    out.bounds.size.width = @max(1, @as(DevicePixels, @intFromFloat(@round(visible.size.width / iw * tw))));
-    out.bounds.size.height = @max(1, @as(DevicePixels, @intFromFloat(@round(visible.size.height / ih * th))));
-    return out;
 }
 
 test "measure keeps the aspect ratio of the intrinsic size" {
@@ -248,21 +211,6 @@ test "measure keeps the aspect ratio of the intrinsic size" {
 
     const width_known = Measure.measure(ctx, .{ .width = 50, .height = null }, no_space, &win, &app);
     try std.testing.expectEqual(@as(f32, 25), width_known.height);
-}
-
-test "sub_tile crops the atlas tile to the visible part" {
-    const tile: atlas.AtlasTile = .{
-        .texture_id = .{ .index = 0, .kind = .polychrome },
-        .tile_id = .{ .value = 1 },
-        .padding = 0,
-        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 200, .height = 100 } },
-    };
-    // Image drawn at 100x100 but only the right half of a 200x100 cover is visible.
-    const image: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 200, .height = 100 } };
-    const visible: Bounds(Pixels) = .{ .origin = .{ .x = 50, .y = 0 }, .size = .{ .width = 100, .height = 100 } };
-    const sub = sub_tile(tile, image, visible);
-    try std.testing.expectEqual(@as(DevicePixels, 50), sub.bounds.origin.x);
-    try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.size.width);
 }
 
 test "element protocol instantiates the image hooks" {

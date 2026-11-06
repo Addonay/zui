@@ -536,13 +536,14 @@ pub const UniformList = struct {
 
         const rem = window.rem_size();
         const radii = s.corner_radii.to_pixels(rem).clamp_radii_for_quad_size(bounds.size);
-        window.paint_shadows(bounds, radii, s.box_shadow);
+        window.paint_drop_shadows(bounds, radii, s.box_shadow);
         if (s.background) |bgf| {
             const bgc = bgf.get_color() orelse color_mod.to_background(color_mod.transparent_black());
             if (!bgc.is_transparent()) {
                 window.paint_quad(.{ .bounds = bounds, .corner_radii = radii, .background = bgc });
             }
         }
+        window.paint_inset_shadows(bounds, radii, s.box_shadow);
 
         const mask = s.overflow_mask(bounds, rem);
         if (mask) |mk| window.push_content_mask(.{ .bounds = mk });
