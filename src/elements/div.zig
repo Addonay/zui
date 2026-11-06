@@ -71,7 +71,7 @@ pub const GroupStyle = struct {
 
 /// Converts `fn(*StyleRefinement) *StyleRefinement`-style callbacks or a
 /// ready-made `*StyleRefinement` (see `style()`) into a refinement pointer.
-fn to_style_refinement(f: anytype) *StyleRefinement {
+pub fn to_style_refinement(f: anytype) *StyleRefinement {
     const T = @TypeOf(f);
     if (T == *StyleRefinement) return f;
     if (T == *StyleBuilder) return f.s;
@@ -3411,7 +3411,7 @@ pub const ScrollAnchor = struct {
     pub fn scroll_to(self: ScrollAnchor, window: *Window, cx: *App) void {
         _ = cx;
         self.handle.state.anchor_request = self;
-        window.refresh();
+        window.notify_current_view();
     }
 };
 const GroupDragOverStyle = struct { type_id: app_mod.TypeId, group: []const u8, style: *StyleRefinement };
@@ -3616,7 +3616,7 @@ fn show_long_press_tooltip(st: *InteractiveElementState, position: Point(Pixels)
     if (st.tooltip_view == null) return false;
     st.tooltip_mouse = position;
     st.tooltip_phase = .visible;
-    window.refresh();
+    window.notify_current_view();
     return true;
 }
 
@@ -3628,7 +3628,7 @@ fn clear_tooltip(st: *InteractiveElementState, window: *Window, cx: *App) void {
         st.tooltip_view = null;
         cx.release_entity(view.entity_id);
     }
-    if (had) window.refresh();
+    if (had) window.notify_current_view();
 }
 
 fn pointer_on_tooltip(window: *const Window) bool {
@@ -3655,10 +3655,10 @@ fn tooltip_on_mouse_move(st: *InteractiveElementState, hovered_now: bool, phase:
             st.tooltip_phase = .none;
         },
         .visible => if (phase == .capture and !hovered and !(st.tooltip_hoverable and pointer_on_tooltip(window))) {
-            window.refresh();
+            window.notify_current_view();
         },
         .waiting_for_hide => if (phase == .capture and (hovered or pointer_on_tooltip(window))) {
-            window.refresh();
+            window.notify_current_view();
         },
     }
 }
@@ -3714,7 +3714,7 @@ const TooltipTimer = struct {
         self.app.pending_updates -= 1;
         st.tooltip_mouse = window.mouse_position();
         st.tooltip_phase = .visible;
-        window.refresh();
+        window.notify_current_view();
         self.app.flush_effects();
     }
 
@@ -4514,7 +4514,9 @@ pub fn StyledElement(comptime Ext: type) type {
                 }
             }
 
-            pp.style = it.compute_style(if (pp.hitbox) |*hbx| hbx else null, pp.state, window, cx);
+            // Without the hitbox: what is hovered is only known once prepaint has finished. Paint
+            // computes it again with the hitbox, as GPUI does.
+            pp.style = it.compute_style(null, pp.state, window, cx);
             const s = &pp.style;
 
             const has_text = s.text_style() != null;
@@ -4579,6 +4581,7 @@ pub fn StyledElement(comptime Ext: type) type {
         pub fn paint(self: *Self, gid: ?*const GlobalElementId, bounds: Bounds(Pixels), rl: *DivFrameState, pp: *DivPrepaintState, window: *Window, cx: *App) void {
             _ = gid;
             _ = rl;
+            pp.style = self.interactivity.compute_style(if (pp.hitbox) |*hbx| hbx else null, pp.state, window, cx);
             const s = &pp.style;
             if (s.visibility == .hidden) return;
             const it = &self.interactivity;
@@ -4733,7 +4736,7 @@ pub fn StyledElement(comptime Ext: type) type {
                 if (it.click_listeners.items.len > 0 and e.button == .left) st.pending_mouse_down = e.*;
                 if (it.active_style != null or it.group != null) {
                     st.active = true;
-                    window.refresh();
+                    window.notify_current_view();
                 }
             }
         }
@@ -4764,7 +4767,7 @@ pub fn StyledElement(comptime Ext: type) type {
                     if (st.pending_mouse_down) |down| {
                         st.pending_mouse_down = null;
                         if (hovered) st.captured_mouse_down = down;
-                        window.refresh();
+                        window.notify_current_view();
                     }
                 }
                 return;
@@ -4787,7 +4790,7 @@ pub fn StyledElement(comptime Ext: type) type {
             if (c.state) |st| {
                 if (st.active) {
                     st.active = false;
-                    window.refresh();
+                    window.notify_current_view();
                 }
                 if (st.captured_mouse_down) |down| {
                     st.captured_mouse_down = null;
@@ -4837,7 +4840,7 @@ pub fn StyledElement(comptime Ext: type) type {
             if (c.state) |st| {
                 if (st.hovered != hovered) {
                     st.hovered = hovered;
-                    if (it.hover_style != null or it.group != null) window.refresh();
+                    if (it.hover_style != null or it.group != null) window.notify_current_view();
                 }
                 if (it.hover_listener) |hl| {
                     // Not while a button is held or a drag runs, as in GPUI.
@@ -4850,9 +4853,9 @@ pub fn StyledElement(comptime Ext: type) type {
                 }
             } else if (it.hover_style != null) {
                 // Without persistent state, refresh whenever hover may have changed.
-                window.refresh();
+                window.notify_current_view();
             }
-            if (it.group_hover_style != null) window.refresh();
+            if (it.group_hover_style != null) window.notify_current_view();
         }
 
         fn onMouseExit(raw: *anyopaque, e: *const MouseExitEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
@@ -4917,7 +4920,7 @@ pub fn StyledElement(comptime Ext: type) type {
             if (off.x == old.x and off.y == old.y) return;
             if (it.tracked_scroll_handle) |sh| sh.set_offset(off);
             if (c.state) |st| st.scroll_offset = off;
-            window.refresh();
+            window.notify_current_view();
         }
 
         // Styled methods (generated from styled.zig).

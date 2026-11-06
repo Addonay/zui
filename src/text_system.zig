@@ -341,7 +341,11 @@ pub const TextSystem = struct {
     fs: cozmic.FontSystem,
     raster: ?cozmic.Raster = null,
     swash: ?cozmic.SwashCache = null,
+    /// For text laid out outside any window's draw.
     layout_cache: LineLayoutCache,
+    /// The cache in use: the drawing window's while it draws (GPUI's `WindowTextSystem` has one per
+    /// window), since a cached view's layouts are named by position in its own window's frames.
+    active_cache: *LineLayoutCache,
 
     fonts: std.ArrayList(FontEntry) = .empty,
     /// Hash of a `Font` to its entry; verified with `Font.eql` on lookup.
@@ -375,9 +379,11 @@ pub const TextSystem = struct {
             .allocator = allocator,
             .fs = try cozmic.FontSystem.init(allocator),
             .layout_cache = undefined,
+            .active_cache = undefined,
         };
         errdefer self.fs.deinit();
-        self.layout_cache = LineLayoutCache.init(allocator, .{ .ctx = self, .shape_fn = shape_for_cache });
+        self.layout_cache = self.new_layout_cache();
+        self.active_cache = &self.layout_cache;
 
         const io = std.Io.Threaded.global_single_threaded.io();
         _ = self.fs.loadSystemFonts(io);
@@ -840,7 +846,7 @@ pub const TextSystem = struct {
         var buf: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(ch, &buf) catch return 0;
         const runs = [_]FontRun{.{ .len = n, .font_id = fid }};
-        const layout = self.layout_cache.layout_line(buf[0..n], font_size, &runs, null) catch return 0;
+        const layout = self.active_cache.layout_line(buf[0..n], font_size, &runs, null) catch return 0;
         return layout.width;
     }
 
@@ -853,7 +859,7 @@ pub const TextSystem = struct {
 
     /// Shapes `text` as one line, with each run's font (GPUI `layout_line`), through the cache.
     pub fn layout_line(self: *TextSystem, text: []const u8, font_size: Pixels, runs: []const FontRun, force_width: ?Pixels) !*const LineLayout {
-        return self.layout_cache.layout_line(text, font_size, runs, force_width);
+        return self.active_cache.layout_line(text, font_size, runs, force_width);
     }
 
     /// Shapes `text` as one line, styled by `runs` (GPUI `shape_line`). `text` must not contain newlines.
@@ -874,7 +880,7 @@ pub const TextSystem = struct {
 
         try self.build_font_runs(runs);
         try self.apply_text_presentation(text, &self.font_runs_scratch);
-        const layout = try self.layout_cache.layout_line(text, font_size, self.font_runs_scratch.items, force_width);
+        const layout = try self.active_cache.layout_line(text, font_size, self.font_runs_scratch.items, force_width);
         return .{ .layout = layout, .text = layout.text, .decoration_runs = decorations.items };
     }
 
@@ -936,7 +942,7 @@ pub const TextSystem = struct {
 
             try self.apply_text_presentation(line_text, &self.font_runs_scratch);
             const max_lines: ?usize = if (line_clamp) |max| max -| wrapped_lines else null;
-            const layout = try self.layout_cache.layout_wrapped_line(line_text, font_size, self.font_runs_scratch.items, wrap_width, max_lines);
+            const layout = try self.active_cache.layout_wrapped_line(line_text, font_size, self.font_runs_scratch.items, wrap_width, max_lines);
             wrapped_lines += layout.wrap_boundaries().len;
             try lines.append(arena, .{ .layout = layout, .text = layout.unwrapped_layout.text, .decoration_runs = decorations.items });
 
@@ -1076,6 +1082,11 @@ pub const TextSystem = struct {
     /// Ends the frame: frees layouts that were not used in it or the previous one.
     pub fn finish_frame(self: *TextSystem) void {
         self.layout_cache.finish_frame();
+    }
+
+    /// A cache that shapes with this text system, for a window to own.
+    pub fn new_layout_cache(self: *TextSystem) LineLayoutCache {
+        return LineLayoutCache.init(self.allocator, .{ .ctx = self, .shape_fn = shape_for_cache });
     }
 
     // -- shaping backend -----------------------------------------------------

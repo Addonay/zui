@@ -555,6 +555,9 @@ fn FrameCache(comptime V: type) type {
         /// Entries that collided with a hash already in use; they live for the same two frames.
         current_extra: std.ArrayList(*Entry) = .empty,
         previous_extra: std.ArrayList(*Entry) = .empty,
+        /// Every entry asked for in a frame, in order, so a cached view can name the ones it used.
+        current_used: std.ArrayList(*Entry) = .empty,
+        previous_used: std.ArrayList(*Entry) = .empty,
 
         fn hash_key(k: Key) u64 {
             var h = std.hash.Wyhash.init(0x5a17_c0de);
@@ -581,7 +584,10 @@ fn FrameCache(comptime V: type) type {
         /// Finds `k` in the current frame, or moves it from the previous frame into the current one.
         fn take(self: *Self, allocator: Allocator, h: u64, k: Key) !?*Entry {
             if (self.current.get(h)) |e| {
-                if (matches(e, k)) return e;
+                if (matches(e, k)) {
+                    try self.current_used.append(allocator, e);
+                    return e;
+                }
             }
             if (self.previous.get(h)) |e| {
                 if (matches(e, k)) {
@@ -593,7 +599,25 @@ fn FrameCache(comptime V: type) type {
             return null;
         }
 
+        /// Keeps the entries that `start..end` of the previous frame used alive for another frame
+        /// (GPUI `reuse_layouts`). They are live: entries are only freed when a frame finishes.
+        fn reuse(self: *Self, allocator: Allocator, start: usize, end: usize) !void {
+            for (self.previous_used.items[start..end]) |e| {
+                if (self.previous.get(e.hash) == e) {
+                    _ = self.previous.remove(e.hash);
+                    try self.insert(allocator, e);
+                } else if (std.mem.indexOfScalar(*Entry, self.previous_extra.items, e)) |i| {
+                    _ = self.previous_extra.swapRemove(i);
+                    try self.insert(allocator, e);
+                } else {
+                    // Already moved over, by this list or by a request in the current frame.
+                    try self.current_used.append(allocator, e);
+                }
+            }
+        }
+
         fn insert(self: *Self, allocator: Allocator, e: *Entry) !void {
+            try self.current_used.append(allocator, e);
             if (self.current.contains(e.hash)) {
                 try self.current_extra.append(allocator, e);
             } else {
@@ -611,6 +635,8 @@ fn FrameCache(comptime V: type) type {
 
             std.mem.swap(std.AutoHashMapUnmanaged(u64, *Entry), &self.previous, &self.current);
             std.mem.swap(std.ArrayList(*Entry), &self.previous_extra, &self.current_extra);
+            self.previous_used.clearRetainingCapacity();
+            std.mem.swap(std.ArrayList(*Entry), &self.previous_used, &self.current_used);
         }
 
         fn destroy(allocator: Allocator, e: *Entry) void {
@@ -630,9 +656,17 @@ fn FrameCache(comptime V: type) type {
             self.previous.deinit(allocator);
             self.current_extra.deinit(allocator);
             self.previous_extra.deinit(allocator);
+            self.current_used.deinit(allocator);
+            self.previous_used.deinit(allocator);
         }
     };
 }
+
+/// A position in the layouts used by the frame being drawn (GPUI `LineLayoutIndex`).
+pub const LineLayoutIndex = struct {
+    lines_index: usize = 0,
+    wrapped_lines_index: usize = 0,
+};
 
 /// Shapes lines of text and caches the results across frames (GPUI `LineLayoutCache`).
 pub const LineLayoutCache = struct {
@@ -723,6 +757,25 @@ pub const LineLayoutCache = struct {
         return &e.value;
     }
 
+    /// How many layouts the frame being drawn has asked for so far (GPUI `layout_index`).
+    pub fn layout_index(self: *const LineLayoutCache) LineLayoutIndex {
+        return .{ .lines_index = self.lines.current_used.items.len, .wrapped_lines_index = self.wrapped.current_used.items.len };
+    }
+
+    /// Carries the layouts that `start..end` of the previous frame used into this one, because the
+    /// view that used them is being reused without laying them out again (GPUI `reuse_layouts`).
+    pub fn reuse_layouts(self: *LineLayoutCache, start: LineLayoutIndex, end: LineLayoutIndex) !void {
+        try self.lines.reuse(self.allocator, start.lines_index, end.lines_index);
+        try self.wrapped.reuse(self.allocator, start.wrapped_lines_index, end.wrapped_lines_index);
+    }
+
+    /// Forgets the layouts asked for since `index`, which a failed `Window.transact` rolled back
+    /// (GPUI `truncate_layouts`). They stay cached, and are freed as usual if nothing asks again.
+    pub fn truncate_layouts(self: *LineLayoutCache, index: LineLayoutIndex) void {
+        self.lines.current_used.shrinkRetainingCapacity(index.lines_index);
+        self.wrapped.current_used.shrinkRetainingCapacity(index.wrapped_lines_index);
+    }
+
     /// Ends the frame: frees layouts unused since the previous frame and rotates the caches.
     pub fn finish_frame(self: *LineLayoutCache) void {
         // Wrapped entries reference unwrapped layouts, so free them first.
@@ -755,6 +808,51 @@ fn free_test_layout(layout: *LineLayout) void {
 fn glyph_x_positions(layout: *const LineLayout, out: []f32) []f32 {
     for (layout.runs[0].glyphs, 0..) |g, i| out[i] = g.position.x;
     return out[0..layout.runs[0].glyphs.len];
+}
+
+const FakeShaper = struct {
+    fn shape(_: *anyopaque, allocator: Allocator, text: []const u8, font_size: Pixels, _: []const FontRun, _: ?Pixels) anyerror!LineLayout {
+        return .{ .font_size = font_size, .width = 0, .ascent = 0, .descent = 0, .runs = try allocator.alloc(ShapedRun, 0), .len = text.len };
+    }
+};
+
+test "reuse_layouts keeps a skipped view's layouts alive, and only those" {
+    var dummy: u8 = 0;
+    var cache = LineLayoutCache.init(testing.allocator, .{ .ctx = &dummy, .shape_fn = FakeShaper.shape });
+    defer cache.deinit();
+
+    // Frame 1: "a" is in the range of a cached view, "b" is not.
+    const start = cache.layout_index();
+    const a = try cache.layout_line("a", 16, &.{}, null);
+    const end = cache.layout_index();
+    try testing.expectEqual(@as(usize, 1), end.lines_index - start.lines_index);
+    _ = try cache.layout_line("b", 16, &.{}, null);
+    cache.finish_frame();
+
+    // Many frames that lay nothing out but reuse the range.
+    var from = start;
+    var to = end;
+    for (0..4) |_| {
+        const next_start = cache.layout_index();
+        try cache.reuse_layouts(from, to);
+        from = next_start;
+        to = cache.layout_index();
+        cache.finish_frame();
+    }
+    try testing.expect(cache.lines.previous.count() == 1);
+    try testing.expectEqualStrings("a", a.text);
+    // The same entry comes back, so it was never shaped again.
+    try testing.expectEqual(a, try cache.layout_line("a", 16, &.{}, null));
+}
+
+test "truncate_layouts forgets what a failed transaction asked for" {
+    var dummy: u8 = 0;
+    var cache = LineLayoutCache.init(testing.allocator, .{ .ctx = &dummy, .shape_fn = FakeShaper.shape });
+    defer cache.deinit();
+    const index = cache.layout_index();
+    _ = try cache.layout_line("a", 16, &.{}, null);
+    cache.truncate_layouts(index);
+    try testing.expectEqual(index.lines_index, cache.layout_index().lines_index);
 }
 
 test "wrap preserves shaped clusters" {

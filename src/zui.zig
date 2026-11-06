@@ -388,6 +388,7 @@ pub const prelude = struct {
 };
 
 test {
+    _ = @import("view_cache_test.zig");
     // Backends are chosen at run time, so nothing else pulls their tests in.
     if (@import("builtin").os.tag == .linux) {
         _ = @import("platform/linux/xkb.zig");

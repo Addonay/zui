@@ -175,6 +175,12 @@ pub fn Entity(comptime T: type) type {
             return @import("view.zig").AnyView.from(self);
         }
 
+        /// This entity as a view that keeps its last output until it notifies, laid out at `style`
+        /// without measuring its contents, so `style` must give it a definite size (GPUI `Entity::cached`).
+        pub fn cached(self: Self, style: anytype) @import("view.zig").AnyView {
+            return self.into_any_view().cached(style);
+        }
+
         /// Entities are IntoElement when `T` is Render: they render as views.
         pub fn into_any_element(self: Self) AnyElement {
             return @import("view.zig").AnyView.from(self).into_any_element();
