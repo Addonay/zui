@@ -121,6 +121,8 @@ pub const DispatchNode = struct {
     /// This node and its descendants sort as one block at this index, and their own indices
     /// only order them inside it (GPUI `TabStopMap::begin_group`).
     tab_group: ?isize = null,
+    /// The view whose element tree this node was pushed in (GPUI `DispatchNode::view_id`).
+    view_id: ?app_mod.EntityId = null,
 
     /// Clears the node for reuse, keeping listener capacity.
     fn reset(self: *DispatchNode, parent: ?DispatchNodeId) void {
@@ -132,6 +134,23 @@ pub const DispatchNode = struct {
         self.tab_index = 0;
         self.tab_stop = false;
         self.tab_group = null;
+        self.view_id = null;
+    }
+};
+
+/// Walks from a view's node up to the root, yielding the views on the way (GPUI
+/// `view_path_reversed`). Nodes that have no view are skipped.
+pub const ViewPath = struct {
+    tree: *const DispatchTree,
+    current: ?DispatchNodeId,
+
+    pub fn next(self: *ViewPath) ?app_mod.EntityId {
+        while (self.current) |id| {
+            const node = &self.tree.nodes.items[id];
+            self.current = node.parent;
+            if (node.view_id) |view_id| return view_id;
+        }
+        return null;
     }
 };
 
@@ -146,6 +165,7 @@ pub const DispatchTree = struct {
     count: usize = 0,
     node_stack: std.ArrayList(DispatchNodeId) = .empty,
     focusable: std.AutoHashMapUnmanaged(u64, DispatchNodeId) = .empty,
+    view_nodes: std.AutoHashMapUnmanaged(app_mod.EntityId, DispatchNodeId) = .empty,
 
     pub fn init(gpa: Allocator) DispatchTree {
         return .{ .gpa = gpa };
@@ -159,6 +179,7 @@ pub const DispatchTree = struct {
         self.nodes.deinit(self.gpa);
         self.node_stack.deinit(self.gpa);
         self.focusable.deinit(self.gpa);
+        self.view_nodes.deinit(self.gpa);
     }
 
     /// Empties the tree for the next frame, keeping allocated capacity.
@@ -166,6 +187,44 @@ pub const DispatchTree = struct {
         self.count = 0;
         self.node_stack.clearRetainingCapacity();
         self.focusable.clearRetainingCapacity();
+        self.view_nodes.clearRetainingCapacity();
+    }
+
+    /// The root node, which is the first one pushed (GPUI `root_node_id`).
+    pub fn root_node_id(self: *const DispatchTree) DispatchNodeId {
+        std.debug.assert(self.count > 0);
+        return 0;
+    }
+
+    /// The node that carries focus `target` in this frame, if there is one (GPUI `focusable_node_id`).
+    pub fn focusable_node_id(self: *const DispatchTree, target: u64) ?DispatchNodeId {
+        return self.focusable.get(target);
+    }
+
+    /// Records the active node as the node of `view_id`, so that `view_path_reversed` can walk up
+    /// from the view (GPUI `set_view_id`).
+    pub fn set_view_id(self: *DispatchTree, view_id: app_mod.EntityId) void {
+        const node_id = self.active_node_id();
+        self.nodes.items[node_id].view_id = view_id;
+        self.view_nodes.put(self.gpa, view_id, node_id) catch oom();
+    }
+
+    /// The views from `view_id` up to the root, nearest first (GPUI `view_path_reversed`). Empty
+    /// if the view has no node in this frame.
+    pub fn view_path_reversed(self: *const DispatchTree, view_id: app_mod.EntityId) ViewPath {
+        return .{ .tree = self, .current = self.view_nodes.get(view_id) };
+    }
+
+    /// Makes `node_id` the active node: pops back to its parent, then pushes it (GPUI
+    /// `set_active_node`). Nodes pushed after the parent are no longer on the stack afterwards.
+    pub fn set_active_node(self: *DispatchTree, node_id: DispatchNodeId) void {
+        std.debug.assert(node_id < self.count);
+        const next_parent = self.nodes.items[node_id].parent;
+        while (self.node_stack.items.len > 0 and self.node_stack.items[self.node_stack.items.len - 1] != next_parent) {
+            _ = self.node_stack.pop();
+        }
+        const matches_parent = if (self.node_stack.items.len == 0) next_parent == null else self.node_stack.items[self.node_stack.items.len - 1] == next_parent;
+        if (matches_parent) self.node_stack.append(self.gpa, node_id) catch oom();
     }
 
     /// Number of live nodes.
@@ -647,6 +706,54 @@ test "clear reuses node storage" {
     b.tree.push_node();
     try testing.expectEqual(@as(DispatchNodeId, 0), b.tree.active_node_id());
     try testing.expect(b.tree.nodes.capacity >= cap_before);
+}
+
+test "root, focusable and view nodes" {
+    var tree = DispatchTree.init(testing.allocator);
+    defer tree.deinit();
+    const view_a: app_mod.EntityId = @enumFromInt(1);
+    const view_b: app_mod.EntityId = @enumFromInt(2);
+
+    tree.push_node(); // 0: root, view a
+    tree.set_view_id(view_a);
+    tree.push_node(); // 1: child of root, focusable
+    tree.set_focus_id(77, 0, true);
+    tree.push_node(); // 2: child of 1, view b
+    tree.set_view_id(view_b);
+    tree.pop_node();
+    tree.pop_node();
+    tree.pop_node();
+
+    try testing.expectEqual(@as(DispatchNodeId, 0), tree.root_node_id());
+    try testing.expectEqual(@as(?DispatchNodeId, 1), tree.focusable_node_id(77));
+    try testing.expectEqual(@as(?DispatchNodeId, null), tree.focusable_node_id(78));
+
+    // From the deepest view up to the root.
+    var path = tree.view_path_reversed(view_b);
+    try testing.expectEqual(@as(?app_mod.EntityId, view_b), path.next());
+    try testing.expectEqual(@as(?app_mod.EntityId, view_a), path.next());
+    try testing.expectEqual(@as(?app_mod.EntityId, null), path.next());
+
+    // A view with no node in this frame has an empty path.
+    var missing = tree.view_path_reversed(@enumFromInt(9));
+    try testing.expectEqual(@as(?app_mod.EntityId, null), missing.next());
+}
+
+test "set_active_node pops to the parent before pushing" {
+    var tree = DispatchTree.init(testing.allocator);
+    defer tree.deinit();
+    tree.push_node(); // 0
+    tree.push_node(); // 1, child of 0
+    tree.pop_node();
+    tree.pop_node();
+    // Node 1's parent is not on the stack, so nothing is activated.
+    tree.set_active_node(1);
+    try testing.expectEqual(@as(usize, 0), tree.node_stack.items.len);
+    tree.set_active_node(0);
+    try testing.expectEqual(@as(usize, 1), tree.node_stack.items.len);
+    tree.set_active_node(1);
+    try testing.expectEqual(@as(DispatchNodeId, 1), tree.active_node_id());
+    try testing.expectEqual(@as(usize, 2), tree.node_stack.items.len);
 }
 
 test "dispatch_key: sequences, prefixes and replays" {

@@ -181,6 +181,22 @@ pub const Keymap = struct {
         return self.entries.items;
     }
 
+    /// Every binding that matches `input` whatever the context, highest precedence first (the
+    /// ones added last). A binding that only starts `input` is left out. Caller frees the slice
+    /// with `allocator`. GPUI `Keymap::all_bindings_for_input`.
+    pub fn all_bindings_for_input(self: *const Keymap, allocator: Allocator, input: []const Keystroke) ![]KeyBinding {
+        var out: std.ArrayList(KeyBinding) = .empty;
+        errdefer out.deinit(allocator);
+        var ix = self.entries.items.len;
+        while (ix > 0) {
+            ix -= 1;
+            const binding = &self.entries.items[ix];
+            const pending = binding.match_keystrokes(input) orelse continue;
+            if (!pending) try out.append(allocator, binding.*);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     /// Depth at which the binding's predicate matches the contexts, or the full depth when it has
     /// no predicate. Null when it does not match.
     fn binding_enabled(binding: *const KeyBinding, contexts: []const KeyContext) ?usize {
@@ -639,6 +655,34 @@ test "keymap: possible_next_bindings leaves out a binding that a deeper one with
     try testing.expectEqual(@as(usize, 2), next.len);
     try testing.expect(is_action(next[0], ActionGamma));
     try testing.expect(is_action(next[1], ActionBeta));
+}
+
+test "keymap: all_bindings_for_input ignores context and lists the newest first" {
+    const bindings = [_]KeyBinding{
+        KeyBinding.new("ctrl-a", ActionAlpha{}, "Workspace"),
+        KeyBinding.new("ctrl-a", ActionBeta{}, "Editor"),
+        KeyBinding.new("ctrl-b", ActionGamma{}, null),
+        KeyBinding.new("ctrl-k a", ActionAlpha{}, null),
+    };
+    var keymap = Keymap.init(testing.allocator);
+    defer keymap.deinit();
+    try keymap.add_bindings(&bindings);
+
+    // Both ctrl-a bindings match, though neither context is on the stack; the later one first.
+    const found = try keymap.all_bindings_for_input(testing.allocator, &.{ks("ctrl-a")});
+    defer testing.allocator.free(found);
+    try testing.expectEqual(@as(usize, 2), found.len);
+    try testing.expect(is_action(found[0], ActionBeta));
+    try testing.expect(is_action(found[1], ActionAlpha));
+
+    // A prefix of a longer binding is not a match.
+    const prefix = try keymap.all_bindings_for_input(testing.allocator, &.{ks("ctrl-k")});
+    defer testing.allocator.free(prefix);
+    try testing.expectEqual(@as(usize, 0), prefix.len);
+
+    const none = try keymap.all_bindings_for_input(testing.allocator, &.{ks("ctrl-z")});
+    defer testing.allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "keymap: binding meta, predicate and action_input" {
