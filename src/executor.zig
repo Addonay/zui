@@ -8,7 +8,20 @@
 //! plain function run on a worker thread.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
+const test_scheduler = @import("test_scheduler.zig");
+const TestScheduler = test_scheduler.TestScheduler;
+
+/// The deterministic scheduler a test attaches to an app's executors (see `test_scheduler.zig`).
+/// Only test builds have one, so every field and check that uses it is `void` and folds away
+/// elsewhere.
+const Attached = if (builtin.is_test) ?*TestScheduler else void;
+const not_attached: Attached = if (builtin.is_test) null else {};
+
+/// The fake clock, in test builds while a `TestScheduler` runs. `now_ns` and every timer read it
+/// instead of the awake clock. A test that runs its own clock may set it directly.
+pub var test_clock_ns: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {};
 
 // ---------------------------------------------------------------------------
 // Synchronization. Zig 0.17 implements mutexes, condition variables and futexes
@@ -17,13 +30,19 @@ const Io = std.Io;
 
 var sync_threaded: Io.Threaded = Io.Threaded.init_single_threaded;
 
-fn sync_io() Io {
+pub fn sync_io() Io {
     return sync_threaded.io();
 }
 
-/// Monotonic time in nanoseconds; does not advance while the system sleeps.
+fn real_now_ns() i96 {
+    return Io.Clock.awake.now(sync_io()).nanoseconds;
+}
+
+/// Monotonic time in nanoseconds; does not advance while the system sleeps. Under a test scheduler
+/// this is its fake clock (GPUI `executor.now()`).
 pub fn now_ns() u64 {
-    return @intCast(Io.Clock.awake.now(sync_io()).nanoseconds);
+    if (builtin.is_test) if (test_clock_ns) |t| return t;
+    return @intCast(real_now_ns());
 }
 
 /// Blocks the calling thread.
@@ -48,30 +67,30 @@ fn ReturnType(comptime f: anytype) type {
 // Runnables and queues.
 
 /// A type-erased unit of work on a worker, timer or main-thread queue.
-const Runnable = struct {
+pub const Runnable = struct {
     next: ?*Runnable = null,
-    /// Timer deadline in awake-clock nanoseconds. Unused by other queues.
+    /// Timer deadline in clock nanoseconds (see `timer_now`). Unused by other queues.
     deadline: i96 = 0,
     /// Runs the work when `execute` is true; otherwise only frees its resources.
     run_fn: *const fn (*Runnable, execute: bool) void,
 
-    fn run(self: *Runnable, execute: bool) void {
+    pub fn run(self: *Runnable, execute: bool) void {
         self.run_fn(self, execute);
     }
 };
 
 /// Intrusive FIFO of `Runnable`s. Not thread-safe; callers hold a mutex.
-const RunQueue = struct {
+pub const RunQueue = struct {
     head: ?*Runnable = null,
     tail: ?*Runnable = null,
 
-    fn push(q: *RunQueue, r: *Runnable) void {
+    pub fn push(q: *RunQueue, r: *Runnable) void {
         r.next = null;
         if (q.tail) |t| t.next = r else q.head = r;
         q.tail = r;
     }
 
-    fn pop(q: *RunQueue) ?*Runnable {
+    pub fn pop(q: *RunQueue) ?*Runnable {
         const r = q.head orelse return null;
         q.head = r.next;
         if (q.head == null) q.tail = null;
@@ -79,8 +98,9 @@ const RunQueue = struct {
         return r;
     }
 
-    /// Inserts `r` keeping the queue ordered by `deadline` (for timers).
-    fn push_sorted(q: *RunQueue, r: *Runnable) void {
+    /// Inserts `r` keeping the queue ordered by `deadline` (for timers). Equal deadlines keep their
+    /// insertion order.
+    pub fn push_sorted(q: *RunQueue, r: *Runnable) void {
         const first = q.head orelse return q.push(r);
         if (r.deadline < first.deadline) {
             r.next = first;
@@ -125,11 +145,14 @@ fn TaskState(comptime T: type) type {
         /// Whoever flips this first logs the error. Completion and detaching can race.
         logged: std.atomic.Value(bool) = .init(false),
         pump: ?Pump = null,
+        /// The scheduler whose work completes this task, if it was spawned under one. Waits then
+        /// run that scheduler instead of blocking.
+        sched: Attached = not_attached,
         result: T = undefined,
 
-        fn create(allocator: std.mem.Allocator) *S {
+        fn create(allocator: std.mem.Allocator, sched: Attached) *S {
             const s = allocator.create(S) catch oom();
-            s.* = .{ .allocator = allocator };
+            s.* = .{ .allocator = allocator, .sched = sched };
             return s;
         }
 
@@ -156,6 +179,7 @@ fn TaskState(comptime T: type) type {
 }
 
 fn wait_until_done(comptime S: type, s: *S) void {
+    if (builtin.is_test) if (s.sched) |sched| return sched.block_until_done(&s.done);
     const io = sync_io();
     while (s.done.load(.acquire) == 0) {
         if (s.pump) |p| {
@@ -174,6 +198,7 @@ fn wait_until_done(comptime S: type, s: *S) void {
 
 /// Like `wait_until_done`, but gives up after `timeout_ns`. Returns whether the task completed.
 fn wait_until_done_for(s: anytype, timeout_ns: u64) bool {
+    if (builtin.is_test) if (s.sched) |sched| return sched.block_until_done_for(&s.done, timeout_ns);
     const io = sync_io();
     const deadline = now_ns() +| timeout_ns;
     while (s.done.load(.acquire) == 0) {
@@ -333,10 +358,11 @@ fn spawn_node(
     comptime f: anytype,
     args: anytype,
     allocator: std.mem.Allocator,
+    sched: Attached,
 ) struct { *Runnable, *TaskState(ReturnType(f)) } {
     const R = ReturnType(f);
     const Node = SpawnNode(f, @TypeOf(args), R);
-    const state = TaskState(R).create(allocator);
+    const state = TaskState(R).create(allocator, sched);
     const node = allocator.create(Node) catch oom();
     node.* = .{
         .runnable = .{ .run_fn = Node.run },
@@ -420,9 +446,19 @@ const Pool = struct {
     timer_thread: ?std.Thread = null,
     /// The thread that created the app, which is the platform's main thread.
     main_thread: std.Thread.Id = undefined,
+    /// Set in tests that run the app deterministically: work and timers go to the scheduler.
+    test_sched: Attached = not_attached,
+
+    /// The clock timers are measured against: the fake clock under a test scheduler, else the awake
+    /// clock. The timer thread compares with the awake clock, so only attached pools may use the fake one.
+    fn timer_now(self: *const Pool) i96 {
+        if (builtin.is_test) if (self.test_sched) |s| return @intCast(s.now());
+        return real_now_ns();
+    }
 
     /// Queues work at `priority`. Starts the workers on first use.
     fn submit(self: *Pool, r: *Runnable, priority: Priority) void {
+        if (builtin.is_test) if (self.test_sched) |s| return s.schedule_background(r, priority);
         const io = sync_io();
         self.mutex.lockUncancelable(io);
         if (!self.started) self.start_workers();
@@ -452,8 +488,9 @@ const Pool = struct {
         return false;
     }
 
-    /// Queues a timer. `r.deadline` is the awake-clock time it fires at.
+    /// Queues a timer. `r.deadline` is the time it fires at, on the clock `timer_now` reads.
     fn submit_timer(self: *Pool, r: *Runnable) void {
+        if (builtin.is_test) if (self.test_sched) |s| return s.add_timer(r);
         const io = sync_io();
         self.mutex.lockUncancelable(io);
         if (self.timer_thread == null) {
@@ -519,6 +556,11 @@ const Pool = struct {
 
     /// Stops the threads after the queued work has run, then frees the pool.
     fn destroy(self: *Pool) void {
+        if (builtin.is_test) if (self.test_sched) |s| {
+            s.drain_background();
+            self.allocator.destroy(self);
+            return;
+        };
         const io = sync_io();
         self.mutex.lockUncancelable(io);
         self.shutdown = true;
@@ -541,9 +583,16 @@ const ForegroundCore = struct {
     queue: RunQueue = .{},
     wake_ctx: ?*anyopaque = null,
     wake_fn: ?*const fn (*anyopaque) void = null,
+    /// Set in tests that run the app deterministically: this queue is then a session of the scheduler.
+    test_sched: Attached = not_attached,
 
     /// Thread-safe. Queues `r` and wakes the platform loop.
     fn enqueue(self: *ForegroundCore, r: *Runnable) void {
+        if (builtin.is_test) if (self.test_sched) |s| {
+            s.schedule_foreground(self, r);
+            self.wake();
+            return;
+        };
         const io = sync_io();
         self.mutex.lockUncancelable(io);
         self.queue.push(r);
@@ -558,6 +607,8 @@ const ForegroundCore = struct {
     /// Runs the work queued before this call. Work queued while running waits
     /// for the next call.
     fn run_pending(self: *ForegroundCore) usize {
+        // Under a test scheduler every ready task runs, background ones too, as GPUI's `run_until_parked`.
+        if (builtin.is_test) if (self.test_sched) |s| return s.run_until_parked();
         const io = sync_io();
         self.mutex.lockUncancelable(io);
         var batch = self.queue;
@@ -569,6 +620,7 @@ const ForegroundCore = struct {
     }
 
     fn has_pending(self: *ForegroundCore) bool {
+        if (builtin.is_test) if (self.test_sched) |s| return s.has_session_work(self);
         const io = sync_io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -582,6 +634,7 @@ const ForegroundCore = struct {
 
     /// Drops pending work without running it, releasing its resources.
     fn drop_pending(self: *ForegroundCore) void {
+        if (builtin.is_test) if (self.test_sched) |s| return s.drop_session(self);
         const io = sync_io();
         self.mutex.lockUncancelable(io);
         var batch = self.queue;
@@ -632,7 +685,7 @@ pub const BackgroundExecutor = struct {
 
     /// Runs `f(args...)` on a worker thread, taking it before lower-priority work that is queued.
     pub fn spawn_with_priority(self: *BackgroundExecutor, priority: Priority, comptime f: anytype, args: anytype) Task(ReturnType(f)) {
-        const r, const state = spawn_node(f, args, self.pool.allocator);
+        const r, const state = spawn_node(f, args, self.pool.allocator, self.pool.test_sched);
         self.pool.submit(r, priority);
         return .{ .state = state };
     }
@@ -705,7 +758,7 @@ pub const BackgroundExecutor = struct {
             }
         };
 
-        const state = TaskState(R).create(self.pool.allocator);
+        const state = TaskState(R).create(self.pool.allocator, self.pool.test_sched);
         state.pump = .{ .ctx = fg.core, .run = ForegroundCore.pump_thunk };
         const node = self.pool.allocator.create(Then) catch oom();
         node.* = .{
@@ -727,9 +780,9 @@ pub const BackgroundExecutor = struct {
         const Fire = struct {
             fn fire() void {}
         };
-        const r, const state = spawn_node(Fire.fire, .{}, self.pool.allocator);
-        const now = Io.Clock.awake.now(sync_io()).nanoseconds;
-        r.deadline = now + @as(i96, @intCast(duration_ns));
+        const r, const state = spawn_node(Fire.fire, .{}, self.pool.allocator, self.pool.test_sched);
+        const at = self.pool.timer_now();
+        r.deadline = at + @as(i96, @intCast(duration_ns));
         self.pool.submit_timer(r);
         return .{ .state = state };
     }
@@ -766,8 +819,8 @@ pub const BackgroundExecutor = struct {
             .ctx = ctx,
             .allocator = allocator,
         };
-        const now = Io.Clock.awake.now(sync_io()).nanoseconds;
-        node.timer.deadline = now + @as(i96, @intCast(duration_ns));
+        const at = self.pool.timer_now();
+        node.timer.deadline = at + @as(i96, @intCast(duration_ns));
         self.pool.submit_timer(&node.timer);
     }
 
@@ -788,9 +841,75 @@ pub const BackgroundExecutor = struct {
         return .{ .pending = t };
     }
 
-    /// Number of CPUs, used as the worker count.
+    /// Number of CPUs, used as the worker count. A test scheduler reports its override (GPUI default 4).
     pub fn num_cpus(self: *const BackgroundExecutor) usize {
+        if (builtin.is_test) if (self.pool.test_sched) |s| return s.num_cpus();
         return self.pool.thread_count;
+    }
+
+    /// The current time: the fake clock under a test scheduler (GPUI `now`).
+    pub fn now(self: *const BackgroundExecutor) u64 {
+        return @intCast(self.pool.timer_now());
+    }
+
+    /// Whether this executor runs on a test scheduler (GPUI `is_test`).
+    pub fn is_test(self: *const BackgroundExecutor) bool {
+        if (builtin.is_test) return self.pool.test_sched != null;
+        return false;
+    }
+
+    fn attached_scheduler(self: *const BackgroundExecutor) *TestScheduler {
+        if (!builtin.is_test) @compileError("test scheduler calls need a test build");
+        return self.pool.test_sched orelse @panic("this executor is not a test executor; use TestAppContext.build");
+    }
+
+    /// Moves the fake clock forward by `duration_ns`, running what comes due on the way in time
+    /// order (GPUI `advance_clock`).
+    pub fn advance_clock(self: *BackgroundExecutor, duration_ns: u64) void {
+        self.attached_scheduler().advance_clock(duration_ns);
+    }
+
+    /// Runs one ready task, or fires due timers first. Returns false when there was nothing to do
+    /// (GPUI `tick`).
+    pub fn tick(self: *BackgroundExecutor) bool {
+        return self.attached_scheduler().tick();
+    }
+
+    /// Runs ready tasks until none is left. Timers stay where they are (GPUI `run_until_parked`).
+    pub fn run_until_parked(self: *BackgroundExecutor) void {
+        _ = self.attached_scheduler().run_until_parked();
+    }
+
+    /// Lets other work run for a random number of ticks, from the seed (GPUI `simulate_random_delay`,
+    /// which is a future there and runs now here).
+    pub fn simulate_random_delay(self: *BackgroundExecutor) void {
+        self.attached_scheduler().simulate_random_delay();
+    }
+
+    /// Lets a blocked wait park: the test waits for another thread to queue work (GPUI `allow_parking`).
+    pub fn allow_parking(self: *BackgroundExecutor) void {
+        self.attached_scheduler().allow_parking();
+    }
+
+    /// A blocked wait that nothing can finish panics instead of parking (GPUI `forbid_parking`).
+    pub fn forbid_parking(self: *BackgroundExecutor) void {
+        self.attached_scheduler().forbid_parking();
+    }
+
+    /// How many ticks `block_with_timeout` may run, drawn from `min..=max` (GPUI `set_block_on_ticks`).
+    pub fn set_block_on_ticks(self: *BackgroundExecutor, min: usize, max: usize) void {
+        self.attached_scheduler().set_block_on_ticks(min, max);
+    }
+
+    /// The seeded generator that orders the work. Test data drawn from it repeats for a seed
+    /// (GPUI `rng`).
+    pub fn rng(self: *BackgroundExecutor) std.Random {
+        return self.attached_scheduler().rng();
+    }
+
+    /// Overrides `num_cpus` for this test (GPUI `set_num_cpus`).
+    pub fn set_num_cpus(self: *BackgroundExecutor, count: usize) void {
+        self.attached_scheduler().set_num_cpus(count);
     }
 };
 
@@ -823,7 +942,7 @@ pub const ForegroundExecutor = struct {
 
     /// Queues `f(args...)` to run on the main thread at the next `run_pending`.
     pub fn spawn(self: *ForegroundExecutor, comptime f: anytype, args: anytype) Task(ReturnType(f)) {
-        const r, const state = spawn_node(f, args, self.core.allocator);
+        const r, const state = spawn_node(f, args, self.core.allocator, self.core.test_sched);
         state.pump = .{ .ctx = self.core, .run = ForegroundCore.pump_thunk };
         self.core.enqueue(r);
         return .{ .state = state };
@@ -849,6 +968,21 @@ pub const ForegroundExecutor = struct {
     pub fn idle_time_remaining(self: *const ForegroundExecutor) ?u64 {
         _ = self;
         return null;
+    }
+
+    /// Whether this executor runs on a test scheduler (GPUI `is_test`).
+    pub fn is_test(self: *const ForegroundExecutor) bool {
+        if (builtin.is_test) return self.core.test_sched != null;
+        return false;
+    }
+
+    /// Waits for `task` on the test thread, running the scheduler meanwhile (GPUI `block_test`). Under
+    /// a test scheduler this is the same wait as `BackgroundExecutor.block_on`; it panics otherwise.
+    pub fn block_test(self: *ForegroundExecutor, task: anytype) @TypeOf(task).Value {
+        if (!builtin.is_test) @compileError("block_test needs a test build");
+        if (self.core.test_sched == null) @panic("block_test needs a test scheduler");
+        var t = task;
+        return t.wait();
     }
 
     /// A handle that can queue main-thread work from any thread (GPUI `SendForegroundExecutor`).
@@ -900,11 +1034,20 @@ pub const SendForegroundExecutor = struct {
     core: *ForegroundCore,
 
     pub fn spawn(self: SendForegroundExecutor, comptime f: anytype, args: anytype) Task(ReturnType(f)) {
-        const r, const state = spawn_node(f, args, self.core.allocator);
+        const r, const state = spawn_node(f, args, self.core.allocator, self.core.test_sched);
         self.core.enqueue(r);
         return .{ .state = state };
     }
 };
+
+/// Makes `bg` and `fg` run on `sched` instead of threads, so the app runs deterministically (GPUI
+/// `TestDispatcher`). Both executors must belong to the same app, and nothing may be queued yet.
+/// Test builds only.
+pub fn attach_test_scheduler(bg: *BackgroundExecutor, fg: *ForegroundExecutor, sched: *TestScheduler) void {
+    if (!builtin.is_test) @compileError("attach_test_scheduler needs a test build");
+    bg.pool.test_sched = sched;
+    fg.core.test_sched = sched;
+}
 
 // ---------------------------------------------------------------------------
 // Tests.

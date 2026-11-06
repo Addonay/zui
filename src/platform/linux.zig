@@ -8,6 +8,7 @@ const app_mod = @import("../app.zig");
 const window_mod = @import("../window.zig");
 const input = @import("linux/input.zig");
 const system_notifications = @import("linux/system_notifications.zig");
+const power = @import("linux/power.zig");
 const portal = @import("linux/portal.zig");
 const launch = @import("linux/launch.zig");
 pub const wayland = @import("linux/wayland.zig");
@@ -87,6 +88,12 @@ pub const Backend = union(enum) {
             .x11 => |c| c.appearance_,
         };
     }
+    fn emit_button_layout_changed(self: Backend) void {
+        switch (self) {
+            .wayland => |c| for (c.windows.items) |w| w.base.emit_button_layout_changed(),
+            .x11 => |c| for (c.windows.items) |w| w.base.emit_button_layout_changed(),
+        }
+    }
     fn set_appearance(self: Backend, appearance: platform.WindowAppearance) void {
         switch (self) {
             .wayland => |c| c.set_appearance(appearance),
@@ -125,8 +132,12 @@ pub const LinuxPlatform = struct {
     notifications: system_notifications.State,
     /// The desktop portals: the settings (appearance, cursor), file dialogs and OpenURI. Started in `run`.
     portal: portal.State,
+    /// The power mode from power-profiles-daemon on the system bus. Started in `run`.
+    power: power.State,
     /// Starts the programs the platform runs. Tests replace it, so no test starts a program.
     launcher: launch.Launcher = .{},
+    /// The titlebar button layout: GPUI's fallback until the settings portal reports the desktop's.
+    button_layout: platform.WindowButtonLayout = platform.WindowButtonLayout.linux_default(),
     /// Where `app_path` writes the path of the executable.
     app_path_buf: [4096]u8 = undefined,
 
@@ -152,6 +163,8 @@ pub const LinuxPlatform = struct {
         .hide_cursor_until_mouse_moves = hideCursorUntilMouseMoves,
         .is_cursor_visible = isCursorVisible,
         .set_app_identity = setAppIdentity,
+        .power_mode = powerMode,
+        .on_power_mode_change = onPowerModeChange,
         .show_system_notification = showNotification,
         .dismiss_system_notification = dismissNotification,
         .open_url = openUrl,
@@ -164,6 +177,14 @@ pub const LinuxPlatform = struct {
         .app_path = appPath,
     };
 
+    fn powerMode(p: *platform.Platform) platform.PowerMode {
+        return from(p).power.current();
+    }
+
+    fn onPowerModeChange(p: *platform.Platform, listener: platform.PowerListener) void {
+        from(p).power.on_change(listener);
+    }
+
     fn windowAppearance(p: *platform.Platform) platform.WindowAppearance {
         return from(p).backend.window_appearance();
     }
@@ -175,7 +196,18 @@ pub const LinuxPlatform = struct {
             .color_scheme => |appearance| self.backend.set_appearance(appearance),
             .cursor_theme => |name| self.backend.set_cursor_theme(name),
             .cursor_size => |size| self.backend.set_cursor_size(size),
+            .button_layout => |text| self.set_button_layout(text),
         }
+    }
+
+    /// Stores the layout the desktop reports and tells every window, as GPUI does on each event.
+    /// Text that does not parse falls back to GPUI's default layout.
+    fn set_button_layout(self: *LinuxPlatform, text: []const u8) void {
+        self.button_layout = platform.WindowButtonLayout.parse(text) catch |err| blk: {
+            std.log.warn("linux: button layout {s}: {s}", .{ text, @errorName(err) });
+            break :blk platform.WindowButtonLayout.linux_default();
+        };
+        self.backend.emit_button_layout_changed();
     }
 
     /// A file chooser's answer goes back to the caller's completion, then the dialog is freed.
@@ -421,6 +453,7 @@ pub const LinuxPlatform = struct {
         const self = from(p);
         self.app = app;
         self.portal.start();
+        self.power.start();
         on_launch(app);
         while (true) {
             _ = app.foreground_executor().run_pending();
@@ -443,12 +476,13 @@ pub const LinuxPlatform = struct {
         const timeout = self.backend.timeout(now) orelse -1;
         const has_pending = self.backend.prepare_wait();
         // Poll ignores a negative descriptor.
-        var fds = [5]std.posix.pollfd{
+        var fds = [6]std.posix.pollfd{
             .{ .fd = self.backend.fd(), .events = std.posix.POLL.IN, .revents = 0 },
             .{ .fd = self.wake_fd, .events = std.posix.POLL.IN, .revents = 0 },
             .{ .fd = self.backend.extra_fd(), .events = std.posix.POLL.IN, .revents = 0 },
             .{ .fd = self.notifications.bus_socket(), .events = self.notifications.bus_events(), .revents = 0 },
             .{ .fd = self.portal.bus_socket(), .events = self.portal.bus_events(), .revents = 0 },
+            .{ .fd = self.power.bus_socket(), .events = self.power.bus_events(), .revents = 0 },
         };
         if (!has_pending) {
             _ = std.posix.poll(&fds, timeout) catch 0;
@@ -457,6 +491,7 @@ pub const LinuxPlatform = struct {
         if (fds[2].revents != 0) self.backend.on_extra_fd();
         if (fds[3].revents != 0) self.notifications.on_bus_poll(fds[3].revents);
         if (fds[4].revents != 0) self.portal.on_bus_poll(fds[4].revents);
+        if (fds[5].revents != 0) self.power.on_bus_poll(fds[5].revents);
         if (fds[1].revents != 0) {
             var buf: u64 = 0;
             _ = std.os.linux.read(self.wake_fd, @ptrCast(&buf), 8);
@@ -476,6 +511,7 @@ pub const LinuxPlatform = struct {
         self.menus.deinit();
         self.notifications.deinit();
         self.portal.deinit();
+        self.power.deinit();
         self.allocator.destroy(self);
     }
 
@@ -485,10 +521,9 @@ pub const LinuxPlatform = struct {
         _ = std.os.linux.write(self.wake_fd, @ptrCast(&one), 8);
     }
 
-    /// gpui_linux starts from its fallback layout and then takes the desktop's `button-layout`
-    /// from the settings portal. ZUI does not read that setting yet, so it keeps the fallback.
-    fn buttonLayout(_: *platform.Platform) ?platform.WindowButtonLayout {
-        return platform.WindowButtonLayout.linux_default();
+    /// The layout the settings portal reported, or GPUI's fallback until it does.
+    fn buttonLayout(p: *platform.Platform) ?platform.WindowButtonLayout {
+        return from(p).button_layout;
     }
 
     fn openWindow(p: *platform.Platform, options: window_mod.WindowOptions, parent: ?*platform.PlatformWindow) anyerror!*platform.PlatformWindow {
@@ -577,6 +612,7 @@ pub fn create(allocator: std.mem.Allocator) !*platform.Platform {
         .wake_fd = efd,
         .notifications = system_notifications.State.init(allocator, self, LinuxPlatform.deliverNotification),
         .portal = portal.State.init(allocator, .{ .ctx = self, .func = LinuxPlatform.onSetting }),
+        .power = power.State.init(allocator),
     };
     // Outputs that change after this point are reported to the app through the platform.
     switch (self.backend) {

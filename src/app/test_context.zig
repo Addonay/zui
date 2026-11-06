@@ -17,6 +17,8 @@ const action_mod = @import("../action.zig");
 const platform_mod = @import("../platform.zig");
 const geometry = @import("../geometry.zig");
 const headless = @import("../platform/headless.zig");
+const TestScheduler = @import("../test_scheduler.zig").TestScheduler;
+const executor_mod = @import("../executor.zig");
 
 const App = app_mod.App;
 const Entity = app_mod.Entity;
@@ -35,14 +37,25 @@ fn ReturnOf(comptime f: anytype) type {
     return @typeInfo(@TypeOf(f)).@"fn".return_type.?;
 }
 
+/// `ZUI_TEST_SEED=<n>` replaces the seed of every `TestAppContext.build`, so a run can check that no
+/// test depends on the seed it was written with (GPUI's `SEED`). Unset, each test keeps its own seed.
+fn seed_from_env(default: u64) u64 {
+    const raw = std.c.getenv("ZUI_TEST_SEED") orelse return default;
+    return std.fmt.parseInt(u64, std.mem.span(raw), 0) catch default;
+}
+
 /// A test application: a headless `App` plus helpers to pump it (GPUI `TestAppContext`).
 pub const TestAppContext = struct {
     allocator: std.mem.Allocator,
     platform: *platform_mod.Platform,
     app: *App,
     visual_contexts: std.ArrayList(*VisualTestContext) = .empty,
+    /// The deterministic scheduler, or null when the app runs on real threads (`init`). GPUI
+    /// `dispatcher`. Only `build` and `single` set it.
+    dispatcher: ?*TestScheduler = null,
 
-    /// Creates a headless app backed by `std.testing.allocator`.
+    /// Creates a headless app backed by `std.testing.allocator`. Its tasks run on worker threads and
+    /// its timers use the real clock.
     pub fn init() TestAppContext {
         return with_allocator(std.testing.allocator);
     }
@@ -53,11 +66,32 @@ pub const TestAppContext = struct {
         return .{ .allocator = allocator, .platform = platform, .app = app };
     }
 
+    /// Creates a deterministic headless app (GPUI `TestAppContext::build` over a `TestDispatcher`).
+    /// Its tasks and timers run on the test thread, in an order drawn from `seed`, and its clock is
+    /// fake: it moves only when a test calls `cx.executor().advance_clock`. Use it for any test that
+    /// depends on timing, so that it cannot flake.
+    pub fn build(seed: u64) TestAppContext {
+        const allocator = std.testing.allocator;
+        // The scheduler starts the fake clock first, so the app's own timestamps are fake too.
+        const scheduler = TestScheduler.init(allocator, seed_from_env(seed));
+        const platform = headless.HeadlessPlatform.create(allocator);
+        const app = App.init(allocator, platform) catch @panic("failed to create test app");
+        executor_mod.attach_test_scheduler(app.background_executor(), app.foreground_executor(), scheduler);
+        return .{ .allocator = allocator, .platform = platform, .app = app, .dispatcher = scheduler };
+    }
+
+    /// `build` with seed 0 (GPUI `TestAppContext::single`).
+    pub fn single() TestAppContext {
+        return build(0);
+    }
+
     pub fn deinit(self: *TestAppContext) void {
         for (self.visual_contexts.items) |v| self.allocator.destroy(v);
         self.visual_contexts.deinit(self.allocator);
+        // The app first: its teardown runs the background work that is left, which needs the scheduler.
         self.app.deinit();
         self.platform.deinit();
+        if (self.dispatcher) |scheduler| scheduler.deinit();
     }
 
     /// Runs `f(args..., *App)` (GPUI `update`).
@@ -176,6 +210,11 @@ pub const TestAppContext = struct {
 pub const VisualTestContext = struct {
     window: *Window,
     cx: *TestAppContext,
+
+    /// A visual context for `window`, which must belong to `cx` (GPUI `VisualTestContext::from_window`).
+    pub fn from_window(window: *Window, cx: *TestAppContext) VisualTestContext {
+        return .{ .window = window, .cx = cx };
+    }
 
     pub fn simulate_event(self: *VisualTestContext, event: PlatformInput) void {
         _ = self.window.dispatch_event(event, self.cx.app);
@@ -576,15 +615,6 @@ test "actions: key binding dispatches to on_action on the focused element" {
     try std.testing.expectEqual(@as(usize, 1), state.saves);
 }
 
-fn wait_until_flushed(vcx: *VisualTestContext) !void {
-    for (0..200) |_| {
-        vcx.run_until_parked();
-        if (!vcx.window.has_pending_keystrokes()) return;
-        @import("../executor.zig").sleep_ns(5 * std.time.ns_per_ms);
-    }
-    return error.PendingInputNeverFlushed;
-}
-
 test "multi-stroke: a sequence runs its action and its keys reach nobody else" {
     var cx = TestAppContext.init();
     defer cx.deinit();
@@ -621,7 +651,7 @@ test "multi-stroke: a wrong second key replays the first, in order" {
 }
 
 test "multi-stroke: a binding that is also a prefix fires after the timeout" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     cx.app.bind_keys(&.{ KeyBinding.new("g", Editor.Save{}, "Editor"), KeyBinding.new("g g", Editor.Outside{}, "Editor") });
     const view, const vcx = cx.add_window_view(Editor.build);
@@ -629,14 +659,17 @@ test "multi-stroke: a binding that is also a prefix fires after the timeout" {
 
     vcx.simulate_keystrokes("g");
     try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, Editor.read_state, .{}).saves);
-    try wait_until_flushed(vcx);
+    // The timeout is one second on the fake clock. Nothing fires before it.
+    cx.executor().advance_clock(std.time.ns_per_s - 1);
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, Editor.read_state, .{}).saves);
+    cx.executor().advance_clock(1);
     const state = cx.read_entity(view, Editor.read_state, .{});
     try std.testing.expectEqual(@as(usize, 1), state.saves);
     try std.testing.expectEqual(@as(usize, 0), state.keys);
 }
 
 test "multi-stroke: without a binding of its own a prefix waits for the next key" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     cx.app.bind_keys(&.{KeyBinding.new("ctrl-k ctrl-c", Editor.Save{}, "Editor")});
     const view, const vcx = cx.add_window_view(Editor.build);
@@ -644,7 +677,7 @@ test "multi-stroke: without a binding of its own a prefix waits for the next key
 
     vcx.simulate_keystrokes("ctrl-k");
     // Past the timeout a prefix with a binding of its own would have fired by.
-    @import("../executor.zig").sleep_ns(700 * std.time.ns_per_ms);
+    cx.executor().advance_clock(700 * std.time.ns_per_ms);
     vcx.run_until_parked();
     try std.testing.expect(vcx.window.has_pending_keystrokes());
     vcx.simulate_keystrokes("ctrl-c");
@@ -1419,6 +1452,49 @@ test "tasks: foreground spawn runs during run_until_parked" {
     try std.testing.expectEqual(@as(usize, 42), task.get().?);
 }
 
+test "deterministic: timers and the clock move only when the test advances them" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    const bg = cx.executor();
+    try std.testing.expect(bg.is_test());
+    const start = bg.now();
+    var t = bg.timer(250 * std.time.ns_per_ms);
+    cx.run_until_parked();
+    try std.testing.expect(!t.is_ready());
+    try std.testing.expectEqual(start, bg.now());
+    bg.advance_clock(249 * std.time.ns_per_ms);
+    try std.testing.expect(!t.is_ready());
+    bg.advance_clock(std.time.ns_per_ms);
+    try std.testing.expect(t.is_ready());
+    try std.testing.expectEqual(start + 250 * std.time.ns_per_ms, bg.now());
+    t.wait();
+    // The app's clock is the fake one, so its own timestamps agree with it.
+    try std.testing.expect(cx.app.synced_animation_epoch <= bg.now());
+}
+
+test "deterministic: background work runs on the test thread, when the test runs the scheduler" {
+    var cx = TestAppContext.build(3);
+    defer cx.deinit();
+    const Probe = struct {
+        fn thread() std.Thread.Id {
+            return std.Thread.getCurrentId();
+        }
+    };
+    var task = cx.executor().spawn(Probe.thread, .{});
+    try std.testing.expect(!task.is_ready());
+    cx.run_until_parked();
+    try std.testing.expectEqual(std.Thread.getCurrentId(), task.get().?);
+}
+
+test "VisualTestContext.from_window: a context for a window that is already open" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    var again = VisualTestContext.from_window(vcx.window, &cx);
+    try std.testing.expectEqual(vcx.window, again.window);
+    again.run_until_parked();
+}
+
 test "globals: update_global from a context notifies observers" {
     var cx = TestAppContext.init();
     defer cx.deinit();
@@ -2162,17 +2238,15 @@ const TooltipPage = struct {
     }
 };
 
+/// Lets the show delay (one millisecond, a timer on the fake clock) pass, then checks the tooltip.
 fn wait_for_tooltip(vcx: *VisualTestContext, wanted: bool) !void {
-    for (0..200) |_| {
-        vcx.run_until_parked();
-        if ((vcx.window.tooltip_bounds != null) == wanted) return;
-        @import("../executor.zig").sleep_ns(5 * std.time.ns_per_ms);
-    }
-    return error.TooltipTimedOut;
+    vcx.cx.executor().advance_clock(std.time.ns_per_ms);
+    vcx.run_until_parked();
+    if ((vcx.window.tooltip_bounds != null) != wanted) return error.TooltipTimedOut;
 }
 
 test "tooltip: shows after the delay and closes when the pointer leaves" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     _, const vcx = cx.add_window_view(TooltipPage.build);
     vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
@@ -2184,18 +2258,18 @@ test "tooltip: shows after the delay and closes when the pointer leaves" {
 }
 
 test "tooltip: leaving before the delay means it never shows" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     _, const vcx = cx.add_window_view(TooltipPage.build);
     vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
     vcx.simulate_mouse_move(.{ .x = 200, .y = 200 }, null, .{});
-    @import("../executor.zig").sleep_ns(40 * std.time.ns_per_ms);
+    cx.executor().advance_clock(40 * std.time.ns_per_ms);
     vcx.run_until_parked();
     try std.testing.expect(vcx.window.tooltip_bounds == null);
 }
 
 test "tooltip: a press closes it, and does not bring it back" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     _, const vcx = cx.add_window_view(TooltipPage.build);
     vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
@@ -2207,7 +2281,7 @@ test "tooltip: a press closes it, and does not bring it back" {
 }
 
 test "tooltip: its element disappearing while it shows closes it safely" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     const view, const vcx = cx.add_window_view(TooltipPage.build);
     vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
@@ -2218,7 +2292,7 @@ test "tooltip: its element disappearing while it shows closes it safely" {
 }
 
 test "tooltip: a timer firing after its element is gone does nothing" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     const view, const vcx = cx.add_window_view(TooltipPage.build);
     vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
@@ -2227,13 +2301,13 @@ test "tooltip: a timer firing after its element is gone does nothing" {
     vcx.run_until_parked();
     vcx.window.refresh();
     vcx.run_until_parked();
-    @import("../executor.zig").sleep_ns(30 * std.time.ns_per_ms);
+    cx.executor().advance_clock(30 * std.time.ns_per_ms);
     vcx.run_until_parked();
     try std.testing.expect(vcx.window.tooltip_bounds == null);
 }
 
 test "tooltip: a hoverable one survives the pointer moving onto it" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     const view, const vcx = cx.add_window_view(TooltipPage.build);
     view.as_mut(cx.app).hoverable = true;
@@ -2391,7 +2465,7 @@ fn open_unpumped(cx: *TestAppContext) struct { window: *Window } {
 
 test "gif: run_until_parked returns while a GIF is on screen, drawing it once per pump" {
     const allocator = std.testing.allocator;
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     const animated = try image_with_delays(allocator, &.{ 150, 150 });
     defer animated.deinit();
@@ -2412,8 +2486,7 @@ test "gif: run_until_parked returns while a GIF is on screen, drawing it once pe
 
 test "gif: frames advance after their delay, and frames are requested only while animating" {
     const allocator = std.testing.allocator;
-    const sleep = @import("../executor.zig").sleep_ns;
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
 
     // Each frame lasts 150 ms, so the first draws happen well inside its delay.
@@ -2428,12 +2501,12 @@ test "gif: frames advance after their delay, and frames are requested only while
     vcx.window.draw(cx.app);
     try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
 
-    sleep(200 * std.time.ns_per_ms);
+    cx.executor().advance_clock(200 * std.time.ns_per_ms);
     vcx.window.draw(cx.app);
     try std.testing.expectEqual(@as(usize, 1), AnimatedView.frame());
     try std.testing.expect(vcx.window.animation_requested);
 
-    sleep(200 * std.time.ns_per_ms);
+    cx.executor().advance_clock(200 * std.time.ns_per_ms);
     vcx.window.draw(cx.app);
     try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
 
@@ -2441,7 +2514,7 @@ test "gif: frames advance after their delay, and frames are requested only while
     AnimatedView.with_id = false;
     const anonymous = open_unpumped(&cx);
     try std.testing.expect(!anonymous.window.animation_requested);
-    sleep(200 * std.time.ns_per_ms);
+    cx.executor().advance_clock(200 * std.time.ns_per_ms);
     anonymous.window.draw(cx.app);
     try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
     try std.testing.expect(!anonymous.window.animation_requested);
@@ -2458,7 +2531,7 @@ test "gif: frames advance after their delay, and frames are requested only while
     cx.app.set_reduce_motion(true);
     AnimatedView.image = animated;
     const reduced = open_unpumped(&cx);
-    sleep(200 * std.time.ns_per_ms);
+    cx.executor().advance_clock(200 * std.time.ns_per_ms);
     reduced.window.draw(cx.app);
     try std.testing.expect(!reduced.window.animation_requested);
     try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
@@ -2801,7 +2874,6 @@ test "window activation: observers hear each change, and a resize is not one" {
 
 const asset_cache_mod = @import("../asset_cache.zig");
 const image_cache_mod = @import("../image_cache.zig");
-const executor_mod = @import("../executor.zig");
 
 /// An asset whose load waits for `gate`, then answers `source * 10`. Counts its starts.
 const Slow = struct {
@@ -2981,13 +3053,12 @@ fn wait_for_image(cache: *image_cache_mod.RetainAllImageCache, vcx: *VisualTestC
             vcx.run_until_parked();
             return result;
         }
-        executor_mod.sleep_ns(5 * std.time.ns_per_ms);
     }
     return error.TimedOut;
 }
 
 test "RetainAllImageCache: keeps each image, and releases them when cleared" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     var pixels: PixelAssets = .{};
     cx.app.asset_source = assets_mod.AssetSource.from(&pixels);
@@ -3016,7 +3087,7 @@ test "RetainAllImageCache: keeps each image, and releases them when cleared" {
 }
 
 test "RetainAllImageCache: released with its entity, even while an image loads" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     var pixels: PixelAssets = .{};
     cx.app.asset_source = assets_mod.AssetSource.from(&pixels);
@@ -3030,7 +3101,6 @@ test "RetainAllImageCache: released with its entity, even while an image loads" 
     // The testing allocator reports it if it is not.
     cache_handle.release(cx.app);
     vcx.run_until_parked();
-    executor_mod.sleep_ns(50 * std.time.ns_per_ms);
     vcx.run_until_parked();
 }
 
@@ -3058,7 +3128,7 @@ const CachedImageView = struct {
 };
 
 test "img: an image in image_cache() loads through that cache, then redraws" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     var pixels: PixelAssets = .{};
     cx.app.asset_source = assets_mod.AssetSource.from(&pixels);
@@ -3078,7 +3148,6 @@ test "img: an image in image_cache() loads through that cache, then redraws" {
                 break;
             }
         }
-        executor_mod.sleep_ns(5 * std.time.ns_per_ms);
     }
     try std.testing.expectEqual(@as(usize, 1), cache.len());
     try std.testing.expectEqual(@as(usize, 0), CachedImageView.fallbacks);
@@ -5382,7 +5451,7 @@ test "last input: a touch sets the touch modality, and a click or a key sets the
 }
 
 test "pending input: a paused timeout does not flush until it is resumed" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     cx.app.bind_keys(&.{ KeyBinding.new("g", Editor.Save{}, "Editor"), KeyBinding.new("g g", Editor.Outside{}, "Editor") });
     const view, const vcx = cx.add_window_view(Editor.build);
@@ -5399,18 +5468,18 @@ test "pending input: a paused timeout does not flush until it is resumed" {
     try std.testing.expect(!vcx.window.set_pending_input_timeout_paused(other, false, cx.app));
     try std.testing.expect(vcx.window.pending_input().?.timeout().?.is_paused());
 
-    @import("../executor.zig").sleep_ns(700 * std.time.ns_per_ms);
+    cx.executor().advance_clock(700 * std.time.ns_per_ms);
     vcx.run_until_parked();
     try std.testing.expect(vcx.window.has_pending_keystrokes());
     try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, Editor.read_state, .{}).saves);
 
     try std.testing.expect(vcx.window.set_pending_input_timeout_paused(view, false, cx.app));
-    try wait_until_flushed(vcx);
+    cx.executor().advance_clock(std.time.ns_per_s);
     try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
 }
 
 test "pending input: releasing the owner of a pause resumes its timeout" {
-    var cx = TestAppContext.init();
+    var cx = TestAppContext.build(0);
     defer cx.deinit();
     const Owner = struct { n: u8 = 0 };
     cx.app.bind_keys(&.{ KeyBinding.new("g", Editor.Save{}, "Editor"), KeyBinding.new("g g", Editor.Outside{}, "Editor") });
@@ -5422,7 +5491,7 @@ test "pending input: releasing the owner of a pause resumes its timeout" {
     try std.testing.expect(vcx.window.set_pending_input_timeout_paused(owner, true, cx.app));
     owner.release(cx.app);
     try std.testing.expect(!vcx.window.pending_input().?.timeout().?.is_paused());
-    try wait_until_flushed(vcx);
+    cx.executor().advance_clock(std.time.ns_per_s);
     try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
 }
 
@@ -5538,6 +5607,93 @@ test "long press capture: a claim holds until the next long press starts" {
     // A long press starting releases the claim, whoever made it.
     vcx.simulate_event(.{ .long_press = .{ .phase = .started, .start_position = .{ .x = 5, .y = 5 }, .position = .{ .x = 5, .y = 5 } } });
     try std.testing.expect(!vcx.window.has_long_press_capture(owner));
+}
+
+/// Registers tab stops in prepaint, the way an element does, with one group in the middle.
+const GroupedTabs = struct {
+    outside_first: FocusHandle,
+    inside_second: FocusHandle,
+    inside_first: FocusHandle,
+    outside_last: FocusHandle,
+
+    pub fn render(self: *GroupedTabs, _: *Window, _: *Context(GroupedTabs)) *Div {
+        return div().id("grouped").w(px(100)).h(px(100)).child(
+            canvas_mod.canvas(self, GroupedTabs.prepaint, paint_nothing),
+        );
+    }
+    fn paint_nothing(_: *GroupedTabs, _: geometry.Bounds(Pixels), _: *void, _: *Window, _: *App) void {}
+    fn prepaint(self: *GroupedTabs, _: geometry.Bounds(Pixels), window: *Window, cx: *App) void {
+        stop(window, &self.outside_first, cx);
+        window.with_tab_group(1, GroupedTabs.inside, .{ self, cx });
+        stop(window, &self.outside_last, cx);
+    }
+    fn inside(window: *Window, self: *GroupedTabs, cx: *App) void {
+        stop(window, &self.inside_second, cx);
+        stop(window, &self.inside_first, cx);
+    }
+    /// An element pushes its own dispatch node before it registers its focus, so each stop does too.
+    fn stop(window: *Window, handle: *const FocusHandle, cx: *App) void {
+        window.next_frame.dispatch_tree.push_node();
+        defer window.next_frame.dispatch_tree.pop_node();
+        window.set_focus_handle(handle, cx);
+    }
+    fn build(_: *Window, app: *App) Entity(GroupedTabs) {
+        return app.new(GroupedTabs{
+            .outside_first = app.focus_handle().tab_index(0).tab_stop(true),
+            .inside_second = app.focus_handle().tab_index(6).tab_stop(true),
+            .inside_first = app.focus_handle().tab_index(5).tab_stop(true),
+            .outside_last = app.focus_handle().tab_index(2).tab_stop(true),
+        });
+    }
+};
+
+test "tab groups: with_tab_group orders its stops as one block" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(GroupedTabs.build);
+    const g = view.read(cx.app);
+    const tree = &vcx.window.rendered_frame.dispatch_tree;
+    // Outside the group, it sorts at index 1 between the stops at 0 and 2; inside, its own indices order.
+    try std.testing.expectEqual(@as(?u64, g.inside_first.id), tree.next_tab_stop(g.outside_first.id, true));
+    try std.testing.expectEqual(@as(?u64, g.inside_second.id), tree.next_tab_stop(g.inside_first.id, true));
+    try std.testing.expectEqual(@as(?u64, g.outside_last.id), tree.next_tab_stop(g.inside_second.id, true));
+    try std.testing.expectEqual(@as(?u64, g.outside_first.id), tree.next_tab_stop(g.outside_last.id, true));
+    try std.testing.expectEqual(@as(?u64, g.outside_last.id), tree.next_tab_stop(g.outside_first.id, false));
+}
+
+test "focus_lost_restore_target: nearest focusable ancestor of the lost focus" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(GroupedTabs.build);
+    const g = view.read(cx.app);
+    const window = vcx.window;
+    try std.testing.expect(window.focus_lost_restore_target(cx.app) == null);
+    // Only set while focus-lost listeners run: the path runs root to leaf, the leaf last.
+    const path = [_]window_mod.FocusId{ g.outside_first.id, g.inside_first.id };
+    window.focus_lost_path = &path;
+    defer window.focus_lost_path = &.{};
+    try std.testing.expectEqual(g.outside_first.id, window.focus_lost_restore_target(cx.app).?.id);
+    const unfocusable = [_]window_mod.FocusId{ 0xdead, g.inside_first.id };
+    window.focus_lost_path = &unfocusable;
+    try std.testing.expect(window.focus_lost_restore_target(cx.app) == null);
+}
+
+var button_layout_changes: usize = 0;
+
+fn count_button_layout(_: *Window, _: *App) void {
+    button_layout_changes += 1;
+}
+
+test "button layout: observers run each time the platform reports a change" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    _ = view;
+    button_layout_changes = 0;
+    _ = vcx.window.observe_button_layout_changed(count_button_layout);
+    vcx.window.platform_window.emit_button_layout_changed();
+    vcx.window.platform_window.emit_button_layout_changed();
+    try std.testing.expectEqual(@as(usize, 2), button_layout_changes);
 }
 
 // ---------------------------------------------------------------------------

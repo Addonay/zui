@@ -547,7 +547,7 @@ pub fn outline(b: Bounds(Pixels), border_color: anytype, border_style: BorderSty
 /// A platform window and its UI state (GPUI `Window`).
 /// How long a partial multi-stroke binding that could also mean something now waits for its next
 /// key (GPUI `PENDING_INPUT_TIMEOUT`).
-const PENDING_INPUT_TIMEOUT_NS: u64 = if (@import("builtin").is_test) 500 * std.time.ns_per_ms else std.time.ns_per_s;
+const PENDING_INPUT_TIMEOUT_NS: u64 = std.time.ns_per_s;
 
 const PendingModifier = struct {
     modifiers: keystroke_mod.Modifiers = .{},
@@ -732,6 +732,8 @@ pub const Window = struct {
     tooltip_bounds: ?Bounds(Pixels) = null,
     focus_enabled: bool = true,
     pending_focus_events: bool = false,
+    /// The focus path that a focus-lost listener is reacting to, empty otherwise (GPUI `focus_lost_path`).
+    focus_lost_path: []const FocusId = &.{},
     active: bool = true,
     hovered: bool = false,
     dirty: bool = true,
@@ -815,6 +817,7 @@ pub const Window = struct {
             .should_close = onShouldClose,
             .close = onClose,
             .appearance_changed = onAppearanceChanged,
+            .button_layout_changed = onButtonLayoutChanged,
             .ime = onIme,
             .ime_area = onImeArea,
             .visibility_changed = onVisibilityChanged,
@@ -1303,6 +1306,50 @@ pub const Window = struct {
         if (!self.focus_enabled) return;
         self.focus_id = null;
         self.refresh();
+    }
+
+    /// While focus-lost listeners run, the nearest ancestor of the lost focus that can still take
+    /// focus, so that the listener can move focus back into the window (GPUI `focus_lost_restore_target`).
+    /// Null at all other times.
+    pub fn focus_lost_restore_target(self: *const Window, cx: *const App) ?FocusHandle {
+        _ = cx;
+        const path = self.focus_lost_path;
+        if (path.len == 0) return null;
+        const tree = &self.rendered_frame.dispatch_tree;
+        var i = path.len - 1;
+        while (i > 0) {
+            i -= 1;
+            const node_id = tree.focusable_node_id(path[i]) orelse continue;
+            const node = tree.node(node_id);
+            return .{ .id = path[i], .tab_index_ = node.tab_index, .tab_stop_ = node.tab_stop };
+        }
+        return null;
+    }
+
+    /// Opens a tab group at `index` on the frame being drawn, so that tab stops created until the
+    /// matching `end_group` are ordered as one block (GPUI `TabStopMap::begin_group`). Call it during
+    /// prepaint, where tab stops are registered. Pair it with `end_group`.
+    pub fn begin_group(self: *Window, index: isize) void {
+        self.next_frame.dispatch_tree.push_node();
+        self.next_frame.dispatch_tree.set_tab_group(index);
+    }
+
+    /// Closes the tab group opened by `begin_group` (GPUI `TabStopMap::end_group`).
+    pub fn end_group(self: *Window) void {
+        self.next_frame.dispatch_tree.pop_node();
+    }
+
+    /// Runs `f` inside a tab group at `index`, or without one when `index` is null (GPUI
+    /// `with_tab_group`).
+    pub fn with_tab_group(self: *Window, index: ?isize, comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        if (index) |i| self.begin_group(i);
+        defer if (index != null) self.end_group();
+        return @call(.auto, f, .{self} ++ args);
+    }
+
+    /// The number of tab stops registered so far in the frame being drawn (GPUI `paint_index`).
+    pub fn paint_index(self: *const Window) usize {
+        return self.next_frame.dispatch_tree.len();
     }
 
     pub fn disable_focus(self: *Window) void {
@@ -3061,6 +3108,23 @@ pub const Window = struct {
         self.appearance_ = self.platform_window.appearance();
         self.app.dispatch_window_appearance(self);
         self.refresh();
+    }
+
+    fn onButtonLayoutChanged(ctx: *anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.app.dispatch_window_button_layout(self);
+    }
+
+    /// Runs `f(window, app)` when the titlebar button layout changes (GPUI `observe_button_layout_changed`).
+    pub fn observe_button_layout_changed(self: *Window, comptime f: fn (*Window, *App) void) app_mod.Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const win: *Window = @ptrCast(@alignCast(@constCast(payload.?)));
+                f(win, app);
+                return true;
+            }
+        };
+        return self.app.add_window_subscriber(.window_button_layout, self.handle_id, 0, S.call);
     }
 
     fn onVisibilityChanged(ctx: *anyopaque) void {

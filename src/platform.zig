@@ -26,6 +26,25 @@ pub const PopupNotSupportedError = popup.PopupNotSupportedError;
 pub const WindowControls = window_controls_mod.WindowControls;
 pub const WindowButton = window_controls_mod.WindowButton;
 pub const WindowButtonLayout = window_controls_mod.WindowButtonLayout;
+
+/// The operating system's preference for energy use versus performance (GPUI `PowerMode`).
+pub const PowerMode = enum {
+    /// The platform cannot determine the mode, or cannot distinguish the active mode from other
+    /// non-low-power modes.
+    unknown,
+    /// The system prioritizes reducing energy use.
+    low_power,
+    /// The system balances energy use and performance.
+    balanced,
+    /// The system prioritizes performance over energy use.
+    high_power,
+};
+
+/// Called when the power mode changes. The platform keeps it for as long as it runs.
+pub const PowerListener = struct {
+    ctx: *anyopaque,
+    func: *const fn (*anyopaque) void,
+};
 pub const WindowControlArea = window_controls_mod.WindowControlArea;
 
 const Pixels = geometry.Pixels;
@@ -497,6 +516,8 @@ pub const WindowCallbacks = struct {
     should_close: *const fn (*anyopaque) bool,
     close: *const fn (*anyopaque) void,
     appearance_changed: *const fn (*anyopaque) void,
+    /// The titlebar button layout changed (GPUI `on_button_layout_changed`). Null where a window has none.
+    button_layout_changed: ?*const fn (*anyopaque) void = null,
     ime: *const fn (*anyopaque, ImeInput) void,
     ime_area: *const fn (*anyopaque) ?Bounds(Pixels),
     /// The window's visibility may have changed (GPUI `on_visibility_change`). The window reads
@@ -777,6 +798,11 @@ fn noopIme(_: *PlatformWindow, _: Bounds(Pixels)) void {}
     pub fn emit_appearance_changed(self: *PlatformWindow) void {
         if (self.callbacks) |c| c.appearance_changed(c.ctx);
     }
+    pub fn emit_button_layout_changed(self: *PlatformWindow) void {
+        if (self.callbacks) |c| {
+            if (c.button_layout_changed) |changed| changed(c.ctx);
+        }
+    }
 };
 
 /// The OS application interface (GPUI `Platform`).
@@ -835,6 +861,10 @@ pub const Platform = struct {
         unhide_other_apps: *const fn (*Platform) void = noop,
         /// The window appearance the platform reports (GPUI `Platform::window_appearance`).
         window_appearance: *const fn (*Platform) WindowAppearance = lightAppearance,
+        /// The current power mode (GPUI `Platform::power_mode`).
+        power_mode: *const fn (*Platform) PowerMode = unknownPowerMode,
+        /// Registers the listener for power mode changes (GPUI `Platform::on_power_mode_change`).
+        on_power_mode_change: *const fn (*Platform, PowerListener) void = noPowerListener,
         /// Shows a file chooser for paths (GPUI `Platform::prompt_for_paths`). Answers once, through
         /// `completion`, possibly before this returns when the dialog cannot be shown.
         prompt_for_paths: *const fn (*Platform, PathPromptOptions, PathsCompletion) void = noPromptForPaths,
@@ -859,6 +889,10 @@ pub const Platform = struct {
     fn lightAppearance(_: *Platform) WindowAppearance {
         return .light;
     }
+    fn unknownPowerMode(_: *Platform) PowerMode {
+        return .unknown;
+    }
+    fn noPowerListener(_: *Platform, _: PowerListener) void {}
     fn noPromptForPaths(_: *Platform, _: PathPromptOptions, completion: PathsCompletion) void {
         completion.call(error.PromptsNotSupported);
     }
@@ -938,6 +972,12 @@ pub const Platform = struct {
     }
     pub fn button_layout(self: *Platform) ?WindowButtonLayout {
         return self.vtable.button_layout(self);
+    }
+    pub fn power_mode(self: *Platform) PowerMode {
+        return self.vtable.power_mode(self);
+    }
+    pub fn on_power_mode_change(self: *Platform, listener: PowerListener) void {
+        self.vtable.on_power_mode_change(self, listener);
     }
     pub fn wake(self: *Platform) void {
         self.vtable.wake(self);
