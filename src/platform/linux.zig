@@ -111,10 +111,69 @@ pub const LinuxPlatform = struct {
         .read_from_primary = readPrimary,
         .set_menus = setMenus,
         .get_menus = getMenus,
+        .keyboard_layout = keyboardLayout,
+        .compositor_name = compositorName,
+        .graphical_environment = graphicalEnvironment,
+        .window_stack = windowStack,
+        .hide_cursor_until_mouse_moves = hideCursorUntilMouseMoves,
+        .is_cursor_visible = isCursorVisible,
         .set_app_identity = setAppIdentity,
         .show_system_notification = showNotification,
         .dismiss_system_notification = dismissNotification,
     };
+
+    fn compositorName(p: *platform.Platform) []const u8 {
+        return switch (from(p).backend) {
+            .wayland => "Wayland",
+            .x11 => "X11",
+        };
+    }
+
+    /// The variables of the display server this connection uses (GPUI `graphical_environment`).
+    /// The activation token is never kept: the connection has used it.
+    fn graphicalEnvironment(p: *platform.Platform) ?platform.GraphicalEnvironment {
+        const is_wayland = std.meta.activeTag(from(p).backend) == .wayland;
+        return .{
+            .wayland_display = if (is_wayland) envValue("WAYLAND_DISPLAY") else null,
+            .x11_display = if (is_wayland) null else envValue("DISPLAY"),
+            .xdg_runtime_dir = envValue("XDG_RUNTIME_DIR"),
+        };
+    }
+
+    fn envValue(name: [*:0]const u8) ?[]const u8 {
+        const v = std.c.getenv(name) orelse return null;
+        return std.mem.span(v);
+    }
+
+    /// Wayland has no window stack a client can read (GPUI's Wayland returns none too).
+    fn windowStack(p: *platform.Platform) ?[]const *platform.PlatformWindow {
+        return switch (from(p).backend) {
+            .wayland => null,
+            .x11 => |c| c.window_stack(),
+        };
+    }
+
+    fn hideCursorUntilMouseMoves(p: *platform.Platform) void {
+        switch (from(p).backend) {
+            .wayland => |c| c.hide_cursor_until_mouse_moves(),
+            .x11 => |c| c.hide_cursor_until_mouse_moves(),
+        }
+    }
+
+    fn isCursorVisible(p: *platform.Platform) bool {
+        return switch (from(p).backend) {
+            .wayland => |c| c.is_cursor_visible(),
+            .x11 => |c| c.is_cursor_visible(),
+        };
+    }
+
+    fn keyboardLayout(p: *platform.Platform) platform.KeyboardLayout {
+        return switch (from(p).backend) {
+            .wayland => |c| c.keyboard_layout(),
+            .x11 => |c| c.keyboard_layout(),
+        };
+    }
+
 
     fn setAppIdentity(p: *platform.Platform, _: []const u8, name: []const u8) void {
         from(p).notifications.set_app_name(name);
@@ -296,5 +355,10 @@ pub fn create(allocator: std.mem.Allocator) !*platform.Platform {
         .wake_fd = efd,
         .notifications = system_notifications.State.init(allocator, self, LinuxPlatform.deliverNotification),
     };
+    // Outputs that change after this point are reported to the app through the platform.
+    switch (self.backend) {
+        .wayland => |c| c.platform_ = &self.platform,
+        .x11 => |c| c.platform_ = &self.platform,
+    }
     return &self.platform;
 }

@@ -129,6 +129,10 @@ pub const Tiling = platform_mod.Tiling;
 pub const Decorations = platform_mod.Decorations;
 pub const ResizeEdge = platform_mod.ResizeEdge;
 
+fn ReturnTypeOf(comptime build: anytype) type {
+    return @typeInfo(@TypeOf(build)).@"fn".return_type.?;
+}
+
 /// The root view type returned by an `open_window` builder.
 pub fn RootViewType(comptime build: anytype) type {
     const R = @typeInfo(@TypeOf(build)).@"fn".return_type.?;
@@ -636,6 +640,10 @@ pub const Window = struct {
     prompt_: ?prompts.ActivePrompt = null,
     /// The bounds the bounds observers last saw; they run only when these change.
     observed_bounds: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } },
+    /// Whether the platform presents this window's frames; read it with `visibility()`.
+    visibility_: platform_mod.WindowVisibility = .visible,
+    /// The display the window is on, as the platform last said; compared to detect a move.
+    display_id_: ?platform_mod.DisplayId = null,
 
     pub const FrameCallback = struct { ctx: *anyopaque, func: *const fn (*anyopaque, *Window, *App) void };
 
@@ -657,6 +665,8 @@ pub const Window = struct {
         self.viewport_size = pw.content_size();
         self.appearance_ = pw.appearance();
         self.observed_bounds = pw.bounds();
+        self.visibility_ = pw.visibility();
+        self.display_id_ = pw.display_id();
         if (options.titlebar) |t| if (t.title) |title| {
             self.title = title;
         };
@@ -673,6 +683,8 @@ pub const Window = struct {
             .appearance_changed = onAppearanceChanged,
             .ime = onIme,
             .ime_area = onImeArea,
+            .visibility_changed = onVisibilityChanged,
+            .display_changed = onDisplayChanged,
         });
         return self;
     }
@@ -711,6 +723,28 @@ pub const Window = struct {
 
     pub fn set_root_view(self: *Window, view: AnyView) void {
         self.root = view;
+    }
+
+    /// Creates an entity with access to this window, as `build(window, cx)` (GPUI `new_window_entity`).
+    pub fn new_window_entity(self: *Window, app: *App, comptime build: anytype) app_mod.Entity(ReturnTypeOf(build)) {
+        const T = ReturnTypeOf(build);
+        const reservation = app.reserve_entity(T);
+        var cx: app_mod.Context(T) = .{ .app = app, .entity_id_ = reservation.entity_id_ };
+        app.pending_updates += 1;
+        const value = build(self, &cx);
+        app.pending_updates -= 1;
+        return app.insert_entity(reservation, value);
+    }
+
+    /// Replaces the root view with a new one built by `build(window, cx)`. The old root is released
+    /// unless another window shows it (GPUI `Window::replace_root`).
+    pub fn replace_root(self: *Window, app: *App, comptime build: anytype) app_mod.Entity(ReturnTypeOf(build)) {
+        const view = self.new_window_entity(app, build);
+        const old = self.root;
+        self.root = view.into_any_view();
+        if (old) |r| if (!app.is_root_of_other_window(r.entity_id, self)) app.release_entity(r.entity_id);
+        self.refresh();
+        return view;
     }
 
     /// The root view, downcast to `V`.
@@ -899,6 +933,71 @@ pub const Window = struct {
             }
         };
         return self.app.add_window_subscriber(.window_bounds, self.handle_id, 0, S.call);
+    }
+
+    /// Whether the platform is presenting this window's frames (GPUI `visibility`).
+    pub fn visibility(self: *const Window) platform_mod.WindowVisibility {
+        return self.visibility_;
+    }
+
+    /// Whether frames drawn for this window will be shown. A shown window that is covered, minimized
+    /// or suspended is not visible here (GPUI `is_visible`).
+    pub fn is_visible(self: *const Window) bool {
+        return self.visibility_.is_visible();
+    }
+
+    /// Runs `f(visibility, window, app)` when the visibility of this window changes (GPUI
+    /// `observe_window_visibility`).
+    pub fn observe_window_visibility(self: *Window, comptime f: fn (platform_mod.WindowVisibility, *Window, *App) void) app_mod.Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const win: *Window = @ptrCast(@alignCast(@constCast(payload.?)));
+                f(win.visibility_, win, app);
+                return true;
+            }
+        };
+        return self.app.add_window_subscriber(.window_visibility, self.handle_id, 0, S.call);
+    }
+
+    /// Runs `f(window, app)` when this window moves to another display, or its display changes
+    /// (GPUI `observe_window_display`).
+    pub fn observe_window_display(self: *Window, comptime f: fn (*Window, *App) void) app_mod.Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const win: *Window = @ptrCast(@alignCast(@constCast(payload.?)));
+                f(win, app);
+                return true;
+            }
+        };
+        return self.app.add_window_subscriber(.window_display, self.handle_id, 0, S.call);
+    }
+
+    /// Reads the platform's visibility and tells the observers if it changed (GPUI `refresh_visibility`).
+    fn refresh_visibility(self: *Window) void {
+        const v = self.platform_window.visibility();
+        if (v == self.visibility_) return;
+        self.visibility_ = v;
+        self.app.dispatch_window_observers(.window_visibility, self);
+    }
+
+    /// Reads the platform's display of this window. If it moved, the observers hear it, after the
+    /// app has learned about the display (GPUI `display_changed`).
+    fn refresh_display(self: *Window) void {
+        const id = self.platform_window.display_id();
+        if (id == self.display_id_) return;
+        self.display_id_ = id;
+        if (id) |new_id| if (!self.app.knows_display(new_id)) self.app.displays_changed();
+        self.notify_display_observers(self.app);
+    }
+
+    /// Runs the display observers of this window (GPUI `notify_display_observers`).
+    pub fn notify_display_observers(self: *Window, app: *App) void {
+        app.dispatch_window_observers(.window_display, self);
+    }
+
+    /// The GPU this window renders with, if the platform can tell (GPUI `gpu_specs`).
+    pub fn gpu_specs(self: *Window) ?platform_mod.GpuSpecs {
+        return self.platform_window.gpu_specs();
     }
 
     /// Compares the platform's bounds with the last ones seen, and tells the observers if they changed.
@@ -1984,6 +2083,8 @@ pub const Window = struct {
         self.draw_if_dirty(cx);
         if (E == interactive.KeyDownEvent) {
             self.pending_modifier.saw_other_input = true;
+            // Typing hides the mouse cursor until the mouse moves (GPUI `dispatch_key_event`).
+            if (event.keystroke.key_char != null and cx.cursor_hide_mode() != .never) cx.hide_cursor_until_mouse_moves();
             self.dispatch_keystroke(E, event, event.keystroke, cx);
             return;
         }
@@ -2366,6 +2467,16 @@ pub const Window = struct {
         self.appearance_ = self.platform_window.appearance();
         self.app.dispatch_window_appearance(self);
         self.refresh();
+    }
+
+    fn onVisibilityChanged(ctx: *anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.refresh_visibility();
+    }
+
+    fn onDisplayChanged(ctx: *anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.refresh_display();
     }
 };
 

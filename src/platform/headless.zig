@@ -21,9 +21,24 @@ pub const HeadlessPlatform = struct {
     app: ?*app_mod.App = null,
     quit_requested: bool = false,
     clipboard: ?[]u8 = null,
-    displays_: [1]platform.Display = .{.{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } } }},
+    /// The connected displays. Tests change them with `set_displays`.
+    displays_: [max_displays]platform.Display = @splat(default_display),
+    display_count: usize = 1,
     cursor: platform.CursorStyle = .arrow,
     menus: platform.app_menu.MenuStore = .{},
+    /// What the app last asked for, for tests.
+    activation_policy: ?platform.ActivationPolicy = null,
+    cursor_visible: bool = true,
+    /// The keyboard layout the platform reports. Tests change it with `set_keyboard_layout`.
+    layout_name: []const u8 = "unknown",
+    hide_requests: u32 = 0,
+    /// What the platform reports for scrollbars. Tests change it.
+    auto_hide_scrollbars: bool = false,
+    cursor_hide_requests: u32 = 0,
+    hide_other_apps_requests: u32 = 0,
+    unhide_other_apps_requests: u32 = 0,
+    const max_displays = 4;
+    const default_display: platform.Display = .{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } } };
 
     const vtable: Platform.VTable = .{
         .run = run,
@@ -38,7 +53,65 @@ pub const HeadlessPlatform = struct {
         .quit_when_last_window_closes = noQuitOnClose,
         .set_menus = setMenus,
         .get_menus = getMenus,
+        .set_activation_policy = setActivationPolicy,
+        .hide_cursor_until_mouse_moves = hideCursorUntilMouseMoves,
+        .is_cursor_visible = isCursorVisible,
+        .hide_other_apps = hideOtherApps,
+        .unhide_other_apps = unhideOtherApps,
+        .keyboard_layout = keyboardLayout,
+        .hide = hideApp,
+        .should_auto_hide_scrollbars = autoHideScrollbars,
     };
+
+    fn hideApp(p: *Platform) void {
+        from(p).hide_requests += 1;
+    }
+
+    fn autoHideScrollbars(p: *Platform) bool {
+        return from(p).auto_hide_scrollbars;
+    }
+
+    fn keyboardLayout(p: *Platform) platform.KeyboardLayout {
+        const name = from(p).layout_name;
+        return .{ .id = name, .name = name };
+    }
+
+    /// Changes the keyboard layout and tells the app, as a platform does when the user switches it.
+    pub fn set_keyboard_layout(self: *HeadlessPlatform, name: []const u8) void {
+        if (std.mem.eql(u8, self.layout_name, name)) return;
+        self.layout_name = name;
+        self.platform.emit_keyboard_layout_changed();
+    }
+
+    fn setActivationPolicy(p: *Platform, policy: platform.ActivationPolicy) void {
+        from(p).activation_policy = policy;
+    }
+
+    fn hideCursorUntilMouseMoves(p: *Platform) void {
+        const self = from(p);
+        self.cursor_hide_requests += 1;
+        self.cursor_visible = false;
+    }
+
+    fn isCursorVisible(p: *Platform) bool {
+        return from(p).cursor_visible;
+    }
+
+    fn hideOtherApps(p: *Platform) void {
+        from(p).hide_other_apps_requests += 1;
+    }
+
+    fn unhideOtherApps(p: *Platform) void {
+        from(p).unhide_other_apps_requests += 1;
+    }
+
+    /// Replaces the connected displays and tells the app, as a platform does when its outputs change.
+    pub fn set_displays(self: *HeadlessPlatform, list: []const platform.Display) void {
+        std.debug.assert(list.len <= max_displays);
+        @memcpy(self.displays_[0..list.len], list);
+        self.display_count = list.len;
+        self.platform.emit_displays_changed();
+    }
 
     fn setMenus(p: *Platform, menus: []const platform.app_menu.Menu) void {
         const self = from(p);
@@ -105,7 +178,8 @@ pub const HeadlessPlatform = struct {
     }
 
     fn displays(p: *Platform) []const platform.Display {
-        return &from(p).displays_;
+        const self = from(p);
+        return self.displays_[0..self.display_count];
     }
 
     fn setCursor(p: *Platform, s: platform.CursorStyle) void {
@@ -150,6 +224,10 @@ pub const HeadlessWindow = struct {
     /// resized by a compositor here, so `start_window_resize` and `show_window_menu` do nothing.
     client_decorations: bool = false,
     client_inset: Pixels = 0,
+    /// Whether the window is presented. Tests change it with `set_visibility`.
+    visibility_: platform.WindowVisibility = .visible,
+    /// The display the window is on. Tests move it with `move_to_display`.
+    display: platform.DisplayId = 0,
 
     fn windowDecorations(p: *PlatformWindow) window_mod.Decorations {
         const self: *HeadlessWindow = @fieldParentPtr("base", p);
@@ -187,7 +265,30 @@ pub const HeadlessWindow = struct {
         .close = close,
         .window_decorations = windowDecorations,
         .set_client_inset = setClientInset,
+        .visibility = visibility,
+        .display_id = displayId,
     };
+
+    fn visibility(p: *PlatformWindow) platform.WindowVisibility {
+        return from(p).visibility_;
+    }
+
+    fn displayId(p: *PlatformWindow) ?platform.DisplayId {
+        return from(p).display;
+    }
+
+    /// Changes what the window presents and reports it. Like a real platform, it reports even a
+    /// repeat of the state it already had: the window must work out what changed.
+    pub fn set_visibility(self: *HeadlessWindow, v: platform.WindowVisibility) void {
+        self.visibility_ = v;
+        self.base.emit_visibility_changed();
+    }
+
+    /// Moves the window to another display and reports it, even when it is the display it is on.
+    pub fn move_to_display(self: *HeadlessWindow, id: platform.DisplayId) void {
+        self.display = id;
+        self.base.emit_display_changed();
+    }
 
     fn create(owner: *HeadlessPlatform, options: window_mod.WindowOptions) !*HeadlessWindow {
         const a = owner.allocator;
