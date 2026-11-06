@@ -40,7 +40,7 @@ const XEvent = proto.XEvent;
 const clear_color: color.Hsla = color.to_hsla(color.rgb(0x0e0e13));
 const im_retry_interval_ms: i64 = 1000;
 const im_retry_count: u32 = 60;
-const window_event_mask: c_long = proto.ExposureMask | proto.KeyPressMask | proto.KeyReleaseMask | proto.ButtonPressMask | proto.ButtonReleaseMask | proto.PointerMotionMask | proto.StructureNotifyMask | proto.FocusChangeMask | proto.EnterWindowMask | proto.LeaveWindowMask | proto.VisibilityChangeMask;
+const window_event_mask: c_long = proto.ExposureMask | proto.KeyPressMask | proto.KeyReleaseMask | proto.ButtonPressMask | proto.ButtonReleaseMask | proto.PointerMotionMask | proto.StructureNotifyMask | proto.FocusChangeMask | proto.EnterWindowMask | proto.LeaveWindowMask | proto.VisibilityChangeMask | proto.PropertyChangeMask;
 
 /// Atoms interned once per connection.
 const Atoms = struct {
@@ -51,6 +51,7 @@ const Atoms = struct {
     incr: Atom = 0,
     net_wm_name: Atom = 0,
     motif_hints: Atom = 0,
+    wm_class: Atom = 0,
     wm_protocols: Atom = 0,
     wm_delete_window: Atom = 0,
     net_wm_ping: Atom = 0,
@@ -58,6 +59,7 @@ const Atoms = struct {
     net_wm_state_maximized_vert: Atom = 0,
     net_wm_state_maximized_horz: Atom = 0,
     net_wm_state_fullscreen: Atom = 0,
+    net_wm_state_hidden: Atom = 0,
     net_wm_moveresize: Atom = 0,
     paste: Atom = 0,
     net_wm_sync_request: Atom = 0,
@@ -212,6 +214,7 @@ pub const X11Connection = struct {
             .incr = api.XInternAtom(dpy, "INCR", 0),
             .net_wm_name = api.XInternAtom(dpy, "_NET_WM_NAME", 0),
             .motif_hints = api.XInternAtom(dpy, "_MOTIF_WM_HINTS", 0),
+            .wm_class = api.XInternAtom(dpy, "WM_CLASS", 0),
             .wm_protocols = api.XInternAtom(dpy, "WM_PROTOCOLS", 0),
             .wm_delete_window = api.XInternAtom(dpy, "WM_DELETE_WINDOW", 0),
             .net_wm_ping = api.XInternAtom(dpy, "_NET_WM_PING", 0),
@@ -219,6 +222,7 @@ pub const X11Connection = struct {
             .net_wm_state_maximized_vert = api.XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_VERT", 0),
             .net_wm_state_maximized_horz = api.XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", 0),
             .net_wm_state_fullscreen = api.XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", 0),
+            .net_wm_state_hidden = api.XInternAtom(dpy, "_NET_WM_STATE_HIDDEN", 0),
             .net_wm_moveresize = api.XInternAtom(dpy, "_NET_WM_MOVERESIZE", 0),
             .net_wm_sync_request = api.XInternAtom(dpy, "_NET_WM_SYNC_REQUEST", 0),
             .net_wm_sync_request_counter = api.XInternAtom(dpy, "_NET_WM_SYNC_REQUEST_COUNTER", 0),
@@ -645,6 +649,9 @@ pub const X11Connection = struct {
                 w.on_configure(@intCast(@max(0, cfg.width)), @intCast(@max(0, cfg.height)));
                 if (moved) w.base.emit_moved();
                 w.update_frame_interval();
+            },
+            proto.PropertyNotify => {
+                if (ev.xproperty.atom == self.atoms.net_wm_state) w.read_wm_state();
             },
             proto.VisibilityNotify => {
                 w.set_visible(ev.xvisibility.state != proto.VisibilityFullyObscured);
@@ -1575,6 +1582,8 @@ pub const X11Window = struct {
     visible: bool = true,
     /// False when the app draws the frame (client decorations, or no titlebar requested).
     decorated: bool = true,
+    /// The window manager's `_NET_WM_STATE` for this window, kept current by PropertyNotify.
+    wm_state: WmState = .{},
     /// _NET_WM_SYNC_REQUEST: the window manager waits for this counter during resizes.
     sync_counter: c_ulong = 0,
     pending_sync: ?proto.XSyncValue = null,
@@ -1646,6 +1655,10 @@ pub const X11Window = struct {
         .minimize = minimize,
         .zoom = zoom,
         .toggle_fullscreen = toggleFullscreen,
+        .is_maximized = isMaximized,
+        .is_fullscreen = isFullscreen,
+        .set_app_id = setAppId,
+        .request_decorations = requestDecorations,
         .start_window_move = startWindowMove,
         .start_window_resize = startWindowResize,
         .show_window_menu = showWindowMenu,
@@ -1992,6 +2005,59 @@ pub const X11Window = struct {
         conn.flush();
     }
 
+    fn isMaximized(p: *platform.PlatformWindow) bool {
+        const st = from(p).wm_state;
+        // A maximized window that gets minimized keeps its maximized state, so hidden counts as not maximized.
+        return !st.hidden and st.maximized_vert and st.maximized_horz;
+    }
+    fn isFullscreen(p: *platform.PlatformWindow) bool {
+        return from(p).wm_state.fullscreen;
+    }
+
+    /// WM_CLASS holds the instance and the class, both the app id (GPUI `set_app_id`).
+    fn setAppId(p: *platform.PlatformWindow, app_id: []const u8) void {
+        const self = from(p);
+        const conn = self.conn;
+        var buf: [512]u8 = undefined;
+        const n = @min(app_id.len, (buf.len - 2) / 2);
+        @memcpy(buf[0..n], app_id[0..n]);
+        buf[n] = 0;
+        @memcpy(buf[n + 1 .. 2 * n + 1], app_id[0..n]);
+        buf[2 * n + 1] = 0;
+        _ = conn.api.XChangeProperty(conn.display, self.x_window, conn.atoms.wm_class, proto.XA_STRING, 8, proto.PROP_MODE_REPLACE, @ptrCast(&buf), @intCast(2 * n + 2));
+        conn.flush();
+    }
+
+    /// Client decorations need a compositor, as in `create` (GPUI `request_decorations`).
+    fn requestDecorations(p: *platform.PlatformWindow, decorations: window_mod.WindowDecorations) void {
+        const self = from(p);
+        const decorated = switch (decorations) {
+            .server => true,
+            .client => !self.conn.has_compositor(),
+        };
+        self.decorated = decorated;
+        self.conn.set_decorations(self.x_window, decorated);
+        self.conn.flush();
+    }
+
+    /// Reads `_NET_WM_STATE` after the window manager changed it (GPUI reads the same property).
+    fn read_wm_state(self: *X11Window) void {
+        const conn = self.conn;
+        var actual_type: proto.Atom = 0;
+        var actual_format: c_int = 0;
+        var nitems: c_ulong = 0;
+        var after: c_ulong = 0;
+        var prop: [*]u8 = undefined;
+        const rc = conn.api.XGetWindowProperty(conn.display, self.x_window, conn.atoms.net_wm_state, 0, 1024, 0, proto.XA_ATOM, &actual_type, &actual_format, &nitems, &after, &prop);
+        if (rc != 0 or actual_type != proto.XA_ATOM or actual_format != 32) {
+            self.wm_state = .{};
+            return;
+        }
+        defer _ = conn.api.XFree(prop);
+        const items: [*]const c_ulong = @ptrCast(@alignCast(prop));
+        self.wm_state = parse_wm_state(items[0..@intCast(nitems)], conn.atoms);
+    }
+
     fn startWindowMove(p: *platform.PlatformWindow) void {
         from(p).send_moveresize(8);
     }
@@ -2101,6 +2167,38 @@ pub const X11Window = struct {
         self.allocator.destroy(self);
     }
 };
+
+/// The `_NET_WM_STATE` atoms a window has set, as the window manager reports them.
+pub const WmState = struct {
+    maximized_vert: bool = false,
+    maximized_horz: bool = false,
+    fullscreen: bool = false,
+    hidden: bool = false,
+};
+
+/// Reads the state atoms of a window (format 32 Xlib longs, read here as atoms).
+pub fn parse_wm_state(items: []const c_ulong, atoms: Atoms) WmState {
+    var st: WmState = .{};
+    for (items) |item| {
+        if (item == atoms.net_wm_state_maximized_vert) st.maximized_vert = true;
+        if (item == atoms.net_wm_state_maximized_horz) st.maximized_horz = true;
+        if (item == atoms.net_wm_state_fullscreen) st.fullscreen = true;
+        if (item == atoms.net_wm_state_hidden) st.hidden = true;
+    }
+    return st;
+}
+
+test "x11 _NET_WM_STATE: maximized needs both axes and not hidden; fullscreen is its own state" {
+    const atoms: Atoms = .{ .net_wm_state_maximized_vert = 10, .net_wm_state_maximized_horz = 11, .net_wm_state_fullscreen = 12, .net_wm_state_hidden = 13 };
+    const both = parse_wm_state(&.{ 10, 11 }, atoms);
+    try std.testing.expect(both.maximized_vert and both.maximized_horz and !both.fullscreen and !both.hidden);
+    const half = parse_wm_state(&.{10}, atoms);
+    try std.testing.expect(!(half.maximized_vert and half.maximized_horz));
+    const full = parse_wm_state(&.{12}, atoms);
+    try std.testing.expect(full.fullscreen and !full.maximized_vert);
+    const minimized = parse_wm_state(&.{ 10, 11, 13 }, atoms);
+    try std.testing.expect(minimized.hidden and minimized.maximized_vert);
+}
 
 test "x11 cursor styles use cursorfont glyphs" {
     try std.testing.expectEqual(proto.XC_left_ptr, X11Connection.cursor_glyph(.arrow));

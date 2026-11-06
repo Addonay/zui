@@ -1070,8 +1070,41 @@ pub const Window = struct {
     pub fn show_window_menu(self: *Window, position: Point(Pixels)) void {
         self.platform_window.show_window_menu(position);
     }
+    /// The bounds and the state they are in: fullscreen and maximized windows report their own
+    /// variant (GPUI `window_bounds`).
     pub fn window_bounds(self: *const Window) WindowBounds {
-        return .{ .windowed = self.bounds() };
+        const b = self.bounds();
+        if (self.is_fullscreen()) return .{ .fullscreen = b };
+        if (self.is_maximized()) return .{ .maximized = b };
+        return .{ .windowed = b };
+    }
+    /// `window_bounds` without the insets the platform draws around the window, such as the shadow
+    /// of client decorations (GPUI `inner_window_bounds`). Tiling is not considered yet.
+    pub fn inner_window_bounds(self: *const Window) WindowBounds {
+        const b = self.bounds();
+        if (self.is_fullscreen()) return .{ .fullscreen = b };
+        if (self.is_maximized()) return .{ .maximized = b };
+        const inset: Pixels = switch (self.window_decorations()) {
+            .server => 0,
+            .client => self.client_inset_value orelse 0,
+        };
+        return .{ .windowed = b.inset(inset) };
+    }
+    /// Whether the platform reports the window as maximized (GPUI `is_maximized`).
+    pub fn is_maximized(self: *const Window) bool {
+        return self.platform_window.is_maximized();
+    }
+    /// Whether the platform reports the window as fullscreen (GPUI `is_fullscreen`).
+    pub fn is_fullscreen(self: *const Window) bool {
+        return self.platform_window.is_fullscreen();
+    }
+    /// Sets the app id: xdg_toplevel's app_id on Wayland, WM_CLASS on X11 (GPUI `set_app_id`).
+    pub fn set_app_id(self: *Window, app_id: []const u8) void {
+        self.platform_window.set_app_id(app_id);
+    }
+    /// Asks for server or client decorations where the platform can choose (GPUI `request_decorations`).
+    pub fn request_decorations(self: *Window, decorations: WindowDecorations) void {
+        self.platform_window.request_decorations(decorations);
     }
     pub fn resize(self: *Window, size: Size(Pixels)) void {
         self.platform_window.resize(size);
@@ -1251,6 +1284,11 @@ pub const Window = struct {
     }
     pub fn pop_view(self: *Window) void {
         _ = self.view_stack.pop();
+    }
+    /// Sets the view id for the current element, which `view_path_reversed` walks from. Only called
+    /// during prepaint, where the element's dispatch node is active (GPUI `Window::set_view_id`).
+    pub fn set_view_id(self: *Window, view_id: EntityId) void {
+        self.next_frame.dispatch_tree.set_view_id(view_id);
     }
     pub fn current_view(self: *const Window) ?EntityId {
         if (self.view_stack.items.len == 0) return null;

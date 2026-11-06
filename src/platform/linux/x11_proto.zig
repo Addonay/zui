@@ -55,6 +55,7 @@ pub const FocusIn: c_int = 9;
 pub const FocusOut: c_int = 10;
 pub const DestroyNotify: c_int = 17;
 pub const ConfigureNotify: c_int = 22;
+pub const PropertyNotify: c_int = 28;
 pub const ClientMessage: c_int = 33;
 
 pub const XConfigureEvent = extern struct {
@@ -162,6 +163,7 @@ pub const GenericEvent: c_int = 35;
 pub const VisibilityNotify: c_int = 15;
 pub const VisibilityFullyObscured: c_int = 2;
 pub const VisibilityChangeMask: c_long = 1 << 16;
+pub const PropertyChangeMask: c_long = 1 << 22;
 pub const UnmapNotify: c_int = 18;
 pub const MapNotify: c_int = 19;
 pub const XI_DeviceChanged: c_int = 1;
@@ -484,6 +486,18 @@ pub const XimApi = struct {
     }
 };
 
+/// Xlib's XPropertyEvent: a property of the window changed (or was deleted).
+pub const XPropertyEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    window: Window,
+    atom: Atom,
+    time: Time,
+    state: c_int,
+};
+
 pub const XVisibilityEvent = extern struct {
     type: c_int,
     serial: c_ulong,
@@ -559,6 +573,7 @@ pub const XEvent = extern union {
     xmapping: XMappingEvent,
     xcookie: XGenericEventCookie,
     xvisibility: XVisibilityEvent,
+    xproperty: XPropertyEvent,
     pad: [24]c_long,
 };
 

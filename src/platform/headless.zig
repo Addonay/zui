@@ -272,6 +272,12 @@ pub const HeadlessWindow = struct {
     /// resized by a compositor here, so `start_window_resize` and `show_window_menu` do nothing.
     client_decorations: bool = false,
     client_inset: Pixels = 0,
+    /// Window state as the platform reports it. Like GPUI's test window, toggling fullscreen flips
+    /// `fullscreen`, and nothing ever reports `maximized` unless a test sets it.
+    fullscreen: bool = false,
+    maximized: bool = false,
+    /// The last app id the app set (GPUI `set_app_id`), for tests.
+    app_id: []const u8 = "",
     /// Whether the window is presented. Tests change it with `set_visibility`.
     visibility_: platform.WindowVisibility = .visible,
     /// The display the window is on. Tests move it with `move_to_display`.
@@ -291,6 +297,23 @@ pub const HeadlessWindow = struct {
     fn setClientInset(p: *PlatformWindow, inset: Pixels) void {
         const self: *HeadlessWindow = @fieldParentPtr("base", p);
         self.client_inset = inset;
+    }
+
+    fn toggleFullscreen(p: *PlatformWindow) void {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        self.fullscreen = !self.fullscreen;
+    }
+    fn isFullscreen(p: *PlatformWindow) bool {
+        return from(p).fullscreen;
+    }
+    fn isMaximized(p: *PlatformWindow) bool {
+        return from(p).maximized;
+    }
+    fn setAppId(p: *PlatformWindow, app_id: []const u8) void {
+        from(p).app_id = app_id;
+    }
+    fn requestDecorations(p: *PlatformWindow, decorations: window_mod.WindowDecorations) void {
+        from(p).client_decorations = decorations == .client;
     }
 
     fn updateImeEnabled(p: *PlatformWindow, enabled: bool) void {
@@ -319,6 +342,11 @@ pub const HeadlessWindow = struct {
         .close = close,
         .window_decorations = windowDecorations,
         .set_client_inset = setClientInset,
+        .toggle_fullscreen = toggleFullscreen,
+        .is_fullscreen = isFullscreen,
+        .is_maximized = isMaximized,
+        .set_app_id = setAppId,
+        .request_decorations = requestDecorations,
         .visibility = visibility,
         .display_id = displayId,
     };
