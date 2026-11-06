@@ -38,6 +38,13 @@ const Cursor = proto.Cursor;
 const XEvent = proto.XEvent;
 
 const clear_color: color.Hsla = color.to_hsla(color.rgb(0x0e0e13));
+
+/// The clear of a frame: the window color for an opaque window, transparent for others (GPUI clears
+/// a transparent window to transparent and leaves the content to the app).
+fn frame_clear(background: window_mod.WindowBackgroundAppearance) color.Hsla {
+    return if (background == .@"opaque") clear_color else color.transparent_black();
+}
+
 const im_retry_interval_ms: i64 = 1000;
 const im_retry_count: u32 = 60;
 const window_event_mask: c_long = proto.ExposureMask | proto.KeyPressMask | proto.KeyReleaseMask | proto.ButtonPressMask | proto.ButtonReleaseMask | proto.PointerMotionMask | proto.StructureNotifyMask | proto.FocusChangeMask | proto.EnterWindowMask | proto.LeaveWindowMask | proto.VisibilityChangeMask | proto.PropertyChangeMask;
@@ -428,6 +435,13 @@ pub const X11Connection = struct {
 
     // -- windows ----------------------------------------------------------
 
+    /// The screen's 32-bit TrueColor visual, which has alpha (the transparent visual of GPUI's `find_visuals`).
+    fn argb_visual(self: *X11Connection) ?proto.VisualInfo {
+        var info: proto.VisualInfo = undefined;
+        if (self.api.XMatchVisualInfo(self.display, self.screen, 32, proto.TRUE_COLOR, &info) == 0) return null;
+        return info;
+    }
+
     pub fn open_window(self: *X11Connection, options: window_mod.WindowOptions) !*X11Window {
         // Native popups are not implemented on X11 yet, as in gpui_linux: callers fall back to
         // an in-window popover.
@@ -450,8 +464,31 @@ pub const X11Connection = struct {
         // The window opens at its requested origin, so windows that are placed side by side stay apart.
         const ox: c_int = @intFromFloat(@round(b.origin.x * self.scale));
         const oy: c_int = @intFromFloat(@round(b.origin.y * self.scale));
-        const x = a.XCreateSimpleWindow(self.display, self.root, ox, oy, pw, ph, 0, 0, 0);
-        w.x_window = x;
+        // A window that asks for a transparent background gets the screen's 32-bit visual and a
+        // colormap of its own, as gpui_linux does. Without such a visual it stays opaque on the
+        // default visual.
+        if (options.window_background != .@"opaque") {
+            if (self.argb_visual()) |info| {
+                const colormap = a.XCreateColormap(self.display, self.root, info.visual, proto.ALLOC_NONE);
+                var attributes: proto.SetWindowAttributes = .{ .border_pixel = 0, .colormap = colormap };
+                w.x_window = a.XCreateWindow(self.display, self.root, ox, oy, pw, ph, 0, @intCast(info.depth), proto.INPUT_OUTPUT, info.visual, proto.CW_BORDER_PIXEL | proto.CW_COLORMAP, &attributes);
+                w.visual = info.visual;
+                w.depth = @intCast(info.depth);
+                w.colormap = colormap;
+                w.gc = a.XCreateGC(self.display, w.x_window, 0, null);
+                w.gc_owned = true;
+            } else {
+                std.log.warn("x11: no 32-bit visual, the window stays opaque", .{});
+            }
+        }
+        if (w.visual == null) {
+            w.x_window = a.XCreateSimpleWindow(self.display, self.root, ox, oy, pw, ph, 0, 0, 0);
+            w.visual = a.XDefaultVisual(self.display, self.screen);
+            w.depth = a.XDefaultDepth(self.display, self.screen);
+            w.gc = a.XDefaultGC(self.display, self.screen);
+        }
+        w.background_appearance = options.window_background;
+        const x = w.x_window;
         // Kinds as GPUI's X11 platform maps them. Floating needs a parent window to do anything,
         // and no window has one here, so it opens like a normal window.
         switch (options.kind) {
@@ -502,7 +539,7 @@ pub const X11Connection = struct {
             self.gpu_context = window_renderer.GpuContext.create(self.allocator, .x11);
         }
         if (self.gpu_context) |ctx| {
-            w.gpu_window = window_renderer.GpuWindow.create(ctx, .{ .x11 = .{ .display = @ptrCast(self.display), .window = x } }, pw, ph, .{});
+            w.gpu_window = window_renderer.GpuWindow.create(ctx, .{ .x11 = .{ .display = @ptrCast(self.display), .window = x } }, pw, ph, .{ .transparent = options.window_background != .@"opaque" });
         }
         self.windows.appendAssumeCapacity(w);
         w.apply_cursor();
@@ -1589,6 +1626,18 @@ pub const X11Window = struct {
     scale: f32,
     /// XImage whose data is malloc'd (XDestroyImage frees it).
     image: ?*proto.XImage = null,
+    /// The window's visual and depth: a 32-bit ARGB visual when the window asked for a transparent
+    /// background at creation, else the screen's default visual.
+    visual: ?*proto.Visual = null,
+    depth: c_int = 0,
+    /// The graphics context puts images with the window's depth. Owned only for an ARGB window,
+    /// whose depth differs from the screen's default GC.
+    gc: proto.GC = null,
+    gc_owned: bool = false,
+    /// The colormap of an ARGB window, freed with it.
+    colormap: proto.Colormap = 0,
+    /// The background as set by `set_background_appearance` (GPUI `background_appearance`).
+    background_appearance: window_mod.WindowBackgroundAppearance = .@"opaque",
     image_w: u32 = 0,
     image_h: u32 = 0,
     frame_wanted: bool = false,
@@ -1653,10 +1702,30 @@ pub const X11Window = struct {
         return self.conn.appearance_;
     }
 
+    /// GPUI `set_background_appearance`. The renderer follows at the next frame. The visual is
+    /// fixed at creation, as in GPUI: a window made opaque on the default visual shows its clear
+    /// as black where the background is transparent.
+    fn setBackgroundAppearance(p: *platform.PlatformWindow, appearance: window_mod.WindowBackgroundAppearance) void {
+        const self = from(p);
+        if (self.background_appearance == appearance) return;
+        self.background_appearance = appearance;
+        if (self.gpu_window) |*g| g.set_transparent(appearance != .@"opaque");
+    }
+
+    fn backgroundAppearance(p: *platform.PlatformWindow) window_mod.WindowBackgroundAppearance {
+        return from(p).background_appearance;
+    }
+
+    /// X11 has no blur protocol. GPUI's X11 window does nothing here as well.
+    fn setClientCornerRadii(_: *platform.PlatformWindow, _: geometry.Corners(Pixels)) void {}
+
     const vtable: platform.PlatformWindow.VTable = .{
         .appearance = windowAppearance,
         .visibility = windowVisibility,
         .display_id = windowDisplayId,
+        .set_background_appearance = setBackgroundAppearance,
+        .background_appearance = backgroundAppearance,
+        .set_client_corner_radii = setClientCornerRadii,
         .gpu_specs = gpuSpecs,
         .play_system_bell = playSystemBell,
         .update_ime_enabled = updateImeEnabled,
@@ -1771,9 +1840,11 @@ pub const X11Window = struct {
         const bytes = @as(usize, w) * h * 4;
         const data: ?*anyopaque = std.c.malloc(bytes);
         const px: [*]u8 = @ptrCast(data orelse return false);
-        const visual = a.XDefaultVisual(conn.display, conn.screen);
-        const depth = a.XDefaultDepth(conn.display, conn.screen);
-        const img = a.XCreateImage(conn.display, visual, @intCast(depth), proto.ZPixmap, 0, px, w, h, 32, @intCast(w * 4)) orelse {
+        const visual = self.visual orelse {
+            std.c.free(data);
+            return false;
+        };
+        const img = a.XCreateImage(conn.display, visual, @intCast(self.depth), proto.ZPixmap, 0, px, w, h, 32, @intCast(w * 4)) orelse {
             std.c.free(data);
             return false;
         };
@@ -1788,7 +1859,7 @@ pub const X11Window = struct {
         if (self.closed or self.destroyed_by_server) return;
         const dims = self.physical();
         if (self.gpu_window) |*g| {
-            if (!g.draw(scene, clear_color, dims.w, dims.h)) self.frame_wanted = true;
+            if (!g.draw(scene, frame_clear(self.background_appearance), dims.w, dims.h)) self.frame_wanted = true;
             self.conn.flush();
             return;
         }
@@ -1796,10 +1867,9 @@ pub const X11Window = struct {
         const img = self.image.?;
         const pixels = img.data.?[0 .. @as(usize, dims.w) * dims.h * 4];
         const fb: cpu.Framebuffer = .{ .pixels = pixels, .width = dims.w, .height = dims.h, .stride = dims.w * 4, .format = .bgra8 };
-        self.renderer.draw(scene, &self.atlas, fb, clear_color);
+        self.renderer.draw(scene, &self.atlas, fb, frame_clear(self.background_appearance));
         const conn = self.conn;
-        const gc = conn.api.XDefaultGC(conn.display, conn.screen);
-        _ = conn.api.XPutImage(conn.display, self.x_window, gc, img, 0, 0, 0, 0, dims.w, dims.h);
+        _ = conn.api.XPutImage(conn.display, self.x_window, self.gc, img, 0, 0, 0, 0, dims.w, dims.h);
         conn.flush();
     }
 
@@ -2166,6 +2236,14 @@ pub const X11Window = struct {
         }
         if (!self.destroyed_by_server) {
             _ = self.conn.api.XDestroyWindow(self.conn.display, self.x_window);
+        }
+        if (self.gc_owned) {
+            _ = self.conn.api.XFreeGC(self.conn.display, self.gc);
+            self.gc_owned = false;
+        }
+        if (self.colormap != 0) {
+            _ = self.conn.api.XFreeColormap(self.conn.display, self.colormap);
+            self.colormap = 0;
         }
         self.conn.flush();
     }

@@ -1,7 +1,10 @@
 //! CPU rasterizer for GPUI scenes: headless rendering, snapshot tests and a software fallback.
 //! The fragment math is ported from gpui_wgpu/src/shaders.wgsl and matches the GPU pixels:
-//! non-premultiplied composite (ALPHA_BLENDING), sRGB-encoded values blended directly,
-//! paths resolved from 4x MSAA. Fills are SIMD over 4 pixels; interior pixels of rounded or
+//! composite in sRGB-encoded values, paths resolved from 4x MSAA. The canvas holds premultiplied
+//! colors (what wl_shm ARGB8888 and X11 32-bit pixels mean), so a transparent window needs no
+//! conversion on present: the clear is premultiplied, and `over_straight` is the premultiplied
+//! over operator once the canvas is read as premultiplied. For opaque windows alpha is 1 and
+//! nothing changes. Fills are SIMD over 4 pixels; interior pixels of rounded or
 //! bordered quads skip the SDF, as the shader's fast path does.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -412,7 +415,13 @@ inline fn to_u8(v: f32) u8 {
     return @intFromFloat(v * 255.0 + 0.5);
 }
 
-/// Source-over of a straight color `c` onto `d`, in the framebuffer's composite mode.
+/// Converts a straight RGBA color to the premultiplied form the canvas stores. Opaque colors
+/// (alpha 1) are unchanged, so opaque windows clear to the same pixels as before.
+pub fn premultiply(c: [4]f32) [4]f32 {
+    return .{ c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3] };
+}
+
+/// Source-over of a straight color `c` onto `d` (`d` premultiplied, as the canvas is; see `premultiply`).
 inline fn over_straight(d: F4, c: F4) F4 {
     const a = c[3];
     const src = F4{ c[0] * a, c[1] * a, c[2] * a, a };
@@ -1413,7 +1422,7 @@ pub const CpuRenderer = struct {
     pub fn draw(self: *CpuRenderer, sc: *const Scene, atlas_: *const CpuAtlas, fb: Framebuffer, clear: Hsla) void {
         const full = Target.init(fb) orelse return;
         const clear_rgba = clear.to_rgb();
-        const clear_px = [4]f32{ clear_rgba.r, clear_rgba.g, clear_rgba.b, clear_rgba.a };
+        const clear_px = premultiply(.{ clear_rgba.r, clear_rgba.g, clear_rgba.b, clear_rgba.a });
 
         const wanted = if (self.threads == 0) (std.Thread.getCpuCount() catch 1) else self.threads;
         const bands = std.math.clamp(@min(wanted, full.height / min_band_rows), 1, max_bands);
@@ -2054,3 +2063,40 @@ test "ppm output has a P6 header and drops alpha" {
     try write_ppm(fb, &writer);
     try testing.expectEqualStrings("P6\n2 1\n255\n\xff\x00\x00\x00\xff\x00", writer.buffered());
 }
+
+test "premultiply: alpha 0 zeroes the color, alpha 1 keeps it, in between scales it" {
+    try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, premultiply(.{ 1, 0.5, 0.25, 0 }));
+    try testing.expectEqual([4]f32{ 0.2, 0.4, 0.6, 1 }, premultiply(.{ 0.2, 0.4, 0.6, 1 }));
+    try testing.expectEqual([4]f32{ 0.5, 0, 0.25, 0.5 }, premultiply(.{ 1, 0, 0.5, 0.5 }));
+    // In bytes: a full channel at 128/255 alpha stays 128 after premultiplying.
+    const half = premultiply(.{ 1, 1, 1, 128.0 / 255.0 });
+    try testing.expectEqual(@as(u8, 128), to_u8(half[3]));
+    try testing.expectEqual(@as(u8, 128), to_u8(half[0]));
+    const solid = premultiply(.{ 1, 1, 1, 1 });
+    try testing.expectEqual(@as(u8, 255), to_u8(solid[0]));
+}
+
+test "a transparent clear is transparent and a half quad lands premultiplied" {
+    var sc = Scene.init(testing.allocator);
+    defer sc.deinit();
+    try sc.insert_primitive(.{ .quad = .{
+        .bounds = test_rect(1, 1, 2, 1),
+        .content_mask = test_mask(0, 0, 4, 4),
+        .background = color.solid_background(color.hsla(0, 1, 0.5, 0.5)),
+    } });
+    sc.finish();
+
+    var target = try TestFb.init(4, 4, .{ 9, 9, 9, 9 });
+    defer target.deinit();
+    var atlas_ = CpuAtlas.init(testing.allocator);
+    defer atlas_.deinit();
+    var renderer = CpuRenderer.init(testing.allocator);
+    defer renderer.deinit();
+    renderer.draw(&sc, &atlas_, target.fb, color.transparent_black());
+
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, target.at(0, 0));
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, target.at(3, 3));
+    // Red at half alpha, premultiplied: color 0.5 and alpha 0.5, i.e. 128 in each.
+    try testing.expectEqual([4]u8{ 128, 0, 0, 128 }, target.at(1, 1));
+}
+

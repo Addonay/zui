@@ -975,7 +975,9 @@ pub const GpuRenderer = struct {
     /// Records every command into one pass; path batches end it, render their coverage, and resume.
     fn record(self: *GpuRenderer, target: Target, sprite_atlas: *GpuAtlas, size: TargetSize, clear: Hsla) void {
         const rgba = clear.to_rgb();
-        var pass = self.beginFramePass(target, .{ .load = .{ .clear = .{ rgba.r, rgba.g, rgba.b, rgba.a } }, .store = .store });
+        // Premultiplied targets clear to premultiplied colors, as the CPU canvas does (see cpu.premultiply).
+        const scale: f32 = if (self.options.premultiplied_alpha) rgba.a else 1;
+        var pass = self.beginFramePass(target, .{ .load = .{ .clear = .{ rgba.r * scale, rgba.g * scale, rgba.b * scale, rgba.a } }, .store = .store });
         pass.setViewport(.{ .width = @intCast(size.width), .height = @intCast(size.height) }, .top_left);
         const flip: f32 = if (self.device.features().origin_top_left) 0 else 1;
         const vs: VsParams = .{ .viewport = .{ @floatFromInt(size.width), @floatFromInt(size.height), 0, 0 } };

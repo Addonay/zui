@@ -477,6 +477,22 @@ pub const NativeSurface = union(enum) {
 
 /// The swapchain of one window. `acquire` returns null when no image can be drawn
 /// right now (window has no size, or the swapchain went stale and must wait a frame).
+/// The surface format frames are drawn in: 8-bit BGRA or RGBA, non-sRGB, as in GPUI (its
+/// blending happens in the encoded space). Both carry alpha, so transparent windows need no other.
+pub fn pick_surface_format(formats: []const SurfaceFormat) ?SurfaceFormat {
+    for (formats) |f| if (f.format == FORMAT_BGRA8 and f.colorSpace == COLOR_SPACE_SRGB_NONLINEAR) return f;
+    for (formats) |f| if (f.format == FORMAT_RGBA8 and f.colorSpace == COLOR_SPACE_SRGB_NONLINEAR) return f;
+    return null;
+}
+
+/// The composite alpha mode, as GPUI picks it: premultiplied for a transparent window when the
+/// surface offers it, opaque otherwise when offered, else the lowest mode the surface supports.
+pub fn pick_composite_alpha(supported: u32, transparent: bool) u32 {
+    if (transparent and supported & COMPOSITE_ALPHA_PREMULTIPLIED != 0) return COMPOSITE_ALPHA_PREMULTIPLIED;
+    if (supported & COMPOSITE_ALPHA_OPAQUE != 0) return COMPOSITE_ALPHA_OPAQUE;
+    return @as(u32, 1) << @intCast(@ctz(supported));
+}
+
 pub const WindowSwapchain = struct {
     const max_images = 8;
 
@@ -527,12 +543,7 @@ pub const WindowSwapchain = struct {
         format_count = @min(format_count, formats.len);
         const format_status = sf.vkGetPhysicalDeviceSurfaceFormatsKHR(ctx.physical, surface, &format_count, &formats);
         if (format_status != SUCCESS and format_status != 5) return error.SurfaceQueryFailed;
-        // Non-sRGB targets, as in GPUI: its blending happens in the encoded space.
-        const chosen: SurfaceFormat = pick: {
-            for (formats[0..format_count]) |f| if (f.format == FORMAT_BGRA8 and f.colorSpace == COLOR_SPACE_SRGB_NONLINEAR) break :pick f;
-            for (formats[0..format_count]) |f| if (f.format == FORMAT_RGBA8 and f.colorSpace == COLOR_SPACE_SRGB_NONLINEAR) break :pick f;
-            return error.NoUsableSurfaceFormat;
-        };
+        const chosen = pick_surface_format(formats[0..format_count]) orelse return error.NoUsableSurfaceFormat;
 
         var mode_count: u32 = 0;
         var modes: [16]i32 = undefined;
@@ -601,6 +612,19 @@ pub const WindowSwapchain = struct {
         self.count = 0;
     }
 
+    /// Switches the window between opaque and transparent. The swapchain is recreated with the
+    /// composite alpha mode of the new choice before the next frame.
+    pub fn set_transparent(self: *WindowSwapchain, transparent: bool) void {
+        if (self.transparent == transparent) return;
+        self.transparent = transparent;
+        self.needs_recreate = true;
+    }
+
+    /// Whether frames are composited with premultiplied alpha. Renderers draw to match.
+    pub fn premultiplied(self: *const WindowSwapchain) bool {
+        return self.composite_alpha == COMPOSITE_ALPHA_PREMULTIPLIED;
+    }
+
     /// (Re)creates the swapchain at `width`x`height`; caller guarantees the queue is idle.
     fn recreate(self: *WindowSwapchain, width: u32, height: u32) !void {
         const ctx = self.ctx;
@@ -620,12 +644,7 @@ pub const WindowSwapchain = struct {
         if (caps.maxImageCount != 0) image_count = @min(image_count, caps.maxImageCount);
         image_count = @min(image_count, max_images);
 
-        const alpha: u32 = if (self.transparent and caps.supportedCompositeAlpha & COMPOSITE_ALPHA_PREMULTIPLIED != 0)
-            COMPOSITE_ALPHA_PREMULTIPLIED
-        else if (caps.supportedCompositeAlpha & COMPOSITE_ALPHA_OPAQUE != 0)
-            COMPOSITE_ALPHA_OPAQUE
-        else
-            @as(u32, 1) << @intCast(@ctz(caps.supportedCompositeAlpha));
+        const alpha = pick_composite_alpha(caps.supportedCompositeAlpha, self.transparent);
         self.composite_alpha = alpha;
 
         var swapchain: u64 = 0;
@@ -714,3 +733,25 @@ pub const WindowSwapchain = struct {
         }
     }
 };
+
+test "surface format: BGRA8 first, then RGBA8, both sRGB-encoded; nothing else" {
+    const bgra_linear: SurfaceFormat = .{ .format = FORMAT_BGRA8, .colorSpace = 1000104002 };
+    const rgba: SurfaceFormat = .{ .format = FORMAT_RGBA8, .colorSpace = COLOR_SPACE_SRGB_NONLINEAR };
+    const bgra: SurfaceFormat = .{ .format = FORMAT_BGRA8, .colorSpace = COLOR_SPACE_SRGB_NONLINEAR };
+    try std.testing.expectEqual(bgra, pick_surface_format(&.{ bgra_linear, rgba, bgra }).?);
+    try std.testing.expectEqual(rgba, pick_surface_format(&.{ bgra_linear, rgba }).?);
+    try std.testing.expectEqual(@as(?SurfaceFormat, null), pick_surface_format(&.{bgra_linear}));
+}
+
+test "composite alpha: premultiplied only for transparent windows the surface supports" {
+    const opaque_only = COMPOSITE_ALPHA_OPAQUE;
+    const both = COMPOSITE_ALPHA_OPAQUE | COMPOSITE_ALPHA_PREMULTIPLIED;
+    const premul_only = COMPOSITE_ALPHA_PREMULTIPLIED;
+    try std.testing.expectEqual(COMPOSITE_ALPHA_PREMULTIPLIED, pick_composite_alpha(both, true));
+    try std.testing.expectEqual(COMPOSITE_ALPHA_OPAQUE, pick_composite_alpha(both, false));
+    try std.testing.expectEqual(COMPOSITE_ALPHA_OPAQUE, pick_composite_alpha(opaque_only, true));
+    try std.testing.expectEqual(COMPOSITE_ALPHA_PREMULTIPLIED, pick_composite_alpha(premul_only, true));
+    // Neither opaque nor premultiplied: the lowest bit the surface has (inherit, 0x4, is one).
+    try std.testing.expectEqual(@as(u32, 0x4), pick_composite_alpha(0x4, true));
+}
+
