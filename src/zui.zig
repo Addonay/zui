@@ -161,6 +161,7 @@ pub const Application = app.Application;
 pub const App = app.App;
 pub const AsyncApp = app.AsyncApp;
 pub const TestAppContext = test_context.TestAppContext;
+pub const TestScheduler = @import("test_scheduler.zig").TestScheduler;
 pub const VisualTestContext = test_context.VisualTestContext;
 pub const Context = app.Context;
 pub const Entity = app.Entity;
