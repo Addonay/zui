@@ -476,6 +476,15 @@ pub const PlatformWindow = struct {
         minimize: *const fn (*PlatformWindow) void = noop,
         zoom: *const fn (*PlatformWindow) void = noop,
         toggle_fullscreen: *const fn (*PlatformWindow) void = noop,
+        /// Window state the compositor reports (GPUI `is_maximized`, `is_fullscreen`). Platforms
+        /// that cannot tell answer false, as GPUI's test window does.
+        is_maximized: *const fn (*PlatformWindow) bool = noFlag,
+        is_fullscreen: *const fn (*PlatformWindow) bool = noFlag,
+        /// GPUI `set_app_id`: the Wayland app id, or the X11 WM_CLASS.
+        set_app_id: *const fn (*PlatformWindow, []const u8) void = noopStr,
+        /// GPUI `request_decorations`: switches between server and client decorations where the
+        /// platform can (Wayland's xdg-decoration). Other platforms keep what they have.
+        request_decorations: *const fn (*PlatformWindow, window_mod.WindowDecorations) void = noopDecorations,
         start_window_move: *const fn (*PlatformWindow) void = noop,
         resize: *const fn (*PlatformWindow, Size(Pixels)) void = noopResize,
         close: *const fn (*PlatformWindow) void,
@@ -529,6 +538,23 @@ pub const PlatformWindow = struct {
     }
     fn noopInset(_: *PlatformWindow, _: Pixels) void {}
     fn noopEdge(_: *PlatformWindow, _: ResizeEdge) void {}
+    fn noFlag(_: *PlatformWindow) bool {
+        return false;
+    }
+    fn noopDecorations(_: *PlatformWindow, _: window_mod.WindowDecorations) void {}
+
+    pub fn is_maximized(self: *PlatformWindow) bool {
+        return self.vtable.is_maximized(self);
+    }
+    pub fn is_fullscreen(self: *PlatformWindow) bool {
+        return self.vtable.is_fullscreen(self);
+    }
+    pub fn set_app_id(self: *PlatformWindow, app_id: []const u8) void {
+        self.vtable.set_app_id(self, app_id);
+    }
+    pub fn request_decorations(self: *PlatformWindow, decorations: window_mod.WindowDecorations) void {
+        self.vtable.request_decorations(self, decorations);
+    }
     fn noopPoint(_: *PlatformWindow, _: Point(Pixels)) void {}
 
     pub fn window_decorations(self: *PlatformWindow) Decorations {

@@ -1301,6 +1301,69 @@ test "views: view_path_reversed walks from a nested view to the root in a live f
     try std.testing.expect(none.next() == null);
 }
 
+fn window_state_probe(window: *Window, _: *App) void {
+    window.toggle_fullscreen();
+}
+
+test "window state: toggle_fullscreen reaches the platform, and window_bounds reports the fullscreen variant" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Counter.build);
+    try std.testing.expect(!vcx.window.is_fullscreen());
+    try std.testing.expect(vcx.window.window_bounds() == .windowed);
+
+    vcx.update(window_state_probe, .{});
+    try std.testing.expect(vcx.window.is_fullscreen());
+    try std.testing.expect(vcx.window.window_bounds() == .fullscreen);
+    try std.testing.expect(vcx.window.inner_window_bounds() == .fullscreen);
+
+    vcx.update(window_state_probe, .{});
+    try std.testing.expect(!vcx.window.is_fullscreen());
+    try std.testing.expect(vcx.window.window_bounds() == .windowed);
+}
+
+test "window state: a maximized window reports the maximized variant from the platform" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Counter.build);
+    headless.HeadlessWindow.from(vcx.window.platform_window).maximized = true;
+    try std.testing.expect(vcx.window.is_maximized());
+    try std.testing.expect(vcx.window.window_bounds() == .maximized);
+    try std.testing.expect(vcx.window.inner_window_bounds() == .maximized);
+}
+
+test "window state: inner_window_bounds leaves out the client shadow inset, and only with client decorations" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Counter.build);
+    const size = vcx.window.bounds().size;
+    vcx.window.set_client_inset(10);
+    // Server decorations draw no shadow of their own, so nothing is inset.
+    try std.testing.expectEqual(size, vcx.window.inner_window_bounds().get_bounds().size);
+
+    vcx.window.request_decorations(.client);
+    try std.testing.expect(vcx.window.window_decorations() == .client);
+    const inner = vcx.window.inner_window_bounds().get_bounds();
+    try std.testing.expectEqual(size.width - 20, inner.size.width);
+    try std.testing.expectEqual(size.height - 20, inner.size.height);
+    try std.testing.expectEqual(@as(Pixels, 10), inner.origin.x);
+    // The outer bounds are what the platform reports, so they keep the shadow.
+    try std.testing.expectEqual(size, vcx.window.bounds().size);
+}
+
+test "window state: set_app_id and request_decorations reach the platform" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Counter.build);
+    try std.testing.expect(vcx.window.window_decorations() == .server);
+    vcx.window.set_app_id("dev.zui.example");
+    try std.testing.expectEqualStrings("dev.zui.example", headless.HeadlessWindow.from(vcx.window.platform_window).app_id);
+    vcx.window.request_decorations(.client);
+    try std.testing.expect(vcx.window.window_decorations() == .client);
+    vcx.window.request_decorations(.server);
+    try std.testing.expect(vcx.window.window_decorations() == .server);
+}
+
 test "actions: a key binding whose context does not match is ignored" {
     var cx = TestAppContext.init();
     defer cx.deinit();

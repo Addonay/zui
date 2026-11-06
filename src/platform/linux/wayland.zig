@@ -1797,6 +1797,10 @@ pub const WaylandWindow = struct {
         .minimize = minimize,
         .zoom = zoom,
         .toggle_fullscreen = toggleFullscreen,
+        .is_maximized = isMaximized,
+        .is_fullscreen = isFullscreen,
+        .set_app_id = setAppId,
+        .request_decorations = requestDecorations,
         .start_window_move = startWindowMove,
         .start_window_resize = startWindowResize,
         .show_window_menu = showWindowMenu,
@@ -2082,6 +2086,37 @@ pub const WaylandWindow = struct {
         }
         self.conn.flush();
     }
+    /// The compositor's maximized state, from xdg_toplevel.configure (GPUI `is_maximized`).
+    fn isMaximized(p: *platform.PlatformWindow) bool {
+        return from(p).maximized;
+    }
+    /// The compositor's fullscreen state, from xdg_toplevel.configure (GPUI `is_fullscreen`).
+    fn isFullscreen(p: *platform.PlatformWindow) bool {
+        return from(p).fullscreen;
+    }
+
+    /// xdg_toplevel.set_app_id (GPUI `set_app_id`). The window is not told again when it is
+    /// recreated, since ZUI never recreates a toplevel.
+    fn setAppId(p: *platform.PlatformWindow, app_id: []const u8) void {
+        const self = from(p);
+        const top = self.xdg_toplevel orelse return;
+        const z = self.allocator.dupeSentinel(u8, app_id, 0) catch return;
+        defer self.allocator.free(z);
+        const a = self.api();
+        _ = a.wl_proxy_marshal_flags(@ptrCast(top), 3, null, a.wl_proxy_get_version(@ptrCast(top)), 0, @as([*:0]const u8, z.ptr));
+        self.conn.flush();
+    }
+
+    /// Server or client decorations through xdg-decoration (GPUI `request_decorations`). Without
+    /// the decoration manager only client decorations exist, as in GPUI.
+    fn requestDecorations(p: *platform.PlatformWindow, decorations: window_mod.WindowDecorations) void {
+        const self = from(p);
+        self.decorated = decorations == .server;
+        if (self.decoration == null) return;
+        self.apply_decoration_mode();
+        self.conn.flush();
+    }
+
     fn startWindowMove(p: *platform.PlatformWindow) void {
         const self = from(p);
         const top = self.xdg_toplevel orelse return;
