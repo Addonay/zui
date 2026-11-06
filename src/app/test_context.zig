@@ -1243,6 +1243,64 @@ test "windows: notify re-renders the view with new state" {
     try std.testing.expect(!scene_has_quad_width(vcx.window, 100));
 }
 
+const ViewPathLeaf = struct {
+    pub fn render(_: *ViewPathLeaf, _: *Window, _: *Context(ViewPathLeaf)) *Div {
+        return div().id("leaf").size(px(10));
+    }
+};
+
+const ViewPathInner = struct {
+    leaf: Entity(ViewPathLeaf),
+
+    pub fn render(self: *ViewPathInner, _: *Window, _: *Context(ViewPathInner)) *Div {
+        return div().id("inner").size(px(20)).child(self.leaf);
+    }
+};
+
+const ViewPathRoot = struct {
+    inner: Entity(ViewPathInner),
+
+    pub fn render(self: *ViewPathRoot, _: *Window, _: *Context(ViewPathRoot)) *Div {
+        return div().id("root").size(px(100)).child(self.inner);
+    }
+
+    fn build(_: *Window, app: *App) Entity(ViewPathRoot) {
+        const leaf = app.new(ViewPathLeaf{});
+        const inner = app.new(ViewPathInner{ .leaf = leaf });
+        return app.new(ViewPathRoot{ .inner = inner });
+    }
+};
+
+test "views: view_path_reversed walks from a nested view to the root in a live frame" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const root, const vcx = cx.add_window_view(ViewPathRoot.build);
+    const inner = cx.read_entity(root, struct {
+        fn f(self: *const ViewPathRoot, _: *const App) Entity(ViewPathInner) {
+            return self.inner;
+        }
+    }.f, .{});
+    const leaf = cx.read_entity(inner, struct {
+        fn f(self: *const ViewPathInner, _: *const App) Entity(ViewPathLeaf) {
+            return self.leaf;
+        }
+    }.f, .{});
+
+    const expected = [_]app_mod.EntityId{ leaf.entity_id(), inner.entity_id(), root.entity_id() };
+    var got: [4]app_mod.EntityId = undefined;
+    var n: usize = 0;
+    var path = vcx.window.rendered_frame.dispatch_tree.view_path_reversed(leaf.entity_id());
+    while (path.next()) |id| : (n += 1) {
+        if (n == got.len) break;
+        got[n] = id;
+    }
+    try std.testing.expectEqual(expected.len, n);
+    for (expected, 0..) |id, i| try std.testing.expectEqual(id, got[i]);
+    // A view with no node in this frame has no path at all.
+    var none = vcx.window.rendered_frame.dispatch_tree.view_path_reversed(@enumFromInt(9999));
+    try std.testing.expect(none.next() == null);
+}
+
 test "actions: a key binding whose context does not match is ignored" {
     var cx = TestAppContext.init();
     defer cx.deinit();

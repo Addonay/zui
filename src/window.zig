@@ -1252,6 +1252,11 @@ pub const Window = struct {
     pub fn pop_view(self: *Window) void {
         _ = self.view_stack.pop();
     }
+    /// Sets the view id for the current element, which `view_path_reversed` walks from. Only called
+    /// during prepaint, where the element's dispatch node is active (GPUI `Window::set_view_id`).
+    pub fn set_view_id(self: *Window, view_id: EntityId) void {
+        self.next_frame.dispatch_tree.set_view_id(view_id);
+    }
     pub fn current_view(self: *const Window) ?EntityId {
         if (self.view_stack.items.len == 0) return null;
         return self.view_stack.items[self.view_stack.items.len - 1];

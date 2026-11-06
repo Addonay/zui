@@ -71,6 +71,7 @@ const ViewElement = struct {
     }
 
     pub fn prepaint(self: *ViewElement, _: ?*const element_mod.GlobalElementId, _: geometry.Bounds(geometry.Pixels), _: *void, window: *Window, cx: *App) void {
+        window.set_view_id(self.view.entity_id);
         window.push_view(self.view.entity_id);
         defer window.pop_view();
         self.child.prepaint(window, cx);
