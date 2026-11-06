@@ -5516,3 +5516,90 @@ test "long press capture: a claim holds until the next long press starts" {
     vcx.simulate_event(.{ .long_press = .{ .phase = .started, .start_position = .{ .x = 5, .y = 5 }, .position = .{ .x = 5, .y = 5 } } });
     try std.testing.expect(!vcx.window.has_long_press_capture(owner));
 }
+
+/// Registers tab stops in prepaint, the way an element does, with one group in the middle.
+const GroupedTabs = struct {
+    outside_first: FocusHandle,
+    inside_second: FocusHandle,
+    inside_first: FocusHandle,
+    outside_last: FocusHandle,
+
+    pub fn render(self: *GroupedTabs, _: *Window, _: *Context(GroupedTabs)) *Div {
+        return div().id("grouped").w(px(100)).h(px(100)).child(
+            canvas_mod.canvas(self, GroupedTabs.prepaint, paint_nothing),
+        );
+    }
+    fn paint_nothing(_: *GroupedTabs, _: geometry.Bounds(Pixels), _: *void, _: *Window, _: *App) void {}
+    fn prepaint(self: *GroupedTabs, _: geometry.Bounds(Pixels), window: *Window, cx: *App) void {
+        stop(window, &self.outside_first, cx);
+        window.with_tab_group(1, GroupedTabs.inside, .{ self, cx });
+        stop(window, &self.outside_last, cx);
+    }
+    fn inside(window: *Window, self: *GroupedTabs, cx: *App) void {
+        stop(window, &self.inside_second, cx);
+        stop(window, &self.inside_first, cx);
+    }
+    /// An element pushes its own dispatch node before it registers its focus, so each stop does too.
+    fn stop(window: *Window, handle: *const FocusHandle, cx: *App) void {
+        window.next_frame.dispatch_tree.push_node();
+        defer window.next_frame.dispatch_tree.pop_node();
+        window.set_focus_handle(handle, cx);
+    }
+    fn build(_: *Window, app: *App) Entity(GroupedTabs) {
+        return app.new(GroupedTabs{
+            .outside_first = app.focus_handle().tab_index(0).tab_stop(true),
+            .inside_second = app.focus_handle().tab_index(6).tab_stop(true),
+            .inside_first = app.focus_handle().tab_index(5).tab_stop(true),
+            .outside_last = app.focus_handle().tab_index(2).tab_stop(true),
+        });
+    }
+};
+
+test "tab groups: with_tab_group orders its stops as one block" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(GroupedTabs.build);
+    const g = view.read(cx.app);
+    const tree = &vcx.window.rendered_frame.dispatch_tree;
+    // Outside the group, it sorts at index 1 between the stops at 0 and 2; inside, its own indices order.
+    try std.testing.expectEqual(@as(?u64, g.inside_first.id), tree.next_tab_stop(g.outside_first.id, true));
+    try std.testing.expectEqual(@as(?u64, g.inside_second.id), tree.next_tab_stop(g.inside_first.id, true));
+    try std.testing.expectEqual(@as(?u64, g.outside_last.id), tree.next_tab_stop(g.inside_second.id, true));
+    try std.testing.expectEqual(@as(?u64, g.outside_first.id), tree.next_tab_stop(g.outside_last.id, true));
+    try std.testing.expectEqual(@as(?u64, g.outside_last.id), tree.next_tab_stop(g.outside_first.id, false));
+}
+
+test "focus_lost_restore_target: nearest focusable ancestor of the lost focus" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(GroupedTabs.build);
+    const g = view.read(cx.app);
+    const window = vcx.window;
+    try std.testing.expect(window.focus_lost_restore_target(cx.app) == null);
+    // Only set while focus-lost listeners run: the path runs root to leaf, the leaf last.
+    const path = [_]window_mod.FocusId{ g.outside_first.id, g.inside_first.id };
+    window.focus_lost_path = &path;
+    defer window.focus_lost_path = &.{};
+    try std.testing.expectEqual(g.outside_first.id, window.focus_lost_restore_target(cx.app).?.id);
+    const unfocusable = [_]window_mod.FocusId{ 0xdead, g.inside_first.id };
+    window.focus_lost_path = &unfocusable;
+    try std.testing.expect(window.focus_lost_restore_target(cx.app) == null);
+}
+
+var button_layout_changes: usize = 0;
+
+fn count_button_layout(_: *Window, _: *App) void {
+    button_layout_changes += 1;
+}
+
+test "button layout: observers run each time the platform reports a change" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    _ = view;
+    button_layout_changes = 0;
+    _ = vcx.window.observe_button_layout_changed(count_button_layout);
+    vcx.window.platform_window.emit_button_layout_changed();
+    vcx.window.platform_window.emit_button_layout_changed();
+    try std.testing.expectEqual(@as(usize, 2), button_layout_changes);
+}
