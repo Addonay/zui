@@ -469,7 +469,7 @@ pub const AssetCache = struct {
 
     /// Decodes (or returns the cached) image for an encoded `Image`.
     pub fn load_image(self: *AssetCache, image: *const Image) ImageCacheError!*RenderImage {
-        const key = std.hash.Wyhash.hash(0x696d6167, std.mem.asBytes(&image.id));
+        const key = image_key(image);
         if (self.images.get(key)) |cached| return cached;
         const result = decode(self.allocator, try self.svg_renderer(), image.format, image.bytes);
         self.store(key, result) catch |err| {
@@ -725,6 +725,11 @@ const RemoteImages = struct {
     }
 };
 
+/// The cache key of an encoded image.
+fn image_key(image: *const Image) u64 {
+    return std.hash.Wyhash.hash(0x696d6167, std.mem.asBytes(&image.id));
+}
+
 fn resource_key(resource: Resource) u64 {
     return switch (resource) {
         .path => |p| std.hash.Wyhash.hash(0x70617468, p),
@@ -792,6 +797,16 @@ pub const ImageSource = union(enum) {
             .render => |r| r,
             .image => |i| cache.load_image(i),
             .custom => unreachable,
+        };
+    }
+
+    /// Whether this source is in `cache`, loading or loaded, without starting a load (GPUI
+    /// `ImageSource::is_asset_cached`). Custom sources and already decoded images are never cached.
+    pub fn is_asset_cached(self: ImageSource, cache: *const AssetCache) bool {
+        return switch (self) {
+            .resource => |r| cache.images.contains(resource_key(r)),
+            .image => |i| cache.images.contains(image_key(i)),
+            .render, .custom => false,
         };
     }
 

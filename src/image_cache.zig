@@ -17,7 +17,6 @@
 //!   for all windows, so nothing needs the one being drawn.
 //! - URLs in an `ImageCacheItem` are fetched on the worker and decoded there. They are not saved to
 //!   disk, unlike the default cache, and they do not share its entries.
-//! - `retain_all(id)` is not ported. Use `window.use_keyed_state` in a provider instead.
 
 const std = @import("std");
 const assets = @import("assets.zig");
@@ -25,6 +24,7 @@ const asset_cache = @import("asset_cache.zig");
 const app_mod = @import("app.zig");
 const window_mod = @import("window.zig");
 const div_mod = @import("elements/div.zig");
+const element_mod = @import("element.zig");
 
 const App = app_mod.App;
 const Entity = app_mod.Entity;
@@ -170,18 +170,17 @@ pub fn image_cache(provider: anytype) *div_mod.Div {
 /// Decoded images, each source loaded once and kept until cleared, removed or the cache is released
 /// (GPUI `RetainAllImageCache`). Create it as an entity with `RetainAllImageCache.new`.
 pub const RetainAllImageCache = struct {
-    allocator: std.mem.Allocator,
     items: std.AutoHashMapUnmanaged(u64, ImageCacheItem) = .empty,
 
     /// Creates the cache as an entity (GPUI `RetainAllImageCache::new`). Its images are released with it.
     pub fn new(cx: *App) Entity(RetainAllImageCache) {
-        return cx.new(RetainAllImageCache{ .allocator = cx.allocator });
+        return cx.new(RetainAllImageCache{});
     }
 
     /// Called when the entity is released: releases every item (GPUI `observe_release`).
     pub fn deinit(self: *RetainAllImageCache, app: *App) void {
         self.clear(app);
-        self.items.deinit(self.allocator);
+        self.items.deinit(app.allocator);
     }
 
     /// The image for `resource`, or null while it loads (GPUI `load`). The window's current view is
@@ -190,7 +189,7 @@ pub const RetainAllImageCache = struct {
         const key = asset_cache.hash(resource);
         if (self.items.get(key) == null) {
             const item = ImageCacheItem.new(resource, cx) catch return error.OutOfMemory;
-            self.items.put(self.allocator, key, item) catch {
+            self.items.put(cx.allocator, key, item) catch {
                 item.release(cx);
                 return error.OutOfMemory;
             };
@@ -218,6 +217,50 @@ pub const RetainAllImageCache = struct {
         return self.items.count() == 0;
     }
 };
+
+/// A provider that keeps one `RetainAllImageCache` in element state under `id` (GPUI
+/// `RetainAllImageCacheProvider`). Make one with `retain_all`.
+pub const RetainAllImageCacheProvider = struct {
+    id: element_mod.ElementId,
+
+    /// The cache for this element's images. Created on first use, then kept for the element's id.
+    pub fn provide(self: *RetainAllImageCacheProvider, window: *Window, cx: *App) AnyImageCache {
+        const cache = window.use_keyed_state(self.id, cx, RetainAllImageCache{});
+        return AnyImageCache.from(cache, cx);
+    }
+};
+
+/// A `RetainAllImageCache` for the images under an element, kept in its element state under `id`
+/// (GPUI `retain_all`). Pass it to `image_cache`.
+pub fn retain_all(id: anytype) RetainAllImageCacheProvider {
+    return .{ .id = element_mod.ElementId.from(id) };
+}
+
+const TestAppContext = @import("app/test_context.zig").TestAppContext;
+
+const RetainTestView = struct {
+    pub fn render(_: *RetainTestView, _: *Window, _: *app_mod.Context(RetainTestView)) *div_mod.Div {
+        return div_mod.div();
+    }
+
+    fn build(_: *Window, app: *App) Entity(RetainTestView) {
+        return app.new(RetainTestView{});
+    }
+};
+
+test "retain_all keeps one cache for each element id" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(RetainTestView.build);
+
+    var provider = retain_all("cache");
+    const first = provider.provide(vcx.window, cx.app);
+    const second = provider.provide(vcx.window, cx.app);
+    try std.testing.expect(first.ptr == second.ptr);
+
+    var other = retain_all("other");
+    try std.testing.expect(other.provide(vcx.window, cx.app).ptr != first.ptr);
+}
 
 test {
     std.testing.refAllDecls(@This());

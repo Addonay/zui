@@ -46,13 +46,22 @@ pub fn extensions() []const []const u8 {
     return assets.supported_extensions();
 }
 
+/// The style of an image element (GPUI `ImageStyle`).
+pub const ImageStyle = struct {
+    /// Draws the image in grayscale.
+    grayscale: bool = false,
+    /// How the image fits its bounds.
+    object_fit: style_mod.ObjectFit = .contain,
+    /// Element shown while the image loads.
+    loading: ?*const fn () AnyElement = null,
+    /// Element shown when the image fails to load.
+    fallback: ?*const fn () AnyElement = null,
+};
+
 /// Element-specific state and style for `Img`. Per-frame fields are set by `request_layout_ext`.
 pub const ImgExt = struct {
     source: ?assets.ImageSource = null,
-    object_fit_: style_mod.ObjectFit = .contain,
-    grayscale_: bool = false,
-    loading_: ?*const fn () AnyElement = null,
-    fallback_: ?*const fn () AnyElement = null,
+    style: ImageStyle = .{},
 
     /// The decoded image for this frame, or null if it failed to load.
     data: ?*assets.RenderImage = null,
@@ -61,27 +70,33 @@ pub const ImgExt = struct {
     /// The frame of a multi-frame image to paint this frame (GPUI `ImgLayoutState::frame_index`).
     frame_index: usize = 0,
 
+    /// The image's style (GPUI `image_style`): this is where `grayscale`, `object_fit`, `with_loading`
+    /// and `with_fallback` store their values.
+    pub fn image_style(self: anytype) *ImageStyle {
+        return &self.ext.style;
+    }
+
     /// How the image fits its bounds (GPUI `object_fit`).
     pub fn object_fit(self: anytype, v: style_mod.ObjectFit) @TypeOf(self) {
-        self.ext.object_fit_ = v;
+        image_style(self).object_fit = v;
         return self;
     }
 
     /// Draws the image in grayscale (GPUI `grayscale`).
     pub fn grayscale(self: anytype, v: bool) @TypeOf(self) {
-        self.ext.grayscale_ = v;
+        image_style(self).grayscale = v;
         return self;
     }
 
     /// Element shown when the image fails to load (GPUI `with_fallback`).
     pub fn with_fallback(self: anytype, f: *const fn () AnyElement) @TypeOf(self) {
-        self.ext.fallback_ = f;
+        image_style(self).fallback = f;
         return self;
     }
 
     /// Element shown while loading (GPUI `with_loading`).
     pub fn with_loading(self: anytype, f: *const fn () AnyElement) @TypeOf(self) {
-        self.ext.loading_ = f;
+        image_style(self).loading = f;
         return self;
     }
 
@@ -93,7 +108,7 @@ pub const ImgExt = struct {
         const source = e.source orelse return null;
 
         const data = load_image(source, window, cx) catch |err| {
-            const placeholder = if (err == error.Loading) e.loading_ else e.fallback_;
+            const placeholder = if (err == error.Loading) e.style.loading else e.style.fallback;
             if (placeholder) |build| {
                 const rep = build();
                 const child = rep.request_layout(window, cx);
@@ -116,8 +131,8 @@ pub const ImgExt = struct {
         if (e.data) |data| {
             if (data.frame_count() == 0) return;
             const frame = e.frame_index;
-            const new_bounds = e.object_fit_.get_bounds(bounds, data.size(frame));
-            window.paint_image(bounds, new_bounds, s.corner_radii.to_pixels(window.rem_size()), data, frame, e.grayscale_) catch |err| {
+            const new_bounds = e.style.object_fit.get_bounds(bounds, data.size(frame));
+            window.paint_image(bounds, new_bounds, s.corner_radii.to_pixels(window.rem_size()), data, frame, e.style.grayscale) catch |err| {
                 std.log.err("img: paint_image failed: {s}", .{@errorName(err)});
             };
         } else if (e.replacement) |rep| {
@@ -141,7 +156,7 @@ fn advance_frame(data: *assets.RenderImage, gid: ?*const GlobalElementId, window
     const state = window.element_state(ImgState, (gid orelse return 0).*, .{});
     state.frame_index = @min(state.frame_index, frame_count -| 1);
 
-    const animating = frame_count > 1 and window.is_window_active() and !cx.reduce_motion;
+    const animating = frame_count > 1 and window.is_window_active() and !cx.reduce_motion();
     if (!animating) {
         state.last_frame_time = null;
         return state.frame_index;
@@ -195,7 +210,7 @@ fn load_image(source: assets.ImageSource, window: *Window, cx: *App) assets.Imag
         .custom => |custom| return custom.load_fn(custom.ptr, window, cx) orelse error.Loading,
         else => {},
     }
-    return source.use_data(&cx.asset_cache, cx.asset_source);
+    return source.use_data(&cx.asset_cache, cx.asset_source().*);
 }
 
 test "measure keeps the aspect ratio of the intrinsic size" {

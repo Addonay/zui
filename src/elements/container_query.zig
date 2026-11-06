@@ -90,6 +90,6 @@ test "container_query renders once with the size its parent gave it" {
     _, const vcx = cx.add_window_view(ContainerQueryView.build);
     try std.testing.expectEqual(@as(usize, 1), test_render_count);
     const seen = test_seen_size orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(vcx.window.viewport_size.width, seen.width);
-    try std.testing.expectEqual(vcx.window.viewport_size.height, seen.height);
+    try std.testing.expectEqual(vcx.window.viewport_size().width, seen.width);
+    try std.testing.expectEqual(vcx.window.viewport_size().height, seen.height);
 }

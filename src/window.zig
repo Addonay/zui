@@ -780,7 +780,10 @@ pub const Window = struct {
     scale_factor_: f32 = 1,
     rem_size_: Pixels = 16,
     rem_size_override_stack: std.ArrayList(Pixels) = .empty,
-    viewport_size: Size(Pixels) = .{ .width = 0, .height = 0 },
+    viewport_size_: Size(Pixels) = .{ .width = 0, .height = 0 },
+    /// From the options; read them with `is_resizable()` and `is_minimizable()`.
+    is_resizable_: bool = true,
+    is_minimizable_: bool = true,
     focus_id: ?FocusId = null,
     /// The focused element whose input handler accepts text, as last told to the platform.
     focused_text_input: ?FocusId = null,
@@ -856,7 +859,9 @@ pub const Window = struct {
             .element_arena = .init(gpa),
         };
         self.scale_factor_ = pw.scale_factor();
-        self.viewport_size = pw.content_size();
+        self.is_resizable_ = options.is_resizable;
+        self.is_minimizable_ = options.is_minimizable;
+        self.viewport_size_ = pw.content_size();
         self.appearance_ = pw.appearance();
         self.observed_bounds = pw.bounds();
         self.visibility_ = pw.visibility();
@@ -1001,6 +1006,25 @@ pub const Window = struct {
         return self.dirty;
     }
 
+    /// Sets whether the next frame must be drawn (GPUI `WindowInvalidator::set_dirty`). Setting it
+    /// wakes the platform the first time it becomes true, so an idle window draws. `refresh` does
+    /// the same, except that it does nothing while the window is drawing.
+    pub fn set_dirty(self: *Window, dirty: bool) void {
+        const became_dirty = dirty and !self.dirty;
+        self.dirty = dirty;
+        if (became_dirty) self.platform_window.request_frame();
+    }
+
+    /// Whether this window can be resized, as its options said (GPUI `is_resizable`).
+    pub fn is_resizable(self: *const Window) bool {
+        return self.is_resizable_;
+    }
+
+    /// Whether this window can be minimized, as its options said (GPUI `is_minimizable`).
+    pub fn is_minimizable(self: *const Window) bool {
+        return self.is_minimizable_;
+    }
+
     pub fn on_entity_notified(self: *Window, id: EntityId) void {
         if (!self.rendered_entities.contains(id)) return;
         // Something other than a view has no place in the tree to invalidate from.
@@ -1028,6 +1052,12 @@ pub const Window = struct {
         };
         self.next_frame_callbacks.append(self.allocator, .{ .ctx = @ptrFromInt(1), .func = S.call }) catch oom();
         self.platform_window.request_frame();
+    }
+
+    /// Runs `f(window, cx)` at the end of the current effect cycle, if the window still exists, so
+    /// that entities on the stack can be returned to the app first (GPUI `Window::defer`).
+    pub fn @"defer"(self: *Window, cx: *App, comptime f: fn (*Window, *App) void) void {
+        cx.defer_window(self.handle_id, f);
     }
 
     // -- properties ---------------------------------------------------
@@ -1097,8 +1127,9 @@ pub const Window = struct {
     pub fn modifiers(self: *const Window) keystroke_mod.Modifiers {
         return self.modifiers_;
     }
-    pub fn viewport_size_(self: *const Window) Size(Pixels) {
-        return self.viewport_size;
+    /// The size of the drawable area within the window (GPUI `viewport_size`).
+    pub fn viewport_size(self: *const Window) Size(Pixels) {
+        return self.viewport_size_;
     }
     pub fn bounds(self: *const Window) Bounds(Pixels) {
         return self.platform_window.bounds();
@@ -1344,6 +1375,12 @@ pub const Window = struct {
     /// Whether the platform reports the window as fullscreen (GPUI `is_fullscreen`).
     pub fn is_fullscreen(self: *const Window) bool {
         return self.platform_window.is_fullscreen();
+    }
+    /// Whether the window is in simple (borderless) fullscreen, which covers the menu bar and notch too
+    /// (GPUI `is_simple_fullscreen`). Only macOS has that mode, so this is always false here, as
+    /// GPUI's platform default is on the other platforms.
+    pub fn is_simple_fullscreen(_: *const Window) bool {
+        return false;
     }
     /// What the window manager lets this window do: fullscreen, maximize, minimize and the window
     /// menu (GPUI `window_controls`). Wayland reports it from xdg_toplevel.wm_capabilities.
@@ -1617,6 +1654,17 @@ pub const Window = struct {
         return f(existing, self);
     }
 
+    /// GPUI `with_optional_element_state`, for an element that may have no id. Without one, `f` gets
+    /// null and nothing is kept. With one, `f` gets a pointer to the state, which is null until `f`
+    /// stores a value there. The value is kept for the id, as `element_state` keeps its state.
+    pub fn with_optional_element_state(self: *Window, comptime S: type, gid: ?GlobalElementId, comptime f: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        if (gid) |g| {
+            const slot = self.element_state(OptionalStateSlot(S), g, .{});
+            return f(&slot.value, self);
+        }
+        return f(null, self);
+    }
+
     /// Keyed entity state (GPUI `use_keyed_state`): creates the entity on first use.
     /// State that lives while this element is rendered in consecutive frames, keyed by the call site.
     /// Pass `@src()`: GPUI's `use_state` gets the same identity from `#[track_caller]`. Use
@@ -1784,7 +1832,7 @@ pub const Window = struct {
 
     pub fn content_mask(self: *const Window) ContentMask(Pixels) {
         if (self.content_mask_stack.items.len == 0) {
-            return .{ .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = self.viewport_size } };
+            return .{ .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = self.viewport_size_ } };
         }
         return self.content_mask_stack.items[self.content_mask_stack.items.len - 1];
     }
@@ -2054,10 +2102,10 @@ pub const Window = struct {
         const element_corner_radii = corner_radii.scale(sf);
         for (shadows) |s| {
             if (s.inset) continue;
-            const shadow_bounds = (Bounds(Pixels){ .origin = b.origin.add(s.offset), .size = b.size }).dilate(s.spread_radius);
+            const shadow_bounds = (Bounds(Pixels){ .origin = b.origin.add(s.offset), .size = b.size }).dilate(s.spread_radius_);
             insertPrim(&self.next_frame.scene, .{ .shadow = .{
                 .order = 0,
-                .blur_radius = s.blur_radius * sf,
+                .blur_radius = s.blur_radius_ * sf,
                 .bounds = shadow_bounds.scale(sf),
                 .content_mask = self.scaled_content_mask(),
                 .corner_radii = corner_radii.scale(sf),
@@ -2078,17 +2126,17 @@ pub const Window = struct {
         const element_corner_radii = corner_radii.scale(sf);
         for (shadows) |s| {
             if (!s.inset) continue;
-            const hole = (Bounds(Pixels){ .origin = b.origin.add(s.offset), .size = b.size }).dilate(-s.spread_radius);
+            const hole = (Bounds(Pixels){ .origin = b.origin.add(s.offset), .size = b.size }).dilate(-s.spread_radius_);
             // Clamped at zero: a negative radius would break the SDF in the shader.
             const hole_corner_radii: Corners(Pixels) = .{
-                .top_left = @max(corner_radii.top_left - s.spread_radius, 0),
-                .top_right = @max(corner_radii.top_right - s.spread_radius, 0),
-                .bottom_right = @max(corner_radii.bottom_right - s.spread_radius, 0),
-                .bottom_left = @max(corner_radii.bottom_left - s.spread_radius, 0),
+                .top_left = @max(corner_radii.top_left - s.spread_radius_, 0),
+                .top_right = @max(corner_radii.top_right - s.spread_radius_, 0),
+                .bottom_right = @max(corner_radii.bottom_right - s.spread_radius_, 0),
+                .bottom_left = @max(corner_radii.bottom_left - s.spread_radius_, 0),
             };
             insertPrim(&self.next_frame.scene, .{ .shadow = .{
                 .order = 0,
-                .blur_radius = s.blur_radius * sf,
+                .blur_radius = s.blur_radius_ * sf,
                 .bounds = hole.scale(sf),
                 .content_mask = self.scaled_content_mask(),
                 .corner_radii = hole_corner_radii.scale(sf),
@@ -2138,6 +2186,25 @@ pub const Window = struct {
             .color = (style.color orelse color_mod.black()).opacity(self.element_opacity()),
             .thickness = style.thickness * sf,
             .wavy = .from(style.wavy),
+        };
+    }
+
+    /// The device-space bounds an underline at `origin` with `width` is painted in, snapped to device
+    /// pixels: the origin is rounded, and the thickness is at least one device pixel. A wavy underline
+    /// is three times as thick (GPUI `underline_bounds`).
+    pub fn underline_bounds(self: *const Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle) Bounds(ScaledPixels) {
+        const sf = self.scale_factor_;
+        const snap_stroke = struct {
+            fn snap(value: f32, scale: f32) f32 {
+                if (value == 0) return 0;
+                return @max(Window.round_half_toward_zero(@max(value, 0) * scale), 1);
+            }
+        }.snap;
+        const thickness = snap_stroke(style.thickness, sf);
+        const height = if (style.wavy) thickness * 3 else thickness;
+        return .{
+            .origin = .{ .x = Window.round_half_toward_zero(origin.x * sf), .y = Window.round_half_toward_zero(origin.y * sf) },
+            .size = .{ .width = snap_stroke(width, sf), .height = height },
         };
     }
 
@@ -2327,7 +2394,7 @@ pub const Window = struct {
         };
         if (device_size.width <= 0 or device_size.height <= 0) return;
 
-        var builder = SvgTile{ .cache = &cx.asset_cache, .source = cx.asset_source, .path = path, .data = data, .size = device_size };
+        var builder = SvgTile{ .cache = &cx.asset_cache, .source = cx.asset_source().*, .path = path, .data = data, .size = device_size };
         const key = atlas_mod.AtlasKey{ .svg = svg_key(path, data, device_size) };
         const tile = (try self.sprite_atlas.get_or_insert_with(key, .{ .context = &builder, .build_fn = SvgTile.build })) orelse return;
 
@@ -2394,8 +2461,8 @@ pub const Window = struct {
         if (self.root) |root| {
             const el = root.into_any_element();
             el.prepaint_as_root(.{ .x = 0, .y = 0 }, .{
-                .width = .{ .definite = self.viewport_size.width },
-                .height = .{ .definite = self.viewport_size.height },
+                .width = .{ .definite = self.viewport_size_.width },
+                .height = .{ .definite = self.viewport_size_.height },
             }, self, cx);
             self.prepaint_deferred_draws(cx);
             const prompt_element = self.prepaint_prompt(cx);
@@ -2439,8 +2506,8 @@ pub const Window = struct {
         const active = self.prompt_ orelse return null;
         const el = active.handle.view.into_any_element();
         el.prepaint_as_root(.{ .x = 0, .y = 0 }, .{
-            .width = .{ .definite = self.viewport_size.width },
-            .height = .{ .definite = self.viewport_size.height },
+            .width = .{ .definite = self.viewport_size_.width },
+            .height = .{ .definite = self.viewport_size_.height },
         }, self, cx);
         return el;
     }
@@ -2468,7 +2535,7 @@ pub const Window = struct {
             const request = self.next_frame.tooltip_requests.items[i];
             const el = request.view.into_any_element();
             const tooltip_size = el.layout_as_root(taffy_mod.AvailableSpace.min_size(), self, cx);
-            const origin = tooltip_origin(request.mouse_position, tooltip_size, self.viewport_size);
+            const origin = tooltip_origin(request.mouse_position, tooltip_size, self.viewport_size_);
             const tooltip_area: Bounds(Pixels) = .{ .origin = origin, .size = tooltip_size };
             if (!request.check_visible_and_update(request.ctx, tooltip_area, self, cx)) continue;
             el.prepaint_at(origin, self, cx);
@@ -3203,13 +3270,13 @@ pub const Window = struct {
     /// `visual_viewport_bounds`). Nothing reports a smaller visual viewport yet, so this is the
     /// whole content area.
     pub fn visual_viewport_bounds(self: *const Window) Bounds(Pixels) {
-        return .{ .origin = .{}, .size = self.viewport_size };
+        return .{ .origin = .{}, .size = self.viewport_size_ };
     }
 
     /// The viewport less the insets, clipped to the visual viewport (GPUI `fully_visible_bounds`).
     pub fn fully_visible_bounds(self: *const Window) Bounds(Pixels) {
         const avoid = self.insets().effective();
-        const viewport = self.viewport_size;
+        const viewport = self.viewport_size_;
         const left = @min(@max(avoid.left, 0), viewport.width);
         const top = @min(@max(avoid.top, 0), viewport.height);
         const right = @max(viewport.width - @max(avoid.right, 0), left);
@@ -3336,7 +3403,7 @@ pub const Window = struct {
 
     fn onResize(ctx: *anyopaque, size: Size(Pixels), scale: f32) void {
         const self: *Window = @ptrCast(@alignCast(ctx));
-        self.viewport_size = size;
+        self.viewport_size_ = size;
         self.scale_factor_ = scale;
         self.refresh();
         self.bounds_changed();
@@ -3475,6 +3542,63 @@ test "sub_tile crops the atlas tile to the visible part" {
     try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.origin.x);
     try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.size.width);
     try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.size.height);
+}
+
+/// The element state `with_optional_element_state` keeps: an optional `S`, empty until first stored.
+fn OptionalStateSlot(comptime S: type) type {
+    return struct {
+        value: ?S = null,
+
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.value) |*v| {
+                if (comptime has_deinit(S)) v.deinit(allocator);
+            }
+        }
+
+        fn has_deinit(comptime T: type) bool {
+            return switch (@typeInfo(T)) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, "deinit"),
+                else => false,
+            };
+        }
+    };
+}
+
+test "with_optional_element_state: no id keeps nothing, an id keeps its value" {
+    const TestAppContext = @import("app/test_context.zig").TestAppContext;
+    const V = struct {
+        pub fn render(_: *@This(), _: *Window, _: *app_mod.Context(@This())) *@import("elements/div.zig").Div {
+            return @import("elements/div.zig").div();
+        }
+        fn build(_: *Window, app: *app_mod.App) app_mod.Entity(@This()) {
+            return app.new(@This(){});
+        }
+    };
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(V.build);
+    const window = vcx.window;
+
+    const Store = struct {
+        fn f(state: ?*?u32, _: *Window) void {
+            const s = state orelse return;
+            if (s.* == null) s.* = 1 else s.*.? += 1;
+        }
+    };
+    // Without an id nothing is stored, and `f` sees null every time.
+    window.with_optional_element_state(u32, null, Store.f);
+    window.with_optional_element_state(u32, null, Store.f);
+
+    const gid: GlobalElementId = .{ .hash = 42 };
+    window.with_optional_element_state(u32, gid, Store.f);
+    window.with_optional_element_state(u32, gid, Store.f);
+    const Read = struct {
+        fn f(state: ?*?u32, _: *Window) u32 {
+            return if (state) |s| s.* orelse 0 else 99;
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 2), window.with_optional_element_state(u32, gid, Read.f));
+    try std.testing.expectEqual(@as(u32, 99), window.with_optional_element_state(u32, null, Read.f));
 }
 
 test "svg key depends on path, inline bytes and size" {

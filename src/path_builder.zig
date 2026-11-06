@@ -89,9 +89,10 @@ const Contour = struct {
 pub const PathBuilder = struct {
     allocator: std.mem.Allocator,
     contours: std.ArrayList(Contour) = .empty,
-    transform: ?Transform = null,
+    // Named with a trailing underscore because `transform` is also the GPUI method that sets it.
+    transform_: ?Transform = null,
     style: PathStyle,
-    dash_array: std.ArrayList(Pixels) = .empty,
+    dash_array_: std.ArrayList(Pixels) = .empty,
 
     /// Creates a builder for a filled path.
     pub fn fill(allocator: std.mem.Allocator) PathBuilder {
@@ -107,7 +108,7 @@ pub const PathBuilder = struct {
     pub fn deinit(self: *PathBuilder) void {
         for (self.contours.items) |*contour| contour.points.deinit(self.allocator);
         self.contours.deinit(self.allocator);
-        self.dash_array.deinit(self.allocator);
+        self.dash_array_.deinit(self.allocator);
     }
 
     pub fn with_style(self: *PathBuilder, style: PathStyle) *PathBuilder {
@@ -116,10 +117,19 @@ pub const PathBuilder = struct {
     }
 
     /// Sets the stroke dash pattern. An odd-length pattern is repeated to even length, as in SVG.
+    /// Fails only when out of memory; `dash_array` is the same thing with the failure turned into a panic.
     pub fn dash_array_set(self: *PathBuilder, pattern: []const Pixels) !void {
-        self.dash_array.clearRetainingCapacity();
-        try self.dash_array.appendSlice(self.allocator, pattern);
-        if (pattern.len % 2 == 1) try self.dash_array.appendSlice(self.allocator, pattern);
+        self.dash_array_.clearRetainingCapacity();
+        try self.dash_array_.appendSlice(self.allocator, pattern);
+        if (pattern.len % 2 == 1) try self.dash_array_.appendSlice(self.allocator, pattern);
+    }
+
+    /// Sets the dash array of the builder (GPUI `PathBuilder::dash_array`). An odd-length array is
+    /// repeated to even length, so `5,3,2` is the same as `5,3,2,5,3,2`. Panics when out of memory,
+    /// as GPUI does.
+    pub fn dash_array(self: *PathBuilder, pattern: []const Pixels) *PathBuilder {
+        self.dash_array_set(pattern) catch @panic("out of memory");
+        return self;
     }
 
     /// Starts a new sub-path at `to`.
@@ -264,34 +274,36 @@ pub const PathBuilder = struct {
         self.contours.items[self.contours.items.len - 1].closed = true;
     }
 
-    /// Applies `transform` to the path when it is built.
-    pub fn transform_by(self: *PathBuilder, transform: Transform) void {
-        self.transform = transform;
+    /// Applies `transform` to the path when it is built (GPUI `transform`). Replaces any transform
+    /// set before.
+    pub fn transform_by(self: *PathBuilder, t: Transform) void {
+        self.transform_ = t;
     }
+    pub const transform = transform_by;
 
     /// Translates the path by `to` when it is built.
     pub fn translate(self: *PathBuilder, to: Point(Pixels)) void {
-        self.transform = (self.transform orelse Transform{}).then(Transform.translation(to.x, to.y));
+        self.transform_ = (self.transform_ orelse Transform{}).then(Transform.translation(to.x, to.y));
     }
 
     /// Scales the path uniformly when it is built.
     pub fn scale(self: *PathBuilder, factor: f32) void {
-        self.transform = (self.transform orelse Transform{}).then(Transform.scale(factor, factor));
+        self.transform_ = (self.transform_ orelse Transform{}).then(Transform.scale(factor, factor));
     }
 
     /// Rotates the path by `degrees` when it is built.
     pub fn rotate(self: *PathBuilder, degrees: f32) void {
         const radians = degrees * std.math.pi / 180.0;
-        self.transform = (self.transform orelse Transform{}).then(Transform.rotation(radians));
+        self.transform_ = (self.transform_ orelse Transform{}).then(Transform.rotation(radians));
     }
 
     /// Tessellates the commands into a `Path`. Consumes the builder, releasing its storage.
     pub fn build(self: *PathBuilder) !Path(Pixels) {
         defer self.deinit();
 
-        if (self.transform) |transform| {
+        if (self.transform_) |applied| {
             for (self.contours.items) |*contour| {
-                for (contour.points.items) |*point| point.* = transform.apply(point.*);
+                for (contour.points.items) |*point| point.* = applied.apply(point.*);
             }
         }
 
@@ -358,10 +370,10 @@ pub const PathBuilder = struct {
             if (points.len < 2) continue;
             const closed = contour.closed and points.len >= 3;
 
-            if (self.dash_array.items.len == 0) {
+            if (self.dash_array_.items.len == 0) {
                 try stroke_polyline(self.allocator, points, closed, half_width, triangles);
             } else {
-                try stroke_dashed(self.allocator, points, closed, self.dash_array.items, half_width, triangles);
+                try stroke_dashed(self.allocator, points, closed, self.dash_array_.items, half_width, triangles);
             }
         }
     }

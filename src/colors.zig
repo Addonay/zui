@@ -1,6 +1,8 @@
 //! Default colors used by GPUI for base components.
 const std = @import("std");
 const color = @import("color.zig");
+const app_mod = @import("app.zig");
+const window_mod = @import("window.zig");
 
 const Rgba = color.Rgba;
 const rgb = color.rgb;
@@ -35,6 +37,20 @@ pub const Colors = struct {
     container: Rgba,
 
     pub const default: Colors = Colors.light();
+
+    /// The default colors for the window's appearance (GPUI `Colors::for_appearance`).
+    pub fn for_appearance(window: *const window_mod.Window) Colors {
+        return switch (window.appearance()) {
+            .light, .vibrant_light => Colors.light(),
+            .dark, .vibrant_dark => Colors.dark(),
+        };
+    }
+
+    /// The colors set by `App.init_colors`, from the global state (GPUI `Colors::get_global`).
+    /// Panics if `init_colors` was not called.
+    pub fn get_global(cx: *app_mod.App) *const Colors {
+        return &cx.global(GlobalColors).value;
+    }
 
     /// Returns the default dark colors.
     pub fn dark() Colors {

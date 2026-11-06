@@ -1198,8 +1198,8 @@ pub const App = struct {
     text_system_: *text_system_mod.TextSystem,
     /// Replaces the in-window prompt (GPUI `prompt_builder`). Null means GPUI's fallback.
     prompt_builder: ?window_mod.PromptBuilder = null,
-    /// Named assets for `img()` and `svg()` (set with `Application.with_assets`).
-    asset_source: assets_mod.AssetSource = assets_mod.AssetSource.empty,
+    /// Named assets for `img()` and `svg()` (set with `Application.with_assets`). Read it with `asset_source()`.
+    asset_source_: assets_mod.AssetSource = assets_mod.AssetSource.empty,
     /// Decoded images, decoded once per source.
     asset_cache: assets_mod.AssetCache,
     /// Background loads of `use_asset` and of image caches (GPUI `loading_assets`).
@@ -1214,7 +1214,10 @@ pub const App = struct {
     /// `shutdown` has run; it runs once.
     shut_down: bool = false,
     quit_mode: QuitMode = .default,
-    reduce_motion: bool = false,
+    /// Read it with `reduce_motion()`.
+    reduce_motion_: bool = false,
+    /// The name set with `TestAppContext.set_name`, read with `get_name()`. Null otherwise.
+    name_: ?[]const u8 = null,
     /// When the app's shared animation clock started; `repeat_synced` phases count from here (GPUI `synced_animation_epoch`).
     synced_animation_epoch: u64 = 0,
     /// Set by `propagate`. A bubble-phase action listener stops propagation by default, and calls
@@ -1799,14 +1802,29 @@ pub const App = struct {
         return self.add_event_listener(emitter.entity_id(), type_id(Ev), 0, S.call);
     }
 
-    /// Schedules `f(cx)` to run after the current effect cycle.
-    pub fn defer_(self: *App, comptime f: anytype) void {
+    /// Schedules `f(cx)` to run at the end of the current effect cycle (GPUI `App::defer`). Zig has no
+    /// closures, so `f` is a function and takes no captures.
+    pub fn @"defer"(self: *App, comptime f: anytype) void {
         const S = struct {
             fn call(app: *App, _: usize) void {
                 f(app);
             }
         };
         self.push_effect(.{ .deferred = .{ .ctx = 0, .func = S.call } });
+    }
+    /// The name `defer` had before it matched GPUI.
+    pub const defer_ = @"defer";
+
+    /// Schedules `f(window, cx)` at the end of the current effect cycle, if the window with `id` still
+    /// exists (the work of GPUI `Window::defer`).
+    pub fn defer_window(self: *App, id: window_mod.WindowId, comptime f: fn (*Window, *App) void) void {
+        const S = struct {
+            fn call(app: *App, ctx: usize) void {
+                const win = app.window_by_id(@intCast(ctx)) orelse return;
+                f(win, app);
+            }
+        };
+        self.push_effect(.{ .deferred = .{ .ctx = @intCast(id), .func = S.call } });
     }
 
     // -- globals ---------------------------------------------------------
@@ -2530,6 +2548,29 @@ pub const App = struct {
         return self.platform.read_from_clipboard();
     }
 
+    /// Reads the clipboard as a task (GPUI `read_from_clipboard_async`). Linux reads synchronously, so
+    /// the task is ready when it is returned, as GPUI's platform default is. Prefer this in code that can
+    /// wait: a platform whose clipboard is asynchronous would return nothing from `read_from_clipboard`.
+    pub fn read_from_clipboard_async(self: *App) executor_mod.Task(?platform_mod.ClipboardItem) {
+        return executor_mod.Task(?platform_mod.ClipboardItem).ready(self.read_from_clipboard());
+    }
+
+    /// The app's assets, for `img()` and `svg()` (GPUI `asset_source`). Set with `Application.with_assets`.
+    pub fn asset_source(self: *const App) *const assets_mod.AssetSource {
+        return &self.asset_source_;
+    }
+
+    /// Deprecated action names, each mapped to the name that replaces it (GPUI
+    /// `deprecated_actions_to_preferred_actions`).
+    pub fn deprecated_actions_to_preferred_actions(self: *const App) *const std.StringHashMapUnmanaged([]const u8) {
+        return self.actions.deprecated_aliases();
+    }
+
+    /// Deprecation messages by action name (GPUI `action_deprecation_messages`).
+    pub fn action_deprecation_messages(self: *const App) *const std.StringHashMapUnmanaged([]const u8) {
+        return self.actions.deprecation_messages();
+    }
+
     pub fn write_to_primary(self: *App, item: platform_mod.ClipboardItem) void {
         self.platform.write_to_primary(item);
     }
@@ -2643,8 +2684,20 @@ pub const App = struct {
         free_strings(self.allocator, arguments);
     }
 
+    /// Whether non-essential animations (spinners, for example) should be drawn in a static state
+    /// instead (GPUI `reduce_motion`).
+    pub fn reduce_motion(self: *const App) bool {
+        return self.reduce_motion_;
+    }
+
+    /// Sets `reduce_motion` (GPUI `set_reduce_motion`).
     pub fn set_reduce_motion(self: *App, v: bool) void {
-        self.reduce_motion = v;
+        self.reduce_motion_ = v;
+    }
+
+    /// The name of the app, set only by tests (GPUI `get_name`). Null when none was set.
+    pub fn get_name(self: *const App) ?[]const u8 {
+        return self.name_;
     }
 
     // -- actions & keymap ------------------------------------------------
@@ -2839,7 +2892,7 @@ pub const Application = struct {
     }
 
     pub fn with_assets(self: Application, source: anytype) Application {
-        self.app.asset_source = if (@TypeOf(source) == assets_mod.AssetSource) source else assets_mod.AssetSource.from(source);
+        self.app.asset_source_ = if (@TypeOf(source) == assets_mod.AssetSource) source else assets_mod.AssetSource.from(source);
         return self;
     }
 
@@ -2886,4 +2939,44 @@ test "init_colors installs the default colors" {
     const expected = colors_mod.Colors.default;
     try std.testing.expectEqual(expected.background.to_u32(), cx.app.default_colors().background.to_u32());
     try std.testing.expectEqual(expected.text.to_u32(), cx.app.default_colors().text.to_u32());
+    try std.testing.expectEqual(expected.text.to_u32(), colors_mod.Colors.get_global(cx.app).text.to_u32());
+}
+
+test "get_name, set_name and reduce_motion" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    try std.testing.expect(cx.app.get_name() == null);
+    cx.set_name("zui-test");
+    try std.testing.expectEqualStrings("zui-test", cx.app.get_name().?);
+
+    try std.testing.expect(!cx.app.reduce_motion());
+    cx.app.set_reduce_motion(true);
+    try std.testing.expect(cx.app.reduce_motion());
+}
+
+test "defer runs at the end of the current update, not during it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var runs: u32 = 0;
+        var seen_during_update: u32 = 0;
+        fn run(_: *App) void {
+            runs += 1;
+        }
+        fn go(app: *App) void {
+            app.@"defer"(run);
+            seen_during_update = runs;
+        }
+    };
+    S.runs = 0;
+    cx.app.update(S.go, .{});
+    try std.testing.expectEqual(@as(u32, 0), S.seen_during_update);
+    try std.testing.expectEqual(@as(u32, 1), S.runs);
+}
+
+test "deprecation maps are empty without deprecated actions" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    try std.testing.expectEqual(@as(u32, 0), cx.app.deprecated_actions_to_preferred_actions().count());
+    try std.testing.expectEqual(@as(u32, 0), cx.app.action_deprecation_messages().count());
 }
