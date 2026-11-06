@@ -75,6 +75,76 @@ pub const SUBPIXEL_VARIANTS_Y: f32 = 1;
 /// Sentinel for a font entry without a backing face (no fonts installed).
 const NO_FACE: u32 = std.math.maxInt(u32);
 
+/// Most missing-glyph reports kept before new ones are dropped (GPUI `MAX_REPORTED_MISSING_GLYPHS`).
+const MAX_MISSING_GLYPHS = 1024;
+
+/// Marks a face that no installed font has for a character (see `text_presentation_font`).
+const NO_FONT: FontId = std.math.maxInt(FontId);
+
+/// A byte range of a line drawn with a different font than its run (see `apply_text_presentation`).
+const FontRunOverride = struct { start: usize, end: usize, font_id: FontId };
+
+/// The byte offset where the character that ends at `end` starts.
+fn prev_char_start(text: []const u8, end: usize) usize {
+    var i = end;
+    while (i > 0 and (text[i - 1] & 0xC0) == 0x80) i -= 1;
+    return if (i > 0) i - 1 else 0;
+}
+
+/// The font of the run that holds byte `index`, or null past the runs.
+fn font_at(runs: []const FontRun, index: usize) ?FontId {
+    var offset: usize = 0;
+    for (runs) |run| {
+        if (index < offset + run.len) return run.font_id;
+        offset += run.len;
+    }
+    return null;
+}
+
+/// Appends `len` bytes in `font_id` to `list`, extending the last run when it has the same font.
+fn append_font_run(allocator: Allocator, list: *std.ArrayList(FontRun), len: usize, font_id: FontId) !void {
+    if (len == 0) return;
+    if (list.items.len > 0) {
+        const last = &list.items[list.items.len - 1];
+        if (last.font_id == font_id) {
+            last.len += len;
+            return;
+        }
+    }
+    try list.append(allocator, .{ .len = len, .font_id = font_id });
+}
+
+/// Whether `haystack` contains `needle`, ignoring ASCII case.
+fn ascii_contains_ci(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// Number of entries of the sorted `values` that are `<= index`.
+fn partition_point_usize(values: []const usize, index: usize) usize {
+    var lo: usize = 0;
+    var hi: usize = values.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (values[mid] <= index) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+/// Maps the virtual font names to the families behind them (GPUI `font_name_with_fallbacks`). `system` is
+/// what ".SystemUIFont" stands for. GPUI's `font_name_with_fallbacks_shared` is the same function, since
+/// `SharedString` is `[]const u8` here.
+pub fn font_name_with_fallbacks(name: []const u8, system: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, ".SystemUIFont")) return system;
+    if (std.mem.eql(u8, name, ".ZedSans") or std.mem.eql(u8, name, "Zed Plex Sans")) return "IBM Plex Sans";
+    if (std.mem.eql(u8, name, ".ZedMono") or std.mem.eql(u8, name, "Zed Plex Mono")) return "Lilex";
+    return name;
+}
+
 /// The distance from the baseline to the underline, for a line of `line_height`.
 pub fn underline_y_offset(line_height: Pixels, ascent: Pixels, descent: Pixels) Pixels {
     const UNDERLINE_DESCENT_OFFSET_FACTOR: f32 = 0.618;
@@ -110,45 +180,96 @@ pub const RenderGlyphParams = struct {
     }
 };
 
-/// Vertical metrics and design-space box of a font, in font units (GPUI `FontMetrics`).
+/// Vertical metrics and design-space box of a font (GPUI `FontMetrics`). The quantities are stored in
+/// font units; the methods scale them to pixels. The fields carry an `_units` suffix because Zig does
+/// not allow a field and a method with the same name, as GPUI has (`metrics.ascent(font_size)`).
 pub const FontMetrics = struct {
     /// Font units per em.
     units_per_em: u32 = 1000,
     /// Distance from the baseline to the top of the tallest glyph, in font units.
-    ascent: f32 = 800,
+    ascent_units: f32 = 800,
     /// Distance from the baseline to the bottom of the lowest glyph, in font units (positive).
-    descent: f32 = 200,
-    line_gap: f32 = 0,
-    underline_position: f32 = -100,
-    underline_thickness: f32 = 50,
-    /// Approximated as 0.7 em: the shaping backend does not expose OS/2 capHeight.
-    cap_height: f32 = 700,
-    /// Approximated as 0.5 em: the shaping backend does not expose OS/2 xHeight.
-    x_height: f32 = 500,
+    descent_units: f32 = 200,
+    /// The recommended extra space between lines, in font units (`hhea` lineGap).
+    line_gap_units: f32 = 0,
+    underline_position_units: f32 = -100,
+    underline_thickness_units: f32 = 50,
+    /// Height of a capital letter (`OS/2` sCapHeight, version 2 and later), or 0.7 em when the font has none.
+    cap_height_units: f32 = 700,
+    /// Height of a lowercase x (`OS/2` sxHeight, version 2 and later), or 0.5 em when the font has none.
+    x_height_units: f32 = 500,
     /// Font bounding box in font units (`head` xMin/yMin/xMax/yMax, or an estimate).
-    bounding_box: Bounds(f32) = .{ .origin = .{ .x = 0, .y = -800 }, .size = .{ .width = 1000, .height = 1000 } },
+    bounding_box_units: Bounds(f32) = .{ .origin = .{ .x = 0, .y = -800 }, .size = .{ .width = 1000, .height = 1000 } },
 
     fn scale(self: FontMetrics, units: f32, font_size: Pixels) Pixels {
         return (units / @as(f32, @floatFromInt(self.units_per_em))) * font_size;
     }
-    pub fn ascent_px(self: FontMetrics, font_size: Pixels) Pixels {
-        return self.scale(self.ascent, font_size);
+    /// The recommended distance from the baseline to the top of the glyphs, in pixels.
+    pub fn ascent(self: FontMetrics, font_size: Pixels) Pixels {
+        return self.scale(self.ascent_units, font_size);
     }
-    pub fn descent_px(self: FontMetrics, font_size: Pixels) Pixels {
-        return self.scale(self.descent, font_size);
+    /// The recommended distance from the baseline to the bottom of the glyphs, in pixels.
+    pub fn descent(self: FontMetrics, font_size: Pixels) Pixels {
+        return self.scale(self.descent_units, font_size);
     }
-    pub fn cap_height_px(self: FontMetrics, font_size: Pixels) Pixels {
-        return self.scale(self.cap_height, font_size);
+    /// The recommended extra space between lines, in pixels.
+    pub fn line_gap(self: FontMetrics, font_size: Pixels) Pixels {
+        return self.scale(self.line_gap_units, font_size);
     }
-    pub fn x_height_px(self: FontMetrics, font_size: Pixels) Pixels {
-        return self.scale(self.x_height, font_size);
+    /// The suggested position of the underline, in pixels.
+    pub fn underline_position(self: FontMetrics, font_size: Pixels) Pixels {
+        return self.scale(self.underline_position_units, font_size);
     }
-    pub fn bounding_box_px(self: FontMetrics, font_size: Pixels) Bounds(Pixels) {
-        const b = self.bounding_box;
+    /// The suggested thickness of the underline, in pixels.
+    pub fn underline_thickness(self: FontMetrics, font_size: Pixels) Pixels {
+        return self.scale(self.underline_thickness_units, font_size);
+    }
+    /// The height of a capital letter, in pixels.
+    pub fn cap_height(self: FontMetrics, font_size: Pixels) Pixels {
+        return self.scale(self.cap_height_units, font_size);
+    }
+    /// The height of a lowercase x, in pixels.
+    pub fn x_height(self: FontMetrics, font_size: Pixels) Pixels {
+        return self.scale(self.x_height_units, font_size);
+    }
+    /// The outer limits of the area the font covers, in pixels.
+    pub fn bounding_box(self: FontMetrics, font_size: Pixels) Bounds(Pixels) {
+        const b = self.bounding_box_units;
         return .{
             .origin = .{ .x = self.scale(b.origin.x, font_size), .y = self.scale(b.origin.y, font_size) },
             .size = .{ .width = self.scale(b.size.width, font_size), .height = self.scale(b.size.height, font_size) },
         };
+    }
+};
+
+/// The spacing a fallback font must have to stand in for a missing glyph (GPUI `FallbackFontClass`).
+pub const FallbackFontClass = enum {
+    /// A proportionally spaced fallback font.
+    proportional,
+    /// A fixed-width fallback font.
+    monospace,
+};
+
+/// A grapheme cluster that no font in the fallback chain can draw (GPUI `MissingGlyph`).
+pub const MissingGlyph = struct {
+    /// The grapheme's UTF-8 text.
+    text: []const u8,
+    /// The spacing the font it was shaped with had.
+    class: FallbackFontClass,
+
+    /// Creates a report for `grapheme` (GPUI `MissingGlyph::new`). The text is not copied.
+    pub fn new(grapheme_text: []const u8, class: FallbackFontClass) MissingGlyph {
+        return .{ .text = grapheme_text, .class = class };
+    }
+
+    /// The unresolved grapheme cluster (GPUI `grapheme`).
+    pub fn grapheme(self: MissingGlyph) []const u8 {
+        return self.text;
+    }
+
+    /// The spacing behavior required of a fallback font (GPUI `font_class`).
+    pub fn font_class(self: MissingGlyph) FallbackFontClass {
+        return self.class;
     }
 };
 
@@ -236,6 +357,15 @@ pub const TextSystem = struct {
     tile_job: TileJob = undefined,
     tile_bytes: std.ArrayList(u8) = .empty,
 
+    /// Whether shaping collects missing glyphs (GPUI `enable_missing_glyph_reporting`). Off by default.
+    missing_glyph_reporting: bool = false,
+    /// Keys of the reports already queued, so each (class, grapheme) is reported once until `add_fonts`.
+    missing_glyph_seen: std.StringHashMapUnmanaged(void) = .empty,
+    /// Reports waiting for `take_missing_glyphs`. Their texts are owned by the queue.
+    missing_glyph_pending: std.ArrayList(MissingGlyph) = .empty,
+    /// The face chosen for a character followed by U+FE0E, per character (see `text_presentation_font`).
+    presentation_faces: std.AutoHashMapUnmanaged(u21, FontId) = .empty,
+
     /// Loads the system fonts and sets up glyph rasterization. Never fails for lack of fonts:
     /// text then measures as zero width, and layout still works.
     pub fn create(allocator: Allocator) !*TextSystem {
@@ -279,6 +409,11 @@ pub const TextSystem = struct {
         self.char_widths.deinit(allocator);
         self.font_runs_scratch.deinit(allocator);
         self.tile_bytes.deinit(allocator);
+        self.clear_missing_glyph_seen();
+        self.missing_glyph_seen.deinit(allocator);
+        for (self.missing_glyph_pending.items) |g| allocator.free(g.text);
+        self.missing_glyph_pending.deinit(allocator);
+        self.presentation_faces.deinit(allocator);
         if (self.swash) |*s| s.deinit();
         if (self.raster) |*r| r.deinit();
         self.fs.deinit();
@@ -306,9 +441,91 @@ pub const TextSystem = struct {
             _ = try self.fs.addFontBytes(bytes);
             if (self.raster) |*raster| try raster.addFromFontSystem(&self.fs, self.fs.fontIds()[before..]);
         }
-        // A family asked for before may now resolve to a new face.
+        // A family asked for before may now resolve to a new face, and a glyph reported missing may now exist.
         self.font_index.clearRetainingCapacity();
+        self.presentation_faces.clearRetainingCapacity();
+        self.clear_missing_glyph_seen();
     }
+
+    /// Turns missing-glyph collection on or off (GPUI `enable_missing_glyph_reporting` and its disable).
+    /// Turning it off drops the reports not yet taken.
+    pub fn set_missing_glyph_reporting(self: *TextSystem, on: bool) void {
+        self.missing_glyph_reporting = on;
+        if (!on) {
+            for (self.missing_glyph_pending.items) |g| self.allocator.free(g.text);
+            self.missing_glyph_pending.clearRetainingCapacity();
+        }
+    }
+
+    /// Takes the missing glyphs reported since the last call (GPUI `MissingGlyphReceiver::recv`, polled).
+    /// Each grapheme appears once per font class until `add_fonts`, and at most 1024 are queued before
+    /// new ones are dropped. The caller frees the result with `free_missing_glyphs`.
+    pub fn take_missing_glyphs(self: *TextSystem) ![]MissingGlyph {
+        return self.missing_glyph_pending.toOwnedSlice(self.allocator);
+    }
+
+    /// Frees a result of `take_missing_glyphs`.
+    pub fn free_missing_glyphs(self: *TextSystem, glyphs: []MissingGlyph) void {
+        for (glyphs) |g| self.allocator.free(g.text);
+        self.allocator.free(glyphs);
+    }
+
+    fn clear_missing_glyph_seen(self: *TextSystem) void {
+        var it = self.missing_glyph_seen.keyIterator();
+        while (it.next()) |key| self.allocator.free(key.*);
+        self.missing_glyph_seen.clearRetainingCapacity();
+    }
+
+    /// Queues a report for `text` in `class` unless it was reported before. Allocation failure drops it.
+    fn report_missing_glyph(self: *TextSystem, text: []const u8, class: FallbackFontClass) void {
+        if (self.missing_glyph_pending.items.len >= MAX_MISSING_GLYPHS) return;
+        const key = self.allocator.alloc(u8, 1 + text.len) catch return;
+        key[0] = @intFromEnum(class);
+        @memcpy(key[1..], text);
+        if (self.missing_glyph_seen.contains(key)) {
+            self.allocator.free(key);
+            return;
+        }
+        if (self.missing_glyph_seen.count() >= MAX_MISSING_GLYPHS) self.clear_missing_glyph_seen();
+        self.missing_glyph_seen.put(self.allocator, key, {}) catch {
+            self.allocator.free(key);
+            return;
+        };
+        const copy = self.allocator.dupe(u8, text) catch return;
+        self.missing_glyph_pending.append(self.allocator, MissingGlyph.new(copy, class)) catch self.allocator.free(copy);
+    }
+
+    /// The spacing class of the face `fid` shapes with (GPUI `fallback_font_class`).
+    fn fallback_class(self: *TextSystem, fid: FontId) FallbackFontClass {
+        const e = self.entry(fid);
+        if (e.face == NO_FACE) return .proportional;
+        const info = self.fs.db.face(e.face) orelse return .proportional;
+        return if (info.monospaced) .monospace else .proportional;
+    }
+
+    /// Reports the graphemes of `text` that have a glyph with id 0 in `result_runs`, which is how cozmic
+    /// marks a character no face in the fallback chain can draw.
+    fn report_missing_glyphs(self: *TextSystem, text: []const u8, result_runs: []const ShapedRun) void {
+        var starts: std.ArrayList(usize) = .empty;
+        defer starts.deinit(self.allocator);
+        var graphemes = cozmic.unicode.graphemeIndices(text);
+        while (graphemes.next()) |start| starts.append(self.allocator, start) catch return;
+
+        for (result_runs) |run| {
+            var class: ?FallbackFontClass = null;
+            for (run.glyphs) |glyph| {
+                if (glyph.id != 0 or glyph.index >= text.len) continue;
+                // The grapheme that contains the glyph's byte: the last start at or before it.
+                const k = partition_point_usize(starts.items, glyph.index);
+                if (k == 0) continue;
+                const begin = starts.items[k - 1];
+                const end = if (k < starts.items.len) starts.items[k] else text.len;
+                if (class == null) class = self.fallback_class(run.font_id);
+                self.report_missing_glyph(text[begin..end], class.?);
+            }
+        }
+    }
+
 
     pub fn font_id(self: *TextSystem, f: *const Font) !FontId {
         var h = std.hash.Wyhash.init(0);
@@ -480,27 +697,33 @@ pub const TextSystem = struct {
             const sm = adapter.fontMetrics(face);
             const upem: f32 = if (sm.units_per_em > 0) sm.units_per_em else 1000;
             out.units_per_em = @intFromFloat(upem);
-            out.ascent = sm.ascent * upem;
-            out.descent = sm.descent * upem;
+            out.ascent_units = sm.ascent * upem;
+            out.descent_units = sm.descent * upem;
             if (sm.underline) |d| {
-                out.underline_position = d.offset;
-                out.underline_thickness = d.thickness;
+                out.underline_position_units = d.offset;
+                out.underline_thickness_units = d.thickness;
             } else {
-                out.underline_position = -0.1 * upem;
-                out.underline_thickness = 0.05 * upem;
+                out.underline_position_units = -0.1 * upem;
+                out.underline_thickness_units = 0.05 * upem;
             }
         }
         if (self.fs.fontBytes(face)) |bytes| {
             const tables = scan_tables(bytes);
             if (tables.head) |h| {
-                out.bounding_box = h.box;
+                out.bounding_box_units = h.box;
                 out.units_per_em = h.units_per_em;
             }
+            // The shaping backend does not report these, so they come from the tables directly.
+            if (tables.hhea_line_gap) |gap| out.line_gap_units = gap;
+            if (tables.os2) |os2| {
+                if (os2.x_height > 0) out.x_height_units = os2.x_height;
+                if (os2.cap_height > 0) out.cap_height_units = os2.cap_height;
+            }
         }
-        if (out.bounding_box.size.width <= 0) {
-            out.bounding_box = .{
-                .origin = .{ .x = 0, .y = -out.ascent },
-                .size = .{ .width = @floatFromInt(out.units_per_em), .height = out.ascent + out.descent },
+        if (out.bounding_box_units.size.width <= 0) {
+            out.bounding_box_units = .{
+                .origin = .{ .x = 0, .y = -out.ascent_units },
+                .size = .{ .width = @floatFromInt(out.units_per_em), .height = out.ascent_units + out.descent_units },
             };
         }
         self.face_data_mut(face).metrics = out;
@@ -522,19 +745,28 @@ pub const TextSystem = struct {
         return self.face_data.getPtr(face).?;
     }
 
-    /// The bounding box of `fid` at `font_size`.
+    /// The bounding box of `fid` at `font_size` (GPUI `bounding_box`).
     pub fn bounding_box(self: *TextSystem, fid: FontId, font_size: Pixels) Bounds(Pixels) {
-        return self.font_metrics(fid).bounding_box_px(font_size);
+        return self.font_metrics(fid).bounding_box(font_size);
     }
 
     /// Ascent (distance above the baseline) of `fid` at `font_size`.
     pub fn ascent(self: *TextSystem, fid: FontId, font_size: Pixels) Pixels {
-        return self.font_metrics(fid).ascent_px(font_size);
+        return self.font_metrics(fid).ascent(font_size);
     }
 
     /// Descent (distance below the baseline) of `fid` at `font_size`.
     pub fn descent(self: *TextSystem, fid: FontId, font_size: Pixels) Pixels {
-        return self.font_metrics(fid).descent_px(font_size);
+        return self.font_metrics(fid).descent(font_size);
+    }
+
+    /// The recommended baseline offset from the top of a line `line_height` tall, for `fid` at `font_size`
+    /// (GPUI `baseline_offset`).
+    pub fn baseline_offset(self: *TextSystem, fid: FontId, font_size: Pixels, line_height: Pixels) Pixels {
+        const ascent_px = self.ascent(fid, font_size);
+        const descent_px = self.descent(fid, font_size);
+        const padding_top = (line_height - ascent_px - descent_px) / 2.0;
+        return padding_top + ascent_px;
     }
 
     /// Units per em of `fid`.
@@ -542,15 +774,18 @@ pub const TextSystem = struct {
         return self.font_metrics(fid).units_per_em;
     }
 
+    /// The height of a capital letter in `fid` at `font_size`.
     pub fn cap_height(self: *TextSystem, fid: FontId, font_size: Pixels) Pixels {
-        return self.font_metrics(fid).cap_height_px(font_size);
+        return self.font_metrics(fid).cap_height(font_size);
     }
 
+    /// The height of a lowercase x in `fid` at `font_size`.
     pub fn x_height(self: *TextSystem, fid: FontId, font_size: Pixels) Pixels {
-        return self.font_metrics(fid).x_height_px(font_size);
+        return self.font_metrics(fid).x_height(font_size);
     }
 
-    /// The advance of `ch` in `fid` at `font_size` (error when the font lacks the glyph).
+    /// The advance of `ch` in `fid` at `font_size`, as a size whose height is 0 (horizontal text).
+    /// Fails when the font has no glyph for `ch` (GPUI `advance`).
     pub fn advance(self: *TextSystem, fid: FontId, font_size: Pixels, ch: u21) !Size(Pixels) {
         const e = self.entry(fid);
         if (e.face == NO_FACE) return error.GlyphNotFound;
@@ -560,24 +795,44 @@ pub const TextSystem = struct {
         return .{ .width = adapter.advanceEm(e.face, gid) * font_size, .height = 0 };
     }
 
-    /// Width of `m` in `fid` at `font_size` (advance-based; GPUI uses ink bounds).
-    pub fn em_width(self: *TextSystem, fid: FontId, font_size: Pixels) !Pixels {
-        return (try self.advance(fid, font_size, 'm')).width;
+    /// The typographic bounds of `ch` in `fid` at `font_size` (GPUI `typographic_bounds`): the origin is
+    /// 0 and the size is the advance. The cosmic backend does not measure glyph ink, so this is the same
+    /// box GPUI's cosmic backend reports. Fails when the font has no glyph for `ch`.
+    pub fn typographic_bounds(self: *TextSystem, fid: FontId, font_size: Pixels, ch: u21) !Bounds(Pixels) {
+        return .{ .origin = .{ .x = 0, .y = 0 }, .size = try self.advance(fid, font_size, ch) };
     }
 
-    /// Advance of `m`.
+    /// Width of `m` in `fid` at `font_size`: the width of `m`'s typographic bounds (GPUI `em_width`).
+    pub fn em_width(self: *TextSystem, fid: FontId, font_size: Pixels) !Pixels {
+        return (try self.typographic_bounds(fid, font_size, 'm')).size.width;
+    }
+
+    /// Advance of `m` (GPUI `em_advance`).
     pub fn em_advance(self: *TextSystem, fid: FontId, font_size: Pixels) !Pixels {
         return (try self.advance(fid, font_size, 'm')).width;
     }
 
-    /// Width of `0` (advance-based; GPUI uses ink bounds).
+    /// Width of `0` (GPUI `ch_width`).
     pub fn ch_width(self: *TextSystem, fid: FontId, font_size: Pixels) !Pixels {
+        return (try self.typographic_bounds(fid, font_size, '0')).size.width;
+    }
+
+    /// Advance of `0` (GPUI `ch_advance`).
+    pub fn ch_advance(self: *TextSystem, fid: FontId, font_size: Pixels) !Pixels {
         return (try self.advance(fid, font_size, '0')).width;
     }
 
-    /// Advance of `0`.
-    pub fn ch_advance(self: *TextSystem, fid: FontId, font_size: Pixels) !Pixels {
-        return (try self.advance(fid, font_size, '0')).width;
+    /// The font `fid` was resolved from, or null for a fallback face that no request names (GPUI `get_font_for_id`).
+    /// The result's strings belong to the text system.
+    pub fn get_font_for_id(self: *TextSystem, fid: FontId) ?Font {
+        if (fid >= self.fonts.items.len) return null;
+        return self.fonts.items[fid].key;
+    }
+
+    /// Resolves each font now, so that the first text shaped with it does not pay for the lookup (GPUI
+    /// `prewarm_fonts`). Cozmic loads a face's data on first use, so this only fills the font table.
+    pub fn prewarm_fonts(self: *TextSystem, fonts: []const Font) void {
+        for (fonts) |*f| _ = self.resolve_font(f);
     }
 
     /// Shaped width of one character, from the line cache (0 when no font can shape it).
@@ -587,6 +842,11 @@ pub const TextSystem = struct {
         const runs = [_]FontRun{.{ .len = n, .font_id = fid }};
         const layout = self.layout_cache.layout_line(buf[0..n], font_size, &runs, null) catch return 0;
         return layout.width;
+    }
+
+    /// Shaped width of an `m` in `fid` at `font_size` (GPUI `em_layout_width`).
+    pub fn em_layout_width(self: *TextSystem, fid: FontId, font_size: Pixels) Pixels {
+        return self.layout_width(fid, font_size, 'm');
     }
 
     // -- shaping ------------------------------------------------------------
@@ -613,6 +873,7 @@ pub const TextSystem = struct {
         }
 
         try self.build_font_runs(runs);
+        try self.apply_text_presentation(text, &self.font_runs_scratch);
         const layout = try self.layout_cache.layout_line(text, font_size, self.font_runs_scratch.items, force_width);
         return .{ .layout = layout, .text = layout.text, .decoration_runs = decorations.items };
     }
@@ -673,9 +934,10 @@ pub const TextSystem = struct {
                 run_start += len_within_line;
             }
 
+            try self.apply_text_presentation(line_text, &self.font_runs_scratch);
             const max_lines: ?usize = if (line_clamp) |max| max -| wrapped_lines else null;
             const layout = try self.layout_cache.layout_wrapped_line(line_text, font_size, self.font_runs_scratch.items, wrap_width, max_lines);
-            wrapped_lines += layout.wrap_boundaries.len;
+            wrapped_lines += layout.wrap_boundaries().len;
             try lines.append(arena, .{ .layout = layout, .text = layout.unwrapped_layout.text, .decoration_runs = decorations.items });
 
             // Skip the `\n` that ends this line.
@@ -712,6 +974,85 @@ pub const TextSystem = struct {
             }
             try self.font_runs_scratch.append(self.allocator, .{ .len = run.len, .font_id = fid });
         }
+    }
+
+    /// Text presentation. A character followed by U+FE0E (VARIATION SELECTOR-15) asks for its text form, but
+    /// font fallback ignores selectors: for U+2764 and similar it takes the color emoji face first, so the
+    /// heart came out in color. Such a character is moved to a face that is not a color face and covers it.
+    /// Its run's font is kept when that face already covers it, and every other character keeps its font.
+    fn apply_text_presentation(self: *TextSystem, text: []const u8, runs: *std.ArrayList(FontRun)) !void {
+        const selector = "\u{fe0e}";
+        var overrides: std.ArrayList(FontRunOverride) = .empty;
+        defer overrides.deinit(self.allocator);
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, text, at, selector)) |sel| {
+            at = sel + selector.len;
+            if (sel == 0) continue;
+            const base_start = prev_char_start(text, sel);
+            const cp = std.unicode.utf8Decode(text[base_start..sel]) catch continue;
+            if (cp >= 0xFE00 and cp <= 0xFE0F) continue; // another selector, not a base character
+            const run_font = font_at(runs.items, base_start) orelse continue;
+            const fid = (try self.text_presentation_font(run_font, cp)) orelse continue;
+            if (fid == run_font) continue;
+            try overrides.append(self.allocator, .{ .start = base_start, .end = sel + selector.len, .font_id = fid });
+        }
+        if (overrides.items.len == 0) return;
+
+        // Rebuild the runs with each override cut out of the run it falls in.
+        var out: std.ArrayList(FontRun) = .empty;
+        errdefer out.deinit(self.allocator);
+        var ov: usize = 0;
+        var run_start: usize = 0;
+        for (runs.items) |run| {
+            const run_end = run_start + run.len;
+            var p = run_start;
+            while (p < run_end) {
+                while (ov < overrides.items.len and overrides.items[ov].end <= p) ov += 1;
+                var piece_end: usize = run_end;
+                var piece_font: FontId = run.font_id;
+                if (ov < overrides.items.len and overrides.items[ov].start <= p) {
+                    piece_end = @min(overrides.items[ov].end, run_end);
+                    piece_font = overrides.items[ov].font_id;
+                } else if (ov < overrides.items.len) {
+                    piece_end = @min(overrides.items[ov].start, run_end);
+                }
+                try append_font_run(self.allocator, &out, piece_end - p, piece_font);
+                p = piece_end;
+            }
+            run_start = run_end;
+        }
+        runs.deinit(self.allocator);
+        runs.* = out;
+    }
+
+    /// The face for `cp` in text presentation, as an entry of its own: `run_font` when it is a non-color
+    /// face that covers `cp`, else the first non-color face that does (preferring the run's weight).
+    /// Null when no face covers it. Answers are cached per character.
+    fn text_presentation_font(self: *TextSystem, run_font: FontId, cp: u21) !?FontId {
+        const adapter = self.fs.shaper() orelse return null;
+        const e = self.entry(run_font);
+        if (e.face != NO_FACE and !self.face_info(e.face).is_color and adapter.mapGlyph(e.face, cp) != 0) return run_font;
+        if (self.presentation_faces.get(cp)) |cached| return if (cached == NO_FONT) null else cached;
+
+        // Among the covering faces, prefer the run's weight, then the run's spacing (a proportional run keeps
+        // a proportional face). Faces named after emoji are skipped even when they are not color faces.
+        const run_monospaced = if (e.face != NO_FACE) if (self.fs.db.face(e.face)) |info| info.monospaced else false else false;
+        var chosen: ?u32 = null;
+        var best: u8 = 0;
+        for (self.fs.db.faces.items) |face| {
+            if (self.face_info(face.id).is_color) continue;
+            if (face.families.len > 0 and ascii_contains_ci(face.families[0], "emoji")) continue;
+            if (adapter.mapGlyph(face.id, cp) == 0) continue;
+            const score: u8 = (if (face.weight == e.weight) @as(u8, 2) else 0) + (if (face.monospaced == run_monospaced) @as(u8, 1) else 0);
+            if (chosen == null or score > best) {
+                chosen = face.id;
+                best = score;
+            }
+            if (best == 3) break;
+        }
+        const fid: FontId = if (chosen) |face| try self.intern_face(face) else NO_FONT;
+        try self.presentation_faces.put(self.allocator, cp, fid);
+        return if (fid == NO_FONT) null else fid;
     }
 
     /// A `LineWrapper` for `font` at `font_size`, sharing this text system's width cache.
@@ -827,6 +1168,7 @@ pub const TextSystem = struct {
             }
         }
         if (have_run) try result_runs.append(allocator, .{ .font_id = cur_font, .glyphs = try glyphs.toOwnedSlice(allocator) });
+        if (self.missing_glyph_reporting) self.report_missing_glyphs(text, result_runs.items);
 
         if (asc == 0 and desc == 0 and runs.len > 0) {
             asc = self.ascent(runs[0].font_id, font_size);
@@ -1047,10 +1389,15 @@ fn decoration_eql(d: *const DecorationRun, run: TextRun) bool {
 /// Values read from a font file's tables.
 const TableScan = struct {
     head: ?struct { box: Bounds(f32), units_per_em: u32 } = null,
+    /// `hhea` lineGap, in font units.
+    hhea_line_gap: ?f32 = null,
+    /// `OS/2` heights in font units, for version 2 tables and later.
+    os2: ?struct { x_height: f32, cap_height: f32 } = null,
     color: bool = false,
 };
 
-/// Reads the `head` table and detects color-glyph tables in an sfnt (or the first face of a TTC).
+/// Reads the `head`, `hhea` and `OS/2` tables and detects color-glyph tables in an sfnt (or the first
+/// face of a TTC).
 fn scan_tables(bytes: []const u8) TableScan {
     var out: TableScan = .{};
     if (bytes.len < 12) return out;
@@ -1077,6 +1424,16 @@ fn scan_tables(bytes: []const u8) TableScan {
             out.head = .{
                 .units_per_em = upem,
                 .box = .{ .origin = .{ .x = x_min, .y = -y_max }, .size = .{ .width = x_max - x_min, .height = y_max - y_min } },
+            };
+        } else if (std.mem.eql(u8, tag, "hhea") and off + 10 <= bytes.len) {
+            // version(4), ascender(2), descender(2), lineGap(2)
+            out.hhea_line_gap = @floatFromInt(be16s(bytes, off + 8));
+        } else if (std.mem.eql(u8, tag, "OS/2") and off + 90 <= bytes.len) {
+            // sxHeight is at 86 and sCapHeight at 88, both from version 2 on.
+            const version = be16(bytes, off) orelse continue;
+            if (version >= 2) out.os2 = .{
+                .x_height = @floatFromInt(be16s(bytes, off + 86)),
+                .cap_height = @floatFromInt(be16s(bytes, off + 88)),
             };
         }
     }
@@ -1283,4 +1640,171 @@ test "add_fonts: a font from memory resolves by family name, shapes and rasteriz
     const layout = try ts.layout_cache.layout_line("A", 16, &runs, null);
     try testing.expect(layout.width > 0);
     try testing.expect((try ts.raster.?.ensureFace(face)) != null);
+}
+
+fn put_u16(buf: []u8, at: usize, v: u16) void {
+    std.mem.writeInt(u16, buf[at..][0..2], v, .big);
+}
+
+fn put_u32(buf: []u8, at: usize, v: u32) void {
+    std.mem.writeInt(u32, buf[at..][0..4], v, .big);
+}
+
+test "scan_tables reads OS/2 heights, hhea line gap and head from a table directory" {
+    // A 246-byte sfnt with three tables: OS/2 (version 2) at 60, hhea at 156 and head at 192.
+    var buf: [246]u8 = @splat(0);
+    put_u32(&buf, 0, 0x00010000);
+    put_u16(&buf, 4, 3);
+    const tags = [_]struct { tag: *const [4]u8, off: u32, len: u32 }{
+        .{ .tag = "OS/2", .off = 60, .len = 96 },
+        .{ .tag = "hhea", .off = 156, .len = 36 },
+        .{ .tag = "head", .off = 192, .len = 54 },
+    };
+    for (tags, 0..) |t, i| {
+        const rec = 12 + i * 16;
+        @memcpy(buf[rec .. rec + 4], t.tag);
+        put_u32(&buf, rec + 8, t.off);
+        put_u32(&buf, rec + 12, t.len);
+    }
+    put_u16(&buf, 60, 2); // OS/2 version
+    put_u16(&buf, 60 + 86, 500); // sxHeight
+    put_u16(&buf, 60 + 88, 700); // sCapHeight
+    put_u16(&buf, 156 + 8, 42); // hhea lineGap
+    put_u16(&buf, 192 + 18, 1000); // unitsPerEm
+    put_u16(&buf, 192 + 42, @bitCast(@as(i16, 800))); // yMax
+
+    const scan = scan_tables(&buf);
+    try testing.expect(!scan.color);
+    const os2 = scan.os2 orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(f32, 500), os2.x_height);
+    try testing.expectEqual(@as(f32, 700), os2.cap_height);
+    try testing.expectEqual(@as(f32, 42), scan.hhea_line_gap orelse return error.TestUnexpectedResult);
+    const head = scan.head orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 1000), head.units_per_em);
+    try testing.expectEqual(@as(f32, -800), head.box.origin.y);
+
+    // A version 1 OS/2 table has no heights, so none are reported.
+    put_u16(&buf, 60, 1);
+    try testing.expect(scan_tables(&buf).os2 == null);
+}
+
+test "font_name_with_fallbacks maps the virtual font names" {
+    try testing.expectEqualStrings("Inter", font_name_with_fallbacks(".SystemUIFont", "Inter"));
+    try testing.expectEqualStrings("IBM Plex Sans", font_name_with_fallbacks(".ZedSans", "Inter"));
+    try testing.expectEqualStrings("Lilex", font_name_with_fallbacks("Zed Plex Mono", "Inter"));
+    try testing.expectEqualStrings("Arial", font_name_with_fallbacks("Arial", "Inter"));
+}
+
+test "get_font_for_id returns the font a request resolved to, and prewarm reuses it" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    const f = font("Zed Plex Sans");
+    const id = try ts.font_id(&f);
+    const back = ts.get_font_for_id(id) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("Zed Plex Sans", back.family);
+    try testing.expect(ts.get_font_for_id(std.math.maxInt(FontId) - 1) == null);
+
+    const g = font("Another Family");
+    ts.prewarm_fonts(&.{ f, g });
+    try testing.expectEqual(id, try ts.font_id(&f));
+    try testing.expect(ts.get_font_for_id(try ts.font_id(&g)) != null);
+}
+
+test "typographic bounds, em widths and baseline offset agree with the advance and metrics" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    if (!ts.fs.hasShaper() or ts.fs.fontIds().len == 0) return error.SkipZigTest;
+    const id = try ts.font_id(&font(".SystemUIFont"));
+
+    const tb = try ts.typographic_bounds(id, 16, 'm');
+    try testing.expectEqual(@as(f32, 0), tb.origin.x);
+    try testing.expectEqual(@as(f32, 0), tb.origin.y);
+    try testing.expect(tb.size.width > 0);
+    try testing.expectApproxEqAbs((try ts.advance(id, 16, 'm')).width, tb.size.width, 0.0001);
+    try testing.expectApproxEqAbs(tb.size.width, try ts.em_width(id, 16), 0.0001);
+    try testing.expectApproxEqAbs(tb.size.width, try ts.em_advance(id, 16), 0.0001);
+    try testing.expectError(error.GlyphNotFound, ts.typographic_bounds(id, 16, 0x10ffff));
+
+    // The baseline sits where the ascent and descent centre in the line.
+    const a = ts.ascent(id, 16);
+    const d = ts.descent(id, 16);
+    try testing.expect(a > 0 and d > 0);
+    try testing.expectApproxEqAbs((30 - a - d) / 2.0 + a, ts.baseline_offset(id, 16, 30), 0.0001);
+
+    // The heights come from the font's own tables, which the synthetic test above checks.
+    const face = ts.entry(id).face;
+    const bytes = ts.fs.fontBytes(face) orelse return error.SkipZigTest;
+    const os2 = scan_tables(bytes).os2 orelse return error.SkipZigTest;
+    const upem: f32 = @floatFromInt(ts.units_per_em(id));
+    try testing.expectApproxEqAbs(os2.cap_height / upem * 16, ts.cap_height(id, 16), 0.0001);
+    try testing.expectApproxEqAbs(os2.x_height / upem * 16, ts.x_height(id, 16), 0.0001);
+}
+
+test "a character followed by U+FE0E is drawn from a text face, not the color emoji face" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    if (!ts.fs.hasShaper() or ts.fs.fontIds().len == 0) return error.SkipZigTest;
+    const f = font(".SystemUIFont");
+    const id = try ts.font_id(&f);
+
+    // Only meaningful where fallback picks a color face for the bare heart; elsewhere there is nothing to fix.
+    const plain = [_]FontRun{.{ .len = "\u{2764}".len, .font_id = id }};
+    const plain_layout = try ts.layout_line("\u{2764}", 16, &plain, null);
+    var plain_is_color = false;
+    for (plain_layout.runs) |run| for (run.glyphs) |g| {
+        plain_is_color = plain_is_color or g.is_emoji;
+    };
+    if (!plain_is_color) return error.SkipZigTest;
+
+    const text = "a\u{2764}\u{fe0e}b";
+    const runs = [_]TextRun{.{ .len = text.len, .font = f, .color = .{ .h = 0, .s = 0, .l = 0, .a = 1 } }};
+    const shaped = try ts.shape_line(text, 16, &runs, null);
+    try testing.expectEqual(@as(usize, text.len), shaped.len());
+    var glyphs: usize = 0;
+    for (shaped.layout.runs) |run| for (run.glyphs) |g| {
+        glyphs += 1;
+        try testing.expect(!g.is_emoji);
+        // The glyph must come out at text size. A monochrome emoji face (Twemoji) rasterized at 4-5x here.
+        const p: RenderGlyphParams = .{ .font_id = run.font_id, .glyph_id = g.id, .font_size = 16, .subpixel_variant = .{ .x = 0, .y = 0 }, .scale_factor = 1, .is_emoji = false };
+        const rb = try ts.raster_bounds(&p);
+        try testing.expect(rb.size.width <= 32 and rb.size.height <= 32);
+    };
+    try testing.expect(glyphs >= 3);
+    try testing.expect(shaped.width() > 0);
+    ts.finish_frame();
+}
+
+test "missing glyphs are reported once per grapheme while reporting is on" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    if (!ts.fs.hasShaper() or ts.fs.fontIds().len == 0) return error.SkipZigTest;
+    const f = font(".SystemUIFont");
+    const color: @import("color.zig").Hsla = .{ .h = 0, .s = 0, .l = 0, .a = 1 };
+
+    // U+10FFFF is a noncharacter that no installed font draws.
+    const text = "a\u{10ffff}b";
+    const runs = [_]TextRun{.{ .len = text.len, .font = f, .color = color }};
+    _ = try ts.shape_line(text, 16, &runs, null);
+    const none = try ts.take_missing_glyphs();
+    defer ts.free_missing_glyphs(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    ts.set_missing_glyph_reporting(true);
+    defer ts.set_missing_glyph_reporting(false);
+    const other = "b\u{10ffff}";
+    const other_runs = [_]TextRun{.{ .len = other.len, .font = f, .color = color }};
+    _ = try ts.shape_line(other, 16, &other_runs, null);
+    const reported = try ts.take_missing_glyphs();
+    defer ts.free_missing_glyphs(reported);
+    try testing.expectEqual(@as(usize, 1), reported.len);
+    try testing.expectEqualStrings("\u{10ffff}", reported[0].grapheme());
+    try testing.expectEqual(FallbackFontClass.proportional, reported[0].font_class());
+
+    // The same grapheme again is not reported twice.
+    const again = "c\u{10ffff}";
+    const again_runs = [_]TextRun{.{ .len = again.len, .font = f, .color = color }};
+    _ = try ts.shape_line(again, 16, &again_runs, null);
+    const repeat = try ts.take_missing_glyphs();
+    defer ts.free_missing_glyphs(repeat);
+    try testing.expectEqual(@as(usize, 0), repeat.len);
 }

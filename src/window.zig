@@ -1800,6 +1800,8 @@ pub const Window = struct {
         self.needs_present = true;
         // Effects queued during render (e.g. notify) are processed now.
         cx.flush_effects();
+        // Glyphs this frame could not draw go to `on_missing_glyphs`, after the frame has finished.
+        cx.dispatch_missing_glyphs();
     }
 
     /// The prompt covers the window, over the root view and its deferred draws.
