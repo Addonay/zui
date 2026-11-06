@@ -2215,7 +2215,10 @@ pub const Window = struct {
                 self.propagate_event = false;
                 cx.propagate_event = false;
                 l.func(l.ctx, action.ptr, .bubble, self, cx);
-                if (!cx.propagate_event) return;
+                if (!cx.propagate_event and !self.propagate_event) return;
+                // Whoever dispatched this reads the window's flag: a propagating action must not
+                // look handled, or a key binding would swallow its key.
+                self.propagate_event = true;
             }
         }
         cx.dispatch_global_action(action);

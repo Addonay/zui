@@ -1076,6 +1076,39 @@ test "img: quitting does not wait for a server that never answers" {
     try std.testing.expect(@import("../executor.zig").now_ns() - start < 2 * std.time.ns_per_s);
 }
 
+const PropagatingEditor = struct {
+    focus: FocusHandle,
+    calls: usize = 0,
+    keys: usize = 0,
+    const NotMine = Action("test", "NotMine");
+
+    fn on_not_mine(self: *PropagatingEditor, _: *const NotMine, _: *Window, cx: *Context(PropagatingEditor)) void {
+        self.calls += 1;
+        cx.app.propagate();
+    }
+    fn on_key(self: *PropagatingEditor, _: *const KeyDownEvent, _: *Window, _: *Context(PropagatingEditor)) void {
+        self.keys += 1;
+    }
+    pub fn render(self: *PropagatingEditor, _: *Window, cx: *Context(PropagatingEditor)) *Div {
+        return div().id("propagating").w(px(100)).h(px(100)).key_context("Editor").track_focus(&self.focus)
+            .on_action(NotMine, cx.listener(on_not_mine)).on_key_down(cx.listener(on_key));
+    }
+    fn build(_: *Window, app: *App) Entity(PropagatingEditor) {
+        return app.new(PropagatingEditor{ .focus = app.focus_handle() });
+    }
+};
+
+test "actions: a binding whose handler propagates does not swallow its key" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("a", PropagatingEditor.NotMine{}, "Editor")});
+    const view, const vcx = cx.add_window_view(PropagatingEditor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.simulate_keystrokes("a");
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).calls);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).keys);
+}
+
 test "actions: dispatch_action reaches on_action on the focus path" {
     var cx = TestAppContext.init();
     defer cx.deinit();
