@@ -5414,11 +5414,80 @@ test "long press: a press that starts over an element with a tooltip shows it at
     vcx.run_until_parked();
     try std.testing.expect(vcx.window.tooltip_bounds != null);
     // The long press took the event, so nothing else heard it.
-    try std.testing.expect(vcx.window.default_prevented);
+    try std.testing.expect(vcx.window.default_prevented());
 
     vcx.simulate_event(.{ .long_press = .{ .phase = .ended, .start_position = .{ .x = 10, .y = 10 }, .position = .{ .x = 10, .y = 10 } } });
     vcx.run_until_parked();
     try std.testing.expect(vcx.window.tooltip_bounds == null);
+}
+
+const PlainView = struct {
+    pub fn render(_: *PlainView, _: *Window, _: *Context(PlainView)) *Div {
+        return div();
+    }
+
+    fn build(_: *Window, app: *App) Entity(PlainView) {
+        return app.new(PlainView{});
+    }
+};
+
+const EmptyRoot = struct {
+    fn build(_: *Window, app: *App) Entity(view_mod.EmptyView) {
+        return app.new(view_mod.EmptyView{});
+    }
+};
+
+test "refresh_interval: a window reports the refresh rate of its display, or none when the display has none" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    hp.set_displays(&.{.{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } }, .refresh_interval = 16_666_666 }});
+    _, const vcx = cx.add_window_view(PlainView.build);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(?u64, 16_666_666), vcx.window.refresh_interval(cx.app));
+
+    hp.set_displays(&.{.{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } } }});
+    try std.testing.expectEqual(@as(?u64, null), vcx.window.refresh_interval(cx.app));
+}
+
+test "AnyWeakView: upgrades while the view's entity lives, and not after it is released" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const entity = cx.app.new(PlainView{});
+    const weak = view_mod.AnyView.from(entity).downgrade();
+    try std.testing.expect(weak.upgrade(cx.app) != null);
+    entity.release(cx.app);
+    try std.testing.expect(weak.upgrade(cx.app) == null);
+}
+
+test "EmptyView can be a window's root: it draws nothing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(EmptyRoot.build);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 0), vcx.window.rendered_frame.scene.quads.items.len);
+}
+
+test "is_focusable and is_managed_view classify types by their methods" {
+    // `assert_*` stops the build on a bad type, so only the `is_*` answers can be checked at run time.
+    try std.testing.expect(window_mod.is_focusable(PlainFocus));
+    try std.testing.expect(!window_mod.is_focusable(PlainView));
+    try std.testing.expect(!window_mod.is_focusable(u32));
+    try std.testing.expect(window_mod.is_managed_view(PlainFocus) == false);
+    window_mod.assert_focusable(PlainFocus);
+}
+
+const PlainFocus = struct {
+    pub fn focus_handle(_: *const PlainFocus, _: *App) FocusHandle {
+        return undefined;
+    }
+};
+
+test "the synced animation clock starts when the app is created" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    try std.testing.expect(cx.app.synced_animation_epoch > 0);
+    try std.testing.expect(cx.app.synced_animation_epoch <= @import("../executor.zig").now_ns());
 }
 
 test "long press: a press outside every tooltip element shows nothing" {

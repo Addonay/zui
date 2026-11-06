@@ -56,6 +56,9 @@ const Output = struct {
     /// Pending mode values, committed on `done`.
     pending_w: i32 = 0,
     pending_h: i32 = 0,
+    /// The current mode's refresh rate in millihertz, 0 when unknown (wl_output.mode `refresh`).
+    refresh_mhz: i32 = 0,
+    pending_refresh_mhz: i32 = 0,
     /// The connection that owns this output; `done` reports changes through it.
     conn: ?*WaylandConnection = null,
 };
@@ -481,7 +484,9 @@ pub const WaylandConnection = struct {
             const scale: f32 = @floatFromInt(out.scale);
             const w: f32 = if (out.width > 0) @as(f32, @floatFromInt(out.width)) / scale else 1920;
             const h: f32 = if (out.height > 0) @as(f32, @floatFromInt(out.height)) / scale else 1080;
-            self.displays_[self.display_count] = .{ .id = out.name, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = w, .height = h } }, .scale_factor = scale };
+            // wl_output reports millihertz; the platform wants nanoseconds between refreshes.
+            const refresh_interval: ?u64 = if (out.refresh_mhz > 0) @intCast(@divTrunc(@as(i64, 1_000_000_000_000), out.refresh_mhz)) else null;
+            self.displays_[self.display_count] = .{ .id = out.name, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = w, .height = h } }, .scale_factor = scale, .refresh_interval = refresh_interval };
             self.display_count += 1;
         }
         if (self.display_count == 0) {
@@ -1236,19 +1241,21 @@ fn seatName(_: ?*anyopaque, _: *proto.Seat, _: [*:0]const u8) callconv(.c) void 
 
 fn outputGeometry(_: ?*anyopaque, _: *anyopaque, _: i32, _: i32, _: i32, _: i32, _: i32, _: ?[*:0]const u8, _: ?[*:0]const u8, _: i32) callconv(.c) void {}
 
-fn outputMode(data: ?*anyopaque, _: *anyopaque, flags: u32, w: i32, h: i32, _: i32) callconv(.c) void {
+fn outputMode(data: ?*anyopaque, _: *anyopaque, flags: u32, w: i32, h: i32, refresh: i32) callconv(.c) void {
     const out: *Output = @ptrCast(@alignCast(data.?));
     if (flags & 1 != 0) { // current mode
         out.pending_w = w;
         out.pending_h = h;
+        out.pending_refresh_mhz = refresh;
     }
 }
 
 fn outputDone(data: ?*anyopaque, _: *anyopaque) callconv(.c) void {
     const out: *Output = @ptrCast(@alignCast(data.?));
-    const changed = out.width != out.pending_w or out.height != out.pending_h;
+    const changed = out.width != out.pending_w or out.height != out.pending_h or out.refresh_mhz != out.pending_refresh_mhz;
     out.width = out.pending_w;
     out.height = out.pending_h;
+    out.refresh_mhz = out.pending_refresh_mhz;
     if (changed) if (out.conn) |c| report_displays_changed(c);
 }
 

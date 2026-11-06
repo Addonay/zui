@@ -4492,7 +4492,7 @@ pub fn StyledElement(comptime Ext: type) type {
                 if (it.tooltip_builder == null) {
                     clear_tooltip(st, window, cx);
                 } else if (st.tooltip_view) |view| {
-                    window.set_tooltip(.{ .view = view, .mouse_position = st.tooltip_mouse, .ctx = st, .check_visible = tooltip_check_visible });
+                    window.set_tooltip(.{ .view = view, .mouse_position = st.tooltip_mouse, .ctx = st, .check_visible_and_update = tooltip_check_visible });
                 }
             }
 
@@ -4688,7 +4688,7 @@ pub fn StyledElement(comptime Ext: type) type {
             if (phase != .bubble) return;
             switch (e.phase) {
                 .started => {
-                    if (window.default_prevented or !c.hitbox.is_hovered_at(e.start_position, window)) return;
+                    if (window.default_prevented() or !c.hitbox.is_hovered_at(e.start_position, window)) return;
                     if (!show_long_press_tooltip(st, e.start_position, window, cx)) return;
                     st.long_press_tooltip_active = true;
                     window.prevent_default();
@@ -4721,7 +4721,7 @@ pub fn StyledElement(comptime Ext: type) type {
             }
             if (phase != .bubble) return;
             if (it.tracked_focus_handle) |fh| {
-                if (!window.default_prevented) {
+                if (!window.default_prevented()) {
                     window.focus(fh);
                     // A focusable parent must not take focus back as the event bubbles.
                     window.prevent_default();

@@ -213,6 +213,34 @@ test "measure keeps the aspect ratio of the intrinsic size" {
     try std.testing.expectEqual(@as(f32, 25), width_known.height);
 }
 
+/// Whether `T` has GPUI's `StyledImage` methods (`grayscale`, `object_fit`, `with_fallback`,
+/// `with_loading`). ZUI has no trait, so `Img` and any element that forwards these methods qualify.
+pub fn is_styled_image(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => has_image_style_methods(T),
+        else => false,
+    };
+}
+
+fn has_image_style_methods(comptime T: type) bool {
+    const names = [_][]const u8{ "grayscale", "object_fit", "with_fallback", "with_loading" };
+    inline for (names) |name| {
+        if (!@hasDecl(T, name)) return false;
+    }
+    return true;
+}
+
+/// Compile error unless `T` is a `StyledImage` (GPUI's bound on image style builders).
+pub fn assert_styled_image(comptime T: type) void {
+    if (comptime !is_styled_image(T)) @compileError(@typeName(T) ++ " must provide the StyledImage methods");
+}
+
+test "StyledImage is checked by its methods" {
+    try std.testing.expect(is_styled_image(Img));
+    try std.testing.expect(!is_styled_image(u32));
+    assert_styled_image(Img);
+}
+
 test "element protocol instantiates the image hooks" {
     // Referencing the protocol functions instantiates `StyledElement(ImgExt)` and type-checks the hooks.
     _ = &Img.request_layout;
