@@ -136,6 +136,36 @@ pub const StrikethroughStyle = struct {
 };
 
 /// The text style of an element, inherited by descendants.
+fn hash_contents(hasher: *std.hash.Wyhash, value: anytype) void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .void => {},
+        .bool, .int, .float => hasher.update(std.mem.asBytes(&value)),
+        .@"enum" => hash_contents(hasher, @intFromEnum(value)),
+        .optional => if (value) |some| {
+            hash_contents(hasher, true);
+            hash_contents(hasher, some);
+        } else hash_contents(hasher, false),
+        .array => for (value) |item| hash_contents(hasher, item),
+        .pointer => |info| switch (info.size) {
+            .slice => {
+                hash_contents(hasher, value.len);
+                for (value) |item| hash_contents(hasher, item);
+            },
+            .one => hash_contents(hasher, value.*),
+            else => @compileError("cannot hash " ++ @typeName(T)),
+        },
+        .@"struct" => |info| inline for (info.field_names) |name| hash_contents(hasher, @field(value, name)),
+        .@"union" => switch (value) {
+            inline else => |payload, tag| {
+                hash_contents(hasher, tag);
+                hash_contents(hasher, payload);
+            },
+        },
+        else => @compileError("cannot hash " ++ @typeName(T)),
+    }
+}
+
 pub const TextStyle = struct {
     color: Hsla = color_mod.black(),
     font_family: SharedString = ".SystemUIFont",
@@ -152,6 +182,14 @@ pub const TextStyle = struct {
     text_overflow: ?TextOverflow = null,
     text_align: TextAlign = .left,
     line_clamp: ?usize = null,
+
+    /// A hash of the contents, which cached views keep to compare across frames: the strings inside
+    /// a style may not outlive the frame that made it.
+    pub fn content_hash(self: *const TextStyle) u64 {
+        var hasher = std.hash.Wyhash.init(0x7e87_57e1);
+        hash_contents(&hasher, self.*);
+        return hasher.final();
+    }
 
     pub fn highlight(self: TextStyle, style: HighlightStyle) TextStyle {
         var s = self;

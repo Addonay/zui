@@ -77,6 +77,14 @@ threadlocal var current_frame_arena: ?*std.heap.ArenaAllocator = null;
 var fallback_arena_storage: ?std.heap.ArenaAllocator = null;
 
 /// The allocator for transient per-frame data (elements, listeners, strings).
+/// Sends `frame_arena` to `arena`, returning the one to restore. A cached view's elements and
+/// listeners must outlive the frame, so it renders into an arena of its own.
+pub fn swap_frame_arena(arena: ?*std.heap.ArenaAllocator) ?*std.heap.ArenaAllocator {
+    const previous = current_frame_arena;
+    current_frame_arena = arena;
+    return previous;
+}
+
 pub fn frame_arena() std.mem.Allocator {
     if (current_frame_arena) |a| return a.allocator();
     if (fallback_arena_storage == null) fallback_arena_storage = .init(std.heap.page_allocator);
@@ -373,6 +381,8 @@ const HitTest = struct {
 // Frames.
 
 const MouseListener = struct {
+    /// The view that registered it, current again while it runs.
+    view: ?EntityId,
     event_type: app_mod.TypeId,
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, event: *const anyopaque, phase: DispatchPhase, window: *Window, cx: *App) void,
@@ -382,15 +392,49 @@ const CursorStyleRequest = struct { hitbox_id: ?HitboxId, style: CursorStyle };
 
 const DeferredDraw = struct {
     priority: usize,
-    element: AnyElement,
+    /// Null when this draw comes from a reused cached view: it replays the ranges below instead.
+    element: ?AnyElement,
+    /// Where its listeners go. A cached view's deferred draws must live as long as the view's.
+    arena: ?*std.heap.ArenaAllocator,
+    view: ?EntityId,
+    prepaint_start: PrepaintStateIndex = .{},
+    prepaint_end: PrepaintStateIndex = .{},
+    paint_start: PaintIndex = .{},
+    paint_end: PaintIndex = .{},
     absolute_offset: Point(Pixels),
     text_style_stack: []const TextStyleRefinement,
     parent_node: key_dispatch.DispatchNodeId,
     element_id_hash: u64,
 };
 
+/// A position in what prepaint added to the frame (GPUI `PrepaintStateIndex`).
+pub const PrepaintStateIndex = struct {
+    hitboxes_index: usize = 0,
+    tooltips_index: usize = 0,
+    deferred_draws_index: usize = 0,
+    dispatch_tree_index: usize = 0,
+    accessed_element_states_index: usize = 0,
+    accessed_entities_index: usize = 0,
+    line_layout_index: text_system_mod.line_layout.LineLayoutIndex = .{},
+};
+
+/// A position in what paint added to the frame (GPUI `PaintIndex`).
+pub const PaintIndex = struct {
+    scene_index: usize = 0,
+    mouse_listeners_index: usize = 0,
+    input_handlers_index: usize = 0,
+    cursor_styles_index: usize = 0,
+    accessed_element_states_index: usize = 0,
+    accessed_entities_index: usize = 0,
+    line_layout_index: text_system_mod.line_layout.LineLayoutIndex = .{},
+};
+
 pub const Frame = struct {
     scene: scene_mod.Scene,
+    /// The element states this frame used, so reusing a cached view keeps its elements' states alive.
+    accessed_element_states: std.ArrayList(ElementStateKey) = .empty,
+    /// The entities this frame rendered, so reusing a cached view still redraws when they notify.
+    accessed_entities: std.ArrayList(EntityId) = .empty,
     hitboxes: std.ArrayList(Hitbox) = .empty,
     mouse_listeners: std.ArrayList(MouseListener) = .empty,
     dispatch_tree: key_dispatch.DispatchTree,
@@ -412,6 +456,8 @@ pub const Frame = struct {
 
     fn deinit(self: *Frame, gpa: std.mem.Allocator) void {
         self.scene.deinit();
+        self.accessed_element_states.deinit(gpa);
+        self.accessed_entities.deinit(gpa);
         self.hitboxes.deinit(gpa);
         self.mouse_listeners.deinit(gpa);
         self.dispatch_tree.deinit();
@@ -424,6 +470,8 @@ pub const Frame = struct {
 
     fn clear(self: *Frame) void {
         self.scene.clear();
+        self.accessed_element_states.clearRetainingCapacity();
+        self.accessed_entities.clearRetainingCapacity();
         self.hitboxes.clearRetainingCapacity();
         self.mouse_listeners.clearRetainingCapacity();
         self.dispatch_tree.clear();
@@ -709,11 +757,21 @@ pub const Window = struct {
     rendered_entities: std.AutoHashMapUnmanaged(EntityId, void) = .empty,
     next_rendered_entities: std.AutoHashMapUnmanaged(EntityId, void) = .empty,
     view_stack: std.ArrayList(EntityId) = .empty,
+    /// Views that may not reuse their cached output in the next frame (GPUI `dirty_views`).
+    dirty_views: std.AutoHashMapUnmanaged(EntityId, void) = .empty,
+    /// Every cached view renders again in this frame (GPUI `refreshing`).
+    refreshing: bool = false,
+    /// Views that asked for another frame in the current one.
+    animation_views: std.ArrayList(EntityId) = .empty,
+    /// This window's shaped lines, created on the first draw (GPUI's `WindowTextSystem`).
+    line_layout_cache: ?text_system_mod.LineLayoutCache = null,
     /// The image caches of the elements being laid out, innermost last (GPUI `image_cache_stack`).
     image_cache_stack: std.ArrayList(image_cache_mod.AnyImageCache) = .empty,
     next_hitbox_id: HitboxId = 1,
     mouse_hit_test: HitTest = .{},
     mouse_position_: Point(Pixels) = .{ .x = 0, .y = 0 },
+    /// Until the pointer has been seen, nothing is hovered, whatever is at the origin.
+    mouse_position_known: bool = false,
     modifiers_: keystroke_mod.Modifiers = .{},
     /// Last known state of the capslock key; read it with `capslock()`.
     capslock_state: keystroke_mod.Capslock = .{},
@@ -847,6 +905,9 @@ pub const Window = struct {
         var it = self.element_states.valueIterator();
         while (it.next()) |b| b.destroy(gpa, b.ptr);
         self.element_states.deinit(gpa);
+        self.dirty_views.deinit(gpa);
+        self.animation_views.deinit(gpa);
+        if (self.line_layout_cache) |*cache| cache.deinit();
         self.rendered_entities.deinit(gpa);
         self.next_rendered_entities.deinit(gpa);
         self.view_stack.deinit(gpa);
@@ -895,8 +956,44 @@ pub const Window = struct {
     /// Schedules a redraw of this window (GPUI `refresh`).
     pub fn refresh(self: *Window) void {
         if (!self.drawing) {
+            self.refreshing = true;
             self.dirty = true;
             self.platform_window.request_frame();
+        }
+    }
+
+    /// Redraws the window, with `entity` and the views above it rendering again. False if a frame
+    /// is being drawn, which cannot be changed now (GPUI `WindowInvalidator::invalidate_view`).
+    pub fn invalidate_view(self: *Window, entity: EntityId) bool {
+        self.mark_view_dirty(entity);
+        if (self.drawing) return false;
+        self.dirty = true;
+        self.platform_window.request_frame();
+        return true;
+    }
+
+    /// Whether no frame is being drawn (GPUI `WindowInvalidator::not_drawing`).
+    pub fn not_drawing(self: *const Window) bool {
+        return !self.drawing;
+    }
+
+    /// Marks a view and its ancestors. Marking stops at a marked view, since its ancestors already
+    /// are (GPUI `mark_view_dirty`).
+    fn mark_view_dirty(self: *Window, view_id: EntityId) void {
+        var path = self.rendered_frame.dispatch_tree.view_path_reversed(view_id);
+        while (path.next()) |id| {
+            const entry = self.dirty_views.getOrPut(self.allocator, id) catch oom();
+            if (entry.found_existing) break;
+        }
+    }
+
+    /// Redraws because the view whose listener is running changed how it looks (GPUI's
+    /// `cx.notify(current_view)`). With no view current, such as in a timer, everything renders again.
+    pub fn notify_current_view(self: *Window) void {
+        if (self.current_view()) |view| {
+            _ = self.invalidate_view(view);
+        } else {
+            self.refresh();
         }
     }
 
@@ -905,11 +1002,19 @@ pub const Window = struct {
     }
 
     pub fn on_entity_notified(self: *Window, id: EntityId) void {
-        if (self.rendered_entities.contains(id)) self.refresh();
+        if (!self.rendered_entities.contains(id)) return;
+        // Something other than a view has no place in the tree to invalidate from.
+        if (self.rendered_frame.dispatch_tree.view_nodes.contains(id)) {
+            _ = self.invalidate_view(id);
+        } else {
+            self.refresh();
+        }
     }
 
     /// Requests that another frame be drawn after the current one (for animations).
     pub fn request_animation_frame(self: *Window) void {
+        // The next frame must render this view again, even if it is cached.
+        if (self.current_view()) |view| self.animation_views.append(self.allocator, view) catch oom();
         self.animation_requested = true;
         self.platform_window.request_frame();
     }
@@ -1347,9 +1452,81 @@ pub const Window = struct {
         return @call(.auto, f, .{self} ++ args);
     }
 
-    /// The number of tab stops registered so far in the frame being drawn (GPUI `paint_index`).
-    pub fn paint_index(self: *const Window) usize {
-        return self.next_frame.dispatch_tree.len();
+    // -- view caching ----------------------------------------------------
+
+    fn line_layouts(self: *Window) *text_system_mod.LineLayoutCache {
+        return self.text_system().active_cache;
+    }
+
+    /// How much prepaint has added to the frame being drawn (GPUI `prepaint_index`).
+    pub fn prepaint_index(self: *Window) PrepaintStateIndex {
+        return .{
+            .hitboxes_index = self.next_frame.hitboxes.items.len,
+            .tooltips_index = self.next_frame.tooltip_requests.items.len,
+            .deferred_draws_index = self.next_frame.deferred_draws.items.len,
+            .dispatch_tree_index = self.next_frame.dispatch_tree.len(),
+            .accessed_element_states_index = self.next_frame.accessed_element_states.items.len,
+            .accessed_entities_index = self.next_frame.accessed_entities.items.len,
+            .line_layout_index = self.line_layouts().layout_index(),
+        };
+    }
+
+    /// How much paint has added to the frame being drawn (GPUI `paint_index`).
+    pub fn paint_index(self: *Window) PaintIndex {
+        return .{
+            .scene_index = self.next_frame.scene.len(),
+            .mouse_listeners_index = self.next_frame.mouse_listeners.items.len,
+            .input_handlers_index = self.next_frame.input_handlers.items.len,
+            .cursor_styles_index = self.next_frame.cursor_styles.items.len,
+            .accessed_element_states_index = self.next_frame.accessed_element_states.items.len,
+            .accessed_entities_index = self.next_frame.accessed_entities.items.len,
+            .line_layout_index = self.line_layouts().layout_index(),
+        };
+    }
+
+    fn reuse_accessed(self: *Window, states: []const ElementStateKey, entities: []const EntityId) void {
+        self.next_frame.accessed_element_states.appendSlice(self.allocator, states) catch oom();
+        for (states) |key| {
+            if (self.element_states.getPtr(key)) |state| state.frame = self.frame_count;
+        }
+        for (entities) |id| self.record_entity(id);
+    }
+
+    /// Copies what `start..end` of the rendered frame added in prepaint, instead of running it
+    /// (GPUI `reuse_prepaint`).
+    pub fn reuse_prepaint(self: *Window, start: PrepaintStateIndex, end: PrepaintStateIndex) void {
+        const old = &self.rendered_frame;
+        const new = &self.next_frame;
+        new.hitboxes.appendSlice(self.allocator, old.hitboxes.items[start.hitboxes_index..end.hitboxes_index]) catch oom();
+        new.tooltip_requests.appendSlice(self.allocator, old.tooltip_requests.items[start.tooltips_index..end.tooltips_index]) catch oom();
+        self.reuse_accessed(
+            old.accessed_element_states.items[start.accessed_element_states_index..end.accessed_element_states_index],
+            old.accessed_entities.items[start.accessed_entities_index..end.accessed_entities_index],
+        );
+        self.line_layouts().reuse_layouts(start.line_layout_index, end.line_layout_index) catch oom();
+        const reused = new.dispatch_tree.reuse_subtree(start.dispatch_tree_index, end.dispatch_tree_index, &old.dispatch_tree, self.focus_id);
+        for (old.deferred_draws.items[start.deferred_draws_index..end.deferred_draws_index]) |draw_| {
+            var copy = draw_;
+            copy.element = null;
+            copy.parent_node = reused.refresh_node_id(draw_.parent_node);
+            new.deferred_draws.append(self.allocator, copy) catch oom();
+        }
+    }
+
+    /// Copies what `start..end` of the rendered frame added in paint, instead of running it
+    /// (GPUI `reuse_paint`).
+    pub fn reuse_paint(self: *Window, start: PaintIndex, end: PaintIndex) void {
+        const old = &self.rendered_frame;
+        const new = &self.next_frame;
+        new.cursor_styles.appendSlice(self.allocator, old.cursor_styles.items[start.cursor_styles_index..end.cursor_styles_index]) catch oom();
+        new.input_handlers.appendSlice(self.allocator, old.input_handlers.items[start.input_handlers_index..end.input_handlers_index]) catch oom();
+        new.mouse_listeners.appendSlice(self.allocator, old.mouse_listeners.items[start.mouse_listeners_index..end.mouse_listeners_index]) catch oom();
+        self.reuse_accessed(
+            old.accessed_element_states.items[start.accessed_element_states_index..end.accessed_element_states_index],
+            old.accessed_entities.items[start.accessed_entities_index..end.accessed_entities_index],
+        );
+        self.line_layouts().reuse_layouts(start.line_layout_index, end.line_layout_index) catch oom();
+        new.scene.replay(.{ .start = start.scene_index, .end = end.scene_index }, &old.scene) catch oom();
     }
 
     pub fn disable_focus(self: *Window) void {
@@ -1405,6 +1582,7 @@ pub const Window = struct {
     /// States not accessed during a frame are dropped.
     pub fn element_state(self: *Window, comptime S: type, gid: GlobalElementId, init: S) *S {
         const key: ElementStateKey = .{ .gid = gid.hash, .tid = app_mod.type_id(S) };
+        if (self.drawing) self.next_frame.accessed_element_states.append(self.allocator, key) catch oom();
         const gop = self.element_states.getOrPut(self.allocator, key) catch oom();
         if (!gop.found_existing) {
             const p = self.allocator.create(S) catch oom();
@@ -1449,17 +1627,19 @@ pub const Window = struct {
         return self.use_keyed_state(ElementId{ .code_location = @truncate(hash) }, cx, init);
     }
 
-    /// Runs `f(arg, window)` during prepaint. If it fails, the hitboxes, tooltips and deferred draws
-    /// it added are removed, so the caller can prepaint again with other values (GPUI `transact`).
+    /// Runs `f(arg, window)` during prepaint. If it fails, what it added to the frame is removed, so
+    /// the caller can prepaint again with other values (GPUI `transact`).
     pub fn transact(self: *Window, arg: anytype, comptime f: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
-        const hitboxes = self.next_frame.hitboxes.items.len;
-        const tooltips = self.next_frame.tooltip_requests.items.len;
-        const deferred = self.next_frame.deferred_draws.items.len;
+        const index = self.prepaint_index();
         const result = f(arg, self);
         if (result) |_| {} else |_| {
-            self.next_frame.hitboxes.shrinkRetainingCapacity(hitboxes);
-            self.next_frame.tooltip_requests.shrinkRetainingCapacity(tooltips);
-            self.next_frame.deferred_draws.shrinkRetainingCapacity(deferred);
+            self.next_frame.hitboxes.shrinkRetainingCapacity(index.hitboxes_index);
+            self.next_frame.tooltip_requests.shrinkRetainingCapacity(index.tooltips_index);
+            self.next_frame.deferred_draws.shrinkRetainingCapacity(index.deferred_draws_index);
+            self.next_frame.dispatch_tree.truncate(index.dispatch_tree_index);
+            self.next_frame.accessed_element_states.shrinkRetainingCapacity(index.accessed_element_states_index);
+            self.next_frame.accessed_entities.shrinkRetainingCapacity(index.accessed_entities_index);
+            self.line_layouts().truncate_layouts(index.line_layout_index);
         }
         return result;
     }
@@ -1495,7 +1675,11 @@ pub const Window = struct {
 
     pub fn push_view(self: *Window, id: EntityId) void {
         self.view_stack.append(self.allocator, id) catch oom();
+        self.record_entity(id);
+    }
+    fn record_entity(self: *Window, id: EntityId) void {
         self.next_rendered_entities.put(self.allocator, id, {}) catch oom();
+        self.next_frame.accessed_entities.append(self.allocator, id) catch oom();
     }
     pub fn pop_view(self: *Window) void {
         _ = self.view_stack.pop();
@@ -1545,7 +1729,7 @@ pub const Window = struct {
     }
     /// Records that the current frame depends on `id` (redraws when it notifies).
     pub fn observe_entity_for_redraw(self: *Window, id: EntityId) void {
-        self.next_rendered_entities.put(self.allocator, id, {}) catch oom();
+        self.record_entity(id);
     }
 
     // -- text style ---------------------------------------------------
@@ -1700,11 +1884,21 @@ pub const Window = struct {
     }
 
     fn hit_test(self: *Window, position: Point(Pixels)) void {
+        self.hit_test_frame(&self.rendered_frame, position);
+    }
+
+    fn set_mouse_position(self: *Window, position: Point(Pixels)) void {
+        self.mouse_position_ = position;
+        self.mouse_position_known = true;
+    }
+
+    fn hit_test_frame(self: *Window, frame: *const Frame, position: Point(Pixels)) void {
         const ht = &self.mouse_hit_test;
         ht.ids.clearRetainingCapacity();
         ht.hover_hitbox_count = 0;
+        if (!self.mouse_position_known) return;
         var set_hover_count = false;
-        const boxes = self.rendered_frame.hitboxes.items;
+        const boxes = frame.hitboxes.items;
         var i = boxes.len;
         while (i > 0) {
             i -= 1;
@@ -1741,7 +1935,7 @@ pub const Window = struct {
                 handler(c, @ptrCast(@alignCast(ev)), phase, w, a);
             }
         };
-        self.next_frame.mouse_listeners.append(self.allocator, .{ .event_type = app_mod.type_id(E), .ctx = ctx, .func = S.call }) catch oom();
+        self.next_frame.mouse_listeners.append(self.allocator, .{ .view = self.current_view(), .event_type = app_mod.type_id(E), .ctx = ctx, .func = S.call }) catch oom();
     }
 
     /// Registers a key event listener on the current dispatch node.
@@ -1822,10 +2016,12 @@ pub const Window = struct {
 
     /// Draws `element` after the current tree, on top (GPUI `defer_draw`).
     pub fn defer_draw(self: *Window, element: AnyElement, absolute_offset: Point(Pixels), priority: usize) void {
-        const stack = self.next_frame.arena.allocator().dupe(TextStyleRefinement, self.text_style_stack.items) catch oom();
+        const stack = frame_arena().dupe(TextStyleRefinement, self.text_style_stack.items) catch oom();
         self.next_frame.deferred_draws.append(self.allocator, .{
             .priority = priority,
             .element = element,
+            .arena = current_frame_arena,
+            .view = self.current_view(),
             .absolute_offset = absolute_offset,
             .text_style_stack = stack,
             .parent_node = self.next_frame.dispatch_tree.active_node_id(),
@@ -2157,6 +2353,13 @@ pub const Window = struct {
     pub fn draw(self: *Window, cx: *App) void {
         self.drawing = true;
         defer self.drawing = false;
+        const ts = self.text_system();
+        if (self.line_layout_cache == null) self.line_layout_cache = ts.new_layout_cache();
+        const outer_cache = ts.active_cache;
+        ts.active_cache = &self.line_layout_cache.?;
+        defer ts.active_cache = outer_cache;
+        for (self.animation_views.items) |view| self.mark_view_dirty(view);
+        self.animation_views.clearRetainingCapacity();
         self.dirty = false;
         self.animation_requested = false;
         self.frame_count += 1;
@@ -2176,7 +2379,6 @@ pub const Window = struct {
         self.next_frame.clear();
         self.layout_engine.clear();
         self.next_rendered_entities.clearRetainingCapacity();
-        self.next_hitbox_id = 1;
         self.text_style_stack.clearRetainingCapacity();
         self.element_offset_stack.clearRetainingCapacity();
         self.content_mask_stack.clearRetainingCapacity();
@@ -2198,6 +2400,8 @@ pub const Window = struct {
             self.prepaint_deferred_draws(cx);
             const prompt_element = self.prepaint_prompt(cx);
             const overlay = self.prepaint_overlay(cx);
+            // Painting asks what is hovered, and hitbox ids do not carry over from frame to frame.
+            self.hit_test_frame(&self.next_frame, self.mouse_position_);
             el.paint(self, cx);
             self.paint_deferred_draws(cx);
             if (prompt_element) |p| p.paint(self, cx);
@@ -2205,6 +2409,8 @@ pub const Window = struct {
         }
         cx.pending_updates -= 1;
 
+        self.refreshing = false;
+        self.dirty_views.clearRetainingCapacity();
         self.next_frame.scene.finish();
         self.next_frame.focus = self.focus_id;
         self.next_frame.window_active = self.active;
@@ -2214,7 +2420,8 @@ pub const Window = struct {
         const previous_active = self.rendered_frame.window_active;
         std.mem.swap(Frame, &self.rendered_frame, &self.next_frame);
         focus_events.after_draw(self, cx, previous_focus, previous_active);
-        self.text_system().finish_frame();
+        self.line_layout_cache.?.finish_frame();
+        ts.finish_frame();
         std.mem.swap(std.AutoHashMapUnmanaged(EntityId, void), &self.rendered_entities, &self.next_rendered_entities);
         self.gc_element_states();
         self.hit_test(self.mouse_position_);
@@ -2271,29 +2478,69 @@ pub const Window = struct {
         return null;
     }
 
-    fn prepaint_deferred_draws(self: *Window, cx: *App) void {
-        const draws = self.next_frame.deferred_draws.items;
-        std.sort.pdq(DeferredDraw, draws, {}, struct {
-            fn lt(_: void, a: DeferredDraw, b: DeferredDraw) bool {
-                return a.priority < b.priority;
+    fn deferred_by_priority(self: *Window, start: usize, end: usize) []usize {
+        const order = frame_arena().alloc(usize, end - start) catch oom();
+        for (order, start..) |*slot, i| slot.* = i;
+        std.mem.sort(usize, order, self.next_frame.deferred_draws.items, struct {
+            fn lt(draws: []const DeferredDraw, a: usize, b: usize) bool {
+                return draws[a].priority < draws[b].priority;
             }
         }.lt);
-        var i: usize = 0;
-        while (i < self.next_frame.deferred_draws.items.len) : (i += 1) {
-            const d = self.next_frame.deferred_draws.items[i];
-            const saved = self.text_style_stack.items.len;
-            self.text_style_stack.appendSlice(self.allocator, d.text_style_stack) catch oom();
-            // The deferred child was laid out by `Deferred.request_layout`; GPUI only prepaints it here.
-            d.element.prepaint_at(d.absolute_offset, self, cx);
-            self.text_style_stack.shrinkRetainingCapacity(saved);
+        return order;
+    }
+
+    /// Prepaints in rounds, since a deferred element can defer more. The list stays in the order
+    /// the draws were added, because reused views name parts of it by index (GPUI `prepaint_deferred_draws`).
+    fn prepaint_deferred_draws(self: *Window, cx: *App) void {
+        var round_start: usize = 0;
+        var depth: usize = 0;
+        while (round_start < self.next_frame.deferred_draws.items.len) : (depth += 1) {
+            if (depth >= 10) @panic("exceeded the maximum (10) deferred depth");
+            const round_end = self.next_frame.deferred_draws.items.len;
+            for (self.deferred_by_priority(round_start, round_end)) |ix| {
+                const d = self.next_frame.deferred_draws.items[ix];
+                const saved = self.text_style_stack.items.len;
+                self.text_style_stack.appendSlice(self.allocator, d.text_style_stack) catch oom();
+                const start = self.prepaint_index();
+                if (d.element) |element| {
+                    const outer_arena = swap_frame_arena(d.arena);
+                    defer _ = swap_frame_arena(outer_arena);
+                    if (d.view) |view| self.push_view(view);
+                    defer if (d.view != null) self.pop_view();
+                    // The deferred child was laid out by `Deferred.request_layout`; GPUI only prepaints it here.
+                    element.prepaint_at(d.absolute_offset, self, cx);
+                } else {
+                    self.reuse_prepaint(d.prepaint_start, d.prepaint_end);
+                }
+                const end = self.prepaint_index();
+                const slot = &self.next_frame.deferred_draws.items[ix];
+                slot.prepaint_start = start;
+                slot.prepaint_end = end;
+                self.text_style_stack.shrinkRetainingCapacity(saved);
+            }
+            round_start = round_end;
         }
     }
 
     fn paint_deferred_draws(self: *Window, cx: *App) void {
-        for (self.next_frame.deferred_draws.items) |d| {
+        for (self.deferred_by_priority(0, self.next_frame.deferred_draws.items.len)) |ix| {
+            const d = self.next_frame.deferred_draws.items[ix];
             const saved = self.text_style_stack.items.len;
             self.text_style_stack.appendSlice(self.allocator, d.text_style_stack) catch oom();
-            d.element.paint(self, cx);
+            const start = self.paint_index();
+            if (d.element) |element| {
+                const outer_arena = swap_frame_arena(d.arena);
+                defer _ = swap_frame_arena(outer_arena);
+                if (d.view) |view| self.push_view(view);
+                defer if (d.view != null) self.pop_view();
+                element.paint(self, cx);
+            } else {
+                self.reuse_paint(d.paint_start, d.paint_end);
+            }
+            const end = self.paint_index();
+            const slot = &self.next_frame.deferred_draws.items[ix];
+            slot.paint_start = start;
+            slot.paint_end = end;
             self.text_style_stack.shrinkRetainingCapacity(saved);
         }
     }
@@ -2380,27 +2627,27 @@ pub const Window = struct {
         defer current_frame_arena = prev_arena;
         switch (event) {
             .mouse_move => |e| {
-                self.mouse_position_ = e.position;
+                self.set_mouse_position(e.position);
                 self.modifiers_ = e.modifiers;
                 self.dispatch_mouse(interactive.MouseMoveEvent, &e, cx);
             },
             .mouse_down => |e| {
-                self.mouse_position_ = e.position;
+                self.set_mouse_position(e.position);
                 self.modifiers_ = e.modifiers;
                 self.dispatch_mouse(interactive.MouseDownEvent, &e, cx);
             },
             .mouse_up => |e| {
-                self.mouse_position_ = e.position;
+                self.set_mouse_position(e.position);
                 self.modifiers_ = e.modifiers;
                 self.dispatch_mouse(interactive.MouseUpEvent, &e, cx);
             },
             .mouse_exited => |e| {
-                self.mouse_position_ = e.position;
+                self.set_mouse_position(e.position);
                 self.modifiers_ = e.modifiers;
                 self.dispatch_mouse(interactive.MouseExitEvent, &e, cx);
             },
             .scroll_wheel => |e| {
-                self.mouse_position_ = e.position;
+                self.set_mouse_position(e.position);
                 self.modifiers_ = e.modifiers;
                 self.dispatch_mouse(interactive.ScrollWheelEvent, &e, cx);
             },
@@ -2421,13 +2668,13 @@ pub const Window = struct {
             // A file drag behaves like a drag started inside the window, so elements handle
             // both the same way, as in GPUI.
             .long_press => |e| {
-                self.mouse_position_ = if (e.phase == .started) e.start_position else e.position;
+                self.set_mouse_position(if (e.phase == .started) e.start_position else e.position);
                 if (e.phase == .started) self.long_press_capture = null;
                 self.dispatch_mouse(interactive.LongPressEvent, &e, cx);
             },
             .file_drop => |e| switch (e) {
                 .entered => |d| {
-                    self.mouse_position_ = d.position;
+                    self.set_mouse_position(d.position);
                     if (cx.active_drag == null) {
                         const view = cx.new(d.paths);
                         const value = cx.allocator.create(interactive.ExternalPaths) catch oom();
@@ -2446,12 +2693,12 @@ pub const Window = struct {
                     return self.dispatch_event(.{ .mouse_move = .{ .position = d.position, .pressed_button = .left } }, cx);
                 },
                 .pending => |d| {
-                    self.mouse_position_ = d.position;
+                    self.set_mouse_position(d.position);
                     return self.dispatch_event(.{ .mouse_move = .{ .position = d.position, .pressed_button = .left } }, cx);
                 },
                 .submit => |d| {
                     cx.activate(true);
-                    self.mouse_position_ = d.position;
+                    self.set_mouse_position(d.position);
                     return self.dispatch_event(.{ .mouse_up = .{ .button = .left, .position = d.position, .click_count = 1 } }, cx);
                 },
                 .exited, .ended => {
@@ -2465,13 +2712,21 @@ pub const Window = struct {
                 self.dispatch_mouse(interactive.PinchEvent, &e, cx);
             },
             .mouse_pressure => |e| {
-                self.mouse_position_ = e.position;
+                self.set_mouse_position(e.position);
                 self.modifiers_ = e.modifiers;
                 self.dispatch_mouse(interactive.MousePressureEvent, &e, cx);
             },
             else => {},
         }
         return !self.propagate_event or self.default_prevented_;
+    }
+
+    fn call_mouse_listener(self: *Window, l: MouseListener, event: *const anyopaque, phase: DispatchPhase, cx: *App) void {
+        if (l.view) |view| self.view_stack.append(self.allocator, view) catch oom();
+        defer if (l.view != null) {
+            _ = self.view_stack.pop();
+        };
+        l.func(l.ctx, event, phase, self, cx);
     }
 
     fn dispatch_mouse(self: *Window, comptime E: type, event: *const E, cx: *App) void {
@@ -2481,7 +2736,7 @@ pub const Window = struct {
         // Capture phase: back to front.
         for (listeners) |l| {
             if (l.event_type != tid) continue;
-            l.func(l.ctx, event, .capture, self, cx);
+            self.call_mouse_listener(l, event, .capture, cx);
             if (!self.propagate_event) break;
         }
         if (self.propagate_event) {
@@ -2490,7 +2745,7 @@ pub const Window = struct {
                 i -= 1;
                 const l = listeners[i];
                 if (l.event_type != tid) continue;
-                l.func(l.ctx, event, .bubble, self, cx);
+                self.call_mouse_listener(l, event, .bubble, cx);
                 if (!self.propagate_event) break;
             }
         }

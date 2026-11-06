@@ -154,6 +154,24 @@ pub const ViewPath = struct {
     }
 };
 
+/// Where `reuse_subtree` put the nodes it moved (GPUI `ReusedSubtree`).
+pub const ReusedSubtree = struct {
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    contains_focus_: bool,
+
+    /// The id in the new tree of a node that was in the moved range.
+    pub fn refresh_node_id(self: ReusedSubtree, node_id: DispatchNodeId) DispatchNodeId {
+        std.debug.assert(node_id >= self.old_start and node_id < self.old_end);
+        return @intCast(node_id - self.old_start + self.new_start);
+    }
+
+    pub fn contains_focus(self: ReusedSubtree) bool {
+        return self.contains_focus_;
+    }
+};
+
 fn oom() noreturn {
     @panic("out of memory");
 }
@@ -246,6 +264,49 @@ pub const DispatchTree = struct {
         }
         self.count += 1;
         self.node_stack.append(self.gpa, id) catch oom();
+    }
+
+    /// Drops the nodes from `index` on, which a failed `Window.transact` rolled back (GPUI `truncate`).
+    pub fn truncate(self: *DispatchTree, index: usize) void {
+        for (self.nodes.items[index..self.count]) |*n| {
+            if (n.focus_id) |id| _ = self.focusable.remove(id);
+            if (n.view_id) |id| _ = self.view_nodes.remove(id);
+        }
+        self.count = index;
+    }
+
+    /// Takes a node of the previous frame's tree, listeners and all (GPUI `move_node`). Listeners
+    /// are swapped, so the source keeps the (empty) lists of the node they replace.
+    fn move_node(self: *DispatchTree, source: *DispatchNode) void {
+        self.push_node();
+        if (source.context) |context| self.set_key_context(context);
+        if (source.focus_id) |id| self.set_focus_id(id, source.tab_index, source.tab_stop);
+        if (source.tab_group) |group| self.set_tab_group(group);
+        if (source.view_id) |id| self.set_view_id(id);
+        const target = self.active_node();
+        std.mem.swap(std.ArrayList(KeyListener), &target.key_listeners, &source.key_listeners);
+        std.mem.swap(std.ArrayList(ActionListener), &target.action_listeners, &source.action_listeners);
+    }
+
+    /// Rebuilds nodes `old_start..old_end` of `source` under the active node, without running the
+    /// prepaint that made them (GPUI `reuse_subtree`).
+    pub fn reuse_subtree(self: *DispatchTree, old_start: usize, old_end: usize, source: *DispatchTree, focus: ?u64) ReusedSubtree {
+        const new_start = self.count;
+        var contains_focus = false;
+        // Ancestors within the range.
+        var stack: std.ArrayList(DispatchNodeId) = .empty;
+        defer stack.deinit(self.gpa);
+        for (source.nodes.items[old_start..old_end], old_start..) |*source_node, source_id| {
+            while (stack.items.len > 0 and source_node.parent != stack.items[stack.items.len - 1]) {
+                _ = stack.pop();
+                self.pop_node();
+            }
+            stack.append(self.gpa, @intCast(source_id)) catch oom();
+            if (source_node.focus_id != null and source_node.focus_id == focus) contains_focus = true;
+            self.move_node(source_node);
+        }
+        for (stack.items) |_| self.pop_node();
+        return .{ .old_start = old_start, .old_end = old_end, .new_start = new_start, .contains_focus_ = contains_focus };
     }
 
     /// Makes the parent of the active node active again.

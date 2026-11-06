@@ -594,7 +594,7 @@ pub const UniformList = struct {
 
         if (c.list.interactivity.tracked_scroll_handle) |sh| sh.set_offset(offset);
         if (c.state) |st| st.scroll_offset = offset;
-        window.refresh();
+        window.notify_current_view();
         window.stop_propagation();
     }
 

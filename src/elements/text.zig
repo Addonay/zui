@@ -683,7 +683,7 @@ pub const InteractiveText = struct {
         if (phase != .bubble or !ctx.hitbox.is_hovered(window)) return;
         if (ok_index(ctx.layout.index_for_position(event.position))) |ix| {
             ctx.state.mouse_down_index = ix;
-            window.refresh();
+            window.notify_current_view();
         }
     }
 
@@ -699,7 +699,7 @@ pub const InteractiveText = struct {
             }
         }
         ctx.state.mouse_down_index = null;
-        window.refresh();
+        window.notify_current_view();
     }
 
     fn on_mouse_move(ctx_ptr: *anyopaque, event: *const interactive.MouseMoveEvent, phase: window_mod.DispatchPhase, window: *Window, cx: *App) void {
@@ -709,7 +709,7 @@ pub const InteractiveText = struct {
         if (ctx.state.hovered_index != updated) {
             ctx.state.hovered_index = updated;
             if (ctx.hover) |h| h.func(h.ctx, updated, event, window, cx);
-            window.refresh();
+            window.notify_current_view();
         }
     }
 };
