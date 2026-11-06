@@ -190,6 +190,17 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   `next_frame.arena`) — elements, listeners and formatted strings live there;
   the arena is the *frame's*, so data survives as `rendered_frame` until the
   frame after next (listeners dispatched against the rendered frame).
+- **View caching**: `entity.cached(style)` and `AnyView.cached(style)` follow GPUI's `ViewElement`: a clean view
+  replays ranges of the rendered frame (`reuse_prepaint`, `reuse_paint`, `reuse_subtree`, `reuse_layouts`, `Scene.replay`).
+  ZUI's elements and listeners live in the frame arena, which a reused view must outlive, so it renders into two
+  arenas of its own (`ViewElementState`), alternating, because the rendered frame still uses the last render's
+  while the next one is made. Deferred draws remember their arena. The text style in the key is a hash, since its
+  strings may not outlive the frame. A second prepaint in one frame, after a failed `transact`, never reuses.
+  Consequences for element code: hitbox ids do not repeat across frames, so hover is known only in paint (the hit
+  test runs again between prepaint and paint), and a listener that changes how its element looks calls
+  `window.notify_current_view()`, not `window.refresh()`, which renders every cached view again. Mouse listeners
+  run with their view current. Line layouts are per window, while the text system stays per app: `Window.draw`
+  points `TextSystem.active_cache` at the window's.
 - **Draw**: `Window.draw` = clear next frame + layout engine → root
   `AnyView.into_any_element()` → `prepaint_as_root` → deferred draws →
   `paint` → `scene.finish()` → swap frames → `text_system().finish_frame()`
