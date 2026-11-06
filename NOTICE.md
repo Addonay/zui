@@ -23,4 +23,4 @@ from the original. `src/renderer/shdc/` comes from the same project and drives s
 ## Vendored C code (`third_party/`)
 
 - nanosvg (`nanosvg.h`, `nanosvgrast.h`): zlib license, Copyright (c) 2013-2014 Mikko Mononen.
-- stb_image (`stb_image.h`): public domain / MIT, Sean Barrett.
+- Wuffs (`third_party/wuffs/`, commit b36a81d): Apache-2.0 OR MIT, Copyright The Wuffs Authors. Image decoding; see `third_party/wuffs/LICENSE`.

@@ -16,6 +16,7 @@ const http_client_mod = @import("http_client.zig");
 const disk_cache = @import("image_disk_cache.zig");
 const log = std.log.scoped(.zui_assets);
 const geometry = @import("geometry.zig");
+const wuffs = @import("wuffs.zig");
 const svg_mod = @import("svg_renderer.zig");
 const window_mod = @import("window.zig");
 const app_mod = @import("app.zig");
@@ -23,12 +24,6 @@ const app_mod = @import("app.zig");
 const Pixels = geometry.Pixels;
 const DevicePixels = geometry.DevicePixels;
 const Size = geometry.Size;
-
-// -- stb_image (third_party/stb/stb_image.h, compiled by third_party/images.c) --
-
-extern fn stbi_load_from_memory(buffer: [*]const u8, len: c_int, x: *c_int, y: *c_int, channels_in_file: *c_int, desired_channels: c_int) ?[*]u8;
-extern fn stbi_load_gif_from_memory(buffer: [*]const u8, len: c_int, delays: *?[*]c_int, x: *c_int, y: *c_int, z: *c_int, comp: *c_int, req_comp: c_int) ?[*]u8;
-extern fn stbi_image_free(ptr: ?*anyopaque) void;
 
 /// Errors produced while loading an image source.
 pub const ImageCacheError = error{
@@ -42,10 +37,12 @@ pub const ImageCacheError = error{
     FetchFailed,
     /// A file could not be read.
     ReadFailed,
-    /// The format is recognized but has no decoder (WebP, TIFF, ICO, PNM).
+    /// The format is recognized but has no decoder (TIFF, ICO).
     UnsupportedFormat,
     /// The bytes did not decode as the claimed format.
     DecodeFailed,
+    /// The image is larger than the decoder accepts (see `wuffs.Limits`).
+    ImageTooLarge,
     /// The SVG document could not be parsed or has no size.
     InvalidSvg,
     OutOfMemory,
@@ -129,6 +126,8 @@ pub const ImageFormat = enum {
     tiff,
     ico,
     pnm,
+    qoi,
+    tga,
 
     pub fn mime_type(self: ImageFormat) []const u8 {
         return switch (self) {
@@ -141,6 +140,8 @@ pub const ImageFormat = enum {
             .tiff => "image/tiff",
             .ico => "image/ico",
             .pnm => "image/x-portable-anymap",
+            .qoi => "image/qoi",
+            .tga => "image/x-tga",
         };
     }
 
@@ -156,6 +157,8 @@ pub const ImageFormat = enum {
             .tiff => "tiff",
             .ico => "ico",
             .pnm => "pnm",
+            .qoi => "qoi",
+            .tga => "tga",
         };
     }
 
@@ -170,6 +173,16 @@ pub const ImageFormat = enum {
         if (bytes.len >= 4 and (std.mem.eql(u8, bytes[0..4], "II*\x00") or std.mem.eql(u8, bytes[0..4], "MM\x00*"))) return .tiff;
         if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "\x00\x00\x01\x00")) return .ico;
         if (bytes.len >= 2 and bytes[0] == 'P' and bytes[1] >= '1' and bytes[1] <= '7') return .pnm;
+        if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "qoif")) return .qoi;
+        return null;
+    }
+
+    /// The format a file name claims, for the formats that have no magic number (TGA). Used only
+    /// when `guess` finds nothing.
+    pub fn from_extension(name: []const u8) ?ImageFormat {
+        const ext = std.fs.path.extension(name);
+        if (ext.len < 2) return null;
+        if (std.ascii.eqlIgnoreCase(ext[1..], "tga")) return .tga;
         return null;
     }
 };
@@ -187,13 +200,7 @@ pub const Image = struct {
 };
 
 /// One decoded frame: BGRA, row-major, straight alpha.
-pub const Frame = struct {
-    width: u32,
-    height: u32,
-    /// Delay before the next frame, in milliseconds.
-    delay_ms: u32 = 100,
-    pixels: []u8,
-};
+pub const Frame = wuffs.Frame;
 
 var next_render_image_id: std.atomic.Value(u64) = .init(1);
 
@@ -264,19 +271,6 @@ pub fn frame_from_rgba_owned(rgba: []u8, width: u32, height: u32, delay_ms: u32)
     return .{ .width = width, .height = height, .delay_ms = delay_ms, .pixels = rgba };
 }
 
-/// Copies RGBA pixels into a new BGRA frame.
-fn frame_from_rgba_copy(allocator: std.mem.Allocator, rgba: []const u8, width: u32, height: u32, delay_ms: u32) ImageCacheError!Frame {
-    const out = allocator.alloc(u8, rgba.len) catch return error.OutOfMemory;
-    var i: usize = 0;
-    while (i + 4 <= rgba.len) : (i += 4) {
-        out[i] = rgba[i + 2];
-        out[i + 1] = rgba[i + 1];
-        out[i + 2] = rgba[i];
-        out[i + 3] = rgba[i + 3];
-    }
-    return .{ .width = width, .height = height, .delay_ms = delay_ms, .pixels = out };
-}
-
 /// Decodes `bytes` as `format` into a new `RenderImage` (GPUI `Image::to_image_data`).
 /// SVG documents are rasterized by `renderer`.
 pub fn decode(allocator: std.mem.Allocator, renderer: *svg_mod.SvgRenderer, format: ImageFormat, bytes: []const u8) ImageCacheError!*RenderImage {
@@ -284,36 +278,55 @@ pub fn decode(allocator: std.mem.Allocator, renderer: *svg_mod.SvgRenderer, form
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidSvg,
     };
-    const frames: []Frame = switch (format) {
-        .gif => try decode_gif(allocator, bytes),
-        .jpeg => try decode_static(allocator, bytes, jpeg_orientation(bytes)),
-        .png, .bmp => try decode_static(allocator, bytes, 1),
-        .webp, .tiff, .ico, .pnm => return error.UnsupportedFormat,
-        .svg => unreachable,
+    const frames = try decode_raster(allocator, format, bytes);
+    const image = RenderImage.new(allocator, frames) catch |err| {
+        free_frames(allocator, frames);
+        return err;
     };
-    return RenderImage.new(allocator, frames) catch error.OutOfMemory;
+    return image;
 }
 
-fn decode_static(allocator: std.mem.Allocator, bytes: []const u8, orientation: u8) ImageCacheError![]Frame {
-    const len = std.math.cast(c_int, bytes.len) orelse return error.DecodeFailed;
-    var w: c_int = 0;
-    var h: c_int = 0;
-    var comp: c_int = 0;
-    const px = stbi_load_from_memory(bytes.ptr, len, &w, &h, &comp, 4) orelse return error.DecodeFailed;
-    defer stbi_image_free(px);
-    if (w <= 0 or h <= 0) return error.DecodeFailed;
-    const n = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
-    const frames = allocator.alloc(Frame, 1) catch return error.OutOfMemory;
-    errdefer allocator.free(frames);
-    if (orientation <= 1 or orientation > 8) {
-        frames[0] = try frame_from_rgba_copy(allocator, px[0..n], @intCast(w), @intCast(h), 0);
-        return frames;
+fn free_frames(allocator: std.mem.Allocator, frames: []Frame) void {
+    for (frames) |f| allocator.free(f.pixels);
+    allocator.free(frames);
+}
+
+/// The Wuffs codec for a raster format, or null for formats Wuffs does not decode.
+fn codec_of(format: ImageFormat) ?wuffs.Codec {
+    return switch (format) {
+        .png => .png,
+        .jpeg => .jpeg,
+        .gif => .gif,
+        .bmp => .bmp,
+        .webp => .webp,
+        .qoi => .qoi,
+        .tga => .targa,
+        .pnm => .netpbm,
+        .svg, .tiff, .ico => null,
+    };
+}
+
+/// Decodes every frame of a raster image. The caller owns the frames.
+fn decode_raster(allocator: std.mem.Allocator, format: ImageFormat, bytes: []const u8) ImageCacheError![]Frame {
+    const codec = codec_of(format) orelse return error.UnsupportedFormat;
+    const frames = try wuffs.decode(allocator, codec, bytes);
+    if (format == .jpeg) {
+        // Wuffs does not apply EXIF orientation. JPEG has one frame.
+        apply_jpeg_orientation(allocator, &frames[0], jpeg_orientation(bytes)) catch |err| {
+            free_frames(allocator, frames);
+            return err;
+        };
     }
-    const upright = allocator.alloc(u8, n) catch return error.OutOfMemory;
-    defer allocator.free(upright);
-    const size_ = apply_orientation(px[0..n], upright, @intCast(w), @intCast(h), orientation);
-    frames[0] = try frame_from_rgba_copy(allocator, upright, size_[0], size_[1], 0);
     return frames;
+}
+
+/// Turns `frame` upright for an EXIF orientation, in a new buffer.
+fn apply_jpeg_orientation(allocator: std.mem.Allocator, frame: *Frame, orientation: u8) error{OutOfMemory}!void {
+    if (orientation <= 1 or orientation > 8) return;
+    const upright = try allocator.alloc(u8, frame.pixels.len);
+    const size = apply_orientation(frame.pixels, upright, frame.width, frame.height, orientation);
+    allocator.free(frame.pixels);
+    frame.* = .{ .width = size[0], .height = size[1], .delay_ms = frame.delay_ms, .pixels = upright };
 }
 
 /// The EXIF orientation of a JPEG, 1 (upright) if it has none. Tolerates truncated or malformed
@@ -377,33 +390,6 @@ fn apply_orientation(src: []const u8, dst: []u8, w: u32, h: u32, orientation: u8
         @memcpy(dst[(oy * out_w + ox) * 4..][0..4], src[(y * w + x) * 4..][0..4]);
     };
     return .{ out_w, out_h };
-}
-
-fn decode_gif(allocator: std.mem.Allocator, bytes: []const u8) ImageCacheError![]Frame {
-    const len = std.math.cast(c_int, bytes.len) orelse return error.DecodeFailed;
-    var delays: ?[*]c_int = null;
-    var w: c_int = 0;
-    var h: c_int = 0;
-    var layers: c_int = 0;
-    var comp: c_int = 0;
-    const px = stbi_load_gif_from_memory(bytes.ptr, len, &delays, &w, &h, &layers, &comp, 4) orelse return error.DecodeFailed;
-    defer stbi_image_free(px);
-    defer if (delays) |d| std.c.free(d);
-    if (w <= 0 or h <= 0 or layers <= 0) return error.DecodeFailed;
-
-    const count: usize = @intCast(layers);
-    const per_frame = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
-    const frames = allocator.alloc(Frame, count) catch return error.OutOfMemory;
-    var built: usize = 0;
-    errdefer {
-        for (frames[0..built]) |f| allocator.free(f.pixels);
-        allocator.free(frames);
-    }
-    while (built < count) : (built += 1) {
-        const delay_ms: u32 = if (delays) |d| @intCast(@max(d[built], 0)) else 100;
-        frames[built] = try frame_from_rgba_copy(allocator, px[built * per_frame ..][0..per_frame], @intCast(w), @intCast(h), delay_ms);
-    }
-    return frames;
 }
 
 /// Reads a whole file into `allocator`-owned memory.
@@ -501,25 +487,27 @@ pub const AssetCache = struct {
         switch (resource) {
             .uri => |uri| {
                 if (!std.mem.startsWith(u8, uri, "file://")) return error.UnsupportedUri;
-                const bytes = try read_file(self.allocator, uri["file://".len..]);
+                const path = uri["file://".len..];
+                const bytes = try read_file(self.allocator, path);
                 defer self.allocator.free(bytes);
-                return decode_guessed(self, bytes);
+                return decode_guessed(self, bytes, path);
             },
             .embedded => |name| {
                 const bytes = source.load(name) orelse return error.AssetNotFound;
-                return decode_guessed(self, bytes);
+                return decode_guessed(self, bytes, name);
             },
             .path => |path| {
                 const bytes = try read_file(self.allocator, path);
                 defer self.allocator.free(bytes);
-                return decode_guessed(self, bytes);
+                return decode_guessed(self, bytes, path);
             },
         }
     }
 
-    /// Format by magic bytes; anything unrecognized is treated as SVG (GPUI behavior).
-    fn decode_guessed(self: *AssetCache, bytes: []const u8) ImageCacheError!*RenderImage {
-        const format = ImageFormat.guess(bytes) orelse .svg;
+    /// Format by magic bytes, then by the name's extension; anything unrecognized is treated as SVG
+    /// (GPUI behavior).
+    fn decode_guessed(self: *AssetCache, bytes: []const u8, name: []const u8) ImageCacheError!*RenderImage {
+        const format = guess_format(bytes, name);
         return decode(self.allocator, try self.svg_renderer(), format, bytes);
     }
 };
@@ -669,13 +657,11 @@ const RemoteImages = struct {
         const format = ImageFormat.guess(body) orelse .svg;
         if (format == .svg) return .{ .svg = body };
         defer a.free(body);
-        const frames = switch (format) {
-            .jpeg => decode_static(a, body, jpeg_orientation(body)),
-            .png, .bmp => decode_static(a, body, 1),
-            .gif => decode_gif(a, body),
-            else => error.UnsupportedFormat,
-        } catch |err| return .{ .failed = err };
-        return .{ .decoded = RenderImage.new(a, frames) catch |err| return .{ .failed = err } };
+        const frames = decode_raster(a, format, body) catch |err| return .{ .failed = err };
+        return .{ .decoded = RenderImage.new(a, frames) catch |err| {
+            free_frames(a, frames);
+            return .{ .failed = err };
+        } };
     }
 
     /// Hands a result to the main thread. Takes ownership of `result`.
@@ -830,25 +816,26 @@ pub fn load_detached(allocator: std.mem.Allocator, io: Io, source: AssetSource, 
     switch (resource) {
         .embedded => |name| {
             const bytes = source.load(name) orelse return error.AssetNotFound;
-            return decode_detached(allocator, bytes);
+            return decode_detached(allocator, bytes, name);
         },
         .path => |path| {
             const bytes = try read_file(allocator, path);
             defer allocator.free(bytes);
-            return decode_detached(allocator, bytes);
+            return decode_detached(allocator, bytes, path);
         },
         .uri => |uri| {
             if (std.mem.startsWith(u8, uri, "file://")) {
-                const bytes = try read_file(allocator, uri["file://".len..]);
+                const path = uri["file://".len..];
+                const bytes = try read_file(allocator, path);
                 defer allocator.free(bytes);
-                return decode_detached(allocator, bytes);
+                return decode_detached(allocator, bytes, path);
             }
             const bytes = fetch_detached(allocator, io, http, uri) catch |err| {
                 log.warn("could not fetch image {s}: {s}", .{ uri, @errorName(err) });
                 return error.FetchFailed;
             };
             defer allocator.free(bytes);
-            return decode_detached(allocator, bytes);
+            return decode_detached(allocator, bytes, uri);
         },
     }
 }
@@ -859,9 +846,15 @@ fn fetch_detached(allocator: std.mem.Allocator, io: Io, http: ?http_client_mod.H
     return client.get(allocator, io, url);
 }
 
+/// The format of `bytes`: by magic number, else by the name's extension (TGA has no magic number),
+/// else SVG.
+fn guess_format(bytes: []const u8, name: []const u8) ImageFormat {
+    return ImageFormat.guess(bytes) orelse ImageFormat.from_extension(name) orelse .svg;
+}
+
 /// Decodes `bytes` with a rasterizer of its own, so it is safe on any thread.
-fn decode_detached(allocator: std.mem.Allocator, bytes: []const u8) ImageCacheError!*RenderImage {
-    const format = ImageFormat.guess(bytes) orelse .svg;
+fn decode_detached(allocator: std.mem.Allocator, bytes: []const u8, name: []const u8) ImageCacheError!*RenderImage {
+    const format = guess_format(bytes, name);
     var renderer = svg_mod.SvgRenderer.init() catch return error.OutOfMemory;
     defer renderer.deinit();
     return decode(allocator, &renderer, format, bytes);
@@ -1021,7 +1014,7 @@ test "bmp decodes 24-bit rows with padding" {
 test "unsupported formats are reported, not decoded" {
     var renderer = try svg_mod.SvgRenderer.init();
     defer renderer.deinit();
-    try testing.expectError(error.UnsupportedFormat, decode(testing.allocator, &renderer, .webp, "RIFF....WEBP"));
+    try testing.expectError(error.UnsupportedFormat, decode(testing.allocator, &renderer, .tiff, "II*\x00...."));
 }
 
 test "empty asset source has no assets" {

@@ -63,7 +63,7 @@ GPUI's `hello_world.rs` (verified via headless snapshot).
 | Linux platform: Wayland + X11 (dlopen, no link deps) | done; verified on Xvfb and an isolated real compositor (see §7); IME on both |
 | Text input: `EntityInputHandler`, `ElementInputHandler`, IME (text-input-v3, XIM), dead keys | done; verified with a real input method on both (see §7) |
 | TestAppContext / VisualTestContext + end-to-end tests | done |
-| img / svg / assets (stb_image, nanosvg) | done (local files load synchronously, URLs in the background; GIFs animate) |
+| img / svg / assets (Wuffs, nanosvg) | done (local files load synchronously, URLs in the background; GIFs animate) |
 | anchored, deferred, canvas, animation (+easings), spring | done |
 | list (variable height), uniform_list | done (agent stopped right after tests passed; verify) |
 | GPU layer (`src/gpu/`, vendored from zicr at `87fe622`; zicr dependency removed) | done |
@@ -111,7 +111,7 @@ src/renderer/window_renderer.zig  GpuContext (shared per connection) + GpuWindow
 src/renderer/gpu_test.zig  GPU vs CPU pixel comparison (skips without Vulkan 1.3)
 src/renderer/shdc/       generator that turns sokol-shdc output into shaders_gen.zig
 examples/*.zig           line-by-line ports of crates/gpui/examples/*.rs
-third_party/             stb_image, nanosvg, images.c shim
+third_party/             Wuffs, nanosvg, images.c shim
 ```
 
 ## 4. Toolchain, dependencies and the container setup
@@ -293,6 +293,10 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   server dies reconnecting is retried once a second for a minute. Every event must go through
   `XFilterEvent`, also while no server is connected. Not done: `delete_surrounding_text` (we never
   send surrounding text), `keyboard_layout`. GPUI has no content types either: it always sends none/normal.
+- **Image decoding**: `src/wuffs.zig` over Google's Wuffs (`third_party/wuffs`, `0.4.0-alpha.12`), a separate
+  library built optimized even in Debug. Not `stb_image`, which is not meant for untrusted files, and images
+  now come from arbitrary URLs. Wuffs decodes one frame of an animated WebP, so the Zig side walks the RIFF
+  chunks and composites, and that Zig is the part where a memory bug could live.
 - **Remote images**: `AssetCache` starts a fetch on first use and returns `error.Loading`, which `img`
   shows as `with_loading`, and the windows refresh when it settles. Each fetch runs on a `std.Io.Threaded`
   of its own in an `Io.Group`, not on the background executor, so quitting can cancel a download stuck on

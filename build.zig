@@ -82,9 +82,20 @@ pub fn build(b: *std.Build) void {
     }
     zui.linkLibrary(b.addLibrary(.{ .name = "zui_http", .linkage = .static, .root_module = http_native }));
 
-    // Vendored C backends: nanosvg (SVG parse + rasterize) and stb_image (decode).
+    // Vendored C backends: nanosvg (SVG parse + rasterize).
     zui.addIncludePath(b.path("third_party"));
     zui.addCSourceFile(.{ .file = b.path("third_party/images.c"), .flags = &.{"-std=c99"} });
+
+    // Wuffs image decoders (third_party/wuffs), a separate static library optimized even in Debug, so
+    // that images decode quickly in a Debug app. Its decoders are memory safe; see src/wuffs.zig.
+    const wuffs_native = b.createModule(.{
+        .target = target,
+        .optimize = if (optimize == .debug) .fast else optimize,
+        .link_libc = true,
+    });
+    wuffs_native.addIncludePath(b.path("third_party/wuffs"));
+    wuffs_native.addCSourceFile(.{ .file = b.path("third_party/wuffs/zui_wuffs.c"), .flags = &.{ "-std=c99", "-fno-sanitize=undefined" } });
+    zui.linkLibrary(b.addLibrary(.{ .name = "zui_wuffs", .linkage = .static, .root_module = wuffs_native }));
 
     // Unit tests.
     const tests = b.addTest(.{ .root_module = zui });
