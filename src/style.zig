@@ -90,23 +90,28 @@ pub const Visibility = enum { visible, hidden };
 pub const BoxShadow = struct {
     color: Hsla,
     offset: Point(Pixels),
-    blur_radius: Pixels = 0,
-    spread_radius: Pixels = 0,
+    // Named with a trailing underscore because the builders below share the names.
+    blur_radius_: Pixels = 0,
+    spread_radius_: Pixels = 0,
     inset: bool = false,
 
     pub fn new(offset_x: Pixels, offset_y: Pixels, c: Hsla) BoxShadow {
         return .{ .color = c, .offset = .{ .x = offset_x, .y = offset_y } };
     }
-    pub fn with_blur_radius(self: BoxShadow, r: Pixels) BoxShadow {
+    /// Sets the shadow blur radius (GPUI `BoxShadow::blur_radius`).
+    pub fn blur_radius(self: BoxShadow, r: Pixels) BoxShadow {
         var s = self;
-        s.blur_radius = r;
+        s.blur_radius_ = r;
         return s;
     }
-    pub fn with_spread_radius(self: BoxShadow, r: Pixels) BoxShadow {
+    /// Sets the shadow spread radius (GPUI `BoxShadow::spread_radius`).
+    pub fn spread_radius(self: BoxShadow, r: Pixels) BoxShadow {
         var s = self;
-        s.spread_radius = r;
+        s.spread_radius_ = r;
         return s;
     }
+    pub const with_blur_radius = blur_radius;
+    pub const with_spread_radius = spread_radius;
     pub fn with_inset(self: BoxShadow) BoxShadow {
         var s = self;
         s.inset = true;

@@ -204,6 +204,11 @@ pub const TestAppContext = struct {
     pub fn read_from_clipboard(self: *TestAppContext) ?platform_mod.ClipboardItem {
         return self.app.read_from_clipboard();
     }
+
+    /// Sets the name `App.get_name` returns (GPUI `TestAppContext::set_name`). The name must outlive the test.
+    pub fn set_name(self: *TestAppContext, name: []const u8) void {
+        self.app.name_ = name;
+    }
 };
 
 /// A window-scoped test context that simulates platform input (GPUI `VisualTestContext`).
@@ -1239,8 +1244,8 @@ test "windows: simulate_resize updates the viewport" {
     defer cx.deinit();
     _, const vcx = cx.add_window_view(Counter.build);
     vcx.simulate_resize(.{ .width = 320, .height = 240 });
-    try std.testing.expectEqual(@as(Pixels, 320), vcx.window.viewport_size.width);
-    try std.testing.expectEqual(@as(Pixels, 240), vcx.window.viewport_size.height);
+    try std.testing.expectEqual(@as(Pixels, 320), vcx.window.viewport_size().width);
+    try std.testing.expectEqual(@as(Pixels, 240), vcx.window.viewport_size().height);
 }
 
 /// Re-renders from state: the quad width tracks `count`, so a repaint after `notify` is observable.
@@ -3061,7 +3066,7 @@ test "RetainAllImageCache: keeps each image, and releases them when cleared" {
     var cx = TestAppContext.build(0);
     defer cx.deinit();
     var pixels: PixelAssets = .{};
-    cx.app.asset_source = assets_mod.AssetSource.from(&pixels);
+    cx.app.asset_source_ = assets_mod.AssetSource.from(&pixels);
     _, const vcx = cx.add_window_view(SlowView.build);
 
     const cache_handle = image_cache_mod.RetainAllImageCache.new(cx.app);
@@ -3090,7 +3095,7 @@ test "RetainAllImageCache: released with its entity, even while an image loads" 
     var cx = TestAppContext.build(0);
     defer cx.deinit();
     var pixels: PixelAssets = .{};
-    cx.app.asset_source = assets_mod.AssetSource.from(&pixels);
+    cx.app.asset_source_ = assets_mod.AssetSource.from(&pixels);
     _, const vcx = cx.add_window_view(SlowView.build);
 
     const cache_handle = image_cache_mod.RetainAllImageCache.new(cx.app);
@@ -3131,7 +3136,7 @@ test "img: an image in image_cache() loads through that cache, then redraws" {
     var cx = TestAppContext.build(0);
     defer cx.deinit();
     var pixels: PixelAssets = .{};
-    cx.app.asset_source = assets_mod.AssetSource.from(&pixels);
+    cx.app.asset_source_ = assets_mod.AssetSource.from(&pixels);
     const view, const vcx = cx.add_window_view(CachedImageView.build);
     try std.testing.expect(CachedImageView.loadings > 0);
 
@@ -5073,7 +5078,7 @@ test "window: the visible bounds are the whole viewport when nothing covers it" 
     _, const vcx = cx.add_window_view(Editor.build);
     const sizes = vcx.update(struct {
         fn f(window: *Window, _: *App) [2]Size(Pixels) {
-            return .{ window.fully_visible_bounds().size, window.viewport_size };
+            return .{ window.fully_visible_bounds().size, window.viewport_size() };
         }
     }.f, .{});
     try std.testing.expectEqual(sizes[1].width, sizes[0].width);
@@ -5242,8 +5247,8 @@ const PaintCase = struct {
             .shadows => {
                 const b: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox + 10, .y = oy + 10 }, .size = .{ .width = 20, .height = 20 } };
                 const shadows = [_]style_mod.BoxShadow{
-                    .{ .color = color_mod.black(), .offset = .{ .x = 2, .y = 3 }, .blur_radius = 4, .spread_radius = 1 },
-                    .{ .color = color_mod.black(), .offset = .{ .x = 0, .y = 0 }, .blur_radius = 1, .spread_radius = 2, .inset = true },
+                    .{ .color = color_mod.black(), .offset = .{ .x = 2, .y = 3 }, .blur_radius_ = 4, .spread_radius_ = 1 },
+                    .{ .color = color_mod.black(), .offset = .{ .x = 0, .y = 0 }, .blur_radius_ = 1, .spread_radius_ = 2, .inset = true },
                 };
                 const radii = geometry.Corners(Pixels).all(5);
                 window.paint_drop_shadows(b, radii, &shadows);

@@ -148,6 +148,9 @@ pub fn action_deprecation_message(comptime T: type) ?[]const u8 {
     return value;
 }
 
+/// GPUI `Action::deprecation_message` under its GPUI name.
+pub const deprecation_message = action_deprecation_message;
+
 /// GPUI `Action::deprecated_aliases`: the `deprecated_aliases` declaration of the action type.
 pub fn action_deprecated_aliases(comptime T: type) []const []const u8 {
     if (!@hasDecl(T, "deprecated_aliases")) return &.{};
@@ -461,6 +464,12 @@ test "ActionRegistry: action_schemas and action_schema_by_name report every name
     try testing.expect(unit != null);
     try testing.expect(unit.? == null);
     try testing.expect(registry.action_schema_by_name("editor::Resize").? != null);
+}
+
+test "deprecation_message: the declaration on the action type, under the GPUI name" {
+    const Renamed = ActionWith("editor", "Save", .{ .deprecation_message = "Use editor::Save." });
+    try testing.expectEqualStrings("Use editor::Save.", deprecation_message(Renamed).?);
+    try testing.expect(deprecation_message(MoveUp) == null);
 }
 
 test "action_documentation: a `documentation` declaration on a data action is read" {
