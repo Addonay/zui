@@ -4289,6 +4289,88 @@ test "windows: App.update_window and App.read_window reach the root view, and fa
     try std.testing.expectError(error.WindowClosed, cx.app.read_window(Counter, gone_typed, Reader.read, .{}));
 }
 
+const style_mod = @import("../style.zig");
+const text_system_mod = @import("../text_system.zig");
+const text_system_line = text_system_mod.line;
+
+/// Paints one shaped line with two underlines, through either `paint` or `paint_with_underline_handler`.
+const UnderlineHandlerView = struct {
+    const text = "aébcde";
+    var calls: usize = 0;
+    var ranges: [4]text_system_line.ByteRange = undefined;
+    var thicknesses: [4]f32 = undefined;
+    var use_default_paint: bool = false;
+
+    fn record(_: ?*anyopaque, range: text_system_line.ByteRange, _: geometry.Point(Pixels), _: Pixels, underline_style: *const style_mod.UnderlineStyle, _: *Window) void {
+        if (calls < ranges.len) {
+            ranges[calls] = range;
+            thicknesses[calls] = underline_style.thickness;
+        }
+        calls += 1;
+    }
+
+    fn paint(_: void, bounds: geometry.Bounds(Pixels), window: *Window, cx: *App) void {
+        // The window may draw more than one frame, so the calls are counted from the last paint.
+        calls = 0;
+        const color: color_mod.Hsla = .{ .h = 0, .s = 0, .l = 0, .a = 1 };
+        const runs = [_]style_mod.TextRun{.{ .len = text.len, .font = text_system_mod.font(".SystemUIFont"), .color = color }};
+        var line = cx.text_system().shape_line(text, px(16), &runs, null) catch return;
+        // a and é share one underline; b has none; c, d and e share another. The colors are explicit: an
+        // underline without one never matches the run it continues into (GPUI compares them the same way).
+        const thin: style_mod.UnderlineStyle = .{ .thickness = 1, .color = color };
+        const thick: style_mod.UnderlineStyle = .{ .thickness = 2, .color = color };
+        const decorations = [_]text_system_line.DecorationRun{
+            .{ .len = 1, .color = color, .underline = thin },
+            .{ .len = 2, .color = color, .underline = thin },
+            .{ .len = 1, .color = color },
+            .{ .len = 1, .color = color, .underline = thick },
+            .{ .len = 2, .color = color, .underline = thick },
+        };
+        line.decoration_runs = &decorations;
+        if (use_default_paint) {
+            line.paint(bounds.origin, px(20), .left, null, window, cx) catch return;
+        } else {
+            line.paint_with_underline_handler(bounds.origin, px(20), .left, null, window, cx, .{ .func = record }) catch return;
+        }
+    }
+
+};
+
+test "paint_with_underline_handler hands each underline's bytes to the handler, and paint draws them" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    if (!cx.app.text_system().fs.hasShaper() or cx.app.text_system().fs.fontIds().len == 0) return error.SkipZigTest;
+    const Root = struct {
+        pub fn render(_: *@This(), _: *Window, _: *Context(@This())) *Div {
+            return div().size_full().child(canvas_mod.canvas_fn({}, UnderlineHandlerView.paint).size_full());
+        }
+    };
+    const build = struct {
+        fn build(_: *Window, app: *App) Entity(Root) {
+            return app.new(Root{});
+        }
+    }.build;
+
+    // Through the handler: the underlines reach it and none is painted by the line itself.
+    UnderlineHandlerView.calls = 0;
+    UnderlineHandlerView.use_default_paint = false;
+    _, const handled_vcx = cx.add_window_view(build);
+    try std.testing.expectEqual(@as(usize, 0), handled_vcx.window.rendered_frame.scene.underlines.items.len);
+    try std.testing.expectEqual(@as(usize, 2), UnderlineHandlerView.calls);
+    try std.testing.expectEqual(text_system_line.ByteRange{ .start = 0, .end = 3 }, UnderlineHandlerView.ranges[0]);
+    try std.testing.expectEqual(text_system_line.ByteRange{ .start = 4, .end = 7 }, UnderlineHandlerView.ranges[1]);
+    try std.testing.expectEqual(@as(f32, 1), UnderlineHandlerView.thicknesses[0]);
+    try std.testing.expectEqual(@as(f32, 2), UnderlineHandlerView.thicknesses[1]);
+
+    // The default paint draws both through the window and never calls the handler.
+    UnderlineHandlerView.calls = 0;
+    UnderlineHandlerView.use_default_paint = true;
+    _, const vcx = cx.add_window_view(build);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 0), UnderlineHandlerView.calls);
+    try std.testing.expectEqual(@as(usize, 2), vcx.window.rendered_frame.scene.underlines.items.len);
+}
+
 fn test_display(id: platform_mod.DisplayId, w: f32, h: f32) platform_mod.Display {
     return .{ .id = id, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = w, .height = h } } };
 }

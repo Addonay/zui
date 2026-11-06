@@ -988,6 +988,8 @@ const SubscriberKind = enum {
     app_quit,
     /// An entity of type `event_type` was created (`App.observe_new`).
     new_entity,
+    /// Graphemes that no font drew (`App.on_missing_glyphs`).
+    missing_glyphs,
     /// A window's visibility changed (`Window.observe_window_visibility`).
     window_visibility,
     /// A window moved to another display, or its display changed (`Window.observe_window_display`).
@@ -1163,6 +1165,8 @@ pub const App = struct {
     globals: std.AutoHashMapUnmanaged(TypeId, GlobalSlot) = .empty,
     subscribers: std.ArrayList(Subscriber) = .empty,
     next_subscription_id: u64 = 1,
+    /// The `on_missing_glyphs` subscriber, if one is registered (GPUI keeps one callback slot).
+    missing_glyph_subscription: ?u64 = null,
     pending_effects: std.ArrayList(Effect) = .empty,
     flushing_effects: bool = false,
     pending_updates: u32 = 0,
@@ -1657,6 +1661,49 @@ pub const App = struct {
         for (self.subscribers.items) |*s| if (s.id == id) {
             s.active = false;
         };
+        // Dropping the `on_missing_glyphs` subscription stops the collection, as in GPUI.
+        if (self.missing_glyph_subscription == id) {
+            self.missing_glyph_subscription = null;
+            self.text_system_.set_missing_glyph_reporting(false);
+        }
+    }
+
+    /// Calls `f(missing, cx)` with the graphemes that no font could draw, after the frame that shaped
+    /// them (GPUI `on_missing_glyphs`). Registering a callback replaces the previous one. Unsubscribing
+    /// stops the reports. The slice is valid for the call only.
+    pub fn on_missing_glyphs(self: *App, comptime f: fn ([]const text_system_mod.MissingGlyph, *App) void) Subscription {
+        if (self.missing_glyph_subscription) |old| self.deactivate_subscriber(old);
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const glyphs: *const []const text_system_mod.MissingGlyph = @ptrCast(@alignCast(payload.?));
+                f(glyphs.*, app);
+                return true;
+            }
+        };
+        const sub = self.add_subscriber(.{ .kind = .missing_glyphs, .emitter = 0, .ctx = 0, .func = S.call, .id = 0 });
+        self.missing_glyph_subscription = sub.id;
+        self.text_system_.set_missing_glyph_reporting(true);
+        return sub;
+    }
+
+    /// Delivers the missing glyphs reported since the last call to the `on_missing_glyphs` callback.
+    /// Windows call it after each frame, since shaping happens in the frame.
+    pub fn dispatch_missing_glyphs(self: *App) void {
+        if (self.missing_glyph_subscription == null) return;
+        const glyphs = self.text_system_.take_missing_glyphs() catch return;
+        defer self.text_system_.free_missing_glyphs(glyphs);
+        if (glyphs.len == 0) return;
+        self.pending_updates += 1;
+        const view: []const text_system_mod.MissingGlyph = glyphs;
+        const payload: *const anyopaque = @ptrCast(&view);
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) : (i += 1) {
+            const sub = self.subscribers.items[i];
+            if (!sub.active or sub.kind != .missing_glyphs) continue;
+            if (!sub.func(self, EntityId.from_u64(0), sub.ctx, payload)) self.subscribers.items[i].active = false;
+        }
+        self.pending_updates -= 1;
+        if (self.pending_updates == 0) self.flush_effects();
     }
 
     /// Runs `f(released, cx)` when `observed` is released, once (GPUI `App::observe_release`).
