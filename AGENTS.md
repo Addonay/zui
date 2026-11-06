@@ -33,43 +33,18 @@ agent (or human) can pick the work up. Read it fully before changing code.
    Don't review every turn — keep working.
 7. Toolchain: **Zig 0.17.0 stable**, never a dev build.
 
-## 2. Status at the time of writing (session stopped by the owner)
+## 2. Status
 
-The old ZUI tree (a hand-rolled retained UI framework, its docs, tools, ports,
-gap reports) was **deleted** and replaced with a fresh port of GPUI. The old
-code is still in git history (`main` before this push, commit `d7a2017`) and
-was used as a source for platform code.
+The old ZUI tree (a hand-rolled retained UI framework) was deleted and replaced with a fresh port of GPUI. The old
+code is still in git history (`main` before this push, commit `d7a2017`).
 
-Builds green: `zig build check` and `zig build test` (≈300 tests pass,
-1 skip). `examples/hello_world.zig` renders pixel-identical in spirit to
-GPUI's `hello_world.rs` (verified via headless snapshot).
+**`todo.md` is the tracker**: what is missing, what exists in name only, and the API comparison by GPUI file. Keep
+it current, and do not repeat it here.
 
-| Area | Status |
-| --- | --- |
-| geometry, color, colors | done (ported tests) |
-| style + `Refinement(T)` (derive Refineable) | done |
-| styled (all 3214 GPUI `Styled` methods incl. macro-generated) | done |
-| app: App, Application, Entity/WeakEntity/AnyEntity, Context(T), globals, observe/subscribe/emit/release, effects | done |
-| window: frames, hitboxes, element state, focus, text style stack, content masks, opacity, paint_* primitives, mouse/key/action dispatch, deferred draws | done |
-| element protocol, AnyElement, IntoElement, ParentElement, FluentBuilder, views (AnyView) | done |
-| div + Interactivity (hover/active/focus/in_focus styles, click, aux click, mouse/key/action listeners, scroll, pinch, groups, track_focus, key_context, drag and drop, file drop, tooltips) | done (pressure and back-gesture listeners, external drag payloads NOT yet) |
-| layout engine on zafi (`taffy.zig`, GPUI's TaffyLayoutEngine) | done |
-| text system on cozmic (shaping+fallback, two-frame line layout cache, LineWrapper, ShapedLine/WrappedLine, StyledText/InteractiveText) | done (some GPUI extras missing, see §8) |
-| keystroke, interactive events, keymap + context predicates, key_dispatch, actions | done, incl. multi-keystroke bindings, keystroke observers and tab groups |
-| executor (Background/Foreground executors, Task(T)) | done (thread pool; no async/await) |
-| scene, bounds_tree, atlas (+CpuAtlas), path_builder | done |
-| CPU renderer (port of GPUI WGSL math; SIMD + multithreaded bands) | done |
-| headless platform (+ `ZUI_SNAPSHOT` PPM output) | done |
-| Linux platform: Wayland + X11 (dlopen, no link deps) | done; verified on Xvfb and an isolated real compositor (see §7); IME on both |
-| Text input: `EntityInputHandler`, `ElementInputHandler`, IME (text-input-v3, XIM), dead keys | done; verified with a real input method on both (see §7) |
-| TestAppContext / VisualTestContext + end-to-end tests | done |
-| img / svg / assets (Wuffs, nanosvg) | done (local files load synchronously, URLs in the background; GIFs animate) |
-| anchored, deferred, canvas, animation (+easings), spring | done |
-| list (variable height), uniform_list | done (agent stopped right after tests passed; verify) |
-| GPU layer (`src/gpu/`, vendored from zicr at `87fe622`; zicr dependency removed) | done |
-| GPU renderer (`src/renderer/gpu.zig`, `shaders.glsl`, committed `shaders_gen.zig`) | done on Vulkan: default on Linux Wayland/X11, CPU fallback; subpixel sprites and surfaces not drawn (see §7) |
-| examples | 22 ported: hello_world, pattern, tree, text_layout, scrollable, ownership_post, active_state_bug, gradient, input, drag_drop, shadow, opacity, svg, image, text, text_wrapper, grid_layout, uniform_list, list_example, animation, focus_visible, tab_stop |
-| macOS / Windows / web platforms | NOT started |
+On Linux, X11 and Wayland, with Vulkan and a CPU fallback, about 91% of the GPUI functions worth porting exist by name,
+and every GPUI example is ported except `toggle_headless`, `layer_shell` and `a11y`. macOS, Windows and web are not
+started, though CI's checks keep the shared code compiling for Windows and macOS. CI itself is off for now: the
+owner's GitHub account has a billing lock, which the owner will sort out, so PRs are checked locally.
 
 ## 3. Repository layout (mirrors `crates/gpui/src`)
 
@@ -374,31 +349,10 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 - **Headless snapshots**: `ZUI_HEADLESS=1 ZUI_SNAPSHOT=out.ppm zig build run-<example>`.
   `ZUI_SCALE=2` sets the headless scale factor.
 
-## 8. Known gaps / next steps (in priority order)
+## 8. Known gaps / next steps
 
-1. Other GPU platforms, using the backends already in `src/gpu/`: macOS (Metal), Windows
-   (D3D12, Vulkan fallback), GL/GLES fallback, web (WebGPU) — GPUI's `gpui_macos` /
-   `gpui_windows` are the references; old ZUI had cocoa/win32 skeletons in history.
-   CI compile-checks those targets, on the headless platform only.
-2. Div: pressure and back-gesture listeners, long-press tooltips, external drag payloads
-   (dragging out of the window), `cached` views.
-3. Input: `Unbind`, `InputPreference`, pausing the pending-input timeout,
-   `keyboard_layout` and its change observer.
-4. Text: a text-presentation selector (`❤\u{fe0e}`) still draws the color glyph. Also ShapedLine cursor/split APIs, typographic bounds, font enumeration, `add_fonts`
-   (every ported example skips GPUI's `load_fonts`), missing-glyph reporting.
-5. Images: local files still load synchronously; WebP; PNG EXIF orientation; no size
-   limit on a download; the `with_loading` delay GPUI has.
-6. Port the remaining GPUI examples (image_gallery, image_loading, gif_viewer, popover, anchor,
-   painting, data_table, mouse_pressure, window*, set_menus, ...). Each must run headless and
-   produce a correct snapshot, and should be driven for real: first frames hide most bugs. Missing
-   APIs the ported ones work around: `container_query` (grid_layout writes it out), `set_menus`,
-   `init_colors`, `percentage`.
-7. Performance (owner's phase 2 goal: beat GPUI): view caching (`AnyView::cached`
-   with replayed scene ranges — `Scene.replay` exists), avoiding full layout
-   when nothing changed, X11 XShm presentation, SIMD gradients in the CPU
-   renderer, benchmarks vs GPUI.
-8. Workflow: `dev` → `main` must eventually be source-only (see §1.5).
-   `.references/` is gitignored.
+See `todo.md`. In order: finish the API, then performance against GPUI (view caching and benchmarks first), and the
+other platforms when the owner asks.
 
 ## 9. Zig 0.17 gotchas met during the port
 
@@ -416,15 +370,16 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 - Optimize mode tags are lowercase (`.debug`).
 - `b.args` doesn't exist in `std.Build` (pass-through run args not wired).
 
-## 10. How work was organized (for agents continuing it)
+## 10. How work is organized
 
-- Orchestrator wrote the architectural core (app, window, element, div,
-  taffy, platform interfaces, refineable, view) and gave each Haiku agent one
-  GPUI source family with an exact interface contract plus `PORTING.md`.
-  Agents never commit; the orchestrator commits, keeps `zig build check` and
-  `zig build test` green, and merges.
-- PRs go from `claude/elegant-ritchie-jema73` (feature branch) into `dev`.
-  PR #1 (core framework) was squash-merged into `dev`; later PRs should use
-  **merge commits** (force-pushing after squash merges was blocked).
-- Verify every change with `zig build check`, `zig build test`, and headless
-  snapshots of examples.
+- Haiku subagents read the source and draft a port, on a branch, into a PR against `dev`. The orchestrator reviews it,
+  corrects and optimizes it, and merges it with a merge commit. The review finds real bugs most of the time, so it
+  is not optional. Read the riskiest code, and run backends live: agents' tests rarely catch backend bugs.
+- Agents and the orchestrator check with `zig build check -j2`, `zig build test -j2`, snapshots, and private displays
+  (see section 7). Keep builds to two at a time, without ReleaseFast: the machine has limited memory, and builds
+  have filled the disk (`.zig-cache` reached 60 GB). Agents delete their own build output, and scratch goes under
+  `.zig-cache/scratch`, because `/tmp` is small.
+- Nothing may reach the real desktop: no `zig build run-*` without isolation, no window, notification, program or file
+  dialog on the real session, and no `gsettings` or `dconf`.
+- Check what a library does from its source or the web, not from memory: Wuffs' WebP support was misremembered.
+- When GPUI moves, read its new commits in `crates/gpui*` and port what applies. Last checked at `4a6121b`.

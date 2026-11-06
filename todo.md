@@ -17,24 +17,21 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 ## API parity
 
-The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1288 of 1419
-functions that should be ported (90.8%)**. Of GPUI's 1642, 223 are set aside below because they should not be ported now: 35 mean nothing in Zig,
-135 are debug tooling and accessibility, 45 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: every one is sorted below.
+The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1305 of 1422
+functions that should be ported (91.8%)**. Of GPUI's 1642, 220 are set aside below because they should not be ported now: 35 mean nothing in Zig,
+132 are debug tooling and accessibility, 45 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: every one is sorted below.
 A name-only comparison: coincidences flatter it, and it says nothing about behaviour. Port a name or move it, and delete it either way.
 
 <details><summary>Still to port, by GPUI file</summary>
 
-#### window.rs (39)
-defer, frame_duration_snapshot, has_image_atlas_entry, input_latency_snapshot, invalidate_view, is_high_rate, is_minimizable, is_resizable, is_simple_fullscreen, native_window_state, not_drawing, paint_surface, painted_quads, painted_underlines, present_if_needed, record_input, replace_views, restore_native_window_state, set_background_appearance, set_client_corner_radii, set_dirty, set_document_path, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, set_window_edited, simulate_next_frame, take_views, touch_prediction_enabled, underline_bounds, update_count, viewport_size, wake_platform, with_optional_element_state
+#### window.rs (37)
+defer, frame_duration_snapshot, has_image_atlas_entry, input_latency_snapshot, invalidate_view, is_high_rate, is_minimizable, is_resizable, is_simple_fullscreen, native_window_state, not_drawing, paint_surface, painted_quads, painted_underlines, present_if_needed, record_input, replace_views, restore_native_window_state, set_dirty, set_document_path, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, set_window_edited, simulate_next_frame, take_views, touch_prediction_enabled, underline_bounds, update_count, viewport_size, wake_platform, with_optional_element_state
 
-#### app.rs (22)
-action_deprecation_messages, asset_source, defer, deprecated_actions_to_preferred_actions, foreground_journal, get_name, init_visible, is_test, new_inaccessible, read_from_clipboard_async, reduce_motion, register_inspector_element, request_windowing, run_embedded, set_inspector_renderer, set_text_rendering_mode, start_hang_monitor, test, text_rendering_mode, update_last_active, with_platform, with_windowing
+#### app.rs (21)
+action_deprecation_messages, asset_source, defer, deprecated_actions_to_preferred_actions, foreground_journal, get_name, init_visible, new_inaccessible, read_from_clipboard_async, reduce_motion, register_inspector_element, request_windowing, run_embedded, set_inspector_renderer, set_text_rendering_mode, start_hang_monitor, test, text_rendering_mode, update_last_active, with_platform, with_windowing
 
 #### platform.rs (13)
 detect, gestures, metadata, on_app_menu_action, on_displays_changed, on_validate_app_menu_command, on_will_open_app_menu, read_from_clipboard_async, request_windowing, set_initial_windowing, stream, uuid, visible_bounds
-
-#### executor.rs (10)
-advance_clock, allow_parking, block_test, forbid_parking, is_test, rng, set_block_on_ticks, set_num_cpus, simulate_random_delay, tick
 
 #### elements/div.rs (4)
 external_drag_payload, interactivity, on_a11y_action, on_back_gesture
@@ -74,9 +71,6 @@ blur_radius, spread_radius
 
 #### subscription.rs (2)
 insert_pending, retain
-
-#### app/async_context.rs (1)
-is_test
 
 #### app/entity_map.rs (1)
 restore_accessed
@@ -164,8 +158,8 @@ These exist, so the comparison counts them, but they do nothing yet.
 
 ## Missing, needing real work
 
-- [ ] Deterministic test scheduler: an agent is on it
-- [ ] Transparent windows: `set_background_appearance`; `WindowOptions.window_background` is stored but unused. An agent is on it
+- [ ] Transparency on a real compositor: alpha was read from pixels and protocol, never seen blended. Blur has never run: mutter offers no `ext_background_effect_manager_v1`
+- [ ] Test scheduler: `once`, `many`, `assert_correct_thread`, `blocked_sessions`, `spawn_dedicated`, `spawn_realtime`, `next_notification`. Asset and remote image tests stay on real workers
 - [ ] Screen capture (portal), `focus_lost_restore_target` beyond the current path
 - [ ] App menu callbacks: `on_app_menu_action`, `on_validate_app_menu_command` (`set_menus` itself exists and is stored)
 - [ ] Popups: grabs and outside-click dismissal have not run with a real pointer; `xdg_popup.reposition` is not ported
