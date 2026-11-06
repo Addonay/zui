@@ -2086,8 +2086,8 @@ pub const App = struct {
     }
 
     /// Posts a system notification (GPUI `App::show_system_notification`). A tag that matches an
-    /// earlier one replaces it where supported. No platform delivers notifications yet, so this
-    /// does nothing; see `on_system_notification_response`.
+    /// earlier one replaces it where supported. Linux posts through the session bus; the other
+    /// platforms do nothing yet. See `on_system_notification_response`.
     pub fn show_system_notification(self: *App, notification: platform_mod.SystemNotification) void {
         self.platform.show_system_notification(notification);
     }
