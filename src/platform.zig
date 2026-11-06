@@ -15,6 +15,18 @@ const window_mod = @import("window.zig");
 const app_mod = @import("app.zig");
 const keystroke_mod = @import("keystroke.zig");
 pub const app_menu = @import("platform/app_menu.zig");
+pub const popup = @import("platform/popup.zig");
+const window_controls_mod = @import("platform/window_controls.zig");
+
+pub const PopupOptions = popup.PopupOptions;
+pub const PopupAnchor = popup.PopupAnchor;
+pub const PopupGravity = popup.PopupGravity;
+pub const PopupConstraintAdjustment = popup.PopupConstraintAdjustment;
+pub const PopupNotSupportedError = popup.PopupNotSupportedError;
+pub const WindowControls = window_controls_mod.WindowControls;
+pub const WindowButton = window_controls_mod.WindowButton;
+pub const WindowButtonLayout = window_controls_mod.WindowButtonLayout;
+pub const WindowControlArea = window_controls_mod.WindowControlArea;
 
 const Pixels = geometry.Pixels;
 const Point = geometry.Point;
@@ -555,7 +567,16 @@ pub const PlatformWindow = struct {
         display_id: *const fn (*PlatformWindow) ?DisplayId = noDisplayId,
         /// The GPU the window renders with, if any (GPUI `gpu_specs`).
         gpu_specs: *const fn (*PlatformWindow) ?GpuSpecs = noGpuSpecs,
+        /// What the window manager lets the window do (GPUI `PlatformWindow::window_controls`).
+        window_controls: *const fn (*PlatformWindow) WindowControls = defaultWindowControls,
     };
+
+    fn defaultWindowControls(_: *PlatformWindow) WindowControls {
+        return .{};
+    }
+    pub fn window_controls(self: *PlatformWindow) WindowControls {
+        return self.vtable.window_controls(self);
+    }
 
     fn defaultVisibility(_: *PlatformWindow) WindowVisibility {
         return .visible;
@@ -751,7 +772,11 @@ pub const Platform = struct {
         run: *const fn (*Platform, *App, *const fn (*anyopaque) void) void,
         quit: *const fn (*Platform) void,
         deinit: *const fn (*Platform) void,
-        open_window: *const fn (*Platform, window_mod.WindowOptions) anyerror!*PlatformWindow,
+        /// `parent` is the window a popup is anchored to (GPUI `WindowParams` resolves it from
+        /// `WindowKind::AnchoredPopup`); null for every other kind.
+        open_window: *const fn (*Platform, window_mod.WindowOptions, ?*PlatformWindow) anyerror!*PlatformWindow,
+        /// The titlebar button layout (GPUI `Platform::button_layout`). Null where the platform has none.
+        button_layout: *const fn (*Platform) ?WindowButtonLayout = noButtonLayout,
         /// Wakes the event loop from another thread (foreground executor).
         wake: *const fn (*Platform) void,
         activate: *const fn (*Platform, bool) void = noopBool,
@@ -868,6 +893,9 @@ pub const Platform = struct {
     fn noopBool(_: *Platform, _: bool) void {}
     fn noopStr(_: *Platform, _: []const u8) void {}
     fn noopCursor(_: *Platform, _: CursorStyle) void {}
+    fn noButtonLayout(_: *Platform) ?WindowButtonLayout {
+        return null;
+    }
     fn noopClip(_: *Platform, _: ClipboardItem) void {}
     fn noClip(_: *Platform) ?ClipboardItem {
         return null;
@@ -888,8 +916,11 @@ pub const Platform = struct {
     pub fn deinit(self: *Platform) void {
         self.vtable.deinit(self);
     }
-    pub fn open_window(self: *Platform, options: window_mod.WindowOptions) !*PlatformWindow {
-        return self.vtable.open_window(self, options);
+    pub fn open_window(self: *Platform, options: window_mod.WindowOptions, parent: ?*PlatformWindow) !*PlatformWindow {
+        return self.vtable.open_window(self, options, parent);
+    }
+    pub fn button_layout(self: *Platform) ?WindowButtonLayout {
+        return self.vtable.button_layout(self);
     }
     pub fn wake(self: *Platform) void {
         self.vtable.wake(self);

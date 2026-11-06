@@ -2342,6 +2342,11 @@ pub const App = struct {
         return self.platform.keyboard_layout();
     }
 
+    /// The titlebar button layout, when the platform has one (GPUI `button_layout`).
+    pub fn button_layout(self: *App) ?platform_mod.WindowButtonLayout {
+        return self.platform.button_layout();
+    }
+
     /// The keyboard mapper (GPUI `keyboard_mapper`). Linux maps nothing, as GPUI's does.
     pub fn keyboard_mapper(_: *App) platform_mod.KeyboardMapper {
         return .{};

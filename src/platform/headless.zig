@@ -218,7 +218,8 @@ pub const HeadlessPlatform = struct {
 
     fn wake(_: *Platform) void {}
 
-    fn openWindow(p: *Platform, options: window_mod.WindowOptions) anyerror!*PlatformWindow {
+    /// Like gpui_linux's headless platform, every kind opens a plain window: no popup placement.
+    fn openWindow(p: *Platform, options: window_mod.WindowOptions, _: ?*PlatformWindow) anyerror!*PlatformWindow {
         const self = from(p);
         const w = try HeadlessWindow.create(self, options);
         try self.windows.append(self.allocator, w);

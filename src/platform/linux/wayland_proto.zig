@@ -22,6 +22,8 @@ pub const Keyboard = opaque {};
 pub const XdgWmBase = opaque {};
 pub const XdgSurface = opaque {};
 pub const XdgToplevel = opaque {};
+pub const XdgPopup = opaque {};
+pub const XdgPositioner = opaque {};
 pub const DataDeviceManager = opaque {};
 pub const DataDevice = opaque {};
 pub const DataOffer = opaque {};
@@ -122,6 +124,13 @@ pub const XdgWmBaseListener = extern struct {
 
 pub const XdgSurfaceListener = extern struct {
     configure: ?*const fn (?*anyopaque, *XdgSurface, u32) callconv(.c) void = null,
+};
+
+/// xdg_popup events (xdg-shell v7). `configure` carries the popup's size in logical pixels.
+pub const XdgPopupListener = extern struct {
+    configure: ?*const fn (?*anyopaque, *XdgPopup, i32, i32, i32, i32) callconv(.c) void = null,
+    popup_done: ?*const fn (?*anyopaque, *XdgPopup) callconv(.c) void = null,
+    repositioned: ?*const fn (?*anyopaque, *XdgPopup, u32) callconv(.c) void = null,
 };
 
 pub const XdgToplevelListener = extern struct {
@@ -501,13 +510,14 @@ pub const xdg_surface_events = [_]Message{
 pub const xdg_surface_methods = [_]Message{
     .{ .name = "destroy", .signature = "", .types = null },
     .{ .name = "get_toplevel", .signature = "n", .types = &[_]?*const anyopaque{@ptrCast(&xdg_toplevel_interface)} },
-    .{ .name = "get_popup", .signature = "n?oo", .types = null },
+    // Types in argument order: the new xdg_popup, then the parent (nullable) and the positioner.
+    .{ .name = "get_popup", .signature = "n?oo", .types = &[_]?*const anyopaque{ @ptrCast(&xdg_popup_interface), @ptrCast(&xdg_surface_interface), @ptrCast(&xdg_positioner_interface) } },
     .{ .name = "set_window_geometry", .signature = "iiii", .types = null },
     .{ .name = "ack_configure", .signature = "u", .types = null },
 };
 pub const xdg_surface_interface: Interface = .{
     .name = "xdg_surface",
-    .version = 5,
+    .version = 7,
     .method_count = 5,
     .methods = @ptrCast(&xdg_surface_methods),
     .event_count = 1,
@@ -538,11 +548,54 @@ pub const xdg_toplevel_methods = [_]Message{
 };
 pub const xdg_toplevel_interface: Interface = .{
     .name = "xdg_toplevel",
-    .version = 5,
+    .version = 7,
     .method_count = 14,
     .methods = @ptrCast(&xdg_toplevel_methods),
     .event_count = 4,
     .events = @ptrCast(&xdg_toplevel_events),
+};
+
+// xdg_positioner (xdg-shell v7): the placement of a popup relative to its parent. Requests are
+// numbered as the XML orders them; `set_reactive` and the parent-size requests are since v3.
+pub const xdg_positioner_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "set_size", .signature = "ii", .types = null },
+    .{ .name = "set_anchor_rect", .signature = "iiii", .types = null },
+    .{ .name = "set_anchor", .signature = "u", .types = null },
+    .{ .name = "set_gravity", .signature = "u", .types = null },
+    .{ .name = "set_constraint_adjustment", .signature = "u", .types = null },
+    .{ .name = "set_offset", .signature = "ii", .types = null },
+    .{ .name = "set_reactive", .signature = "", .types = null },
+    .{ .name = "set_parent_size", .signature = "ii", .types = null },
+    .{ .name = "set_parent_configure", .signature = "u", .types = null },
+};
+pub const xdg_positioner_interface: Interface = .{
+    .name = "xdg_positioner",
+    .version = 7,
+    .method_count = 10,
+    .methods = @ptrCast(&xdg_positioner_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+// xdg_popup (xdg-shell v7): `reposition` and `repositioned` are since v3.
+pub const xdg_popup_events = [_]Message{
+    .{ .name = "configure", .signature = "iiii", .types = null },
+    .{ .name = "popup_done", .signature = "", .types = null },
+    .{ .name = "repositioned", .signature = "u", .types = null },
+};
+pub const xdg_popup_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "grab", .signature = "ou", .types = null },
+    .{ .name = "reposition", .signature = "ou", .types = null },
+};
+pub const xdg_popup_interface: Interface = .{
+    .name = "xdg_popup",
+    .version = 7,
+    .method_count = 3,
+    .methods = @ptrCast(&xdg_popup_methods),
+    .event_count = 3,
+    .events = @ptrCast(&xdg_popup_events),
 };
 
 pub const decoration_events = [_]Message{
@@ -677,13 +730,15 @@ pub const xdg_wm_base_events = [_]Message{
 };
 pub const xdg_wm_base_methods = [_]Message{
     .{ .name = "destroy", .signature = "", .types = null },
-    .{ .name = "create_positioner", .signature = "n", .types = null },
+    // A new_id argument needs its interface in `types`: libwayland reads it when marshalling, and
+    // a null table segfaults (found live, on the first popup).
+    .{ .name = "create_positioner", .signature = "n", .types = &[_]?*const anyopaque{@ptrCast(&xdg_positioner_interface)} },
     .{ .name = "get_xdg_surface", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&xdg_surface_interface), null } },
     .{ .name = "pong", .signature = "u", .types = null },
 };
 pub const xdg_wm_base_interface: Interface = .{
     .name = "xdg_wm_base",
-    .version = 5,
+    .version = 7,
     .method_count = 4,
     .methods = @ptrCast(&xdg_wm_base_methods),
     .event_count = 1,

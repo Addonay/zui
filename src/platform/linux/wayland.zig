@@ -200,6 +200,9 @@ pub const WaylandConnection = struct {
     pointer_pos: PxPoint = .{ .x = 0, .y = 0 },
     pointer_enter_serial: u32 = 0,
     last_serial: u32 = 0,
+    /// Serial of the last button or key press, which a popup grab must name (GPUI keeps the
+    /// same, not the enter events that `last_serial` also takes).
+    last_press_serial: u32 = 0,
     pressed: ?MouseButton = null,
     click: input.ClickTracker = .{},
     cursor_style: CursorStyle = .arrow,
@@ -552,7 +555,7 @@ pub const WaylandConnection = struct {
         return window_renderer.GpuWindow.create(ctx, .{ .wayland = .{ .display = @ptrCast(self.display), .surface = @ptrCast(w.surface.?) } }, w.phys_w(), w.phys_h(), .{ .externally_paced = true });
     }
 
-    pub fn open_window(self: *WaylandConnection, options: window_mod.WindowOptions) !*WaylandWindow {
+    pub fn open_window(self: *WaylandConnection, options: window_mod.WindowOptions, parent: ?*platform.PlatformWindow) !*WaylandWindow {
         try self.windows.ensureUnusedCapacity(self.allocator, 1);
         const w = try self.allocator.create(WaylandWindow);
         const bounds: PxBounds = if (options.window_bounds) |wb| wb.get_bounds() else .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1280, .height = 800 } };
@@ -568,7 +571,7 @@ pub const WaylandConnection = struct {
             // a window with a titlebar gets the compositor's frame and one without gets none.
             .decorated = if (options.window_decorations) |d| d == .server else options.titlebar != null,
         };
-        w.create_surface(options) catch |err| {
+        w.create_surface(options, if (parent) |p| WaylandWindow.from(p) else null) catch |err| {
             w.closed = true;
             w.free_protocol();
             w.free();
@@ -1169,7 +1172,9 @@ fn registryGlobal(data: ?*anyopaque, reg: *proto.Registry, name: u32, iface: [*:
     } else if (std.mem.eql(u8, iface_name, "wl_shm")) {
         self.shm = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, api.wl_shm_interface, @as(u32, 1), 0, name, api.wl_shm_interface.name, @as(u32, 1), api.wl_shm_interface));
     } else if (std.mem.eql(u8, iface_name, "xdg_wm_base")) {
-        const ver: u32 = @min(version, 5);
+        // The highest xdg-shell this build knows (v7). wm_capabilities needs v5; older compositors
+        // send none, and the window keeps GPUI's default of every control.
+        const ver: u32 = @min(version, 7);
         self.wm_base = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.xdg_wm_base_interface, ver, 0, name, proto.xdg_wm_base_interface.name, ver, &proto.xdg_wm_base_interface));
     } else if (std.mem.eql(u8, iface_name, "wl_seat")) {
         // Version 8 brings high resolution wheels. Newer keyboards can repeat keys on their
@@ -1354,6 +1359,7 @@ fn pointerButton(data: ?*anyopaque, _: *proto.Pointer, serial: u32, _: u32, code
     const button = input.evdev_button(code) orelse return;
     const pressed = state == 1;
     if (pressed) {
+        self.last_press_serial = serial;
         self.commit_composition();
         self.pressed = button;
         const count = self.click.press(button, self.pointer_pos);
@@ -1439,6 +1445,7 @@ fn keyboardKey(data: ?*anyopaque, _: *proto.Keyboard, serial: u32, _: u32, code:
     const self = pointerConn(data);
     self.last_serial = serial;
     const pressed = state == 1;
+    if (pressed) self.last_press_serial = serial;
     if (self.xkb) |*x| {
         if (x.hasLiveState()) x.updateKey(code + 8, pressed);
     }
@@ -1737,6 +1744,13 @@ pub const WaylandWindow = struct {
     surface: ?*proto.Surface = null,
     xdg_surface: ?*proto.XdgSurface = null,
     xdg_toplevel: ?*proto.XdgToplevel = null,
+    /// Set instead of `xdg_toplevel` for an `AnchoredPopup` window.
+    xdg_popup: ?*proto.XdgPopup = null,
+    /// What the window manager lets the window do, from xdg_toplevel.wm_capabilities (GPUI
+    /// `window_controls`). It is staged in `in_progress_controls` and applied at the next
+    /// xdg_surface.configure, as GPUI does.
+    window_controls_: platform.WindowControls = .{},
+    in_progress_controls: ?platform.WindowControls = null,
     decoration: ?*proto.Decoration = null,
     viewport: ?*anyopaque = null,
     frac_scale: ?*anyopaque = null,
@@ -1817,10 +1831,12 @@ pub const WaylandWindow = struct {
         .visibility = windowVisibility,
         .display_id = windowDisplayId,
         .gpu_specs = windowGpuSpecs,
+        .window_controls = windowControls,
     };
 
     const xs_listener: proto.XdgSurfaceListener = .{ .configure = xdgSurfaceConfigure };
-    const top_listener: proto.XdgToplevelListener = .{ .configure = xdgToplevelConfigure, .close = xdgToplevelClose, .configure_bounds = xdgNoopBounds, .wm_capabilities = xdgNoopCaps };
+    const top_listener: proto.XdgToplevelListener = .{ .configure = xdgToplevelConfigure, .close = xdgToplevelClose, .configure_bounds = xdgNoopBounds, .wm_capabilities = xdgWmCapabilities };
+    const popup_listener: proto.XdgPopupListener = .{ .configure = xdgPopupConfigure, .popup_done = xdgPopupDone, .repositioned = xdgPopupRepositioned };
     const callback_listener: proto.WlCallbackListener = .{ .done = frameDone };
     const buffer_listener: proto.WlBufferListener = .{ .release = bufferRelease };
     const deco_listener: proto.DecorationListener = .{ .configure = decorationConfigure };
@@ -1834,7 +1850,7 @@ pub const WaylandWindow = struct {
         return &self.conn.api;
     }
 
-    fn create_surface(self: *WaylandWindow, options: window_mod.WindowOptions) !void {
+    fn create_surface(self: *WaylandWindow, options: window_mod.WindowOptions, parent: ?*WaylandWindow) !void {
         const c = self.conn;
         const a = &c.api;
         const compositor = c.compositor orelse return error.MissingWaylandGlobals;
@@ -1862,6 +1878,19 @@ pub const WaylandWindow = struct {
         const xs = self.xdg_surface.?;
         _ = a.wl_proxy_add_listener(@ptrCast(xs), &xs_listener, self);
 
+        if (options.kind == .anchored_popup) {
+            try self.create_popup_role(wm_base, xs, options, parent orelse return error.PopupParentNotFound);
+        } else {
+            try self.create_toplevel_role(c, xs, options);
+        }
+        // Empty commit asks the compositor for the first configure.
+        _ = a.wl_proxy_marshal_flags(@ptrCast(surface), 6, null, a.wl_proxy_get_version(@ptrCast(surface)), 0);
+        self.apply_buffer_scale();
+    }
+
+    /// The xdg_toplevel role of an ordinary window: title, app id and the decoration request.
+    fn create_toplevel_role(self: *WaylandWindow, c: *WaylandConnection, xs: *proto.XdgSurface, options: window_mod.WindowOptions) !void {
+        const a = &c.api;
         const top_raw = a.wl_proxy_marshal_flags(@ptrCast(xs), 1, &proto.xdg_toplevel_interface, a.wl_proxy_get_version(@ptrCast(xs)), 0, @as(?*anyopaque, null));
         self.xdg_toplevel = @ptrCast(top_raw orelse return error.CannotCreateToplevel);
         const top = self.xdg_toplevel.?;
@@ -1882,9 +1911,64 @@ pub const WaylandWindow = struct {
                 self.apply_decoration_mode();
             }
         }
-        // Empty commit asks the compositor for the first configure.
-        _ = a.wl_proxy_marshal_flags(@ptrCast(surface), 6, null, a.wl_proxy_get_version(@ptrCast(surface)), 0);
-        self.apply_buffer_scale();
+    }
+
+    /// The xdg_popup role (GPUI `WindowKind::AnchoredPopup`): a positioner places the popup
+    /// relative to the parent's xdg_surface, and a grab makes it a menu that the compositor
+    /// dismisses on outside clicks.
+    fn create_popup_role(self: *WaylandWindow, wm_base: *proto.XdgWmBase, xs: *proto.XdgSurface, options: window_mod.WindowOptions, parent: *WaylandWindow) !void {
+        const c = self.conn;
+        const a = &c.api;
+        const parent_xs = parent.xdg_surface orelse return error.PopupParentNotFound;
+        const popup_opts = options.kind.anchored_popup;
+        const positioner_raw = a.wl_proxy_marshal_flags(@ptrCast(wm_base), 1, &proto.xdg_positioner_interface, a.wl_proxy_get_version(@ptrCast(wm_base)), 0, @as(?*anyopaque, null));
+        const positioner: *proto.XdgPositioner = @ptrCast(positioner_raw orelse return error.CannotCreatePositioner);
+        self.position_popup(positioner, popup_opts, parent);
+
+        const popup_raw = a.wl_proxy_marshal_flags(@ptrCast(xs), 2, &proto.xdg_popup_interface, a.wl_proxy_get_version(@ptrCast(xs)), 0, @as(?*anyopaque, null), @as(?*anyopaque, @ptrCast(parent_xs)), @as(*anyopaque, @ptrCast(positioner)));
+        self.xdg_popup = @ptrCast(popup_raw orelse return error.CannotCreatePopup);
+        const popup = self.xdg_popup.?;
+        _ = a.wl_proxy_add_listener(@ptrCast(popup), &popup_listener, self);
+
+        // A grab must name a press, or the compositor dismisses the popup at once (GPUI picks the
+        // newest press serial, or no grab before any press).
+        if (popup_opts.grab and c.last_press_serial != 0) {
+            if (c.seat) |seat| {
+                _ = a.wl_proxy_marshal_flags(@ptrCast(popup), 1, null, a.wl_proxy_get_version(@ptrCast(popup)), 0, @as(*anyopaque, @ptrCast(seat)), c.last_press_serial);
+            }
+        }
+        _ = a.wl_proxy_marshal_flags(@ptrCast(positioner), 0, null, a.wl_proxy_get_version(@ptrCast(positioner)), 1);
+    }
+
+    /// The window geometry in surface coordinates: the surface without a client-drawn shadow
+    /// (what `apply_window_geometry` sets). Popups are placed relative to it.
+    fn window_geometry(self: *const WaylandWindow) PxBounds {
+        const inset: f32 = self.client_inset orelse 0;
+        const left: f32 = if (self.tiling.left) 0 else inset;
+        const right: f32 = if (self.tiling.right) 0 else inset;
+        const top: f32 = if (self.tiling.top) 0 else inset;
+        const bottom: f32 = if (self.tiling.bottom) 0 else inset;
+        return .{
+            .origin = .{ .x = left, .y = top },
+            .size = .{ .width = self.size.width - left - right, .height = self.size.height - top - bottom },
+        };
+    }
+
+    /// Fills the positioner for `popup` (size, anchor rectangle, anchor, gravity, adjustment and
+    /// offset), with the anchor rectangle clamped into the parent's geometry as gpui_linux does.
+    fn position_popup(self: *WaylandWindow, positioner: *proto.XdgPositioner, popup: platform.PopupOptions, parent: *WaylandWindow) void {
+        const a = self.api();
+        const v = a.wl_proxy_get_version(@ptrCast(positioner));
+        // A zero or negative size is a protocol error.
+        const w: i32 = @intFromFloat(@max(1, self.size.width));
+        const h: i32 = @intFromFloat(@max(1, self.size.height));
+        _ = a.wl_proxy_marshal_flags(@ptrCast(positioner), 1, null, v, 0, w, h);
+        const r = platform.popup.anchor_rect_in_geometry(popup.anchor_rect, parent.window_geometry());
+        _ = a.wl_proxy_marshal_flags(@ptrCast(positioner), 2, null, v, 0, r[0], r[1], r[2], r[3]);
+        _ = a.wl_proxy_marshal_flags(@ptrCast(positioner), 3, null, v, 0, platform.popup.xdg_anchor(popup.anchor));
+        _ = a.wl_proxy_marshal_flags(@ptrCast(positioner), 4, null, v, 0, platform.popup.xdg_gravity(popup.gravity));
+        _ = a.wl_proxy_marshal_flags(@ptrCast(positioner), 5, null, v, 0, popup.constraint_adjustment.bits());
+        _ = a.wl_proxy_marshal_flags(@ptrCast(positioner), 6, null, v, 0, @as(i32, @intFromFloat(popup.offset.x)), @as(i32, @intFromFloat(popup.offset.y)));
     }
 
     fn apply_decoration_mode(self: *WaylandWindow) void {
@@ -2273,6 +2357,11 @@ pub const WaylandWindow = struct {
             _ = a.wl_proxy_marshal_flags(@ptrCast(d), 0, null, a.wl_proxy_get_version(@ptrCast(d)), 1);
             self.decoration = null;
         }
+        // A popup's role object must go before the xdg_surface it is built on.
+        if (self.xdg_popup) |p| {
+            _ = a.wl_proxy_marshal_flags(@ptrCast(p), 0, null, a.wl_proxy_get_version(@ptrCast(p)), 1);
+            self.xdg_popup = null;
+        }
         if (self.xdg_toplevel) |t| {
             _ = a.wl_proxy_marshal_flags(@ptrCast(t), 0, null, a.wl_proxy_get_version(@ptrCast(t)), 1);
             self.xdg_toplevel = null;
@@ -2306,6 +2395,10 @@ pub const WaylandWindow = struct {
     fn xdgSurfaceConfigure(data: ?*anyopaque, xs: *proto.XdgSurface, serial: u32) callconv(.c) void {
         const self: *WaylandWindow = @ptrCast(@alignCast(data.?));
         const a = self.api();
+        if (self.in_progress_controls) |controls| {
+            self.window_controls_ = controls;
+            self.in_progress_controls = null;
+        }
         const pending = self.pending_configure;
         self.maximized = pending.maximized;
         self.fullscreen = pending.fullscreen;
@@ -2402,7 +2495,56 @@ pub const WaylandWindow = struct {
     }
 
     fn xdgNoopBounds(_: ?*anyopaque, _: *proto.XdgToplevel, _: i32, _: i32) callconv(.c) void {}
-    fn xdgNoopCaps(_: ?*anyopaque, _: *proto.XdgToplevel, _: ?*anyopaque) callconv(.c) void {}
+
+    /// xdg_toplevel.wm_capabilities (since v5): an array of u32 values, each naming a control the
+    /// compositor offers (window_menu 1, maximize 2, fullscreen 3, minimize 4). Anything not named is
+    /// not offered.
+    fn xdgWmCapabilities(data: ?*anyopaque, _: *proto.XdgToplevel, raw: ?*anyopaque) callconv(.c) void {
+        const self: *WaylandWindow = @ptrCast(@alignCast(data.?));
+        if (raw) |p| {
+            const arr: *const proto.WlArray = @ptrCast(@alignCast(p));
+            if (arr.data) |items| {
+                self.in_progress_controls = window_controls_from_capabilities(items[0 .. arr.size / 4]);
+            }
+        } else {
+            self.in_progress_controls = window_controls_from_capabilities(&.{});
+        }
+    }
+
+    /// The controls named by an xdg_toplevel.wm_capabilities array (window_menu 1, maximize 2,
+    /// fullscreen 3, minimize 4). Anything not named is not offered, as gpui_linux reads it.
+    pub fn window_controls_from_capabilities(values: []const u32) platform.WindowControls {
+        var controls: platform.WindowControls = .{ .fullscreen = false, .maximize = false, .minimize = false, .window_menu = false };
+        for (values) |v| switch (v) {
+            1 => controls.window_menu = true,
+            2 => controls.maximize = true,
+            3 => controls.fullscreen = true,
+            4 => controls.minimize = true,
+            else => {},
+        };
+        return controls;
+    }
+
+    fn windowControls(p: *platform.PlatformWindow) platform.WindowControls {
+        return from(p).window_controls_;
+    }
+
+    /// xdg_popup.configure: the popup's size. The position is the compositor's to choose.
+    fn xdgPopupConfigure(data: ?*anyopaque, _: *proto.XdgPopup, _: i32, _: i32, width: i32, height: i32) callconv(.c) void {
+        const self: *WaylandWindow = @ptrCast(@alignCast(data.?));
+        if (self.closed) return;
+        self.pending_configure = .{ .width = width, .height = height };
+    }
+
+    /// xdg_popup.popup_done: the compositor dismissed the popup (a grab was clicked outside, or
+    /// its parent went away). Closes it like a toplevel's close request.
+    fn xdgPopupDone(data: ?*anyopaque, _: *proto.XdgPopup) callconv(.c) void {
+        const self: *WaylandWindow = @ptrCast(@alignCast(data.?));
+        if (self.closed) return;
+        if (self.base.emit_should_close()) self.base.emit_close();
+    }
+
+    fn xdgPopupRepositioned(_: ?*anyopaque, _: *proto.XdgPopup, _: u32) callconv(.c) void {}
 
     fn decorationConfigure(_: ?*anyopaque, _: *proto.Decoration, _: u32) callconv(.c) void {}
 
@@ -2415,4 +2557,31 @@ pub const WaylandWindow = struct {
         self.base.emit_resize(self.size, self.scale);
     }
 };
+
+test "wm_capabilities names the controls the compositor offers" {
+    const all = WaylandWindow.window_controls_from_capabilities(&.{ 1, 2, 3, 4 });
+    try std.testing.expect(all.window_menu and all.maximize and all.fullscreen and all.minimize);
+
+    // Only what is named is offered: a compositor without maximize lacks it.
+    const some = WaylandWindow.window_controls_from_capabilities(&.{ 4, 1 });
+    try std.testing.expect(some.minimize and some.window_menu);
+    try std.testing.expect(!some.maximize and !some.fullscreen);
+
+    // An empty array (a compositor that offers nothing) offers no control.
+    const none = WaylandWindow.window_controls_from_capabilities(&.{});
+    try std.testing.expect(!none.minimize and !none.maximize and !none.fullscreen and !none.window_menu);
+
+    // Unknown values are ignored.
+    const unknown = WaylandWindow.window_controls_from_capabilities(&.{ 99, 2 });
+    try std.testing.expect(unknown.maximize and !unknown.minimize);
+}
+
+test "popup anchor rectangle is taken in the parent's window geometry" {
+    // A geometry 10 px in from the surface origin: an anchor at the origin is clamped to the
+    // geometry's first pixel, and its size is cut to fit inside it.
+    const geo: PxBounds = .{ .origin = .{ .x = 10, .y = 10 }, .size = .{ .width = 300, .height = 200 } };
+    const anchor: PxBounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 20, .height = 20 } };
+    const r = platform.popup.anchor_rect_in_geometry(anchor, geo);
+    try std.testing.expectEqual([4]i32{ 0, 0, 10, 10 }, r);
+}
 
