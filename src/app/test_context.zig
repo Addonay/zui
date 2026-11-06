@@ -2364,8 +2364,10 @@ const AnimatedView = struct {
     var image: *assets_mod.RenderImage = undefined;
     var with_id: bool = true;
     var last: ?*img_mod.Img = null;
+    var renders: usize = 0;
 
     pub fn render(_: *AnimatedView, _: *Window, _: *Context(AnimatedView)) *Div {
+        renders += 1;
         const i = img_mod.img(image).size(px(10));
         last = if (with_id) i.id("gif") else i;
         return div().child(last.?);
@@ -2385,6 +2387,27 @@ fn open_unpumped(cx: *TestAppContext) struct { window: *Window } {
     const window = handle.window(cx.app) orelse unreachable;
     window.draw(cx.app);
     return .{ .window = window };
+}
+
+test "gif: run_until_parked returns while a GIF is on screen, drawing it once per pump" {
+    const allocator = std.testing.allocator;
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const animated = try image_with_delays(allocator, &.{ 150, 150 });
+    defer animated.deinit();
+    AnimatedView.image = animated;
+    AnimatedView.with_id = true;
+    AnimatedView.renders = 0;
+    const handle = cx.app.open_window(.{}, AnimatedView.build) catch unreachable;
+    const window = handle.window(cx.app) orelse unreachable;
+    // The GIF asks for frames, but its next one is due only after 150 ms of real time. The pump must
+    // not keep drawing it: before, it ran to its 10,000-iteration guard.
+    cx.run_until_parked();
+    try std.testing.expect(window.animation_requested);
+    const before = AnimatedView.renders;
+    cx.run_until_parked();
+    cx.run_until_parked();
+    try std.testing.expect(AnimatedView.renders - before <= 2);
 }
 
 test "gif: frames advance after their delay, and frames are requested only while animating" {
@@ -3073,7 +3096,7 @@ test "keymap: highest_precedence_binding_for_action is the newest binding that w
     _, const vcx = cx.add_window_view(Editor.build);
     vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
     const found = vcx.window.highest_precedence_binding_for_action(Editor.Save{}) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("t", found.keystrokes[0].key);
+    try std.testing.expectEqualStrings("t", found.keystrokes[0].inner.key);
 }
 
 test "keymap: a NoAction on a newer binding shadows it, so the older one is the highest precedence" {
@@ -3088,7 +3111,7 @@ test "keymap: a NoAction on a newer binding shadows it, so the older one is the 
     _, const vcx = cx.add_window_view(Editor.build);
     vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
     const found = vcx.window.highest_precedence_binding_for_action(Editor.Save{}) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("s", found.keystrokes[0].key);
+    try std.testing.expectEqualStrings("s", found.keystrokes[0].inner.key);
 }
 
 test "keymap: an action whose keys a newer, different action takes has no highest precedence" {
@@ -3103,7 +3126,7 @@ test "keymap: an action whose keys a newer, different action takes has no highes
     vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
     try std.testing.expect(vcx.window.highest_precedence_binding_for_action(Editor.Save{}) == null);
     const found = vcx.window.highest_precedence_binding_for_action(Editor.Outside{}) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("s", found.keystrokes[0].key);
+    try std.testing.expectEqualStrings("s", found.keystrokes[0].inner.key);
 }
 
 test "keymap: highest_precedence_binding_for_action is null when the context or the binding is missing" {
@@ -5515,4 +5538,133 @@ test "long press capture: a claim holds until the next long press starts" {
     // A long press starting releases the claim, whoever made it.
     vcx.simulate_event(.{ .long_press = .{ .phase = .started, .start_position = .{ .x = 5, .y = 5 }, .position = .{ .x = 5, .y = 5 } } });
     try std.testing.expect(!vcx.window.has_long_press_capture(owner));
+}
+
+// ---------------------------------------------------------------------------
+// Input preference (GPUI key_dispatch.rs `test_keystroke_input_preference`,
+// `test_input_preference_rechecked_after_interception` and
+// `test_keystroke_interceptors_can_consume_preferred_character_input`).
+// A key down that the platform says prefers text (AltGr) goes to the focused input instead of
+// key bindings, as long as the input accepts text.
+
+const AltGrTestAction = Action("test", "AltGrTestAction");
+
+const AltGrProbe = struct {
+    var actions: usize = 0;
+    var intercepted: [4]app_mod.InputPreference = undefined;
+    var n_intercepted: usize = 0;
+    var observed: [4]app_mod.InputPreference = undefined;
+    var n_observed: usize = 0;
+    var stop: bool = false;
+    /// The view whose `accepts` an interceptor flips.
+    var target: ?app_mod.Entity(ImeField) = null;
+    var mismatched: bool = false;
+
+    fn reset() void {
+        actions = 0;
+        n_intercepted = 0;
+        n_observed = 0;
+        stop = false;
+        target = null;
+        mismatched = false;
+    }
+    fn on_action(_: *const AltGrTestAction, _: *App) void {
+        actions += 1;
+    }
+    fn intercept(event: *const app_mod.KeystrokeEvent, window: *Window, app: *App) void {
+        if (n_intercepted < intercepted.len) intercepted[n_intercepted] = event.input_preference;
+        n_intercepted += 1;
+        if (target) |view| {
+            // The preference must agree with what the input says at this moment.
+            if ((event.input_preference == .character_input) != view.read(app).accepts) mismatched = true;
+            view.as_mut(app).accepts = !view.read(app).accepts;
+        }
+        if (stop) window.stop_propagation();
+    }
+    fn observe(event: *const app_mod.KeystrokeEvent, _: *Window, _: *App) void {
+        if (n_observed < observed.len) observed[n_observed] = event.input_preference;
+        n_observed += 1;
+    }
+};
+
+/// Sends an AltGr-style key down (ctrl-alt-a that types "ą") and returns whether it propagated.
+fn dispatch_altgr(cx: *TestAppContext, vcx: *VisualTestContext, prefer_character_input: bool) bool {
+    _ = vcx.window.dispatch_event(.{ .key_down = .{
+        .keystroke = .{ .key = "a", .key_char = "ą", .modifiers = .{ .control = true, .alt = true } },
+        .prefer_character_input = prefer_character_input,
+    } }, cx.app);
+    return vcx.window.propagate_event;
+}
+
+fn altgr_setup(cx: *TestAppContext) struct { view: app_mod.Entity(ImeField), vcx: *VisualTestContext } {
+    AltGrProbe.reset();
+    cx.app.bind_keys(&.{KeyBinding.new("ctrl-alt-a", AltGrTestAction{}, null)});
+    cx.app.on_action(AltGrTestAction, AltGrProbe.on_action);
+    _ = cx.app.observe_keystrokes(AltGrProbe.observe);
+    _ = cx.app.intercept_keystrokes(AltGrProbe.intercept);
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    return .{ .view = view, .vcx = vcx };
+}
+
+test "input preference: a key that prefers text skips bindings only while the input accepts text" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const setup = altgr_setup(&cx);
+    const cases = [_]struct { prefer: bool, accepts: bool, want: app_mod.InputPreference }{
+        .{ .prefer = true, .accepts = true, .want = .character_input },
+        .{ .prefer = false, .accepts = true, .want = .key_bindings },
+        .{ .prefer = true, .accepts = false, .want = .key_bindings },
+        .{ .prefer = false, .accepts = false, .want = .key_bindings },
+    };
+    for (cases) |c| {
+        setup.view.as_mut(cx.app).accepts = c.accepts;
+        AltGrProbe.actions = 0;
+        AltGrProbe.n_intercepted = 0;
+        AltGrProbe.n_observed = 0;
+        const propagated = dispatch_altgr(&cx, setup.vcx, c.prefer);
+        // Text input takes the key, so it propagates. The global action listener below does not stop
+        // propagation the way an element listener does, so only the text case checks it.
+        if (c.want == .character_input) try std.testing.expect(propagated);
+        try std.testing.expectEqual(@as(usize, 1), AltGrProbe.n_intercepted);
+        try std.testing.expectEqual(c.want, AltGrProbe.intercepted[0]);
+        try std.testing.expectEqual(@as(usize, 1), AltGrProbe.n_observed);
+        try std.testing.expectEqual(c.want, AltGrProbe.observed[0]);
+        try std.testing.expectEqual(@as(usize, if (c.want == .key_bindings) 1 else 0), AltGrProbe.actions);
+    }
+}
+
+test "input preference: it is checked again after interceptors, which may change what the input accepts" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const setup = altgr_setup(&cx);
+    AltGrProbe.target = setup.view;
+    const cases = [_]struct { initially: bool, want: app_mod.InputPreference }{
+        .{ .initially = true, .want = .key_bindings },
+        .{ .initially = false, .want = .character_input },
+    };
+    for (cases) |c| {
+        setup.view.as_mut(cx.app).accepts = c.initially;
+        AltGrProbe.actions = 0;
+        AltGrProbe.n_observed = 0;
+        const propagated = dispatch_altgr(&cx, setup.vcx, true);
+        if (!c.initially) try std.testing.expect(propagated);
+        try std.testing.expectEqual(@as(usize, 1), AltGrProbe.n_observed);
+        try std.testing.expectEqual(c.want, AltGrProbe.observed[0]);
+        try std.testing.expectEqual(@as(usize, if (c.initially) 1 else 0), AltGrProbe.actions);
+    }
+    try std.testing.expect(!AltGrProbe.mismatched);
+}
+
+test "input preference: an interceptor can consume a key that prefers character input" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const setup = altgr_setup(&cx);
+    AltGrProbe.stop = true;
+    const propagated = dispatch_altgr(&cx, setup.vcx, true);
+    try std.testing.expectEqual(@as(usize, 1), AltGrProbe.n_intercepted);
+    try std.testing.expectEqual(app_mod.InputPreference.character_input, AltGrProbe.intercepted[0]);
+    try std.testing.expect(!propagated);
+    try std.testing.expectEqual(@as(usize, 0), AltGrProbe.actions);
 }

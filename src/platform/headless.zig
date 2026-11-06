@@ -187,15 +187,26 @@ pub const HeadlessPlatform = struct {
         self.run_until_idle(app);
     }
 
-    /// Pumps foreground tasks and pending frames until nothing is left to do.
+    /// Pumps foreground tasks and pending frames until nothing is left to do. Frames that a draw
+    /// asks for (animations, GIFs) are carried to the next pump, so an animation draws once per
+    /// call instead of keeping the pump busy until its guard. Real time moves them on, as a
+    /// display's frame callback does.
     pub fn run_until_idle(self: *HeadlessPlatform, app: *app_mod.App) void {
+        for (self.windows.items) |w| {
+            if (w.frame_requested_by_draw) {
+                w.frame_requested_by_draw = false;
+                w.frame_requested = true;
+            }
+        }
         var guard: usize = 0;
         while (!self.quit_requested and guard < 10_000) : (guard += 1) {
             var did = app.foreground_executor().run_pending() > 0;
             for (self.windows.items) |w| {
                 if (w.frame_requested) {
                     w.frame_requested = false;
+                    w.drawing = true;
                     w.base.emit_request_frame(.{});
+                    w.drawing = false;
                     did = true;
                 }
             }
@@ -260,6 +271,11 @@ pub const HeadlessWindow = struct {
     scale: f32 = 1,
     title: []const u8 = "",
     frame_requested: bool = true,
+    /// Set while `emit_request_frame` runs, so a frame the draw asks for is not run in the same pump.
+    drawing: bool = false,
+    /// A frame a draw asked for (an animation, such as a GIF, or a redraw after layout). It waits for
+    /// the next pump, so `run_until_idle` parks instead of drawing the animation until its guard.
+    frame_requested_by_draw: bool = false,
     closed: bool = false,
     atlas: atlas_mod.CpuAtlas,
     /// The last presented scene (borrowed from the window's rendered frame).
@@ -407,7 +423,8 @@ pub const HeadlessWindow = struct {
         return from(p).scale;
     }
     fn requestFrame(p: *PlatformWindow) void {
-        from(p).frame_requested = true;
+        const self = from(p);
+        if (self.drawing) self.frame_requested_by_draw = true else self.frame_requested = true;
     }
     fn draw(p: *PlatformWindow, scene: *const scene_mod.Scene) void {
         const self = from(p);
