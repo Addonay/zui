@@ -17,21 +17,21 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 ## API parity
 
-The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1254 of 1413
-functions that should be ported (88.7%)**. Of GPUI's 1642, 229 are set aside below because they should not be ported now: 35 mean nothing in Zig,
-135 are debug tooling and accessibility, 51 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: 271 of 458, not sorted yet.
+The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1263 of 1413
+functions that should be ported (89.4%)**. Of GPUI's 1642, 229 are set aside below because they should not be ported now: 35 mean nothing in Zig,
+135 are debug tooling and accessibility, 51 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: every one is sorted below.
 A name-only comparison: coincidences flatter it, and it says nothing about behaviour. Port a name or move it, and delete it either way.
 
 <details><summary>Still to port, by GPUI file</summary>
 
-#### window.rs (44)
-default_prevented, defer, focus_lost_restore_target, frame_duration_snapshot, has_image_atlas_entry, input_latency_snapshot, invalidate_view, is_high_rate, is_minimizable, is_resizable, is_simple_fullscreen, native_window_state, not_drawing, paint_surface, painted_quads, painted_underlines, present_if_needed, record_input, refresh_interval, replace_views, restore_native_window_state, set_background_appearance, set_client_corner_radii, set_dirty, set_document_path, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, set_window_edited, simulate_next_frame, take_views, touch_prediction_enabled, underline_bounds, update_count, viewport_size, wake_platform, window_controls, with_optional_element_state, with_tab_group
+#### window.rs (42)
+defer, focus_lost_restore_target, frame_duration_snapshot, has_image_atlas_entry, input_latency_snapshot, invalidate_view, is_high_rate, is_minimizable, is_resizable, is_simple_fullscreen, native_window_state, not_drawing, paint_surface, painted_quads, painted_underlines, present_if_needed, record_input, replace_views, restore_native_window_state, set_background_appearance, set_client_corner_radii, set_dirty, set_document_path, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, set_window_edited, simulate_next_frame, take_views, touch_prediction_enabled, underline_bounds, update_count, viewport_size, wake_platform, window_controls, with_optional_element_state, with_tab_group
 
 #### app.rs (25)
 action_deprecation_messages, action_documentation, action_schema_by_name, action_schemas, asset_source, defer, deprecated_actions_to_preferred_actions, foreground_journal, get_name, init_visible, is_test, new_inaccessible, read_from_clipboard_async, reduce_motion, register_inspector_element, request_windowing, run_embedded, set_inspector_renderer, set_text_rendering_mode, start_hang_monitor, test, text_rendering_mode, update_last_active, with_platform, with_windowing
 
-#### platform.rs (18)
-default_bounds, detect, gestures, linux_default, metadata, on_app_menu_action, on_displays_changed, on_power_mode_change, on_validate_app_menu_command, on_will_open_app_menu, read_from_clipboard_async, refresh_interval, refresh_interval_from_hz, request_windowing, set_initial_windowing, stream, uuid, visible_bounds
+#### platform.rs (15)
+detect, gestures, linux_default, metadata, on_app_menu_action, on_displays_changed, on_power_mode_change, on_validate_app_menu_command, on_will_open_app_menu, read_from_clipboard_async, request_windowing, set_initial_windowing, stream, uuid, visible_bounds
 
 #### executor.rs (10)
 advance_clock, allow_parking, block_test, forbid_parking, is_test, rng, set_block_on_ticks, set_num_cpus, simulate_random_delay, tick
@@ -45,17 +45,11 @@ external_drag_payload, interactivity, on_a11y_action, on_back_gesture
 #### arena.rs (3)
 alloc, begin_scope, end_scope
 
-#### elements/animation.rs (3)
-map_element, repeat_synced, with_max_fps
-
 #### gestures.rs (3)
 android, filter, ios
 
 #### key_dispatch.rs (3)
 contains_focus, refresh_node_id, reuse_subtree
-
-#### style.rs (3)
-blur_radius, combine_highlights, spread_radius
 
 #### tab_stop.rs (3)
 begin_group, end_group, paint_index
@@ -80,6 +74,9 @@ action_input, meta
 
 #### path_builder.rs (2)
 dash_array, transform
+
+#### style.rs (2)
+blur_radius, spread_radius
 
 #### subscription.rs (2)
 insert_pending, retain
@@ -128,9 +125,17 @@ with_timeout
 
 </details>
 
-<details><summary>Types not found in ZUI</summary>
+<details><summary>Types, sorted</summary>
 
-ActivityGuard, Along, AnchoredState, AnyTooltip, AnyWeakView, AppCell, AppContext, AppRef, AppRefMut, ApplicationHandle, Arena, ArenaBox, ArenaClearNeeded, AsKeystroke, Asset, AssetLogger, BindingIndex, BorrowAppContext, DebugBelow, DebugFrameOverlayMode, DefaultColors, DivInspectorState, DummyKeyboardMapper, ElementClickedState, ElementHoverState, EmptyView, EntityInputHandler, EventEmitter, ExternalDragPayload, ExternalDragPayloadSource, FileDragPaths, Focusable, FontFamilyId, FutureExt, GestureEvent, GestureTuning, GlyphRasterData, GpuiBorrow, Half, ImageCache, ImageCacheElement, ImageId, ImageStyle, ImgLayoutState, ImgResourceLoader, InputEvent, InputPreference, InteractiveElement, Interpolate, IntoElement, InvalidKeystrokeError, IsZero, KeyEvent, KeyboardInteractivity, KeymapVersion, Layer, LayerShellNotSupportedError, LayerShellOptions, LeakDetectorSnapshot, MacroActionBuilder, MacroActionData, ManagedView, MissingGlyphSink, MouseEvent, OngoingScroll, OwnedOsMenu, PathVertex_ScaledPixels, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformScheduler, PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupNotSupportedError, PopupOptions, PowerMode, Prompt, Radians, ReadGlobal, Render, RenderImageParams, RenderOnce, RenderSvgParams, RetainAllImageCacheProvider, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, ScrollPhysics, Sealed, SharedUri, SourceMetadata, SpringTarget, StatefulInteractiveElement, StyledImage, SurfaceSource, SystemWindowTab, SystemWindowTabController, TabStopCount, TabStopOperation, TabStopOrderNodeSummary, TaskExt, Text, ThermalState, ThreadedDispatcher, Timeout, TooltipId, Unbind, UniformListFrameState, UpdateGlobal, View, VisualContext, WindowButton, WindowButtonLayout, WindowControlArea, WindowControls, WindowingModes, WindowingRequest, WithTimeout
+Still to do, each needing real work: `ExternalDragPayload`, `ExternalDragPayloadSource`, `FileDragPaths` (dragging out of the window); `InputPreference`; `Unbind`; `PowerMode` (UPower over D-Bus, as `gpui_linux/linux/power.rs`); `Popup*` (`xdg_popup`); `ScreenCaptureFrame`, `ScreenCaptureSource`, `ScreenCaptureStream`, `SourceMetadata` (portal screencast); `WindowButton`, `WindowButtonLayout`, `WindowControlArea`, `WindowControls` (xdg-shell v5); `WindowingModes`, `WindowingRequest`; `PlatformKeyboardLayout`, `DummyKeyboardMapper`.
+
+Under another name: `ManagedView`, `DragMoveEvent`, `ExternalPaths`, `PlatformDisplay` (`platform.Display`), `Radians`, `DefaultColors`, `EntityInputHandler`, `ImageStyle`, `ImageCache`, `SharedUri`, `Prompt`, `InteractiveElement`, `StatefulInteractiveElement`, `Text`.
+
+Rust-only, duck typed here: `AppContext`, `AppCell`, `AppRef`, `AppRefMut`, `ActivityGuard`, `ApplicationHandle`, `AsKeystroke`, `Asset`, `BorrowAppContext`, `EventEmitter`, `FutureExt`, `GpuiBorrow`, `Half`, `IsZero`, `Interpolate`, `IntoElement`, `Render`, `RenderOnce`, `ReadGlobal`, `UpdateGlobal`, `Sealed`, `SpringTarget`, `TaskExt`, `Timeout`, `WithTimeout`, `VisualContext`, `View`.
+
+GPUI-private: `Along`, `AnchoredState`, `Arena`, `ArenaBox`, `ArenaClearNeeded`, `AssetLogger`, `BindingIndex`, `ElementClickedState`, `ElementHoverState`, `FontFamilyId`, `GlyphRasterData`, `ImageId`, `ImgLayoutState`, `ImgResourceLoader`, `KeymapVersion`, `MacroActionBuilder`, `MacroActionData`, `OngoingScroll`, `ScrollPhysics`, `RenderImageParams`, `RenderSvgParams`, `TabStopOperation`, `ThreadedDispatcher`, `TooltipId`, `UniformListFrameState`, `InvalidKeystrokeError`.
+
+Debug tooling: `DebugBelow`, `DebugFrameOverlayMode`, `DivInspectorState`, `LeakDetectorSnapshot`, `PlatformScheduler`, the profiler and inspector types. macOS or Windows: `SurfaceSource`, `SystemWindowTab`, `SystemWindowTabController`, `ThermalState`. Not in `gpui_linux` either: the layer shell types.
 
 </details>
 
@@ -157,8 +162,17 @@ These exist, so the comparison counts them, but they do nothing yet.
 - [ ] Long press: no platform emits it, so it has only run with simulated events
 - [ ] `last_input_was_touch` works, but raw touch events are not dispatched to elements
 - [ ] `transact` does not roll back dispatch-tree nodes or accessed element states, which GPUI's does
-- [ ] Refresh rate: `refresh_interval`, `is_high_rate`. `window_controls` needs xdg-shell v5. `set_background_appearance` needs
-      alpha buffers. `set_client_corner_radii` is stored nowhere. `inner_window_bounds` ignores tiling
+- [ ] `refresh_interval`: X11 `displays()` is one whole-screen display, so per-monitor refresh needs per-monitor displays first,
+      and its value is whole milliseconds. Neither backend's path has run. `inner_window_bounds` ignores tiling
+- [ ] `with_tab_group` at the window level: tab groups work through `tab_group()` on elements only
+
+## Missing, needing real work
+
+- [ ] Deterministic test scheduler: `advance_clock`, `tick`, `forbid_parking`, `allow_parking`, `block_test`, `rng`, `simulate_random_delay`
+- [ ] Action JSON schemas: `action_schemas`, `action_json_schema`, `documentation`, `deprecated_aliases`, needing a comptime generator
+- [ ] `window_controls` (xdg-shell v5), `set_background_appearance` (alpha buffers), `set_client_corner_radii`, `xdg_popup`
+- [ ] `on_power_mode_change` (UPower over D-Bus), screen capture (portal), `focus_lost_restore_target`
+- [ ] App menu callbacks: `on_app_menu_action`, `on_validate_app_menu_command` (`set_menus` itself exists and is stored)
 - [ ] `_NET_WM_STATE` and Wayland `set_app_id`, `request_decorations` have not run on a real window manager or compositor
 
 ## Images
