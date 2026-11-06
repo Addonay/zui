@@ -304,7 +304,10 @@ types: Prompt
 - [ ] `testing`: `test_allow_parking` is not ported, since ZUI has no parking check
 - [ ] Flaky test? `remove_asset` failed once in a run that touched no asset code; not reproduced
 - [ ] `run_until_parked` never parks while a GIF is on screen, and spins to its 10,000-iteration guard
-- [ ] WebP, TIFF, ICO, PNM decoders; WebP animates in GPUI since `635026f`, with GPUI's test data for it in `platform.rs`
+- [ ] TIFF and ICO decoders. HDR, PSD and PIC went away with `stb_image`; AVIF and EXR were never here
+- [ ] Wuffs is pinned to `0.4.0-alpha.12`, since the stable 0.3 has no WebP or JPEG. Move to 0.4 when it is released
+- [ ] Coverage-guided fuzzing of `src/wuffs.zig`'s chunk walker and compositors; today it is 400 fixed-seed corruptions per fixture
+- [ ] An animation over `Limits.max_total_bytes` (1 GiB of frames) fails outright, where it could play what fits
 - [ ] EXIF orientation in PNG (JPEG is done)
 - [ ] GPUI's delay before `with_loading` appears, so fast loads do not flash a placeholder
 - [ ] Atlas tiles of images replaced by a newer download are never freed

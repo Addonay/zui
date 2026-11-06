@@ -46,8 +46,9 @@ pub const Limits = struct {
     max_total_bytes: u64 = 1 << 30,
     /// Most frames one animation may have.
     max_frames: usize = 1 << 16,
-    /// Largest work buffer a decoder may ask for.
-    max_workbuf: u64 = 64 << 20,
+    /// Largest work buffer a decoder may ask for. A 48-megapixel JPEG asks for 68 MB, or 205 MB if
+    /// it is progressive, so this scales like the image itself.
+    max_workbuf: u64 = 1 << 30,
 };
 
 pub const Error = error{
@@ -237,6 +238,12 @@ fn straight_bgra(argb_premul: u32) [4]u8 {
     return .{ unpremul(b, a), unpremul(g, a), unpremul(r, a), @intCast(a) };
 }
 
+/// Whether an animation that fails partway keeps the frames it has, as GPUI's does. A truncated
+/// download of a GIF should play what arrived. Being over a limit stays an error.
+fn keeps_frames(err: Error, frame_count: usize) bool {
+    return err == error.DecodeFailed and frame_count > 0;
+}
+
 // -- sequences: GIF, APNG and everything Wuffs decodes as one or more frames ---------------------
 
 /// Decodes frames the way Wuffs' example/gifplayer does: a canvas that starts transparent, each frame
@@ -264,9 +271,16 @@ fn decode_sequence(allocator: std.mem.Allocator, codec: Codec, bytes: []const u8
         frames.deinit(allocator);
     }
 
-    while (try session.next_frame()) |info| {
+    while (true) {
+        const info = (session.next_frame() catch |err| {
+            if (keeps_frames(err, frames.items.len)) break;
+            return err;
+        }) orelse break;
         const rect = Rect.of_info(info);
-        try check_rect(rect, size);
+        check_rect(rect, size) catch |err| {
+            if (keeps_frames(err, frames.items.len)) break;
+            return err;
+        };
         if (frames.items.len >= limits.max_frames) return error.ImageTooLarge;
         if (frames.items.len == 0) fill_rect(canvas, size.width, Rect.full(size), info.background);
 
@@ -275,7 +289,10 @@ fn decode_sequence(allocator: std.mem.Allocator, codec: Codec, bytes: []const u8
             @memcpy(previous.?, canvas);
         }
 
-        try session.decode_frame(canvas, work, info.overwrite != 0);
+        session.decode_frame(canvas, work, info.overwrite != 0) catch |err| {
+            if (keeps_frames(err, frames.items.len)) break;
+            return err;
+        };
 
         const copy_len = try budget.reserve(size.width, size.height);
         const pixels = try allocator.alloc(u8, copy_len);
@@ -325,8 +342,9 @@ const ChunkIterator = struct {
 /// the chunks, and a file shorter than it claims is read to its end.
 fn webp_body(bytes: []const u8) ?[]const u8 {
     if (bytes.len < 12 or !std.mem.eql(u8, bytes[0..4], "RIFF") or !std.mem.eql(u8, bytes[8..12], "WEBP")) return null;
-    const riff_end: usize = @as(usize, std.mem.readInt(u32, bytes[4..8], .little)) + 8;
-    const end_at = @min(bytes.len, riff_end);
+    // In 64 bits: on a 32-bit target, a size near 4 GiB from the file would overflow `usize`.
+    const riff_end = @as(u64, std.mem.readInt(u32, bytes[4..8], .little)) + 8;
+    const end_at: usize = @intCast(@min(bytes.len, riff_end));
     if (end_at < 12) return null;
     return bytes[12..end_at];
 }
@@ -388,7 +406,11 @@ fn decode_webp_animation(allocator: std.mem.Allocator, bytes: []const u8, limits
     }
 
     var pending_dispose: ?Rect = null;
-    while (try it.next()) |chunk| {
+    while (true) {
+        const chunk = (it.next() catch |err| {
+            if (keeps_frames(err, frames.items.len)) break;
+            return err;
+        }) orelse break;
         if (std.mem.eql(u8, &chunk.fourcc, "VP8X")) {
             if (canvas != null) return error.DecodeFailed;
             if (chunk.payload.len < 10) return error.DecodeFailed;
@@ -407,11 +429,20 @@ fn decode_webp_animation(allocator: std.mem.Allocator, bytes: []const u8, limits
                 pending_dispose = null;
             }
 
-            const frame = try AnimFrame.parse(chunk.payload);
+            const frame = AnimFrame.parse(chunk.payload) catch |err| {
+                if (keeps_frames(err, frames.items.len)) break;
+                return err;
+            };
             const rect: Rect = .{ .x0 = frame.x, .y0 = frame.y, .x1 = frame.x + frame.width, .y1 = frame.y + frame.height };
-            try check_rect(rect, canvas_size);
+            check_rect(rect, canvas_size) catch |err| {
+                if (keeps_frames(err, frames.items.len)) break;
+                return err;
+            };
 
-            const source = try decode_anim_frame(allocator, frame, limits);
+            const source = decode_anim_frame(allocator, frame, limits) catch |err| {
+                if (keeps_frames(err, frames.items.len)) break;
+                return err;
+            };
             defer allocator.free(source);
             composite(pixels_canvas, canvas_size.width, rect, source, frame.blend);
 
@@ -899,4 +930,40 @@ test "wuffs: WebP walker rejects chunk sizes that overrun the file" {
     const anmf = std.mem.indexOf(u8, &bad, "ANMF").?;
     std.mem.writeInt(u32, bad[anmf + 4 ..][0..4], 0x7fff_0000, .little);
     try testing.expectError(error.DecodeFailed, decode(testing.allocator, .webp, &bad));
+}
+
+test "wuffs: a RIFF size near 4 GiB does not overflow" {
+    var bytes: [fixture.lossless_webp.len]u8 = undefined;
+    @memcpy(&bytes, fixture.lossless_webp);
+    std.mem.writeInt(u32, bytes[4..8], 0xffff_ffff, .little);
+    try testing.expect(webp_body(&bytes) != null);
+    try testing.expectEqual(bytes.len - 12, webp_body(&bytes).?.len);
+}
+
+test "wuffs: an animation cut short keeps the frames before the cut" {
+    // Cut inside the last frame of each: the earlier ones must survive, unchanged.
+    const cases = [_]struct { codec: Codec, bytes: []const u8 }{
+        .{ .codec = .gif, .bytes = fixture.animated_gif },
+        .{ .codec = .webp, .bytes = fixture.animated_webp },
+    };
+    for (cases) |case| {
+        const whole = try decode(testing.allocator, case.codec, case.bytes);
+        defer free_frames_for_test(whole);
+        var cut = case.bytes.len - 1;
+        const kept = while (cut > 0) : (cut -= 1) {
+            const frames = decode(testing.allocator, case.codec, case.bytes[0..cut]) catch continue;
+            if (frames.len < whole.len) break frames;
+            free_frames_for_test(frames);
+        } else return error.TestExpectedEqual;
+        defer free_frames_for_test(kept);
+        try testing.expect(kept.len >= 1);
+        for (kept, whole[0..kept.len]) |a, b| try testing.expectEqualSlices(u8, b.pixels, a.pixels);
+    }
+    // A file with no complete frame is still an error.
+    try testing.expectError(error.DecodeFailed, decode(testing.allocator, .gif, fixture.animated_gif[0..20]));
+}
+
+test "wuffs: the default limits leave room for the work buffer of a 48-megapixel progressive JPEG" {
+    const limits: Limits = .{};
+    try testing.expect(limits.max_workbuf >= 205 << 20);
 }

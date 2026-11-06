@@ -94,7 +94,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     wuffs_native.addIncludePath(b.path("third_party/wuffs"));
-    wuffs_native.addCSourceFile(.{ .file = b.path("third_party/wuffs/zui_wuffs.c"), .flags = &.{"-std=c99"} });
+    wuffs_native.addCSourceFile(.{ .file = b.path("third_party/wuffs/zui_wuffs.c"), .flags = &.{ "-std=c99", "-fno-sanitize=undefined" } });
     zui.linkLibrary(b.addLibrary(.{ .name = "zui_wuffs", .linkage = .static, .root_module = wuffs_native }));
 
     // Unit tests.
