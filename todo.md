@@ -17,27 +17,24 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 ## API parity
 
-The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1263 of 1413
-functions that should be ported (89.4%)**. Of GPUI's 1642, 229 are set aside below because they should not be ported now: 35 mean nothing in Zig,
-135 are debug tooling and accessibility, 51 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: every one is sorted below.
+The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1288 of 1419
+functions that should be ported (90.8%)**. Of GPUI's 1642, 223 are set aside below because they should not be ported now: 35 mean nothing in Zig,
+135 are debug tooling and accessibility, 45 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: every one is sorted below.
 A name-only comparison: coincidences flatter it, and it says nothing about behaviour. Port a name or move it, and delete it either way.
 
 <details><summary>Still to port, by GPUI file</summary>
 
-#### window.rs (42)
-defer, focus_lost_restore_target, frame_duration_snapshot, has_image_atlas_entry, input_latency_snapshot, invalidate_view, is_high_rate, is_minimizable, is_resizable, is_simple_fullscreen, native_window_state, not_drawing, paint_surface, painted_quads, painted_underlines, present_if_needed, record_input, replace_views, restore_native_window_state, set_background_appearance, set_client_corner_radii, set_dirty, set_document_path, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, set_window_edited, simulate_next_frame, take_views, touch_prediction_enabled, underline_bounds, update_count, viewport_size, wake_platform, window_controls, with_optional_element_state, with_tab_group
+#### window.rs (39)
+defer, frame_duration_snapshot, has_image_atlas_entry, input_latency_snapshot, invalidate_view, is_high_rate, is_minimizable, is_resizable, is_simple_fullscreen, native_window_state, not_drawing, paint_surface, painted_quads, painted_underlines, present_if_needed, record_input, replace_views, restore_native_window_state, set_background_appearance, set_client_corner_radii, set_dirty, set_document_path, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, set_window_edited, simulate_next_frame, take_views, touch_prediction_enabled, underline_bounds, update_count, viewport_size, wake_platform, with_optional_element_state
 
-#### app.rs (25)
-action_deprecation_messages, action_documentation, action_schema_by_name, action_schemas, asset_source, defer, deprecated_actions_to_preferred_actions, foreground_journal, get_name, init_visible, is_test, new_inaccessible, read_from_clipboard_async, reduce_motion, register_inspector_element, request_windowing, run_embedded, set_inspector_renderer, set_text_rendering_mode, start_hang_monitor, test, text_rendering_mode, update_last_active, with_platform, with_windowing
+#### app.rs (22)
+action_deprecation_messages, asset_source, defer, deprecated_actions_to_preferred_actions, foreground_journal, get_name, init_visible, is_test, new_inaccessible, read_from_clipboard_async, reduce_motion, register_inspector_element, request_windowing, run_embedded, set_inspector_renderer, set_text_rendering_mode, start_hang_monitor, test, text_rendering_mode, update_last_active, with_platform, with_windowing
 
-#### platform.rs (15)
-detect, gestures, linux_default, metadata, on_app_menu_action, on_displays_changed, on_power_mode_change, on_validate_app_menu_command, on_will_open_app_menu, read_from_clipboard_async, request_windowing, set_initial_windowing, stream, uuid, visible_bounds
+#### platform.rs (13)
+detect, gestures, metadata, on_app_menu_action, on_displays_changed, on_validate_app_menu_command, on_will_open_app_menu, read_from_clipboard_async, request_windowing, set_initial_windowing, stream, uuid, visible_bounds
 
 #### executor.rs (10)
 advance_clock, allow_parking, block_test, forbid_parking, is_test, rng, set_block_on_ticks, set_num_cpus, simulate_random_delay, tick
-
-#### action.rs (9)
-action_json_schema, action_schema_by_name, action_schemas, deprecated_aliases, deprecation_message, deprecation_messages, documentation, generate_list_of_all_registered_actions, is_unbind
 
 #### elements/div.rs (4)
 external_drag_payload, interactivity, on_a11y_action, on_back_gesture
@@ -51,11 +48,11 @@ android, filter, ios
 #### key_dispatch.rs (3)
 contains_focus, refresh_node_id, reuse_subtree
 
-#### tab_stop.rs (3)
-begin_group, end_group, paint_index
-
 #### text_system/line_layout.rs (3)
 layout_index, reuse_layouts, truncate_layouts
+
+#### action.rs (2)
+deprecation_message, generate_list_of_all_registered_actions
 
 #### color.rs (2)
 color_space, opaque_strategy
@@ -68,9 +65,6 @@ image_style, is_asset_cached
 
 #### elements/text.rs (2)
 __hash_text_macro_location_unstable_do_not_use, new_inaccessible
-
-#### keymap/binding.rs (2)
-action_input, meta
 
 #### path_builder.rs (2)
 dash_array, transform
@@ -98,6 +92,9 @@ retain_all
 
 #### elements/list.rs (1)
 set_item_measurement_readiness
+
+#### keymap/binding.rs (1)
+action_input
 
 #### keymap/context.rs (1)
 new_with_defaults
@@ -143,7 +140,7 @@ Debug tooling: `DebugBelow`, `DebugFrameOverlayMode`, `DivInspectorState`, `Leak
 
 **Rust-only:** apply_to, as_any, as_f32, as_non_zero_u64, borrow, borrow_mut, boxed_clone, bubble, capture, clear_accessed, detach_and_log_err_with_backtrace, dispatcher, downcast_mut, end_lease, extend_accessed, handle_created, handle_released, into_element, lease, new_invalid, partial_eq, pop_access_scope, push_access_scope, ref_counts_drop_handle, scheduler_executor, source_location, take_accessed, take_dropped, to_bytes, to_f64, to_i32, try_borrow_mut, union
 
-**Waiting on macOS or Windows:** add_recent_document, add_tab, button_layout, get_next_tab_group_window, get_prev_tab_group_window, insert_window_control_hitbox, is_screen_capture_supported, merge_all_windows, move_tab_to_new_window, observe_button_layout_changed, on_app_lifecycle, on_memory_warning, on_system_sleep, on_system_wake, on_thermal_state_change, perform_dock_menu_action, power_mode, prevent_app_nap, prevent_idle_sleep, read_from_find_pasteboard, remove_tab, screen_capture_sources, select_next_tab, select_previous_tab, set_dock_menu, tab_groups, tabs, thermal_state, update_jump_list, update_tab_position, update_tab_title, window_control_area, write_to_find_pasteboard
+**Waiting on macOS or Windows:** add_recent_document, add_tab, get_next_tab_group_window, get_prev_tab_group_window, insert_window_control_hitbox, is_screen_capture_supported, merge_all_windows, move_tab_to_new_window, on_app_lifecycle, on_memory_warning, on_system_sleep, on_system_wake, on_thermal_state_change, perform_dock_menu_action, prevent_app_nap, prevent_idle_sleep, read_from_find_pasteboard, remove_tab, screen_capture_sources, select_next_tab, select_previous_tab, set_dock_menu, tab_groups, tabs, thermal_state, update_jump_list, update_tab_position, update_tab_title, window_control_area, write_to_find_pasteboard
 
 **Waiting on portal work over D-Bus:** delete_credentials, read_credentials, write_credentials, write_credentials_if_not_exists
 
@@ -164,16 +161,16 @@ These exist, so the comparison counts them, but they do nothing yet.
 - [ ] `transact` does not roll back dispatch-tree nodes or accessed element states, which GPUI's does
 - [ ] `refresh_interval`: X11 `displays()` is one whole-screen display, so per-monitor refresh needs per-monitor displays first,
       and its value is whole milliseconds. Neither backend's path has run. `inner_window_bounds` ignores tiling
-- [ ] `with_tab_group` at the window level: tab groups work through `tab_group()` on elements only
 
 ## Missing, needing real work
 
-- [ ] Deterministic test scheduler: `advance_clock`, `tick`, `forbid_parking`, `allow_parking`, `block_test`, `rng`, `simulate_random_delay`
-- [ ] Action JSON schemas: `action_schemas`, `action_json_schema`, `documentation`, `deprecated_aliases`, needing a comptime generator
-- [ ] `window_controls` (xdg-shell v5), `set_background_appearance` (alpha buffers), `set_client_corner_radii`, `xdg_popup`
-- [ ] `on_power_mode_change` (UPower over D-Bus), screen capture (portal), `focus_lost_restore_target`
+- [ ] Deterministic test scheduler: an agent is on it
+- [ ] Transparent windows: `set_background_appearance`; `WindowOptions.window_background` is stored but unused. An agent is on it
+- [ ] Screen capture (portal), `focus_lost_restore_target` beyond the current path
 - [ ] App menu callbacks: `on_app_menu_action`, `on_validate_app_menu_command` (`set_menus` itself exists and is stored)
-- [ ] `_NET_WM_STATE` and Wayland `set_app_id`, `request_decorations` have not run on a real window manager or compositor
+- [ ] Popups: grabs and outside-click dismissal have not run with a real pointer; `xdg_popup.reposition` is not ported
+- [ ] Power mode has only run against a fake bus; a daemon that never answers leaves it at its last value
+- [ ] Action schemas have no field descriptions, since Zig keeps no doc comments
 
 ## Images
 
