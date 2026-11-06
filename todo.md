@@ -17,21 +17,21 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 ## API parity
 
-The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1305 of 1422
-functions that should be ported (91.8%)**. Of GPUI's 1642, 220 are set aside below because they should not be ported now: 35 mean nothing in Zig,
-132 are debug tooling and accessibility, 45 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: every one is sorted below.
+The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1344 of 1411
+functions that should be ported (95.3%)**. Of GPUI's 1642, 231 are set aside below because they should not be ported now: 40 mean nothing in Zig,
+132 are debug tooling and accessibility, 51 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: every one is sorted below.
 A name-only comparison: coincidences flatter it, and it says nothing about behaviour. Port a name or move it, and delete it either way.
 
 <details><summary>Still to port, by GPUI file</summary>
 
-#### window.rs (37)
-defer, frame_duration_snapshot, has_image_atlas_entry, input_latency_snapshot, invalidate_view, is_high_rate, is_minimizable, is_resizable, is_simple_fullscreen, native_window_state, not_drawing, paint_surface, painted_quads, painted_underlines, present_if_needed, record_input, replace_views, restore_native_window_state, set_dirty, set_document_path, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, set_window_edited, simulate_next_frame, take_views, touch_prediction_enabled, underline_bounds, update_count, viewport_size, wake_platform, with_optional_element_state
+#### window.rs (26)
+defer, frame_duration_snapshot, has_image_atlas_entry, input_latency_snapshot, is_high_rate, native_window_state, paint_surface, painted_quads, painted_underlines, present_if_needed, record_input, replace_views, restore_native_window_state, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, simulate_next_frame, take_views, touch_prediction_enabled, update_count, wake_platform
 
-#### app.rs (21)
-action_deprecation_messages, asset_source, defer, deprecated_actions_to_preferred_actions, foreground_journal, get_name, init_visible, new_inaccessible, read_from_clipboard_async, reduce_motion, register_inspector_element, request_windowing, run_embedded, set_inspector_renderer, set_text_rendering_mode, start_hang_monitor, test, text_rendering_mode, update_last_active, with_platform, with_windowing
+#### app.rs (12)
+defer, foreground_journal, init_visible, new_inaccessible, register_inspector_element, request_windowing, run_embedded, set_inspector_renderer, start_hang_monitor, test, with_platform, with_windowing
 
-#### platform.rs (13)
-detect, gestures, metadata, on_app_menu_action, on_displays_changed, on_validate_app_menu_command, on_will_open_app_menu, read_from_clipboard_async, request_windowing, set_initial_windowing, stream, uuid, visible_bounds
+#### platform.rs (12)
+detect, gestures, metadata, on_app_menu_action, on_displays_changed, on_validate_app_menu_command, on_will_open_app_menu, request_windowing, set_initial_windowing, stream, uuid, visible_bounds
 
 #### elements/div.rs (4)
 external_drag_payload, interactivity, on_a11y_action, on_back_gesture
@@ -42,32 +42,8 @@ alloc, begin_scope, end_scope
 #### gestures.rs (3)
 android, filter, ios
 
-#### key_dispatch.rs (3)
-contains_focus, refresh_node_id, reuse_subtree
-
-#### text_system/line_layout.rs (3)
-layout_index, reuse_layouts, truncate_layouts
-
-#### action.rs (2)
-deprecation_message, generate_list_of_all_registered_actions
-
-#### color.rs (2)
-color_space, opaque_strategy
-
-#### colors.rs (2)
-for_appearance, get_global
-
-#### elements/img.rs (2)
-image_style, is_asset_cached
-
 #### elements/text.rs (2)
 __hash_text_macro_location_unstable_do_not_use, new_inaccessible
-
-#### path_builder.rs (2)
-dash_array, transform
-
-#### style.rs (2)
-blur_radius, spread_radius
 
 #### subscription.rs (2)
 insert_pending, retain
@@ -75,44 +51,11 @@ insert_pending, retain
 #### app/entity_map.rs (1)
 restore_accessed
 
-#### elements/anchored.rs (1)
-attach
-
-#### elements/deferred.rs (1)
-with_priority
-
-#### elements/image_cache.rs (1)
-retain_all
-
 #### elements/list.rs (1)
 set_item_measurement_readiness
 
-#### keymap/binding.rs (1)
-action_input
-
-#### keymap/context.rs (1)
-new_with_defaults
-
-#### platform/app_menu.rs (1)
-separator
-
-#### platform/keyboard.rs (1)
-get_key_equivalents
-
 #### platform/scap_screen_capture.rs (1)
 scap_screen_sources
-
-#### seeds.rs (1)
-calculate_seeds
-
-#### svg_renderer.rs (1)
-render_parsed
-
-#### text_system/line_wrapper.rs (1)
-len_utf8
-
-#### util.rs (1)
-with_timeout
 
 </details>
 
@@ -132,9 +75,9 @@ Debug tooling: `DebugBelow`, `DebugFrameOverlayMode`, `DivInspectorState`, `Leak
 
 <details><summary>Set aside</summary>
 
-**Rust-only:** apply_to, as_any, as_f32, as_non_zero_u64, borrow, borrow_mut, boxed_clone, bubble, capture, clear_accessed, detach_and_log_err_with_backtrace, dispatcher, downcast_mut, end_lease, extend_accessed, handle_created, handle_released, into_element, lease, new_invalid, partial_eq, pop_access_scope, push_access_scope, ref_counts_drop_handle, scheduler_executor, source_location, take_accessed, take_dropped, to_bytes, to_f64, to_i32, try_borrow_mut, union
+**Rust-only:** action_input, apply_to, as_any, as_f32, as_non_zero_u64, borrow, borrow_mut, boxed_clone, bubble, calculate_seeds, capture, clear_accessed, detach_and_log_err_with_backtrace, dispatcher, downcast_mut, end_lease, extend_accessed, generate_list_of_all_registered_actions, handle_created, handle_released, into_element, lease, new_invalid, opaque_strategy, partial_eq, pop_access_scope, push_access_scope, ref_counts_drop_handle, scheduler_executor, source_location, take_accessed, take_dropped, to_bytes, to_f64, to_i32, try_borrow_mut, union, with_timeout
 
-**Waiting on macOS or Windows:** add_recent_document, add_tab, get_next_tab_group_window, get_prev_tab_group_window, insert_window_control_hitbox, is_screen_capture_supported, merge_all_windows, move_tab_to_new_window, on_app_lifecycle, on_memory_warning, on_system_sleep, on_system_wake, on_thermal_state_change, perform_dock_menu_action, prevent_app_nap, prevent_idle_sleep, read_from_find_pasteboard, remove_tab, screen_capture_sources, select_next_tab, select_previous_tab, set_dock_menu, tab_groups, tabs, thermal_state, update_jump_list, update_tab_position, update_tab_title, window_control_area, write_to_find_pasteboard
+**Waiting on macOS or Windows:** add_recent_document, add_tab, get_key_equivalents, get_next_tab_group_window, get_prev_tab_group_window, insert_window_control_hitbox, is_screen_capture_supported, merge_all_windows, move_tab_to_new_window, on_app_lifecycle, on_memory_warning, on_system_sleep, on_system_wake, on_thermal_state_change, perform_dock_menu_action, prevent_app_nap, prevent_idle_sleep, read_from_find_pasteboard, remove_tab, screen_capture_sources, select_next_tab, select_previous_tab, set_dock_menu, set_document_path, set_text_rendering_mode, set_window_edited, tab_groups, tabs, text_rendering_mode, thermal_state, update_jump_list, update_last_active, update_tab_position, update_tab_title, window_control_area, write_to_find_pasteboard
 
 **Waiting on portal work over D-Bus:** delete_credentials, read_credentials, write_credentials, write_credentials_if_not_exists
 
@@ -217,7 +160,6 @@ These exist, so the comparison counts them, but they do nothing yet.
 - [ ] Back-gesture listeners; no platform emits pressure yet (macOS will)
 - [ ] Long-press tooltips
 - [ ] External drag payloads (dragging out of the window)
-- [ ] `cached` views
 - [ ] `ContainerQuery` is a styled element with an id and interactivity, which GPUI's is not; `Percentage`
       arithmetic and a `Radians` type are not ported
 - [ ] `set_menus` is stored but only macOS will draw it
@@ -267,7 +209,9 @@ Each must run headless with a correct snapshot, and be driven for real: first fr
 
 ## Performance (after API parity)
 
-- [ ] View caching with `AnyView::cached` and replayed scene ranges (`Scene.replay` exists)
+- [ ] Compare view caching with GPUI in a release build. So far only Debug: 128 ms uncached, 4.7 ms cached, for 20 views of 60 rows
+- [ ] Run a cached view on a real Wayland and X11 window; no example uses `cached` yet
+- [ ] Tooltip and throttled animation timers refresh the whole window, because no view is current in a timer. They could remember theirs
 - [ ] Avoid full layout when nothing changed
 - [ ] X11 XShm presentation
 - [ ] SIMD gradients in the CPU renderer
