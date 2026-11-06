@@ -2489,11 +2489,12 @@ pub const Window = struct {
         const arena = arena_state.allocator();
         const contexts = tree.context_stack(path, arena);
 
+        const preference = self.input_preference(E, event, cx);
         self.propagate_event = true;
-        const intercepted: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .context_stack = contexts };
+        const intercepted: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .input_preference = preference, .context_stack = contexts };
         cx.dispatch_keystroke_interceptors(&intercepted, self);
         if (!self.propagate_event) {
-            self.finish_dispatch_keystroke(E, event, keystroke, contexts, path, cx);
+            self.finish_dispatch_keystroke(E, event, keystroke, preference, contexts, path, cx);
             return;
         }
 
@@ -2534,18 +2535,33 @@ pub const Window = struct {
 
         const pending_changed = had_pending;
         defer if (pending_changed) cx.dispatch_pending_input_observers(self);
-        for (result.bindings) |binding| {
-            self.dispatch_action_on_path(path, binding.action, cx);
-            if (!self.propagate_event) {
-                const observed: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .action = binding.action, .context_stack = contexts };
-                cx.dispatch_keystroke_observers(&observed, self);
-                return;
+        // Interceptors or replayed actions may have changed whether the input handler accepts text,
+        // so the preference is checked again before bindings run (GPUI `dispatch_key_event`).
+        const recheck = self.input_preference(E, event, cx);
+        if (recheck == .key_bindings) {
+            for (result.bindings) |binding| {
+                self.dispatch_action_on_path(path, binding.action, cx);
+                if (!self.propagate_event) {
+                    const observed: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .input_preference = recheck, .action = binding.action, .context_stack = contexts };
+                    cx.dispatch_keystroke_observers(&observed, self);
+                    return;
+                }
             }
         }
-        self.finish_dispatch_keystroke(E, event, keystroke, contexts, path, cx);
+        self.finish_dispatch_keystroke(E, event, keystroke, recheck, contexts, path, cx);
     }
 
-    fn finish_dispatch_keystroke(self: *Window, comptime E: type, event: *const E, keystroke: keystroke_mod.Keystroke, contexts: []const key_dispatch.KeyContext, path: []const key_dispatch.DispatchNodeId, cx: *App) void {
+    /// Whether a key down prefers typing text over key bindings (GPUI `Window::input_preference`).
+    /// That holds only when the platform asks for it (AltGr on Windows, for one) and the focused
+    /// input accepts text. Other events always go to key bindings.
+    fn input_preference(self: *Window, comptime E: type, event: *const E, cx: *App) app_mod.InputPreference {
+        if (comptime E != interactive.KeyDownEvent) return .key_bindings;
+        if (!event.prefer_character_input) return .key_bindings;
+        var handler = self.platform_window.input_handler() orelse return .key_bindings;
+        return if (handler.accepts_text_input(self, cx)) .character_input else .key_bindings;
+    }
+
+    fn finish_dispatch_keystroke(self: *Window, comptime E: type, event: *const E, keystroke: keystroke_mod.Keystroke, preference: app_mod.InputPreference, contexts: []const key_dispatch.KeyContext, path: []const key_dispatch.DispatchNodeId, cx: *App) void {
         if (E == interactive.KeyDownEvent) {
             self.dispatch_key_listeners(E, event, path, cx);
             if (!self.propagate_event) return;
@@ -2553,7 +2569,7 @@ pub const Window = struct {
         } else if (!self.propagate_event) {
             return;
         }
-        const observed: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .context_stack = contexts };
+        const observed: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .input_preference = preference, .context_stack = contexts };
         cx.dispatch_keystroke_observers(&observed, self);
     }
 
@@ -2597,7 +2613,7 @@ pub const Window = struct {
             for (replay.bindings) |binding| {
                 self.dispatch_action_on_path(path, binding.action, cx);
                 if (!self.propagate_event) {
-                    const observed: app_mod.KeystrokeEvent = .{ .keystroke = replay.keystroke, .action = binding.action };
+                    const observed: app_mod.KeystrokeEvent = .{ .keystroke = replay.keystroke, .input_preference = .key_bindings, .action = binding.action };
                     cx.dispatch_keystroke_observers(&observed, self);
                     continue :next;
                 }
@@ -2799,7 +2815,9 @@ pub const Window = struct {
         defer self.allocator.free(candidates);
         // Newest first: the first binding that wins at its own keystrokes is the highest precedence.
         for (candidates) |binding| {
-            const found = keymap.bindings_for_input(self.allocator, binding.keystrokes, contexts) catch oom();
+            const typed = plain_keystrokes(self.allocator, binding.keystrokes);
+            defer self.allocator.free(typed);
+            const found = keymap.bindings_for_input(self.allocator, typed, contexts) catch oom();
             defer self.allocator.free(found.bindings);
             if (found.bindings.len > 0 and keymap_mod.same_binding(&found.bindings[0], &binding)) return binding;
         }
@@ -2824,6 +2842,14 @@ pub const Window = struct {
         return false;
     }
 
+    /// The keystrokes of a binding as plain keystrokes, for matching input against it. The slice is
+    /// owned by `gpa`.
+    fn plain_keystrokes(gpa: std.mem.Allocator, keystrokes: []const keymap_mod.KeybindingKeystroke) []keystroke_mod.Keystroke {
+        const out = gpa.alloc(keystroke_mod.Keystroke, keystrokes.len) catch oom();
+        for (keystrokes, out) |keystroke, *slot| slot.* = keystroke.inner;
+        return out;
+    }
+
     /// The keystrokes bound to `action` in the focused element's context, displayed for the
     /// platform and joined with spaces, or the action's name when nothing is bound (GPUI
     /// `keystroke_text_for`). The text lives in the frame arena.
@@ -2833,7 +2859,7 @@ pub const Window = struct {
         const os = cx.platform_info().os;
         const arena = frame_arena();
         const parts = arena.alloc([]const u8, binding.keystrokes.len) catch oom();
-        for (binding.keystrokes, parts) |keystroke, *part| part.* = format("{f}", .{keystroke.display(os)});
+        for (binding.keystrokes, parts) |keystroke, *part| part.* = format("{f}", .{keystroke.as_keystroke().display(os)});
         return std.mem.join(arena, " ", parts) catch oom();
     }
 
