@@ -1106,9 +1106,22 @@ pub const Subscription = struct {
 // ---------------------------------------------------------------------------
 // Effects.
 
+/// Whether a keystroke should prefer character input or key bindings (GPUI `InputPreference`).
+pub const InputPreference = enum {
+    /// Prefer typing text over triggering key bindings.
+    character_input,
+    /// Dispatch key bindings normally, if any match.
+    key_bindings,
+};
+
 /// What a keystroke did (GPUI `KeystrokeEvent`). Valid during the call.
 pub const KeystrokeEvent = struct {
     keystroke: keystroke_mod.Keystroke,
+    /// Whether this keystroke should prefer character input or key bindings. It is `character_input`
+    /// when the platform prefers text for the key (AltGr on Windows) and the focused input accepts
+    /// text. Interceptors still receive these keystrokes and can consume them. A multi-stroke
+    /// binding still waits as pending input even then.
+    input_preference: InputPreference = .key_bindings,
     /// The action it resolved to. Always null for interceptors, which run first.
     action: ?action_mod.AnyAction = null,
     context_stack: []const keymap_mod.KeyContext = &.{},
