@@ -356,6 +356,7 @@ pub const OsMenu = app_menu.OsMenu;
 pub const OsAction = app_menu.OsAction;
 pub const SystemMenuType = app_menu.SystemMenuType;
 pub const SystemNotification = platform.SystemNotification;
+pub const PowerMode = platform.PowerMode;
 pub const SystemNotificationAction = platform.SystemNotificationAction;
 pub const SystemNotificationResponse = platform.SystemNotificationResponse;
 pub const WindowVisibility = platform.WindowVisibility;
@@ -397,6 +398,7 @@ test {
         _ = @import("platform/linux/xdnd.zig");
         _ = @import("platform/linux/dbus.zig");
         _ = @import("platform/linux/system_notifications.zig");
+        _ = @import("platform/linux/power.zig");
         _ = @import("platform/linux/portal.zig");
         _ = @import("platform/linux/launch.zig");
         _ = @import("platform/linux/input.zig");
