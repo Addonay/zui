@@ -14,6 +14,7 @@ const color = @import("../../color.zig");
 const cpu = @import("../../renderer/cpu.zig");
 const window_renderer = @import("../../renderer/window_renderer.zig");
 const xkb = @import("xkb.zig");
+const xkb_x11 = @import("xkb_x11.zig");
 const xim_preedit = @import("xim_preedit.zig");
 const x11_scroll = @import("x11_scroll.zig");
 const xdnd = @import("xdnd.zig");
@@ -66,6 +67,7 @@ const Atoms = struct {
     net_wm_window_type_notification: Atom = 0,
     net_wm_window_type_dialog: Atom = 0,
     net_wm_cm_s0: Atom = 0,
+    net_client_list_stacking: Atom = 0,
     xdnd_aware: Atom = 0,
     xdnd_enter: Atom = 0,
     xdnd_position: Atom = 0,
@@ -118,6 +120,18 @@ pub const X11Connection = struct {
     gpu_context: ?*window_renderer.GpuContext = null,
     gpu_probed: bool = false,
     compose: ?xkb.Compose = null,
+    /// The keyboard layout of the core keyboard, through libxkbcommon-x11. Null without it.
+    keyboard: ?xkb_x11.Keyboard = null,
+    layout: xkb.LayoutName = .{},
+    /// First event type of the XKB extension (new keyboard, map, state), or -1 when not selected.
+    xkb_event_base: c_int = -1,
+    /// The window under the pointer, and the one whose cursor is hidden until the pointer moves.
+    pointer_window: ?*X11Window = null,
+    cursor_hidden_window: ?*X11Window = null,
+    blank_cursor: Cursor = 0,
+    stack_buf: [256]*platform.PlatformWindow = undefined,
+    /// Told when the keyboard layout changes. Set by `LinuxPlatform.create`.
+    platform_: ?*platform.Platform = null,
     xi_lib: ?dl.Library = null,
     xi_api: ?proto.XiApi = null,
     xi_opcode: c_int = 0,
@@ -211,6 +225,7 @@ pub const X11Connection = struct {
             .net_wm_window_type_notification = api.XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NOTIFICATION", 0),
             .net_wm_window_type_dialog = api.XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", 0),
             .net_wm_cm_s0 = api.XInternAtom(dpy, "_NET_WM_CM_S0", 0),
+            .net_client_list_stacking = api.XInternAtom(dpy, "_NET_CLIENT_LIST_STACKING", 0),
             .xdnd_aware = api.XInternAtom(dpy, "XdndAware", 0),
             .xdnd_enter = api.XInternAtom(dpy, "XdndEnter", 0),
             .xdnd_position = api.XInternAtom(dpy, "XdndPosition", 0),
@@ -242,6 +257,9 @@ pub const X11Connection = struct {
             .scale = input.env_scale() orelse xftScale(api, dpy),
         };
         self.compose = xkb.Compose.init();
+        self.keyboard = xkb_x11.Keyboard.open(self.display);
+        self.refresh_keyboard_layout();
+        self.init_xkb_events();
         self.init_input_method();
         self.init_xinput();
         self.init_xrandr();
@@ -364,6 +382,8 @@ pub const X11Connection = struct {
     }
 
     pub fn deinit(self: *X11Connection) void {
+        if (self.keyboard) |*k| k.deinit();
+        if (self.blank_cursor != 0) _ = self.api.XFreeCursor(self.display, self.blank_cursor);
         for (self.windows.items) |w| w.close_now();
         for (self.windows.items) |w| w.free();
         self.windows.deinit(self.allocator);
@@ -540,12 +560,23 @@ pub const X11Connection = struct {
         if (self.xim_api) |x| {
             if (x.XFilterEvent(&ev, 0) != 0) return;
         }
+        // XKB events (selected in `init_xkb_events`): new keyboard and map change the keymap, state
+        // only a group switch, which the layout query sees.
+        if (self.xkb_event_base >= 0 and ev.type >= self.xkb_event_base and ev.type <= self.xkb_event_base + 2) {
+            if (ev.type - self.xkb_event_base != 2) {
+                if (self.keyboard) |*k| k.keymap_changed();
+            }
+            self.refresh_keyboard_layout();
+            return;
+        }
         switch (ev.type) {
             proto.SelectionRequest => return self.serve_selection(ev.xselectionrequest),
             // The layout changed; Xlib keeps its old key map until told otherwise.
             proto.MappingNotify => {
                 var mapping = ev.xmapping;
                 _ = self.api.XRefreshKeyboardMapping(&mapping);
+                if (self.keyboard) |*k| k.keymap_changed();
+                self.refresh_keyboard_layout();
                 return;
             },
             proto.SelectionClear => {
@@ -614,14 +645,14 @@ pub const X11Connection = struct {
                 w.update_frame_interval();
             },
             proto.VisibilityNotify => {
-                w.visible = ev.xvisibility.state != proto.VisibilityFullyObscured;
+                w.set_visible(ev.xvisibility.state != proto.VisibilityFullyObscured);
                 if (w.visible) w.frame_wanted = true;
             },
             proto.MapNotify => {
-                w.visible = true;
+                w.set_visible(true);
                 w.frame_wanted = true;
             },
-            proto.UnmapNotify => w.visible = false,
+            proto.UnmapNotify => w.set_visible(false),
             proto.Expose => {
                 if (ev.xexpose.count == 0) w.frame_wanted = true;
             },
@@ -638,15 +669,22 @@ pub const X11Connection = struct {
                 w.base.emit_active(false);
             },
             proto.EnterNotify => {
+                self.pointer_window = w;
                 w.base.emit_hover(true);
             },
             proto.LeaveNotify => {
+                if (self.pointer_window == w) self.pointer_window = null;
                 w.base.emit_hover(false);
                 _ = w.base.emit_input(.{ .mouse_exited = .{ .position = w.logical(ev.xcrossing.x, ev.xcrossing.y), .modifiers = input.modifiers(self.mods) } });
             },
             proto.MotionNotify => {
                 const m = ev.xmotion;
                 self.note_mods(m.state);
+                // Moving the pointer shows a cursor hidden by typing again.
+                if (self.cursor_hidden_window) |hidden| {
+                    self.cursor_hidden_window = null;
+                    hidden.apply_cursor();
+                }
                 _ = w.base.emit_input(.{ .mouse_move = .{
                     .position = w.logical(m.x, m.y),
                     .pressed_button = self.pressed,
@@ -654,9 +692,92 @@ pub const X11Connection = struct {
                 } });
             },
             proto.ButtonPress, proto.ButtonRelease => self.on_button(w, ev.xbutton, ev.type == proto.ButtonPress),
-            proto.KeyPress, proto.KeyRelease => self.on_key(w, ev.xkey, ev.type == proto.KeyPress),
+            proto.KeyPress, proto.KeyRelease => {
+                self.on_key(w, ev.xkey, ev.type == proto.KeyPress);
+                // A key can switch the layout group, so the layout is asked after each one.
+                self.refresh_keyboard_layout();
+            },
             else => {},
         }
+    }
+
+    /// Asks the server for keyboard map and state events, so a layout switch by another client is heard.
+    fn init_xkb_events(self: *X11Connection) void {
+        const query = self.api.XkbQueryExtension orelse return;
+        const select = self.api.XkbSelectEvents orelse return;
+        var opcode: c_int = 0;
+        var event_base: c_int = 0;
+        var error_base: c_int = 0;
+        var major: c_int = 0;
+        var minor: c_int = 0;
+        if (query(self.display, &opcode, &event_base, &error_base, &major, &minor) == 0) return;
+        const mask = proto.XkbNewKeyboardNotifyMask | proto.XkbMapNotifyMask | proto.XkbStateNotifyMask;
+        _ = select(self.display, proto.XkbUseCoreKbd, mask, mask);
+        self.xkb_event_base = event_base;
+    }
+
+    /// Windows front to back, read from `_NET_CLIENT_LIST_STACKING` on the root (GPUI `window_stack`).
+    /// Windows of other applications are not in that list. Valid until the next call.
+    pub fn window_stack(self: *X11Connection) ?[]const *platform.PlatformWindow {
+        var actual_type: proto.Atom = 0;
+        var actual_format: c_int = 0;
+        var nitems: c_ulong = 0;
+        var after: c_ulong = 0;
+        var prop: [*]u8 = undefined;
+        const rc = self.api.XGetWindowProperty(self.display, self.root, self.atoms.net_client_list_stacking, 0, 4096, 0, proto.XA_WINDOW, &actual_type, &actual_format, &nitems, &after, &prop);
+        if (rc != 0 or actual_type != proto.XA_WINDOW or actual_format != 32) return null;
+        defer _ = self.api.XFree(prop);
+        // Format 32 is an array of Xlib `long`s, which are 64 bits here.
+        const ids: [*]const c_ulong = @ptrCast(@alignCast(prop));
+        var n: usize = 0;
+        // The list is bottom to top.
+        var i: usize = nitems;
+        while (i > 0) {
+            i -= 1;
+            const w = self.find_window(ids[i]) orelse continue;
+            if (n == self.stack_buf.len) break;
+            self.stack_buf[n] = &w.base;
+            n += 1;
+        }
+        return self.stack_buf[0..n];
+    }
+
+    /// Hides the cursor over the window the pointer is in, until the pointer moves (GPUI
+    /// `hide_cursor_until_mouse_moves`).
+    pub fn hide_cursor_until_mouse_moves(self: *X11Connection) void {
+        if (self.cursor_hidden_window != null) return;
+        const w = self.pointer_window orelse return;
+        if (w.closed or w.destroyed_by_server) return;
+        _ = self.api.XDefineCursor(self.display, w.x_window, self.blank());
+        self.cursor_hidden_window = w;
+    }
+
+    pub fn is_cursor_visible(self: *const X11Connection) bool {
+        return self.cursor_hidden_window == null;
+    }
+
+    /// A cursor that draws nothing, made on first use.
+    fn blank(self: *X11Connection) Cursor {
+        if (self.blank_cursor != 0) return self.blank_cursor;
+        const data = [_]u8{0};
+        const pixmap = self.api.XCreateBitmapFromData(self.display, self.root, &data, 1, 1);
+        var black: proto.XColor = .{ .pixel = 0, .red = 0, .green = 0, .blue = 0, .flags = 0, .pad = 0 };
+        self.blank_cursor = self.api.XCreatePixmapCursor(self.display, pixmap, pixmap, &black, &black, 0, 0);
+        _ = self.api.XFreePixmap(self.display, pixmap);
+        return self.blank_cursor;
+    }
+
+    /// Reads the layout now in effect and tells the app if it changed (GPUI `handle_keyboard_layout_change`).
+    fn refresh_keyboard_layout(self: *X11Connection) void {
+        const kb = if (self.keyboard) |*k| k else return;
+        const name = kb.layout_name() orelse "unknown";
+        if (!self.layout.set(name)) return;
+        if (self.platform_) |p| p.emit_keyboard_layout_changed();
+    }
+
+    /// The layout in effect, as of the last key or mapping event.
+    pub fn keyboard_layout(self: *const X11Connection) platform.KeyboardLayout {
+        return self.layout.get();
     }
 
     fn note_mods(self: *X11Connection, state: c_uint) void {
@@ -869,8 +990,10 @@ pub const X11Connection = struct {
                 if (e.mode != proto.NotifyNormal) return;
                 const w = self.find_window(e.event) orelse return;
                 if (ev.xcookie.evtype == proto.XI_Enter) {
+                    self.pointer_window = w;
                     w.base.emit_hover(true);
                 } else {
+                    if (self.pointer_window == w) self.pointer_window = null;
                     _ = w.base.emit_input(.{ .mouse_exited = .{
                         .position = w.logical_f(e.event_x, e.event_y),
                         .pressed_button = self.pressed,
@@ -923,6 +1046,11 @@ pub const X11Connection = struct {
                 const mask = if (e.valuators.mask) |m| m[0..@intCast(@max(e.valuators.mask_len, 0))] else &[_]u8{};
                 // Scrolling also arrives as motion: the pointer only moved if axis 0 or 1 did.
                 if (mask.len > 0 and mask[0] & 3 != 0) {
+                    // Moving the pointer shows a cursor hidden by typing again.
+                    if (self.cursor_hidden_window) |hidden| {
+                        self.cursor_hidden_window = null;
+                        hidden.apply_cursor();
+                    }
                     _ = w.base.emit_input(.{ .mouse_move = .{ .position = pos, .pressed_button = self.pressed, .modifiers = mods } });
                 }
                 if (e.valuators.values) |values| {
@@ -1462,7 +1590,34 @@ pub const X11Window = struct {
         conn.flush();
     }
 
+    /// Records whether the window is presented, and tells the app when that changes.
+    fn set_visible(self: *X11Window, v: bool) void {
+        if (self.visible == v) return;
+        self.visible = v;
+        self.base.emit_visibility_changed();
+    }
+
+    fn windowVisibility(p: *platform.PlatformWindow) platform.WindowVisibility {
+        const self: *X11Window = @fieldParentPtr("base", p);
+        return if (self.visible) .visible else .hidden;
+    }
+
+    /// X11 has one screen, reported as display 0, and a window never changes screen. So
+    /// `on_display_changed` is a no-op here, as in GPUI.
+    fn windowDisplayId(_: *platform.PlatformWindow) ?platform.DisplayId {
+        return 0;
+    }
+
+    fn gpuSpecs(p: *platform.PlatformWindow) ?platform.GpuSpecs {
+        const self: *X11Window = @fieldParentPtr("base", p);
+        if (self.gpu_window) |*g| return g.gpu_specs();
+        return null;
+    }
+
     const vtable: platform.PlatformWindow.VTable = .{
+        .visibility = windowVisibility,
+        .display_id = windowDisplayId,
+        .gpu_specs = gpuSpecs,
         .play_system_bell = playSystemBell,
         .update_ime_enabled = updateImeEnabled,
         .update_ime_position = updateImePosition,
@@ -1905,6 +2060,8 @@ pub const X11Window = struct {
             if (self.conn.xsync_api) |sync| _ = sync.XSyncDestroyCounter(self.conn.display, self.sync_counter);
             self.sync_counter = 0;
         }
+        if (self.conn.cursor_hidden_window == self) self.conn.cursor_hidden_window = null;
+        if (self.conn.pointer_window == self) self.conn.pointer_window = null;
         // The Vulkan surface must die before the X window it wraps.
         if (self.gpu_window) |*g| {
             g.deinit();

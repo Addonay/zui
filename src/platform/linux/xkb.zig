@@ -32,6 +32,8 @@ pub const Keymap = opaque {};
 pub const State = opaque {};
 
 pub const XKB_KEYMAP_FORMAT_TEXT_V1: c_uint = 1;
+/// The layout in effect after all modifiers and latches (`xkb_state_component`).
+pub const XKB_STATE_LAYOUT_EFFECTIVE: c_uint = 1 << 7;
 pub const XKB_KEYMAP_COMPILE_NO_FLAGS: c_uint = 0;
 pub const XKB_KEY_DOWN: c_uint = 1;
 pub const XKB_KEY_UP: c_uint = 0;
@@ -47,6 +49,8 @@ pub const XkbStateUpdateKeyFn = *const fn (*State, u32, c_uint) callconv(.c) c_u
 pub const XkbStateUpdateMaskFn = *const fn (*State, u32, u32, u32, u32, u32, u32) callconv(.c) c_uint;
 pub const XkbStateKeyGetOneSymFn = *const fn (*State, u32) callconv(.c) u32;
 pub const XkbStateKeyGetUtf8Fn = *const fn (*State, u32, [*]u8, usize) callconv(.c) c_int;
+pub const XkbStateSerializeLayoutFn = *const fn (*State, c_uint) callconv(.c) u32;
+pub const XkbKeymapLayoutGetNameFn = *const fn (*Keymap, u32) callconv(.c) ?[*:0]const u8;
 
 pub const XkbApi = struct {
     context_new: XkbContextNewFn,
@@ -60,6 +64,8 @@ pub const XkbApi = struct {
     state_update_mask: XkbStateUpdateMaskFn,
     state_key_get_one_sym: XkbStateKeyGetOneSymFn,
     state_key_get_utf8: XkbStateKeyGetUtf8Fn,
+    state_serialize_layout: XkbStateSerializeLayoutFn,
+    keymap_layout_get_name: XkbKeymapLayoutGetNameFn,
 
     pub fn load(lib: dl.Library) ?XkbApi {
         return .{
@@ -74,6 +80,8 @@ pub const XkbApi = struct {
             .state_update_mask = lib.lookup(XkbStateUpdateMaskFn, "xkb_state_update_mask") orelse return null,
             .state_key_get_one_sym = lib.lookup(XkbStateKeyGetOneSymFn, "xkb_state_key_get_one_sym") orelse return null,
             .state_key_get_utf8 = lib.lookup(XkbStateKeyGetUtf8Fn, "xkb_state_key_get_utf8") orelse return null,
+            .state_serialize_layout = lib.lookup(XkbStateSerializeLayoutFn, "xkb_state_serialize_layout") orelse return null,
+            .keymap_layout_get_name = lib.lookup(XkbKeymapLayoutGetNameFn, "xkb_keymap_layout_get_name") orelse return null,
         };
     }
 
@@ -167,6 +175,16 @@ pub const Xkb = struct {
         return self.api.state_key_get_one_sym(st, xkb_code);
     }
 
+    /// The name of the layout in effect, such as "English (US)", or null without a keymap. The
+    /// name points into the keymap, so copy it before the keymap changes.
+    pub fn layout_name(self: *Xkb) ?[]const u8 {
+        const st = self.state orelse return null;
+        const keymap = self.keymap orelse return null;
+        const index = self.api.state_serialize_layout(st, XKB_STATE_LAYOUT_EFFECTIVE);
+        const name = self.api.keymap_layout_get_name(keymap, index) orelse return null;
+        return std.mem.span(name);
+    }
+
     /// UTF-8 text for a key in the current layout. Returns byte count (0 =
     /// no text, e.g. modifiers and dead keys). snprintf-like: pass NULL/0
     /// to query, but callers here always have a stack buffer.
@@ -175,6 +193,28 @@ pub const Xkb = struct {
         const n = self.api.state_key_get_utf8(st, xkb_code, out.ptr, out.len);
         if (n <= 0) return 0;
         return @intCast(@min(n, out.len));
+    }
+};
+
+/// The name of the keyboard layout a connection uses, kept in the connection so that the platform
+/// can hand out slices of it (GPUI `LinuxKeyboardLayout`).
+pub const LayoutName = struct {
+    buf: [64]u8 = undefined,
+    len: usize = 0,
+
+    /// Stores `name`, cut to the buffer. Returns whether it differs from what was stored.
+    pub fn set(self: *LayoutName, name: []const u8) bool {
+        const n = @min(name.len, self.buf.len);
+        if (self.len == n and std.mem.eql(u8, self.buf[0..n], name[0..n])) return false;
+        @memcpy(self.buf[0..n], name[0..n]);
+        self.len = n;
+        return true;
+    }
+
+    /// The layout as the platform reports it. Its id and name are the same string.
+    pub fn get(self: *const LayoutName) platform.KeyboardLayout {
+        const n: []const u8 = if (self.len == 0) "unknown" else self.buf[0..self.len];
+        return .{ .id = n, .name = n };
     }
 };
 

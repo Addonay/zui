@@ -615,6 +615,15 @@ pub const SelectionNotify: c_int = 31;
 pub const MappingNotify: c_int = 34;
 pub const XA_PRIMARY: Atom = 1;
 pub const XA_ATOM: Atom = 4;
+pub const XA_WINDOW: Atom = 33;
+pub const Pixmap = c_ulong;
+/// Xlib's `XColor` (64-bit layout).
+pub const XColor = extern struct { pixel: c_ulong, red: u16, green: u16, blue: u16, flags: u8, pad: u8 };
+/// XKB event mask bits and the core keyboard device (XKBlib.h).
+pub const XkbNewKeyboardNotifyMask: c_ulong = 1 << 0;
+pub const XkbMapNotifyMask: c_ulong = 1 << 1;
+pub const XkbStateNotifyMask: c_ulong = 1 << 2;
+pub const XkbUseCoreKbd: c_uint = 0x0100;
 pub const XA_CARDINAL: Atom = 6;
 pub const CW_OVERRIDE_REDIRECT: c_ulong = 1 << 9;
 
@@ -757,6 +766,12 @@ pub const Api = struct {
     XDeleteProperty: *const fn (*Display, Window, Atom) callconv(.c) c_int,
     XGetWindowProperty: *const fn (*Display, Window, Atom, c_long, c_long, Bool, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *[*]u8) callconv(.c) c_int,
     XFree: *const fn (*anyopaque) callconv(.c) c_int,
+    XCreateBitmapFromData: *const fn (*Display, Drawable, [*]const u8, c_uint, c_uint) callconv(.c) Pixmap,
+    XCreatePixmapCursor: *const fn (*Display, Pixmap, Pixmap, *XColor, *XColor, c_uint, c_uint) callconv(.c) Cursor,
+    XFreePixmap: *const fn (*Display, Pixmap) callconv(.c) c_int,
+    /// Optional: without XKB events a layout change by another client is only seen on the next key.
+    XkbQueryExtension: ?*const fn (*Display, *c_int, *c_int, *c_int, *c_int, *c_int) callconv(.c) Bool = null,
+    XkbSelectEvents: ?*const fn (*Display, c_uint, c_ulong, c_ulong) callconv(.c) Bool = null,
     XConvertSelection: *const fn (*Display, Atom, Atom, Atom, Window, Time) callconv(.c) c_int,
     XSetSelectionOwner: *const fn (*Display, Atom, Window, Time) callconv(.c) c_int,
     XGetSelectionOwner: *const fn (*Display, Atom) callconv(.c) Window,
@@ -810,6 +825,11 @@ pub const Api = struct {
             .XDeleteProperty = lib.lookup(*const fn (*Display, Window, Atom) callconv(.c) c_int, "XDeleteProperty") orelse return null,
             .XGetWindowProperty = lib.lookup(*const fn (*Display, Window, Atom, c_long, c_long, Bool, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *[*]u8) callconv(.c) c_int, "XGetWindowProperty") orelse return null,
             .XFree = lib.lookup(*const fn (*anyopaque) callconv(.c) c_int, "XFree") orelse return null,
+            .XCreateBitmapFromData = lib.lookup(*const fn (*Display, Drawable, [*]const u8, c_uint, c_uint) callconv(.c) Pixmap, "XCreateBitmapFromData") orelse return null,
+            .XCreatePixmapCursor = lib.lookup(*const fn (*Display, Pixmap, Pixmap, *XColor, *XColor, c_uint, c_uint) callconv(.c) Cursor, "XCreatePixmapCursor") orelse return null,
+            .XFreePixmap = lib.lookup(*const fn (*Display, Pixmap) callconv(.c) c_int, "XFreePixmap") orelse return null,
+            .XkbQueryExtension = lib.lookup(*const fn (*Display, *c_int, *c_int, *c_int, *c_int, *c_int) callconv(.c) Bool, "XkbQueryExtension"),
+            .XkbSelectEvents = lib.lookup(*const fn (*Display, c_uint, c_ulong, c_ulong) callconv(.c) Bool, "XkbSelectEvents"),
             .XConvertSelection = lib.lookup(*const fn (*Display, Atom, Atom, Atom, Window, Time) callconv(.c) c_int, "XConvertSelection") orelse return null,
             .XSetSelectionOwner = lib.lookup(*const fn (*Display, Atom, Window, Time) callconv(.c) c_int, "XSetSelectionOwner") orelse return null,
             .XGetSelectionOwner = lib.lookup(*const fn (*Display, Atom) callconv(.c) Window, "XGetSelectionOwner") orelse return null,

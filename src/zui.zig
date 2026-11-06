@@ -347,6 +347,19 @@ pub const SystemMenuType = app_menu.SystemMenuType;
 pub const SystemNotification = platform.SystemNotification;
 pub const SystemNotificationAction = platform.SystemNotificationAction;
 pub const SystemNotificationResponse = platform.SystemNotificationResponse;
+pub const WindowVisibility = platform.WindowVisibility;
+pub const DisplayId = platform.DisplayId;
+pub const DisplayEvent = platform.DisplayEvent;
+pub const DisplayChanges = platform.DisplayChanges;
+pub const ActivationPolicy = platform.ActivationPolicy;
+pub const CursorHideMode = app.CursorHideMode;
+pub const PlatformInfo = platform.PlatformInfo;
+pub const OperatingSystem = platform.OperatingSystem;
+pub const PlatformTarget = platform.PlatformTarget;
+pub const GraphicalEnvironment = platform.GraphicalEnvironment;
+pub const KeyboardLayout = platform.KeyboardLayout;
+pub const KeyboardMapper = platform.KeyboardMapper;
+pub const GpuSpecs = platform.GpuSpecs;
 
 /// Common imports (GPUI `prelude`).
 pub const prelude = struct {
