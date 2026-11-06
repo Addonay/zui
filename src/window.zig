@@ -2211,9 +2211,11 @@ pub const Window = struct {
             i -= 1;
             for (tree.node(path[i]).action_listeners.items) |l| {
                 if (l.action_type != action.type_id) continue;
+                // Bubble listeners stop the action unless they call `App.propagate`.
                 self.propagate_event = false;
+                cx.propagate_event = false;
                 l.func(l.ctx, action.ptr, .bubble, self, cx);
-                if (!self.propagate_event) return;
+                if (!cx.propagate_event) return;
             }
         }
         cx.dispatch_global_action(action);

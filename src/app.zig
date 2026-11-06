@@ -975,15 +975,35 @@ pub const AnyDrag = struct {
 pub const Subscription = struct {
     app: ?*App,
     id: u64,
+    /// Nonzero for a subscription made by `join`: `group - 1` indexes `App.subscription_groups`.
+    group: u32 = 0,
+
+    /// Joins two subscriptions into one that unsubscribes both (GPUI `Subscription::join`).
+    /// Both belong to the same app. The joined ids are kept by the app until it is deinitialized.
+    pub fn join(a: Subscription, b: Subscription) Subscription {
+        const app = a.app orelse return b;
+        var ids: std.ArrayList(u64) = .empty;
+        a.append_ids(&ids, app);
+        b.append_ids(&ids, app);
+        app.subscription_groups.append(app.allocator, ids) catch oom();
+        return .{ .app = app, .id = 0, .group = @intCast(app.subscription_groups.items.len) };
+    }
+
+    fn append_ids(self: Subscription, ids: *std.ArrayList(u64), app: *App) void {
+        if (self.group == 0) {
+            ids.append(app.allocator, self.id) catch oom();
+            return;
+        }
+        for (app.subscription_groups.items[self.group - 1].items) |id| ids.append(app.allocator, id) catch oom();
+    }
 
     pub fn detach(self: Subscription) void {
         _ = self;
     }
     pub fn unsubscribe(self: Subscription) void {
         const app = self.app orelse return;
-        for (app.subscribers.items) |*s| if (s.id == self.id) {
-            s.active = false;
-        };
+        if (self.group == 0) return app.deactivate_subscriber(self.id);
+        for (app.subscription_groups.items[self.group - 1].items) |id| app.deactivate_subscriber(id);
     }
     pub fn deinit(self: Subscription) void {
         self.unsubscribe();
@@ -1075,6 +1095,11 @@ pub const App = struct {
     shut_down: bool = false,
     quit_mode: QuitMode = .default,
     reduce_motion: bool = false,
+    /// Set by `propagate`. A bubble-phase action listener stops propagation by default, and calls
+    /// `propagate` to let the action reach the handlers above it.
+    propagate_event: bool = true,
+    /// The subscription ids each `Subscription.join` made. Freed by `deinit`.
+    subscription_groups: std.ArrayList(std.ArrayList(u64)) = .empty,
     async_app: AsyncApp = undefined,
 
     pub fn init(allocator: std.mem.Allocator, platform: *platform_mod.Platform) !*App {
@@ -1132,6 +1157,8 @@ pub const App = struct {
         // Subscribers that were never compacted still own their contexts.
         for (self.subscribers.items) |s| if (s.owned) |o| o.free(self.allocator, o.ptr);
         self.subscribers.deinit(self.allocator);
+        for (self.subscription_groups.items) |*g| g.deinit(self.allocator);
+        self.subscription_groups.deinit(self.allocator);
         self.pending_effects.deinit(self.allocator);
         self.effect_arena.deinit();
         self.text_system_.destroy();
@@ -1501,6 +1528,65 @@ pub const App = struct {
             }
         };
         return self.add_observer(observed.entity_id(), 0, S.call);
+    }
+
+    fn deactivate_subscriber(self: *App, id: u64) void {
+        for (self.subscribers.items) |*s| if (s.id == id) {
+            s.active = false;
+        };
+    }
+
+    /// Runs `f(released, cx)` when `observed` is released, once (GPUI `App::observe_release`).
+    /// `released` is the entity's state, valid for the call only.
+    pub fn observe_release(self: *App, observed: anytype, comptime f: anytype) Subscription {
+        const T2 = @TypeOf(observed).Type;
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const released: *T2 = @ptrCast(@alignCast(@constCast(payload.?)));
+                f(released, app);
+                return false;
+            }
+        };
+        return self.add_release_listener(observed.entity_id(), S.call);
+    }
+
+    /// Runs `f(released, window, cx)` when `observed` is released, once (GPUI
+    /// `App::observe_release_in`). Does nothing if `window` has closed by then.
+    pub fn observe_release_in(self: *App, observed: anytype, window: *Window, comptime f: anytype) Subscription {
+        const T2 = @TypeOf(observed).Type;
+        const S = struct {
+            fn call(app: *App, _: EntityId, ctx: usize, payload: ?*const anyopaque) bool {
+                const win = app.window_by_id(@intCast(ctx)) orelse return false;
+                const released: *T2 = @ptrCast(@alignCast(@constCast(payload.?)));
+                f(released, win, app);
+                return false;
+            }
+        };
+        return self.add_subscriber(.{ .kind = .release, .emitter = observed.entity_id().as_u64(), .ctx = window.handle_id, .func = S.call, .id = 0 });
+    }
+
+    /// Lets the action being dispatched continue to the handlers above the one that called this
+    /// (GPUI `App::propagate`). Action handlers stop propagation by default during the bubble phase.
+    pub fn propagate(self: *App) void {
+        self.propagate_event = true;
+    }
+
+    /// Runs `f(view, window, cx, args...)` in the window, where `view` is its root view (GPUI
+    /// `App::update_window`). Fails with `error.WindowClosed` when the window is gone.
+    pub fn update_window(self: *App, handle: window_mod.AnyWindowHandle, comptime f: anytype, args: anytype) error{WindowClosed}!ReturnOf(f) {
+        const win = self.window_by_id(handle.id) orelse return error.WindowClosed;
+        const view = win.root orelse return error.WindowClosed;
+        const result = @call(.auto, f, .{ view, win, self } ++ args);
+        self.flush_effects();
+        return result;
+    }
+
+    /// Runs `f(root_entity, cx, args...)` with the window's root view (GPUI `App::read_window`).
+    /// `V` is the root view type of `handle`.
+    pub fn read_window(self: *App, comptime V: type, handle: window_mod.WindowHandle(V), comptime f: anytype, args: anytype) error{WindowClosed}!ReturnOf(f) {
+        _ = self.window_by_id(handle.window_id) orelse return error.WindowClosed;
+        const entity: Entity(V) = .{ .entity_id_ = handle.entity_id_ };
+        return @call(.auto, f, .{ entity, self } ++ args);
     }
 
     /// Subscribes to an entity's events from outside any entity: `f(emitter, event, cx)`.
