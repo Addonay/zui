@@ -101,6 +101,7 @@ src/platform/linux.zig + linux/{wayland,wayland_proto,x11,x11_proto,xkb,input,dl
 src/platform/linux/text_input_state.zig  text-input-v3 double-buffered state, no Wayland in it
 src/platform/linux/xim_preedit.zig       XIM composition edits, no X11 in it
 src/platform/linux/x11_scroll.zig        XInput2 scroll valuators, no X11 in it
+src/platform/linux/dbus.zig system_notifications.zig   D-Bus client, and notifications on it
 src/platform/linux/xdnd.zig              text/uri-list parsing for file drags
 src/platform/linux/wayland_scroll.zig    wl_pointer axis frames, no Wayland in it
 src/renderer/cpu.zig     CPU renderer
@@ -297,6 +298,9 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   library built optimized even in Debug. Not `stb_image`, which is not meant for untrusted files, and images
   now come from arbitrary URLs. Wuffs decodes one frame of an animated WebP, so the Zig side walks the RIFF
   chunks and composites, and that Zig is the part where a memory bug could live.
+- **D-Bus**: `platform/linux/dbus.zig` is a client in Zig with no libdbus, non-blocking and polled from the
+  platform loop. Test it only against a fake server on a private bus (see the isolation recipe below): a test
+  must never reach the real session bus. Notifications are on top of it, in `linux/system_notifications.zig`.
 - **Remote images**: `AssetCache` starts a fetch on first use and returns `error.Loading`, which `img`
   shows as `with_loading`, and the windows refresh when it settles. Each fetch runs on a `std.Io.Threaded`
   of its own in an `Io.Group`, not on the background executor, so quitting can cancel a download stuck on

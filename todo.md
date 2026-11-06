@@ -338,7 +338,9 @@ types: Prompt
 - [ ] `ContainerQuery` is a styled element with an id and interactivity, which GPUI's is not; `Percentage`
       arithmetic and a `Radians` type are not ported
 - [ ] `set_menus` is stored but only macOS will draw it
-- [ ] Linux notifications: the API exists, but posting needs a D-Bus client, which ZUI lacks
+- [ ] Notifications on the real GNOME Shell: only a fake server has been tested. A server that never answers leaves
+      that tag waiting forever (no timeout). The first post connects synchronously, blocking for up to 1 s
+- [ ] File dialogs (`prompt_for_paths`), credentials and `window_appearance` can now build on `linux/dbus.zig`
 - [ ] Scroll: ZUI stops propagation in the scroll listener and GPUI does not, so nested scrollers differ
 - [ ] `Unbind` (needs GPUI's binding precedence model), `InputPreference`, pausing the pending-input timeout
 - [ ] `keyboard_layout` and its change observer
