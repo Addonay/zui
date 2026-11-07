@@ -74,7 +74,28 @@ pub const HeadlessPlatform = struct {
         .prompt_for_paths = promptForPaths,
         .prompt_for_new_path = promptForNewPath,
         .restart = restart,
+        .set_initial_windowing = setInitialWindowing,
+        .request_windowing = requestWindowing,
     };
+
+    /// Accepts only headless: this platform never has a display to start in (GPUI
+    /// `Platform::set_initial_windowing`, which a headless platform answers the same way).
+    fn setInitialWindowing(_: *platform.Platform, request: platform.WindowingRequest) anyerror!void {
+        return switch (request) {
+            .headless => {},
+            .windowed => error.WindowingNotSupported,
+        };
+    }
+
+    /// Refuses every switch: it is already headless and cannot connect to a display (GPUI
+    /// `Platform::request_windowing`, where a platform that cannot switch fails the request).
+    fn requestWindowing(p: *platform.Platform, request: platform.WindowingRequest) anyerror!void {
+        _ = p;
+        return switch (request) {
+            .headless => error.AlreadyHeadless,
+            .windowed => error.WindowingNotSupported,
+        };
+    }
 
     fn windowAppearance(p: *Platform) platform.WindowAppearance {
         return from(p).appearance;
@@ -192,26 +213,62 @@ pub const HeadlessPlatform = struct {
     /// call instead of keeping the pump busy until its guard. Real time moves them on, as a
     /// display's frame callback does.
     pub fn run_until_idle(self: *HeadlessPlatform, app: *app_mod.App) void {
+        self.promote_draw_requests();
+        var guard: usize = 0;
+        while (!self.quit_requested and guard < 10_000) : (guard += 1) {
+            var did = app.foreground_executor().run_pending() > 0;
+            if (self.draw_requested_frames()) did = true;
+            if (!did) break;
+        }
+    }
+
+    /// Moves frames that draws asked for into the next pump, so an animation draws once per pump.
+    /// Used by the Linux platform's headless mode, which pumps in its own loop (no GPUI counterpart:
+    /// GPUI's headless Linux platform keeps frame requests in the window itself).
+    pub fn promote_draw_requests(self: *HeadlessPlatform) void {
         for (self.windows.items) |w| {
             if (w.frame_requested_by_draw) {
                 w.frame_requested_by_draw = false;
                 w.frame_requested = true;
             }
         }
-        var guard: usize = 0;
-        while (!self.quit_requested and guard < 10_000) : (guard += 1) {
-            var did = app.foreground_executor().run_pending() > 0;
-            for (self.windows.items) |w| {
-                if (w.frame_requested) {
-                    w.frame_requested = false;
-                    w.drawing = true;
-                    w.base.emit_request_frame(.{});
-                    w.drawing = false;
-                    did = true;
-                }
+    }
+
+    /// Draws every window that asked for a frame, once. Returns whether any frame was drawn.
+    /// No GPUI counterpart: GPUI's headless window is drawn by the platform's frame timer.
+    ///
+    /// Deliberately naive: it walks every window on every pump. A faster version would keep a list
+    /// of the windows that asked, which only matters with many windows.
+    pub fn draw_requested_frames(self: *HeadlessPlatform) bool {
+        var did = false;
+        for (self.windows.items) |w| {
+            if (w.frame_requested) {
+                w.frame_requested = false;
+                w.drawing = true;
+                w.base.emit_request_frame(.{});
+                w.drawing = false;
+                did = true;
             }
-            if (!did) break;
         }
+        return did;
+    }
+
+    /// Whether some window still wants a frame, so a loop should wake for one without waiting for
+    /// an event. No GPUI counterpart (see `draw_requested_frames`).
+    pub fn frames_pending(self: *HeadlessPlatform) bool {
+        for (self.windows.items) |w| {
+            if (w.frame_requested or w.frame_requested_by_draw) return true;
+        }
+        return false;
+    }
+
+    /// Opens a window on this platform, as `Platform::open_window` does (no GPUI counterpart beyond
+    /// the platform's). Returns the window's base, owned by this platform until it closes.
+    pub fn open_window_base(self: *HeadlessPlatform, options: window_mod.WindowOptions) !*PlatformWindow {
+        const w = try HeadlessWindow.create(self, options);
+        errdefer w.destroy();
+        try self.windows.append(self.allocator, w);
+        return &w.base;
     }
 
     fn quit(p: *Platform) void {
@@ -231,10 +288,7 @@ pub const HeadlessPlatform = struct {
 
     /// Like gpui_linux's headless platform, every kind opens a plain window: no popup placement.
     fn openWindow(p: *Platform, options: window_mod.WindowOptions, _: ?*PlatformWindow) anyerror!*PlatformWindow {
-        const self = from(p);
-        const w = try HeadlessWindow.create(self, options);
-        try self.windows.append(self.allocator, w);
-        return &w.base;
+        return from(p).open_window_base(options);
     }
 
     fn displays(p: *Platform) []const platform.Display {

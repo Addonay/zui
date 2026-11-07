@@ -221,15 +221,15 @@ pub const X11Connection = struct {
     /// Backing storage for `displays`: one entry per CRTC (at most `crtc_rates.len`), or the screen.
     display_storage: [16]Display = undefined,
 
-    /// Connects to the X server named by DISPLAY.
-    pub fn connect(allocator: std.mem.Allocator) !*X11Connection {
-        if (std.c.getenv("DISPLAY") == null) return error.NoDisplay;
+    /// Connects to the X server `display` names, as `DISPLAY` does (GPUI `X11Client::new` with the
+    /// display it resolved from the environment).
+    pub fn connect(allocator: std.mem.Allocator, display: [:0]const u8) !*X11Connection {
         var lib = dl.Library.open(&.{ "libX11.so.6", "libX11.so" }) orelse return error.LibraryNotFound;
         const api = proto.Api.load(lib) orelse {
             lib.close();
             return error.MissingSymbols;
         };
-        const dpy = api.XOpenDisplay(null) orelse {
+        const dpy = api.XOpenDisplay(display.ptr) orelse {
             lib.close();
             return error.CannotOpenDisplay;
         };

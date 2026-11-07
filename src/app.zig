@@ -1185,6 +1185,10 @@ pub const App = struct {
     restart_arguments: []const []const u8 = &.{},
     entities: EntityMap = .{},
     windows: std.ArrayList(?*Window) = .empty,
+    /// The windowing switch waiting for the foreground executor, with the generation of the request
+    /// that made it. A request made later replaces it, and its own task then finds it superseded.
+    pending_windowing: ?PendingWindowing = null,
+    windowing_generation: u64 = 0,
     globals: std.AutoHashMapUnmanaged(TypeId, GlobalSlot) = .empty,
     subscribers: std.ArrayList(Subscriber) = .empty,
     next_subscription_id: u64 = 1,
@@ -1303,6 +1307,8 @@ pub const App = struct {
         self.shutdown();
         // The platform must not call back into an app that is going away.
         self.platform.clear_app_listeners();
+        if (self.pending_windowing) |pending| pending.request.deinit();
+        self.pending_windowing = null;
         self.display_snapshot.deinit(self.allocator);
         self.window_stack_storage.deinit(self.allocator);
         if (self.system_notification_response) |h| h.free(self.allocator, h.ctx);
@@ -2255,6 +2261,37 @@ pub const App = struct {
         self.platform.quit();
     }
 
+    /// A requested windowing switch, copied so that it outlives the caller (no GPUI counterpart).
+    const PendingWindowing = struct {
+        generation: u64,
+        request: platform_mod.OwnedWindowingRequest,
+    };
+
+    /// Switches the platform between headless and windowed modes (GPUI `App::request_windowing`). The
+    /// switch is applied by the foreground executor, between event-loop iterations, so it never runs
+    /// inside an event handler. The task fails when windows are open, which belong to the display
+    /// server that opened them, when the platform cannot make the switch, or when a later request
+    /// replaced this one before it ran.
+    pub fn request_windowing(self: *App, request: platform_mod.WindowingRequest) executor_mod.Task(anyerror!void) {
+        if (self.window_count() > 0) return .ready(error.WindowsAreOpen);
+        const owned = platform_mod.OwnedWindowingRequest.dupe(self.allocator, request) catch
+            return .ready(error.OutOfMemory);
+        if (self.pending_windowing) |pending| pending.request.deinit();
+        self.windowing_generation += 1;
+        self.pending_windowing = .{ .generation = self.windowing_generation, .request = owned };
+        return self.foreground_executor().spawn(apply_windowing_request, .{ self, self.windowing_generation });
+    }
+
+    /// Applies the pending switch if `generation` is still the current request.
+    fn apply_windowing_request(self: *App, generation: u64) anyerror!void {
+        const pending = self.pending_windowing orelse return error.Superseded;
+        if (pending.generation != generation) return error.Superseded;
+        self.pending_windowing = null;
+        defer pending.request.deinit();
+        if (self.window_count() > 0) return error.WindowsAreOpen;
+        return self.platform.request_windowing(pending.request.request);
+    }
+
     /// Brings the application to the foreground.
     pub fn activate(self: *App, ignoring_other_apps: bool) void {
         self.platform.activate(ignoring_other_apps);
@@ -2923,6 +2960,22 @@ pub const Application = struct {
         return self;
     }
 
+    /// Sets the windowing mode the app starts in (GPUI `Application::with_windowing`). It defaults to
+    /// the process's own display server, or headless when that names none. Panics when the platform
+    /// cannot start in `request`, since the app could not start as asked. The headless platform only
+    /// starts headless, and the Linux platform only in the modes it was created to allow.
+    pub fn with_windowing(self: Application, request: platform_mod.WindowingRequest) Application {
+        self.platform.set_initial_windowing(request) catch |err|
+            std.debug.panic("with_windowing: the platform cannot start in that mode ({s})", .{@errorName(err)});
+        return self;
+    }
+
+    /// Creates the application on `platform`, which the caller made (GPUI `Application::with_platform`).
+    /// The app takes the platform over and frees it when `run` returns.
+    pub fn with_platform(allocator: std.mem.Allocator, platform: *platform_mod.Platform) Application {
+        return init_with(allocator, platform);
+    }
+
     /// Sets when the app quits by itself, after its last window closes (GPUI `with_quit_mode`).
     pub fn with_quit_mode(self: Application, mode: QuitMode) Application {
         self.app.set_quit_mode(mode);
@@ -3016,6 +3069,21 @@ test "defer runs at the end of the current update, not during it" {
     cx.app.update(S.go, .{});
     try std.testing.expectEqual(@as(u32, 0), S.seen_during_update);
     try std.testing.expectEqual(@as(u32, 1), S.runs);
+}
+
+test "request_windowing answers on the foreground executor, and a newer request supersedes an older one" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    // The older request copies its strings, which the newer one frees when it replaces it.
+    var buffer = "wayland-0".*;
+    var first = cx.app.request_windowing(.{ .windowed = .{ .wayland_display = &buffer } });
+    var second = cx.app.request_windowing(.headless);
+    _ = cx.app.foreground_executor().run_pending();
+    const first_result = first.get() orelse return error.TestUnexpectedResult;
+    try std.testing.expectError(error.Superseded, first_result);
+    const second_result = second.get() orelse return error.TestUnexpectedResult;
+    // The headless test platform cannot switch: a request for headless is already satisfied.
+    try std.testing.expectError(error.AlreadyHeadless, second_result);
 }
 
 test "deprecation maps are empty without deprecated actions" {

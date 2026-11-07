@@ -42,6 +42,7 @@ const examples = [_][]const u8{
     "window",
     "window_positioning",
     "move_entity_between_windows",
+    "toggle_headless",
 };
 
 pub fn build(b: *std.Build) void {
