@@ -110,7 +110,31 @@ const DragSession = struct {
 };
 
 /// A monitor's rectangle and how often it refreshes.
-const CrtcRate = struct { x: c_int, y: c_int, w: c_int, h: c_int, interval_ms: i64 };
+/// One active RandR CRTC, which is one monitor. `id` is the CRTC's XID, the display id, and `uuid`
+/// names the monitor's output the way GPUI names Wayland outputs (null when the output has no name).
+const CrtcRate = struct { id: u32, x: c_int, y: c_int, w: c_int, h: c_int, interval_ms: i64, uuid: ?platform.Uuid = null };
+
+/// The CRTC holding the physical root-window point (x, y), or null when no monitor does. Points
+/// on the edge between two monitors belong to the one that starts there, so a window is never
+/// on two displays at once.
+fn crtc_index_at(rates: []const CrtcRate, x: c_int, y: c_int) ?usize {
+    for (rates, 0..) |c, i| {
+        if (x >= c.x and y >= c.y and x < c.x + c.w and y < c.y + c.h) return i;
+    }
+    return null;
+}
+
+test "crtc_index_at picks the monitor holding a point" {
+    const rates = [_]CrtcRate{
+        .{ .id = 10, .x = 0, .y = 0, .w = 1920, .h = 1080, .interval_ms = 16 },
+        .{ .id = 11, .x = 1920, .y = 0, .w = 1280, .h = 1024, .interval_ms = 16 },
+    };
+    try std.testing.expectEqual(@as(?usize, 0), crtc_index_at(&rates, 0, 0));
+    try std.testing.expectEqual(@as(?usize, 0), crtc_index_at(&rates, 1919, 1079));
+    try std.testing.expectEqual(@as(?usize, 1), crtc_index_at(&rates, 1920, 0));
+    try std.testing.expectEqual(@as(?usize, null), crtc_index_at(&rates, 3200, 0));
+    try std.testing.expectEqual(@as(?usize, null), crtc_index_at(&rates, -1, 0));
+}
 
 /// Latched Xlib error handler: a failed request is logged and dropped rather
 /// than exiting the process (Xlib's default would kill every window).
@@ -194,7 +218,8 @@ pub const X11Connection = struct {
     owning_selection: bool = false,
     clip_read: ?[]u8 = null,
     dead: bool = false,
-    display_storage: [1]Display = undefined,
+    /// Backing storage for `displays`: one entry per CRTC (at most `crtc_rates.len`), or the screen.
+    display_storage: [16]Display = undefined,
 
     /// Connects to the X server named by DISPLAY.
     pub fn connect(allocator: std.mem.Allocator) !*X11Connection {
@@ -382,30 +407,50 @@ pub const X11Connection = struct {
         return n;
     }
 
+    /// The monitors as displays (GPUI `Platform::displays`, which on X11 lists one display per
+    /// screen): one per active RandR CRTC, with its real position and size. Without RandR, or with no
+    /// active monitor, the whole screen is one display with id 0 and the zero UUID GPUI gives X11.
+    /// Each display's refresh interval is its own monitor's.
+    /// Deliberately naive: rebuilt from `crtc_rates` on every call. A faster version would keep the
+    /// array and rebuild it only when RandR reports a change.
     pub fn displays(self: *X11Connection) []const Display {
-        const w = self.api.XDisplayWidth(self.display, self.screen);
-        const h = self.api.XDisplayHeight(self.display, self.screen);
         const out = &self.display_storage;
-        out[0] = .{
-            .id = 0,
-            .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = @as(f32, @floatFromInt(w)) / self.scale, .height = @as(f32, @floatFromInt(h)) / self.scale } },
-            .scale_factor = self.scale,
-            .refresh_interval = self.fastest_refresh_interval_ns(),
-        };
-        return out[0..1];
+        if (self.crtc_count == 0) {
+            const w = self.api.XDisplayWidth(self.display, self.screen);
+            const h = self.api.XDisplayHeight(self.display, self.screen);
+            out[0] = .{
+                .id = 0,
+                .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = @as(f32, @floatFromInt(w)) / self.scale, .height = @as(f32, @floatFromInt(h)) / self.scale } },
+                .scale_factor = self.scale,
+                .refresh_interval = null,
+                .uuid_bytes = std.mem.zeroes(platform.Uuid),
+            };
+            return out[0..1];
+        }
+        for (self.crtc_rates[0..self.crtc_count], out[0..self.crtc_count]) |c, *d| {
+            d.* = .{
+                .id = c.id,
+                .bounds = .{ .origin = .{ .x = @as(f32, @floatFromInt(c.x)) / self.scale, .y = @as(f32, @floatFromInt(c.y)) / self.scale }, .size = .{ .width = @as(f32, @floatFromInt(c.w)) / self.scale, .height = @as(f32, @floatFromInt(c.h)) / self.scale } },
+                .scale_factor = self.scale,
+                .refresh_interval = @as(u64, @intCast(c.interval_ms)) * std.time.ns_per_ms,
+                .uuid_bytes = c.uuid,
+            };
+        }
+        return out[0..self.crtc_count];
     }
 
-    /// The shortest interval between refreshes of any monitor, in nanoseconds. X11 reports one
-    /// display for the whole screen, so it gets the fastest rate, the one GPUI's docs call maximum.
-    /// Null before RandR has listed the monitors.
-    fn fastest_refresh_interval_ns(self: *const X11Connection) ?u64 {
-        var fastest: ?i64 = null;
-        for (self.crtc_rates[0..self.crtc_count]) |c| {
-            fastest = if (fastest) |f| @min(f, c.interval_ms) else c.interval_ms;
-        }
-        const ms = fastest orelse return null;
-        return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
+    /// The display id of the monitor holding a logical point of the root window, or of the first
+    /// monitor when none holds it. Without RandR the screen is display 0. No GPUI counterpart: GPUI
+    /// has one display per screen and never looks a point up. Deliberately naive: a linear scan of
+    /// the CRTCs per call, which is fine for the handful of monitors a desktop has.
+    pub fn display_id_at(self: *const X11Connection, x: f32, y: f32) platform.DisplayId {
+        if (self.crtc_count == 0) return 0;
+        const px: c_int = @intFromFloat(@floor(x * self.scale));
+        const py: c_int = @intFromFloat(@floor(y * self.scale));
+        const i = crtc_index_at(self.crtc_rates[0..self.crtc_count], px, py) orelse 0;
+        return self.crtc_rates[i].id;
     }
+
 
     pub fn deinit(self: *X11Connection) void {
         if (self.keyboard) |*k| k.deinit();
@@ -654,7 +699,12 @@ pub const X11Connection = struct {
             if (kind == proto.RRScreenChangeNotify or kind == proto.RRNotify) {
                 _ = x.XRRUpdateConfiguration(&ev);
                 self.refresh_crtcs();
-                for (self.windows.items) |win| win.update_frame_interval();
+                for (self.windows.items) |win| {
+                    win.update_frame_interval();
+                    win.update_display_id();
+                }
+                // Monitors may have come, gone or moved, so the app rereads the displays.
+                if (self.platform_) |p| p.emit_displays_changed();
                 return;
             }
         }
@@ -702,6 +752,7 @@ pub const X11Connection = struct {
                 w.on_configure(@intCast(@max(0, cfg.width)), @intCast(@max(0, cfg.height)));
                 if (moved) w.base.emit_moved();
                 w.update_frame_interval();
+                w.update_display_id();
             },
             proto.PropertyNotify => {
                 if (ev.xproperty.atom == self.atoms.net_wm_state) w.read_wm_state();
@@ -1197,9 +1248,23 @@ pub const X11Connection = struct {
                 interval = input.frame_interval_ms(mode.dotClock, mode.hTotal, mode.vTotal, mode.modeFlags);
                 break;
             }
-            self.crtc_rates[self.crtc_count] = .{ .x = info.x, .y = info.y, .w = @intCast(info.width), .h = @intCast(info.height), .interval_ms = interval };
+            var uuid: ?platform.Uuid = null;
+            if (info.noutput > 0) if (info.outputs) |outs| {
+                uuid = output_uuid(x, self.display, res, outs[0]);
+            };
+            self.crtc_rates[self.crtc_count] = .{ .id = @intCast(crtc), .x = info.x, .y = info.y, .w = @intCast(info.width), .h = @intCast(info.height), .interval_ms = interval, .uuid = uuid };
             self.crtc_count += 1;
         }
+    }
+
+    /// The UUID of a RandR output, made from its name the way GPUI makes one for a Wayland output.
+    /// Null when the output has no name.
+    fn output_uuid(api: proto.XrandrApi, display: *proto.Display, res: *proto.XRRScreenResources, output: c_ulong) ?platform.Uuid {
+        const info = api.XRRGetOutputInfo(display, res, output) orelse return null;
+        defer api.XRRFreeOutputInfo(info);
+        const name = info.name orelse return null;
+        if (info.nameLen <= 0) return null;
+        return platform.uuid_v5(platform.uuid_namespace_dns, name[0..@intCast(info.nameLen)]);
     }
 
     /// The refresh interval of the monitor holding a root-relative point. Off every monitor,
@@ -1643,6 +1708,8 @@ pub const X11Window = struct {
     frame_wanted: bool = false,
     last_frame_ms: i64 = 0,
     frame_interval_ms: i64 = input.default_frame_interval_ms,
+    /// The display the window was last reported on; see `update_display_id`.
+    display_id_: ?platform.DisplayId = null,
     /// False while unmapped or fully covered: no frames then, as in GPUI.
     visible: bool = true,
     /// False when the app draws the frame (client decorations, or no titlebar requested).
@@ -1685,10 +1752,10 @@ pub const X11Window = struct {
         return if (self.visible) .visible else .hidden;
     }
 
-    /// X11 has one screen, reported as display 0, and a window never changes screen. So
-    /// `on_display_changed` is a no-op here, as in GPUI.
-    fn windowDisplayId(_: *platform.PlatformWindow) ?platform.DisplayId {
-        return 0;
+    /// The monitor under the window's centre (GPUI `PlatformWindow::display`).
+    fn windowDisplayId(p: *platform.PlatformWindow) ?platform.DisplayId {
+        const self: *X11Window = @fieldParentPtr("base", p);
+        return self.display_id();
     }
 
     fn gpuSpecs(p: *platform.PlatformWindow) ?platform.GpuSpecs {
@@ -1770,6 +1837,25 @@ pub const X11Window = struct {
         if (self.sync_counter == 0) return;
         _ = sync.XSyncSetCounter(self.conn.display, self.sync_counter, value);
         self.conn.flush();
+    }
+
+    /// The display under the window's centre, from its logical origin and size (the same centre
+    /// `update_frame_interval` uses). Without RandR, the screen's display 0.
+    fn display_id(self: *const X11Window) platform.DisplayId {
+        const dims = self.physical();
+        const cx = self.origin.x + @as(f32, @floatFromInt(dims.w)) / (2 * self.scale);
+        const cy = self.origin.y + @as(f32, @floatFromInt(dims.h)) / (2 * self.scale);
+        return self.conn.display_id_at(cx, cy);
+    }
+
+    /// Reports a change of display to the window's observers, once per change. The first value
+    /// is only recorded: nothing had been reported before it.
+    fn update_display_id(self: *X11Window) void {
+        if (self.closed or self.destroyed_by_server) return;
+        const now = self.display_id();
+        const before = self.display_id_;
+        self.display_id_ = now;
+        if (before) |b| if (b != now) self.base.emit_display_changed();
     }
 
     /// Follows the monitor under the window's center. One monitor needs no round trip.

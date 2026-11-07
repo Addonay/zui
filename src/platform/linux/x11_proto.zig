@@ -338,6 +338,14 @@ pub const XRRScreenResources = extern struct {
     nmode: c_int,
     modes: ?[*]XRRModeInfo,
 };
+/// The leading fields of `XRROutputInfo`: the ones read to name a monitor. The rest of the struct
+/// is never touched, so it is left out.
+pub const XRROutputInfo = extern struct {
+    timestamp: Time,
+    crtc: c_ulong,
+    name: ?[*]u8,
+    nameLen: c_int,
+};
 pub const XRRCrtcInfo = extern struct {
     timestamp: Time,
     x: c_int,
@@ -366,6 +374,8 @@ pub const XrandrApi = struct {
     XRRFreeScreenResources: *const fn (*XRRScreenResources) callconv(.c) void,
     XRRGetCrtcInfo: *const fn (*Display, *XRRScreenResources, c_ulong) callconv(.c) ?*XRRCrtcInfo,
     XRRFreeCrtcInfo: *const fn (*XRRCrtcInfo) callconv(.c) void,
+    XRRGetOutputInfo: *const fn (*Display, *XRRScreenResources, c_ulong) callconv(.c) ?*XRROutputInfo,
+    XRRFreeOutputInfo: *const fn (*XRROutputInfo) callconv(.c) void,
 
     pub fn load(lib: dl.Library) ?XrandrApi {
         var out: XrandrApi = undefined;
@@ -414,6 +424,8 @@ comptime {
             .{ @offsetOf(XRRModeInfo, "modeFlags"), 72 }, .{ @sizeOf(XRRScreenResources), 64 },
             .{ @offsetOf(XRRScreenResources, "crtcs"), 24 }, .{ @offsetOf(XRRScreenResources, "modes"), 56 },
             .{ @sizeOf(XRRCrtcInfo), 64 },             .{ @offsetOf(XRRCrtcInfo, "mode"), 24 },
+            .{ @offsetOf(XRROutputInfo, "crtc"), 8 },  .{ @offsetOf(XRROutputInfo, "name"), 16 },
+            .{ @offsetOf(XRROutputInfo, "nameLen"), 24 },
         };
         for (checks) |c| {
             if (c[0] != c[1]) @compileError("X11 extension struct layout mismatch");

@@ -14,6 +14,7 @@ const interactive = @import("interactive.zig");
 const window_mod = @import("window.zig");
 const app_mod = @import("app.zig");
 const keystroke_mod = @import("keystroke.zig");
+const action_mod = @import("action.zig");
 pub const app_menu = @import("platform/app_menu.zig");
 pub const popup = @import("platform/popup.zig");
 const window_controls_mod = @import("platform/window_controls.zig");
@@ -45,6 +46,24 @@ pub const PowerListener = struct {
     ctx: *anyopaque,
     func: *const fn (*anyopaque) void,
 };
+/// Called on the main thread when the displays may have changed (GPUI `on_displays_changed`).
+pub const Listener = struct {
+    ctx: *anyopaque,
+    func: *const fn (*anyopaque) void,
+};
+
+/// Called with the action picked from the application menu (GPUI `on_app_menu_action`).
+pub const ActionListener = struct {
+    ctx: *anyopaque,
+    func: *const fn (*anyopaque, action_mod.AnyAction) void,
+};
+
+/// Says whether a menu command can run now (GPUI `on_validate_app_menu_command`).
+pub const ActionValidator = struct {
+    ctx: *anyopaque,
+    func: *const fn (*anyopaque, action_mod.AnyAction) bool,
+};
+
 pub const WindowControlArea = window_controls_mod.WindowControlArea;
 
 const Pixels = geometry.Pixels;
@@ -56,6 +75,33 @@ const App = app_mod.App;
 pub const CursorStyle = style_mod.CursorStyle;
 
 pub const DisplayId = u32;
+
+/// A 16-byte UUID (GPUI's `uuid::Uuid`, as `PlatformDisplay::uuid` returns).
+pub const Uuid = [16]u8;
+
+/// The DNS namespace of RFC 4122 appendix C (`Uuid::NAMESPACE_DNS`).
+pub const uuid_namespace_dns: Uuid = .{ 0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8 };
+
+/// A name-based UUID, version 5 (RFC 4122 section 4.3), as GPUI's `Uuid::new_v5` makes it.
+/// Deliberately naive: it hashes with the std SHA-1 on every call. Displays call it once, when
+/// the outputs are read, so nothing needs it faster yet.
+pub fn uuid_v5(namespace: Uuid, name: []const u8) Uuid {
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    hasher.update(&namespace);
+    hasher.update(name);
+    var digest: [20]u8 = undefined;
+    hasher.final(&digest);
+    var out: Uuid = digest[0..16].*;
+    out[6] = (out[6] & 0x0f) | 0x50;
+    out[8] = (out[8] & 0x3f) | 0x80;
+    return out;
+}
+
+test "uuid_v5 matches the RFC 4122 example for python.org" {
+    const got = uuid_v5(uuid_namespace_dns, "python.org");
+    const want: Uuid = .{ 0x88, 0x63, 0x13, 0xe1, 0x3b, 0x8a, 0x53, 0x72, 0x9b, 0x90, 0x0c, 0x9a, 0xee, 0x19, 0x9e, 0x5d };
+    try std.testing.expectEqualSlices(u8, &want, &got);
+}
 
 /// Window size GPUI opens a window at when the display is big enough (GPUI `DEFAULT_WINDOW_SIZE`).
 pub const DEFAULT_WINDOW_SIZE: geometry.Size(Pixels) = .{ .width = 1536, .height = 1095 };
@@ -76,6 +122,21 @@ pub const Display = struct {
     /// The time between the display's refreshes in nanoseconds: the maximum rate for a variable
     /// refresh display. Null when the platform does not report it (GPUI `refresh_interval`).
     refresh_interval: ?u64 = null,
+    /// The stable identifier `uuid` returns. Null when the platform gives the display no name.
+    uuid_bytes: ?Uuid = null,
+
+    /// A stable identifier that survives restarts (GPUI `PlatformDisplay::uuid`). Fails with
+    /// `NoUuid` when the platform could not name the display.
+    pub fn uuid(self: Display) error{NoUuid}!Uuid {
+        return self.uuid_bytes orelse error.NoUuid;
+    }
+
+    /// The part of the display where windows may go, without taskbars and docks (GPUI
+    /// `PlatformDisplay::visible_bounds`). No Linux backend reports a work area, so this is the
+    /// full bounds there, which is what GPUI's default implementation gives.
+    pub fn visible_bounds(self: Display) Bounds(Pixels) {
+        return self.bounds;
+    }
 
     /// The bounds a window gets when the app does not place it: `DEFAULT_WINDOW_SIZE`, clipped to
     /// the display and centered on it (GPUI `PlatformDisplay::default_bounds`).
@@ -94,6 +155,14 @@ test "refresh_interval_from_hz converts rates and rejects unknown ones (GPUI tes
     for ([_]f64{ 0.0, -60.0, std.math.nan(f64), std.math.inf(f64) }) |unknown| {
         try std.testing.expectEqual(@as(?u64, null), refresh_interval_from_hz(unknown));
     }
+}
+
+test "uuid fails without a name and visible_bounds is the full bounds" {
+    const named: Display = .{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 10, .height = 20 } }, .uuid_bytes = uuid_v5(uuid_namespace_dns, "x") };
+    try std.testing.expectEqualSlices(u8, &uuid_v5(uuid_namespace_dns, "x"), &(try named.uuid()));
+    const unnamed: Display = .{ .id = 1, .bounds = named.bounds };
+    try std.testing.expectError(error.NoUuid, unnamed.uuid());
+    try std.testing.expectEqual(named.bounds, named.visible_bounds());
 }
 
 test "default_bounds: 1536x1095 clipped to the display and centered on it" {
@@ -527,13 +596,10 @@ pub const WindowCallbacks = struct {
     display_changed: ?*const fn (*anyopaque) void = null,
 };
 
-/// What the platform reports to the app as a whole (GPUI's `on_displays_changed` and
-/// `on_keyboard_layout_change` callbacks). Set once with `Platform.set_callbacks`.
+/// What the platform reports to the app as a whole (GPUI's `on_keyboard_layout_change` callback).
+/// Set once with `Platform.set_callbacks`. Displays use `Platform.on_displays_changed`.
 pub const PlatformCallbacks = struct {
     ctx: *anyopaque,
-    /// The displays may have been added, removed or changed. Calls may be spurious: the app
-    /// rereads `Platform.displays` to learn what changed.
-    displays_changed: *const fn (*anyopaque) void,
     /// The current keyboard layout changed.
     keyboard_layout_changed: *const fn (*anyopaque) void,
 };
@@ -809,6 +875,14 @@ fn noopIme(_: *PlatformWindow, _: Bounds(Pixels)) void {}
 pub const Platform = struct {
     vtable: *const VTable,
     callbacks: ?PlatformCallbacks = null,
+    /// Set by `on_displays_changed`; the platform keeps it for as long as it runs.
+    displays_changed_: ?Listener = null,
+    /// Set by `on_app_menu_action`.
+    app_menu_action_: ?ActionListener = null,
+    /// Set by `on_will_open_app_menu`.
+    will_open_app_menu_: ?Listener = null,
+    /// Set by `on_validate_app_menu_command`.
+    validate_app_menu_command_: ?ActionValidator = null,
 
     pub const VTable = struct {
         /// Runs the event loop until quit, calling `on_launch(app)` once ready.
@@ -1035,9 +1109,62 @@ pub const Platform = struct {
     pub fn set_callbacks(self: *Platform, cbs: PlatformCallbacks) void {
         self.callbacks = cbs;
     }
-    /// Backends call these when the displays or the keyboard layout changed.
+    /// Registers the callback run when displays may have been added, removed or changed. Calls may
+    /// be spurious: the app rereads `displays` (GPUI `Platform::on_displays_changed`). Replaces the
+    /// earlier callback.
+    pub fn on_displays_changed(self: *Platform, listener: Listener) void {
+        self.displays_changed_ = listener;
+    }
+
+    /// Registers the callback run with the action picked from the application menu (GPUI
+    /// `Platform::on_app_menu_action`). Replaces the earlier callback.
+    pub fn on_app_menu_action(self: *Platform, listener: ActionListener) void {
+        self.app_menu_action_ = listener;
+    }
+
+    /// Registers the callback run just before the application menu opens (GPUI
+    /// `Platform::on_will_open_app_menu`). Replaces the earlier callback.
+    pub fn on_will_open_app_menu(self: *Platform, listener: Listener) void {
+        self.will_open_app_menu_ = listener;
+    }
+
+    /// Registers the callback that says whether a menu command can run now (GPUI
+    /// `Platform::on_validate_app_menu_command`). Replaces the earlier callback.
+    pub fn on_validate_app_menu_command(self: *Platform, validator: ActionValidator) void {
+        self.validate_app_menu_command_ = validator;
+    }
+
+    /// Backends call this when the displays changed. Stands in for GPUI's displays callback.
     pub fn emit_displays_changed(self: *Platform) void {
-        if (self.callbacks) |c| c.displays_changed(c.ctx);
+        if (self.displays_changed_) |l| l.func(l.ctx);
+    }
+
+    /// Backends call this with the action a menu item picked. No Linux code calls it: GPUI's Linux
+    /// backend stores its menu callbacks and never invokes them either.
+    pub fn emit_app_menu_action(self: *Platform, action: action_mod.AnyAction) void {
+        if (self.app_menu_action_) |l| l.func(l.ctx, action);
+    }
+
+    /// Backends call this before an application menu opens. No Linux code calls it yet.
+    pub fn emit_will_open_app_menu(self: *Platform) void {
+        if (self.will_open_app_menu_) |l| l.func(l.ctx);
+    }
+
+    /// Backends ask whether a menu command can run. False when no validator is registered, so a
+    /// command is never offered without the app's say-so.
+    pub fn emit_validate_app_menu_command(self: *Platform, action: action_mod.AnyAction) bool {
+        const v = self.validate_app_menu_command_ orelse return false;
+        return v.func(v.ctx, action);
+    }
+
+    /// Drops every listener the app registered, so the platform never calls into an app that is
+    /// going away. No GPUI counterpart: GPUI's platforms are dropped with the app instead.
+    pub fn clear_app_listeners(self: *Platform) void {
+        self.callbacks = null;
+        self.displays_changed_ = null;
+        self.app_menu_action_ = null;
+        self.will_open_app_menu_ = null;
+        self.validate_app_menu_command_ = null;
     }
     pub fn emit_keyboard_layout_changed(self: *Platform) void {
         if (self.callbacks) |c| c.keyboard_layout_changed(c.ctx);
