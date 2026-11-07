@@ -22,6 +22,8 @@ pub const Keyboard = opaque {};
 pub const XdgWmBase = opaque {};
 pub const XdgSurface = opaque {};
 pub const XdgToplevel = opaque {};
+pub const XdgPopup = opaque {};
+pub const XdgPositioner = opaque {};
 pub const DataDeviceManager = opaque {};
 pub const DataDevice = opaque {};
 pub const DataOffer = opaque {};
@@ -31,6 +33,12 @@ pub const Decoration = opaque {};
 pub const CursorTheme = opaque {};
 pub const TextInputManager = opaque {};
 pub const TextInput = opaque {};
+pub const PrimaryDeviceManager = opaque {};
+pub const PrimaryDevice = opaque {};
+pub const PrimaryOffer = opaque {};
+pub const PrimarySource = opaque {};
+pub const CursorShapeManager = opaque {};
+pub const CursorShapeDevice = opaque {};
 /// Cursor entry: image array layout verified against wayland-cursor.h
 /// (image_count, then images pointer; name follows and is unread).
 pub const CursorHandle = extern struct {
@@ -118,6 +126,13 @@ pub const XdgSurfaceListener = extern struct {
     configure: ?*const fn (?*anyopaque, *XdgSurface, u32) callconv(.c) void = null,
 };
 
+/// xdg_popup events (xdg-shell v7). `configure` carries the popup's size in logical pixels.
+pub const XdgPopupListener = extern struct {
+    configure: ?*const fn (?*anyopaque, *XdgPopup, i32, i32, i32, i32) callconv(.c) void = null,
+    popup_done: ?*const fn (?*anyopaque, *XdgPopup) callconv(.c) void = null,
+    repositioned: ?*const fn (?*anyopaque, *XdgPopup, u32) callconv(.c) void = null,
+};
+
 pub const XdgToplevelListener = extern struct {
     configure: ?*const fn (?*anyopaque, *XdgToplevel, i32, i32, ?*anyopaque) callconv(.c) void = null,
     close: ?*const fn (?*anyopaque, *XdgToplevel) callconv(.c) void = null,
@@ -140,8 +155,9 @@ pub const FractionalScaleListener = extern struct {
 /// zwp_text_input_v3 is optional. Keep its wire description local so the
 /// backend remains usable on compositors that do not advertise the global.
 pub const TextInputListener = extern struct {
-    enter: ?*const fn (?*anyopaque, *TextInput, *Surface) callconv(.c) void = null,
-    leave: ?*const fn (?*anyopaque, *TextInput, *Surface) callconv(.c) void = null,
+    // Surfaces are nullable: some compositors have been seen sending null here.
+    enter: ?*const fn (?*anyopaque, *TextInput, ?*Surface) callconv(.c) void = null,
+    leave: ?*const fn (?*anyopaque, *TextInput, ?*Surface) callconv(.c) void = null,
     preedit_string: ?*const fn (?*anyopaque, *TextInput, ?[*:0]const u8, i32, i32) callconv(.c) void = null,
     commit_string: ?*const fn (?*anyopaque, *TextInput, ?[*:0]const u8) callconv(.c) void = null,
     delete_surrounding_text: ?*const fn (?*anyopaque, *TextInput, u32, u32) callconv(.c) void = null,
@@ -182,12 +198,17 @@ pub const SeatListener = extern struct {
 /// wayland-client-protocol.h; bound at version 1 so only v1 events exist.
 pub const DataOfferListener = extern struct {
     offer: ?*const fn (?*anyopaque, *DataOffer, [*:0]const u8) callconv(.c) void = null,
+    source_actions: ?*const fn (?*anyopaque, *DataOffer, u32) callconv(.c) void = null,
+    action: ?*const fn (?*anyopaque, *DataOffer, u32) callconv(.c) void = null,
 };
 
 pub const DataSourceListener = extern struct {
     target: ?*const fn (?*anyopaque, *DataSource, ?[*:0]const u8) callconv(.c) void = null,
     send: ?*const fn (?*anyopaque, *DataSource, [*:0]const u8, i32) callconv(.c) void = null,
     cancelled: ?*const fn (?*anyopaque, *DataSource) callconv(.c) void = null,
+    dnd_drop_performed: ?*const fn (?*anyopaque, *DataSource) callconv(.c) void = null,
+    dnd_finished: ?*const fn (?*anyopaque, *DataSource) callconv(.c) void = null,
+    action: ?*const fn (?*anyopaque, *DataSource, u32) callconv(.c) void = null,
 };
 
 pub const DataDeviceListener = extern struct {
@@ -201,18 +222,22 @@ pub const DataDeviceListener = extern struct {
 
 pub const data_offer_events = [_]Message{
     .{ .name = "offer", .signature = "s", .types = null },
+    .{ .name = "source_actions", .signature = "3u", .types = null },
+    .{ .name = "action", .signature = "3u", .types = null },
 };
 pub const data_offer_methods = [_]Message{
     .{ .name = "accept", .signature = "u?s", .types = null },
     .{ .name = "receive", .signature = "sh", .types = null },
     .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "finish", .signature = "3", .types = null },
+    .{ .name = "set_actions", .signature = "3uu", .types = null },
 };
 pub const data_offer_interface: Interface = .{
     .name = "wl_data_offer",
-    .version = 1,
-    .method_count = 3,
+    .version = 3,
+    .method_count = 5,
     .methods = @ptrCast(&data_offer_methods),
-    .event_count = 1,
+    .event_count = 3,
     .events = @ptrCast(&data_offer_events),
 };
 
@@ -220,17 +245,21 @@ pub const data_source_events = [_]Message{
     .{ .name = "target", .signature = "?s", .types = null },
     .{ .name = "send", .signature = "sh", .types = null },
     .{ .name = "cancelled", .signature = "", .types = null },
+    .{ .name = "dnd_drop_performed", .signature = "3", .types = null },
+    .{ .name = "dnd_finished", .signature = "3", .types = null },
+    .{ .name = "action", .signature = "3u", .types = null },
 };
 pub const data_source_methods = [_]Message{
     .{ .name = "offer", .signature = "s", .types = null },
     .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "set_actions", .signature = "3u", .types = null },
 };
 pub const data_source_interface: Interface = .{
     .name = "wl_data_source",
-    .version = 1,
-    .method_count = 2,
+    .version = 3,
+    .method_count = 3,
     .methods = @ptrCast(&data_source_methods),
-    .event_count = 3,
+    .event_count = 6,
     .events = @ptrCast(&data_source_events),
 };
 
@@ -249,9 +278,9 @@ pub const data_device_events = [_]Message{
     .{ .name = "selection", .signature = "?o", .types = &[_]?*const anyopaque{@ptrCast(&data_offer_interface)} },
 };
 pub const data_device_methods = [_]Message{
-    .{ .name = "start_drag", .signature = "oo?ou", .types = null },
+    .{ .name = "start_drag", .signature = "?oo?ou", .types = null },
     .{ .name = "set_selection", .signature = "?ou", .types = null },
-    .{ .name = "release", .signature = "", .types = null },
+    .{ .name = "release", .signature = "2", .types = null },
 };
 pub const data_device_interface: Interface = .{
     .name = "wl_data_device",
@@ -260,6 +289,159 @@ pub const data_device_interface: Interface = .{
     .methods = @ptrCast(&data_device_methods),
     .event_count = 6,
     .events = @ptrCast(&data_device_events),
+};
+
+// -- zwp_primary_selection_unstable_v1 ---------------------------------------
+
+pub const PrimaryOfferListener = extern struct {
+    offer: *const fn (?*anyopaque, *PrimaryOffer, [*:0]const u8) callconv(.c) void,
+};
+pub const PrimarySourceListener = extern struct {
+    send: *const fn (?*anyopaque, *PrimarySource, [*:0]const u8, i32) callconv(.c) void,
+    cancelled: *const fn (?*anyopaque, *PrimarySource) callconv(.c) void,
+};
+pub const PrimaryDeviceListener = extern struct {
+    data_offer: *const fn (?*anyopaque, *PrimaryDevice, *PrimaryOffer) callconv(.c) void,
+    selection: *const fn (?*anyopaque, *PrimaryDevice, ?*PrimaryOffer) callconv(.c) void,
+};
+
+pub const primary_offer_events = [_]Message{.{ .name = "offer", .signature = "s", .types = null }};
+pub const primary_offer_methods = [_]Message{
+    .{ .name = "receive", .signature = "sh", .types = null },
+    .{ .name = "destroy", .signature = "", .types = null },
+};
+pub const primary_offer_interface: Interface = .{
+    .name = "zwp_primary_selection_offer_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&primary_offer_methods),
+    .event_count = 1,
+    .events = @ptrCast(&primary_offer_events),
+};
+pub const primary_source_events = [_]Message{
+    .{ .name = "send", .signature = "sh", .types = null },
+    .{ .name = "cancelled", .signature = "", .types = null },
+};
+pub const primary_source_methods = [_]Message{
+    .{ .name = "offer", .signature = "s", .types = null },
+    .{ .name = "destroy", .signature = "", .types = null },
+};
+pub const primary_source_interface: Interface = .{
+    .name = "zwp_primary_selection_source_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&primary_source_methods),
+    .event_count = 2,
+    .events = @ptrCast(&primary_source_events),
+};
+pub const primary_device_events = [_]Message{
+    .{ .name = "data_offer", .signature = "n", .types = &[_]?*const anyopaque{@ptrCast(&primary_offer_interface)} },
+    .{ .name = "selection", .signature = "?o", .types = &[_]?*const anyopaque{@ptrCast(&primary_offer_interface)} },
+};
+pub const primary_device_methods = [_]Message{
+    .{ .name = "set_selection", .signature = "?ou", .types = &[_]?*const anyopaque{ @ptrCast(&primary_source_interface), null } },
+    .{ .name = "destroy", .signature = "", .types = null },
+};
+pub const primary_device_interface: Interface = .{
+    .name = "zwp_primary_selection_device_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&primary_device_methods),
+    .event_count = 2,
+    .events = @ptrCast(&primary_device_events),
+};
+pub const primary_device_manager_methods = [_]Message{
+    .{ .name = "create_source", .signature = "n", .types = &[_]?*const anyopaque{@ptrCast(&primary_source_interface)} },
+    .{ .name = "get_device", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&primary_device_interface), null } },
+    .{ .name = "destroy", .signature = "", .types = null },
+};
+pub const primary_device_manager_interface: Interface = .{
+    .name = "zwp_primary_selection_device_manager_v1",
+    .version = 1,
+    .method_count = 3,
+    .methods = @ptrCast(&primary_device_manager_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+// -- zwp_pointer_gestures_v1 ---------------------------------------------------
+
+pub const PointerGestures = opaque {};
+pub const PointerGesturePinch = opaque {};
+pub const PointerGesturePinchListener = extern struct {
+    begin: *const fn (?*anyopaque, *PointerGesturePinch, u32, u32, ?*Surface, u32) callconv(.c) void,
+    update: *const fn (?*anyopaque, *PointerGesturePinch, u32, i32, i32, i32, i32) callconv(.c) void,
+    end: *const fn (?*anyopaque, *PointerGesturePinch, u32, u32, i32) callconv(.c) void,
+};
+pub const pointer_gesture_pinch_methods = [_]Message{.{ .name = "destroy", .signature = "", .types = null }};
+pub const pointer_gesture_pinch_events = [_]Message{
+    .{ .name = "begin", .signature = "uuou", .types = &[_]?*const anyopaque{ null, null, null, null } },
+    .{ .name = "update", .signature = "uffff", .types = null },
+    .{ .name = "end", .signature = "uui", .types = null },
+};
+pub const pointer_gesture_pinch_interface: Interface = .{
+    .name = "zwp_pointer_gesture_pinch_v1",
+    .version = 1,
+    .method_count = 1,
+    .methods = @ptrCast(&pointer_gesture_pinch_methods),
+    .event_count = 3,
+    .events = @ptrCast(&pointer_gesture_pinch_events),
+};
+pub const pointer_gestures_methods = [_]Message{
+    .{ .name = "get_swipe_gesture", .signature = "no", .types = &[_]?*const anyopaque{ null, null } },
+    .{ .name = "get_pinch_gesture", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&pointer_gesture_pinch_interface), null } },
+};
+pub const pointer_gestures_interface: Interface = .{
+    .name = "zwp_pointer_gestures_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&pointer_gestures_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+// -- xdg_system_bell_v1 -------------------------------------------------------
+
+pub const SystemBell = opaque {};
+pub const system_bell_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "ring", .signature = "?o", .types = &[_]?*const anyopaque{null} },
+};
+pub const system_bell_interface: Interface = .{
+    .name = "xdg_system_bell_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&system_bell_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+// -- wp_cursor_shape_v1 -------------------------------------------------------
+
+pub const cursor_shape_device_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "set_shape", .signature = "uu", .types = null },
+};
+pub const cursor_shape_device_interface: Interface = .{
+    .name = "wp_cursor_shape_device_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&cursor_shape_device_methods),
+    .event_count = 0,
+    .events = null,
+};
+pub const cursor_shape_manager_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "get_pointer", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&cursor_shape_device_interface), null } },
+    .{ .name = "get_tablet_tool_v2", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&cursor_shape_device_interface), null } },
+};
+pub const cursor_shape_manager_interface: Interface = .{
+    .name = "wp_cursor_shape_manager_v1",
+    .version = 1,
+    .method_count = 3,
+    .methods = @ptrCast(&cursor_shape_manager_methods),
+    .event_count = 0,
+    .events = null,
 };
 
 pub const data_device_manager_methods = [_]Message{
@@ -328,13 +510,14 @@ pub const xdg_surface_events = [_]Message{
 pub const xdg_surface_methods = [_]Message{
     .{ .name = "destroy", .signature = "", .types = null },
     .{ .name = "get_toplevel", .signature = "n", .types = &[_]?*const anyopaque{@ptrCast(&xdg_toplevel_interface)} },
-    .{ .name = "get_popup", .signature = "noo", .types = null },
+    // Types in argument order: the new xdg_popup, then the parent (nullable) and the positioner.
+    .{ .name = "get_popup", .signature = "n?oo", .types = &[_]?*const anyopaque{ @ptrCast(&xdg_popup_interface), @ptrCast(&xdg_surface_interface), @ptrCast(&xdg_positioner_interface) } },
     .{ .name = "set_window_geometry", .signature = "iiii", .types = null },
     .{ .name = "ack_configure", .signature = "u", .types = null },
 };
 pub const xdg_surface_interface: Interface = .{
     .name = "xdg_surface",
-    .version = 5,
+    .version = 7,
     .method_count = 5,
     .methods = @ptrCast(&xdg_surface_methods),
     .event_count = 1,
@@ -344,8 +527,8 @@ pub const xdg_surface_interface: Interface = .{
 pub const xdg_toplevel_events = [_]Message{
     .{ .name = "configure", .signature = "iia", .types = null },
     .{ .name = "close", .signature = "", .types = null },
-    .{ .name = "configure_bounds", .signature = "ii", .types = null },
-    .{ .name = "wm_capabilities", .signature = "a", .types = null },
+    .{ .name = "configure_bounds", .signature = "4ii", .types = null },
+    .{ .name = "wm_capabilities", .signature = "5a", .types = null },
 };
 pub const xdg_toplevel_methods = [_]Message{
     .{ .name = "destroy", .signature = "", .types = null },
@@ -359,17 +542,60 @@ pub const xdg_toplevel_methods = [_]Message{
     .{ .name = "set_min_size", .signature = "ii", .types = null },
     .{ .name = "set_maximized", .signature = "", .types = null },
     .{ .name = "unset_maximized", .signature = "", .types = null },
-    .{ .name = "set_fullscreen", .signature = "o", .types = null },
+    .{ .name = "set_fullscreen", .signature = "?o", .types = null },
     .{ .name = "unset_fullscreen", .signature = "", .types = null },
     .{ .name = "set_minimized", .signature = "", .types = null },
 };
 pub const xdg_toplevel_interface: Interface = .{
     .name = "xdg_toplevel",
-    .version = 5,
+    .version = 7,
     .method_count = 14,
     .methods = @ptrCast(&xdg_toplevel_methods),
     .event_count = 4,
     .events = @ptrCast(&xdg_toplevel_events),
+};
+
+// xdg_positioner (xdg-shell v7): the placement of a popup relative to its parent. Requests are
+// numbered as the XML orders them; `set_reactive` and the parent-size requests are since v3.
+pub const xdg_positioner_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "set_size", .signature = "ii", .types = null },
+    .{ .name = "set_anchor_rect", .signature = "iiii", .types = null },
+    .{ .name = "set_anchor", .signature = "u", .types = null },
+    .{ .name = "set_gravity", .signature = "u", .types = null },
+    .{ .name = "set_constraint_adjustment", .signature = "u", .types = null },
+    .{ .name = "set_offset", .signature = "ii", .types = null },
+    .{ .name = "set_reactive", .signature = "", .types = null },
+    .{ .name = "set_parent_size", .signature = "ii", .types = null },
+    .{ .name = "set_parent_configure", .signature = "u", .types = null },
+};
+pub const xdg_positioner_interface: Interface = .{
+    .name = "xdg_positioner",
+    .version = 7,
+    .method_count = 10,
+    .methods = @ptrCast(&xdg_positioner_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+// xdg_popup (xdg-shell v7): `reposition` and `repositioned` are since v3.
+pub const xdg_popup_events = [_]Message{
+    .{ .name = "configure", .signature = "iiii", .types = null },
+    .{ .name = "popup_done", .signature = "", .types = null },
+    .{ .name = "repositioned", .signature = "u", .types = null },
+};
+pub const xdg_popup_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "grab", .signature = "ou", .types = null },
+    .{ .name = "reposition", .signature = "ou", .types = null },
+};
+pub const xdg_popup_interface: Interface = .{
+    .name = "xdg_popup",
+    .version = 7,
+    .method_count = 3,
+    .methods = @ptrCast(&xdg_popup_methods),
+    .event_count = 3,
+    .events = @ptrCast(&xdg_popup_events),
 };
 
 pub const decoration_events = [_]Message{
@@ -407,8 +633,8 @@ pub const decoration_manager_interface: Interface = .{
 // rect, so the app rasterizes sharp at any fractional density.
 pub const viewport_methods = [_]Message{
     .{ .name = "destroy", .signature = "", .types = null },
-    .{ .name = "set_source", .signature = "fffff", .types = null },
-    .{ .name = "set_destination", .signature = "iiii", .types = null },
+    .{ .name = "set_source", .signature = "ffff", .types = null },
+    .{ .name = "set_destination", .signature = "ii", .types = null },
 };
 pub const viewport_interface: Interface = .{
     .name = "wp_viewport",
@@ -421,7 +647,7 @@ pub const viewport_interface: Interface = .{
 
 pub const viewporter_methods = [_]Message{
     .{ .name = "destroy", .signature = "", .types = null },
-    .{ .name = "get_viewporter", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&viewport_interface), null } },
+    .{ .name = "get_viewport", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&viewport_interface), null } },
 };
 pub const viewporter_interface: Interface = .{
     .name = "wp_viewporter",
@@ -458,6 +684,43 @@ pub const fractional_scale_manager_interface: Interface = .{
     .methods = @ptrCast(&fractional_scale_manager_methods),
     .event_count = 0,
     .events = null,
+};
+
+// ext-background-effect-v1 (staging): a blur behind a surface, for blurred windows. Checked
+// against wayland-protocols' staging/ext-background-effect/ext-background-effect-v1.xml. The
+// manager sends `capabilities` as soon as it is bound, so its event table must be declared
+// even though nothing reads it (GPUI does not check the capabilities either).
+pub const background_effect_manager_events = [_]Message{
+    .{ .name = "capabilities", .signature = "u", .types = null },
+};
+pub const background_effect_manager_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "get_background_effect", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&background_effect_surface_interface), null } },
+};
+pub const background_effect_manager_interface: Interface = .{
+    .name = "ext_background_effect_manager_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&background_effect_manager_methods),
+    .event_count = 1,
+    .events = @ptrCast(&background_effect_manager_events),
+};
+pub const background_effect_surface_methods = [_]Message{
+    .{ .name = "destroy", .signature = "", .types = null },
+    .{ .name = "set_blur_region", .signature = "?o", .types = &[_]?*const anyopaque{null} },
+};
+pub const background_effect_surface_interface: Interface = .{
+    .name = "ext_background_effect_surface_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = @ptrCast(&background_effect_surface_methods),
+    .event_count = 0,
+    .events = null,
+};
+
+/// ext_background_effect_manager_v1.capabilities (opcode 0). Ignored, as in GPUI.
+pub const BackgroundEffectManagerListener = extern struct {
+    capabilities: ?*const fn (?*anyopaque, *anyopaque, u32) callconv(.c) void = null,
 };
 
 pub const text_input_events = [_]Message{
@@ -504,13 +767,15 @@ pub const xdg_wm_base_events = [_]Message{
 };
 pub const xdg_wm_base_methods = [_]Message{
     .{ .name = "destroy", .signature = "", .types = null },
-    .{ .name = "create_positioner", .signature = "n", .types = null },
+    // A new_id argument needs its interface in `types`: libwayland reads it when marshalling, and
+    // a null table segfaults (found live, on the first popup).
+    .{ .name = "create_positioner", .signature = "n", .types = &[_]?*const anyopaque{@ptrCast(&xdg_positioner_interface)} },
     .{ .name = "get_xdg_surface", .signature = "no", .types = &[_]?*const anyopaque{ @ptrCast(&xdg_surface_interface), null } },
     .{ .name = "pong", .signature = "u", .types = null },
 };
 pub const xdg_wm_base_interface: Interface = .{
     .name = "xdg_wm_base",
-    .version = 5,
+    .version = 7,
     .method_count = 4,
     .methods = @ptrCast(&xdg_wm_base_methods),
     .event_count = 1,

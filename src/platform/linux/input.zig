@@ -120,6 +120,126 @@ const fkey_names = [_][]const u8{
     "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24",
 };
 
+/// Lines scrolled by one wheel notch, as in gpui_linux.
+pub const SCROLL_LINES: f32 = 3.0;
+
+/// Milliseconds between frames for a display mode. Interlaced modes refresh twice as often
+/// and double-scanned ones half as often, as SDL3 accounts for. Unknown modes get 60 Hz.
+pub const default_frame_interval_ms: i64 = 16;
+pub const mode_interlace: u64 = 0x10;
+pub const mode_double_scan: u64 = 0x20;
+
+pub fn frame_interval_ms(dot_clock: u64, h_total: u32, v_total: u32, flags: u64) i64 {
+    if (dot_clock == 0 or h_total == 0 or v_total == 0) return default_frame_interval_ms;
+    var lines: u64 = v_total;
+    if (flags & mode_double_scan != 0) lines *= 2;
+    var clock = dot_clock;
+    if (flags & mode_interlace != 0) clock *= 2;
+    const denominator = @as(u64, h_total) * lines;
+    // Rounded down, so the timer never holds a frame past the display's next refresh.
+    const interval: i64 = @intCast(@divFloor(denominator * 1000, clock));
+    return std.math.clamp(interval, 1, 100);
+}
+
+test "frame intervals from display modes" {
+    // 1920x1080 at 60 Hz, 144 Hz.
+    try std.testing.expectEqual(@as(i64, 16), frame_interval_ms(148_500_000, 2200, 1125, 0));
+    try std.testing.expectEqual(@as(i64, 6), frame_interval_ms(356_000_000, 2200, 1125, 0));
+    // Interlaced 1080i at 30 full frames still scans 60 fields a second.
+    try std.testing.expectEqual(@as(i64, 16), frame_interval_ms(74_250_000, 2200, 1125, mode_interlace));
+    // Double scan draws every line twice, so 30 frames a second.
+    try std.testing.expectEqual(@as(i64, 33), frame_interval_ms(74_250_000, 1100, 1125, mode_double_scan));
+    // Virtual displays often report nothing useful.
+    try std.testing.expectEqual(default_frame_interval_ms, frame_interval_ms(0, 2200, 1125, 0));
+    try std.testing.expectEqual(default_frame_interval_ms, frame_interval_ms(148_500_000, 0, 1125, 0));
+    // Absurd values stay in a sane range.
+    try std.testing.expectEqual(@as(i64, 100), frame_interval_ms(1, 1000, 1000, 0));
+    try std.testing.expectEqual(@as(i64, 1), frame_interval_ms(std.math.maxInt(u32), 1, 1, 0));
+}
+
+/// The character a dead key stands for while it waits for the next key, as in GPUI.
+pub fn dead_key_text(keysym: u32) ?[]const u8 {
+    return switch (keysym) {
+        0xfe50 => "`", // dead_grave
+        0xfe51 => "\u{b4}", // dead_acute
+        0xfe52 => "^", // dead_circumflex
+        0xfe53 => "~", // dead_tilde
+        0xfe54 => "\u{af}", // dead_macron
+        0xfe55 => "\u{2d8}", // dead_breve
+        0xfe56 => "\u{2d9}", // dead_abovedot
+        0xfe57 => "\u{a8}", // dead_diaeresis
+        0xfe58 => "\u{2da}", // dead_abovering
+        0xfe59 => "\u{2dd}", // dead_doubleacute
+        0xfe5a => "\u{2c7}", // dead_caron
+        0xfe5b => "\u{b8}", // dead_cedilla
+        0xfe5c => "\u{2db}", // dead_ogonek
+        0xfe5d => "\u{345}", // dead_iota
+        0xfe5e => "\u{3099}", // dead_voiced_sound
+        0xfe5f => "\u{309a}", // dead_semivoiced_sound
+        0xfe60 => "\u{323}\u{323}", // dead_belowdot
+        0xfe61 => "\u{321}", // dead_hook
+        0xfe62 => "\u{31b}", // dead_horn
+        0xfe63 => "\u{336}\u{336}", // dead_stroke
+        0xfe64 => "\u{313}\u{313}", // dead_abovecomma
+        0xfe65 => "\u{2bd}", // dead_abovereversedcomma
+        0xfe66 => "\u{30f}", // dead_doublegrave
+        0xfe67 => "\u{2f3}", // dead_belowring
+        0xfe68 => "\u{331}", // dead_belowmacron
+        0xfe69 => "\u{a788}", // dead_belowcircumflex
+        0xfe6a => "\u{330}", // dead_belowtilde
+        0xfe6b => "\u{32e}", // dead_belowbreve
+        0xfe6c => "\u{324}", // dead_belowdiaeresis
+        0xfe6d => "\u{32f}", // dead_invertedbreve
+        0xfe6e => "\u{326}", // dead_belowcomma
+        0xfe8a => "\u{259}", // dead_small_schwa
+        0xfe8b => "\u{18f}", // dead_capital_schwa
+        else => null,
+    };
+}
+
+/// True for Shift, Control, Alt, Super and friends: they never join compose sequences.
+pub fn is_modifier_keysym(sym: u32) bool {
+    return (sym >= 0xffe1 and sym <= 0xffee) or (sym >= 0xfe01 and sym <= 0xfe0f) or sym == 0xff7e or sym == 0xff7f;
+}
+
+/// How many key repeats are due at `now`, and when the next one is. Repeats are scheduled
+/// from the previous deadline, not from `now`, so a late wakeup does not slow the rate.
+/// After a long stall the backlog is dropped instead of flooding the app.
+pub const RepeatStep = struct { count: u32, next_ms: i64 };
+pub const max_repeat_burst: u32 = 8;
+
+pub fn repeat_step(now: i64, next_ms: i64, interval_ms: i64) RepeatStep {
+    if (now < next_ms) return .{ .count = 0, .next_ms = next_ms };
+    const interval = @max(interval_ms, 1);
+    const count = @divFloor(now - next_ms, interval) + 1;
+    if (count > max_repeat_burst) return .{ .count = max_repeat_burst, .next_ms = now + interval };
+    return .{ .count = @intCast(count), .next_ms = next_ms + count * interval };
+}
+
+test "key repeat keeps its rate across late wakeups" {
+    try std.testing.expectEqual(RepeatStep{ .count = 0, .next_ms = 100 }, repeat_step(99, 100, 25));
+    try std.testing.expectEqual(RepeatStep{ .count = 1, .next_ms = 125 }, repeat_step(100, 100, 25));
+    // 7 ms late: the next deadline does not move.
+    try std.testing.expectEqual(RepeatStep{ .count = 1, .next_ms = 125 }, repeat_step(107, 100, 25));
+    // Two periods late: both are delivered.
+    try std.testing.expectEqual(RepeatStep{ .count = 3, .next_ms = 175 }, repeat_step(150, 100, 25));
+    // A long stall drops the backlog.
+    try std.testing.expectEqual(RepeatStep{ .count = max_repeat_burst, .next_ms = 5025 }, repeat_step(5000, 100, 25));
+}
+
+test "dead keys know their characters" {
+    try std.testing.expectEqualStrings("\u{b4}", dead_key_text(0xfe51).?);
+    try std.testing.expectEqualStrings("^", dead_key_text(0xfe52).?);
+    try std.testing.expect(dead_key_text('a') == null);
+}
+
+test "modifier keysyms" {
+    try std.testing.expect(is_modifier_keysym(0xffe1)); // Shift_L
+    try std.testing.expect(is_modifier_keysym(0xfe03)); // ISO_Level3_Shift
+    try std.testing.expect(!is_modifier_keysym('a'));
+    try std.testing.expect(!is_modifier_keysym(0xfe51)); // dead_acute
+}
+
 /// UTF-8 text for a keysym (printable only). Returns a slice into `buf`.
 pub fn utf8_for_keysym(sym: u32, buf: *[4]u8) ?[]const u8 {
     const cp: u21 = switch (sym) {

@@ -411,7 +411,16 @@ pub const WrapIter = struct {
     grapheme_index: usize = 0,
     width_before_grapheme: Pixels = 0,
 
-    const Candidate = struct { c: u21, len_utf8: usize, element_width: ?Pixels = null };
+    const Candidate = struct {
+        c: u21,
+        len_utf8_: usize,
+        element_width: ?Pixels = null,
+
+        /// Bytes this candidate takes up in the text (GPUI `WrapBoundaryCandidate::len_utf8`).
+        pub fn len_utf8(self: Candidate) usize {
+            return self.len_utf8_;
+        }
+    };
 
     fn next_candidate(self: *WrapIter) ?Candidate {
         while (self.frag_ix < self.fragments.len) {
@@ -421,14 +430,14 @@ pub const WrapIter = struct {
                         const n = utf8_len_at(t, self.frag_pos);
                         const c = decode_at(t, self.frag_pos);
                         self.frag_pos += n;
-                        return .{ .c = c, .len_utf8 = n };
+                        return .{ .c = c, .len_utf8_ = n };
                     }
                     self.frag_ix += 1;
                     self.frag_pos = 0;
                 },
                 .element => |e| {
                     self.frag_ix += 1;
-                    return .{ .c = 0, .len_utf8 = e.len_utf8, .element_width = e.width };
+                    return .{ .c = 0, .len_utf8_ = e.len_utf8, .element_width = e.width };
                 },
             }
         }
@@ -440,7 +449,7 @@ pub const WrapIter = struct {
         const w = self.wrapper;
         while (self.next_candidate()) |cand| {
             const ix = self.index;
-            self.index += cand.len_utf8;
+            self.index += cand.len_utf8();
 
             while (self.grapheme_ix < self.graphemes.len and self.graphemes[self.grapheme_ix] < ix) self.grapheme_ix += 1;
             const is_grapheme_boundary = self.grapheme_ix < self.graphemes.len and self.graphemes[self.grapheme_ix] == ix;

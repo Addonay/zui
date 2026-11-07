@@ -33,41 +33,18 @@ agent (or human) can pick the work up. Read it fully before changing code.
    Don't review every turn — keep working.
 7. Toolchain: **Zig 0.17.0 stable**, never a dev build.
 
-## 2. Status at the time of writing (session stopped by the owner)
+## 2. Status
 
-The old ZUI tree (a hand-rolled retained UI framework, its docs, tools, ports,
-gap reports) was **deleted** and replaced with a fresh port of GPUI. The old
-code is still in git history (`main` before this push, commit `d7a2017`) and
-was used as a source for platform code.
+The old ZUI tree (a hand-rolled retained UI framework) was deleted and replaced with a fresh port of GPUI. The old
+code is still in git history (`main` before this push, commit `d7a2017`).
 
-Builds green: `zig build check` and `zig build test` (≈300 tests pass,
-1 skip). `examples/hello_world.zig` renders pixel-identical in spirit to
-GPUI's `hello_world.rs` (verified via headless snapshot).
+**`todo.md` is the tracker**: what is missing, what exists in name only, and the API comparison by GPUI file. Keep
+it current, and do not repeat it here.
 
-| Area | Status |
-| --- | --- |
-| geometry, color, colors | done (ported tests) |
-| style + `Refinement(T)` (derive Refineable) | done |
-| styled (all 3214 GPUI `Styled` methods incl. macro-generated) | done |
-| app: App, Application, Entity/WeakEntity/AnyEntity, Context(T), globals, observe/subscribe/emit/release, effects | done |
-| window: frames, hitboxes, element state, focus, text style stack, content masks, opacity, paint_* primitives, mouse/key/action dispatch, deferred draws | done |
-| element protocol, AnyElement, IntoElement, ParentElement, FluentBuilder, views (AnyView) | done |
-| div + Interactivity (hover/active/focus/in_focus styles, click, mouse/key/action listeners, scroll, groups, track_focus, key_context) | done (drag/drop, tooltips, file drop, pressure/pinch NOT yet) |
-| layout engine on zafi (`taffy.zig`, GPUI's TaffyLayoutEngine) | done |
-| text system on cozmic (shaping+fallback, two-frame line layout cache, LineWrapper, ShapedLine/WrappedLine, StyledText/InteractiveText) | done (some GPUI extras missing, see §8) |
-| keystroke, interactive events, keymap + context predicates, key_dispatch, actions | done (multi-keystroke pending replay, tab groups NOT yet) |
-| executor (Background/Foreground executors, Task(T)) | done (thread pool; no async/await) |
-| scene, bounds_tree, atlas (+CpuAtlas), path_builder | done |
-| CPU renderer (port of GPUI WGSL math; SIMD + multithreaded bands) | done |
-| headless platform (+ `ZUI_SNAPSHOT` PPM output) | done |
-| Linux platform: Wayland + X11 (dlopen, no link deps) | done; verified on Xvfb and a mock Wayland compositor; no IME yet |
-| TestAppContext / VisualTestContext + end-to-end tests | done |
-| img / svg / assets (stb_image, nanosvg) | done (sync loading; GIF first frame only) |
-| anchored, deferred, canvas, animation (+easings), spring | done |
-| list (variable height), uniform_list | done (agent stopped right after tests passed; verify) |
-| GPU renderer on zicr (`src/renderer/gpu.zig`, `shaders.glsl`, `-Dgpu=true`) | **WIP, not working yet** (see §7) |
-| examples | 8 ported: hello_world, pattern, tree, text_layout, scrollable, ownership_post, active_state_bug, gradient |
-| macOS / Windows / web platforms | NOT started |
+On Linux, X11 and Wayland, with Vulkan and a CPU fallback, about 91% of the GPUI functions worth porting exist by name,
+and every GPUI example is ported except `layer_shell` and `a11y`. macOS, Windows and web are not
+started, though CI's checks keep the shared code compiling for Windows and macOS. CI itself is off for now: the
+owner's GitHub account has a billing lock, which the owner will sort out, so PRs are checked locally.
 
 ## 3. Repository layout (mirrors `crates/gpui/src`)
 
@@ -88,16 +65,29 @@ src/elements/*.zig       div, text, img, svg, list, uniform_list, anchored, defe
 src/taffy.zig            TaffyLayoutEngine on zafi (Style -> zafi.Style conversion)
 src/text_system.zig + text_system/{font,line_layout,line,line_wrapper}.zig
 src/keystroke.zig interactive.zig keymap.zig keymap_context.zig key_dispatch.zig action.zig
+src/input.zig            ElementInputHandler: a view's EntityInputHandler methods as a PlatformInputHandler
 src/executor.zig         BackgroundExecutor, ForegroundExecutor, Task(T)
 src/scene.zig bounds_tree.zig atlas.zig path_builder.zig
 src/assets.zig svg_renderer.zig spring.zig
+src/http_client.zig http_native.zig image_disk_cache.zig   remote images: HTTP client and on-disk copies
 src/platform.zig         Platform / PlatformWindow vtable interfaces + shared types
 src/platform/headless.zig  headless/test platform
 src/platform/linux.zig + linux/{wayland,wayland_proto,x11,x11_proto,xkb,input,dl}.zig
+src/platform/linux/text_input_state.zig  text-input-v3 double-buffered state, no Wayland in it
+src/platform/linux/xim_preedit.zig       XIM composition edits, no X11 in it
+src/platform/linux/x11_scroll.zig        XInput2 scroll valuators, no X11 in it
+src/platform/linux/dbus.zig system_notifications.zig   D-Bus client, and notifications on it
+src/platform/linux/xdnd.zig              text/uri-list parsing for file drags
+src/platform/linux/wayland_scroll.zig    wl_pointer axis frames, no Wayland in it
 src/renderer/cpu.zig     CPU renderer
-src/renderer/gpu.zig gpu_test.zig shaders.glsl   GPU renderer (WIP)
+src/gpu/                 portable GPU layer (Vulkan/D3D12/D3D11/Metal/GL/WebGPU), vendored from zicr
+src/renderer/gpu.zig     GPU renderer + GpuAtlas; shaders.glsl -> shaders_gen.zig (committed)
+src/renderer/vulkan.zig  libvulkan loading, instance/device, per-window swapchains
+src/renderer/window_renderer.zig  GpuContext (shared per connection) + GpuWindow
+src/renderer/gpu_test.zig  GPU vs CPU pixel comparison (skips without Vulkan 1.3)
+src/renderer/shdc/       generator that turns sokol-shdc output into shaders_gen.zig
 examples/*.zig           line-by-line ports of crates/gpui/examples/*.rs
-third_party/             stb_image, nanosvg, images.c shim
+third_party/             Wuffs, nanosvg, images.c shim
 ```
 
 ## 4. Toolchain, dependencies and the container setup
@@ -106,12 +96,13 @@ third_party/             stb_image, nanosvg, images.c shim
   (installed at `~/tools/zig-x86_64-linux-0.17.0`, symlinked to `/usr/local/bin/zig`).
   Note: Zig 0.17 changed a lot vs older versions — see §9.
 - `build.zig.zon` dependencies:
-  - `cozmic` — `git+https://github.com/Addonay/cozmic.git#bbc0f4f282acd024d1dc0b5e4d16fc4b08fcb6b0`
+  - `cozmic` — `git+https://github.com/Addonay/cozmic.git#bd7e29cf11b9db0c046647dd58d8c8622c9b8683`
     (its own deps: ezi_code, harfbuzz 14.1.0, freetype 2.14.3, zlib 1.3.1, libpng 1.6.50)
   - `zafi` — `git+https://github.com/Addonay/zafi.git#04086f7a21f120a5ea52f921fb2034d75e10264f`
-  - `zicr` (lazy) — `git+https://github.com/Addonay/zicr.git#87fe62228af2b69527ccd503da035c86b490ef42`
-    (its lazy dep `sokol_tools_bin` provides the `sokol-shdc` shader compiler)
-  - Removed from the old tree: `zlay`, `vellz`, `wgpu`.
+  - `sokol_tools_bin` (lazy) — the `sokol-shdc` binaries, fetched only by
+    `zig build shaders -Dregen-shaders=true`. Run that after editing `shaders.glsl`;
+    normal builds use the committed `src/renderer/shaders_gen.zig`.
+  - Removed: `zicr` (backends copied to `src/gpu/`, see §1.2), `zlay`, `vellz`, `wgpu`.
 - **Network quirk of the cloud container used**: Zig's own fetcher could not
   get through the HTTPS proxy ("unable to discover remote git server
   capabilities"), and GitHub archive tarballs returned 403. Workaround used:
@@ -131,7 +122,7 @@ third_party/             stb_image, nanosvg, images.c shim
 
 | Path | Source | Why |
 | --- | --- | --- |
-| `.references/zed` | `https://github.com/zed-industries/zed` (sparse: `crates/gpui`, `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_wgpu`, `gpui_web`, `gpui_platform`, `gpui_macros`) at `f816e1f` (2026-11-01) | THE reference. Every port follows these files. |
+| `.references/gpui` (local name; `.references/zed` in the cloud container) | `https://github.com/zed-industries/zed` (sparse: `crates/gpui`, `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_wgpu`, `gpui_web`, `gpui_platform`, `gpui_macros`) kept up to date with `git pull`; last checked at `4a6121b` (2026-11-06) | THE reference. Every port follows these files. |
 | `.references/zafi` | `https://github.com/Addonay/zafi` | layout API |
 | `.references/cozmic` | `https://github.com/Addonay/cozmic` | text API |
 | `.references/zicr` | `https://github.com/Addonay/zicr` | GPU layer, shader pipeline, Vulkan bootstrap example (`tools/vk_smoke.zig`) |
@@ -159,7 +150,7 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   element, all styled elements share **one generic type**
   `StyledElement(Ext)` in `elements/div.zig`: `Div = StyledElement(DivExt)`,
   `Img = StyledElement(ImgExt)`, `Svg = StyledElement(SvgExt)`. Ext hooks:
-  `request_layout_ext(self, *Style, window, cx) ?LayoutId` and
+  `request_layout_ext(self, ?*const GlobalElementId, *Style, window, cx) ?LayoutId`, `prepaint_ext` and
   `paint_ext(self, bounds, *const Style, window, cx)`. Ext-specific builder
   methods are forwarded with `pub const x = if (@hasDecl(Ext, "x")) Ext.x else {};`.
   The Styled alias block was generated by a throwaway Python script from
@@ -199,6 +190,17 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   `next_frame.arena`) — elements, listeners and formatted strings live there;
   the arena is the *frame's*, so data survives as `rendered_frame` until the
   frame after next (listeners dispatched against the rendered frame).
+- **View caching**: `entity.cached(style)` and `AnyView.cached(style)` follow GPUI's `ViewElement`: a clean view
+  replays ranges of the rendered frame (`reuse_prepaint`, `reuse_paint`, `reuse_subtree`, `reuse_layouts`, `Scene.replay`).
+  ZUI's elements and listeners live in the frame arena, which a reused view must outlive, so it renders into two
+  arenas of its own (`ViewElementState`), alternating, because the rendered frame still uses the last render's
+  while the next one is made. Deferred draws remember their arena. The text style in the key is a hash, since its
+  strings may not outlive the frame. A second prepaint in one frame, after a failed `transact`, never reuses.
+  Consequences for element code: hitbox ids do not repeat across frames, so hover is known only in paint (the hit
+  test runs again between prepaint and paint), and a listener that changes how its element looks calls
+  `window.notify_current_view()`, not `window.refresh()`, which renders every cached view again. Mouse listeners
+  run with their view current. Line layouts are per window, while the text system stays per app: `Window.draw`
+  points `TextSystem.active_cache` at the window's.
 - **Draw**: `Window.draw` = clear next frame + layout engine → root
   `AnyView.into_any_element()` → `prepaint_as_root` → deferred draws →
   `paint` → `scene.finish()` → swap frames → `text_system().finish_frame()`
@@ -218,7 +220,7 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 - **Mouse dispatch**: capture phase front-to-back over registered listeners,
   then bubble back-to-front, `stop_propagation` stops. Key/action dispatch walks
   the dispatch-tree path to the focused node (capture then bubble), keybindings
-  matched first via `Keymap.binding_for(keystroke, context_stack)`; unhandled
+  matched first via `key_dispatch.dispatch_key` (see multi-stroke bindings below); unhandled
   key-downs with `key_char` go to the platform input handler.
 - Key and action listeners are registered during **prepaint** (when the
   element's dispatch node is pushed), not paint as in GPUI — `element.zig`
@@ -228,6 +230,8 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 - **Layout**: zafi tree cleared per frame (like GPUI), styles converted to
   device pixels (scale factor), rounding disabled, bounds snapped with
   round-half-toward-zero; measure functions via a threadlocal trampoline.
+- **Color glyphs**: cozmic renders COLRv1 through the bundled HarfBuzz's `hb-raster` and the rest
+  through FreeType. `-Dsystem-libs` builds of cozmic have no COLRv1.
 - **Text**: cozmic shapes each `layout_line` directly (one AttrsList span per
   run, no cozmic wrapping); GPUI's `LineWrapper` wraps. FontId = index into a
   resolved-face table (fallback faces get their own ids). Glyph rasterization
@@ -239,64 +243,140 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   main-thread continuation (replacement for `cx.spawn(async { bg.await; this.update })`).
 - **Platform** interfaces are vtables embedded in backend structs and recovered
   with `@fieldParentPtr` (`Platform`, `PlatformWindow`); `PlatformAtlas` is a
-  `{ptr, vtable}` value. `current_platform()` picks Linux (Wayland, then X11)
-  or headless (`ZUI_HEADLESS=1`, tests, or no display).
+  `{ptr, vtable}` value. `current_platform()` gives the Linux platform, or
+  `HeadlessPlatform` under `ZUI_HEADLESS=1` and tests (see Windowing modes).
 - **CPU renderer** follows GPUI's WGSL literally: straight alpha, sRGB-space
   blending (as wgpu ALPHA_BLENDING), gradient color-space handling via LUT,
   erf-blur shadows, 4x MSAA paths with Loop-Blinn curves, gamma 1.8/contrast.
   Underline alpha is squared exactly like GPUI's shader (looks like a GPUI quirk).
   Benchmarks (4 vCPU Xeon, 1080p, ReleaseFast, 4 threads): 10k opaque rects
   5.2 ms, 10k rounded 21 ms, 10k gradients 231 ms (slowest path).
-- **GPU renderer (WIP)** — design rule: ZUI renderer on top of `zicr.gpu`
-  backends only (Vulkan on Linux/Windows/Android, D3D12 on Windows, Metal on
-  macOS/iOS, GL/GLES as fallback, WebGPU for web/wgpu-native). Never import
-  zicr's `render2d`; import the standalone module `zicr_dep.module("gpu")`.
-  Native handle acquisition (Vulkan instance/surface/swapchain, Metal layer,
-  DXGI swapchain, GL context, WebGPU surface) is per-platform code in ZUI.
-  Files: `src/renderer/gpu.zig` + `shaders.glsl` (sokol-shdc
-  annotated GLSL, port of `gpui_wgpu/src/shaders.wgsl`), gated by
-  `-Dgpu=true` with a `gpu-test` step comparing GPU vs CPU pixels on lavapipe.
-  The agent was stopped while fixing a compile error: importing the full
-  `zicr` module pulls in zicr's `render2d`, which doesn't compile on 0.17 here;
-  the fix in progress was to use `zicr_dep.module("gpu")` (the standalone GPU
-  module) instead. Vulkan bootstrap (`vulkan_surface.zig`) and wiring into the
-  Linux windows were NOT done. Plan: port `gpui_wgpu/src/wgpu_renderer.rs`
-  batching onto zicr; instance data via instanced vertex attributes (portable
-  to GL/WebGL); persistent growable instance buffer; GpuAtlas implementing
-  PlatformAtlas with dirty-region uploads.
+- **GPU renderer**: port of `gpui_wgpu`'s batching on the vendored `src/gpu/` layer
+  (never zicr's `render2d`). Instances are per-instance vertex attributes, so it stays
+  portable to GL/WebGL. One `GpuContext` (device, atlas, pipelines) per connection, one
+  `GpuWindow` (swapchain) per window; a window that cannot get one uses the CPU renderer.
+  Selection: `ZUI_RENDERER=cpu` forces CPU, `=gpu` also accepts software Vulkan, the default
+  takes hardware devices only (the CPU renderer beats llvmpipe). Debug builds log the choice.
+  Requires Vulkan 1.3 with dynamic rendering, synchronization2 and buffer device address.
+  Wayland uses mailbox and the existing frame-callback pacing, so an occluded window never
+  blocks the main thread; X11 uses FIFO. Frame upload cap: 32 MB (`error.FrameTooLarge`,
+  about 200k quads). Pattern stripes take their remainder from the instance because the
+  packed height exceeds float precision and in-shader `fmod` drifts.
+  Not drawn yet: subpixel sprites (need dual-source blending; nothing in ZUI emits them today)
+  and platform surfaces. No device-lost recovery: a failed frame logs and retries.
+  `ZUI_VULKAN_VALIDATION=1` enables the Khronos layer when installed (it was not on the
+  machine used, so the renderer has not been run under native validation).
+  Test on software Vulkan: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`;
+  `ZUI_GPU_TEST_DUMP=dir` writes each GPU/CPU pair as PPM.
+- **Text input**: ranges are UTF-16, as in GPUI. Platforms call `PlatformWindow.emit_ime`
+  (`ImeInput`), which `Window.handle_ime` applies to the focused handler. After each frame the
+  window tells the platform when the focused text field changed (off, then on, on every change,
+  because text-input-v3 requires it) and where the caret went. Wayland rules, from the protocol
+  XML: a `done` with a stale serial still applies text but must not send state (foot gets this
+  wrong); the rectangle is not moved while composing; `enter` can arrive before `wl_keyboard.enter`
+  and with a null surface; one-byte commits go through as key presses, because IBus takes plain
+  keys too. X11: XIM is opened only when XMODIFIERS names a real method, otherwise xkb compose
+  shows dead keys inline. Xlib's instantiate callback fires once per registration, so after a
+  server dies reconnecting is retried once a second for a minute. Every event must go through
+  `XFilterEvent`, also while no server is connected. Not done: `delete_surrounding_text` (we never
+  send surrounding text), `keyboard_layout`. GPUI has no content types either: it always sends none/normal.
+- **Image decoding**: `src/wuffs.zig` over Google's Wuffs (`third_party/wuffs`, `0.4.0-alpha.12`), a separate
+  library built optimized even in Debug. Not `stb_image`, which is not meant for untrusted files, and images
+  now come from arbitrary URLs. Wuffs decodes one frame of an animated WebP, so the Zig side walks the RIFF
+  chunks and composites, and that Zig is the part where a memory bug could live.
+- **D-Bus**: `platform/linux/dbus.zig` is a client in Zig with no libdbus, non-blocking and polled from the
+  platform loop. Test it only against a fake server on a private bus (see the isolation recipe below): a test
+  must never reach the real session bus. Notifications are on top of it, in `linux/system_notifications.zig`.
+- **Remote images**: `AssetCache` starts a fetch on first use and returns `error.Loading`, which `img`
+  shows as `with_loading`, and the windows refresh when it settles. Each fetch runs on a `std.Io.Threaded`
+  of its own in an `Io.Group`, not on the background executor, so quitting can cancel a download stuck on
+  a slow server. Raster decoding happens on that thread, SVG on the main thread since its renderer is
+  not thread-safe. A copy is kept in the per-user cache directory (`with_image_cache`, off in tests)
+  and shown first, then the fetch still runs and replaces it if the bytes changed. Measured on 2026-11-05:
+  curl takes 1.0 to 1.4 s for these URLs, `std.http` the same in release and about 0.9 s more in Debug,
+  decoding 25 to 60 ms. So the HTTP client is a static library, `http_native.zig`, built optimized even in
+  Debug, because `std` is compiled per artifact. It has its own `Io` and a C ABI, and callers poll a job
+  from their own `Io` so that cancelling them cancels the fetch.
+- **Window prompts**: `window/prompts.zig` follows GPUI's fallback prompt, with one addition: GPUI handles
+  no keys there, and ZUI takes arrows, Tab, Enter, Space and Escape (which picks the Cancel button).
+  Answers go to a listener. A replaced prompt, or one whose window closed, is never answered.
+- **Multi-stroke bindings**: `Window.dispatch_keystroke` follows GPUI's `dispatch_key_event`. A prefix
+  is held in `pending_keystrokes` (strings owned, since platform buffers are not stable) and its keys
+  reach nobody. A key that breaks the sequence replays what was held. It waits one second only if
+  the prefix is a binding of its own, a text field has focus, or it is a lone modifier; otherwise it
+  waits for the next key forever, as in GPUI. Moving focus drops it. Key events now redraw first
+  when the window is dirty, so they never match against a stale dispatch tree.
+- **X11 pointer and timing**: pointer events come from XInput2 when libXi and XI 2.1 are there,
+  and from core events otherwise (selecting XI2 suppresses the core ones for that window). Wheels
+  report both through valuators and as emulated buttons 4 to 7: the emulated ones are skipped, or
+  every notch would scroll twice. Keys stay on core events, because XIM needs them. Each monitor's
+  refresh rate comes from RandR (interlace and double scan included), so frames follow the display
+  under the window. No frames while unmapped or fully covered. `_NET_WM_SYNC_REQUEST` is answered
+  after the frame is drawn, not on configure as in GPUI. XDND takes `text/uri-list` of any length up
+  to 16 MB, unlike GPUI's 4 KB; lists sent with INCR are refused. Events are emitted as
+  `FileDropEvent`, but nothing turns them into element drops until `on_drop` exists.
+  Extension struct layouts in `x11_proto.zig` are checked at compile time against values measured
+  with `offsetof`.
+- **Drag and drop**: `App.active_drag` holds an `AnyDrag`: an erased copy of the value (shallow, so
+  slices inside must outlive the drag) and the view drawn under the pointer, released when it ends.
+  Platform file drags become the same thing with an `ExternalPaths` value, whose paths belong to the
+  platform: a drop handler that keeps them must copy them. Any mouse up that no element took
+  cancels the drag.
+- **Tooltips**: a small state machine in `InteractiveElementState`. Timers cannot be cancelled, so
+  each carries a generation, and checks with `Window.owns_element_state` that its element still exists.
+- **Wayland pointer and drags**: fingers scroll in pixels, wheels in lines. `wl_data_device` is
+  bound at version 3, so a drag offers copy only (a move would make the source delete the user's
+  files). The file list is read through a non-blocking pipe polled by the main loop, with a timeout,
+  because a slow source must not freeze the window. `finish` is sent only with an accepted type and
+  a chosen action, since it is a protocol error otherwise. Drags cannot be tested with the harness
+  below: even GTK to GTK gets cancelled under injected pointers, so test those by hand.
+- **Testing without touching the desktop**: isolate *before* starting the bus, so the bus and
+  everything it activates inherit it: `env -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS
+  -u IBUS_ADDRESS HOME=<s>/home XDG_CONFIG_HOME=<s>/cfg XDG_DATA_HOME=<s>/data XDG_CACHE_HOME=<s>/cache
+  XDG_STATE_HOME=<s>/state XDG_RUNTIME_DIR=<s>/rt dbus-run-session -- script`. **Never run
+  `gsettings` or `dconf` outside that**, and setting these variables inside the script is too late:
+  `dconf-service` is activated with the bus daemon's environment and writes the real user database.
+  Compare `stat ~/.config/dconf/user` and the real `ibus-daemon` PID before and after.
+  - Native Wayland: `mutter --headless --wayland --no-x11 --virtual-monitor 1024x768
+    --wayland-display zui-test`. Unset `DISPLAY` for the client, or a Wayland failure silently falls
+    back to X11. `WAYLAND_DEBUG=client` shows the protocol.
+  - A real Wayland IME: `gnome-shell --headless --wayland --no-x11 --unsafe-mode` instead, with
+    `GSETTINGS_BACKEND=keyfile` and `sources=[('ibus','libpinyin')]` in
+    `<s>/cfg/glib-2.0/settings/keyfile`. It starts its own ibus. Press Escape to leave the overview,
+    then click the field: a new window does not get keyboard focus by itself.
+  - Keys and clicks: `org.gnome.Mutter.RemoteDesktop` over one D-Bus connection (the session dies
+    with it; its keyboard hot-plugs on the first key, so that press is lost).
+  - A real X11 IME: `ibus-daemon --xim --panel=disable`, `ibus engine libpinyin`,
+    `XMODIFIERS=@im=ibus`, on Xvfb. Unset `WAYLAND_DISPLAY`, or the app opens on the real desktop.
+  - Smooth scrolling and a real window manager: leave out `--no-x11` so mutter starts XWayland.
+    The display name is in its log ("public X11 display"), and the client needs
+    `XAUTHORITY=$XDG_RUNTIME_DIR/.mutter-Xwaylandauth.*`. `NotifyPointerAxis` gives real valuators.
+    `--virtual-monitor 1024x768@120` tests refresh rates.
+  - Dead keys on X11: `xmodmap -e "keycode 48 = dead_acute"`, then `xdotool key 48`. Plain mutter
+    ignores layout settings.
+  - A process still running at its timeout proves nothing: check for frames and protocol errors.
+    Send output to a file, since pipes can lose it when `timeout` kills the job. `xdotool
+    windowclose` destroys the window under the app, which logs harmless X11 protocol errors.
+- **Windowing modes**: on Linux one `LinuxPlatform` lives for the whole app, and its `Backend` is a union of headless, Wayland and
+  X11, replaced in place by `App.request_windowing`, which runs on the foreground executor and refuses while windows are
+  open (GPUI too switches the connection, not the platform). Connections take the display name as an argument rather than
+  reading the environment. The app connects in `run`, not at creation, so `displays()` is empty before `on_launch`. With no
+  display named it logs a warning, stays headless and blocks until quit; GPUI panics if the named server cannot be reached, ZUI
+  falls back when headless is allowed. Tests, snapshots and `ZUI_HEADLESS` still use `HeadlessPlatform`. The loop no longer
+  ends with the last window: `QuitMode` decides.
+- **Displays on X11**: one per active RandR CRTC, which differs from GPUI's one per X screen: real monitors have real positions and
+  rates. `uuid` is a version 5 UUID of the output name, as GPUI does for Wayland outputs.
+- **Wayland listeners**: libwayland aborts the process on an event whose listener entry is null, so raising a bound version means adding
+  a handler for every new event, even an empty one. Unit tests cannot catch this: run against mutter.
+- **Frame benchmark**: `examples/frame_bench.zig` (not a GPUI example) times `Window.draw` headless. See Performance in `todo.md` for numbers and how to profile.
 - **Headless snapshots**: `ZUI_HEADLESS=1 ZUI_SNAPSHOT=out.ppm zig build run-<example>`.
   `ZUI_SCALE=2` sets the headless scale factor.
 
-## 8. Known gaps / next steps (in priority order)
+## 8. Known gaps / next steps
 
-1. Finish the GPU renderer on `zicr.gpu` backends only (see §7): switch the
-   build to `zicr_dep.module("gpu")`, add Vulkan surface/swapchain bootstrap for
-   Wayland/X11 and wire it into the Linux windows (CPU renderer stays the
-   fallback), then macOS (Metal backend) and Windows (D3D12, Vulkan fallback)
-   platforms, GL/GLES fallback, and web (WebGPU backend) — GPUI's
-   `gpui_macos` / `gpui_windows` are the references; old ZUI had cocoa/win32
-   skeletons in history.
-2. Div: drag & drop (`on_drag`, `on_drop`, `drag_over`), tooltips,
-   `on_file_drop`, pressure/pinch/back-gesture listeners, `on_aux_click`,
-   `on_mouse_up_out`, `cached` views. `with_animation` is not yet aliased on
-   StyledElement (add `pub const with_animation = animation.AnimationExt(*Self).with_animation;` etc.).
-3. Input: `EntityInputHandler` / `ElementInputHandler` (GPUI text input
-   example), IME (Wayland text-input-v3, X11 XIM), multi-keystroke binding
-   replay, tab groups, `Unbind`.
-4. Text: ShapedLine cursor/split APIs, typographic bounds, font enumeration,
-   `add_fonts`, missing-glyph reporting.
-5. Async: assets/images load synchronously; GIF animation; WebP.
-6. Port the remaining GPUI examples (animation, image, image_gallery,
-   input, list_example, uniform_list, popover, anchor, painting, data_table,
-   drag_drop, focus_visible, tab_stop, window*, shadow, opacity, svg, text,
-   text_wrapper, grid_layout, set_menus, ...). Each must run headless and
-   produce a correct snapshot.
-7. Performance (owner's phase 2 goal: beat GPUI): view caching (`AnyView::cached`
-   with replayed scene ranges — `Scene.replay` exists), avoiding full layout
-   when nothing changed, X11 XShm presentation, SIMD gradients in the CPU
-   renderer, benchmarks vs GPUI.
-8. Workflow: `dev` → `main` must eventually be source-only (see §1.5).
-   `.references/` is gitignored.
+See `todo.md`. In order: finish the API, with naive implementations where that is quicker, then performance against GPUI
+(the owner asked for this order on 2026-11-07), and the other platforms when the owner asks. Whatever is left naive goes in
+`todo.md` under Performance, and is said in a doc comment where it is written.
 
 ## 9. Zig 0.17 gotchas met during the port
 
@@ -309,18 +389,23 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 - Shadowing is an error: a local/param must not share a name with any decl in
   scope — with 3214 Styled aliases on `StyledElement`, names like `w`, `h`,
   `bg`, `m`, `p`, `active`, `text` cannot be used as locals inside it.
+- `x = .{ .a = x.b, .b = x.a }` writes through the result location: `.b` reads the new `.a`, so a swap
+  collapses both fields with no error. Copy to a local first or use `std.mem.swap`.
 - Optimize mode tags are lowercase (`.debug`).
 - `b.args` doesn't exist in `std.Build` (pass-through run args not wired).
 
-## 10. How work was organized (for agents continuing it)
+## 10. How work is organized
 
-- Orchestrator wrote the architectural core (app, window, element, div,
-  taffy, platform interfaces, refineable, view) and gave each Haiku agent one
-  GPUI source family with an exact interface contract plus `PORTING.md`.
-  Agents never commit; the orchestrator commits, keeps `zig build check` and
-  `zig build test` green, and merges.
-- PRs go from `claude/elegant-ritchie-jema73` (feature branch) into `dev`.
-  PR #1 (core framework) was squash-merged into `dev`; later PRs should use
-  **merge commits** (force-pushing after squash merges was blocked).
-- Verify every change with `zig build check`, `zig build test`, and headless
-  snapshots of examples.
+- Haiku subagents read the source and draft a port, on a branch, into a PR against `dev`. The orchestrator reviews it,
+  corrects and optimizes it, and merges it with a merge commit. The review finds real bugs most of the time, so it
+  is not optional. Read the riskiest code, and run backends live: agents' tests rarely catch backend bugs.
+- Agents and the orchestrator check with `zig build check -j2`, `zig build test -j2`, snapshots, and private displays
+  (see section 7). Keep builds to two at a time, without ReleaseFast: the machine has limited memory, and builds
+  have filled the disk (`.zig-cache` reached 60 GB). Agents delete their own build output, and scratch goes under
+  `.zig-cache/scratch`, because `/tmp` is small.
+- Stage files by name, never `git add -A`, and read `git status` first. The repo is public, and a core dump in the root once went out
+  through `add -A` with the process's environment, API keys included.
+- Nothing may reach the real desktop: no `zig build run-*` without isolation, no window, notification, program or file
+  dialog on the real session, and no `gsettings` or `dconf`.
+- Check what a library does from its source or the web, not from memory: Wuffs' WebP support was misremembered.
+- When GPUI moves, read its new commits in `crates/gpui*` and port what applies. Last checked at `4a6121b`.

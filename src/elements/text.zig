@@ -32,14 +32,7 @@ const Hitbox = window_mod.Hitbox;
 const TextAlign = style.TextAlign;
 
 /// A byte range of a string (GPUI `Range<usize>`).
-pub const ByteRange = struct {
-    start: usize,
-    end: usize,
-
-    pub fn contains(self: ByteRange, index: usize) bool {
-        return index >= self.start and index < self.end;
-    }
-};
+pub const ByteRange = text_system.line.ByteRange;
 
 // ---------------------------------------------------------------------------
 // Plain text elements.
@@ -146,36 +139,51 @@ pub const TextLayout = struct {
     /// Paints backgrounds and glyphs.
     pub fn paint(self: TextLayout, source: []const u8, window: *Window, cx: *App) void {
         _ = source;
-        self.paint_lines(.all, window, cx);
+        self.paint_lines(.all, window, cx) catch |e| log_paint_error(e);
     }
 
-    /// Paints only the backgrounds of the runs, so highlights can go between backgrounds and glyphs.
-    pub fn paint_background(self: TextLayout, window: *Window, cx: *App) void {
-        self.paint_lines(.background, window, cx);
+    /// Paints only the backgrounds of the runs, so highlights can go between backgrounds and glyphs (GPUI `paint_background`).
+    pub fn paint_background(self: TextLayout, window: *Window, cx: *App) !void {
+        return self.paint_lines(.background, window, cx);
     }
 
-    /// Paints only the glyphs and decorations of the runs.
-    pub fn paint_foreground(self: TextLayout, window: *Window, cx: *App) void {
-        self.paint_lines(.foreground, window, cx);
+    /// Paints only the glyphs and decorations of the runs (GPUI `paint_foreground`).
+    pub fn paint_foreground(self: TextLayout, window: *Window, cx: *App) !void {
+        return self.paint_lines(.foreground, window, cx);
     }
 
     const Pass = enum { all, background, foreground };
 
-    fn paint_lines(self: TextLayout, pass: Pass, window: *Window, cx: *App) void {
+    /// Fails when the text was never measured or prepainted. A line that fails to paint is logged and
+    /// the rest still paint, as in GPUI (`log_err`).
+    fn paint_lines(self: TextLayout, pass: Pass, window: *Window, cx: *App) !void {
         const st = self.state;
-        const b = st.bounds orelse return;
+        if (!st.measured) return error.MeasurementNotPerformed;
+        const b = st.bounds orelse return error.PrepaintNotPerformed;
         const lh = st.line_height;
         var line_origin = b.origin;
         const text_align = window.text_style().text_align;
         for (st.lines) |line| {
             if (pass != .foreground) {
-                line.paint_background(line_origin, lh, text_align, b.size.width, window, cx) catch {};
+                line.paint_background(line_origin, lh, text_align, b, window, cx) catch |e| log_paint_error(e);
             }
             if (pass != .background) {
-                line.paint(line_origin, lh, text_align, b.size.width, window, cx) catch {};
+                line.paint(line_origin, lh, text_align, b, window, cx) catch |e| log_paint_error(e);
             }
             line_origin.y += line.size(lh).height;
         }
+    }
+
+    fn log_paint_error(e: anyerror) void {
+        std.log.warn("text paint failed: {s}", .{@errorName(e)});
+    }
+
+    /// The layouts of every line, in source order (GPUI `line_layouts`). Allocated in the frame arena.
+    pub fn line_layouts(self: TextLayout) []const *const WrappedLineLayout {
+        std.debug.assert(self.state.measured); // measurement has not been performed
+        const out = window_mod.frame_arena().alloc(*const WrappedLineLayout, self.state.lines.len) catch @panic("OOM");
+        for (self.state.lines, out) |line, *slot| slot.* = line.layout;
+        return out;
     }
 
     /// The byte index of the character at `position` (relative to the window), or the nearest one.
@@ -280,7 +288,7 @@ pub const TextLayout = struct {
         const arena = window_mod.frame_arena();
         for (self.state.lines) |line| {
             var seen: usize = 0;
-            for (line.layout.wrap_boundaries) |b| {
+            for (line.layout.wrap_boundaries()) |b| {
                 const index = line.layout.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix].index;
                 out.appendSlice(arena, line.text[seen..index]) catch @panic("OOM");
                 out.append(arena, '\n') catch @panic("OOM");
@@ -675,7 +683,7 @@ pub const InteractiveText = struct {
         if (phase != .bubble or !ctx.hitbox.is_hovered(window)) return;
         if (ok_index(ctx.layout.index_for_position(event.position))) |ix| {
             ctx.state.mouse_down_index = ix;
-            window.refresh();
+            window.notify_current_view();
         }
     }
 
@@ -691,7 +699,7 @@ pub const InteractiveText = struct {
             }
         }
         ctx.state.mouse_down_index = null;
-        window.refresh();
+        window.notify_current_view();
     }
 
     fn on_mouse_move(ctx_ptr: *anyopaque, event: *const interactive.MouseMoveEvent, phase: window_mod.DispatchPhase, window: *Window, cx: *App) void {
@@ -701,7 +709,7 @@ pub const InteractiveText = struct {
         if (ctx.state.hovered_index != updated) {
             ctx.state.hovered_index = updated;
             if (ctx.hover) |h| h.func(h.ctx, updated, event, window, cx);
-            window.refresh();
+            window.notify_current_view();
         }
     }
 };

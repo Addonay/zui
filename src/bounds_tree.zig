@@ -17,13 +17,13 @@ pub fn BoundsTree(comptime U: type) type {
         /// All nodes stored contiguously for cache efficiency.
         nodes: std.ArrayList(Node) = .empty,
         /// Index of the root node, if any.
-        root: ?usize = null,
+        root: ?u32 = null,
         /// Index of the leaf with the highest ordering (for fast-path lookups).
-        max_leaf: ?usize = null,
+        max_leaf: ?u32 = null,
         /// Reusable stack for tree traversal during insertion.
-        insert_path: std.ArrayList(usize) = .empty,
+        insert_path: std.ArrayList(u32) = .empty,
         /// Reusable stack for search operations.
-        search_stack: std.ArrayList(usize) = .empty,
+        search_stack: std.ArrayList(u32) = .empty,
 
         const Node = struct {
             /// Bounding box containing this node and all descendants.
@@ -41,16 +41,16 @@ pub fn BoundsTree(comptime U: type) type {
         };
 
         const NodeChildren = struct {
-            indices: [max_children]usize = undefined,
-            len: usize = 0,
+            indices: [max_children]u32 = undefined,
+            len: u32 = 0,
 
-            fn push(self: *NodeChildren, index: usize) void {
+            fn push(self: *NodeChildren, index: u32) void {
                 std.debug.assert(self.len < max_children);
                 self.indices[self.len] = index;
                 self.len += 1;
             }
 
-            fn slice(self: *const NodeChildren) []const usize {
+            fn slice(self: *const NodeChildren) []const u32 {
                 return self.indices[0..self.len];
             }
         };
@@ -97,7 +97,7 @@ pub fn BoundsTree(comptime U: type) type {
 
             // Fast path: the max-ordering leaf often intersects.
             if (self.max_leaf) |max_idx| {
-                const max_node = self.nodes.items[max_idx];
+                const max_node = &self.nodes.items[max_idx];
                 if (query.intersects(max_node.bounds)) return max_node.max_order;
             }
 
@@ -106,7 +106,7 @@ pub fn BoundsTree(comptime U: type) type {
 
             var max_found: u32 = 0;
             while (self.search_stack.pop()) |node_idx| {
-                const node = self.nodes.items[node_idx];
+                const node = &self.nodes.items[node_idx];
 
                 // Pruning: skip if this subtree can't improve the result.
                 if (node.max_order <= max_found) continue;
@@ -114,7 +114,7 @@ pub fn BoundsTree(comptime U: type) type {
 
                 switch (node.kind) {
                     .leaf => |order| max_found = @max(max_found, order),
-                    .internal => |children| for (children.slice()) |child_idx| {
+                    .internal => |*children| for (children.slice()) |child_idx| {
                         if (self.nodes.items[child_idx].max_order > max_found) {
                             try self.search_stack.append(self.allocator, child_idx);
                         }
@@ -126,8 +126,8 @@ pub fn BoundsTree(comptime U: type) type {
         }
 
         /// Inserts a leaf with the given bounds and ordering and returns its index.
-        fn insert_leaf(self: *Self, bounds: B, order: u32) !usize {
-            const new_leaf_idx = self.nodes.items.len;
+        fn insert_leaf(self: *Self, bounds: B, order: u32) !u32 {
+            const new_leaf_idx: u32 = @intCast(self.nodes.items.len);
             try self.nodes.append(self.allocator, .{
                 .bounds = bounds,
                 .max_order = order,
@@ -154,7 +154,7 @@ pub fn BoundsTree(comptime U: type) type {
                     children.push(root_idx);
                 }
 
-                const new_root_idx = self.nodes.items.len;
+                const new_root_idx: u32 = @intCast(self.nodes.items.len);
                 try self.nodes.append(self.allocator, .{
                     .bounds = root_bounds.@"union"(bounds),
                     .max_order = @max(root_order, order),
@@ -169,8 +169,8 @@ pub fn BoundsTree(comptime U: type) type {
             var current_idx = root_idx;
 
             while (true) {
-                const children = switch (self.nodes.items[current_idx].kind) {
-                    .internal => |kids| kids,
+                const children: *const NodeChildren = switch (self.nodes.items[current_idx].kind) {
+                    .internal => |*kids| kids,
                     .leaf => unreachable,
                 };
                 try self.insert_path.append(self.allocator, current_idx);
@@ -201,7 +201,7 @@ pub fn BoundsTree(comptime U: type) type {
                     // Keep the max-end invariant unless the new leaf is the highest.
                     if (order <= node.max_order) {
                         const last = kids.len - 1;
-                        std.mem.swap(usize, &kids.indices[last - 1], &kids.indices[last]);
+                        std.mem.swap(u32, &kids.indices[last - 1], &kids.indices[last]);
                     }
                     node.bounds = node.bounds.@"union"(bounds);
                     node.max_order = @max(node.max_order, order);
@@ -221,7 +221,7 @@ pub fn BoundsTree(comptime U: type) type {
                     new_children.push(best_child_idx);
                 }
 
-                const new_internal_idx = self.nodes.items.len;
+                const new_internal_idx: u32 = @intCast(self.nodes.items.len);
                 const new_internal_max = @max(sibling_order, order);
                 try self.nodes.append(self.allocator, .{
                     .bounds = sibling_bounds.@"union"(bounds),
@@ -234,13 +234,13 @@ pub fn BoundsTree(comptime U: type) type {
                 const children_len = parent_kids.len;
                 parent_kids.indices[best_child_pos] = new_internal_idx;
                 if (new_internal_max > parent.max_order) {
-                    std.mem.swap(usize, &parent_kids.indices[best_child_pos], &parent_kids.indices[children_len - 1]);
+                    std.mem.swap(u32, &parent_kids.indices[best_child_pos], &parent_kids.indices[children_len - 1]);
                 }
                 break;
             }
 
             // Propagate bounds and max_order up the path, deepest node first.
-            var updated_child_idx: ?usize = null;
+            var updated_child_idx: ?u32 = null;
             var path_pos = self.insert_path.items.len;
             while (path_pos > 0) {
                 path_pos -= 1;
@@ -254,9 +254,9 @@ pub fn BoundsTree(comptime U: type) type {
                     // The invariant for the updated child was already handled at its own level.
                     if (updated_child_idx) |child_idx| {
                         const kids = &node.kind.internal;
-                        if (std.mem.indexOfScalar(usize, kids.slice(), child_idx)) |pos| {
+                        if (std.mem.indexOfScalar(u32, kids.slice(), child_idx)) |pos| {
                             const last = kids.len - 1;
-                            if (pos != last) std.mem.swap(usize, &kids.indices[pos], &kids.indices[last]);
+                            if (pos != last) std.mem.swap(u32, &kids.indices[pos], &kids.indices[last]);
                         }
                     }
                 }

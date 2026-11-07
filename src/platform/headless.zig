@@ -21,8 +21,33 @@ pub const HeadlessPlatform = struct {
     app: ?*app_mod.App = null,
     quit_requested: bool = false,
     clipboard: ?[]u8 = null,
-    displays_: [1]platform.Display = .{.{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } } }},
+    /// The connected displays. Tests change them with `set_displays`.
+    displays_: [max_displays]platform.Display = @splat(default_display),
+    display_count: usize = 1,
     cursor: platform.CursorStyle = .arrow,
+    menus: platform.app_menu.MenuStore = .{},
+    /// What the app last asked for, for tests.
+    activation_policy: ?platform.ActivationPolicy = null,
+    cursor_visible: bool = true,
+    /// The keyboard layout the platform reports. Tests change it with `set_keyboard_layout`.
+    layout_name: []const u8 = "unknown",
+    hide_requests: u32 = 0,
+    /// What the platform reports for scrollbars. Tests change it.
+    auto_hide_scrollbars: bool = false,
+    cursor_hide_requests: u32 = 0,
+    hide_other_apps_requests: u32 = 0,
+    unhide_other_apps_requests: u32 = 0,
+    /// The appearance the platform reports. Tests change it with `set_window_appearance`.
+    appearance: platform.WindowAppearance = .light,
+    /// What the app last asked the platform to do, for tests.
+    prompts: u32 = 0,
+    restarts: u32 = 0,
+    /// The binary of the last restart, copied since the app's slice is valid for the call only.
+    restart_binary: [256]u8 = undefined,
+    restart_binary_len: ?usize = null,
+    restart_argument_count: usize = 0,
+    const max_displays = 4;
+    const default_display: platform.Display = .{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } } };
 
     const vtable: Platform.VTable = .{
         .run = run,
@@ -35,7 +60,136 @@ pub const HeadlessPlatform = struct {
         .write_to_clipboard = writeClipboard,
         .read_from_clipboard = readClipboard,
         .quit_when_last_window_closes = noQuitOnClose,
+        .set_menus = setMenus,
+        .get_menus = getMenus,
+        .set_activation_policy = setActivationPolicy,
+        .hide_cursor_until_mouse_moves = hideCursorUntilMouseMoves,
+        .is_cursor_visible = isCursorVisible,
+        .hide_other_apps = hideOtherApps,
+        .unhide_other_apps = unhideOtherApps,
+        .keyboard_layout = keyboardLayout,
+        .hide = hideApp,
+        .should_auto_hide_scrollbars = autoHideScrollbars,
+        .window_appearance = windowAppearance,
+        .prompt_for_paths = promptForPaths,
+        .prompt_for_new_path = promptForNewPath,
+        .restart = restart,
+        .set_initial_windowing = setInitialWindowing,
+        .request_windowing = requestWindowing,
     };
+
+    /// Accepts only headless: this platform never has a display to start in (GPUI
+    /// `Platform::set_initial_windowing`, which a headless platform answers the same way).
+    fn setInitialWindowing(_: *platform.Platform, request: platform.WindowingRequest) anyerror!void {
+        return switch (request) {
+            .headless => {},
+            .windowed => error.WindowingNotSupported,
+        };
+    }
+
+    /// Refuses every switch: it is already headless and cannot connect to a display (GPUI
+    /// `Platform::request_windowing`, where a platform that cannot switch fails the request).
+    fn requestWindowing(p: *platform.Platform, request: platform.WindowingRequest) anyerror!void {
+        _ = p;
+        return switch (request) {
+            .headless => error.AlreadyHeadless,
+            .windowed => error.WindowingNotSupported,
+        };
+    }
+
+    fn windowAppearance(p: *Platform) platform.WindowAppearance {
+        return from(p).appearance;
+    }
+
+    /// Cancels the dialog: a headless platform has nothing to choose from.
+    fn promptForPaths(p: *Platform, _: platform.PathPromptOptions, completion: platform.PathsCompletion) void {
+        from(p).prompts += 1;
+        completion.call(null);
+    }
+
+    fn promptForNewPath(p: *Platform, _: []const u8, _: ?[]const u8, completion: platform.PathCompletion) void {
+        from(p).prompts += 1;
+        completion.call(null);
+    }
+
+    /// Records the restart instead of starting anything.
+    fn restart(p: *Platform, binary_path: ?[]const u8, arguments: []const []const u8) void {
+        const self = from(p);
+        self.restarts += 1;
+        self.restart_argument_count = arguments.len;
+        self.restart_binary_len = null;
+        if (binary_path) |path| {
+            const n = @min(path.len, self.restart_binary.len);
+            @memcpy(self.restart_binary[0..n], path[0..n]);
+            self.restart_binary_len = n;
+        }
+    }
+
+    /// Changes the appearance and tells every window, as a platform does when the desktop's scheme changes.
+    pub fn set_window_appearance(self: *HeadlessPlatform, appearance: platform.WindowAppearance) void {
+        if (self.appearance == appearance) return;
+        self.appearance = appearance;
+        for (self.windows.items) |w| w.base.emit_appearance_changed();
+    }
+
+    fn hideApp(p: *Platform) void {
+        from(p).hide_requests += 1;
+    }
+
+    fn autoHideScrollbars(p: *Platform) bool {
+        return from(p).auto_hide_scrollbars;
+    }
+
+    fn keyboardLayout(p: *Platform) platform.KeyboardLayout {
+        const name = from(p).layout_name;
+        return .{ .id = name, .name = name };
+    }
+
+    /// Changes the keyboard layout and tells the app, as a platform does when the user switches it.
+    pub fn set_keyboard_layout(self: *HeadlessPlatform, name: []const u8) void {
+        if (std.mem.eql(u8, self.layout_name, name)) return;
+        self.layout_name = name;
+        self.platform.emit_keyboard_layout_changed();
+    }
+
+    fn setActivationPolicy(p: *Platform, policy: platform.ActivationPolicy) void {
+        from(p).activation_policy = policy;
+    }
+
+    fn hideCursorUntilMouseMoves(p: *Platform) void {
+        const self = from(p);
+        self.cursor_hide_requests += 1;
+        self.cursor_visible = false;
+    }
+
+    fn isCursorVisible(p: *Platform) bool {
+        return from(p).cursor_visible;
+    }
+
+    fn hideOtherApps(p: *Platform) void {
+        from(p).hide_other_apps_requests += 1;
+    }
+
+    fn unhideOtherApps(p: *Platform) void {
+        from(p).unhide_other_apps_requests += 1;
+    }
+
+    /// Replaces the connected displays and tells the app, as a platform does when its outputs change.
+    pub fn set_displays(self: *HeadlessPlatform, list: []const platform.Display) void {
+        std.debug.assert(list.len <= max_displays);
+        @memcpy(self.displays_[0..list.len], list);
+        self.display_count = list.len;
+        self.platform.emit_displays_changed();
+    }
+
+    fn setMenus(p: *Platform, menus: []const platform.app_menu.Menu) void {
+        const self = from(p);
+        self.menus.set(self.allocator, menus);
+    }
+
+    fn getMenus(p: *Platform) ?[]const platform.app_menu.OwnedMenu {
+        return from(p).menus.get();
+    }
 
     pub fn create(allocator: std.mem.Allocator) *Platform {
         const self = allocator.create(HeadlessPlatform) catch @panic("OOM");
@@ -54,20 +208,67 @@ pub const HeadlessPlatform = struct {
         self.run_until_idle(app);
     }
 
-    /// Pumps foreground tasks and pending frames until nothing is left to do.
+    /// Pumps foreground tasks and pending frames until nothing is left to do. Frames that a draw
+    /// asks for (animations, GIFs) are carried to the next pump, so an animation draws once per
+    /// call instead of keeping the pump busy until its guard. Real time moves them on, as a
+    /// display's frame callback does.
     pub fn run_until_idle(self: *HeadlessPlatform, app: *app_mod.App) void {
+        self.promote_draw_requests();
         var guard: usize = 0;
         while (!self.quit_requested and guard < 10_000) : (guard += 1) {
             var did = app.foreground_executor().run_pending() > 0;
-            for (self.windows.items) |w| {
-                if (w.frame_requested) {
-                    w.frame_requested = false;
-                    w.base.emit_request_frame(.{});
-                    did = true;
-                }
-            }
+            if (self.draw_requested_frames()) did = true;
             if (!did) break;
         }
+    }
+
+    /// Moves frames that draws asked for into the next pump, so an animation draws once per pump.
+    /// Used by the Linux platform's headless mode, which pumps in its own loop (no GPUI counterpart:
+    /// GPUI's headless Linux platform keeps frame requests in the window itself).
+    pub fn promote_draw_requests(self: *HeadlessPlatform) void {
+        for (self.windows.items) |w| {
+            if (w.frame_requested_by_draw) {
+                w.frame_requested_by_draw = false;
+                w.frame_requested = true;
+            }
+        }
+    }
+
+    /// Draws every window that asked for a frame, once. Returns whether any frame was drawn.
+    /// No GPUI counterpart: GPUI's headless window is drawn by the platform's frame timer.
+    ///
+    /// Deliberately naive: it walks every window on every pump. A faster version would keep a list
+    /// of the windows that asked, which only matters with many windows.
+    pub fn draw_requested_frames(self: *HeadlessPlatform) bool {
+        var did = false;
+        for (self.windows.items) |w| {
+            if (w.frame_requested) {
+                w.frame_requested = false;
+                w.drawing = true;
+                w.base.emit_request_frame(.{});
+                w.drawing = false;
+                did = true;
+            }
+        }
+        return did;
+    }
+
+    /// Whether some window still wants a frame, so a loop should wake for one without waiting for
+    /// an event. No GPUI counterpart (see `draw_requested_frames`).
+    pub fn frames_pending(self: *HeadlessPlatform) bool {
+        for (self.windows.items) |w| {
+            if (w.frame_requested or w.frame_requested_by_draw) return true;
+        }
+        return false;
+    }
+
+    /// Opens a window on this platform, as `Platform::open_window` does (no GPUI counterpart beyond
+    /// the platform's). Returns the window's base, owned by this platform until it closes.
+    pub fn open_window_base(self: *HeadlessPlatform, options: window_mod.WindowOptions) !*PlatformWindow {
+        const w = try HeadlessWindow.create(self, options);
+        errdefer w.destroy();
+        try self.windows.append(self.allocator, w);
+        return &w.base;
     }
 
     fn quit(p: *Platform) void {
@@ -79,20 +280,20 @@ pub const HeadlessPlatform = struct {
         for (self.windows.items) |w| w.destroy();
         self.windows.deinit(self.allocator);
         if (self.clipboard) |c| self.allocator.free(c);
+        self.menus.deinit();
         self.allocator.destroy(self);
     }
 
     fn wake(_: *Platform) void {}
 
-    fn openWindow(p: *Platform, options: window_mod.WindowOptions) anyerror!*PlatformWindow {
-        const self = from(p);
-        const w = try HeadlessWindow.create(self, options);
-        try self.windows.append(self.allocator, w);
-        return &w.base;
+    /// Like gpui_linux's headless platform, every kind opens a plain window: no popup placement.
+    fn openWindow(p: *Platform, options: window_mod.WindowOptions, _: ?*PlatformWindow) anyerror!*PlatformWindow {
+        return from(p).open_window_base(options);
     }
 
     fn displays(p: *Platform) []const platform.Display {
-        return &from(p).displays_;
+        const self = from(p);
+        return self.displays_[0..self.display_count];
     }
 
     fn setCursor(p: *Platform, s: platform.CursorStyle) void {
@@ -119,16 +320,104 @@ pub const HeadlessWindow = struct {
     base: PlatformWindow = .{ .vtable = &vtable },
     owner: *HeadlessPlatform,
     size: geometry.Size(Pixels),
+    /// Where the window sits; tests move it with `move_to`.
+    origin: geometry.Point(Pixels) = .{ .x = 0, .y = 0 },
     scale: f32 = 1,
     title: []const u8 = "",
     frame_requested: bool = true,
+    /// Set while `emit_request_frame` runs, so a frame the draw asks for is not run in the same pump.
+    drawing: bool = false,
+    /// A frame a draw asked for (an animation, such as a GIF, or a redraw after layout). It waits for
+    /// the next pump, so `run_until_idle` parks instead of drawing the animation until its guard.
+    frame_requested_by_draw: bool = false,
     closed: bool = false,
+    /// Set by `set_background_appearance`; a transparent window clears to transparent.
+    background: window_mod.WindowBackgroundAppearance = .@"opaque",
+    /// Set by `set_client_corner_radii`. Nothing here blurs, so it is only kept for the platform's answer.
+    corner_radii: geometry.Corners(Pixels) = .{},
     atlas: atlas_mod.CpuAtlas,
     /// The last presented scene (borrowed from the window's rendered frame).
     last_scene: ?*const scene_mod.Scene = null,
     draw_count: u64 = 0,
+    /// What the window last told the input method, for tests.
+    ime_enabled: bool = false,
+    ime_enabled_changes: u32 = 0,
+    ime_position: ?geometry.Bounds(Pixels) = null,
+    /// The app draws the frame (no server decorations are asked for). Nothing is moved or
+    /// resized by a compositor here, so `start_window_resize` and `show_window_menu` do nothing.
+    client_decorations: bool = false,
+    client_inset: Pixels = 0,
+    /// Window state as the platform reports it. Like GPUI's test window, toggling fullscreen flips
+    /// `fullscreen`, and nothing ever reports `maximized` unless a test sets it.
+    fullscreen: bool = false,
+    maximized: bool = false,
+    /// The last app id the app set (GPUI `set_app_id`), for tests.
+    app_id: []const u8 = "",
+    /// Whether the window is presented. Tests change it with `set_visibility`.
+    visibility_: platform.WindowVisibility = .visible,
+    /// The display the window is on. Tests move it with `move_to_display`.
+    display: platform.DisplayId = 0,
+
+    fn windowAppearance(p: *PlatformWindow) platform.WindowAppearance {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        return self.owner.appearance;
+    }
+
+    fn windowDecorations(p: *PlatformWindow) window_mod.Decorations {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        if (self.client_decorations) return .{ .client = .{ .tiling = .{} } };
+        return .server;
+    }
+
+    fn setClientInset(p: *PlatformWindow, inset: Pixels) void {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        self.client_inset = inset;
+    }
+
+    fn setBackgroundAppearance(p: *PlatformWindow, appearance: window_mod.WindowBackgroundAppearance) void {
+        from(p).background = appearance;
+    }
+
+    fn backgroundAppearance(p: *PlatformWindow) window_mod.WindowBackgroundAppearance {
+        return from(p).background;
+    }
+
+    fn setClientCornerRadii(p: *PlatformWindow, radii: geometry.Corners(Pixels)) void {
+        from(p).corner_radii = radii;
+    }
+
+    fn toggleFullscreen(p: *PlatformWindow) void {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        self.fullscreen = !self.fullscreen;
+    }
+    fn isFullscreen(p: *PlatformWindow) bool {
+        return from(p).fullscreen;
+    }
+    fn isMaximized(p: *PlatformWindow) bool {
+        return from(p).maximized;
+    }
+    fn setAppId(p: *PlatformWindow, app_id: []const u8) void {
+        from(p).app_id = app_id;
+    }
+    fn requestDecorations(p: *PlatformWindow, decorations: window_mod.WindowDecorations) void {
+        from(p).client_decorations = decorations == .client;
+    }
+
+    fn updateImeEnabled(p: *PlatformWindow, enabled: bool) void {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        self.ime_enabled = enabled;
+        self.ime_enabled_changes += 1;
+    }
+
+    fn updateImePosition(p: *PlatformWindow, area: geometry.Bounds(Pixels)) void {
+        const self: *HeadlessWindow = @fieldParentPtr("base", p);
+        self.ime_position = area;
+    }
 
     const vtable: PlatformWindow.VTable = .{
+        .appearance = windowAppearance,
+        .update_ime_enabled = updateImeEnabled,
+        .update_ime_position = updateImePosition,
         .bounds = bounds,
         .content_size = contentSize,
         .scale_factor = scaleFactor,
@@ -138,13 +427,46 @@ pub const HeadlessWindow = struct {
         .set_title = setTitle,
         .resize = resize,
         .close = close,
+        .window_decorations = windowDecorations,
+        .set_client_inset = setClientInset,
+        .set_background_appearance = setBackgroundAppearance,
+        .background_appearance = backgroundAppearance,
+        .set_client_corner_radii = setClientCornerRadii,
+        .toggle_fullscreen = toggleFullscreen,
+        .is_fullscreen = isFullscreen,
+        .is_maximized = isMaximized,
+        .set_app_id = setAppId,
+        .request_decorations = requestDecorations,
+        .visibility = visibility,
+        .display_id = displayId,
     };
+
+    fn visibility(p: *PlatformWindow) platform.WindowVisibility {
+        return from(p).visibility_;
+    }
+
+    fn displayId(p: *PlatformWindow) ?platform.DisplayId {
+        return from(p).display;
+    }
+
+    /// Changes what the window presents and reports it. Like a real platform, it reports even a
+    /// repeat of the state it already had: the window must work out what changed.
+    pub fn set_visibility(self: *HeadlessWindow, v: platform.WindowVisibility) void {
+        self.visibility_ = v;
+        self.base.emit_visibility_changed();
+    }
+
+    /// Moves the window to another display and reports it, even when it is the display it is on.
+    pub fn move_to_display(self: *HeadlessWindow, id: platform.DisplayId) void {
+        self.display = id;
+        self.base.emit_display_changed();
+    }
 
     fn create(owner: *HeadlessPlatform, options: window_mod.WindowOptions) !*HeadlessWindow {
         const a = owner.allocator;
         const self = try a.create(HeadlessWindow);
         const b = if (options.window_bounds) |wb| wb.get_bounds() else geometry.Bounds(Pixels){ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 800, .height = 600 } };
-        self.* = .{ .owner = owner, .size = b.size, .atlas = atlas_mod.CpuAtlas.init(a) };
+        self.* = .{ .owner = owner, .size = b.size, .atlas = atlas_mod.CpuAtlas.init(a), .client_decorations = options.window_decorations == .client, .background = options.window_background };
         if (std.c.getenv("ZUI_SCALE")) |s| self.scale = std.fmt.parseFloat(f32, std.mem.span(s)) catch 1;
         return self;
     }
@@ -159,7 +481,13 @@ pub const HeadlessWindow = struct {
     }
 
     fn bounds(p: *PlatformWindow) geometry.Bounds(Pixels) {
-        return .{ .origin = .{ .x = 0, .y = 0 }, .size = from(p).size };
+        return .{ .origin = from(p).origin, .size = from(p).size };
+    }
+    /// Moves the window and reports it as the platform does: only a real change is reported.
+    pub fn move_to(self: *HeadlessWindow, origin: geometry.Point(Pixels)) void {
+        if (self.origin.x == origin.x and self.origin.y == origin.y) return;
+        self.origin = origin;
+        self.base.emit_moved();
     }
     fn contentSize(p: *PlatformWindow) geometry.Size(Pixels) {
         return from(p).size;
@@ -168,7 +496,8 @@ pub const HeadlessWindow = struct {
         return from(p).scale;
     }
     fn requestFrame(p: *PlatformWindow) void {
-        from(p).frame_requested = true;
+        const self = from(p);
+        if (self.drawing) self.frame_requested_by_draw = true else self.frame_requested = true;
     }
     fn draw(p: *PlatformWindow, scene: *const scene_mod.Scene) void {
         const self = from(p);
@@ -190,13 +519,34 @@ pub const HeadlessWindow = struct {
         var r = cpu.CpuRenderer.init(a);
         defer r.deinit();
         const fb: cpu.Framebuffer = .{ .pixels = pixels, .width = w, .height = h, .stride = w * 4, .format = .rgba8 };
-        r.draw(scene, &self.atlas, fb, @import("../color.zig").white());
+        const color = @import("../color.zig");
+        if (self.background == .@"opaque") {
+            r.draw(scene, &self.atlas, fb, color.white());
+        } else {
+            r.draw(scene, &self.atlas, fb, color.transparent_black());
+        }
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(a);
-        try out.print(a, "P6\n{d} {d}\n255\n", .{ w, h });
-        try out.ensureUnusedCapacity(a, @as(usize, w) * h * 3);
-        var i: usize = 0;
-        while (i < pixels.len) : (i += 4) out.appendSliceAssumeCapacity(pixels[i .. i + 3]);
+        if (self.background == .@"opaque") {
+            try out.print(a, "P6\n{d} {d}\n255\n", .{ w, h });
+            try out.ensureUnusedCapacity(a, @as(usize, w) * h * 3);
+            var i: usize = 0;
+            while (i < pixels.len) : (i += 4) out.appendSliceAssumeCapacity(pixels[i .. i + 3]);
+        } else {
+            // A transparent window is written as PAM (RGB_ALPHA) with straight alpha, since PPM has
+            // no alpha. The renderer keeps premultiplied pixels, so they are divided by alpha here.
+            try out.print(a, "P7\nWIDTH {d}\nHEIGHT {d}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", .{ w, h });
+            try out.ensureUnusedCapacity(a, pixels.len);
+            var i: usize = 0;
+            while (i < pixels.len) : (i += 4) {
+                const alpha = pixels[i + 3];
+                for (0..3) |c| {
+                    const v: u32 = if (alpha == 0) 0 else @min(255, (@as(u32, pixels[i + c]) * 255 + alpha / 2) / alpha);
+                    out.appendAssumeCapacity(@intCast(v));
+                }
+                out.appendAssumeCapacity(alpha);
+            }
+        }
         const zpath = try a.dupeSentinel(u8, path, 0);
         defer a.free(zpath);
         const f = std.c.fopen(zpath, "wb") orelse return error.OpenFailed;

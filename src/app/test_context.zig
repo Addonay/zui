@@ -5,6 +5,10 @@
 //! so tests exercise the same dispatch paths as a real platform.
 
 const std = @import("std");
+const input_mod = @import("../input.zig");
+const view_mod = @import("../view.zig");
+const color_mod = @import("../color.zig");
+const headless_mod = @import("../platform/headless.zig");
 const app_mod = @import("../app.zig");
 const window_mod = @import("../window.zig");
 const interactive = @import("../interactive.zig");
@@ -13,6 +17,8 @@ const action_mod = @import("../action.zig");
 const platform_mod = @import("../platform.zig");
 const geometry = @import("../geometry.zig");
 const headless = @import("../platform/headless.zig");
+const TestScheduler = @import("../test_scheduler.zig").TestScheduler;
+const executor_mod = @import("../executor.zig");
 
 const App = app_mod.App;
 const Entity = app_mod.Entity;
@@ -31,14 +37,25 @@ fn ReturnOf(comptime f: anytype) type {
     return @typeInfo(@TypeOf(f)).@"fn".return_type.?;
 }
 
+/// `ZUI_TEST_SEED=<n>` replaces the seed of every `TestAppContext.build`, so a run can check that no
+/// test depends on the seed it was written with (GPUI's `SEED`). Unset, each test keeps its own seed.
+fn seed_from_env(default: u64) u64 {
+    const raw = std.c.getenv("ZUI_TEST_SEED") orelse return default;
+    return std.fmt.parseInt(u64, std.mem.span(raw), 0) catch default;
+}
+
 /// A test application: a headless `App` plus helpers to pump it (GPUI `TestAppContext`).
 pub const TestAppContext = struct {
     allocator: std.mem.Allocator,
     platform: *platform_mod.Platform,
     app: *App,
     visual_contexts: std.ArrayList(*VisualTestContext) = .empty,
+    /// The deterministic scheduler, or null when the app runs on real threads (`init`). GPUI
+    /// `dispatcher`. Only `build` and `single` set it.
+    dispatcher: ?*TestScheduler = null,
 
-    /// Creates a headless app backed by `std.testing.allocator`.
+    /// Creates a headless app backed by `std.testing.allocator`. Its tasks run on worker threads and
+    /// its timers use the real clock.
     pub fn init() TestAppContext {
         return with_allocator(std.testing.allocator);
     }
@@ -49,11 +66,32 @@ pub const TestAppContext = struct {
         return .{ .allocator = allocator, .platform = platform, .app = app };
     }
 
+    /// Creates a deterministic headless app (GPUI `TestAppContext::build` over a `TestDispatcher`).
+    /// Its tasks and timers run on the test thread, in an order drawn from `seed`, and its clock is
+    /// fake: it moves only when a test calls `cx.executor().advance_clock`. Use it for any test that
+    /// depends on timing, so that it cannot flake.
+    pub fn build(seed: u64) TestAppContext {
+        const allocator = std.testing.allocator;
+        // The scheduler starts the fake clock first, so the app's own timestamps are fake too.
+        const scheduler = TestScheduler.init(allocator, seed_from_env(seed));
+        const platform = headless.HeadlessPlatform.create(allocator);
+        const app = App.init(allocator, platform) catch @panic("failed to create test app");
+        executor_mod.attach_test_scheduler(app.background_executor(), app.foreground_executor(), scheduler);
+        return .{ .allocator = allocator, .platform = platform, .app = app, .dispatcher = scheduler };
+    }
+
+    /// `build` with seed 0 (GPUI `TestAppContext::single`).
+    pub fn single() TestAppContext {
+        return build(0);
+    }
+
     pub fn deinit(self: *TestAppContext) void {
         for (self.visual_contexts.items) |v| self.allocator.destroy(v);
         self.visual_contexts.deinit(self.allocator);
+        // The app first: its teardown runs the background work that is left, which needs the scheduler.
         self.app.deinit();
         self.platform.deinit();
+        if (self.dispatcher) |scheduler| scheduler.deinit();
     }
 
     /// Runs `f(args..., *App)` (GPUI `update`).
@@ -151,20 +189,12 @@ pub const TestAppContext = struct {
         self.run_until_parked();
     }
 
-    /// Sends a key-down followed by a key-up. Printable keys without command or control
-    /// modifiers also deliver their text, as the platform would.
+    /// Sends a key-down followed by a key-up. Keys the platform would type also deliver their
+    /// text (GPUI `Keystroke::with_simulated_ime`).
     pub fn dispatch_keystroke(self: *TestAppContext, window: *Window, keystroke: Keystroke) void {
-        var ks = keystroke;
-        if (ks.key_char == null and !ks.modifiers.control and !ks.modifiers.platform and ks.key.len == 1) {
-            ks.key_char = if (ks.modifiers.shift and std.ascii.isLower(ks.key[0])) shifted_letter(ks.key[0]) else ks.key;
-        }
+        const ks = keystroke.with_simulated_ime();
         _ = window.dispatch_event(.{ .key_down = .{ .keystroke = ks } }, self.app);
         _ = window.dispatch_event(.{ .key_up = .{ .keystroke = ks } }, self.app);
-    }
-
-    fn shifted_letter(c: u8) []const u8 {
-        const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        return upper[c - 'a' ..][0..1];
     }
 
     pub fn write_to_clipboard(self: *TestAppContext, item: platform_mod.ClipboardItem) void {
@@ -174,12 +204,22 @@ pub const TestAppContext = struct {
     pub fn read_from_clipboard(self: *TestAppContext) ?platform_mod.ClipboardItem {
         return self.app.read_from_clipboard();
     }
+
+    /// Sets the name `App.get_name` returns (GPUI `TestAppContext::set_name`). The name must outlive the test.
+    pub fn set_name(self: *TestAppContext, name: []const u8) void {
+        self.app.name_ = name;
+    }
 };
 
 /// A window-scoped test context that simulates platform input (GPUI `VisualTestContext`).
 pub const VisualTestContext = struct {
     window: *Window,
     cx: *TestAppContext,
+
+    /// A visual context for `window`, which must belong to `cx` (GPUI `VisualTestContext::from_window`).
+    pub fn from_window(window: *Window, cx: *TestAppContext) VisualTestContext {
+        return .{ .window = window, .cx = cx };
+    }
 
     pub fn simulate_event(self: *VisualTestContext, event: PlatformInput) void {
         _ = self.window.dispatch_event(event, self.cx.app);
@@ -222,6 +262,12 @@ pub const VisualTestContext = struct {
         self.cx.run_until_parked();
     }
 
+    /// Moves the window and reports it, as a window manager does (GPUI `on_moved`).
+    pub fn simulate_move(self: *VisualTestContext, origin: Point(Pixels)) void {
+        headless.HeadlessWindow.from(self.window.platform_window).move_to(origin);
+        self.cx.run_until_parked();
+    }
+
     pub fn dispatch_action(self: *VisualTestContext, action: anytype) void {
         self.cx.dispatch_action(self.window, action);
     }
@@ -229,6 +275,18 @@ pub const VisualTestContext = struct {
     pub fn focus(self: *VisualTestContext, handle: window_mod.FocusHandle) void {
         self.window.focus(handle);
         self.cx.run_until_parked();
+    }
+
+    /// Creates an entity with access to the window, as `build(window, cx)` (GPUI `new_window_entity`).
+    pub fn new_window_entity(self: *VisualTestContext, comptime build: anytype) Entity(@typeInfo(@TypeOf(build)).@"fn".return_type.?) {
+        return self.window.new_window_entity(self.cx.app, build);
+    }
+
+    /// Replaces the window's root view with a new one, built by `build(window, cx)` (GPUI `replace_root_view`).
+    pub fn replace_root_view(self: *VisualTestContext, comptime build: anytype) Entity(@typeInfo(@TypeOf(build)).@"fn".return_type.?) {
+        const view = self.window.replace_root(self.cx.app, build);
+        self.cx.run_until_parked();
+        return view;
     }
 
     /// Runs `f(window, app)` against the window (GPUI `update`).
@@ -272,6 +330,11 @@ const ClickEvent = interactive.ClickEvent;
 const KeyDownEvent = interactive.KeyDownEvent;
 const FocusHandle = window_mod.FocusHandle;
 const div = div_mod.div;
+const canvas_mod = @import("../elements/canvas.zig");
+const style_cursor = @import("../style.zig").CursorStyle;
+const img_mod = @import("../elements/img.zig");
+const assets_mod = @import("../assets.zig");
+const element_mod = @import("../element.zig");
 const px = geometry.px;
 const rgb = @import("../color.zig").rgb;
 const red = @import("../color.zig").red;
@@ -517,6 +580,9 @@ const Editor = struct {
         self.saves += 1;
         cx.notify();
     }
+    fn note_window(_: *Editor, window: *Window, _: *Context(Editor)) window_mod.WindowId {
+        return window.window_handle_id();
+    }
     fn on_key_down(self: *Editor, ev: *const KeyDownEvent, _: *Window, _: *Context(Editor)) void {
         self.keys += 1;
         const key = ev.keystroke.key;
@@ -552,6 +618,540 @@ test "actions: key binding dispatches to on_action on the focused element" {
     vcx.simulate_keystrokes("cmd-s");
     const state = cx.read_entity(view, Editor.read_state, .{});
     try std.testing.expectEqual(@as(usize, 1), state.saves);
+}
+
+test "multi-stroke: a sequence runs its action and its keys reach nobody else" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("g s", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expect(vcx.window.has_pending_keystrokes());
+    try std.testing.expectEqual(@as(usize, 1), vcx.window.pending_input_keystrokes().?.len);
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, Editor.read_state, .{}).keys);
+
+    vcx.simulate_keystrokes("s");
+    const state = cx.read_entity(view, Editor.read_state, .{});
+    try std.testing.expectEqual(@as(usize, 1), state.saves);
+    try std.testing.expectEqual(@as(usize, 0), state.keys);
+    try std.testing.expect(!vcx.window.has_pending_keystrokes());
+}
+
+test "multi-stroke: a wrong second key replays the first, in order" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("g s", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g x");
+    const state = cx.read_entity(view, Editor.read_state, .{});
+    try std.testing.expectEqual(@as(usize, 0), state.saves);
+    try std.testing.expectEqual(@as(usize, 2), state.keys);
+    const last = view.read(cx.app);
+    try std.testing.expectEqualStrings("x", last.last_key[0..last.last_key_len]);
+    try std.testing.expect(!vcx.window.has_pending_keystrokes());
+}
+
+test "multi-stroke: a binding that is also a prefix fires after the timeout" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    cx.app.bind_keys(&.{ KeyBinding.new("g", Editor.Save{}, "Editor"), KeyBinding.new("g g", Editor.Outside{}, "Editor") });
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, Editor.read_state, .{}).saves);
+    // The timeout is one second on the fake clock. Nothing fires before it.
+    cx.executor().advance_clock(std.time.ns_per_s - 1);
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, Editor.read_state, .{}).saves);
+    cx.executor().advance_clock(1);
+    const state = cx.read_entity(view, Editor.read_state, .{});
+    try std.testing.expectEqual(@as(usize, 1), state.saves);
+    try std.testing.expectEqual(@as(usize, 0), state.keys);
+}
+
+test "multi-stroke: without a binding of its own a prefix waits for the next key" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("ctrl-k ctrl-c", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("ctrl-k");
+    // Past the timeout a prefix with a binding of its own would have fired by.
+    cx.executor().advance_clock(700 * std.time.ns_per_ms);
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.has_pending_keystrokes());
+    vcx.simulate_keystrokes("ctrl-c");
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+}
+
+test "multi-stroke: moving focus drops pending input" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("g s", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expect(vcx.window.has_pending_keystrokes());
+    vcx.window.blur();
+    try std.testing.expect(!vcx.window.has_pending_keystrokes());
+    view.read(cx.app).focus.focus(vcx.window);
+    vcx.simulate_keystrokes("s");
+    const state = cx.read_entity(view, Editor.read_state, .{});
+    try std.testing.expectEqual(@as(usize, 0), state.saves);
+    try std.testing.expectEqual(@as(usize, 1), state.keys);
+}
+
+const KeystrokeLog = struct {
+    var observed: usize = 0;
+    var last_had_action: bool = false;
+    var intercepted: usize = 0;
+    var stop: bool = false;
+    var pending_changes: usize = 0;
+
+    fn observe(event: *const app_mod.KeystrokeEvent, _: *Window, _: *App) void {
+        observed += 1;
+        last_had_action = event.action != null;
+    }
+    fn intercept(_: *const app_mod.KeystrokeEvent, window: *Window, _: *App) void {
+        intercepted += 1;
+        if (stop) window.stop_propagation();
+    }
+    fn pending_changed(_: *Window, _: *App) void {
+        pending_changes += 1;
+    }
+};
+
+test "keystroke observers see the action; interceptors run first and can stop bindings" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    KeystrokeLog.observed = 0;
+    KeystrokeLog.intercepted = 0;
+    KeystrokeLog.stop = false;
+    cx.app.bind_keys(&.{KeyBinding.new("cmd-s", Editor.Save{}, "Editor")});
+    _ = cx.app.observe_keystrokes(KeystrokeLog.observe);
+    const interceptor = cx.app.intercept_keystrokes(KeystrokeLog.intercept);
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("cmd-s");
+    try std.testing.expectEqual(@as(usize, 1), KeystrokeLog.observed);
+    try std.testing.expect(KeystrokeLog.last_had_action);
+    try std.testing.expectEqual(@as(usize, 1), KeystrokeLog.intercepted);
+
+    vcx.simulate_keystrokes("a");
+    try std.testing.expectEqual(@as(usize, 2), KeystrokeLog.observed);
+    try std.testing.expect(!KeystrokeLog.last_had_action);
+
+    KeystrokeLog.stop = true;
+    vcx.simulate_keystrokes("cmd-s");
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+
+    KeystrokeLog.stop = false;
+    interceptor.unsubscribe();
+    vcx.simulate_keystrokes("cmd-s");
+    try std.testing.expectEqual(@as(usize, 2), cx.read_entity(view, Editor.read_state, .{}).saves);
+    try std.testing.expectEqual(@as(usize, 3), KeystrokeLog.intercepted);
+}
+
+test "pending input observers run as a sequence starts and ends" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    KeystrokeLog.pending_changes = 0;
+    cx.app.bind_keys(&.{KeyBinding.new("g s", Editor.Save{}, "Editor")});
+    _, const vcx = cx.add_window_view(Editor.build);
+    _ = cx.app.observe_pending_input(vcx.window, KeystrokeLog.pending_changed);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expectEqual(@as(usize, 1), KeystrokeLog.pending_changes);
+    vcx.simulate_keystrokes("s");
+    try std.testing.expectEqual(@as(usize, 2), KeystrokeLog.pending_changes);
+}
+
+test "a modifier tapped alone is a keystroke; used with another key it is not" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("shift", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const send = struct {
+        fn modifiers(w: *Window, app: *App, shift: bool, control: bool) void {
+            _ = w.dispatch_event(.{ .modifiers_changed = .{ .modifiers = .{ .shift = shift, .control = control } } }, app);
+        }
+    }.modifiers;
+
+    send(vcx.window, cx.app, true, false);
+    send(vcx.window, cx.app, false, false);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+
+    send(vcx.window, cx.app, true, false);
+    vcx.simulate_keystrokes("shift-a");
+    send(vcx.window, cx.app, false, false);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+
+    send(vcx.window, cx.app, true, false);
+    send(vcx.window, cx.app, true, true);
+    send(vcx.window, cx.app, false, false);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+}
+
+const OverscrollView = struct {
+    var child_y: [64]f32 = undefined;
+    var frames: usize = 0;
+
+    fn record(_: void, bounds: geometry.Bounds(Pixels), _: *Window, _: *App) void {
+        if (frames < child_y.len) child_y[frames] = bounds.origin.y;
+        frames += 1;
+    }
+
+    pub fn render(_: *OverscrollView, _: *Window, _: *Context(OverscrollView)) *Div {
+        return div().id("scroller").w(px(100)).h(px(100)).overflow_y_scroll().child(
+            div().w(px(100)).h(px(300)).child(canvas_mod.canvas_fn({}, record).size_full()),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(OverscrollView) {
+        return app.new(OverscrollView{});
+    }
+};
+
+test "scroll: no frame is painted past either end, and scrolling at a limit draws nothing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    OverscrollView.frames = 0;
+    _, const vcx = cx.add_window_view(OverscrollView.build);
+    vcx.run_until_parked();
+    const pos: Point(Pixels) = .{ .x = 10, .y = 10 };
+
+    // A first event at the top, before any limit could be known by an event.
+    const at_rest = OverscrollView.frames;
+    try std.testing.expect(at_rest > 0);
+    vcx.simulate_scroll(pos, .{ .x = 0, .y = 50 });
+    vcx.run_until_parked();
+    try std.testing.expectEqual(at_rest, OverscrollView.frames);
+
+    // Far past the bottom in one event stops exactly at the end.
+    vcx.simulate_scroll(pos, .{ .x = 0, .y = -1000 });
+    vcx.run_until_parked();
+    try std.testing.expect(OverscrollView.frames > at_rest);
+    const top = OverscrollView.child_y[0];
+    try std.testing.expectEqual(top - 200, OverscrollView.child_y[OverscrollView.frames - 1]);
+
+    // Past the bottom again: no frame.
+    const at_end = OverscrollView.frames;
+    vcx.simulate_scroll(pos, .{ .x = 0, .y = -50 });
+    vcx.run_until_parked();
+    try std.testing.expectEqual(at_end, OverscrollView.frames);
+
+    // No frame ever left the range.
+    for (OverscrollView.child_y[0..OverscrollView.frames]) |y| {
+        try std.testing.expect(y <= top and y >= top - 200);
+    }
+}
+
+const RemoteImageView = struct {
+    var url: []const u8 = "";
+    var fallbacks: usize = 0;
+    var loadings: usize = 0;
+
+    fn on_fallback() element_mod.AnyElement {
+        fallbacks += 1;
+        return div().into_any_element();
+    }
+    fn on_loading() element_mod.AnyElement {
+        loadings += 1;
+        return div().into_any_element();
+    }
+
+    pub fn render(_: *RemoteImageView, _: *Window, _: *Context(RemoteImageView)) *Div {
+        return div().w(px(100)).h(px(100)).child(img_mod.img(url).with_loading(on_loading).with_fallback(on_fallback));
+    }
+    fn build(_: *Window, app: *App) Entity(RemoteImageView) {
+        return app.new(RemoteImageView{});
+    }
+    fn reset(new_url: []const u8) void {
+        url = new_url;
+        fallbacks = 0;
+        loadings = 0;
+    }
+    fn wait(vcx: *VisualTestContext, cache: *assets_mod.AssetCache) assets_mod.ImageCacheError!*assets_mod.RenderImage {
+        const resource: assets_mod.Resource = .{ .uri = url };
+        for (0..1000) |_| {
+            vcx.run_until_parked();
+            const result = cache.load_resource(.empty, resource);
+            if (result != error.Loading) {
+                vcx.run_until_parked();
+                return result;
+            }
+            @import("../executor.zig").sleep_ns(5 * std.time.ns_per_ms);
+        }
+        return error.Loading;
+    }
+};
+
+/// A 1x1 PNG.
+const tiny_png = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0d\x49\x44\x41\x54\x78\x9c\x63\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99\x3d\x1d\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+/// A 2x1 PNG.
+const wide_png = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x02\x00\x00\x00\x01\x08\x06\x00\x00\x00\xf4\x22\x7f\x8a\x00\x00\x00\x0e\x49\x44\x41\x54\x78\x9c\x63\xf8\xcf\xc0\xf0\x1f\x04\x01\x10\xf8\x03\xfd\x4e\x95\xc1\x6f\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+const FakeHttp = struct {
+    var released: std.atomic.Value(bool) = .init(false);
+    var served: std.atomic.Value(u32) = .init(0);
+    var body: []const u8 = tiny_png;
+
+    /// Answers `body` once released.
+    fn gated(_: ?*anyopaque, allocator: std.mem.Allocator, _: std.Io, _: []const u8) anyerror![]u8 {
+        while (!released.load(.acquire)) @import("../executor.zig").sleep_ns(std.time.ns_per_ms);
+        defer _ = served.fetchAdd(1, .release);
+        return allocator.dupe(u8, body);
+    }
+
+    /// Answers once the test has seen the loading state.
+    fn ok(_: ?*anyopaque, allocator: std.mem.Allocator, _: std.Io, _: []const u8) anyerror![]u8 {
+        while (!released.load(.acquire)) @import("../executor.zig").sleep_ns(std.time.ns_per_ms);
+        return allocator.dupe(u8, tiny_png);
+    }
+    fn broken(_: ?*anyopaque, _: std.mem.Allocator, _: std.Io, _: []const u8) anyerror![]u8 {
+        return error.ConnectionRefused;
+    }
+};
+
+test "img: a URL shows the loading placeholder, then the image in a redrawn frame" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.ok };
+    FakeHttp.released.store(false, .release);
+    RemoteImageView.reset("https://example.test/a.png");
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    const first_frames = vcx.window.frame_count;
+    try std.testing.expect(RemoteImageView.loadings > 0);
+    FakeHttp.released.store(true, .release);
+    const image = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    try std.testing.expectEqual(@as(i32, 1), image.size(0).width);
+    try std.testing.expect(vcx.window.frame_count > first_frames);
+    try std.testing.expectEqual(@as(usize, 0), RemoteImageView.fallbacks);
+}
+
+test "img: a failed URL shows the fallback and is not fetched again every frame" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.broken };
+    RemoteImageView.reset("https://example.test/gone.png");
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    try std.testing.expectError(error.FetchFailed, RemoteImageView.wait(vcx, &cx.app.asset_cache));
+    try std.testing.expect(RemoteImageView.fallbacks > 0);
+}
+
+const DiskCacheFixture = struct {
+    tmp: std.testing.TmpDir,
+    dir: []u8,
+
+    fn init() !DiskCacheFixture {
+        const tmp = std.testing.tmpDir(.{});
+        return .{ .tmp = tmp, .dir = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path }) };
+    }
+    fn deinit(self: *DiskCacheFixture) void {
+        std.testing.allocator.free(self.dir);
+        self.tmp.cleanup();
+    }
+    /// Loads the URL once in a throwaway app, so its bytes end up on disk.
+    fn seed(self: *DiskCacheFixture, png: []const u8) !void {
+        var cx = TestAppContext.init();
+        defer cx.deinit();
+        cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.gated };
+        cx.app.asset_cache.fetch_config.?.disk_cache = .{ .dir = self.dir };
+        FakeHttp.body = png;
+        FakeHttp.released.store(true, .release);
+        _, const vcx = cx.add_window_view(RemoteImageView.build);
+        _ = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    }
+    fn wait_served(vcx: *VisualTestContext, count: u32) void {
+        while (FakeHttp.served.load(.acquire) < count) @import("../executor.zig").sleep_ns(std.time.ns_per_ms);
+        // Long enough for the task to publish after answering.
+        @import("../executor.zig").sleep_ns(50 * std.time.ns_per_ms);
+        vcx.run_until_parked();
+    }
+};
+
+test "img: a URL seen before shows at once, before the network answers" {
+    var disk = try DiskCacheFixture.init();
+    defer disk.deinit();
+    RemoteImageView.reset("https://example.test/saved.png");
+    try disk.seed(tiny_png);
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.gated };
+    cx.app.asset_cache.fetch_config.?.disk_cache = .{ .dir = disk.dir };
+    FakeHttp.released.store(false, .release);
+    defer FakeHttp.released.store(true, .release);
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    const first = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    try std.testing.expectEqual(@as(i32, 1), first.size(0).width);
+
+    // The same bytes come back: the image stays, and nothing is redrawn for it.
+    FakeHttp.served.store(0, .release);
+    const frames = vcx.window.frame_count;
+    FakeHttp.released.store(true, .release);
+    DiskCacheFixture.wait_served(vcx, 1);
+    try std.testing.expectEqual(first, try cx.app.asset_cache.load_resource(.empty, .{ .uri = RemoteImageView.url }));
+    try std.testing.expectEqual(frames, vcx.window.frame_count);
+}
+
+test "img: a saved copy is replaced when the URL's content changed" {
+    var disk = try DiskCacheFixture.init();
+    defer disk.deinit();
+    RemoteImageView.reset("https://example.test/changes.png");
+    try disk.seed(tiny_png);
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.gated };
+    cx.app.asset_cache.fetch_config.?.disk_cache = .{ .dir = disk.dir };
+    FakeHttp.released.store(false, .release);
+    defer FakeHttp.released.store(true, .release);
+    FakeHttp.body = wide_png;
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    const first = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    try std.testing.expectEqual(@as(i32, 1), first.size(0).width);
+
+    FakeHttp.served.store(0, .release);
+    FakeHttp.released.store(true, .release);
+    DiskCacheFixture.wait_served(vcx, 1);
+    const second = try cx.app.asset_cache.load_resource(.empty, .{ .uri = RemoteImageView.url });
+    try std.testing.expectEqual(@as(i32, 2), second.size(0).width);
+}
+
+test "img: a saved copy stays when the network fails" {
+    var disk = try DiskCacheFixture.init();
+    defer disk.deinit();
+    RemoteImageView.reset("https://example.test/offline.png");
+    try disk.seed(tiny_png);
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.asset_cache.fetch_config.?.http_client = .{ .get_fn = FakeHttp.broken };
+    cx.app.asset_cache.fetch_config.?.disk_cache = .{ .dir = disk.dir };
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    const first = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    @import("../executor.zig").sleep_ns(50 * std.time.ns_per_ms);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(first, try cx.app.asset_cache.load_resource(.empty, .{ .uri = RemoteImageView.url }));
+    try std.testing.expectEqual(@as(usize, 0), RemoteImageView.fallbacks);
+}
+
+/// Answers one HTTP request with a PNG, with a redirect first.
+const LocalServer = struct {
+    fn respond(server: *std.Io.net.Server, io: std.Io, reply: []const u8) !void {
+        var stream = try server.accept(io);
+        defer stream.close(io);
+        var read_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(io, &read_buffer);
+        var seen: usize = 0;
+        while (seen < 4) {
+            const byte = try reader.interface.takeByte();
+            seen = switch (byte) {
+                '\r' => if (seen == 2) 3 else 1,
+                '\n' => if (seen == 3) 4 else if (seen == 1) 2 else 0,
+                else => 0,
+            };
+        }
+        var write_buffer: [4096]u8 = undefined;
+        var writer = stream.writer(io, &write_buffer);
+        try writer.interface.writeAll(reply);
+        try writer.interface.flush();
+    }
+
+    fn serve(server: *std.Io.net.Server, io: std.Io, port: u16) void {
+        var redirect_buffer: [256]u8 = undefined;
+        const redirect = std.fmt.bufPrint(&redirect_buffer, "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/real.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{port}) catch unreachable;
+        respond(server, io, redirect) catch return;
+        var reply_buffer: [512]u8 = undefined;
+        const reply = std.fmt.bufPrint(&reply_buffer, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ tiny_png.len, tiny_png }) catch unreachable;
+        respond(server, io, reply) catch return;
+    }
+};
+
+test "img: the built-in client fetches over a real socket and follows a redirect" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+    const thread = try std.Thread.spawn(.{}, LocalServer.serve, .{ &server, io, port });
+    defer thread.join();
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    var url_buffer: [64]u8 = undefined;
+    RemoteImageView.reset(try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/a.png", .{port}));
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    const image = try RemoteImageView.wait(vcx, &cx.app.asset_cache);
+    try std.testing.expectEqual(@as(i32, 1), image.size(0).width);
+}
+
+test "img: quitting does not wait for a server that never answers" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    // Connections complete in the backlog and then nothing is ever read or sent.
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+
+    var cx = TestAppContext.init();
+    var url_buffer: [64]u8 = undefined;
+    RemoteImageView.reset(try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/a.png", .{server.socket.address.getPort()}));
+    _, const vcx = cx.add_window_view(RemoteImageView.build);
+    vcx.run_until_parked();
+    @import("../executor.zig").sleep_ns(50 * std.time.ns_per_ms);
+    const start = @import("../executor.zig").now_ns();
+    cx.deinit();
+    try std.testing.expect(@import("../executor.zig").now_ns() - start < 2 * std.time.ns_per_s);
+}
+
+const PropagatingEditor = struct {
+    focus: FocusHandle,
+    calls: usize = 0,
+    keys: usize = 0,
+    const NotMine = Action("test", "NotMine");
+
+    fn on_not_mine(self: *PropagatingEditor, _: *const NotMine, _: *Window, cx: *Context(PropagatingEditor)) void {
+        self.calls += 1;
+        cx.app.propagate();
+    }
+    fn on_key(self: *PropagatingEditor, _: *const KeyDownEvent, _: *Window, _: *Context(PropagatingEditor)) void {
+        self.keys += 1;
+    }
+    pub fn render(self: *PropagatingEditor, _: *Window, cx: *Context(PropagatingEditor)) *Div {
+        return div().id("propagating").w(px(100)).h(px(100)).key_context("Editor").track_focus(&self.focus)
+            .on_action(NotMine, cx.listener(on_not_mine)).on_key_down(cx.listener(on_key));
+    }
+    fn build(_: *Window, app: *App) Entity(PropagatingEditor) {
+        return app.new(PropagatingEditor{ .focus = app.focus_handle() });
+    }
+};
+
+test "actions: a binding whose handler propagates does not swallow its key" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("a", PropagatingEditor.NotMine{}, "Editor")});
+    const view, const vcx = cx.add_window_view(PropagatingEditor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.simulate_keystrokes("a");
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).calls);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).keys);
 }
 
 test "actions: dispatch_action reaches on_action on the focus path" {
@@ -644,8 +1244,8 @@ test "windows: simulate_resize updates the viewport" {
     defer cx.deinit();
     _, const vcx = cx.add_window_view(Counter.build);
     vcx.simulate_resize(.{ .width = 320, .height = 240 });
-    try std.testing.expectEqual(@as(Pixels, 320), vcx.window.viewport_size.width);
-    try std.testing.expectEqual(@as(Pixels, 240), vcx.window.viewport_size.height);
+    try std.testing.expectEqual(@as(Pixels, 320), vcx.window.viewport_size().width);
+    try std.testing.expectEqual(@as(Pixels, 240), vcx.window.viewport_size().height);
 }
 
 /// Re-renders from state: the quad width tracks `count`, so a repaint after `notify` is observable.
@@ -679,6 +1279,127 @@ test "windows: notify re-renders the view with new state" {
     vcx.simulate_click(.{ .x = 5, .y = 5 }, .{});
     try std.testing.expect(scene_has_quad_width(vcx.window, 101));
     try std.testing.expect(!scene_has_quad_width(vcx.window, 100));
+}
+
+const ViewPathLeaf = struct {
+    pub fn render(_: *ViewPathLeaf, _: *Window, _: *Context(ViewPathLeaf)) *Div {
+        return div().id("leaf").size(px(10));
+    }
+};
+
+const ViewPathInner = struct {
+    leaf: Entity(ViewPathLeaf),
+
+    pub fn render(self: *ViewPathInner, _: *Window, _: *Context(ViewPathInner)) *Div {
+        return div().id("inner").size(px(20)).child(self.leaf);
+    }
+};
+
+const ViewPathRoot = struct {
+    inner: Entity(ViewPathInner),
+
+    pub fn render(self: *ViewPathRoot, _: *Window, _: *Context(ViewPathRoot)) *Div {
+        return div().id("root").size(px(100)).child(self.inner);
+    }
+
+    fn build(_: *Window, app: *App) Entity(ViewPathRoot) {
+        const leaf = app.new(ViewPathLeaf{});
+        const inner = app.new(ViewPathInner{ .leaf = leaf });
+        return app.new(ViewPathRoot{ .inner = inner });
+    }
+};
+
+test "views: view_path_reversed walks from a nested view to the root in a live frame" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const root, const vcx = cx.add_window_view(ViewPathRoot.build);
+    const inner = cx.read_entity(root, struct {
+        fn f(self: *const ViewPathRoot, _: *const App) Entity(ViewPathInner) {
+            return self.inner;
+        }
+    }.f, .{});
+    const leaf = cx.read_entity(inner, struct {
+        fn f(self: *const ViewPathInner, _: *const App) Entity(ViewPathLeaf) {
+            return self.leaf;
+        }
+    }.f, .{});
+
+    const expected = [_]app_mod.EntityId{ leaf.entity_id(), inner.entity_id(), root.entity_id() };
+    var got: [4]app_mod.EntityId = undefined;
+    var n: usize = 0;
+    var path = vcx.window.rendered_frame.dispatch_tree.view_path_reversed(leaf.entity_id());
+    while (path.next()) |id| : (n += 1) {
+        if (n == got.len) break;
+        got[n] = id;
+    }
+    try std.testing.expectEqual(expected.len, n);
+    for (expected, 0..) |id, i| try std.testing.expectEqual(id, got[i]);
+    // A view with no node in this frame has no path at all.
+    var none = vcx.window.rendered_frame.dispatch_tree.view_path_reversed(@enumFromInt(9999));
+    try std.testing.expect(none.next() == null);
+}
+
+fn window_state_probe(window: *Window, _: *App) void {
+    window.toggle_fullscreen();
+}
+
+test "window state: toggle_fullscreen reaches the platform, and window_bounds reports the fullscreen variant" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Counter.build);
+    try std.testing.expect(!vcx.window.is_fullscreen());
+    try std.testing.expect(vcx.window.window_bounds() == .windowed);
+
+    vcx.update(window_state_probe, .{});
+    try std.testing.expect(vcx.window.is_fullscreen());
+    try std.testing.expect(vcx.window.window_bounds() == .fullscreen);
+    try std.testing.expect(vcx.window.inner_window_bounds() == .fullscreen);
+
+    vcx.update(window_state_probe, .{});
+    try std.testing.expect(!vcx.window.is_fullscreen());
+    try std.testing.expect(vcx.window.window_bounds() == .windowed);
+}
+
+test "window state: a maximized window reports the maximized variant from the platform" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Counter.build);
+    headless.HeadlessWindow.from(vcx.window.platform_window).maximized = true;
+    try std.testing.expect(vcx.window.is_maximized());
+    try std.testing.expect(vcx.window.window_bounds() == .maximized);
+    try std.testing.expect(vcx.window.inner_window_bounds() == .maximized);
+}
+
+test "window state: inner_window_bounds leaves out the client shadow inset, and only with client decorations" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Counter.build);
+    const size = vcx.window.bounds().size;
+    vcx.window.set_client_inset(10);
+    // Server decorations draw no shadow of their own, so nothing is inset.
+    try std.testing.expectEqual(size, vcx.window.inner_window_bounds().get_bounds().size);
+
+    vcx.window.request_decorations(.client);
+    try std.testing.expect(vcx.window.window_decorations() == .client);
+    const inner = vcx.window.inner_window_bounds().get_bounds();
+    try std.testing.expectEqual(size.width - 20, inner.size.width);
+    try std.testing.expectEqual(size.height - 20, inner.size.height);
+    try std.testing.expectEqual(@as(Pixels, 10), inner.origin.x);
+    // The outer bounds are what the platform reports, so they keep the shadow.
+    try std.testing.expectEqual(size, vcx.window.bounds().size);
+}
+
+test "window state: set_app_id and request_decorations reach the platform" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Counter.build);
+    try std.testing.expect(vcx.window.window_decorations() == .server);
+    vcx.window.set_app_id("dev.zui.example");
+    try std.testing.expectEqualStrings("dev.zui.example", headless.HeadlessWindow.from(vcx.window.platform_window).app_id);
+    vcx.window.request_decorations(.client);
+    try std.testing.expect(vcx.window.window_decorations() == .client);
+    vcx.window.request_decorations(.server);
+    try std.testing.expect(vcx.window.window_decorations() == .server);
 }
 
 test "actions: a key binding whose context does not match is ignored" {
@@ -734,6 +1455,49 @@ test "tasks: foreground spawn runs during run_until_parked" {
     var task = cx.app.foreground_executor().spawn(Done.work, .{@as(usize, 21)});
     cx.run_until_parked();
     try std.testing.expectEqual(@as(usize, 42), task.get().?);
+}
+
+test "deterministic: timers and the clock move only when the test advances them" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    const bg = cx.executor();
+    try std.testing.expect(bg.is_test());
+    const start = bg.now();
+    var t = bg.timer(250 * std.time.ns_per_ms);
+    cx.run_until_parked();
+    try std.testing.expect(!t.is_ready());
+    try std.testing.expectEqual(start, bg.now());
+    bg.advance_clock(249 * std.time.ns_per_ms);
+    try std.testing.expect(!t.is_ready());
+    bg.advance_clock(std.time.ns_per_ms);
+    try std.testing.expect(t.is_ready());
+    try std.testing.expectEqual(start + 250 * std.time.ns_per_ms, bg.now());
+    t.wait();
+    // The app's clock is the fake one, so its own timestamps agree with it.
+    try std.testing.expect(cx.app.synced_animation_epoch <= bg.now());
+}
+
+test "deterministic: background work runs on the test thread, when the test runs the scheduler" {
+    var cx = TestAppContext.build(3);
+    defer cx.deinit();
+    const Probe = struct {
+        fn thread() std.Thread.Id {
+            return std.Thread.getCurrentId();
+        }
+    };
+    var task = cx.executor().spawn(Probe.thread, .{});
+    try std.testing.expect(!task.is_ready());
+    cx.run_until_parked();
+    try std.testing.expectEqual(std.Thread.getCurrentId(), task.get().?);
+}
+
+test "VisualTestContext.from_window: a context for a window that is already open" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    var again = VisualTestContext.from_window(vcx.window, &cx);
+    try std.testing.expectEqual(vcx.window, again.window);
+    again.run_until_parked();
 }
 
 test "globals: update_global from a context notifies observers" {
@@ -858,7 +1622,7 @@ const TextField = struct {
 
     pub fn render(self: *TextField, window: *Window, cx: *Context(TextField)) *Div {
         // Input handlers are registered during the frame, while the field is focused.
-        window.handle_input(&self.focus, .{ .ctx = self, .vtable = &input_vtable }, cx.app);
+        window.handle_input(&self.focus, platform_mod.PlatformInputHandler{ .ctx = self, .vtable = &input_vtable }, cx.app);
         return div().id("field").w(px(100)).h(px(30)).track_focus(&self.focus);
     }
     fn build(_: *Window, app: *App) Entity(TextField) {
@@ -880,6 +1644,704 @@ test "keystrokes: typed text is delivered to the focused input handler" {
     try std.testing.expectEqualStrings("hiA", cx.read_entity(view, TextField.read_text, .{}));
     vcx.simulate_keystrokes("cmd-a");
     try std.testing.expectEqualStrings("hiA", cx.read_entity(view, TextField.read_text, .{}));
+}
+
+/// A field holding ASCII text with a composition, through `ElementInputHandler`. Two focus
+/// handles let tests move focus between fields of the same view.
+const ImeField = struct {
+    focus: FocusHandle,
+    other_focus: FocusHandle,
+    buffer: [64]u8 = @splat(0),
+    len: usize = 0,
+    marked: ?platform_mod.Range = null,
+    caret: usize = 0,
+    accepts: bool = true,
+
+    pub fn render(self: *ImeField, window: *Window, cx: *Context(ImeField)) *Div {
+        const bounds: geometry.Bounds(Pixels) = .{ .origin = .{ .x = 5, .y = 7 }, .size = .{ .width = 100, .height = 20 } };
+        window.handle_input(&self.focus, input_mod.ElementInputHandler(ImeField).new(bounds, cx.entity()), cx);
+        window.handle_input(&self.other_focus, input_mod.ElementInputHandler(ImeField).new(bounds, cx.entity()), cx);
+        return div().w(px(100)).h(px(30)).track_focus(&self.focus).child(div().w(px(10)).h(px(10)).track_focus(&self.other_focus));
+    }
+
+    pub fn text_for_range(self: *ImeField, range: platform_mod.Range, _: *?platform_mod.Range, _: *Window, _: *Context(ImeField)) ?[]const u8 {
+        return self.buffer[range.start..range.end];
+    }
+    pub fn selected_text_range(self: *ImeField, _: bool, _: *Window, _: *Context(ImeField)) ?platform_mod.UTF16Selection {
+        return .{ .range = .{ .start = self.caret, .end = self.caret } };
+    }
+    pub fn marked_text_range(self: *ImeField, _: *Window, _: *Context(ImeField)) ?platform_mod.Range {
+        return self.marked;
+    }
+    pub fn unmark_text(self: *ImeField, _: *Window, _: *Context(ImeField)) void {
+        self.marked = null;
+    }
+    pub fn replace_text_in_range(self: *ImeField, range: ?platform_mod.Range, text: []const u8, _: *Window, _: *Context(ImeField)) void {
+        const r = range orelse self.marked orelse platform_mod.Range{ .start = self.caret, .end = self.caret };
+        self.splice(r, text);
+        self.marked = null;
+    }
+    pub fn replace_and_mark_text_in_range(self: *ImeField, range: ?platform_mod.Range, text: []const u8, new_selected: ?platform_mod.Range, _: *Window, _: *Context(ImeField)) void {
+        const r = range orelse self.marked orelse platform_mod.Range{ .start = self.caret, .end = self.caret };
+        self.splice(r, text);
+        self.marked = if (text.len > 0) .{ .start = r.start, .end = r.start + text.len } else null;
+        if (new_selected) |sel| self.caret = r.start + sel.end;
+    }
+    pub fn bounds_for_range(_: *ImeField, range: platform_mod.Range, element_bounds: geometry.Bounds(Pixels), _: *Window, _: *Context(ImeField)) ?geometry.Bounds(Pixels) {
+        return .{ .origin = .{ .x = element_bounds.origin.x + @as(f32, @floatFromInt(range.start)) * 10, .y = element_bounds.origin.y }, .size = .{ .width = 0, .height = 20 } };
+    }
+    pub fn character_index_for_point(_: *ImeField, _: Point(Pixels), _: *Window, _: *Context(ImeField)) ?usize {
+        return 0;
+    }
+    pub fn accepts_text_input(self: *ImeField, _: *Window, _: *Context(ImeField)) bool {
+        return self.accepts;
+    }
+
+    fn splice(self: *ImeField, r: platform_mod.Range, text: []const u8) void {
+        const tail_len = self.len - r.end;
+        std.mem.copyForwards(u8, self.buffer[r.start + text.len..], self.buffer[r.end..self.len]);
+        @memcpy(self.buffer[r.start..][0..text.len], text);
+        self.len = r.start + text.len + tail_len;
+        self.caret = r.start + text.len;
+    }
+
+    fn build(_: *Window, app: *App) Entity(ImeField) {
+        return app.new(ImeField{ .focus = app.focus_handle(), .other_focus = app.focus_handle() });
+    }
+    fn read_text(s: *const ImeField, _: *const App) []const u8 {
+        return s.buffer[0..s.len];
+    }
+    fn read_marked(s: *const ImeField, _: *const App) ?platform_mod.Range {
+        return s.marked;
+    }
+    fn ime(vcx: *VisualTestContext, input: platform_mod.ImeInput) void {
+        vcx.window.platform_window.emit_ime(input);
+        vcx.cx.app.flush_effects();
+    }
+    fn headless(vcx: *VisualTestContext) *headless_mod.HeadlessWindow {
+        return @fieldParentPtr("base", vcx.window.platform_window);
+    }
+};
+
+const NestedFocus = struct {
+    outer: FocusHandle,
+    inner: FocusHandle,
+
+    pub fn render(self: *NestedFocus, _: *Window, _: *Context(NestedFocus)) *Div {
+        return div().id("outer").size(px(100)).track_focus(&self.outer).child(div().id("inner").size(px(20)).track_focus(&self.inner));
+    }
+    fn build(_: *Window, app: *App) Entity(NestedFocus) {
+        return app.new(NestedFocus{ .outer = app.focus_handle(), .inner = app.focus_handle() });
+    }
+};
+
+test "focus: clicking a focusable child keeps focus from its focusable parent" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(NestedFocus.build);
+    vcx.simulate_click(.{ .x = 5, .y = 5 }, .{});
+    try std.testing.expect(view.read(cx.app).inner.is_focused(vcx.window));
+    try std.testing.expect(!view.read(cx.app).outer.is_focused(vcx.window));
+    // Outside the child, the parent takes it.
+    vcx.simulate_click(.{ .x = 50, .y = 50 }, .{});
+    try std.testing.expect(view.read(cx.app).outer.is_focused(vcx.window));
+}
+
+test "input: a composition replaces itself and commits in place" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.simulate_input("ab");
+
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "n" } });
+    try std.testing.expectEqualStrings("abn", cx.read_entity(view, ImeField.read_text, .{}));
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "ni" } });
+    try std.testing.expectEqualStrings("abni", cx.read_entity(view, ImeField.read_text, .{}));
+    try std.testing.expectEqual(platform_mod.Range{ .start = 2, .end = 4 }, cx.read_entity(view, ImeField.read_marked, .{}).?);
+
+    // Committing replaces the composition, wherever the caret is.
+    ImeField.ime(vcx, .{ .insert_text = "XY" });
+    try std.testing.expectEqualStrings("abXY", cx.read_entity(view, ImeField.read_text, .{}));
+    try std.testing.expect(cx.read_entity(view, ImeField.read_marked, .{}) == null);
+
+    // A typed key replaces a composition too: that is how a composed dead key lands.
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "'" } });
+    vcx.simulate_input("e");
+    try std.testing.expectEqualStrings("abXYe", cx.read_entity(view, ImeField.read_text, .{}));
+}
+
+test "input: cancelling and accepting a composition" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.simulate_input("a");
+
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "zz" } });
+    ImeField.ime(vcx, .delete_text);
+    try std.testing.expectEqualStrings("a", cx.read_entity(view, ImeField.read_text, .{}));
+    // With nothing marked, deleting must not touch the text.
+    ImeField.ime(vcx, .delete_text);
+    try std.testing.expectEqualStrings("a", cx.read_entity(view, ImeField.read_text, .{}));
+
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "q" } });
+    ImeField.ime(vcx, .unmark_text);
+    try std.testing.expectEqualStrings("aq", cx.read_entity(view, ImeField.read_text, .{}));
+    try std.testing.expect(cx.read_entity(view, ImeField.read_marked, .{}) == null);
+}
+
+test "input: the platform hears about every change of focused field" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    const win = ImeField.headless(vcx);
+    try std.testing.expect(!win.ime_enabled);
+
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    try std.testing.expect(win.ime_enabled);
+    try std.testing.expectEqual(@as(u32, 1), win.ime_enabled_changes);
+
+    // Redrawing the same field says nothing new.
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(u32, 1), win.ime_enabled_changes);
+
+    // Moving between two text fields: off, then on again, as text-input-v3 requires.
+    vcx.focus(view.read(cx.app).other_focus);
+    vcx.run_until_parked();
+    try std.testing.expect(win.ime_enabled);
+    try std.testing.expectEqual(@as(u32, 3), win.ime_enabled_changes);
+
+    vcx.window.blur();
+    vcx.run_until_parked();
+    try std.testing.expect(!win.ime_enabled);
+}
+
+test "input: a field that refuses text disables the input method" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    const win = ImeField.headless(vcx);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    try std.testing.expect(win.ime_enabled);
+
+    view.as_mut(cx.app).accepts = false;
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(!win.ime_enabled);
+}
+
+test "input: candidates follow the caret, and the composition start while composing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    const win = ImeField.headless(vcx);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    vcx.simulate_input("ab");
+
+    vcx.window.invalidate_character_coordinates();
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(f32, 25), win.ime_position.?.origin.x);
+
+    ImeField.ime(vcx, .{ .set_marked_text = .{ .text = "xyz" } });
+    const area = win.base.ime_area().?;
+    try std.testing.expectEqual(@as(f32, 25), area.origin.x);
+}
+
+test "input: the caret position reaches the input method after typing, without being asked" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    const win = ImeField.headless(vcx);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    vcx.simulate_input("abc");
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(f32, 35), win.ime_position.?.origin.x);
+
+    // Text set by the application only counts once the view says so.
+    win.ime_position = null;
+    view.as_mut(cx.app).caret = 1;
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(win.ime_position == null);
+    vcx.window.notify_text_input_changed(&view.read(cx.app).focus);
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(f32, 15), win.ime_position.?.origin.x);
+
+    // Notifications about a field without focus are ignored.
+    win.ime_position = null;
+    vcx.window.notify_text_input_changed(&view.read(cx.app).other_focus);
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(win.ime_position == null);
+}
+
+const DragField = struct {
+    released_outside: usize = 0,
+    released_inside: usize = 0,
+
+    pub fn render(_: *DragField, _: *Window, cx: *Context(DragField)) *Div {
+        return div().size(px(200)).child(
+            div().id("field").size(px(20)).on_mouse_up(.left, cx.listener(on_inside)).on_mouse_up_out(.left, cx.listener(on_outside)),
+        );
+    }
+    fn on_inside(self: *DragField, _: *const interactive.MouseUpEvent, _: *Window, _: *Context(DragField)) void {
+        self.released_inside += 1;
+    }
+    fn on_outside(self: *DragField, _: *const interactive.MouseUpEvent, _: *Window, _: *Context(DragField)) void {
+        self.released_outside += 1;
+    }
+    fn build(_: *Window, app: *App) Entity(DragField) {
+        return app.new(DragField{});
+    }
+};
+
+test "div: on_mouse_up_out fires only for releases outside the element" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragField.build);
+    vcx.simulate_click(.{ .x = 5, .y = 5 }, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).released_inside);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).released_outside);
+    vcx.simulate_click(.{ .x = 100, .y = 100 }, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).released_inside);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).released_outside);
+}
+
+test "input: a released view reads as an empty field instead of crashing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    var handler = input_mod.ElementInputHandler(ImeField).new(.{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1, .height = 1 } }, view).platform_input_handler();
+    // An id that was never allocated stands in for a view released after painting.
+    const dead = input_mod.ElementInputHandler(ImeField);
+    const stale: *dead = @ptrCast(@alignCast(handler.ctx));
+    stale.view = .{ .entity_id_ = @enumFromInt(0x7fffffff) };
+    try std.testing.expect(!handler.accepts_text_input(vcx.window, cx.app));
+    try std.testing.expect(handler.selected_text_range(true, vcx.window, cx.app) == null);
+    handler.replace_text_in_range(null, "x", vcx.window, cx.app);
+    try std.testing.expect(handler.selected_bounds(vcx.window, cx.app) == null);
+}
+
+const Payload = struct { n: u32 };
+
+const DragPreview = struct {
+    n: u32,
+    pub fn render(_: *DragPreview, _: *Window, _: *Context(DragPreview)) *Div {
+        return div().w(px(10)).h(px(10)).bg(color_mod.red());
+    }
+};
+
+const DragPage = struct {
+    dropped: ?u32 = null,
+    drops: usize = 0,
+    clicks: usize = 0,
+    aux_clicks: usize = 0,
+    previews_made: usize = 0,
+    files: usize = 0,
+    file_name: [64]u8 = undefined,
+    file_name_len: usize = 0,
+    allow: bool = true,
+    pinches: usize = 0,
+    pressures: usize = 0,
+    last_stage: interactive.PressureStage = .zero,
+
+    var allow_drop: bool = true;
+
+    fn make_preview(value: *const Payload, _: Point(Pixels), _: *Window, cx: *App) Entity(DragPreview) {
+        return cx.new(DragPreview{ .n = value.n });
+    }
+    fn refuse(_: app_mod.AnyDragValue, _: *Window, _: *App) bool {
+        return allow_drop;
+    }
+    fn on_drop(self: *DragPage, value: *const Payload, _: *Window, _: *Context(DragPage)) void {
+        self.dropped = value.n;
+        self.drops += 1;
+    }
+    fn on_files(self: *DragPage, value: *const interactive.ExternalPaths, _: *Window, _: *Context(DragPage)) void {
+        self.files = value.items.len;
+        // Paths belong to the platform, so a handler that keeps them copies them.
+        const first = value.items[0];
+        self.file_name_len = @min(first.len, self.file_name.len);
+        @memcpy(self.file_name[0..self.file_name_len], first[0..self.file_name_len]);
+    }
+    fn on_click(self: *DragPage, _: *const interactive.ClickEvent, _: *Window, _: *Context(DragPage)) void {
+        self.clicks += 1;
+    }
+    fn on_aux(self: *DragPage, _: *const interactive.ClickEvent, _: *Window, _: *Context(DragPage)) void {
+        self.aux_clicks += 1;
+    }
+    fn on_pinch(self: *DragPage, _: *const interactive.PinchEvent, _: *Window, _: *Context(DragPage)) void {
+        self.pinches += 1;
+    }
+    fn on_pressure(self: *DragPage, e: *const interactive.MousePressureEvent, _: *Window, _: *Context(DragPage)) void {
+        self.pressures += 1;
+        self.last_stage = e.stage;
+    }
+    pub fn render(_: *DragPage, _: *Window, cx: *Context(DragPage)) *Div {
+        return div().size(px(300)).child(
+            div().id("source").absolute().left(px(0)).top(px(0)).w(px(50)).h(px(50))
+                .on_drag(Payload{ .n = 7 }, make_preview)
+                .on_click(cx.listener(on_click))
+                .on_aux_click(cx.listener(on_aux)),
+        ).child(
+            div().id("target").absolute().left(px(100)).top(px(0)).w(px(50)).h(px(50))
+                .on_drop(Payload, cx.listener(on_drop))
+                .on_drop(interactive.ExternalPaths, cx.listener(on_files))
+                .on_pinch(cx.listener(on_pinch))
+                .on_mouse_pressure(cx.listener(on_pressure)),
+        ).child(
+            div().id("picky").absolute().left(px(200)).top(px(0)).w(px(50)).h(px(50))
+                .can_drop(refuse)
+                .on_drop(Payload, cx.listener(on_drop)),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(DragPage) {
+        return app.new(DragPage{});
+    }
+};
+
+fn start_drag(vcx: *VisualTestContext) void {
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .left, .{});
+    vcx.simulate_mouse_move(.{ .x = 30, .y = 10 }, .left, .{});
+    vcx.run_until_parked();
+}
+
+const ResizeHandle = struct {
+    fn make_preview(_: *const u8, _: Point(Pixels), _: *Window, app: *App) Entity(Empty) {
+        return app.new(Empty{});
+    }
+    const Empty = struct {
+        pub fn render(_: *Empty, _: *Window, _: *Context(Empty)) *Div {
+            return div();
+        }
+    };
+    pub fn render(_: *ResizeHandle, _: *Window, _: *Context(ResizeHandle)) *Div {
+        const value: u8 = 0;
+        return div().size_full().cursor_text().child(
+            div().id("resize-handle").w(px(4)).h_full().cursor_col_resize().on_drag(value, make_preview),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(ResizeHandle) {
+        return app.new(ResizeHandle{});
+    }
+};
+
+// GPUI `test_drag_cursor_applies_before_next_paint`.
+test "drag: its cursor applies before the next paint, and ends with it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(ResizeHandle.build);
+    vcx.run_until_parked();
+    const hp: *headless.HeadlessPlatform = @fieldParentPtr("platform", cx.platform);
+    const window = vcx.window;
+    const on_handle: Point(Pixels) = .{ .x = 1, .y = 10 };
+    const away: Point(Pixels) = .{ .x = 20, .y = 10 };
+
+    // Dispatched directly, because pumping would paint a frame and hide the bug.
+    _ = window.dispatch_event(.{ .mouse_move = .{ .position = on_handle } }, cx.app);
+    try std.testing.expectEqual(style_cursor.resize_column, hp.cursor);
+    _ = window.dispatch_event(.{ .mouse_down = .{ .position = on_handle, .button = .left } }, cx.app);
+    _ = window.dispatch_event(.{ .mouse_move = .{ .position = away, .pressed_button = .left } }, cx.app);
+    try std.testing.expect(cx.app.has_active_drag());
+    // The pointer is over the text area now, and the frame has not been painted again.
+    try std.testing.expectEqual(style_cursor.resize_column, hp.cursor);
+
+    vcx.run_until_parked();
+    try std.testing.expectEqual(style_cursor.resize_column, hp.cursor);
+    _ = window.dispatch_event(.{ .mouse_up = .{ .position = away, .button = .left } }, cx.app);
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    try std.testing.expectEqual(style_cursor.i_beam, hp.cursor);
+}
+
+test "drag: dropping on a target delivers the value and ends the drag" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    start_drag(vcx);
+    try std.testing.expect(cx.app.has_active_drag());
+    vcx.simulate_mouse_move(.{ .x = 120, .y = 10 }, .left, .{});
+    vcx.run_until_parked();
+    vcx.simulate_mouse_up(.{ .x = 120, .y = 10 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    try std.testing.expectEqual(@as(?u32, 7), view.read(cx.app).dropped);
+    // Starting a drag is not a click.
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).clicks);
+}
+
+test "drag: a release away from any target cancels without delivering" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    start_drag(vcx);
+    vcx.simulate_mouse_move(.{ .x = 280, .y = 280 }, .left, .{});
+    vcx.simulate_mouse_up(.{ .x = 280, .y = 280 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    try std.testing.expect(view.read(cx.app).dropped == null);
+}
+
+test "drag: small jitter stays a click, and only the threshold starts a drag" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .left, .{});
+    vcx.simulate_mouse_move(.{ .x = 11, .y = 11 }, .left, .{});
+    try std.testing.expect(!cx.app.has_active_drag());
+    vcx.simulate_mouse_up(.{ .x = 11, .y = 11 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).clicks);
+}
+
+test "drag: moving the pointer without a press does not start one" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(DragPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.simulate_mouse_move(.{ .x = 40, .y = 40 }, null, .{});
+    try std.testing.expect(!cx.app.has_active_drag());
+    // A press and release elsewhere clears any state before moving back over.
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .left, .{});
+    vcx.simulate_mouse_up(.{ .x = 280, .y = 280 }, .left, .{});
+    vcx.simulate_mouse_move(.{ .x = 30, .y = 30 }, null, .{});
+    try std.testing.expect(!cx.app.has_active_drag());
+}
+
+test "drag: can_drop refuses the value, and the drag still ends" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    DragPage.allow_drop = false;
+    defer DragPage.allow_drop = true;
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    start_drag(vcx);
+    vcx.simulate_mouse_move(.{ .x = 220, .y = 10 }, .left, .{});
+    vcx.simulate_mouse_up(.{ .x = 220, .y = 10 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expect(view.read(cx.app).dropped == null);
+    try std.testing.expect(!cx.app.has_active_drag());
+}
+
+test "drag: the preview draws at the pointer, and stop_active_drag cancels it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(DragPage.build);
+    const before = vcx.window.rendered_frame.scene.quads.items.len;
+    start_drag(vcx);
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.rendered_frame.scene.quads.items.len > before);
+    try std.testing.expect(cx.app.stop_active_drag(vcx.window));
+    try std.testing.expect(!cx.app.stop_active_drag(vcx.window));
+}
+
+test "clicks: other buttons reach on_aux_click, not on_click" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .right, .{});
+    vcx.simulate_mouse_up(.{ .x = 10, .y = 10 }, .right, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).aux_clicks);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).clicks);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).clicks);
+}
+
+test "file drags: paths reach on_drop like any other drag" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    const paths = [_][]const u8{ "/tmp/a.txt", "/tmp/b.png" };
+    vcx.simulate_event(.{ .file_drop = .{ .entered = .{ .position = .{ .x = 120, .y = 10 }, .paths = .{ .items = &paths } } } });
+    try std.testing.expect(cx.app.has_active_drag());
+    vcx.run_until_parked();
+    vcx.simulate_event(.{ .file_drop = .{ .pending = .{ .position = .{ .x = 125, .y = 12 } } } });
+    vcx.run_until_parked();
+    vcx.simulate_event(.{ .file_drop = .{ .submit = .{ .position = .{ .x = 125, .y = 12 } } } });
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    try std.testing.expectEqual(@as(usize, 2), view.read(cx.app).files);
+    const page = view.read(cx.app);
+    try std.testing.expectEqualStrings("/tmp/a.txt", page.file_name[0..page.file_name_len]);
+}
+
+test "file drags: leaving the window ends the drag and drops nothing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    const paths = [_][]const u8{"/tmp/a.txt"};
+    vcx.simulate_event(.{ .file_drop = .{ .entered = .{ .position = .{ .x = 120, .y = 10 }, .paths = .{ .items = &paths } } } });
+    vcx.simulate_event(.{ .file_drop = .exited });
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).files);
+}
+
+test "pressure: reaches the element under the pointer with its stage" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    vcx.simulate_mouse_move(.{ .x = 120, .y = 10 }, null, .{});
+    vcx.simulate_event(.{ .mouse_pressure = .{ .position = .{ .x = 120, .y = 10 }, .pressure = 0.5, .stage = .normal } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).pressures);
+    try std.testing.expectEqual(interactive.PressureStage.normal, view.read(cx.app).last_stage);
+    vcx.simulate_mouse_move(.{ .x = 280, .y = 280 }, null, .{});
+    vcx.simulate_event(.{ .mouse_pressure = .{ .position = .{ .x = 280, .y = 280 }, .pressure = 0.9, .stage = .force } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).pressures);
+}
+
+test "pinch: reaches the element under the pointer" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(DragPage.build);
+    vcx.simulate_mouse_move(.{ .x = 120, .y = 10 }, null, .{});
+    vcx.simulate_event(.{ .pinch = .{ .position = .{ .x = 120, .y = 10 }, .delta = 0.1 } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).pinches);
+    vcx.simulate_mouse_move(.{ .x = 280, .y = 280 }, null, .{});
+    vcx.simulate_event(.{ .pinch = .{ .position = .{ .x = 280, .y = 280 }, .delta = 0.1 } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).pinches);
+}
+
+const TooltipView = struct {
+    pub fn render(_: *TooltipView, _: *Window, _: *Context(TooltipView)) *Div {
+        return div().w(px(40)).h(px(20)).bg(color_mod.red());
+    }
+};
+
+const TooltipPage = struct {
+    show_button: bool = true,
+    hoverable: bool = false,
+
+    fn build_tip(_: *Window, cx: *App) view_mod.AnyView {
+        return view_mod.AnyView.from(cx.new(TooltipView{}));
+    }
+    pub fn render(self: *TooltipPage, _: *Window, _: *Context(TooltipPage)) *Div {
+        const root = div().size(px(300));
+        if (self.show_button) {
+            const button = div().id("button").absolute().left(px(0)).top(px(0)).w(px(50)).h(px(50)).tooltip_show_delay(1);
+            _ = if (self.hoverable) button.hoverable_tooltip(build_tip) else button.tooltip(build_tip);
+            _ = root.child(button);
+        }
+        return root;
+    }
+    fn build(_: *Window, app: *App) Entity(TooltipPage) {
+        return app.new(TooltipPage{});
+    }
+};
+
+/// Lets the show delay (one millisecond, a timer on the fake clock) pass, then checks the tooltip.
+fn wait_for_tooltip(vcx: *VisualTestContext, wanted: bool) !void {
+    vcx.cx.executor().advance_clock(std.time.ns_per_ms);
+    vcx.run_until_parked();
+    if ((vcx.window.tooltip_bounds != null) != wanted) return error.TooltipTimedOut;
+}
+
+test "tooltip: shows after the delay and closes when the pointer leaves" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.run_until_parked();
+    try wait_for_tooltip(vcx, true);
+    try std.testing.expectEqual(@as(f32, 11), vcx.window.tooltip_bounds.?.origin.x);
+    vcx.simulate_mouse_move(.{ .x = 200, .y = 200 }, null, .{});
+    try wait_for_tooltip(vcx, false);
+}
+
+test "tooltip: leaving before the delay means it never shows" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.simulate_mouse_move(.{ .x = 200, .y = 200 }, null, .{});
+    cx.executor().advance_clock(40 * std.time.ns_per_ms);
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds == null);
+}
+
+test "tooltip: a press closes it, and does not bring it back" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    try wait_for_tooltip(vcx, true);
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .left, .{});
+    try wait_for_tooltip(vcx, false);
+    vcx.simulate_mouse_up(.{ .x = 10, .y = 10 }, .left, .{});
+    vcx.run_until_parked();
+}
+
+test "tooltip: its element disappearing while it shows closes it safely" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    try wait_for_tooltip(vcx, true);
+    view.as_mut(cx.app).show_button = false;
+    vcx.window.refresh();
+    try wait_for_tooltip(vcx, false);
+}
+
+test "tooltip: a timer firing after its element is gone does nothing" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    view.as_mut(cx.app).show_button = false;
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    cx.executor().advance_clock(30 * std.time.ns_per_ms);
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds == null);
+}
+
+test "tooltip: a hoverable one survives the pointer moving onto it" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(TooltipPage.build);
+    view.as_mut(cx.app).hoverable = true;
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    try wait_for_tooltip(vcx, true);
+    const b = vcx.window.tooltip_bounds.?;
+    // Off the button, onto the tooltip. The tooltip starts at the pointer, inside the button,
+    // so go to its far corner, moved past the button with the tooltip still there.
+    vcx.simulate_mouse_move(.{ .x = b.origin.x + b.size.width - 1, .y = b.origin.y + 1 }, null, .{});
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds != null);
+}
+
+test "tooltip placement stays inside the window" {
+    const viewport: geometry.Size(Pixels) = .{ .width = 100, .height = 100 };
+    const tip: geometry.Size(Pixels) = .{ .width = 30, .height = 20 };
+    const place = window_mod.tooltip_origin;
+    try std.testing.expectEqual(@as(f32, 11), place(.{ .x = 10, .y = 10 }, tip, viewport).x);
+    // Past the right and bottom edges it flips to the other side of the pointer.
+    const corner = place(.{ .x = 95, .y = 95 }, tip, viewport);
+    try std.testing.expectEqual(@as(f32, 64), corner.x);
+    try std.testing.expectEqual(@as(f32, 74), corner.y);
+    // Bigger than the window: pinned to the start rather than off screen.
+    const huge = place(.{ .x = 5, .y = 5 }, .{ .width = 500, .height = 500 }, viewport);
+    try std.testing.expectEqual(@as(f32, 0), huge.x);
+    try std.testing.expectEqual(@as(f32, 0), huge.y);
 }
 
 test "VisualTestContext: focus, update, mouse move and dispatch_action" {
@@ -912,4 +2374,3570 @@ test "TestAppContext: public API compiles and an extra window opens" {
     _ = cx.foreground_executor();
     _ = cx.background_executor();
     try std.testing.expectEqual(@as(usize, 1), cx.app.windows.items.len);
+}
+
+test "menus: set_menus stores copies that get_menus returns" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    try std.testing.expect(cx.app.get_menus() == null);
+    const Toggle = action_mod.Action("test", "Toggle");
+    var name: [4]u8 = "File".*;
+    const items = [_]platform_mod.app_menu.MenuItem{
+        platform_mod.app_menu.MenuItem.action("Toggle", Toggle{}).checked(true),
+        platform_mod.app_menu.MenuItem.separator_item(),
+    };
+    cx.app.set_menus(&.{platform_mod.app_menu.Menu.new(&name).items(&items)});
+    // The stored menus are copies: changing the caller's name does not change them.
+    name[0] = 'X';
+    const menus = cx.app.get_menus().?;
+    try std.testing.expectEqualStrings("File", menus[0].name);
+    try std.testing.expectEqual(@as(usize, 2), menus[0].items.len);
+    try std.testing.expect(menus[0].items[0].action_item.checked);
+}
+
+test "app menus: a pick dispatches its action, and validation asks the app" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Ping = action_mod.Action("test", "AppMenuPing");
+    const Other = action_mod.Action("test", "AppMenuOther");
+    const Seen = struct {
+        var count: usize = 0;
+        fn on_ping(_: *const Ping, _: *App) void {
+            count += 1;
+        }
+    };
+    Seen.count = 0;
+    // Nothing is bound yet, so the menu item is not offered.
+    try std.testing.expect(!cx.app.is_action_available(Ping));
+    cx.app.on_action(Ping, Seen.on_ping);
+    try std.testing.expect(cx.app.is_action_available(Ping));
+    const boxed = action_mod.box_action(cx.app.effect_arena.allocator(), Ping{});
+    try std.testing.expect(cx.app.platform.emit_validate_app_menu_command(boxed));
+    try std.testing.expect(!cx.app.platform.emit_validate_app_menu_command(action_mod.box_action(cx.app.effect_arena.allocator(), Other{})));
+    cx.app.platform.emit_app_menu_action(boxed);
+    try std.testing.expectEqual(@as(usize, 1), Seen.count);
+}
+
+test "window test hooks: scale, next-frame callbacks, painted quads, update count and views" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Counter.build);
+    _ = view;
+    const win = vcx.window;
+
+    win.set_scale_factor(2);
+    try std.testing.expectEqual(@as(f32, 2), win.scale_factor());
+
+    const Ran = struct {
+        var n: usize = 0;
+        fn on_frame(_: *Window, _: *App) void {
+            n += 1;
+        }
+    };
+    Ran.n = 0;
+    win.on_next_frame(Ran.on_frame);
+    try std.testing.expectEqual(@as(usize, 1), win.simulate_next_frame(cx.app));
+    try std.testing.expectEqual(@as(usize, 0), win.simulate_next_frame(cx.app));
+    try std.testing.expectEqual(@as(usize, 1), Ran.n);
+
+    const before = win.update_count();
+    win.refresh();
+    try std.testing.expect(win.update_count() > before);
+
+    const Woken = struct {
+        var n: usize = 0;
+        fn wake(_: *anyopaque) void {
+            n += 1;
+        }
+    };
+    Woken.n = 0;
+    // Installing a waker while the window is dirty wakes the platform at once.
+    win.dirty = true;
+    win.set_platform_waker(.{ .ctx = win, .func = Woken.wake });
+    try std.testing.expectEqual(@as(usize, 1), Woken.n);
+    win.wake_platform();
+    try std.testing.expectEqual(@as(usize, 2), Woken.n);
+    // A window becoming dirty wakes the platform too.
+    win.dirty = false;
+    win.refresh();
+    try std.testing.expectEqual(@as(usize, 3), Woken.n);
+    win.set_platform_waker(null);
+    win.wake_platform();
+    try std.testing.expectEqual(@as(usize, 3), Woken.n);
+
+    try std.testing.expectEqual(@as(usize, 0), win.dirty_views.count());
+    try win.dirty_views.put(win.allocator, app_mod.EntityId.from_u64(7), {});
+    const taken = win.take_views();
+    try std.testing.expectEqual(@as(usize, 1), taken.count());
+    try std.testing.expectEqual(@as(usize, 0), win.dirty_views.count());
+    win.replace_views(taken);
+    try std.testing.expectEqual(@as(usize, 1), win.dirty_views.count());
+
+    // Painted quads come from the last rendered frame; the Hover view paints a coloured div.
+    const hover_view, const hvcx = cx.add_window_view(Hover.build);
+    _ = hover_view;
+    try std.testing.expect(hvcx.window.painted_quads().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), hvcx.window.painted_underlines().len);
+
+    // No frames means nothing in the atlas, so no image can be there.
+    const empty = try @import("../assets.zig").RenderImage.new(std.testing.allocator, &.{});
+    defer empty.deinit();
+    try std.testing.expect(!win.has_image_atlas_entry(empty));
+}
+
+test "notifications: a response from the platform reaches the registered handler" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Seen = struct {
+        var tag: [16]u8 = undefined;
+        var tag_len: usize = 0;
+        var action: [16]u8 = undefined;
+        var action_len: usize = 0;
+        fn on_response(_: u8, response: platform_mod.SystemNotificationResponse, _: *App) void {
+            @memcpy(tag[0..response.tag.len], response.tag);
+            tag_len = response.tag.len;
+            if (response.action_id) |id| {
+                @memcpy(action[0..id.len], id);
+                action_len = id.len;
+            }
+        }
+    };
+    cx.app.set_app_identity("dev.test", "Test");
+    // Posting and dismissing are accepted on every platform; without a backend they do nothing.
+    cx.app.show_system_notification(.{ .tag = "t", .title = "T", .body = "B", .actions = &.{.{ .id = "open", .label = "Open" }} });
+    cx.app.dismiss_system_notification("t");
+    cx.app.dispatch_system_notification_response(.{ .tag = "none" });
+    cx.app.on_system_notification_response(@as(u8, 0), Seen.on_response);
+    cx.app.dispatch_system_notification_response(.{ .tag = "t", .action_id = "open" });
+    try std.testing.expectEqualStrings("t", Seen.tag[0..Seen.tag_len]);
+    try std.testing.expectEqualStrings("open", Seen.action[0..Seen.action_len]);
+}
+
+/// A decoded image of one 1x1 frame per entry of `delays_ms` (a GIF has one such frame per picture).
+fn image_with_delays(allocator: std.mem.Allocator, delays_ms: []const u32) !*assets_mod.RenderImage {
+    const frames = try allocator.alloc(assets_mod.Frame, delays_ms.len);
+    var built: usize = 0;
+    errdefer {
+        for (frames[0..built]) |f| allocator.free(f.pixels);
+        allocator.free(frames);
+    }
+    while (built < delays_ms.len) : (built += 1) {
+        const pixels = try allocator.alloc(u8, 4);
+        @memset(pixels, @intCast(built + 1));
+        frames[built] = .{ .width = 1, .height = 1, .delay_ms = delays_ms[built], .pixels = pixels };
+    }
+    return assets_mod.RenderImage.new(allocator, frames);
+}
+
+const AnimatedView = struct {
+    var image: *assets_mod.RenderImage = undefined;
+    var with_id: bool = true;
+    var last: ?*img_mod.Img = null;
+    var renders: usize = 0;
+
+    pub fn render(_: *AnimatedView, _: *Window, _: *Context(AnimatedView)) *Div {
+        renders += 1;
+        const i = img_mod.img(image).size(px(10));
+        last = if (with_id) i.id("gif") else i;
+        return div().child(last.?);
+    }
+    fn build(_: *Window, app: *App) Entity(AnimatedView) {
+        return app.new(AnimatedView{});
+    }
+    fn frame() usize {
+        return last.?.ext.frame_index;
+    }
+};
+
+/// Opens a window without pumping frames. `add_window` runs `run_until_parked`, which keeps drawing
+/// while an animation asks for frames, so a GIF would advance before the test looked at it.
+fn open_unpumped(cx: *TestAppContext) struct { window: *Window } {
+    const handle = cx.app.open_window(.{}, AnimatedView.build) catch unreachable;
+    const window = handle.window(cx.app) orelse unreachable;
+    window.draw(cx.app);
+    return .{ .window = window };
+}
+
+test "gif: run_until_parked returns while a GIF is on screen, drawing it once per pump" {
+    const allocator = std.testing.allocator;
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    const animated = try image_with_delays(allocator, &.{ 150, 150 });
+    defer animated.deinit();
+    AnimatedView.image = animated;
+    AnimatedView.with_id = true;
+    AnimatedView.renders = 0;
+    const handle = cx.app.open_window(.{}, AnimatedView.build) catch unreachable;
+    const window = handle.window(cx.app) orelse unreachable;
+    // The GIF asks for frames, but its next one is due only after 150 ms of real time. The pump must
+    // not keep drawing it: before, it ran to its 10,000-iteration guard.
+    cx.run_until_parked();
+    try std.testing.expect(window.animation_requested);
+    const before = AnimatedView.renders;
+    cx.run_until_parked();
+    cx.run_until_parked();
+    try std.testing.expect(AnimatedView.renders - before <= 2);
+}
+
+test "gif: frames advance after their delay, and frames are requested only while animating" {
+    const allocator = std.testing.allocator;
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+
+    // Each frame lasts 150 ms, so the first draws happen well inside its delay.
+    const animated = try image_with_delays(allocator, &.{ 150, 150 });
+    defer animated.deinit();
+    AnimatedView.image = animated;
+
+    AnimatedView.with_id = true;
+    const vcx = open_unpumped(&cx);
+    try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
+    try std.testing.expect(vcx.window.animation_requested);
+    vcx.window.draw(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
+
+    cx.executor().advance_clock(200 * std.time.ns_per_ms);
+    vcx.window.draw(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), AnimatedView.frame());
+    try std.testing.expect(vcx.window.animation_requested);
+
+    cx.executor().advance_clock(200 * std.time.ns_per_ms);
+    vcx.window.draw(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
+
+    // Without an element id there is no state to advance: frame 0 forever, and no frame requests.
+    AnimatedView.with_id = false;
+    const anonymous = open_unpumped(&cx);
+    try std.testing.expect(!anonymous.window.animation_requested);
+    cx.executor().advance_clock(200 * std.time.ns_per_ms);
+    anonymous.window.draw(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
+    try std.testing.expect(!anonymous.window.animation_requested);
+
+    // A single-frame image never animates, even with an id.
+    AnimatedView.with_id = true;
+    const single = try image_with_delays(allocator, &.{150});
+    defer single.deinit();
+    AnimatedView.image = single;
+    const still = open_unpumped(&cx);
+    try std.testing.expect(!still.window.animation_requested);
+
+    // Reduced motion holds the current frame and asks for nothing.
+    cx.app.set_reduce_motion(true);
+    AnimatedView.image = animated;
+    const reduced = open_unpumped(&cx);
+    cx.executor().advance_clock(200 * std.time.ns_per_ms);
+    reduced.window.draw(cx.app);
+    try std.testing.expect(!reduced.window.animation_requested);
+    try std.testing.expectEqual(@as(usize, 0), AnimatedView.frame());
+    cx.app.set_reduce_motion(false);
+
+    // A window that is not active holds its frame too.
+    reduced.window.active = false;
+    reduced.window.draw(cx.app);
+    try std.testing.expect(!reduced.window.animation_requested);
+}
+
+// ---------------------------------------------------------------------------
+// Prompts (GPUI `window/prompts.rs`) and window observers.
+
+/// Where the last answer went, and how often. Listeners are plain functions, so the tests share
+/// these; tests run one after another.
+const PromptProbe = struct {
+    var answered: ?usize = null;
+    var calls: usize = 0;
+    var other_calls: usize = 0;
+    var builder_calls: usize = 0;
+
+    fn reset() void {
+        answered = null;
+        calls = 0;
+        other_calls = 0;
+        builder_calls = 0;
+    }
+
+    fn on_answer(response: *const window_mod.PromptResponse, _: *Window, _: *App) void {
+        answered = response.index;
+        calls += 1;
+    }
+
+    fn on_other_answer(_: *const window_mod.PromptResponse, _: *Window, _: *App) void {
+        other_calls += 1;
+    }
+
+    fn counting_builder(
+        level: window_mod.PromptLevel,
+        message: []const u8,
+        detail: ?[]const u8,
+        answers: []const window_mod.PromptButton,
+        handle: window_mod.PromptHandle,
+        window: *Window,
+        app: *App,
+    ) window_mod.RenderablePromptHandle {
+        builder_calls += 1;
+        return window_mod.fallback_prompt_renderer(level, message, detail, answers, handle, window, app);
+    }
+};
+
+/// Two areas that open prompts: the first has a cancel button, the second has none.
+const PromptHost = struct {
+    focus: window_mod.FocusHandle,
+
+    pub fn render(self: *PromptHost, _: *Window, cx: *Context(PromptHost)) *Div {
+        return div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(div()
+                .id("open")
+                .track_focus(&self.focus)
+                .w(px(100))
+                .h(px(40))
+                .on_click(cx.listener(open_with_cancel)))
+            .child(div()
+                .id("open-plain")
+                .w(px(100))
+                .h(px(40))
+                .on_click(cx.listener(open_without_cancel)));
+    }
+
+    fn open_with_cancel(_: *PromptHost, _: *const ClickEvent, window: *Window, cx: *Context(PromptHost)) void {
+        window.prompt(.info, "Are you sure?", null, &.{ "OK", "Cancel" }, cx.app, PromptProbe.on_answer);
+    }
+
+    fn open_without_cancel(_: *PromptHost, _: *const ClickEvent, window: *Window, cx: *Context(PromptHost)) void {
+        window.prompt(.warning, "Keep going?", "Nothing to cancel here.", &.{ "Yes", "No" }, cx.app, PromptProbe.on_answer);
+    }
+
+    fn build(_: *Window, app: *App) Entity(PromptHost) {
+        return app.new(PromptHost{ .focus = app.focus_handle() });
+    }
+
+    fn read_focus(self: *const PromptHost, _: *const App) window_mod.FocusHandle {
+        return self.focus;
+    }
+};
+
+/// The centres of the two prompt buttons. They are the last hitboxes a frame draws, since the
+/// prompt is prepainted after the root view.
+fn prompt_button_centers(window: *Window) [2]Point(Pixels) {
+    const boxes = window.rendered_frame.hitboxes.items;
+    std.debug.assert(boxes.len >= 2);
+    return .{ center_of(boxes[boxes.len - 2].bounds), center_of(boxes[boxes.len - 1].bounds) };
+}
+
+fn center_of(b: geometry.Bounds(Pixels)) Point(Pixels) {
+    return .{ .x = b.origin.x + b.size.width / 2, .y = b.origin.y + b.size.height / 2 };
+}
+
+test "prompt: a click answers with the button's index, closes the prompt and gives focus back" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(PromptHost.build);
+    const focus = view.read(cx.app).focus;
+    vcx.focus(focus);
+
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expect(vcx.window.has_active_prompt());
+    try std.testing.expect(!focus.is_focused(vcx.window));
+    try std.testing.expectEqual(@as(?usize, null), PromptProbe.answered);
+
+    const buttons = prompt_button_centers(vcx.window);
+    vcx.simulate_click(buttons[1], .{});
+    try std.testing.expectEqual(@as(?usize, 1), PromptProbe.answered);
+    try std.testing.expectEqual(@as(usize, 1), PromptProbe.calls);
+    try std.testing.expect(!vcx.window.has_active_prompt());
+    try std.testing.expect(focus.is_focused(vcx.window));
+}
+
+test "prompt: the first button is index 0, and an answer is delivered once" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const buttons = prompt_button_centers(vcx.window);
+    vcx.simulate_click(buttons[0], .{});
+    try std.testing.expectEqual(@as(?usize, 0), PromptProbe.answered);
+    // The prompt is gone, so a second click on the same spot answers nothing.
+    vcx.simulate_click(buttons[0], .{});
+    try std.testing.expectEqual(@as(usize, 1), PromptProbe.calls);
+}
+
+test "prompt: the keyboard moves the selection with right and enter chooses it" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expect(vcx.window.has_active_prompt());
+
+    vcx.simulate_keystrokes("right enter");
+    try std.testing.expectEqual(@as(?usize, 1), PromptProbe.answered);
+    try std.testing.expect(!vcx.window.has_active_prompt());
+}
+
+test "prompt: enter alone chooses the first button, and left wraps to the last" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.simulate_keystrokes("left enter");
+    try std.testing.expectEqual(@as(?usize, 1), PromptProbe.answered);
+}
+
+test "prompt: escape chooses the cancel button" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.simulate_keystrokes("escape");
+    try std.testing.expectEqual(@as(?usize, 1), PromptProbe.answered);
+    try std.testing.expect(!vcx.window.has_active_prompt());
+}
+
+test "prompt: escape without a cancel button leaves the prompt open" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 50 }, .{});
+    try std.testing.expect(vcx.window.has_active_prompt());
+    vcx.simulate_keystrokes("escape");
+    try std.testing.expectEqual(@as(?usize, null), PromptProbe.answered);
+    try std.testing.expect(vcx.window.has_active_prompt());
+    // Enter still answers, with the first button.
+    vcx.simulate_keystrokes("enter");
+    try std.testing.expectEqual(@as(?usize, 0), PromptProbe.answered);
+}
+
+fn replace_prompt(window: *Window, app: *App) void {
+    window.prompt(.critical, "Second", null, &.{ "Only", "Me" }, app, PromptProbe.on_other_answer);
+}
+
+test "prompt: a prompt replaced before its answer is never answered" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.update(replace_prompt, .{});
+    vcx.run_until_parked();
+    vcx.simulate_click(prompt_button_centers(vcx.window)[0], .{});
+    try std.testing.expectEqual(@as(usize, 0), PromptProbe.calls);
+    try std.testing.expectEqual(@as(usize, 1), PromptProbe.other_calls);
+}
+
+fn close_window_now(window: *Window, app: *App) void {
+    app.close_window(window);
+}
+
+test "prompt: closing the window with a prompt open frees everything it held" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expect(vcx.window.has_active_prompt());
+    // std.testing.allocator reports any arena left behind when the test ends.
+    vcx.update(close_window_now, .{});
+    try std.testing.expectEqual(@as(usize, 0), PromptProbe.calls);
+}
+
+test "prompt: a custom builder replaces the fallback, and the window still delivers the answer" {
+    PromptProbe.reset();
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.set_prompt_builder(PromptProbe.counting_builder);
+    defer cx.app.reset_prompt_builder();
+    _, const vcx = cx.add_window_view(PromptHost.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expectEqual(@as(usize, 1), PromptProbe.builder_calls);
+    vcx.simulate_click(prompt_button_centers(vcx.window)[0], .{});
+    try std.testing.expectEqual(@as(?usize, 0), PromptProbe.answered);
+}
+
+/// Counts what a view hears about its window (GPUI `cx.observe_window_bounds` and
+/// `cx.observe_window_activation`).
+const BoundsWatch = struct {
+    changes: usize = 0,
+    activations: usize = 0,
+
+    pub fn render(_: *BoundsWatch, _: *Window, _: *Context(BoundsWatch)) *Div {
+        return div().size_full();
+    }
+
+    fn watch(_: *BoundsWatch, window: *Window, cx: *Context(BoundsWatch)) void {
+        _ = cx.observe_window_bounds(window, on_bounds);
+        _ = cx.observe_window_activation(window, on_activation);
+    }
+
+    fn on_bounds(self: *BoundsWatch, _: *Window, _: *Context(BoundsWatch)) void {
+        self.changes += 1;
+    }
+
+    fn on_activation(self: *BoundsWatch, _: *Window, _: *Context(BoundsWatch)) void {
+        self.activations += 1;
+    }
+
+    fn build(window: *Window, app: *App) Entity(BoundsWatch) {
+        const view = app.new(BoundsWatch{});
+        view.update(app, BoundsWatch.watch, .{window});
+        return view;
+    }
+
+    fn read_changes(s: *const BoundsWatch, _: *const App) usize {
+        return s.changes;
+    }
+
+    fn read_activations(s: *const BoundsWatch, _: *const App) usize {
+        return s.activations;
+    }
+};
+
+test "window bounds: a resize calls the observer, and a resize to the same size does not" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(BoundsWatch.build);
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+
+    vcx.simulate_resize(.{ .width = 320, .height = 240 });
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+
+    // Nothing changed, so the observer stays quiet, even though the platform reported a resize.
+    vcx.simulate_resize(.{ .width = 320, .height = 240 });
+    vcx.simulate_mouse_move(.{ .x = 5, .y = 5 }, null, .{});
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+}
+
+const WindowMoves = struct {
+    var moves: usize = 0;
+    var last: geometry.Point(Pixels) = .{ .x = -1, .y = -1 };
+
+    fn on_move(window: *Window, _: *App) void {
+        moves += 1;
+        last = window.bounds().origin;
+    }
+};
+
+test "window bounds: a move reaches window observers with the new origin, and a repeat does not" {
+    WindowMoves.moves = 0;
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(BoundsWatch.build);
+    const subscription = vcx.window.observe_window_bounds(WindowMoves.on_move);
+    defer subscription.unsubscribe();
+
+    vcx.simulate_move(.{ .x = 40, .y = 25 });
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+    try std.testing.expectEqual(@as(usize, 1), WindowMoves.moves);
+    try std.testing.expectEqual(@as(Pixels, 40), WindowMoves.last.x);
+    try std.testing.expectEqual(@as(Pixels, 25), WindowMoves.last.y);
+
+    // The same origin again is not a change.
+    vcx.simulate_move(.{ .x = 40, .y = 25 });
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+    try std.testing.expectEqual(@as(usize, 1), WindowMoves.moves);
+
+    // A move and then a resize are two changes; the window observer hears both.
+    vcx.simulate_move(.{ .x = 1, .y = 1 });
+    vcx.simulate_resize(.{ .width = 300, .height = 300 });
+    try std.testing.expectEqual(@as(usize, 3), cx.read_entity(view, BoundsWatch.read_changes, .{}));
+    try std.testing.expectEqual(@as(usize, 3), WindowMoves.moves);
+}
+
+test "window activation: observers hear each change, and a resize is not one" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(BoundsWatch.build);
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, BoundsWatch.read_activations, .{}));
+
+    vcx.window.platform_window.emit_active(false);
+    vcx.window.platform_window.emit_active(true);
+    try std.testing.expectEqual(@as(usize, 2), cx.read_entity(view, BoundsWatch.read_activations, .{}));
+    try std.testing.expect(vcx.window.is_window_active());
+
+    vcx.simulate_resize(.{ .width = 320, .height = 240 });
+    try std.testing.expectEqual(@as(usize, 2), cx.read_entity(view, BoundsWatch.read_activations, .{}));
+}
+
+// -- asset loads and image caches ----------------------------------------
+
+const asset_cache_mod = @import("../asset_cache.zig");
+const image_cache_mod = @import("../image_cache.zig");
+
+/// An asset whose load waits for `gate`, then answers `source * 10`. Counts its starts.
+const Slow = struct {
+    pub const Source = u32;
+    pub const Output = u32;
+    var starts: std.atomic.Value(u32) = .init(0);
+    var gate: std.atomic.Value(bool) = .init(false);
+
+    pub fn load(source: Source, cx: *asset_cache_mod.LoadContext) Output {
+        _ = starts.fetchAdd(1, .acq_rel);
+        while (!gate.load(.acquire)) {
+            if (cx.is_cancelled()) return 0;
+            executor_mod.sleep_ns(std.time.ns_per_ms);
+        }
+        return source * 10;
+    }
+
+    fn reset(open: bool) void {
+        starts.store(0, .release);
+        gate.store(open, .release);
+    }
+
+    /// Loads run on workers, which may not have got to one yet when a frame has asked for it.
+    fn wait_for_starts(count: u32) !void {
+        for (0..5000) |_| {
+            if (starts.load(.acquire) >= count) break;
+            executor_mod.sleep_ns(std.time.ns_per_ms);
+        }
+        try std.testing.expectEqual(count, starts.load(.acquire));
+    }
+};
+
+/// An asset whose load always fails.
+const Broken = struct {
+    pub const Source = u32;
+    pub const Output = anyerror!u32;
+
+    pub fn load(_: Source, _: *asset_cache_mod.LoadContext) Output {
+        return error.LoadFailed;
+    }
+};
+
+const SlowView = struct {
+    var source: u32 = 1;
+    var seen: ?u32 = null;
+    var renders: usize = 0;
+
+    pub fn render(_: *SlowView, window: *Window, cx: *Context(SlowView)) *Div {
+        renders += 1;
+        seen = window.use_asset(Slow, source, cx.app);
+        return div();
+    }
+    fn build(_: *Window, app: *App) Entity(SlowView) {
+        return app.new(SlowView{});
+    }
+    fn reset(s: u32) void {
+        source = s;
+        seen = null;
+        renders = 0;
+    }
+};
+
+const BrokenView = struct {
+    var seen: ?anyerror!u32 = null;
+
+    pub fn render(_: *BrokenView, window: *Window, cx: *Context(BrokenView)) *Div {
+        seen = window.use_asset(Broken, 1, cx.app);
+        return div();
+    }
+    fn build(_: *Window, app: *App) Entity(BrokenView) {
+        return app.new(BrokenView{});
+    }
+};
+
+/// Runs the app until `done` holds, for at most about five seconds.
+fn pump_until(vcx: *VisualTestContext, done: *const fn () bool) !void {
+    for (0..1000) |_| {
+        vcx.run_until_parked();
+        if (done()) return;
+        executor_mod.sleep_ns(5 * std.time.ns_per_ms);
+    }
+    return error.TimedOut;
+}
+
+fn slow_view_has_value() bool {
+    return SlowView.seen != null;
+}
+
+fn broken_view_has_value() bool {
+    return BrokenView.seen != null;
+}
+
+test "use_asset: none while loading, then the value once the window redraws" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    Slow.reset(false);
+    SlowView.reset(4);
+    _, const vcx = cx.add_window_view(SlowView.build);
+    try std.testing.expectEqual(@as(?u32, null), SlowView.seen);
+    try Slow.wait_for_starts(1);
+
+    Slow.gate.store(true, .release);
+    try pump_until(vcx, slow_view_has_value);
+    try std.testing.expectEqual(@as(?u32, 40), SlowView.seen);
+}
+
+test "use_asset: a load runs once per source, even across frames" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    Slow.reset(false);
+    SlowView.reset(7);
+    _, const vcx = cx.add_window_view(SlowView.build);
+    for (0..5) |_| {
+        vcx.window.refresh();
+        vcx.run_until_parked();
+    }
+    try std.testing.expect(SlowView.renders >= 5);
+    try Slow.wait_for_starts(1);
+
+    Slow.gate.store(true, .release);
+    try pump_until(vcx, slow_view_has_value);
+    try std.testing.expectEqual(@as(?u32, 70), SlowView.seen);
+    try std.testing.expectEqual(@as(u32, 1), Slow.starts.load(.acquire));
+}
+
+test "remove_asset: the next use loads again, and an abandoned load is dropped" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    Slow.reset(true);
+    SlowView.reset(2);
+    _, const vcx = cx.add_window_view(SlowView.build);
+    try pump_until(vcx, slow_view_has_value);
+    try std.testing.expectEqual(@as(?u32, 20), SlowView.seen);
+
+    // Close the gate, drop the entry, and render again: a new load starts and has no value yet.
+    Slow.gate.store(false, .release);
+    cx.app.remove_asset(Slow, 2);
+    try std.testing.expect(!cx.app.has_asset(Slow, 2));
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try Slow.wait_for_starts(2);
+    try std.testing.expectEqual(@as(?u32, null), SlowView.seen);
+
+    // Abandon that second load while it runs; its result must not come back into the cache.
+    cx.app.remove_asset(Slow, 2);
+    Slow.gate.store(true, .release);
+    vcx.window.refresh();
+    try pump_until(vcx, slow_view_has_value);
+    try std.testing.expectEqual(@as(?u32, 20), SlowView.seen);
+    try std.testing.expectEqual(@as(u32, 3), Slow.starts.load(.acquire));
+}
+
+test "use_asset: a failing load is reported as a failure" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    BrokenView.seen = null;
+    _, const vcx = cx.add_window_view(BrokenView.build);
+    try pump_until(vcx, broken_view_has_value);
+    try std.testing.expectError(error.LoadFailed, BrokenView.seen.?);
+}
+
+/// Serves one embedded image, `pixel.png`, and counts how often it is asked for.
+const PixelAssets = struct {
+    var loads: std.atomic.Value(u32) = .init(0);
+
+    pub fn load(_: *PixelAssets, path: []const u8) ?[]const u8 {
+        if (!std.mem.eql(u8, path, "pixel.png")) return null;
+        _ = loads.fetchAdd(1, .acq_rel);
+        return tiny_png;
+    }
+};
+
+fn wait_for_image(cache: *image_cache_mod.RetainAllImageCache, vcx: *VisualTestContext, resource: assets_mod.Resource) !*assets_mod.RenderImage {
+    for (0..1000) |_| {
+        vcx.run_until_parked();
+        if (cache.load(resource, vcx.window, vcx.cx.app)) |result| {
+            vcx.run_until_parked();
+            return result;
+        }
+    }
+    return error.TimedOut;
+}
+
+test "RetainAllImageCache: keeps each image, and releases them when cleared" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    var pixels: PixelAssets = .{};
+    cx.app.asset_source_ = assets_mod.AssetSource.from(&pixels);
+    _, const vcx = cx.add_window_view(SlowView.build);
+
+    const cache_handle = image_cache_mod.RetainAllImageCache.new(cx.app);
+    const cache = cache_handle.as_mut(cx.app);
+    const resource: assets_mod.Resource = .{ .embedded = "pixel.png" };
+    try std.testing.expectEqual(@as(?image_cache_mod.ImageResult, null), cache.load(resource, vcx.window, cx.app));
+
+    const first = try wait_for_image(cache, vcx, resource);
+    try std.testing.expectEqual(@as(usize, 1), cache.len());
+    const again = (cache.load(resource, vcx.window, cx.app).?) catch unreachable;
+    try std.testing.expectEqual(first, again);
+    try std.testing.expectEqual(@as(u32, 1), PixelAssets.loads.load(.acquire));
+
+    // Clearing frees the load: one live entry fewer, not just an empty table.
+    const live_before = cx.app.asset_loads.live.count();
+    cache.clear(cx.app);
+    try std.testing.expect(cache.is_empty());
+    try std.testing.expectEqual(live_before - 1, cx.app.asset_loads.live.count());
+    // The next load starts over and decodes again.
+    _ = try wait_for_image(cache, vcx, resource);
+    try std.testing.expectEqual(@as(u32, 2), PixelAssets.loads.load(.acquire));
+    cache_handle.release(cx.app);
+}
+
+test "RetainAllImageCache: released with its entity, even while an image loads" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    var pixels: PixelAssets = .{};
+    cx.app.asset_source_ = assets_mod.AssetSource.from(&pixels);
+    _, const vcx = cx.add_window_view(SlowView.build);
+
+    const cache_handle = image_cache_mod.RetainAllImageCache.new(cx.app);
+    const cache = cache_handle.as_mut(cx.app);
+    const resource: assets_mod.Resource = .{ .embedded = "pixel.png" };
+    _ = cache.load(resource, vcx.window, cx.app);
+    // Release while the worker may still be decoding: the late image must be freed, not kept.
+    // The testing allocator reports it if it is not.
+    cache_handle.release(cx.app);
+    vcx.run_until_parked();
+    vcx.run_until_parked();
+}
+
+/// An `img` inside `image_cache(...)`: the image loads through that cache, not the app's own.
+const CachedImageView = struct {
+    var loadings: usize = 0;
+    var fallbacks: usize = 0;
+
+    cache: Entity(image_cache_mod.RetainAllImageCache),
+
+    pub fn render(self: *CachedImageView, _: *Window, _: *Context(CachedImageView)) *Div {
+        return div().child(image_cache_mod.image_cache(self.cache).child(img_mod.img("pixel.png").with_loading(on_loading).with_fallback(on_fallback)));
+    }
+    fn on_loading() element_mod.AnyElement {
+        loadings += 1;
+        return div().into_any_element();
+    }
+    fn on_fallback() element_mod.AnyElement {
+        fallbacks += 1;
+        return div().into_any_element();
+    }
+    fn build(_: *Window, app: *App) Entity(CachedImageView) {
+        return app.new(CachedImageView{ .cache = image_cache_mod.RetainAllImageCache.new(app) });
+    }
+};
+
+test "img: an image in image_cache() loads through that cache, then redraws" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    var pixels: PixelAssets = .{};
+    cx.app.asset_source_ = assets_mod.AssetSource.from(&pixels);
+    const view, const vcx = cx.add_window_view(CachedImageView.build);
+    try std.testing.expect(CachedImageView.loadings > 0);
+
+    const cache = view.read(cx.app).cache.as_mut(cx.app);
+    // The image arrives in the cache, which is what the img asked for.
+    for (0..1000) |_| {
+        vcx.run_until_parked();
+        if (cache.len() == 1) {
+            var items = cache.items.valueIterator();
+            const item = items.next().?.*;
+            if (item.get()) |result| {
+                const image = try result;
+                try std.testing.expectEqual(@as(i32, 1), image.size(0).width);
+                break;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), cache.len());
+    try std.testing.expectEqual(@as(usize, 0), CachedImageView.fallbacks);
+    // The app's own cache was not used for it.
+    try std.testing.expectEqual(@as(usize, 0), cx.app.asset_cache.images.count());
+}
+
+test "keymap: highest_precedence_binding_for_action is the newest binding that wins in the focus context" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{
+        KeyBinding.new("cmd-s", Editor.Save{}, "Editor"),
+        KeyBinding.new("cmd-t", Editor.Save{}, "Editor"),
+    });
+    _, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const found = vcx.window.highest_precedence_binding_for_action(Editor.Save{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("t", found.keystrokes[0].inner.key);
+}
+
+test "keymap: a NoAction on a newer binding shadows it, so the older one is the highest precedence" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const NoAction = action_mod.NoAction;
+    cx.app.bind_keys(&.{
+        KeyBinding.new("cmd-s", Editor.Save{}, "Editor"),
+        KeyBinding.new("cmd-t", Editor.Save{}, "Editor"),
+        KeyBinding.new("cmd-t", NoAction{}, "Editor"),
+    });
+    _, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const found = vcx.window.highest_precedence_binding_for_action(Editor.Save{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("s", found.keystrokes[0].inner.key);
+}
+
+test "keymap: an action whose keys a newer, different action takes has no highest precedence" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    // Both actions are zero-sized, so only the action type tells them apart.
+    cx.app.bind_keys(&.{
+        KeyBinding.new("cmd-s", Editor.Save{}, "Editor"),
+        KeyBinding.new("cmd-s", Editor.Outside{}, "Editor"),
+    });
+    _, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expect(vcx.window.highest_precedence_binding_for_action(Editor.Save{}) == null);
+    const found = vcx.window.highest_precedence_binding_for_action(Editor.Outside{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("s", found.keystrokes[0].inner.key);
+}
+
+test "keymap: highest_precedence_binding_for_action is null when the context or the binding is missing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{KeyBinding.new("cmd-s", Editor.Save{}, "Terminal")});
+    _, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expect(vcx.window.highest_precedence_binding_for_action(Editor.Save{}) == null);
+    try std.testing.expect(vcx.window.highest_precedence_binding_for_action(Editor.Outside{}) == null);
+}
+
+test "actions: available_actions lists the actions on the focus path that the registry builds" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    try std.testing.expectEqual(@as(usize, 0), vcx.window.available_actions(cx.app).len);
+    try cx.app.actions.register(Editor.Save);
+    const available = vcx.window.available_actions(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), available.len);
+    try std.testing.expectEqualStrings("test::Save", available[0].name);
+}
+
+test "window: capslock follows modifier events, and client inset and pointer capture read back" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    try std.testing.expect(!vcx.window.capslock().on);
+    _ = vcx.window.dispatch_event(.{ .modifiers_changed = .{ .capslock = .{ .on = true } } }, cx.app);
+    try std.testing.expect(vcx.window.capslock().on);
+    _ = vcx.window.dispatch_event(.{ .modifiers_changed = .{ .capslock = .{ .on = false } } }, cx.app);
+    try std.testing.expect(!vcx.window.capslock().on);
+
+    try std.testing.expect(vcx.window.client_inset() == null);
+    vcx.window.set_client_inset(12);
+    try std.testing.expectEqual(@as(?Pixels, 12), vcx.window.client_inset());
+
+    try std.testing.expect(vcx.window.captured_hitbox() == null);
+    vcx.window.capture_pointer(42);
+    try std.testing.expectEqual(@as(?u64, 42), vcx.window.captured_hitbox());
+    vcx.window.release_pointer();
+    try std.testing.expect(vcx.window.captured_hitbox() == null);
+}
+
+test "focus: a weak handle upgrades only while its element is rendered" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const handle = view.read(cx.app).focus;
+    const weak = handle.downgrade();
+    try std.testing.expect(weak.upgrade(vcx.window) != null);
+    try std.testing.expect((window_mod.WeakFocusHandle{ .id = handle.id +% 1000 }).upgrade(vcx.window) == null);
+}
+
+test "focus: a ManagedView needs focus_handle and render" {
+    const Popover = struct {
+        pub fn focus_handle(_: *const @This()) void {}
+        pub fn render(_: *@This()) void {}
+    };
+    comptime window_mod.assert_managed_view(Popover);
+    try std.testing.expect(window_mod.is_managed_view(Popover));
+    try std.testing.expect(!window_mod.is_managed_view(u8));
+}
+
+/// A text view with every optional `EntityInputHandler` method, so each one can be seen reaching it.
+const RichField = struct {
+    focus: FocusHandle,
+    buffer: [64]u8 = @splat(0),
+    len: usize = 0,
+    selection: platform_mod.Range = .{ .start = 0, .end = 0 },
+    pasted: usize = 0,
+    rect: geometry.Bounds(Pixels) = undefined,
+
+    pub fn render(self: *RichField, _: *Window, _: *Context(RichField)) *Div {
+        return div().id("rich").w(px(100)).h(px(30)).track_focus(&self.focus);
+    }
+    pub fn text_for_range(self: *RichField, range: platform_mod.Range, _: *?platform_mod.Range, _: *Window, _: *Context(RichField)) ?[]const u8 {
+        return self.buffer[range.start..range.end];
+    }
+    pub fn selected_text_range(self: *RichField, _: bool, _: *Window, _: *Context(RichField)) ?platform_mod.UTF16Selection {
+        return .{ .range = self.selection, .reversed = false };
+    }
+    pub fn marked_text_range(_: *RichField, _: *Window, _: *Context(RichField)) ?platform_mod.Range {
+        return null;
+    }
+    pub fn unmark_text(_: *RichField, _: *Window, _: *Context(RichField)) void {}
+    pub fn replace_text_in_range(self: *RichField, _: ?platform_mod.Range, text: []const u8, _: *Window, _: *Context(RichField)) void {
+        const n = @min(text.len, self.buffer.len - self.len);
+        @memcpy(self.buffer[self.len..][0..n], text[0..n]);
+        self.len += n;
+        self.selection = .{ .start = self.len, .end = self.len };
+    }
+    pub fn replace_and_mark_text_in_range(_: *RichField, _: ?platform_mod.Range, _: []const u8, _: ?platform_mod.Range, _: *Window, _: *Context(RichField)) void {}
+    pub fn bounds_for_range(_: *RichField, _: platform_mod.Range, element_bounds: geometry.Bounds(Pixels), _: *Window, _: *Context(RichField)) ?geometry.Bounds(Pixels) {
+        return element_bounds;
+    }
+    pub fn character_index_for_point(_: *RichField, _: Point(Pixels), _: *Window, _: *Context(RichField)) ?usize {
+        return null;
+    }
+    pub fn paste(self: *RichField, item: platform_mod.ClipboardItem, window: *Window, cx: *Context(RichField)) void {
+        self.pasted += 1;
+        if (item.text()) |text| self.replace_text_in_range(null, text, window, cx);
+    }
+    /// One rectangle per selected character, ten pixels wide, starting at the character's offset.
+    pub fn selection_bounds_for_range(self: *RichField, range: platform_mod.Range, element_bounds: geometry.Bounds(Pixels), _: *Window, _: *Context(RichField)) []const geometry.Bounds(Pixels) {
+        self.rect = .{
+            .origin = .{ .x = element_bounds.origin.x + @as(Pixels, @floatFromInt(range.start)) * 10, .y = element_bounds.origin.y },
+            .size = .{ .width = @as(Pixels, @floatFromInt(range.end - range.start)) * 10, .height = element_bounds.size.height },
+        };
+        return (&self.rect)[0..1];
+    }
+    pub fn set_selected_text_range(self: *RichField, range: platform_mod.Range, _: *Window, _: *Context(RichField)) void {
+        self.selection = range;
+    }
+    pub fn text_length_utf16(self: *RichField, _: *Window, _: *Context(RichField)) ?usize {
+        return self.len;
+    }
+    pub fn text_input_configuration(_: *RichField, _: *Window, _: *Context(RichField)) platform_mod.TextInputConfiguration {
+        return .{ .input_action = .search };
+    }
+    pub fn text_input_editable_range(self: *RichField, _: *Window, _: *Context(RichField)) ?platform_mod.Range {
+        return .{ .start = 0, .end = self.len };
+    }
+    fn build(_: *Window, app: *App) Entity(RichField) {
+        return app.new(RichField{ .focus = app.focus_handle() });
+    }
+    fn read_text(s: *const RichField, _: *const App) []const u8 {
+        return s.buffer[0..s.len];
+    }
+    fn pasted_count(s: *const RichField, _: *const App) usize {
+        return s.pasted;
+    }
+};
+
+test "input: paste, selection, length and configuration reach the view's own methods" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(RichField.build);
+    vcx.run_until_parked();
+    const bounds: geometry.Bounds(Pixels) = .{ .origin = .{ .x = 5, .y = 6 }, .size = .{ .width = 100, .height = 20 } };
+    var handler = input_mod.ElementInputHandler(RichField).new(bounds, view).platform_input_handler();
+
+    handler.paste(platform_mod.ClipboardItem.new_string("abcd"), vcx.window, cx.app);
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, RichField.pasted_count, .{}));
+    try std.testing.expectEqualStrings("abcd", cx.read_entity(view, RichField.read_text, .{}));
+    try std.testing.expectEqual(@as(?usize, 4), handler.text_length_utf16(vcx.window, cx.app));
+
+    handler.set_selected_text_range(.{ .start = 1, .end = 3 }, vcx.window, cx.app);
+    const selection = handler.selected_text_range(true, vcx.window, cx.app).?;
+    try std.testing.expectEqual(@as(usize, 1), selection.range.start);
+    try std.testing.expectEqual(@as(usize, 3), selection.range.end);
+
+    const rects = handler.selection_bounds_for_range(.{ .start = 1, .end = 3 }, bounds, vcx.window, cx.app);
+    try std.testing.expectEqual(@as(usize, 1), rects.len);
+    try std.testing.expectEqual(@as(Pixels, 15), rects[0].origin.x);
+    try std.testing.expectEqual(@as(Pixels, 20), rects[0].size.width);
+
+    try std.testing.expectEqual(platform_mod.TextInputAction.search, handler.text_input_configuration(vcx.window, cx.app).input_action);
+    const editable = handler.text_input_editable_range(vcx.window, cx.app).?;
+    try std.testing.expectEqual(@as(usize, 4), editable.end);
+}
+
+test "input: a view without the optional methods gets GPUI's defaults" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    vcx.run_until_parked();
+    const bounds: geometry.Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 100, .height = 20 } };
+    var handler = input_mod.ElementInputHandler(ImeField).new(bounds, view).platform_input_handler();
+
+    // The default paste replaces the range with the clipboard text.
+    handler.paste(platform_mod.ClipboardItem.new_string("abc"), vcx.window, cx.app);
+    try std.testing.expectEqualStrings("abc", cx.read_entity(view, ImeField.read_text, .{}));
+    try std.testing.expect(handler.text_length_utf16(vcx.window, cx.app) == null);
+    try std.testing.expectEqual(@as(usize, 0), handler.selection_bounds_for_range(.{ .start = 0, .end = 1 }, bounds, vcx.window, cx.app).len);
+    try std.testing.expect(handler.text_input_editable_range(vcx.window, cx.app) == null);
+    handler.set_selected_text_range(.{ .start = 0, .end = 1 }, vcx.window, cx.app);
+    try std.testing.expectEqual(platform_mod.TextInputAction.unspecified, handler.text_input_configuration(vcx.window, cx.app).input_action);
+}
+
+// ---------------------------------------------------------------------------
+// Context (GPUI `app/context.rs`): observers, releases, globals, deferred work,
+// focus listeners, quit hooks, and the async contexts that go with them.
+
+/// An entity that observes itself and can be told to stop.
+const SelfWatch = struct {
+    value: usize = 0,
+    self_seen: usize = 0,
+    sub: ?app_mod.Subscription = null,
+
+    fn watch(self: *SelfWatch, cx: *Context(SelfWatch)) void {
+        self.sub = cx.observe_self(on_change);
+    }
+    fn on_change(self: *SelfWatch, _: *Context(SelfWatch)) void {
+        self.self_seen += 1;
+    }
+    fn stop(self: *SelfWatch, _: *Context(SelfWatch)) void {
+        if (self.sub) |s| s.unsubscribe();
+        self.sub = null;
+    }
+    fn bump(self: *SelfWatch, cx: *Context(SelfWatch)) void {
+        self.value += 1;
+        cx.notify();
+    }
+};
+
+test "context: observe_self runs on each notify, until it is unsubscribed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const watch = cx.new(SelfWatch{});
+    cx.update_entity(watch, SelfWatch.watch, .{});
+    cx.update_entity(watch, SelfWatch.bump, .{});
+    cx.update_entity(watch, SelfWatch.bump, .{});
+    try std.testing.expectEqual(@as(usize, 2), watch.read(cx.app).self_seen);
+    cx.update_entity(watch, SelfWatch.stop, .{});
+    cx.update_entity(watch, SelfWatch.bump, .{});
+    try std.testing.expectEqual(@as(usize, 2), watch.read(cx.app).self_seen);
+    try std.testing.expectEqual(@as(usize, 3), watch.read(cx.app).value);
+}
+
+/// An entity that emits, and subscribes to its own events.
+const Chatty = struct {
+    pub const Event = struct { amount: usize };
+    received: usize = 0,
+    sub: ?app_mod.Subscription = null,
+
+    fn watch(self: *Chatty, cx: *Context(Chatty)) void {
+        self.sub = cx.subscribe_self(on_event);
+    }
+    fn on_event(self: *Chatty, ev: *const Event, _: *Context(Chatty)) void {
+        self.received += ev.amount;
+    }
+    fn say(_: *Chatty, cx: *Context(Chatty)) void {
+        cx.emit(.{ .amount = 2 });
+    }
+    fn stop(self: *Chatty, _: *Context(Chatty)) void {
+        if (self.sub) |s| s.unsubscribe();
+        self.sub = null;
+    }
+};
+
+test "context: subscribe_self receives the entity's own events, until unsubscribed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const chatty = cx.new(Chatty{});
+    cx.update_entity(chatty, Chatty.watch, .{});
+    cx.update_entity(chatty, Chatty.say, .{});
+    cx.update_entity(chatty, Chatty.say, .{});
+    try std.testing.expectEqual(@as(usize, 4), chatty.read(cx.app).received);
+    cx.update_entity(chatty, Chatty.stop, .{});
+    cx.update_entity(chatty, Chatty.say, .{});
+    try std.testing.expectEqual(@as(usize, 4), chatty.read(cx.app).received);
+}
+
+const ReleaseTarget = struct {
+    id: u8 = 0,
+};
+
+/// Watches another entity's release, and can stop watching.
+const Mourner = struct {
+    released: usize = 0,
+    sub: ?app_mod.Subscription = null,
+
+    fn watch(self: *Mourner, target: Entity(ReleaseTarget), cx: *Context(Mourner)) void {
+        self.sub = cx.observe_release(target, on_released);
+    }
+    fn on_released(self: *Mourner, released: *ReleaseTarget, _: *Context(Mourner)) void {
+        if (released.id == 9) self.released += 1;
+    }
+    fn stop(self: *Mourner, _: *Context(Mourner)) void {
+        if (self.sub) |s| s.unsubscribe();
+        self.sub = null;
+    }
+};
+
+test "context: observe_release runs once when the entity is released, and not after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const target = cx.new(ReleaseTarget{ .id = 9 });
+    const other = cx.new(ReleaseTarget{ .id = 9 });
+    const mourner = cx.new(Mourner{});
+    cx.update_entity(mourner, Mourner.watch, .{target});
+    // A second mourner that stops before the release must hear nothing.
+    const quiet = cx.new(Mourner{});
+    cx.update_entity(quiet, Mourner.watch, .{other});
+    cx.update_entity(quiet, Mourner.stop, .{});
+
+    target.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), mourner.read(cx.app).released);
+    other.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), quiet.read(cx.app).released);
+}
+
+/// A view that watches things in its window: another entity, a global, and its own release.
+const WindowWatch = struct {
+    window_calls: usize = 0,
+    window_matches: bool = false,
+    sub_a: ?app_mod.Subscription = null,
+    sub_b: ?app_mod.Subscription = null,
+    sub_global: ?app_mod.Subscription = null,
+    expected: ?*Window = null,
+
+    pub fn render(_: *WindowWatch, _: *Window, _: *Context(WindowWatch)) *Div {
+        return div().size_full();
+    }
+
+    fn build(window: *Window, app: *App) Entity(WindowWatch) {
+        return app.new(WindowWatch{ .expected = window });
+    }
+
+    fn note(self: *WindowWatch, window: *Window) void {
+        self.window_calls += 1;
+        self.window_matches = self.window_matches or window == self.expected.?;
+    }
+
+    fn watch_release_in(self: *WindowWatch, a: Entity(ReleaseTarget), b: Entity(ReleaseTarget), window: *Window, cx: *Context(WindowWatch)) void {
+        self.sub_a = cx.observe_release_in(a, window, on_release_a);
+        self.sub_b = cx.observe_release_in(b, window, on_release_a);
+        if (self.sub_b) |s| s.unsubscribe();
+        self.sub_b = null;
+    }
+    fn on_release_a(self: *WindowWatch, _: *ReleaseTarget, window: *Window, _: *Context(WindowWatch)) void {
+        self.note(window);
+    }
+
+    fn watch_global(self: *WindowWatch, window: *Window, cx: *Context(WindowWatch)) void {
+        self.sub_global = cx.observe_global_in(Setting, window, on_global);
+    }
+    fn on_global(self: *WindowWatch, window: *Window, _: *Context(WindowWatch)) void {
+        self.note(window);
+    }
+    fn stop_global(self: *WindowWatch, _: *Context(WindowWatch)) void {
+        if (self.sub_global) |s| s.unsubscribe();
+        self.sub_global = null;
+    }
+};
+
+const Setting = struct { n: u32 = 0 };
+
+test "context: observe_release_in and observe_global_in run with their window, and stop when unsubscribed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(WindowWatch.build);
+    const a = cx.new(ReleaseTarget{ .id = 1 });
+    const b = cx.new(ReleaseTarget{ .id = 2 });
+    cx.update_entity(view, WindowWatch.watch_release_in, .{ a, b, vcx.window });
+
+    // Released with its window open: runs once, with that window.
+    a.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).window_calls);
+    try std.testing.expect(view.read(cx.app).window_matches);
+    // The second watch was unsubscribed before its release, so it never ran.
+    b.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).window_calls);
+
+    // The global observer runs on each change, with the window, until it is unsubscribed.
+    cx.update_entity(view, WindowWatch.watch_global, .{ vcx.window });
+    cx.app.set_global(Setting{ .n = 1 });
+    cx.app.set_global(Setting{ .n = 2 });
+    try std.testing.expectEqual(@as(usize, 3), view.read(cx.app).window_calls);
+    cx.update_entity(view, WindowWatch.stop_global, .{});
+    cx.app.set_global(Setting{ .n = 3 });
+    try std.testing.expectEqual(@as(usize, 3), view.read(cx.app).window_calls);
+}
+
+/// Observes another entity with its window (GPUI `observe_in`).
+const ObserveIn = struct {
+    calls: usize = 0,
+    saw_window: ?*Window = null,
+    sub: ?app_mod.Subscription = null,
+
+    pub fn render(_: *ObserveIn, _: *Window, _: *Context(ObserveIn)) *Div {
+        return div().size_full();
+    }
+    fn watch(self: *ObserveIn, target: Entity(ReleaseTarget), window: *Window, cx: *Context(ObserveIn)) void {
+        self.sub = cx.observe_in(target, window, on_change);
+    }
+    fn on_change(self: *ObserveIn, _: Entity(ReleaseTarget), window: *Window, _: *Context(ObserveIn)) void {
+        self.calls += 1;
+        self.saw_window = window;
+    }
+    fn stop(self: *ObserveIn, _: *Context(ObserveIn)) void {
+        if (self.sub) |s| s.unsubscribe();
+        self.sub = null;
+    }
+    fn build(_: *Window, app: *App) Entity(ObserveIn) {
+        return app.new(ObserveIn{});
+    }
+};
+
+test "context: observe_in runs when the observed entity notifies, with the window it was given" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ObserveIn.build);
+    const target = cx.new(ReleaseTarget{});
+    cx.update_entity(view, ObserveIn.watch, .{ target, vcx.window });
+    cx.update_entity(target, struct {
+        fn poke(_: *ReleaseTarget, c: *Context(ReleaseTarget)) void {
+            c.notify();
+        }
+    }.poke, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).calls);
+    try std.testing.expectEqual(vcx.window, view.read(cx.app).saw_window.?);
+    cx.update_entity(view, ObserveIn.stop, .{});
+    cx.update_entity(target, struct {
+        fn poke(_: *ReleaseTarget, c: *Context(ReleaseTarget)) void {
+            c.notify();
+        }
+    }.poke, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).calls);
+}
+
+/// Defers work to the end of an update, with its window (GPUI `defer_in`).
+const Deferred = struct {
+    ran: usize = 0,
+    ran_with_window: bool = false,
+
+    pub fn render(_: *Deferred, _: *Window, _: *Context(Deferred)) *Div {
+        return div().size_full();
+    }
+    fn build(_: *Window, app: *App) Entity(Deferred) {
+        return app.new(Deferred{});
+    }
+    fn start(self: *Deferred, window: *Window, cx: *Context(Deferred)) void {
+        self.ran = 0;
+        cx.defer_in(window, finish);
+    }
+    fn finish(self: *Deferred, window: *Window, _: *Context(Deferred)) void {
+        self.ran += 1;
+        self.ran_with_window = window.handle_id == 0;
+    }
+};
+
+test "context: defer_in runs at the end of the update, with the window" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Deferred.build);
+    cx.update_entity(view, Deferred.start, .{vcx.window});
+    // The update has ended, so the deferred work has run exactly once.
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).ran);
+    try std.testing.expect(view.read(cx.app).ran_with_window);
+}
+
+/// Holds two focus handles, one inside the other, and a sibling (GPUI focus listeners).
+const FocusWatch = struct {
+    outer: window_mod.FocusHandle,
+    inner: window_mod.FocusHandle,
+    other: window_mod.FocusHandle,
+    focused: usize = 0,
+    blurred: usize = 0,
+    focus_in: usize = 0,
+    focus_out: usize = 0,
+    focus_out_blurred_inner: bool = false,
+    lost: usize = 0,
+    lost_unsubscribed: usize = 0,
+    lost_sub: ?app_mod.Subscription = null,
+
+    pub fn render(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) *Div {
+        return div().size_full()
+            .child(div().id("outer").size(px(100)).track_focus(&self.outer).child(div().id("inner").size(px(20)).track_focus(&self.inner)))
+            .child(div().id("other").size(px(100)).track_focus(&self.other));
+    }
+
+    fn build(_: *Window, app: *App) Entity(FocusWatch) {
+        return app.new(FocusWatch{ .outer = app.focus_handle(), .inner = app.focus_handle(), .other = app.focus_handle() });
+    }
+
+    fn watch(self: *FocusWatch, window: *Window, cx: *Context(FocusWatch)) void {
+        _ = cx.on_focus(self.outer, window, on_focused);
+        _ = cx.on_blur(self.outer, window, on_blurred);
+        _ = cx.on_focus_in(self.outer, window, on_focus_in);
+        _ = cx.on_focus_out(self.outer, window, on_focus_out);
+        _ = cx.on_focus_lost(window, on_lost);
+        self.lost_sub = cx.on_focus_lost(window, on_lost_unsubscribed);
+        if (self.lost_sub) |s| s.unsubscribe();
+        self.lost_sub = null;
+    }
+    fn on_focused(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) void {
+        self.focused += 1;
+    }
+    fn on_blurred(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) void {
+        self.blurred += 1;
+    }
+    fn on_focus_in(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) void {
+        self.focus_in += 1;
+    }
+    fn on_focus_out(self: *FocusWatch, event: app_mod.FocusOutEvent, _: *Window, _: *Context(FocusWatch)) void {
+        self.focus_out += 1;
+        self.focus_out_blurred_inner = event.blurred.id == self.inner.id;
+    }
+    fn on_lost(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) void {
+        self.lost += 1;
+    }
+    fn on_lost_unsubscribed(self: *FocusWatch, _: *Window, _: *Context(FocusWatch)) void {
+        self.lost_unsubscribed += 1;
+    }
+};
+
+test "context: focus listeners fire on the focus changes they are for, and only those" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(FocusWatch.build);
+    cx.update_entity(view, FocusWatch.watch, .{vcx.window});
+    const s = view.read(cx.app);
+    const outer = s.outer;
+    const inner = s.inner;
+    const other = s.other;
+
+    // Focus moves into the inner handle. `outer` gains focus from its subtree (on_focus_in), but
+    // the focused element is `inner`, so on_focus(outer) must not fire.
+    vcx.focus(inner);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).focus_in);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).focused);
+
+    // Focus moves to a sibling: `outer` loses focus through its descendant. on_focus_out reports
+    // the element that lost it, the inner handle, and on_blur(outer) does not fire.
+    vcx.focus(other);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).focus_out);
+    try std.testing.expect(view.read(cx.app).focus_out_blurred_inner);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).blurred);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).focus_in);
+
+    // Focus returns to `outer` itself: on_focus fires, and on_focus_in fires again.
+    vcx.focus(outer);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).focused);
+    try std.testing.expectEqual(@as(usize, 2), view.read(cx.app).focus_in);
+
+    // Nothing focused any more: on_blur(outer) and on_focus_lost fire, and the unsubscribed
+    // listener stays silent.
+    vcx.window.blur();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).blurred);
+    try std.testing.expectEqual(@as(usize, 2), view.read(cx.app).focus_out);
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).lost);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).lost_unsubscribed);
+}
+
+/// Entity with a quit hook, and a second one that unsubscribes before the quit.
+const Quitter = struct {
+    quits: usize = 0,
+    sub: ?app_mod.Subscription = null,
+
+    fn watch(self: *Quitter, cx: *Context(Quitter)) void {
+        self.sub = cx.on_app_quit(on_quit);
+    }
+    fn on_quit(self: *Quitter, _: *Context(Quitter)) void {
+        self.quits += 1;
+    }
+    fn stop(self: *Quitter, _: *Context(Quitter)) void {
+        if (self.sub) |s| s.unsubscribe();
+        self.sub = null;
+    }
+};
+
+test "context: on_app_quit runs once at shutdown, not on quit, and not after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const kept = cx.new(Quitter{});
+    cx.update_entity(kept, Quitter.watch, .{});
+    const dropped = cx.new(Quitter{});
+    cx.update_entity(dropped, Quitter.watch, .{});
+    cx.update_entity(dropped, Quitter.stop, .{});
+
+    // quit asks the platform to stop; the hooks run at shutdown, when the loop has ended.
+    cx.app.quit();
+    try std.testing.expectEqual(@as(usize, 0), kept.read(cx.app).quits);
+    cx.app.shutdown();
+    try std.testing.expectEqual(@as(usize, 1), kept.read(cx.app).quits);
+    try std.testing.expectEqual(@as(usize, 0), dropped.read(cx.app).quits);
+    // Once only: a second shutdown does nothing.
+    cx.app.shutdown();
+    try std.testing.expectEqual(@as(usize, 1), kept.read(cx.app).quits);
+}
+
+/// A view that starts async work with its window (GPUI `spawn_in`).
+const Spawner = struct {
+    pub fn render(_: *Spawner, _: *Window, _: *Context(Spawner)) *Div {
+        return div().size_full();
+    }
+    fn build(_: *Window, app: *App) Entity(Spawner) {
+        return app.new(Spawner{});
+    }
+    fn start(_: *Spawner, window: *Window, cx: *Context(Spawner)) void {
+        var task = cx.spawn_in(window, Work.run, .{});
+        task.detach();
+    }
+};
+
+const Work = struct {
+    var calls: usize = 0;
+    var err: ?anyerror = null;
+
+    fn note(_: *Window, _: *App) void {
+        calls += 1;
+    }
+    fn run(_: app_mod.WeakEntity(Spawner), wcx: app_mod.AsyncWindowContext) void {
+        wcx.update(note, .{}) catch |e| {
+            err = e;
+            return;
+        };
+    }
+};
+
+test "context: spawn_in runs with a window context, which fails once the window is closed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    Work.calls = 0;
+    Work.err = null;
+
+    // The window is open when the work runs: its update reaches the window.
+    const view, const vcx = cx.add_window_view(Spawner.build);
+    cx.update_entity(view, Spawner.start, .{vcx.window});
+    cx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), Work.calls);
+    try std.testing.expectEqual(@as(?anyerror, null), Work.err);
+
+    // Closed before the work runs: the update fails instead of touching a dead window.
+    const view2, const vcx2 = cx.add_window_view(Spawner.build);
+    cx.update_entity(view2, Spawner.start, .{vcx2.window});
+    cx.app.close_window(vcx2.window);
+    cx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), Work.calls);
+    try std.testing.expectEqual(@as(?anyerror, error.WindowClosed), Work.err);
+}
+
+/// Counts the entities created after it is set up (GPUI `observe_new`).
+const NewProbe = struct {
+    var seen: usize = 0;
+    var seen_without_window: usize = 0;
+
+    fn on_new(m: *Model, window: ?*Window, _: *Context(Model)) void {
+        seen += 1;
+        if (window == null) seen_without_window += 1;
+        m.value = 5;
+    }
+};
+
+test "app: observe_new runs for each new entity of the type, until unsubscribed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    NewProbe.seen = 0;
+    NewProbe.seen_without_window = 0;
+    const sub = cx.app.observe_new(Model, NewProbe.on_new);
+    const first = cx.new(Model{});
+    try std.testing.expectEqual(@as(usize, 5), first.read(cx.app).value);
+    _ = cx.new(Model{});
+    try std.testing.expectEqual(@as(usize, 2), NewProbe.seen);
+    try std.testing.expectEqual(@as(usize, 2), NewProbe.seen_without_window);
+    sub.unsubscribe();
+    _ = cx.new(Model{});
+    try std.testing.expectEqual(@as(usize, 2), NewProbe.seen);
+}
+
+test "entities: AnyWeakEntity upgrades while the entity lives, and not after release" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const model = cx.new(Model{});
+    const weak = model.into_any().downgrade();
+    try std.testing.expect(weak.is_upgradable(cx.app));
+    try std.testing.expect(weak.upgrade(cx.app) != null);
+    try std.testing.expect(weak.downcast(Model) != null);
+    try std.testing.expect(weak.downcast(Chatty) == null);
+    model.release(cx.app);
+    try std.testing.expect(!weak.is_upgradable(cx.app));
+    try std.testing.expect(weak.upgrade(cx.app) == null);
+}
+
+test "app: quit mode decides whether closing the last window quits" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const quit_requested = struct {
+        fn get(c: *TestAppContext) bool {
+            return headless.HeadlessPlatform.from(c.platform).quit_requested;
+        }
+    }.get;
+
+    // Explicit: closing the last window never quits by itself.
+    cx.app.set_quit_mode(.explicit);
+    _, const first = cx.add_window_view(WindowWatch.build);
+    cx.app.close_window(first.window);
+    try std.testing.expect(!quit_requested(&cx));
+
+    // last_window_closed: quits on every platform.
+    cx.app.set_quit_mode(.last_window_closed);
+    _, const second = cx.add_window_view(WindowWatch.build);
+    cx.app.close_window(second.window);
+    try std.testing.expect(quit_requested(&cx));
+}
+
+test "app: find_display returns the display with that id, or null" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const displays = cx.app.displays();
+    try std.testing.expect(displays.len > 0);
+    const found = cx.app.find_display(displays[0].id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(displays[0].id, found.id);
+    try std.testing.expect(cx.app.find_display(displays[0].id +% 1000) == null);
+}
+
+test "async: read_global reads a set global and fails while it is unset" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Read = struct {
+        fn get(s: *const Setting, _: *App) u32 {
+            return s.n;
+        }
+    };
+    const async_app = cx.app.to_async();
+    try std.testing.expectError(error.GlobalNotFound, async_app.read_global(Setting, Read.get, .{}));
+    try std.testing.expectEqual(@as(?u32, null), async_app.try_read_global(Setting, Read.get, .{}));
+    cx.app.set_global(Setting{ .n = 4 });
+    try std.testing.expectEqual(@as(u32, 4), try async_app.read_global(Setting, Read.get, .{}));
+    try std.testing.expectEqual(@as(?u32, 4), async_app.try_read_global(Setting, Read.get, .{}));
+}
+
+test "app: global_mut returns the global for writing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.set_global(Setting{ .n = 1 });
+    cx.app.global_mut(Setting).n = 7;
+    try std.testing.expectEqual(@as(u32, 7), cx.app.global(Setting).n);
+}
+
+test "app: update_default_global sets the default first, then updates it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Bump = struct {
+        fn run(s: *Setting, _: *App) u32 {
+            s.n += 1;
+            return s.n;
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 1), cx.app.update_default_global(Setting, Bump.run));
+    try std.testing.expectEqual(@as(u32, 2), cx.app.update_default_global(Setting, Bump.run));
+}
+
+test "app: background_spawn runs on a worker and its result can be waited for" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Double = struct {
+        fn run(x: u32) u32 {
+            return x * 2;
+        }
+    };
+    var task = cx.app.background_spawn(Double.run, .{@as(u32, 21)});
+    try std.testing.expectEqual(@as(u32, 42), task.wait());
+}
+
+// -- div: GPUI's listener and scroll APIs ---------------------------------
+
+/// A panel that hears drags of `Payload` from outside itself, leaving, file drops and scrolls.
+const MoveProbe = struct {
+    moves: usize = 0,
+    last_x: Pixels = -1,
+    last_bounds_x: Pixels = -1,
+    last_drag_n: u32 = 0,
+    exits: usize = 0,
+    file_exits: usize = 0,
+
+    fn on_drag_move(self: *MoveProbe, e: *const div_mod.DragMoveEvent(Payload), _: *Window, cx: *Context(MoveProbe)) void {
+        self.moves += 1;
+        self.last_x = e.event.position.x;
+        self.last_bounds_x = e.bounds.origin.x;
+        self.last_drag_n = e.drag(cx.app).n;
+    }
+    fn on_exit(self: *MoveProbe, _: *const interactive.MouseExitEvent, _: *Window, _: *Context(MoveProbe)) void {
+        self.exits += 1;
+    }
+    fn on_file_exit(self: *MoveProbe, _: *const interactive.FileDropEvent, _: *Window, _: *Context(MoveProbe)) void {
+        self.file_exits += 1;
+    }
+    fn make_preview(value: *const Payload, _: Point(Pixels), _: *Window, cx: *App) Entity(DragPreview) {
+        return cx.new(DragPreview{ .n = value.n });
+    }
+    fn make_other_preview(_: *const u8, _: Point(Pixels), _: *Window, cx: *App) Entity(DragPreview) {
+        return cx.new(DragPreview{ .n = 0 });
+    }
+    pub fn render(_: *MoveProbe, _: *Window, cx: *Context(MoveProbe)) *Div {
+        return div().size(px(300)).child(
+            div().id("source").absolute().left(px(0)).top(px(0)).w(px(50)).h(px(50))
+                .on_drag(Payload{ .n = 7 }, make_preview),
+        ).child(
+            div().id("other").absolute().left(px(0)).top(px(60)).w(px(50)).h(px(50))
+                .on_drag(@as(u8, 1), make_other_preview),
+        ).child(
+            div().id("panel").absolute().left(px(100)).top(px(0)).w(px(100)).h(px(100))
+                .on_drag_move(Payload, cx.listener(on_drag_move))
+                .on_mouse_exit(cx.listener(on_exit))
+                .on_file_drop_exit(cx.listener(on_file_exit)),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(MoveProbe) {
+        return app.new(MoveProbe{});
+    }
+};
+
+test "drag move: reaches the listener while the pointer is outside its element, with that element's bounds" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(MoveProbe.build);
+    start_drag(vcx);
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).moves);
+    vcx.simulate_mouse_move(.{ .x = 180, .y = 150 }, .left, .{});
+    vcx.run_until_parked();
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), page.moves);
+    try std.testing.expectEqual(@as(Pixels, 180), page.last_x);
+    try std.testing.expectEqual(@as(Pixels, 100), page.last_bounds_x);
+    try std.testing.expectEqual(@as(u32, 7), page.last_drag_n);
+    vcx.simulate_mouse_up(.{ .x = 180, .y = 150 }, .left, .{});
+    vcx.run_until_parked();
+}
+
+test "drag move: keeps hearing moves until the drag ends, and not after the release" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(MoveProbe.build);
+    start_drag(vcx);
+    vcx.simulate_mouse_move(.{ .x = 150, .y = 50 }, .left, .{});
+    vcx.simulate_mouse_move(.{ .x = 260, .y = 250 }, .left, .{});
+    try std.testing.expectEqual(@as(usize, 2), view.read(cx.app).moves);
+    vcx.simulate_mouse_up(.{ .x = 260, .y = 250 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expect(!cx.app.has_active_drag());
+    vcx.simulate_mouse_move(.{ .x = 150, .y = 50 }, null, .{});
+    try std.testing.expectEqual(@as(usize, 2), view.read(cx.app).moves);
+}
+
+test "drag move: a drag of another type never reaches the listener" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(MoveProbe.build);
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 70 }, null, .{});
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 70 }, .left, .{});
+    vcx.simulate_mouse_move(.{ .x = 30, .y = 70 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expect(cx.app.has_active_drag());
+    vcx.simulate_mouse_move(.{ .x = 150, .y = 50 }, .left, .{});
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).moves);
+    vcx.simulate_mouse_up(.{ .x = 150, .y = 50 }, .left, .{});
+    vcx.run_until_parked();
+}
+
+test "mouse exit: fires when the pointer leaves from inside the element, and not from outside it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(MoveProbe.build);
+    vcx.simulate_mouse_move(.{ .x = 150, .y = 50 }, null, .{});
+    vcx.simulate_event(.{ .mouse_exited = .{ .position = .{ .x = 150, .y = 50 } } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).exits);
+    vcx.simulate_event(.{ .mouse_exited = .{ .position = .{ .x = 290, .y = 290 } } });
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).exits);
+}
+
+test "file drop exit: fires when a file drag leaves while over the element only" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(MoveProbe.build);
+    const paths = [_][]const u8{"/tmp/a.txt"};
+    vcx.simulate_event(.{ .file_drop = .{ .entered = .{ .position = .{ .x = 290, .y = 290 }, .paths = .{ .items = &paths } } } });
+    vcx.simulate_event(.{ .file_drop = .exited });
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).file_exits);
+    vcx.simulate_event(.{ .file_drop = .{ .entered = .{ .position = .{ .x = 150, .y = 50 }, .paths = .{ .items = &paths } } } });
+    vcx.simulate_event(.{ .file_drop = .exited });
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).file_exits);
+}
+
+/// Two scroll containers, one inside the other.
+const NestedScroll = struct {
+    outer: div_mod.ScrollHandle,
+    inner: div_mod.ScrollHandle,
+
+    pub fn render(self: *NestedScroll, _: *Window, _: *Context(NestedScroll)) *Div {
+        return div().size(px(300)).child(
+            div().id("outer").absolute().left(px(0)).top(px(0)).w(px(100)).h(px(100)).overflow_y_scroll().track_scroll(&self.outer).child(
+                div().w(px(100)).h(px(300)).child(
+                    div().id("inner").w(px(100)).h(px(100)).overflow_y_scroll().track_scroll(&self.inner).child(
+                        div().w(px(100)).h(px(300)),
+                    ),
+                ),
+            ),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(NestedScroll) {
+        return app.new(NestedScroll{
+            .outer = div_mod.ScrollHandle.new(std.heap.page_allocator),
+            .inner = div_mod.ScrollHandle.new(std.heap.page_allocator),
+        });
+    }
+};
+
+test "scroll: a wheel over nested scrollers moves both, as GPUI does, since neither stops it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(NestedScroll.build);
+    vcx.simulate_scroll(.{ .x = 10, .y = 10 }, .{ .x = 0, .y = -30 });
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(Pixels, -30), page.inner.offset().y);
+    try std.testing.expectEqual(@as(Pixels, -30), page.outer.offset().y);
+}
+
+/// Scroll containers that differ only in the axis rules.
+const AxisScroll = struct {
+    plain: div_mod.ScrollHandle,
+    restricted: div_mod.ScrollHandle,
+    dominant: div_mod.ScrollHandle,
+    concurrent: div_mod.ScrollHandle,
+
+    pub fn render(self: *AxisScroll, _: *Window, _: *Context(AxisScroll)) *Div {
+        return div().size(px(400)).child(
+            div().id("plain").absolute().left(px(0)).top(px(0)).w(px(100)).h(px(100)).overflow_x_scroll().track_scroll(&self.plain).child(div().w(px(300)).h(px(300))),
+        ).child(
+            div().id("restricted").absolute().left(px(120)).top(px(0)).w(px(100)).h(px(100)).overflow_x_scroll().restrict_scroll_to_axis().track_scroll(&self.restricted).child(div().w(px(300)).h(px(300))),
+        ).child(
+            div().id("dominant").absolute().left(px(0)).top(px(150)).w(px(100)).h(px(100)).overflow_scroll().track_scroll(&self.dominant).child(div().w(px(300)).h(px(300))),
+        ).child(
+            div().id("concurrent").absolute().left(px(120)).top(px(150)).w(px(100)).h(px(100)).overflow_scroll().allow_concurrent_scroll().track_scroll(&self.concurrent).child(div().w(px(300)).h(px(300))),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(AxisScroll) {
+        return app.new(AxisScroll{
+            .plain = div_mod.ScrollHandle.new(std.heap.page_allocator),
+            .restricted = div_mod.ScrollHandle.new(std.heap.page_allocator),
+            .dominant = div_mod.ScrollHandle.new(std.heap.page_allocator),
+            .concurrent = div_mod.ScrollHandle.new(std.heap.page_allocator),
+        });
+    }
+};
+
+test "scroll: a vertical wheel moves a horizontal-only container, unless it is restricted to its axis" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(AxisScroll.build);
+    vcx.simulate_scroll(.{ .x = 10, .y = 10 }, .{ .x = 0, .y = -30 });
+    vcx.simulate_scroll(.{ .x = 130, .y = 10 }, .{ .x = 0, .y = -30 });
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(Pixels, -30), page.plain.offset().x);
+    try std.testing.expectEqual(@as(Pixels, 0), page.restricted.offset().x);
+}
+
+test "scroll: only the dominant axis moves unless concurrent scrolling is allowed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(AxisScroll.build);
+    vcx.simulate_scroll(.{ .x = 10, .y = 160 }, .{ .x = -10, .y = -30 });
+    vcx.simulate_scroll(.{ .x = 130, .y = 160 }, .{ .x = -10, .y = -30 });
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(Pixels, 0), page.dominant.offset().x);
+    try std.testing.expectEqual(@as(Pixels, -30), page.dominant.offset().y);
+    try std.testing.expectEqual(@as(Pixels, -10), page.concurrent.offset().x);
+    try std.testing.expectEqual(@as(Pixels, -30), page.concurrent.offset().y);
+}
+
+/// A 10-item scroll container of 100px, its items 50px each.
+const ItemScroll = struct {
+    scroll: div_mod.ScrollHandle,
+
+    pub fn render(self: *ItemScroll, _: *Window, _: *Context(ItemScroll)) *Div {
+        var d = div().id("items").w(px(100)).h(px(100)).overflow_y_scroll().track_scroll(&self.scroll);
+        for (0..10) |_| d = d.child(div().w(px(100)).h(px(50)));
+        return d;
+    }
+    fn build(_: *Window, app: *App) Entity(ItemScroll) {
+        return app.new(ItemScroll{ .scroll = div_mod.ScrollHandle.new(std.heap.page_allocator) });
+    }
+};
+
+test "scroll handle: scroll_to_item, scroll_to_top_of_item and scroll_to_bottom move the list in the next frame" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ItemScroll.build);
+    vcx.run_until_parked();
+    const handle = view.read(cx.app).scroll;
+
+    // Child 5 spans 250 to 300: scrolling the least needed puts its bottom at the viewport's bottom.
+    handle.scroll_to_item(5);
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(Pixels, -200), handle.offset().y);
+
+    handle.scroll_to_top_of_item(3);
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(Pixels, -150), handle.offset().y);
+
+    handle.scroll_to_bottom();
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(Pixels, -400), handle.offset().y);
+}
+
+test "scroll handle: top_item, bottom_item and logical_scroll_top read the items at each offset" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(ItemScroll.build);
+    vcx.run_until_parked();
+    const handle = view.read(cx.app).scroll;
+    // Offset 175 puts the top at 175, in item 3 (150 to 200), and the bottom at 275, in item 5 (250 to 300).
+    handle.set_offset(.{ .x = 0, .y = -175 });
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 3), handle.top_item());
+    try std.testing.expectEqual(@as(usize, 5), handle.bottom_item());
+    const top_ix, const top_px = handle.logical_scroll_top();
+    try std.testing.expectEqual(@as(usize, 3), top_ix);
+    try std.testing.expectEqual(@as(Pixels, -25), top_px);
+}
+
+/// A tall scroll container with an element far down it, which an anchor brings into view.
+const AnchoredScroll = struct {
+    handle: div_mod.ScrollHandle,
+    anchor: div_mod.ScrollAnchor,
+
+    pub fn render(self: *AnchoredScroll, _: *Window, _: *Context(AnchoredScroll)) *Div {
+        return div().id("scroll").w(px(100)).h(px(100)).overflow_y_scroll().track_scroll(&self.handle).child(
+            div().w(px(100)).h(px(250)),
+        ).child(
+            div().id("target").w(px(100)).h(px(50)).anchor_scroll(self.anchor),
+        ).child(
+            div().w(px(100)).h(px(300)),
+        );
+    }
+    fn build(_: *Window, app: *App) Entity(AnchoredScroll) {
+        const handle = div_mod.ScrollHandle.new(std.heap.page_allocator);
+        return app.new(AnchoredScroll{ .handle = handle, .anchor = div_mod.ScrollAnchor.for_handle(handle) });
+    }
+};
+
+test "anchor: scroll_to brings the anchored element to the top of the scroll container" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(AnchoredScroll.build);
+    vcx.run_until_parked();
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(Pixels, 0), page.handle.offset().y);
+    page.anchor.scroll_to(vcx.window, cx.app);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(Pixels, -250), page.handle.offset().y);
+}
+
+/// Three canvases in wrappers, whose prepaint order and bounds a parent records.
+const Children = struct {
+    /// What a canvas does when prepainted: note its id in the owner's order.
+    const Tag = struct { owner: *Children, id: usize };
+
+    tags: [3]Tag = undefined,
+    /// The canvas ids in the order they prepainted in the last frame.
+    frame_order: [3]usize = .{ 99, 99, 99 },
+    /// Filled while the frame prepaints, then copied into `frame_order` by the listener.
+    order_now: [3]usize = undefined,
+    order_count: usize = 0,
+    bounds_count: usize = 0,
+    bounds_y: [3]Pixels = .{ -1, -1, -1 },
+
+    fn on_tag(tag: *Tag, _: geometry.Bounds(Pixels), _: *Window, _: *App) void {
+        tag.owner.order_now[tag.owner.order_count] = tag.id;
+        tag.owner.order_count += 1;
+    }
+    fn paint_tag(_: *Tag, _: geometry.Bounds(Pixels), _: *void, _: *Window, _: *App) void {}
+
+    fn on_prepainted(self: *Children, e: *const div_mod.PrepaintedChildren, _: *Window, _: *Context(Children)) void {
+        self.bounds_count = e.bounds.len;
+        for (e.bounds, 0..) |b, i| self.bounds_y[i] = b.origin.y;
+        self.frame_order = self.order_now;
+        self.order_count = 0;
+    }
+    fn order(_: *Window, _: *App) []const usize {
+        return &.{ 2, 0, 1 };
+    }
+    pub fn render(self: *Children, _: *Window, cx: *Context(Children)) *Div {
+        var d = div().flex_col().size(px(100)).on_children_prepainted(cx.listener(on_prepainted)).with_dynamic_prepaint_order(order);
+        for (0..3) |i| {
+            self.tags[i] = .{ .owner = self, .id = i };
+            d = d.child(div().w(px(20)).h(px(20)).child(canvas_mod.canvas(&self.tags[i], on_tag, paint_tag)));
+        }
+        return d;
+    }
+    fn build(_: *Window, app: *App) Entity(Children) {
+        return app.new(Children{});
+    }
+};
+
+test "children: on_children_prepainted hears the bounds of every child, in child order" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Children.build);
+    vcx.run_until_parked();
+    const page = view.read(cx.app);
+    try std.testing.expectEqual(@as(usize, 3), page.bounds_count);
+    try std.testing.expectEqual(@as(Pixels, 0), page.bounds_y[0]);
+    try std.testing.expectEqual(@as(Pixels, 20), page.bounds_y[1]);
+    try std.testing.expectEqual(@as(Pixels, 40), page.bounds_y[2]);
+}
+
+test "children: with_dynamic_prepaint_order prepaints the children in the order returned" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Children.build);
+    vcx.run_until_parked();
+    try std.testing.expectEqualSlices(usize, &.{ 2, 0, 1 }, &view.read(cx.app).frame_order);
+}
+
+test "pixel_snap: values round half toward zero to the device pixel" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Children.build);
+    const win = vcx.window;
+    const sf = win.scale_factor();
+    // In device pixels: 10.4 rounds to 10, and -10.4 to -10.
+    const x: Pixels = 10.4 / sf;
+    try std.testing.expectApproxEqAbs(@as(f32, 10) / sf, win.pixel_snap(x), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -10) / sf, win.pixel_snap(-x), 0.0001);
+    // Exactly half rounds toward zero: 2.5 to 2, and -2.5 to -2 (scale 1 or 2 keeps it exact).
+    try std.testing.expectEqual(@as(f64, 2) / @as(f64, sf), win.pixel_snap_f64(2.5 / @as(f64, sf)));
+    const b = win.pixel_snap_bounds(.{ .origin = .{ .x = 1.6 / sf, .y = 0 }, .size = .{ .width = 2.4 / sf, .height = 2.6 / sf } });
+    try std.testing.expectApproxEqAbs(@as(f32, 2) / sf, b.origin.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2) / sf, b.size.width, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3) / sf, b.size.height, 0.0001);
+}
+
+/// A view with two nested action listeners on its focus path. The inner one stops the action
+/// unless it calls `App.propagate`, as the bubble phase of GPUI's action dispatch does.
+const Bubbler = struct {
+    focus: FocusHandle,
+    inner_hits: usize = 0,
+    outer_hits: usize = 0,
+    propagate: bool = false,
+
+    const Ping = Action("test", "Ping");
+
+    pub fn render(self: *Bubbler, _: *Window, cx: *Context(Bubbler)) *Div {
+        return div().id("outer").size_full()
+            .on_action(Ping, cx.listener(on_outer))
+            .child(div().id("inner").size_full().track_focus(&self.focus).on_action(Ping, cx.listener(on_inner)));
+    }
+    fn on_inner(self: *Bubbler, _: *const Ping, _: *Window, cx: *Context(Bubbler)) void {
+        self.inner_hits += 1;
+        if (self.propagate) cx.app.propagate();
+    }
+    fn on_outer(self: *Bubbler, _: *const Ping, _: *Window, _: *Context(Bubbler)) void {
+        self.outer_hits += 1;
+    }
+    fn set_propagate(self: *Bubbler, on: bool, _: *Context(Bubbler)) void {
+        self.propagate = on;
+    }
+    fn build(_: *Window, app: *App) Entity(Bubbler) {
+        return app.new(Bubbler{ .focus = app.focus_handle() });
+    }
+    fn read_hits(s: *const Bubbler, _: *const App) struct { inner: usize, outer: usize } {
+        return .{ .inner = s.inner_hits, .outer = s.outer_hits };
+    }
+};
+
+test "actions: a bubble listener stops the action unless it calls App.propagate" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Bubbler.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const focus = view.read(cx.app).focus;
+    try std.testing.expect(focus.is_focused(vcx.window));
+
+    vcx.dispatch_action(Bubbler.Ping{});
+    var hits = cx.read_entity(view, Bubbler.read_hits, .{});
+    try std.testing.expectEqual(@as(usize, 1), hits.inner);
+    try std.testing.expectEqual(@as(usize, 0), hits.outer);
+
+    cx.update_entity(view, Bubbler.set_propagate, .{true});
+    vcx.dispatch_action(Bubbler.Ping{});
+    hits = cx.read_entity(view, Bubbler.read_hits, .{});
+    try std.testing.expectEqual(@as(usize, 2), hits.inner);
+    try std.testing.expectEqual(@as(usize, 1), hits.outer);
+
+    // The flag is per dispatch: once it is cleared, the action stops at the inner listener again.
+    cx.update_entity(view, Bubbler.set_propagate, .{false});
+    vcx.dispatch_action(Bubbler.Ping{});
+    hits = cx.read_entity(view, Bubbler.read_hits, .{});
+    try std.testing.expectEqual(@as(usize, 3), hits.inner);
+    try std.testing.expectEqual(@as(usize, 1), hits.outer);
+}
+
+test "app: observe_release runs once on release and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var fired: usize = 0;
+        var last_id: u8 = 0;
+        fn on_release(released: *ReleaseTarget, _: *App) void {
+            fired += 1;
+            last_id = released.id;
+        }
+    };
+    S.fired = 0;
+    const kept = cx.new(ReleaseTarget{ .id = 3 });
+    const dropped = cx.new(ReleaseTarget{ .id = 4 });
+    const sub_kept = cx.app.observe_release(kept, S.on_release);
+    const sub_dropped = cx.app.observe_release(dropped, S.on_release);
+    sub_dropped.unsubscribe();
+
+    dropped.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), S.fired);
+    kept.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), S.fired);
+    try std.testing.expectEqual(@as(u8, 3), S.last_id);
+    _ = sub_kept;
+}
+
+test "app: observe_release_in passes its window, and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var fired: usize = 0;
+        var window: ?*Window = null;
+        fn on_release(_: *ReleaseTarget, win: *Window, _: *App) void {
+            fired += 1;
+            window = win;
+        }
+    };
+    S.fired = 0;
+    S.window = null;
+    _, const vcx = cx.add_window_view(Counter.build);
+    const a = cx.new(ReleaseTarget{});
+    const b = cx.new(ReleaseTarget{});
+    const sub_a = cx.app.observe_release_in(a, vcx.window, S.on_release);
+    const sub_b = cx.app.observe_release_in(b, vcx.window, S.on_release);
+    sub_b.unsubscribe();
+
+    b.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), S.fired);
+    a.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), S.fired);
+    try std.testing.expectEqual(vcx.window, S.window.?);
+    _ = sub_a;
+}
+
+test "subscriptions: join unsubscribes both halves, and a join that is kept runs both" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var fired: usize = 0;
+        fn on_release(_: *ReleaseTarget, _: *App) void {
+            fired += 1;
+        }
+    };
+    S.fired = 0;
+    const a = cx.new(ReleaseTarget{});
+    const b = cx.new(ReleaseTarget{});
+    const c = cx.new(ReleaseTarget{});
+    const d = cx.new(ReleaseTarget{});
+    const e = cx.new(ReleaseTarget{});
+    // Joining a join with a third subscription keeps all three; unsubscribing stops all three.
+    const joined = app_mod.Subscription.join(cx.app.observe_release(a, S.on_release), cx.app.observe_release(b, S.on_release));
+    const all = app_mod.Subscription.join(joined, cx.app.observe_release(c, S.on_release));
+    all.unsubscribe();
+    // A join that is never unsubscribed keeps both halves running.
+    _ = app_mod.Subscription.join(cx.app.observe_release(d, S.on_release), cx.app.observe_release(e, S.on_release));
+
+    a.release(cx.app);
+    b.release(cx.app);
+    c.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 0), S.fired);
+    d.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 1), S.fired);
+    e.release(cx.app);
+    try std.testing.expectEqual(@as(usize, 2), S.fired);
+}
+
+test "windows: App.update_window and App.read_window reach the root view, and fail once closed" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const Reader = struct {
+        fn read(view: Entity(Counter), app: *App) usize {
+            return view.read(app).count;
+        }
+    };
+    const Bump = struct {
+        var seen_root: u64 = 0;
+        // Gets the root view as an AnyView, the window and the app, then the extra argument.
+        fn bump(view: view_mod.AnyView, _: *Window, app: *App, by: usize) usize {
+            seen_root = view.entity_id.as_u64();
+            const counter: Entity(Counter) = .{ .entity_id_ = view.entity_id };
+            counter.update(app, add, .{by});
+            return 7;
+        }
+        fn add(self: *Counter, n: usize, _: *Context(Counter)) void {
+            self.count += n;
+        }
+    };
+    Bump.seen_root = 0;
+
+    const window_handle = window_mod.AnyWindowHandle{ .id = handle.window_id };
+    try std.testing.expectEqual(@as(usize, 7), try cx.app.update_window(window_handle, Bump.bump, .{@as(usize, 2)}));
+    try std.testing.expectEqual(handle.entity_id_.as_u64(), Bump.seen_root);
+    try std.testing.expectEqual(@as(usize, 2), try cx.app.read_window(Counter, handle, Reader.read, .{}));
+
+    const gone = window_mod.AnyWindowHandle{ .id = 9999 };
+    try std.testing.expectError(error.WindowClosed, cx.app.update_window(gone, Bump.bump, .{@as(usize, 1)}));
+    const gone_typed: WindowHandle(Counter) = .{ .window_id = 9999, .entity_id_ = handle.entity_id_ };
+    try std.testing.expectError(error.WindowClosed, cx.app.read_window(Counter, gone_typed, Reader.read, .{}));
+}
+
+const style_mod = @import("../style.zig");
+const text_system_mod = @import("../text_system.zig");
+const text_system_line = text_system_mod.line;
+
+/// Paints one shaped line with two underlines, through either `paint` or `paint_with_underline_handler`.
+const UnderlineHandlerView = struct {
+    const text = "aébcde";
+    var calls: usize = 0;
+    var ranges: [4]text_system_line.ByteRange = undefined;
+    var thicknesses: [4]f32 = undefined;
+    var use_default_paint: bool = false;
+
+    fn record(_: ?*anyopaque, range: text_system_line.ByteRange, _: geometry.Point(Pixels), _: Pixels, underline_style: *const style_mod.UnderlineStyle, _: *Window) void {
+        if (calls < ranges.len) {
+            ranges[calls] = range;
+            thicknesses[calls] = underline_style.thickness;
+        }
+        calls += 1;
+    }
+
+    fn paint(_: void, bounds: geometry.Bounds(Pixels), window: *Window, cx: *App) void {
+        // The window may draw more than one frame, so the calls are counted from the last paint.
+        calls = 0;
+        const color: color_mod.Hsla = .{ .h = 0, .s = 0, .l = 0, .a = 1 };
+        const runs = [_]style_mod.TextRun{.{ .len = text.len, .font = text_system_mod.font(".SystemUIFont"), .color = color }};
+        var line = cx.text_system().shape_line(text, px(16), &runs, null) catch return;
+        // a and é share one underline; b has none; c, d and e share another. The colors are explicit: an
+        // underline without one never matches the run it continues into (GPUI compares them the same way).
+        const thin: style_mod.UnderlineStyle = .{ .thickness = 1, .color = color };
+        const thick: style_mod.UnderlineStyle = .{ .thickness = 2, .color = color };
+        const decorations = [_]text_system_line.DecorationRun{
+            .{ .len = 1, .color = color, .underline = thin },
+            .{ .len = 2, .color = color, .underline = thin },
+            .{ .len = 1, .color = color },
+            .{ .len = 1, .color = color, .underline = thick },
+            .{ .len = 2, .color = color, .underline = thick },
+        };
+        line.decoration_runs = &decorations;
+        if (use_default_paint) {
+            line.paint(bounds.origin, px(20), .left, null, window, cx) catch return;
+        } else {
+            line.paint_with_underline_handler(bounds.origin, px(20), .left, null, window, cx, .{ .func = record }) catch return;
+        }
+    }
+
+};
+
+test "paint_with_underline_handler hands each underline's bytes to the handler, and paint draws them" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    if (!cx.app.text_system().fs.hasShaper() or cx.app.text_system().fs.fontIds().len == 0) return error.SkipZigTest;
+    const Root = struct {
+        pub fn render(_: *@This(), _: *Window, _: *Context(@This())) *Div {
+            return div().size_full().child(canvas_mod.canvas_fn({}, UnderlineHandlerView.paint).size_full());
+        }
+    };
+    const build = struct {
+        fn build(_: *Window, app: *App) Entity(Root) {
+            return app.new(Root{});
+        }
+    }.build;
+
+    // Through the handler: the underlines reach it and none is painted by the line itself.
+    UnderlineHandlerView.calls = 0;
+    UnderlineHandlerView.use_default_paint = false;
+    _, const handled_vcx = cx.add_window_view(build);
+    try std.testing.expectEqual(@as(usize, 0), handled_vcx.window.rendered_frame.scene.underlines.items.len);
+    try std.testing.expectEqual(@as(usize, 2), UnderlineHandlerView.calls);
+    try std.testing.expectEqual(text_system_line.ByteRange{ .start = 0, .end = 3 }, UnderlineHandlerView.ranges[0]);
+    try std.testing.expectEqual(text_system_line.ByteRange{ .start = 4, .end = 7 }, UnderlineHandlerView.ranges[1]);
+    try std.testing.expectEqual(@as(f32, 1), UnderlineHandlerView.thicknesses[0]);
+    try std.testing.expectEqual(@as(f32, 2), UnderlineHandlerView.thicknesses[1]);
+
+    // The default paint draws both through the window and never calls the handler.
+    UnderlineHandlerView.calls = 0;
+    UnderlineHandlerView.use_default_paint = true;
+    _, const vcx = cx.add_window_view(build);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 0), UnderlineHandlerView.calls);
+    try std.testing.expectEqual(@as(usize, 2), vcx.window.rendered_frame.scene.underlines.items.len);
+}
+
+fn test_display(id: platform_mod.DisplayId, w: f32, h: f32) platform_mod.Display {
+    return .{ .id = id, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = w, .height = h } } };
+}
+
+test "windows: visibility observers hear each change once, see the new state, and stop after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const S = struct {
+        var seen: [8]platform_mod.WindowVisibility = undefined;
+        var n: usize = 0;
+        var stored_matches = true;
+        fn on(v: platform_mod.WindowVisibility, win: *Window, _: *App) void {
+            seen[n] = v;
+            n += 1;
+            if (win.visibility() != v) stored_matches = false;
+        }
+    };
+    S.n = 0;
+    S.stored_matches = true;
+    const win = handle.window(cx.app).?;
+    try std.testing.expect(win.is_visible());
+    const sub = win.observe_window_visibility(S.on);
+    const hw = headless_mod.HeadlessWindow.from(win.platform_window);
+
+    hw.set_visibility(.hidden);
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+    try std.testing.expectEqual(platform_mod.WindowVisibility.hidden, S.seen[0]);
+    try std.testing.expect(!win.is_visible());
+
+    // The platform may report the same state again: observers only see changes.
+    hw.set_visibility(.hidden);
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+
+    hw.set_visibility(.visible);
+    try std.testing.expectEqual(@as(usize, 2), S.n);
+    try std.testing.expectEqual(platform_mod.WindowVisibility.visible, S.seen[1]);
+    try std.testing.expect(win.is_visible());
+    try std.testing.expect(S.stored_matches);
+
+    sub.unsubscribe();
+    hw.set_visibility(.hidden);
+    try std.testing.expectEqual(@as(usize, 2), S.n);
+}
+
+test "windows: an entity's visibility observer gets the window, and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const Watcher = struct {
+        seen: usize = 0,
+        last: platform_mod.WindowVisibility = .visible,
+        sub: ?app_mod.Subscription = null,
+        fn start(self: *@This(), win: *Window, cx_: *Context(@This())) void {
+            self.sub = cx_.observe_window_visibility(win, on);
+        }
+        fn on(self: *@This(), v: platform_mod.WindowVisibility, win: *Window, _: *Context(@This())) void {
+            std.debug.assert(win.visibility() == v);
+            self.seen += 1;
+            self.last = v;
+        }
+        fn stop(self: *@This(), _: *Context(@This())) void {
+            self.sub.?.unsubscribe();
+        }
+    };
+    const watcher = cx.new(Watcher{});
+    const win = handle.window(cx.app).?;
+    watcher.update(cx.app, Watcher.start, .{win});
+
+    const hw = headless_mod.HeadlessWindow.from(win.platform_window);
+    hw.set_visibility(.hidden);
+    try std.testing.expectEqual(@as(usize, 1), watcher.read(cx.app).seen);
+    try std.testing.expectEqual(platform_mod.WindowVisibility.hidden, watcher.read(cx.app).last);
+
+    watcher.update(cx.app, Watcher.stop, .{});
+    hw.set_visibility(.visible);
+    try std.testing.expectEqual(@as(usize, 1), watcher.read(cx.app).seen);
+}
+
+test "displays: observe_displays reports additions, changes and removals, and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var events: [8]platform_mod.DisplayEvent = undefined;
+        var n: usize = 0;
+        fn on(event: platform_mod.DisplayEvent, _: *App) void {
+            events[n] = event;
+            n += 1;
+        }
+    };
+    S.n = 0;
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    const sub = cx.app.observe_displays(S.on);
+    const other = test_display(2, 800, 600);
+
+    hp.set_displays(&.{ test_display(0, 1920, 1080), other });
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+    try std.testing.expectEqual(platform_mod.DisplayEvent{ .added = 2 }, S.events[0]);
+
+    // Removed events come first, then added and changed ones, in the platform's order.
+    hp.set_displays(&.{ test_display(0, 1280, 720), other, test_display(3, 640, 480) });
+    try std.testing.expectEqual(@as(usize, 3), S.n);
+    try std.testing.expectEqual(platform_mod.DisplayEvent{ .changed = .{ .id = 0, .changes = .{ .bounds = true } } }, S.events[1]);
+    try std.testing.expectEqual(platform_mod.DisplayEvent{ .added = 3 }, S.events[2]);
+
+    // The same displays again change nothing.
+    hp.set_displays(&.{ test_display(0, 1280, 720), other, test_display(3, 640, 480) });
+    try std.testing.expectEqual(@as(usize, 3), S.n);
+
+    // Two removals, in the order the app last saw the displays.
+    hp.set_displays(&.{test_display(0, 1280, 720)});
+    try std.testing.expectEqual(@as(usize, 5), S.n);
+    try std.testing.expectEqual(platform_mod.DisplayEvent{ .removed = 2 }, S.events[3]);
+    try std.testing.expectEqual(platform_mod.DisplayEvent{ .removed = 3 }, S.events[4]);
+
+    sub.unsubscribe();
+    hp.set_displays(&.{ test_display(0, 1280, 720), test_display(4, 1024, 768) });
+    try std.testing.expectEqual(@as(usize, 5), S.n);
+}
+
+test "windows: a window hears when it moves to another display, not when the move is no move" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const S = struct {
+        var seen: [8]platform_mod.DisplayId = undefined;
+        var n: usize = 0;
+        fn on(win: *Window, _: *App) void {
+            seen[n] = win.display_id_ orelse 999;
+            n += 1;
+        }
+    };
+    S.n = 0;
+    const win = handle.window(cx.app).?;
+    const sub = win.observe_window_display(S.on);
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    const hw = headless_mod.HeadlessWindow.from(win.platform_window);
+
+    // A display connecting is not a move: the window stays where it was.
+    hp.set_displays(&.{ test_display(0, 1920, 1080), test_display(2, 800, 600) });
+    try std.testing.expectEqual(@as(usize, 0), S.n);
+
+    hw.move_to_display(2);
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+    try std.testing.expectEqual(@as(platform_mod.DisplayId, 2), S.seen[0]);
+
+    // Platforms may report a move that isn't one.
+    hw.move_to_display(2);
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+
+    // A change to a display the window is not on does not notify it.
+    hp.set_displays(&.{ test_display(0, 1280, 720), test_display(2, 800, 600) });
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+
+    // A change to the window's own display does.
+    hp.set_displays(&.{ test_display(0, 1280, 720), test_display(2, 1024, 768) });
+    try std.testing.expectEqual(@as(usize, 2), S.n);
+    try std.testing.expectEqual(@as(platform_mod.DisplayId, 2), S.seen[1]);
+
+    sub.unsubscribe();
+    hw.move_to_display(0);
+    try std.testing.expectEqual(@as(usize, 2), S.n);
+}
+
+test "windows: replace_root swaps the root view and releases the old one; new_window_entity sees the window" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const old, const vcx = cx.add_window_view(Counter.build);
+    const S = struct {
+        var old_released = false;
+        var seen_window: ?*Window = null;
+        fn on_release(_: *Counter, _: *App) void {
+            old_released = true;
+        }
+    };
+    S.old_released = false;
+    const sub = cx.app.observe_release(old, S.on_release);
+    sub.detach();
+
+    const Marker = struct {
+        tag: u32 = 0,
+        fn init(win: *Window, _: *Context(@This())) @This() {
+            S.seen_window = win;
+            return .{ .tag = 7 };
+        }
+        pub fn render(_: *@This(), _: *Window, _: *Context(@This())) *div_mod.Div {
+            return div();
+        }
+    };
+
+    const created = vcx.new_window_entity(Marker.init);
+    try std.testing.expectEqual(@as(u32, 7), created.read(cx.app).tag);
+    try std.testing.expect(S.seen_window == vcx.window);
+    try std.testing.expect(!S.old_released);
+
+    const marker = vcx.replace_root_view(Marker.init);
+    try std.testing.expect(S.old_released);
+    try std.testing.expectEqual(@as(u32, 7), marker.read(cx.app).tag);
+    try std.testing.expect(vcx.window.root_view(Marker) != null);
+}
+
+test "keyboard: on_keyboard_layout_change runs on each change of layout, and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var n: usize = 0;
+        var last: []const u8 = "";
+        fn on(app: *App) void {
+            n += 1;
+            last = app.keyboard_layout().name;
+        }
+    };
+    S.n = 0;
+    S.last = "";
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    try std.testing.expectEqualStrings("unknown", cx.app.keyboard_layout().name);
+    const sub = cx.app.on_keyboard_layout_change(S.on);
+
+    hp.set_keyboard_layout("German");
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+    try std.testing.expectEqualStrings("German", S.last);
+    try std.testing.expectEqualStrings("German", cx.app.keyboard_layout().id);
+
+    // The same layout again is no change.
+    hp.set_keyboard_layout("German");
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+
+    sub.unsubscribe();
+    hp.set_keyboard_layout("English (US)");
+    try std.testing.expectEqual(@as(usize, 1), S.n);
+    try std.testing.expectEqualStrings("English (US)", cx.app.keyboard_layout().name);
+}
+
+test "keyboard: the keyboard mapper leaves keystrokes as they are, as GPUI's Linux mapper does" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const ks = try keystroke_mod.Keystroke.parse("cmd-shift-z");
+    const mapped = cx.app.keyboard_mapper().map_key_equivalent(ks, true);
+    try std.testing.expectEqualStrings(ks.key, mapped.key);
+    try std.testing.expectEqual(ks.modifiers, mapped.modifiers);
+}
+
+test "cursor: typing hides the cursor only in the modes that hide it on typing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const vcx = cx.add_window_view(Counter.build)[1];
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    try std.testing.expectEqual(app_mod.CursorHideMode.on_typing_and_action, cx.app.cursor_hide_mode());
+
+    cx.app.set_cursor_hide_mode(.never);
+    vcx.simulate_keystrokes("a");
+    try std.testing.expectEqual(@as(u32, 0), hp.cursor_hide_requests);
+    try std.testing.expect(cx.app.is_cursor_visible());
+
+    cx.app.set_cursor_hide_mode(.on_typing);
+    vcx.simulate_keystrokes("a");
+    try std.testing.expectEqual(@as(u32, 1), hp.cursor_hide_requests);
+    try std.testing.expect(!cx.app.is_cursor_visible());
+
+    // A key that types no text does not hide it.
+    hp.cursor_visible = true;
+    vcx.simulate_keystrokes("escape");
+    try std.testing.expectEqual(@as(u32, 1), hp.cursor_hide_requests);
+    try std.testing.expect(cx.app.is_cursor_visible());
+}
+
+test "platform: the headless platform reports the host OS, and no display server, window stack or GPU" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const handle = cx.add_window(Counter.build);
+    const info = cx.app.platform_info();
+    try std.testing.expectEqual(platform_mod.PlatformInfo.host().os, info.os);
+    try std.testing.expectEqual(platform_mod.PlatformTarget.native, info.target);
+    try std.testing.expect(cx.app.graphical_environment() == null);
+    try std.testing.expect(cx.app.window_stack() == null);
+    try std.testing.expect(handle.window(cx.app).?.gpu_specs() == null);
+}
+
+test "platform: hide, hide_other_apps, unhide_other_apps and the activation policy reach the platform" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    try std.testing.expect(hp.activation_policy == null);
+
+    cx.app.hide();
+    cx.app.hide_other_apps();
+    cx.app.unhide_other_apps();
+    try std.testing.expectEqual(@as(u32, 1), hp.hide_requests);
+    try std.testing.expectEqual(@as(u32, 1), hp.hide_other_apps_requests);
+    try std.testing.expectEqual(@as(u32, 1), hp.unhide_other_apps_requests);
+
+    cx.app.set_activation_policy(.accessory);
+    try std.testing.expectEqual(platform_mod.ActivationPolicy.accessory, hp.activation_policy.?);
+}
+
+test "app: should_auto_hide_scrollbars reports the platform's setting" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    try std.testing.expect(!cx.app.should_auto_hide_scrollbars());
+    hp.auto_hide_scrollbars = true;
+    try std.testing.expect(cx.app.should_auto_hide_scrollbars());
+}
+
+test "app: on_reopen runs each time the app is reopened, and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const S = struct {
+        var n: usize = 0;
+        fn on(_: *App) void {
+            n += 1;
+        }
+    };
+    S.n = 0;
+    const sub = cx.app.on_reopen(S.on);
+    cx.app.dispatch_reopen();
+    cx.app.dispatch_reopen();
+    try std.testing.expectEqual(@as(usize, 2), S.n);
+    sub.unsubscribe();
+    cx.app.dispatch_reopen();
+    try std.testing.expectEqual(@as(usize, 2), S.n);
+}
+
+test "app: restart runs the on_app_restart observers, then the platform restarts with the path and arguments" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    const S = struct {
+        var runs: usize = 0;
+        fn observe(_: *App) void {
+            runs += 1;
+        }
+    };
+    S.runs = 0;
+    const sub = cx.app.on_app_restart(S.observe);
+    defer sub.unsubscribe();
+    try cx.app.set_restart_path("/opt/zui/new-binary");
+    try cx.app.set_restart_arguments(&.{ "--flag", "value" });
+    cx.app.restart();
+    try std.testing.expectEqual(@as(usize, 1), S.runs);
+    try std.testing.expectEqual(@as(u32, 1), hp.restarts);
+    try std.testing.expectEqual(@as(usize, 2), hp.restart_argument_count);
+    const len = hp.restart_binary_len orelse return error.TestExpectedRestartPath;
+    try std.testing.expectEqualStrings("/opt/zui/new-binary", hp.restart_binary[0..len]);
+    // One restart takes the path and the arguments, so the next one has neither.
+    cx.app.restart();
+    try std.testing.expectEqual(@as(?usize, null), hp.restart_binary_len);
+    try std.testing.expectEqual(@as(usize, 0), hp.restart_argument_count);
+}
+
+test "app: window appearance is the platform's, and the platform can change it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    try std.testing.expectEqual(platform_mod.WindowAppearance.light, cx.app.window_appearance());
+    hp.set_window_appearance(.dark);
+    try std.testing.expectEqual(platform_mod.WindowAppearance.dark, cx.app.window_appearance());
+}
+
+test "app: a file dialog the platform cannot show answers cancelled through the callback" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    const S = struct {
+        var calls: usize = 0;
+        var cancelled = false;
+        fn answer(_: void, result: anyerror!?[]const []const u8, _: *App) void {
+            calls += 1;
+            const paths = result catch return;
+            cancelled = paths == null;
+        }
+    };
+    S.calls = 0;
+    S.cancelled = false;
+    cx.app.prompt_for_paths(.{}, {}, S.answer);
+    try std.testing.expectEqual(@as(usize, 1), S.calls);
+    try std.testing.expect(S.cancelled);
+    try std.testing.expectEqual(@as(u32, 1), hp.prompts);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers added with GPUI's `with_window`, `clear_globals`, `all_bindings_for_input`,
+// `update_window_entity`, `read_default_global` and the window closures.
+
+test "app: with_window runs in the window that rendered the entity, and not for others" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    const window_id = vcx.window.window_handle_id();
+
+    const found = cx.app.with_window(view.entity_id(), struct {
+        fn f(win: *Window, _: *App) window_mod.WindowId {
+            return win.window_handle_id();
+        }
+    }.f, .{});
+    try std.testing.expectEqual(@as(?window_mod.WindowId, window_id), found);
+
+    const Plain = struct { n: u8 = 0 };
+    const plain = cx.new(Plain{});
+    const none = cx.app.with_window(plain.entity_id(), struct {
+        fn f(_: *Window, _: *App) bool {
+            return true;
+        }
+    }.f, .{});
+    try std.testing.expect(none == null);
+}
+
+test "app: clear_globals removes every global" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const First = struct { v: u32 = 1 };
+    const Second = struct { v: u32 = 2 };
+    cx.app.set_global(First{});
+    cx.app.set_global(Second{});
+    try std.testing.expect(cx.app.has_global(First));
+    cx.app.clear_globals();
+    try std.testing.expect(!cx.app.has_global(First));
+    try std.testing.expect(!cx.app.has_global(Second));
+    // Setting again after a clear works, so the slots were really dropped.
+    cx.app.set_global(First{ .v = 5 });
+    try std.testing.expectEqual(@as(u32, 5), cx.app.global(First).v);
+}
+
+test "keymap: all_bindings_for_input ignores context and lists the newest first" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    cx.app.bind_keys(&.{
+        KeyBinding.new("cmd-s", Editor.Save{}, "Editor"),
+        KeyBinding.new("cmd-s", Editor.Outside{}, null),
+    });
+    const input = [_]Keystroke{try Keystroke.parse("cmd-s")};
+    const found = try cx.app.all_bindings_for_input(&input);
+    defer cx.app.allocator.free(found);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expect(found[0].action.is(Editor.Outside));
+    try std.testing.expect(found[1].action.is(Editor.Save));
+    try std.testing.expectEqual(@as(usize, 2), cx.app.key_bindings().bindings().len);
+}
+
+test "window: keystroke_text_for shows the bound keystroke, or the action name when unbound" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Unbound = Action("test", "Unbound");
+    cx.app.bind_keys(&.{KeyBinding.new("cmd-s", Editor.Save{}, "Editor")});
+    const view, const vcx = cx.add_window_view(Editor.build);
+    _ = view;
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    const Shown = struct {
+        fn bound(window: *Window, app: *App) []const u8 {
+            return window.keystroke_text_for(Editor.Save{}, app);
+        }
+        fn unbound(window: *Window, app: *App) []const u8 {
+            return window.keystroke_text_for(Unbound{}, app);
+        }
+    };
+    const os = cx.app.platform_info().os;
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{(Keystroke{ .key = "s", .modifiers = .{ .platform = true } }).display(os)});
+    defer std.testing.allocator.free(expected);
+    const text = vcx.update(Shown.bound, .{});
+    try std.testing.expectEqualStrings(expected, text);
+    try std.testing.expect(std.mem.indexOf(u8, vcx.update(Shown.unbound, .{}), "Unbound") != null);
+}
+
+test "window: is_action_available_in asks the focused element's path" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    const handle = view.read(cx.app).focus;
+    const available = vcx.update(struct {
+        fn f(focus: FocusHandle, window: *Window, _: *App) bool {
+            return window.is_action_available_in(app_mod.type_id(Editor.Save), focus);
+        }
+    }.f, .{handle});
+    try std.testing.expect(available);
+    const not_available = vcx.update(struct {
+        fn f(focus: FocusHandle, window: *Window, _: *App) bool {
+            return window.is_action_available_in(app_mod.type_id(struct {}), focus);
+        }
+    }.f, .{handle});
+    try std.testing.expect(!not_available);
+}
+
+test "window: the visible bounds are the whole viewport when nothing covers it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    const sizes = vcx.update(struct {
+        fn f(window: *Window, _: *App) [2]Size(Pixels) {
+            return .{ window.fully_visible_bounds().size, window.viewport_size() };
+        }
+    }.f, .{});
+    try std.testing.expectEqual(sizes[1].width, sizes[0].width);
+    try std.testing.expectEqual(sizes[1].height, sizes[0].height);
+    const origin = vcx.update(struct {
+        fn f(window: *Window, _: *App) Point(Pixels) {
+            return window.fully_visible_bounds().origin;
+        }
+    }.f, .{});
+    try std.testing.expectEqual(@as(Pixels, 0), origin.x);
+    try std.testing.expectEqual(@as(Pixels, 0), origin.y);
+}
+
+test "insets: effective is the larger of the safe area and the keyboard" {
+    const insets = window_mod.WindowInsets{
+        .safe_area = .{ .top = 10, .right = 0, .bottom = 4, .left = 0 },
+        .ime = .{ .top = 0, .right = 0, .bottom = 50, .left = 2 },
+    };
+    const effective = insets.effective();
+    try std.testing.expectEqual(@as(Pixels, 10), effective.top);
+    try std.testing.expectEqual(@as(Pixels, 50), effective.bottom);
+    try std.testing.expectEqual(@as(Pixels, 2), effective.left);
+    try std.testing.expectEqual(@as(Pixels, 0), effective.right);
+}
+
+test "window: with_content_mask, with_element_offset and with_rem_size apply inside only" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    const result = vcx.update(struct {
+        fn f(window: *Window, _: *App) [4]Pixels {
+            const outer_mask = window.content_mask().bounds.origin.x;
+            const mask: window_mod.ContentMask(Pixels) = .{ .bounds = .{ .origin = .{ .x = 5, .y = 5 }, .size = .{ .width = 10, .height = 10 } } };
+            const inside_mask = window.with_content_mask(mask, struct {
+                fn g(w: *Window) Pixels {
+                    return w.content_mask().bounds.origin.x;
+                }
+            }.g, .{});
+            const inside_offset = window.with_element_offset(.{ .x = 3, .y = 4 }, struct {
+                fn g(w: *Window) Pixels {
+                    return w.element_offset().x;
+                }
+            }.g, .{});
+            const inside_rem = window.with_rem_size(20, struct {
+                fn g(w: *Window) Pixels {
+                    return w.rem_size();
+                }
+            }.g, .{});
+            return .{ outer_mask, inside_mask, inside_offset, inside_rem };
+        }
+    }.f, .{});
+    try std.testing.expectEqual(@as(Pixels, 0), result[0]);
+    try std.testing.expectEqual(@as(Pixels, 5), result[1]);
+    try std.testing.expectEqual(@as(Pixels, 3), result[2]);
+    try std.testing.expectEqual(@as(Pixels, 20), result[3]);
+
+    const after = vcx.update(struct {
+        fn f(window: *Window, _: *App) [3]Pixels {
+            return .{ window.content_mask().bounds.origin.x, window.element_offset().x, window.rem_size() };
+        }
+    }.f, .{});
+    try std.testing.expectEqual(@as(Pixels, 0), after[0]);
+    try std.testing.expectEqual(@as(Pixels, 0), after[1]);
+    try std.testing.expectEqual(@as(Pixels, 16), after[2]);
+}
+
+test "window: with_global_id gives the callee its own id, and namespaces restore on return" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Editor.build);
+    const result = vcx.update(struct {
+        fn f(window: *Window, _: *App) struct { inside: u64, outside: u64, namespaced: u64, restored: u64 } {
+            const outside = window.current_global_id().hash;
+            const inside = window.with_global_id("row", struct {
+                fn g(gid: @import("../element.zig").GlobalElementId, w: *Window) u64 {
+                    std.debug.assert(gid.hash == w.current_global_id().hash);
+                    return gid.hash;
+                }
+            }.g, .{});
+            const namespaced = window.with_element_namespace("list", struct {
+                fn g(w: *Window) u64 {
+                    return w.current_global_id().hash;
+                }
+            }.g, .{});
+            return .{ .inside = inside, .outside = outside, .namespaced = namespaced, .restored = window.current_global_id().hash };
+        }
+    }.f, .{});
+    try std.testing.expect(result.inside != result.outside);
+    try std.testing.expect(result.namespaced != result.outside);
+    try std.testing.expectEqual(result.outside, result.restored);
+}
+
+test "async window context: update_window_entity and update_root reach the window" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    const actx = app_mod.AsyncWindowContext{ .app = cx.app, .window_id = vcx.window.window_handle_id() };
+
+    const seen = try actx.update_window_entity(view, Editor.note_window, .{});
+    try std.testing.expectEqual(vcx.window.window_handle_id(), seen);
+
+    const has_root = try actx.update_root(struct {
+        fn f(_: anytype, _: *Window, _: *App) bool {
+            return true;
+        }
+    }.f, .{});
+    try std.testing.expect(has_root);
+}
+
+test "async app: read_default_global sets the global the first time" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Level = struct { value: u32 = 7 };
+    var actx = app_mod.AsyncApp{ .app = cx.app };
+    const value = actx.read_default_global(Level, struct {
+        fn f(g: *Level, _: *App) u32 {
+            return g.value;
+        }
+    }.f, .{});
+    try std.testing.expectEqual(@as(u32, 7), value);
+    try std.testing.expect(cx.app.has_global(Level));
+}
+
+const scene_mod = @import("../scene.zig");
+
+/// Paints through the window's paint_* helpers from a canvas. `mode` picks the case for the next window.
+const PaintCase = struct {
+    var mode: enum { underline_exclusions, shadows, image, svg, missing_svg, hitboxes, transact, use_state } = .underline_exclusions;
+    var image: ?*assets_mod.RenderImage = null;
+    /// Hitboxes the `hitboxes` mode inserts: `bottom` covers the whole box, `top` its left half and blocks the mouse.
+    var bottom: ?window_mod.Hitbox = null;
+    var top: ?window_mod.Hitbox = null;
+    /// Hitboxes added by a failed and a successful `transact` in the `transact` mode.
+    var added_by_failed: usize = 0;
+    var added_by_ok: usize = 0;
+    /// The entities the `use_state` mode got from two call sites in the last frame.
+    var first_site: ?app_mod.EntityId = null;
+    var second_site: ?app_mod.EntityId = null;
+    const UseStateValue = struct { n: u32 = 0 };
+
+    fn fail_after_inserting(_: void, window: *Window) error{Refused}!void {
+        _ = window.insert_hitbox(.{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 5, .height = 5 } }, .normal);
+        return error.Refused;
+    }
+
+    fn insert_one(_: void, window: *Window) error{Refused}!void {
+        _ = window.insert_hitbox(.{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 5, .height = 5 } }, .normal);
+    }
+    const svg_source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>";
+
+    fn paint(_: void, bounds: geometry.Bounds(Pixels), window: *Window, cx: *App) void {
+        const ox = bounds.origin.x;
+        const oy = bounds.origin.y;
+        const no_radii: geometry.Corners(Pixels) = geometry.Corners(Pixels).all(0);
+        switch (mode) {
+            .underline_exclusions => {
+                const style: style_mod.UnderlineStyle = .{ .thickness = 1, .color = color_mod.black() };
+                // Unsorted, one span inside, one reaching past the left edge, one outside.
+                const exclusions = [_]window_mod.ScaledRange{
+                    .{ .start = ox + 15, .end = ox + 25 },
+                    .{ .start = ox + 3, .end = ox + 12 },
+                    .{ .start = ox + 40, .end = ox + 50 },
+                };
+                window.paint_underline_with_exclusions(.{ .x = ox + 10, .y = oy + 10 }, 20, &style, &exclusions);
+            },
+            .shadows => {
+                const b: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox + 10, .y = oy + 10 }, .size = .{ .width = 20, .height = 20 } };
+                const shadows = [_]style_mod.BoxShadow{
+                    .{ .color = color_mod.black(), .offset = .{ .x = 2, .y = 3 }, .blur_radius_ = 4, .spread_radius_ = 1 },
+                    .{ .color = color_mod.black(), .offset = .{ .x = 0, .y = 0 }, .blur_radius_ = 1, .spread_radius_ = 2, .inset = true },
+                };
+                const radii = geometry.Corners(Pixels).all(5);
+                window.paint_drop_shadows(b, radii, &shadows);
+                window.paint_inset_shadows(b, radii, &shadows);
+            },
+            .image => {
+                const data = image orelse return;
+                const at: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox + 10, .y = oy }, .size = .{ .width = 20, .height = 40 } };
+                const clipped_left: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox - 10, .y = oy }, .size = .{ .width = 40, .height = 40 } };
+                const outside: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox + 200, .y = oy }, .size = .{ .width = 20, .height = 40 } };
+                const whole: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox, .y = oy }, .size = .{ .width = 40, .height = 40 } };
+                window.paint_image(whole, at, no_radii, data, 0, false) catch @panic("paint_image");
+                window.paint_image(whole, clipped_left, no_radii, data, 0, false) catch @panic("paint_image");
+                window.paint_image(whole, outside, no_radii, data, 0, false) catch @panic("paint_image");
+            },
+            .hitboxes => {
+                bottom = window.insert_hitbox(.{ .origin = .{ .x = ox, .y = oy }, .size = .{ .width = 40, .height = 40 } }, .normal);
+                top = window.insert_hitbox(.{ .origin = .{ .x = ox, .y = oy }, .size = .{ .width = 20, .height = 40 } }, .block_mouse);
+            },
+            .transact => {
+                const none: void = {};
+                const start = window.next_frame.hitboxes.items.len;
+                if (window.transact(none, fail_after_inserting)) |_| @panic("transact should have failed") else |_| {}
+                added_by_failed = window.next_frame.hitboxes.items.len - start;
+                const before_ok = window.next_frame.hitboxes.items.len;
+                window.transact(none, insert_one) catch @panic("insert_one cannot fail");
+                added_by_ok = window.next_frame.hitboxes.items.len - before_ok;
+            },
+            .use_state => {
+                first_site = window.use_state(@src(), cx, UseStateValue{}).entity_id();
+                second_site = window.use_state(@src(), cx, UseStateValue{}).entity_id();
+            },
+            .svg, .missing_svg => {
+                const b: geometry.Bounds(Pixels) = .{ .origin = .{ .x = ox, .y = oy }, .size = .{ .width = 10, .height = 10 } };
+                const identity = scene_mod.TransformationMatrix.unit();
+                if (mode == .svg) {
+                    window.paint_svg(b, "test.svg", svg_source, identity, color_mod.black(), cx) catch @panic("paint_svg");
+                } else {
+                    window.paint_svg(b, "missing.svg", null, identity, color_mod.black(), cx) catch @panic("paint_svg");
+                }
+            },
+        }
+    }
+};
+
+const PaintRoot = struct {
+    pub fn render(_: *@This(), _: *Window, _: *Context(@This())) *Div {
+        return div().size_full().child(canvas_mod.canvas_fn({}, PaintCase.paint).size_full());
+    }
+};
+
+fn build_paint_root(_: *Window, app: *App) Entity(PaintRoot) {
+    return app.new(PaintRoot{});
+}
+
+test "paint_underline_with_exclusions cuts the spans out, in any order, and clips them to the underline" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .underline_exclusions;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const underlines = vcx.window.rendered_frame.scene.underlines.items;
+    // The underline covers x 10..30. Excluded: 15..25 and 3..12 (clipped to 10..12). 40..50 is outside.
+    try std.testing.expectEqual(@as(usize, 2), underlines.len);
+    try std.testing.expectEqual(@as(f32, 12), underlines[0].content_mask.bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 3), underlines[0].content_mask.bounds.size.width);
+    try std.testing.expectEqual(@as(f32, 25), underlines[1].content_mask.bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 5), underlines[1].content_mask.bounds.size.width);
+    // Each piece keeps the geometry of the whole underline.
+    try std.testing.expectEqual(@as(f32, 10), underlines[0].bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 20), underlines[0].bounds.size.width);
+}
+
+test "paint_drop_shadows and paint_inset_shadows paint their own kind, the inset hole shrinks by the spread" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .shadows;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const shadows = vcx.window.rendered_frame.scene.shadows.items;
+    try std.testing.expectEqual(@as(usize, 2), shadows.len);
+
+    // The drop shadow: the box moved by its offset, then grown by the spread. It is outside the element.
+    const drop = shadows[0];
+    try std.testing.expectEqual(@as(u32, 0), drop.inset);
+    try std.testing.expectEqual(@as(f32, 11), drop.bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 12), drop.bounds.origin.y);
+    try std.testing.expectEqual(@as(f32, 22), drop.bounds.size.width);
+    try std.testing.expectEqual(@as(f32, 4), drop.blur_radius);
+
+    // The inset shadow: the hole is the box shrunk by the spread, with radii shrunk by it too.
+    const inset = shadows[1];
+    try std.testing.expectEqual(@as(u32, 1), inset.inset);
+    try std.testing.expectEqual(@as(f32, 12), inset.bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 16), inset.bounds.size.width);
+    try std.testing.expectEqual(@as(f32, 3), inset.corner_radii.top_left);
+    // The element is what the inset shadow lies inside of, so the shader clips to it.
+    try std.testing.expectEqual(@as(f32, 10), inset.element_bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 20), inset.element_bounds.size.width);
+    try std.testing.expectEqual(@as(f32, 5), inset.element_corner_radii.top_left);
+}
+
+test "paint_image crops the atlas tile to the visible part and paints nothing outside the bounds" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const allocator = std.testing.allocator;
+    const frames = try allocator.alloc(assets_mod.Frame, 1);
+    frames[0] = .{ .width = 4, .height = 4, .pixels = try allocator.alloc(u8, 4 * 4 * 4) };
+    @memset(frames[0].pixels, 255);
+    const image = try assets_mod.RenderImage.new(allocator, frames);
+    defer image.deinit();
+    PaintCase.image = image;
+    defer PaintCase.image = null;
+    PaintCase.mode = .image;
+
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const sprites = vcx.window.rendered_frame.scene.polychrome_sprites.items;
+    // The third image lies outside its bounds, so nothing is drawn for it.
+    try std.testing.expectEqual(@as(usize, 2), sprites.len);
+    // Fully visible: the whole tile at 10..30.
+    try std.testing.expectEqual(@as(f32, 10), sprites[0].bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 20), sprites[0].bounds.size.width);
+    const whole_tile = sprites[0].tile;
+    try std.testing.expectEqual(@as(i32, 4), whole_tile.bounds.size.width);
+    // Clipped on the left: the visible 0..30 is three quarters of the 40-wide image, so three of its four columns.
+    try std.testing.expectEqual(@as(f32, 0), sprites[1].bounds.origin.x);
+    try std.testing.expectEqual(@as(f32, 30), sprites[1].bounds.size.width);
+    try std.testing.expectEqual(whole_tile.bounds.origin.x + 1, sprites[1].tile.bounds.origin.x);
+    try std.testing.expectEqual(@as(i32, 3), sprites[1].tile.bounds.size.width);
+}
+
+test "paint_svg draws the artwork centred in its bounds, and paints nothing for a missing asset" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .svg;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const sprites = vcx.window.rendered_frame.scene.monochrome_sprites.items;
+    try std.testing.expectEqual(@as(usize, 1), sprites.len);
+    // Rasterized at twice the size and drawn at half of that, so the 10x10 box is covered exactly.
+    try std.testing.expectApproxEqAbs(@as(f32, 0), sprites[0].bounds.origin.x, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), sprites[0].bounds.origin.y, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), sprites[0].bounds.size.width, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), sprites[0].bounds.size.height, 1e-3);
+
+    PaintCase.mode = .missing_svg;
+    _, const missing = cx.add_window_view(build_paint_root);
+    try std.testing.expectEqual(@as(usize, 0), missing.window.rendered_frame.scene.monochrome_sprites.items.len);
+}
+
+test "hitbox: is_hovered_at finds the hitbox under a point, and only a blocking hitbox above it hides it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .hitboxes;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const bottom = PaintCase.bottom.?;
+    const top = PaintCase.top.?;
+    // The left half is covered by the blocking hitbox above, so the one below is not hovered there.
+    try std.testing.expect(top.is_hovered_at(.{ .x = 5, .y = 5 }, vcx.window));
+    try std.testing.expect(!bottom.is_hovered_at(.{ .x = 5, .y = 5 }, vcx.window));
+    // The right half is only the bottom hitbox.
+    try std.testing.expect(bottom.is_hovered_at(.{ .x = 30, .y = 5 }, vcx.window));
+    try std.testing.expect(!top.is_hovered_at(.{ .x = 30, .y = 5 }, vcx.window));
+    try std.testing.expect(!bottom.is_hovered_at(.{ .x = 100, .y = 100 }, vcx.window));
+}
+
+test "transact: a failed prepaint keeps none of the hitboxes it added, a successful one keeps its own" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .transact;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    try std.testing.expectEqual(@as(usize, 0), PaintCase.added_by_failed);
+    try std.testing.expectEqual(@as(usize, 1), PaintCase.added_by_ok);
+    try std.testing.expectEqual(@as(usize, 1), vcx.window.rendered_frame.hitboxes.items.len);
+}
+
+test "use_state: one call site keeps its entity across frames, and two call sites get two entities" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    PaintCase.mode = .use_state;
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const first = PaintCase.first_site.?.as_u64();
+    const second = PaintCase.second_site.?.as_u64();
+    try std.testing.expect(first != second);
+
+    vcx.window.refresh();
+    vcx.run_until_parked();
+    try std.testing.expectEqual(first, PaintCase.first_site.?.as_u64());
+    try std.testing.expectEqual(second, PaintCase.second_site.?.as_u64());
+}
+
+test "last input: a touch sets the touch modality, and a click or a key sets the others" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(build_paint_root);
+    try std.testing.expect(!vcx.window.last_input_was_touch());
+
+    vcx.simulate_event(.{ .touch = .{ .phase = .started, .position = .{ .x = 5, .y = 5 } } });
+    try std.testing.expect(vcx.window.last_input_was_touch());
+    try std.testing.expect(!vcx.window.last_input_was_keyboard());
+
+    vcx.simulate_click(.{ .x = 5, .y = 5 }, .{});
+    try std.testing.expect(!vcx.window.last_input_was_touch());
+
+    vcx.simulate_keystrokes("a");
+    try std.testing.expect(vcx.window.last_input_was_keyboard());
+    try std.testing.expect(!vcx.window.last_input_was_touch());
+}
+
+test "pending input: a paused timeout does not flush until it is resumed" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    cx.app.bind_keys(&.{ KeyBinding.new("g", Editor.Save{}, "Editor"), KeyBinding.new("g g", Editor.Outside{}, "Editor") });
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expect(!vcx.window.pending_input().?.timeout().?.is_paused());
+    try std.testing.expect(vcx.window.set_pending_input_timeout_paused(view, true, cx.app));
+    try std.testing.expect(vcx.window.pending_input().?.timeout().?.is_paused());
+    // Already paused by this owner: nothing changes, and another owner cannot resume it.
+    try std.testing.expect(!vcx.window.set_pending_input_timeout_paused(view, true, cx.app));
+    const Other = struct { n: u8 = 0 };
+    const other = cx.app.new(Other{});
+    try std.testing.expect(!vcx.window.set_pending_input_timeout_paused(other, false, cx.app));
+    try std.testing.expect(vcx.window.pending_input().?.timeout().?.is_paused());
+
+    cx.executor().advance_clock(700 * std.time.ns_per_ms);
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.has_pending_keystrokes());
+    try std.testing.expectEqual(@as(usize, 0), cx.read_entity(view, Editor.read_state, .{}).saves);
+
+    try std.testing.expect(vcx.window.set_pending_input_timeout_paused(view, false, cx.app));
+    cx.executor().advance_clock(std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+}
+
+test "pending input: releasing the owner of a pause resumes its timeout" {
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    const Owner = struct { n: u8 = 0 };
+    cx.app.bind_keys(&.{ KeyBinding.new("g", Editor.Save{}, "Editor"), KeyBinding.new("g g", Editor.Outside{}, "Editor") });
+    const view, const vcx = cx.add_window_view(Editor.build);
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    const owner = cx.app.new(Owner{});
+
+    vcx.simulate_keystrokes("g");
+    try std.testing.expect(vcx.window.set_pending_input_timeout_paused(owner, true, cx.app));
+    owner.release(cx.app);
+    try std.testing.expect(!vcx.window.pending_input().?.timeout().?.is_paused());
+    cx.executor().advance_clock(std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 1), cx.read_entity(view, Editor.read_state, .{}).saves);
+}
+
+test "long press: a press that starts over an element with a tooltip shows it at once, and its end hides it" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds == null);
+
+    vcx.simulate_event(.{ .long_press = .{ .phase = .started, .start_position = .{ .x = 10, .y = 10 }, .position = .{ .x = 10, .y = 10 } } });
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds != null);
+    // The long press took the event, so nothing else heard it.
+    try std.testing.expect(vcx.window.default_prevented());
+
+    vcx.simulate_event(.{ .long_press = .{ .phase = .ended, .start_position = .{ .x = 10, .y = 10 }, .position = .{ .x = 10, .y = 10 } } });
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds == null);
+}
+
+const PlainView = struct {
+    pub fn render(_: *PlainView, _: *Window, _: *Context(PlainView)) *Div {
+        return div();
+    }
+
+    fn build(_: *Window, app: *App) Entity(PlainView) {
+        return app.new(PlainView{});
+    }
+};
+
+const EmptyRoot = struct {
+    fn build(_: *Window, app: *App) Entity(view_mod.EmptyView) {
+        return app.new(view_mod.EmptyView{});
+    }
+};
+
+test "refresh_interval: a window reports the refresh rate of its display, or none when the display has none" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+    hp.set_displays(&.{.{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } }, .refresh_interval = 16_666_666 }});
+    _, const vcx = cx.add_window_view(PlainView.build);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(?u64, 16_666_666), vcx.window.refresh_interval(cx.app));
+
+    hp.set_displays(&.{.{ .id = 0, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } } }});
+    try std.testing.expectEqual(@as(?u64, null), vcx.window.refresh_interval(cx.app));
+}
+
+test "AnyWeakView: upgrades while the view's entity lives, and not after it is released" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const entity = cx.app.new(PlainView{});
+    const weak = view_mod.AnyView.from(entity).downgrade();
+    try std.testing.expect(weak.upgrade(cx.app) != null);
+    entity.release(cx.app);
+    try std.testing.expect(weak.upgrade(cx.app) == null);
+}
+
+test "EmptyView can be a window's root: it draws nothing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(EmptyRoot.build);
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 0), vcx.window.rendered_frame.scene.quads.items.len);
+}
+
+test "is_focusable and is_managed_view classify types by their methods" {
+    // `assert_*` stops the build on a bad type, so only the `is_*` answers can be checked at run time.
+    try std.testing.expect(window_mod.is_focusable(PlainFocus));
+    try std.testing.expect(!window_mod.is_focusable(PlainView));
+    try std.testing.expect(!window_mod.is_focusable(u32));
+    try std.testing.expect(window_mod.is_managed_view(PlainFocus) == false);
+    window_mod.assert_focusable(PlainFocus);
+}
+
+const PlainFocus = struct {
+    pub fn focus_handle(_: *const PlainFocus, _: *App) FocusHandle {
+        return undefined;
+    }
+};
+
+test "the synced animation clock starts when the app is created" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    try std.testing.expect(cx.app.synced_animation_epoch > 0);
+    try std.testing.expect(cx.app.synced_animation_epoch <= @import("../executor.zig").now_ns());
+}
+
+test "long press: a press outside every tooltip element shows nothing" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(TooltipPage.build);
+    vcx.simulate_event(.{ .long_press = .{ .phase = .started, .start_position = .{ .x = 200, .y = 200 }, .position = .{ .x = 200, .y = 200 } } });
+    vcx.run_until_parked();
+    try std.testing.expect(vcx.window.tooltip_bounds == null);
+}
+
+test "long press capture: a claim holds until the next long press starts" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Owner = struct { n: u8 = 0 };
+    _, const vcx = cx.add_window_view(build_paint_root);
+    const owner = cx.app.new(Owner{});
+    const other = cx.app.new(Owner{});
+
+    try std.testing.expect(!vcx.window.has_long_press_capture(owner));
+    vcx.window.capture_long_press(owner);
+    try std.testing.expect(vcx.window.has_long_press_capture(owner));
+    try std.testing.expect(!vcx.window.has_long_press_capture(other));
+
+    // A long press starting releases the claim, whoever made it.
+    vcx.simulate_event(.{ .long_press = .{ .phase = .started, .start_position = .{ .x = 5, .y = 5 }, .position = .{ .x = 5, .y = 5 } } });
+    try std.testing.expect(!vcx.window.has_long_press_capture(owner));
+}
+
+/// Registers tab stops in prepaint, the way an element does, with one group in the middle.
+const GroupedTabs = struct {
+    outside_first: FocusHandle,
+    inside_second: FocusHandle,
+    inside_first: FocusHandle,
+    outside_last: FocusHandle,
+
+    pub fn render(self: *GroupedTabs, _: *Window, _: *Context(GroupedTabs)) *Div {
+        return div().id("grouped").w(px(100)).h(px(100)).child(
+            canvas_mod.canvas(self, GroupedTabs.prepaint, paint_nothing),
+        );
+    }
+    fn paint_nothing(_: *GroupedTabs, _: geometry.Bounds(Pixels), _: *void, _: *Window, _: *App) void {}
+    fn prepaint(self: *GroupedTabs, _: geometry.Bounds(Pixels), window: *Window, cx: *App) void {
+        stop(window, &self.outside_first, cx);
+        window.with_tab_group(1, GroupedTabs.inside, .{ self, cx });
+        stop(window, &self.outside_last, cx);
+    }
+    fn inside(window: *Window, self: *GroupedTabs, cx: *App) void {
+        stop(window, &self.inside_second, cx);
+        stop(window, &self.inside_first, cx);
+    }
+    /// An element pushes its own dispatch node before it registers its focus, so each stop does too.
+    fn stop(window: *Window, handle: *const FocusHandle, cx: *App) void {
+        window.next_frame.dispatch_tree.push_node();
+        defer window.next_frame.dispatch_tree.pop_node();
+        window.set_focus_handle(handle, cx);
+    }
+    fn build(_: *Window, app: *App) Entity(GroupedTabs) {
+        return app.new(GroupedTabs{
+            .outside_first = app.focus_handle().tab_index(0).tab_stop(true),
+            .inside_second = app.focus_handle().tab_index(6).tab_stop(true),
+            .inside_first = app.focus_handle().tab_index(5).tab_stop(true),
+            .outside_last = app.focus_handle().tab_index(2).tab_stop(true),
+        });
+    }
+};
+
+test "tab groups: with_tab_group orders its stops as one block" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(GroupedTabs.build);
+    const g = view.read(cx.app);
+    const tree = &vcx.window.rendered_frame.dispatch_tree;
+    // Outside the group, it sorts at index 1 between the stops at 0 and 2; inside, its own indices order.
+    try std.testing.expectEqual(@as(?u64, g.inside_first.id), tree.next_tab_stop(g.outside_first.id, true));
+    try std.testing.expectEqual(@as(?u64, g.inside_second.id), tree.next_tab_stop(g.inside_first.id, true));
+    try std.testing.expectEqual(@as(?u64, g.outside_last.id), tree.next_tab_stop(g.inside_second.id, true));
+    try std.testing.expectEqual(@as(?u64, g.outside_first.id), tree.next_tab_stop(g.outside_last.id, true));
+    try std.testing.expectEqual(@as(?u64, g.outside_last.id), tree.next_tab_stop(g.outside_first.id, false));
+}
+
+test "focus_lost_restore_target: nearest focusable ancestor of the lost focus" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(GroupedTabs.build);
+    const g = view.read(cx.app);
+    const window = vcx.window;
+    try std.testing.expect(window.focus_lost_restore_target(cx.app) == null);
+    // Only set while focus-lost listeners run: the path runs root to leaf, the leaf last.
+    const path = [_]window_mod.FocusId{ g.outside_first.id, g.inside_first.id };
+    window.focus_lost_path = &path;
+    defer window.focus_lost_path = &.{};
+    try std.testing.expectEqual(g.outside_first.id, window.focus_lost_restore_target(cx.app).?.id);
+    const unfocusable = [_]window_mod.FocusId{ 0xdead, g.inside_first.id };
+    window.focus_lost_path = &unfocusable;
+    try std.testing.expect(window.focus_lost_restore_target(cx.app) == null);
+}
+
+var button_layout_changes: usize = 0;
+
+fn count_button_layout(_: *Window, _: *App) void {
+    button_layout_changes += 1;
+}
+
+test "button layout: observers run each time the platform reports a change" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Editor.build);
+    _ = view;
+    button_layout_changes = 0;
+    _ = vcx.window.observe_button_layout_changed(count_button_layout);
+    vcx.window.platform_window.emit_button_layout_changed();
+    vcx.window.platform_window.emit_button_layout_changed();
+    try std.testing.expectEqual(@as(usize, 2), button_layout_changes);
+}
+
+// ---------------------------------------------------------------------------
+// Input preference (GPUI key_dispatch.rs `test_keystroke_input_preference`,
+// `test_input_preference_rechecked_after_interception` and
+// `test_keystroke_interceptors_can_consume_preferred_character_input`).
+// A key down that the platform says prefers text (AltGr) goes to the focused input instead of
+// key bindings, as long as the input accepts text.
+
+const AltGrTestAction = Action("test", "AltGrTestAction");
+
+const AltGrProbe = struct {
+    var actions: usize = 0;
+    var intercepted: [4]app_mod.InputPreference = undefined;
+    var n_intercepted: usize = 0;
+    var observed: [4]app_mod.InputPreference = undefined;
+    var n_observed: usize = 0;
+    var stop: bool = false;
+    /// The view whose `accepts` an interceptor flips.
+    var target: ?app_mod.Entity(ImeField) = null;
+    var mismatched: bool = false;
+
+    fn reset() void {
+        actions = 0;
+        n_intercepted = 0;
+        n_observed = 0;
+        stop = false;
+        target = null;
+        mismatched = false;
+    }
+    fn on_action(_: *const AltGrTestAction, _: *App) void {
+        actions += 1;
+    }
+    fn intercept(event: *const app_mod.KeystrokeEvent, window: *Window, app: *App) void {
+        if (n_intercepted < intercepted.len) intercepted[n_intercepted] = event.input_preference;
+        n_intercepted += 1;
+        if (target) |view| {
+            // The preference must agree with what the input says at this moment.
+            if ((event.input_preference == .character_input) != view.read(app).accepts) mismatched = true;
+            view.as_mut(app).accepts = !view.read(app).accepts;
+        }
+        if (stop) window.stop_propagation();
+    }
+    fn observe(event: *const app_mod.KeystrokeEvent, _: *Window, _: *App) void {
+        if (n_observed < observed.len) observed[n_observed] = event.input_preference;
+        n_observed += 1;
+    }
+};
+
+/// Sends an AltGr-style key down (ctrl-alt-a that types "ą") and returns whether it propagated.
+fn dispatch_altgr(cx: *TestAppContext, vcx: *VisualTestContext, prefer_character_input: bool) bool {
+    _ = vcx.window.dispatch_event(.{ .key_down = .{
+        .keystroke = .{ .key = "a", .key_char = "ą", .modifiers = .{ .control = true, .alt = true } },
+        .prefer_character_input = prefer_character_input,
+    } }, cx.app);
+    return vcx.window.propagate_event;
+}
+
+fn altgr_setup(cx: *TestAppContext) struct { view: app_mod.Entity(ImeField), vcx: *VisualTestContext } {
+    AltGrProbe.reset();
+    cx.app.bind_keys(&.{KeyBinding.new("ctrl-alt-a", AltGrTestAction{}, null)});
+    cx.app.on_action(AltGrTestAction, AltGrProbe.on_action);
+    _ = cx.app.observe_keystrokes(AltGrProbe.observe);
+    _ = cx.app.intercept_keystrokes(AltGrProbe.intercept);
+    const view, const vcx = cx.add_window_view(ImeField.build);
+    vcx.focus(view.read(cx.app).focus);
+    vcx.run_until_parked();
+    return .{ .view = view, .vcx = vcx };
+}
+
+test "input preference: a key that prefers text skips bindings only while the input accepts text" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const setup = altgr_setup(&cx);
+    const cases = [_]struct { prefer: bool, accepts: bool, want: app_mod.InputPreference }{
+        .{ .prefer = true, .accepts = true, .want = .character_input },
+        .{ .prefer = false, .accepts = true, .want = .key_bindings },
+        .{ .prefer = true, .accepts = false, .want = .key_bindings },
+        .{ .prefer = false, .accepts = false, .want = .key_bindings },
+    };
+    for (cases) |c| {
+        setup.view.as_mut(cx.app).accepts = c.accepts;
+        AltGrProbe.actions = 0;
+        AltGrProbe.n_intercepted = 0;
+        AltGrProbe.n_observed = 0;
+        const propagated = dispatch_altgr(&cx, setup.vcx, c.prefer);
+        // Text input takes the key, so it propagates. The global action listener below does not stop
+        // propagation the way an element listener does, so only the text case checks it.
+        if (c.want == .character_input) try std.testing.expect(propagated);
+        try std.testing.expectEqual(@as(usize, 1), AltGrProbe.n_intercepted);
+        try std.testing.expectEqual(c.want, AltGrProbe.intercepted[0]);
+        try std.testing.expectEqual(@as(usize, 1), AltGrProbe.n_observed);
+        try std.testing.expectEqual(c.want, AltGrProbe.observed[0]);
+        try std.testing.expectEqual(@as(usize, if (c.want == .key_bindings) 1 else 0), AltGrProbe.actions);
+    }
+}
+
+test "input preference: it is checked again after interceptors, which may change what the input accepts" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const setup = altgr_setup(&cx);
+    AltGrProbe.target = setup.view;
+    const cases = [_]struct { initially: bool, want: app_mod.InputPreference }{
+        .{ .initially = true, .want = .key_bindings },
+        .{ .initially = false, .want = .character_input },
+    };
+    for (cases) |c| {
+        setup.view.as_mut(cx.app).accepts = c.initially;
+        AltGrProbe.actions = 0;
+        AltGrProbe.n_observed = 0;
+        const propagated = dispatch_altgr(&cx, setup.vcx, true);
+        if (!c.initially) try std.testing.expect(propagated);
+        try std.testing.expectEqual(@as(usize, 1), AltGrProbe.n_observed);
+        try std.testing.expectEqual(c.want, AltGrProbe.observed[0]);
+        try std.testing.expectEqual(@as(usize, if (c.initially) 1 else 0), AltGrProbe.actions);
+    }
+    try std.testing.expect(!AltGrProbe.mismatched);
+}
+
+test "input preference: an interceptor can consume a key that prefers character input" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const setup = altgr_setup(&cx);
+    AltGrProbe.stop = true;
+    const propagated = dispatch_altgr(&cx, setup.vcx, true);
+    try std.testing.expectEqual(@as(usize, 1), AltGrProbe.n_intercepted);
+    try std.testing.expectEqual(app_mod.InputPreference.character_input, AltGrProbe.intercepted[0]);
+    try std.testing.expect(!propagated);
+    try std.testing.expectEqual(@as(usize, 0), AltGrProbe.actions);
+}
+
+test "window background: set at creation, then changed, and read back" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Plain = struct {
+        pub fn render(_: *@This(), _: *Window, _: *app_mod.Context(@This())) *div_mod.Div {
+            return div();
+        }
+    };
+    const handle = cx.app.open_window(.{ .window_background = .transparent }, struct {
+        fn build(_: *Window, app: *App) Entity(Plain) {
+            return app.new(Plain{});
+        }
+    }.build) catch unreachable;
+    const window = handle.window(cx.app) orelse unreachable;
+    try std.testing.expectEqual(window_mod.WindowBackgroundAppearance.transparent, window.background_appearance());
+    window.set_background_appearance(.blurred);
+    try std.testing.expectEqual(window_mod.WindowBackgroundAppearance.blurred, window.background_appearance());
+    window.set_background_appearance(.@"opaque");
+    try std.testing.expectEqual(window_mod.WindowBackgroundAppearance.@"opaque", window.background_appearance());
+    window.set_client_corner_radii(.{ .top_left = 8, .top_right = 8, .bottom_left = 8, .bottom_right = 8 });
 }

@@ -8,16 +8,14 @@ const style_mod = @import("../style.zig");
 const scene = @import("../scene.zig");
 const window_mod = @import("../window.zig");
 const app_mod = @import("../app.zig");
-const atlas = @import("../atlas.zig");
 const assets = @import("../assets.zig");
-const svg_renderer = @import("../svg_renderer.zig");
+const asset_cache = @import("../asset_cache.zig");
 const div = @import("div.zig");
 
 const Window = window_mod.Window;
 const App = app_mod.App;
 const Style = style_mod.Style;
 const Pixels = geometry.Pixels;
-const DevicePixels = geometry.DevicePixels;
 const Size = geometry.Size;
 const Point = geometry.Point;
 const Bounds = geometry.Bounds;
@@ -47,9 +45,9 @@ pub const Transformation = struct {
         return .{ .translation = t };
     }
 
-    /// Rotates by `radians` around the element center.
-    pub fn rotate(radians: f32) Transformation {
-        return .{ .rotation = radians };
+    /// Rotates around the element center by radians, or by a `Percentage` of a full turn.
+    pub fn rotate(angle: anytype) Transformation {
+        return .{ .rotation = geometry.to_radians(angle) };
     }
 
     pub fn with_scaling(self: Transformation, s: Size(f32)) Transformation {
@@ -64,9 +62,9 @@ pub const Transformation = struct {
         return t;
     }
 
-    pub fn with_rotation(self: Transformation, radians: f32) Transformation {
+    pub fn with_rotation(self: Transformation, angle: anytype) Transformation {
         var t = self;
-        t.rotation = radians;
+        t.rotation = geometry.to_radians(angle);
         return t;
     }
 
@@ -88,8 +86,6 @@ pub const SvgExt = struct {
     path_: ?[]const u8 = null,
     external_path_: ?[]const u8 = null,
     data_: ?[]const u8 = null,
-    /// Hash of `data_`, the atlas key component for inline data.
-    data_key: u64 = 0,
     transformation_: ?Transformation = null,
 
     /// Sets the embedded asset path, read through the app's `AssetSource` (GPUI `path`).
@@ -107,7 +103,6 @@ pub const SvgExt = struct {
     /// Sets inline SVG bytes, which must outlive the frame (GPUI `data`).
     pub fn data(self: anytype, bytes: []const u8) @TypeOf(self) {
         self.ext.data_ = bytes;
-        self.ext.data_key = std.hash.Wyhash.hash(0x73766764, bytes);
         return self;
     }
 
@@ -124,83 +119,45 @@ pub const SvgExt = struct {
         const sf = window.scale_factor();
         const transformation = if (e.transformation_) |t| t.into_matrix(bounds.center(), sf) else scene.TransformationMatrix.unit();
 
-        const source: SvgSource = if (e.data_) |bytes|
-            .{ .data = .{ .bytes = bytes, .key = e.data_key } }
-        else if (e.external_path_) |p|
-            .{ .external = p }
-        else if (e.path_) |p|
-            .{ .asset = p }
-        else
-            return;
-
-        // Rasterize at twice the device size, then draw at half size: smoother edges (GPUI SMOOTH_SVG_SCALE_FACTOR).
-        const smooth = svg_renderer.SMOOTH_SVG_SCALE_FACTOR;
-        const device_size: Size(DevicePixels) = .{
-            .width = @intFromFloat(@ceil(bounds.size.width * sf * smooth)),
-            .height = @intFromFloat(@ceil(bounds.size.height * sf * smooth)),
-        };
-        if (device_size.width <= 0 or device_size.height <= 0) return;
-
-        var ctx: SvgTile = .{ .cache = &cx.asset_cache, .source = cx.asset_source, .src = source, .size = device_size };
-        const key = atlas.AtlasKey{ .svg = svg_key(source, device_size) };
-        const tile = (window.sprite_atlas.get_or_insert_with(key, .{ .context = &ctx, .build_fn = SvgTile.build }) catch return) orelse return;
-
-        // Draw at half the tile size, centered on the bounds. The origin is rounded in device pixels (GPUI).
-        const draw_w = @as(f32, @floatFromInt(tile.bounds.size.width)) / smooth;
-        const draw_h = @as(f32, @floatFromInt(tile.bounds.size.height)) / smooth;
-        const center = bounds.center();
-        const ox = @round(center.x * sf - draw_w / 2.0);
-        const oy = @round(center.y * sf - draw_h / 2.0);
-        const svg_bounds: Bounds(Pixels) = .{
-            .origin = .{ .x = ox / sf, .y = oy / sf },
-            .size = .{ .width = draw_w / sf, .height = draw_h / sf },
-        };
-        window.paint_monochrome_tile(svg_bounds, tile, color, transformation);
+        if (e.data_) |bytes| {
+            window.paint_svg(bounds, e.path_ orelse "", bytes, transformation, color, cx) catch |err| {
+                std.log.err("svg: paint_svg failed: {s}", .{@errorName(err)});
+            };
+        } else if (e.external_path_) |p| {
+            // Nothing is painted until the file has loaded (GPUI loads it with `use_asset`).
+            const bytes = window.use_asset(SvgFile, p, cx) orelse return;
+            if (bytes.len == 0) return;
+            window.paint_svg(bounds, p, bytes, transformation, color, cx) catch |err| {
+                std.log.err("svg: paint_svg failed: {s}", .{@errorName(err)});
+            };
+        } else if (e.path_) |p| {
+            window.paint_svg(bounds, p, null, transformation, color, cx) catch |err| {
+                std.log.err("svg: paint_svg failed: {s}", .{@errorName(err)});
+            };
+        }
     }
 };
 
-/// Where an SVG's bytes come from.
-const SvgSource = union(enum) {
-    data: struct { bytes: []const u8, key: u64 },
-    external: []const u8,
-    asset: []const u8,
-};
+/// The bytes of an SVG file on disk, loaded once per path (GPUI `SvgAsset`). An empty result means
+/// the file could not be read.
+pub const SvgFile = struct {
+    pub const Source = []const u8;
+    pub const Output = []const u8;
 
-/// Key for the rasterized mask: source identity plus the device size.
-fn svg_key(source: SvgSource, size: Size(DevicePixels)) u64 {
-    const id: u64 = switch (source) {
-        .data => |d| d.key,
-        .external => |p| std.hash.Wyhash.hash(0x65787400, p),
-        .asset => |p| std.hash.Wyhash.hash(0x61737400, p),
-    };
-    const dims = [_]u64{ @intCast(size.width), @intCast(size.height) };
-    return std.hash.Wyhash.hash(id, std.mem.sliceAsBytes(&dims));
-}
+    pub fn clone_source(source: Source, allocator: std.mem.Allocator) error{OutOfMemory}!Source {
+        return allocator.dupe(u8, source);
+    }
 
-/// Atlas builder: loads the SVG source and rasterizes it to an alpha mask.
-const SvgTile = struct {
-    cache: *assets.AssetCache,
-    source: assets.AssetSource,
-    src: SvgSource,
-    size: Size(DevicePixels),
+    pub fn free_source(source: Source, allocator: std.mem.Allocator) void {
+        allocator.free(source);
+    }
 
-    fn build(raw: *anyopaque) anyerror!?atlas.TileData {
-        const self: *SvgTile = @ptrCast(@alignCast(raw));
-        // The mask is copied into the atlas right away, so frame-arena memory is enough.
-        const arena = window_mod.frame_arena();
-        const bytes: []const u8 = switch (self.src) {
-            .data => |d| d.bytes,
-            .external => |p| assets.read_file(arena, p) catch return null,
-            .asset => |p| self.source.load(p) orelse return null,
-        };
-        const renderer = try self.cache.svg_renderer();
-        const parsed = renderer.parse_svg(arena, bytes) catch return null;
-        defer parsed.deinit();
-        const mask = renderer.render_alpha_mask(arena, parsed, .{ .size = self.size }) catch return null;
-        return .{
-            .size = .{ .width = @intCast(mask.width), .height = @intCast(mask.height) },
-            .bytes = mask.pixels,
-        };
+    pub fn load(source: Source, cx: *asset_cache.LoadContext) Output {
+        return assets.read_file(cx.allocator, source) catch @as(Output, &.{});
+    }
+
+    pub fn dispose(out: Output, app: *App) void {
+        if (out.len > 0) app.allocator.free(out);
     }
 };
 
@@ -211,12 +168,10 @@ test "transformation without rotation or scale only moves the origin" {
     try std.testing.expectApproxEqAbs(@as(f32, 10), p.y, 1e-4);
 }
 
-test "svg key depends on source and size" {
-    const a = svg_key(.{ .asset = "a.svg" }, .{ .width = 16, .height = 16 });
-    const b = svg_key(.{ .asset = "a.svg" }, .{ .width = 32, .height = 16 });
-    const c = svg_key(.{ .asset = "b.svg" }, .{ .width = 16, .height = 16 });
-    try std.testing.expect(a != b);
-    try std.testing.expect(a != c);
+test "rotate takes radians or a percentage of a turn" {
+    const geometry_mod = @import("../geometry.zig");
+    try std.testing.expectApproxEqAbs(std.math.pi / 2.0, Transformation.rotate(geometry_mod.percentage(0.25)).rotation, 1e-6);
+    try std.testing.expectEqual(@as(f32, 0.5), Transformation.rotate(@as(f32, 0.5)).rotation);
 }
 
 test "element protocol instantiates the svg hooks" {

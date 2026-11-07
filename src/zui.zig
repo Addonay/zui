@@ -38,11 +38,25 @@ pub const interactive = @import("interactive.zig");
 pub const keystroke = @import("keystroke.zig");
 pub const keymap = @import("keymap.zig");
 pub const key_dispatch = @import("key_dispatch.zig");
+pub const input = @import("input.zig");
+/// Grapheme segmentation and friends, which GPUI code gets from the unicode_segmentation crate.
+pub const unicode = @import("cozmic").unicode;
+pub const ElementInputHandler = input.ElementInputHandler;
+pub const TooltipBuilder = elements.div.TooltipBuilder;
+pub const AnyDrag = app.AnyDrag;
+pub const AnyDragValue = app.AnyDragValue;
+pub const assert_entity_input_handler = input.assert_entity_input_handler;
 pub const action = @import("action.zig");
 pub const executor = @import("executor.zig");
 pub const platform = @import("platform.zig");
 pub const renderer = struct {
     pub const cpu = @import("renderer/cpu.zig");
+    pub const gpu = @import("renderer/gpu.zig");
+    pub const vulkan = @import("renderer/vulkan.zig");
+    pub const window_renderer = @import("renderer/window_renderer.zig");
+    test {
+        _ = @import("renderer/gpu_test.zig");
+    }
 };
 pub const elements = struct {
     pub const div = @import("elements/div.zig");
@@ -52,6 +66,7 @@ pub const elements = struct {
     pub const deferred = @import("elements/deferred.zig");
     pub const canvas = @import("elements/canvas.zig");
     pub const animation = @import("elements/animation.zig");
+    pub const container_query = @import("elements/container_query.zig");
     pub const img = @import("elements/img.zig");
     pub const svg = @import("elements/svg.zig");
     pub const uniform_list = @import("elements/uniform_list.zig");
@@ -76,10 +91,13 @@ pub const Edges = geometry.Edges;
 pub const Corners = geometry.Corners;
 pub const Corner = geometry.Corner;
 pub const Axis = geometry.Axis;
+pub const Anchor = geometry.Anchor;
 pub const px = geometry.px;
 pub const half = geometry.half;
 pub const rems = geometry.rems;
 pub const relative = geometry.relative;
+pub const percentage = geometry.percentage;
+pub const Percentage = geometry.Percentage;
 pub const phi = geometry.phi;
 pub const auto = geometry.auto;
 pub const point = geometry.point;
@@ -143,6 +161,7 @@ pub const Application = app.Application;
 pub const App = app.App;
 pub const AsyncApp = app.AsyncApp;
 pub const TestAppContext = test_context.TestAppContext;
+pub const TestScheduler = @import("test_scheduler.zig").TestScheduler;
 pub const VisualTestContext = test_context.VisualTestContext;
 pub const Context = app.Context;
 pub const Entity = app.Entity;
@@ -161,10 +180,21 @@ pub const WindowOptions = window.WindowOptions;
 pub const WindowBounds = window.WindowBounds;
 pub const WindowHandle = window.WindowHandle;
 pub const WindowKind = window.WindowKind;
+pub const WindowBackgroundAppearance = window.WindowBackgroundAppearance;
 pub const TitlebarOptions = window.TitlebarOptions;
+pub const WindowDecorations = window.WindowDecorations;
+pub const WindowId = window.WindowId;
+pub const WindowIdValue = window.WindowIdValue;
+pub const AnyWindowHandle = window.AnyWindowHandle;
+pub const Decorations = window.Decorations;
+pub const Tiling = window.Tiling;
+pub const ResizeEdge = window.ResizeEdge;
 pub const FocusHandle = window.FocusHandle;
 pub const Hitbox = window.Hitbox;
 pub const HitboxBehavior = window.HitboxBehavior;
+pub const PendingInputStatus = window.PendingInputStatus;
+pub const PendingInputTimeoutStatus = window.PendingInputTimeoutStatus;
+pub const ScaledRange = window.ScaledRange;
 pub const ContentMask = window.ContentMask;
 pub const DispatchPhase = window.DispatchPhase;
 pub const PaintQuad = window.PaintQuad;
@@ -172,6 +202,14 @@ pub const quad = window.quad;
 pub const fill = window.fill;
 pub const outline = window.outline;
 pub const format = window.format;
+pub const PromptLevel = window.PromptLevel;
+pub const PromptButton = window.PromptButton;
+pub const PromptResponse = window.PromptResponse;
+pub const PromptHandle = window.PromptHandle;
+pub const RenderablePromptHandle = window.RenderablePromptHandle;
+pub const PromptBuilder = window.PromptBuilder;
+pub const FallbackPromptRenderer = window.FallbackPromptRenderer;
+pub const fallback_prompt_renderer = window.fallback_prompt_renderer;
 pub const AnyView = view.AnyView;
 
 // -- elements ---------------------------------------------------------------
@@ -207,6 +245,17 @@ pub const RenderImage = assets.RenderImage;
 pub const AssetSource = assets.AssetSource;
 pub const Resource = assets.Resource;
 pub const ImageCacheError = assets.ImageCacheError;
+/// Background asset loads (GPUI `asset_cache`): `LoadContext`, `CachedLoad`, and `hash`.
+pub const asset_cache = @import("asset_cache.zig");
+pub const LoadContext = asset_cache.LoadContext;
+pub const hash = asset_cache.hash;
+/// Image caches (GPUI `elements/image_cache`).
+pub const image_cache_mod = @import("image_cache.zig");
+pub const image_cache = image_cache_mod.image_cache;
+pub const AnyImageCache = image_cache_mod.AnyImageCache;
+pub const ImageCacheProvider = image_cache_mod.ImageCacheProvider;
+pub const ImageCacheItem = image_cache_mod.ImageCacheItem;
+pub const RetainAllImageCache = image_cache_mod.RetainAllImageCache;
 pub const SvgRenderer = svg_renderer.SvgRenderer;
 
 // -- anchored / deferred / canvas -------------------------------------------
@@ -219,6 +268,8 @@ pub const deferred = elements.deferred.deferred;
 pub const Canvas = elements.canvas.Canvas;
 pub const canvas = elements.canvas.canvas;
 pub const canvas_fn = elements.canvas.canvas_fn;
+pub const ContainerQuery = elements.container_query.ContainerQuery;
+pub const container_query = elements.container_query.container_query;
 
 // -- uniform_list / list ----------------------------------------------------
 pub const uniform_list = elements.uniform_list.uniform_list;
@@ -279,9 +330,51 @@ pub const KeyUpEvent = interactive.KeyUpEvent;
 pub const ModifiersChangedEvent = interactive.ModifiersChangedEvent;
 pub const PlatformInput = interactive.PlatformInput;
 pub const KeyBinding = keymap.KeyBinding;
+pub const KeystrokeEvent = app.KeystrokeEvent;
+pub const InputPreference = app.InputPreference;
+pub const http_client = @import("http_client.zig");
+pub const image_disk_cache = @import("image_disk_cache.zig");
+pub const HttpClient = http_client.HttpClient;
 pub const KeyContext = key_dispatch.KeyContext;
 pub const Action = action.Action;
 pub const ClipboardItem = platform.ClipboardItem;
+pub const NoAction = action.NoAction;
+pub const ActionWith = action.ActionWith;
+pub const ActionOptions = action.ActionOptions;
+pub const action_json_schema = action.action_json_schema;
+pub const ActionRegistry = action.ActionRegistry;
+pub const Unbind = action.Unbind;
+pub const is_unbind = action.is_unbind;
+pub const PressureStage = interactive.PressureStage;
+pub const MousePressureEvent = interactive.MousePressureEvent;
+pub const app_menu = platform.app_menu;
+pub const Menu = app_menu.Menu;
+pub const MenuItem = app_menu.MenuItem;
+pub const OwnedMenu = app_menu.OwnedMenu;
+pub const OwnedMenuItem = app_menu.OwnedMenuItem;
+pub const OsMenu = app_menu.OsMenu;
+pub const OsAction = app_menu.OsAction;
+pub const SystemMenuType = app_menu.SystemMenuType;
+pub const SystemNotification = platform.SystemNotification;
+pub const PowerMode = platform.PowerMode;
+pub const SystemNotificationAction = platform.SystemNotificationAction;
+pub const SystemNotificationResponse = platform.SystemNotificationResponse;
+pub const WindowVisibility = platform.WindowVisibility;
+pub const DisplayId = platform.DisplayId;
+pub const DisplayEvent = platform.DisplayEvent;
+pub const DisplayChanges = platform.DisplayChanges;
+pub const ActivationPolicy = platform.ActivationPolicy;
+pub const CursorHideMode = app.CursorHideMode;
+pub const PlatformInfo = platform.PlatformInfo;
+pub const OperatingSystem = platform.OperatingSystem;
+pub const PlatformTarget = platform.PlatformTarget;
+pub const GraphicalEnvironment = platform.GraphicalEnvironment;
+pub const WindowingModes = platform.WindowingModes;
+pub const WindowingRequest = platform.WindowingRequest;
+pub const linux_platform = platform.linux_platform;
+pub const KeyboardLayout = platform.KeyboardLayout;
+pub const KeyboardMapper = platform.KeyboardMapper;
+pub const GpuSpecs = platform.GpuSpecs;
 
 /// Common imports (GPUI `prelude`).
 pub const prelude = struct {
@@ -298,10 +391,34 @@ pub const prelude = struct {
 };
 
 test {
+    _ = @import("view_cache_test.zig");
+    // Backends are chosen at run time, so nothing else pulls their tests in.
+    if (@import("builtin").os.tag == .linux) {
+        _ = @import("platform/linux/xkb.zig");
+        _ = @import("platform/linux/text_input_state.zig");
+        _ = @import("platform/linux/xim_preedit.zig");
+        _ = @import("platform/linux/x11_scroll.zig");
+        _ = @import("platform/linux/wayland_scroll.zig");
+        _ = @import("platform/linux/xdnd.zig");
+        _ = @import("platform/linux/dbus.zig");
+        _ = @import("platform/linux/system_notifications.zig");
+        _ = @import("platform/linux/power.zig");
+        _ = @import("platform/linux/portal.zig");
+        _ = @import("platform/linux/launch.zig");
+        _ = @import("platform/linux/input.zig");
+        _ = @import("platform/linux/x11.zig");
+        _ = @import("platform/linux/wayland.zig");
+        _ = @import("platform/linux/wayland_proto.zig");
+        _ = @import("platform/linux/x11_proto.zig");
+        _ = @import("platform/linux.zig");
+    }
     std.testing.refAllDecls(@This());
     _ = @import("spring.zig");
     _ = @import("elements/anchored.zig");
     _ = @import("elements/deferred.zig");
     _ = @import("elements/canvas.zig");
+    _ = @import("platform/app_menu.zig");
+    _ = @import("platform/popup.zig");
+    _ = @import("platform/window_controls.zig");
     _ = @import("elements/animation.zig");
 }

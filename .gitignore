@@ -29,3 +29,6 @@
 /.zig-global/
 /.zig-cache-layout/
 /.opencode/
+vgcore.*
+core.*
+callgrind.out.*

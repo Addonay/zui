@@ -180,7 +180,23 @@ pub const SvgRenderer = struct {
     pub fn render_single_frame(self: *SvgRenderer, allocator: std.mem.Allocator, bytes: []const u8, scale_factor: f32) RenderError!*assets.RenderImage {
         const svg = try self.parse_svg(allocator, bytes);
         defer svg.deinit();
-        const rgba = try self.render_pixmap(allocator, svg, .{ .scale_factor = scale_factor * SMOOTH_SVG_SCALE_FACTOR });
+        return self.render_parsed(allocator, svg, .{ .scale_factor = scale_factor });
+    }
+
+    /// Rasterizes an already parsed document into an image at `size` (GPUI `render_parsed`). A scale
+    /// factor is rasterized at `SMOOTH_SVG_SCALE_FACTOR` times its size, and the image records that
+    /// in `scale_factor`, as GPUI does.
+    pub fn render_parsed(self: *SvgRenderer, allocator: std.mem.Allocator, svg: ParsedSvg, size: SvgSize) RenderError!*assets.RenderImage {
+        var rendered_size = size;
+        var image_scale: f32 = 1;
+        switch (size) {
+            .scale_factor => |f| {
+                rendered_size = .{ .scale_factor = f * SMOOTH_SVG_SCALE_FACTOR };
+                image_scale = SMOOTH_SVG_SCALE_FACTOR;
+            },
+            else => {},
+        }
+        const rgba = try self.render_pixmap(allocator, svg, rendered_size);
         const frames = allocator.alloc(assets.Frame, 1) catch {
             allocator.free(rgba.pixels);
             return error.OutOfMemory;
@@ -191,7 +207,7 @@ pub const SvgRenderer = struct {
             allocator.free(frames);
             return error.OutOfMemory;
         };
-        image.scale_factor = SMOOTH_SVG_SCALE_FACTOR;
+        image.scale_factor = image_scale;
         return image;
     }
 };

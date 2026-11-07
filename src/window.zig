@@ -2,6 +2,7 @@
 //! element state, painting primitives and event dispatch.
 
 const std = @import("std");
+const taffy_mod = @import("taffy.zig");
 const geometry = @import("geometry.zig");
 const color_mod = @import("color.zig");
 const style_mod = @import("style.zig");
@@ -9,6 +10,7 @@ const scene_mod = @import("scene.zig");
 const taffy = @import("taffy.zig");
 const element_mod = @import("element.zig");
 const app_mod = @import("app.zig");
+const keymap_mod = @import("keymap.zig");
 const platform_mod = @import("platform.zig");
 const interactive = @import("interactive.zig");
 const keystroke_mod = @import("keystroke.zig");
@@ -18,11 +20,18 @@ const text_system_mod = @import("text_system.zig");
 const atlas_mod = @import("atlas.zig");
 const view_mod = @import("view.zig");
 const refineable = @import("refineable.zig");
+const prompts = @import("window/prompts.zig");
+const focus_events = @import("window/focus_events.zig");
+const assets_mod = @import("assets.zig");
+const image_cache_mod = @import("image_cache.zig");
+const svg_renderer_mod = @import("svg_renderer.zig");
+const executor_mod = @import("executor.zig");
 
 const App = app_mod.App;
 const EntityId = app_mod.EntityId;
 const Pixels = geometry.Pixels;
 const ScaledPixels = geometry.ScaledPixels;
+const DevicePixels = geometry.DevicePixels;
 const Point = geometry.Point;
 const Size = geometry.Size;
 const Bounds = geometry.Bounds;
@@ -44,8 +53,22 @@ pub const ContentMask = scene_mod.ContentMask;
 pub const DispatchPhase = key_dispatch.DispatchPhase;
 pub const KeyContext = key_dispatch.KeyContext;
 pub const AnyView = view_mod.AnyView;
+pub const PromptLevel = prompts.PromptLevel;
+pub const PromptButton = prompts.PromptButton;
+pub const PromptResponse = prompts.PromptResponse;
+pub const PromptHandle = prompts.PromptHandle;
+pub const RenderablePromptHandle = prompts.RenderablePromptHandle;
+pub const PromptBuilder = prompts.PromptBuilder;
+pub const FallbackPromptRenderer = prompts.FallbackPromptRenderer;
+pub const fallback_prompt_renderer = prompts.fallback_prompt_renderer;
 
 pub const WindowId = u32;
+
+/// A span of device-space x positions, for `Window.paint_underline_with_exclusions` (GPUI `Range<ScaledPixels>`).
+pub const ScaledRange = struct {
+    start: ScaledPixels,
+    end: ScaledPixels,
+};
 
 // ---------------------------------------------------------------------------
 // Frame arena (GPUI's ELEMENT_ARENA).
@@ -54,6 +77,14 @@ threadlocal var current_frame_arena: ?*std.heap.ArenaAllocator = null;
 var fallback_arena_storage: ?std.heap.ArenaAllocator = null;
 
 /// The allocator for transient per-frame data (elements, listeners, strings).
+/// Sends `frame_arena` to `arena`, returning the one to restore. A cached view's elements and
+/// listeners must outlive the frame, so it renders into an arena of its own.
+pub fn swap_frame_arena(arena: ?*std.heap.ArenaAllocator) ?*std.heap.ArenaAllocator {
+    const previous = current_frame_arena;
+    current_frame_arena = arena;
+    return previous;
+}
+
 pub fn frame_arena() std.mem.Allocator {
     if (current_frame_arena) |a| return a.allocator();
     if (fallback_arena_storage == null) fallback_arena_storage = .init(std.heap.page_allocator);
@@ -80,7 +111,17 @@ pub const WindowBounds = union(enum) {
     }
 };
 
-pub const WindowKind = enum { normal, popup, floating, dialog };
+/// What kind of OS window to open (GPUI `WindowKind`).
+pub const WindowKind = union(enum) {
+    normal,
+    /// A window above all others, for alerts. Use sparingly.
+    popup,
+    /// A parent-anchored popup for menus and dropdowns (GPUI `AnchoredPopup`). Platforms without
+    /// a native implementation reject it with `error.PopupNotSupported`.
+    anchored_popup: platform_mod.PopupOptions,
+    floating,
+    dialog,
+};
 pub const WindowBackgroundAppearance = enum { @"opaque", transparent, blurred };
 pub const WindowDecorations = enum { server, client };
 
@@ -99,12 +140,25 @@ pub const WindowOptions = struct {
     is_movable: bool = true,
     is_resizable: bool = true,
     is_minimizable: bool = true,
+    /// Whether the app draws the titlebar and handles its drags itself. Like GPUI, the Linux
+    /// platforms accept it without acting on it: the window manager keeps its own titlebar.
+    app_owns_titlebar_drag: bool = false,
     display_id: ?u32 = null,
     window_background: WindowBackgroundAppearance = .@"opaque",
     app_id: ?[]const u8 = null,
     window_min_size: ?Size(Pixels) = null,
+    /// `null` means server-side decorations, unless `titlebar` is null (then the platform
+    /// draws none and the app is expected to draw its own).
     window_decorations: ?WindowDecorations = null,
 };
+
+pub const Tiling = platform_mod.Tiling;
+pub const Decorations = platform_mod.Decorations;
+pub const ResizeEdge = platform_mod.ResizeEdge;
+
+fn ReturnTypeOf(comptime build: anytype) type {
+    return @typeInfo(@TypeOf(build)).@"fn".return_type.?;
+}
 
 /// The root view type returned by an `open_window` builder.
 pub fn RootViewType(comptime build: anytype) type {
@@ -140,6 +194,34 @@ pub fn WindowHandle(comptime V: type) type {
         }
     };
 }
+
+/// The numeric id of a window (GPUI `WindowId`, which has `as_u64`).
+pub const WindowIdValue = struct {
+    raw: WindowId,
+
+    pub fn as_u64(self: WindowIdValue) u64 {
+        return self.raw;
+    }
+};
+
+/// A handle to a window whose root view type is not part of the handle (GPUI `AnyWindowHandle`).
+pub const AnyWindowHandle = struct {
+    id: WindowId,
+
+    pub fn window_id(self: AnyWindowHandle) WindowIdValue {
+        return .{ .raw = self.id };
+    }
+
+    /// Runs `f(window, cx, args...)` in the window, or fails with `error.WindowClosed`. Unlike
+    /// GPUI's closure, `f` gets no root view: that type is not known through this handle.
+    pub fn update(self: AnyWindowHandle, cx: anytype, comptime f: anytype, args: anytype) !@typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        const app = app_mod.app_of(cx);
+        const win = app.window_by_id(self.id) orelse return error.WindowClosed;
+        const result = @call(.auto, f, .{ win, app } ++ args);
+        app.flush_effects();
+        return result;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Focus.
@@ -190,11 +272,59 @@ pub const FocusHandle = struct {
     pub fn eql(a: FocusHandle, b: FocusHandle) bool {
         return a.id == b.id;
     }
+    /// GPUI `downgrade`.
+    pub fn downgrade(self: FocusHandle) WeakFocusHandle {
+        return .{ .id = self.id };
+    }
 };
+
+/// A focus handle that does not keep its element alive (GPUI `WeakFocusHandle`). Without
+/// reference counts it is only valid while the element is in the last rendered frame.
+pub const WeakFocusHandle = struct {
+    id: FocusId,
+
+    /// The focus handle, if the element is still in the last rendered frame (GPUI `upgrade`).
+    pub fn upgrade(self: WeakFocusHandle, window: *const Window) ?FocusHandle {
+        if (!window.rendered_frame.dispatch_tree.focusable.contains(self.id)) return null;
+        return .{ .id = self.id };
+    }
+    pub fn eql(a: WeakFocusHandle, b: WeakFocusHandle) bool {
+        return a.id == b.id;
+    }
+};
+
+/// Sent when a view wants its container to close (GPUI `DismissEvent`).
+pub const DismissEvent = struct {};
+
+/// Sent when a focus leaves an element (GPUI `FocusOutEvent`); defined with the focus listeners.
+pub const FocusOutEvent = focus_events.FocusOutEvent;
 
 /// Types that can be focused (GPUI `Focusable`): `fn focus_handle(self, cx) FocusHandle`.
 pub fn is_focusable(comptime T: type) bool {
-    return @hasDecl(T, "focus_handle");
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, "focus_handle"),
+        else => false,
+    };
+}
+
+/// Compile error unless `T` is `Focusable` (GPUI's `Focusable` bound, as in `window.focus_view`).
+pub fn assert_focusable(comptime T: type) void {
+    if (comptime !is_focusable(T)) @compileError(@typeName(T) ++ " must implement focus_handle to be Focusable");
+}
+
+/// Views a window can host as a popover, modal or menu (GPUI `ManagedView`): focusable, rendered,
+/// and able to emit `DismissEvent`. Zig cannot check the emitter at compile time, so it is only
+/// checked by `assert_managed_view`'s `render` and `focus_handle` declarations.
+pub fn is_managed_view(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, "focus_handle") and @hasDecl(T, "render"),
+        else => false,
+    };
+}
+
+/// Compile error unless `T` is a `ManagedView`.
+pub fn assert_managed_view(comptime T: type) void {
+    if (comptime !is_managed_view(T)) @compileError(@typeName(T) ++ " must implement focus_handle and render to be a ManagedView");
 }
 
 // ---------------------------------------------------------------------------
@@ -211,9 +341,30 @@ pub const Hitbox = struct {
     content_mask: ContentMask(Pixels),
     behavior: HitboxBehavior = .normal,
 
-    /// True if the mouse is over this hitbox and nothing above blocks it.
+    /// True if the mouse is over this hitbox and nothing above blocks it. After keyboard input
+    /// nothing is hovered until the mouse moves (GPUI `Hitbox::is_hovered`).
     pub fn is_hovered(self: *const Hitbox, window: *const Window) bool {
         return window.hitbox_is_hovered(self.id);
+    }
+    /// Like `is_hovered`, whatever the last input was (GPUI `HitboxId::is_hovered_ignoring_last_input`).
+    pub fn is_hovered_ignoring_last_input(self: *const Hitbox, window: *const Window) bool {
+        return window.hitbox_is_hovered_ignoring_last_input(self.id);
+    }
+
+    /// Whether this hitbox would be hovered at `position`, whatever the last input was (GPUI `is_hovered_at`).
+    /// It walks the rendered frame the way `Window.hit_test` does, and stops at the first hitbox that
+    /// blocks the mouse, so only hitboxes that stack above it count.
+    pub fn is_hovered_at(self: *const Hitbox, position: Point(Pixels), window: *const Window) bool {
+        const boxes = window.rendered_frame.hitboxes.items;
+        var i = boxes.len;
+        while (i > 0) {
+            i -= 1;
+            const h = boxes[i];
+            if (!h.bounds.contains(position) or !h.content_mask.bounds.contains(position)) continue;
+            if (h.id == self.id) return true;
+            if (h.behavior != .normal) return false;
+        }
+        return false;
     }
     /// True if a scroll event at the mouse position should go to this hitbox.
     pub fn should_handle_scroll(self: *const Hitbox, window: *const Window) bool {
@@ -230,6 +381,8 @@ const HitTest = struct {
 // Frames.
 
 const MouseListener = struct {
+    /// The view that registered it, current again while it runs.
+    view: ?EntityId,
     event_type: app_mod.TypeId,
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, event: *const anyopaque, phase: DispatchPhase, window: *Window, cx: *App) void,
@@ -239,15 +392,49 @@ const CursorStyleRequest = struct { hitbox_id: ?HitboxId, style: CursorStyle };
 
 const DeferredDraw = struct {
     priority: usize,
-    element: AnyElement,
+    /// Null when this draw comes from a reused cached view: it replays the ranges below instead.
+    element: ?AnyElement,
+    /// Where its listeners go. A cached view's deferred draws must live as long as the view's.
+    arena: ?*std.heap.ArenaAllocator,
+    view: ?EntityId,
+    prepaint_start: PrepaintStateIndex = .{},
+    prepaint_end: PrepaintStateIndex = .{},
+    paint_start: PaintIndex = .{},
+    paint_end: PaintIndex = .{},
     absolute_offset: Point(Pixels),
     text_style_stack: []const TextStyleRefinement,
     parent_node: key_dispatch.DispatchNodeId,
     element_id_hash: u64,
 };
 
+/// A position in what prepaint added to the frame (GPUI `PrepaintStateIndex`).
+pub const PrepaintStateIndex = struct {
+    hitboxes_index: usize = 0,
+    tooltips_index: usize = 0,
+    deferred_draws_index: usize = 0,
+    dispatch_tree_index: usize = 0,
+    accessed_element_states_index: usize = 0,
+    accessed_entities_index: usize = 0,
+    line_layout_index: text_system_mod.line_layout.LineLayoutIndex = .{},
+};
+
+/// A position in what paint added to the frame (GPUI `PaintIndex`).
+pub const PaintIndex = struct {
+    scene_index: usize = 0,
+    mouse_listeners_index: usize = 0,
+    input_handlers_index: usize = 0,
+    cursor_styles_index: usize = 0,
+    accessed_element_states_index: usize = 0,
+    accessed_entities_index: usize = 0,
+    line_layout_index: text_system_mod.line_layout.LineLayoutIndex = .{},
+};
+
 pub const Frame = struct {
     scene: scene_mod.Scene,
+    /// The element states this frame used, so reusing a cached view keeps its elements' states alive.
+    accessed_element_states: std.ArrayList(ElementStateKey) = .empty,
+    /// The entities this frame rendered, so reusing a cached view still redraws when they notify.
+    accessed_entities: std.ArrayList(EntityId) = .empty,
     hitboxes: std.ArrayList(Hitbox) = .empty,
     mouse_listeners: std.ArrayList(MouseListener) = .empty,
     dispatch_tree: key_dispatch.DispatchTree,
@@ -257,6 +444,7 @@ pub const Frame = struct {
     window_active: bool = false,
     arena: std.heap.ArenaAllocator,
     input_handlers: std.ArrayList(PendingInputHandler) = .empty,
+    tooltip_requests: std.ArrayList(AnyTooltip) = .empty,
 
     fn init(gpa: std.mem.Allocator) Frame {
         return .{
@@ -268,26 +456,56 @@ pub const Frame = struct {
 
     fn deinit(self: *Frame, gpa: std.mem.Allocator) void {
         self.scene.deinit();
+        self.accessed_element_states.deinit(gpa);
+        self.accessed_entities.deinit(gpa);
         self.hitboxes.deinit(gpa);
         self.mouse_listeners.deinit(gpa);
         self.dispatch_tree.deinit();
         self.cursor_styles.deinit(gpa);
         self.deferred_draws.deinit(gpa);
         self.input_handlers.deinit(gpa);
+        self.tooltip_requests.deinit(gpa);
         self.arena.deinit();
     }
 
     fn clear(self: *Frame) void {
         self.scene.clear();
+        self.accessed_element_states.clearRetainingCapacity();
+        self.accessed_entities.clearRetainingCapacity();
         self.hitboxes.clearRetainingCapacity();
         self.mouse_listeners.clearRetainingCapacity();
         self.dispatch_tree.clear();
         self.cursor_styles.clearRetainingCapacity();
         self.deferred_draws.clearRetainingCapacity();
         self.input_handlers.clearRetainingCapacity();
+        self.tooltip_requests.clearRetainingCapacity();
         self.focus = null;
         _ = self.arena.reset(.retain_capacity);
     }
+};
+
+/// A tooltip an element wants shown (GPUI `AnyTooltip`). `check_visible_and_update` runs as it is
+/// about to be placed, because an element that stopped painting has no mouse handlers
+/// left to notice the pointer moving away.
+/// Just past the pointer, flipping to the other side at the window's edge.
+pub fn tooltip_origin(mouse: Point(Pixels), tooltip_size: Size(Pixels), viewport: Size(Pixels)) Point(Pixels) {
+    var origin: Point(Pixels) = .{ .x = mouse.x + 1, .y = mouse.y + 1 };
+    if (origin.x + tooltip_size.width > viewport.width) {
+        const flipped = mouse.x - tooltip_size.width - 1;
+        origin.x = if (flipped >= 0) flipped else @max(0, viewport.width - tooltip_size.width);
+    }
+    if (origin.y + tooltip_size.height > viewport.height) {
+        const flipped = mouse.y - tooltip_size.height - 1;
+        origin.y = if (flipped >= 0) flipped else @max(0, viewport.height - tooltip_size.height);
+    }
+    return origin;
+}
+
+pub const AnyTooltip = struct {
+    view: view_mod.AnyView,
+    mouse_position: Point(Pixels),
+    ctx: *anyopaque,
+    check_visible_and_update: *const fn (ctx: *anyopaque, tooltip_bounds: Bounds(Pixels), window: *Window, cx: *App) bool,
 };
 
 const PendingInputHandler = struct {
@@ -375,6 +593,148 @@ pub fn outline(b: Bounds(Pixels), border_color: anytype, border_style: BorderSty
 // Window.
 
 /// A platform window and its UI state (GPUI `Window`).
+/// How long a partial multi-stroke binding that could also mean something now waits for its next
+/// key (GPUI `PENDING_INPUT_TIMEOUT`).
+const PENDING_INPUT_TIMEOUT_NS: u64 = std.time.ns_per_s;
+
+const PendingModifier = struct {
+    modifiers: keystroke_mod.Modifiers = .{},
+    saw_other_input: bool = false,
+};
+
+/// The timeout that flushes pending input (GPUI `PendingInputTimeout`). A running timeout has
+/// `started_at_ns` set; a paused one keeps `remaining_ns` and the owner that paused it.
+const PendingTimeout = struct {
+    duration_ns: u64,
+    remaining_ns: u64,
+    started_at_ns: ?u64 = null,
+    pause: ?PendingTimeoutPause = null,
+
+    fn status(self: PendingTimeout) PendingInputTimeoutStatus {
+        return .{
+            .duration_ns = self.duration_ns,
+            .remaining_ns = self.remaining_ns,
+            .started_at_ns = self.started_at_ns,
+            .paused = self.pause != null,
+        };
+    }
+};
+
+/// Who paused a pending-input timeout, and the subscription that resumes it when they are released.
+const PendingTimeoutPause = struct {
+    owner_id: app_mod.EntityId,
+    release: app_mod.Subscription,
+};
+
+/// The timeout state of pending input, read from `Window.pending_input` (GPUI `PendingInputTimeoutStatus`).
+pub const PendingInputTimeoutStatus = struct {
+    duration_ns: u64,
+    remaining_ns: u64,
+    started_at_ns: ?u64,
+    paused: bool,
+
+    /// The full timeout in nanoseconds (GPUI `duration`).
+    pub fn duration(self: PendingInputTimeoutStatus) u64 {
+        return self.duration_ns;
+    }
+
+    /// Nanoseconds left before the pending input is flushed (GPUI `remaining`, which takes the
+    /// clock from `cx`; ZUI's clock is global).
+    pub fn remaining(self: PendingInputTimeoutStatus) u64 {
+        const started = self.started_at_ns orelse return self.remaining_ns;
+        return self.remaining_ns -| (executor_mod.now_ns() -| started);
+    }
+
+    pub fn is_paused(self: PendingInputTimeoutStatus) bool {
+        return self.paused;
+    }
+};
+
+/// Pending input for a potential multi-stroke key binding (GPUI `PendingInputStatus`).
+pub const PendingInputStatus = struct {
+    keystroke_list: []const keystroke_mod.Keystroke,
+    timeout_status: ?PendingInputTimeoutStatus,
+
+    /// The keystrokes entered so far (GPUI `keystrokes`).
+    pub fn keystrokes(self: PendingInputStatus) []const keystroke_mod.Keystroke {
+        return self.keystroke_list;
+    }
+
+    /// The timeout state, if this input needs one to flush (GPUI `timeout`).
+    pub fn timeout(self: PendingInputStatus) ?PendingInputTimeoutStatus {
+        return self.timeout_status;
+    }
+};
+
+/// What the last input event came from. Focus-visible styles and hover depend on it (GPUI `InputModality`).
+const InputModality = enum { mouse, keyboard, touch };
+
+fn free_keystrokes(gpa: std.mem.Allocator, list: *std.ArrayList(keystroke_mod.Keystroke)) void {
+    for (list.items) |keystroke| {
+        gpa.free(keystroke.key);
+        if (keystroke.key_char) |text| gpa.free(text);
+    }
+    list.deinit(gpa);
+    list.* = .empty;
+}
+
+/// The next key did not come in time: what was typed so far happens now.
+const PendingInputTimer = struct {
+    app: *App,
+    window_id: WindowId,
+    generation: u64,
+
+    fn fire(self: PendingInputTimer) void {
+        const cx = self.app;
+        const window = cx.window_by_id(self.window_id) orelse return;
+        if (window.pending_timeout_generation != self.generation) return;
+        var input = window.pending_keystrokes;
+        window.pending_keystrokes = .empty;
+        window.drop_pending_timeout();
+        defer free_keystrokes(window.allocator, &input);
+        if (input.items.len == 0) return;
+        if (window.pending_focus != null and window.pending_focus != window.focus_id) return;
+
+        cx.pending_updates += 1;
+        defer {
+            cx.pending_updates -= 1;
+            if (cx.pending_updates == 0) cx.flush_effects();
+        }
+        const prev_arena = current_frame_arena;
+        current_frame_arena = &window.rendered_frame.arena;
+        defer current_frame_arena = prev_arena;
+
+        const tree = &window.rendered_frame.dispatch_tree;
+        const path = tree.dispatch_path(window.focus_id, window.allocator);
+        defer window.allocator.free(path);
+        var arena_state = std.heap.ArenaAllocator.init(window.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const contexts = tree.context_stack(path, arena);
+        const replays = key_dispatch.flush_dispatch(arena, &cx.keymap, input.items, contexts) catch oom();
+        cx.dispatch_pending_input_observers(window);
+        window.replay_pending_input(replays, path, cx);
+    }
+};
+
+/// Areas the platform covers with system UI, a notch or the keyboard (GPUI `WindowInsets`). No
+/// backend reports them yet; the zero default is what GPUI's Linux backends report too.
+pub const WindowInsets = struct {
+    safe_area: geometry.Edges(Pixels) = .{},
+    ime: geometry.Edges(Pixels) = .{},
+    corner_radii: geometry.Corners(Pixels) = .{},
+
+    /// The combined inset that content should avoid (GPUI `WindowInsets::effective`).
+    pub fn effective(self: WindowInsets) geometry.Edges(Pixels) {
+        return .{
+            .top = @max(self.safe_area.top, self.ime.top),
+            .right = @max(self.safe_area.right, self.ime.right),
+            .bottom = @max(self.safe_area.bottom, self.ime.bottom),
+            .left = @max(self.safe_area.left, self.ime.left),
+        };
+    }
+};
+
 pub const Window = struct {
     allocator: std.mem.Allocator,
     app: *App,
@@ -397,42 +757,101 @@ pub const Window = struct {
     rendered_entities: std.AutoHashMapUnmanaged(EntityId, void) = .empty,
     next_rendered_entities: std.AutoHashMapUnmanaged(EntityId, void) = .empty,
     view_stack: std.ArrayList(EntityId) = .empty,
+    /// Views that may not reuse their cached output in the next frame (GPUI `dirty_views`).
+    dirty_views: std.AutoHashMapUnmanaged(EntityId, void) = .empty,
+    /// Every cached view renders again in this frame (GPUI `refreshing`).
+    refreshing: bool = false,
+    /// Views that asked for another frame in the current one.
+    animation_views: std.ArrayList(EntityId) = .empty,
+    /// This window's shaped lines, created on the first draw (GPUI's `WindowTextSystem`).
+    line_layout_cache: ?text_system_mod.LineLayoutCache = null,
+    /// The image caches of the elements being laid out, innermost last (GPUI `image_cache_stack`).
+    image_cache_stack: std.ArrayList(image_cache_mod.AnyImageCache) = .empty,
     next_hitbox_id: HitboxId = 1,
     mouse_hit_test: HitTest = .{},
     mouse_position_: Point(Pixels) = .{ .x = 0, .y = 0 },
+    /// Until the pointer has been seen, nothing is hovered, whatever is at the origin.
+    mouse_position_known: bool = false,
     modifiers_: keystroke_mod.Modifiers = .{},
-    capslock: keystroke_mod.Capslock = .{},
+    /// Last known state of the capslock key; read it with `capslock()`.
+    capslock_state: keystroke_mod.Capslock = .{},
+    /// Shadow area of a client-decorated window; read it with `client_inset()`.
+    client_inset_value: ?Pixels = null,
     scale_factor_: f32 = 1,
     rem_size_: Pixels = 16,
     rem_size_override_stack: std.ArrayList(Pixels) = .empty,
-    viewport_size: Size(Pixels) = .{ .width = 0, .height = 0 },
+    viewport_size_: Size(Pixels) = .{ .width = 0, .height = 0 },
+    /// From the options; read them with `is_resizable()` and `is_minimizable()`.
+    is_resizable_: bool = true,
+    is_minimizable_: bool = true,
     focus_id: ?FocusId = null,
+    /// The focused element whose input handler accepts text, as last told to the platform.
+    focused_text_input: ?FocusId = null,
+    /// The caret may have moved: the next frame tells the input method where it landed.
+    ime_position_dirty: bool = false,
+    /// Where the tooltip was last drawn, for hoverable tooltips.
+    tooltip_bounds: ?Bounds(Pixels) = null,
     focus_enabled: bool = true,
     pending_focus_events: bool = false,
+    /// The focus path that a focus-lost listener is reacting to, empty otherwise (GPUI `focus_lost_path`).
+    focus_lost_path: []const FocusId = &.{},
     active: bool = true,
     hovered: bool = false,
     dirty: bool = true,
+    /// Counts invalidations; read it with `update_count`.
+    update_count_: usize = 0,
+    /// Set by `set_platform_waker`; read it through `wake_platform`.
+    platform_waker_: ?Waker = null,
     drawing: bool = false,
     needs_present: bool = false,
     /// Set by `request_animation_frame`; another frame is drawn after this one.
     animation_requested: bool = false,
+    /// A throttled animation frame (`Animation.with_max_fps`) is waiting for its timer.
+    throttled_frame_pending: bool = false,
     next_frame_callbacks: std.ArrayList(FrameCallback) = .empty,
     frame_count: u64 = 0,
-    default_prevented: bool = false,
+    default_prevented_: bool = false,
     propagate_event: bool = true,
-    captured_hitbox: ?HitboxId = null,
+    /// Hitbox that captured the pointer; read it with `captured_hitbox()`.
+    pointer_capture: ?HitboxId = null,
+    /// The entity that claimed the current long press (GPUI `long_press_capture`).
+    long_press_capture: ?app_mod.EntityId = null,
+    /// Keystrokes that may still complete a multi-stroke binding. Their strings are owned.
     pending_keystrokes: std.ArrayList(keystroke_mod.Keystroke) = .empty,
-    last_input_was_keyboard: bool = false,
+    pending_focus: ?u64 = null,
+    pending_timeout: ?PendingTimeout = null,
+    /// Timers cannot be cancelled: each carries this, and is stale once it changed.
+    pending_timeout_generation: u64 = 0,
+    /// Pending input was dropped outside dispatch; observers run on the next draw.
+    pending_input_notify: bool = false,
+    /// Set during prepaint by `request_autoscroll`, taken by the scrolling container (GPUI
+    /// `requested_autoscroll`).
+    requested_autoscroll: ?Bounds(Pixels) = null,
+    pending_modifier: PendingModifier = .{},
+    last_input_modality: InputModality = .mouse,
     title: []const u8 = "",
     should_close_handler: ?FrameCallback = null,
     appearance_: platform_mod.WindowAppearance = .light,
+    /// The prompt on screen, if any (GPUI `prompt`).
+    prompt_: ?prompts.ActivePrompt = null,
+    /// The bounds the bounds observers last saw; they run only when these change.
+    observed_bounds: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } },
+    /// Whether the platform presents this window's frames; read it with `visibility()`.
+    visibility_: platform_mod.WindowVisibility = .visible,
+    /// The display the window is on, as the platform last said; compared to detect a move.
+    display_id_: ?platform_mod.DisplayId = null,
 
     pub const FrameCallback = struct { ctx: *anyopaque, func: *const fn (*anyopaque, *Window, *App) void };
 
     pub fn create(app: *App, options: WindowOptions) !*Window {
         const gpa = app.allocator;
         const self = try gpa.create(Window);
-        const pw = try app.platform.open_window(options);
+        // An anchored popup names its parent by handle; the platform wants the parent's OS window.
+        const parent: ?*platform_mod.PlatformWindow = switch (options.kind) {
+            .anchored_popup => |popup| (app.window_by_id(popup.parent.id) orelse return error.PopupParentNotFound).platform_window,
+            else => null,
+        };
+        const pw = try app.platform.open_window(options, parent);
         self.* = .{
             .allocator = gpa,
             .app = app,
@@ -444,8 +863,13 @@ pub const Window = struct {
             .element_arena = .init(gpa),
         };
         self.scale_factor_ = pw.scale_factor();
-        self.viewport_size = pw.content_size();
+        self.is_resizable_ = options.is_resizable;
+        self.is_minimizable_ = options.is_minimizable;
+        self.viewport_size_ = pw.content_size();
         self.appearance_ = pw.appearance();
+        self.observed_bounds = pw.bounds();
+        self.visibility_ = pw.visibility();
+        self.display_id_ = pw.display_id();
         if (options.titlebar) |t| if (t.title) |title| {
             self.title = title;
         };
@@ -456,15 +880,25 @@ pub const Window = struct {
             .active_status_change = onActiveStatusChange,
             .hover_status_change = onHoverStatusChange,
             .resize = onResize,
+            .moved = onMoved,
             .should_close = onShouldClose,
             .close = onClose,
             .appearance_changed = onAppearanceChanged,
+            .button_layout_changed = onButtonLayoutChanged,
+            .ime = onIme,
+            .ime_area = onImeArea,
+            .visibility_changed = onVisibilityChanged,
+            .display_changed = onDisplayChanged,
         });
         return self;
     }
 
     pub fn destroy(self: *Window, app: *App) void {
-        if (self.root) |r| app.release_entity(r.entity_id);
+        self.close_prompt(app);
+        // An entity that another open window now shows (moved between windows) outlives this one.
+        if (self.root) |r| {
+            if (!app.is_root_of_other_window(r.entity_id, self)) app.release_entity(r.entity_id);
+        }
         self.platform_window.close();
         const gpa = self.allocator;
         self.layout_engine.deinit();
@@ -480,18 +914,44 @@ pub const Window = struct {
         var it = self.element_states.valueIterator();
         while (it.next()) |b| b.destroy(gpa, b.ptr);
         self.element_states.deinit(gpa);
+        self.dirty_views.deinit(gpa);
+        self.animation_views.deinit(gpa);
+        if (self.line_layout_cache) |*cache| cache.deinit();
         self.rendered_entities.deinit(gpa);
         self.next_rendered_entities.deinit(gpa);
         self.view_stack.deinit(gpa);
+        self.image_cache_stack.deinit(gpa);
         self.mouse_hit_test.ids.deinit(gpa);
         self.next_frame_callbacks.deinit(gpa);
-        self.pending_keystrokes.deinit(gpa);
+        free_keystrokes(gpa, &self.pending_keystrokes);
         self.rem_size_override_stack.deinit(gpa);
         gpa.destroy(self);
     }
 
     pub fn set_root_view(self: *Window, view: AnyView) void {
         self.root = view;
+    }
+
+    /// Creates an entity with access to this window, as `build(window, cx)` (GPUI `new_window_entity`).
+    pub fn new_window_entity(self: *Window, app: *App, comptime build: anytype) app_mod.Entity(ReturnTypeOf(build)) {
+        const T = ReturnTypeOf(build);
+        const reservation = app.reserve_entity(T);
+        var cx: app_mod.Context(T) = .{ .app = app, .entity_id_ = reservation.entity_id_ };
+        app.pending_updates += 1;
+        const value = build(self, &cx);
+        app.pending_updates -= 1;
+        return app.insert_entity(reservation, value);
+    }
+
+    /// Replaces the root view with a new one built by `build(window, cx)`. The old root is released
+    /// unless another window shows it (GPUI `Window::replace_root`).
+    pub fn replace_root(self: *Window, app: *App, comptime build: anytype) app_mod.Entity(ReturnTypeOf(build)) {
+        const view = self.new_window_entity(app, build);
+        const old = self.root;
+        self.root = view.into_any_view();
+        if (old) |r| if (!app.is_root_of_other_window(r.entity_id, self)) app.release_entity(r.entity_id);
+        self.refresh();
+        return view;
     }
 
     /// The root view, downcast to `V`.
@@ -505,8 +965,140 @@ pub const Window = struct {
     /// Schedules a redraw of this window (GPUI `refresh`).
     pub fn refresh(self: *Window) void {
         if (!self.drawing) {
-            self.dirty = true;
-            self.platform_window.request_frame();
+            self.refreshing = true;
+            self.update_count_ += 1;
+            self.request_draw();
+        }
+    }
+
+    /// Marks the window dirty and asks the platform for a frame every time, as `refresh` and
+    /// `invalidate_view` always did. Wakes the platform waker when the window just became dirty.
+    fn request_draw(self: *Window) void {
+        const became_dirty = !self.dirty;
+        self.dirty = true;
+        self.platform_window.request_frame();
+        if (became_dirty) self.wake_platform();
+    }
+
+    /// Redraws the window, with `entity` and the views above it rendering again. False if a frame
+    /// is being drawn, which cannot be changed now (GPUI `WindowInvalidator::invalidate_view`).
+    pub fn invalidate_view(self: *Window, entity: EntityId) bool {
+        self.mark_view_dirty(entity);
+        self.update_count_ += 1;
+        if (self.drawing) return false;
+        self.request_draw();
+        return true;
+    }
+
+    /// The platform's frame waker (GPUI `frame_waker`), the callback that wakes its event loop so a
+    /// frame request is delivered. Passed to `set_platform_waker`.
+    pub const Waker = struct {
+        ctx: *anyopaque,
+        func: *const fn (*anyopaque) void,
+    };
+
+    /// Installs the platform's frame waker, or removes it with null (GPUI
+    /// `Window::set_platform_waker`). If the window is already dirty, the waker runs at once so the
+    /// pending frame is not lost.
+    pub fn set_platform_waker(self: *Window, waker: ?Waker) void {
+        self.platform_waker_ = waker;
+        if (self.dirty) self.wake_platform();
+    }
+
+    /// Runs the platform waker, if one is installed, so a frame request is delivered even when the
+    /// platform stopped asking for frames for idle windows. Does nothing without a waker (GPUI
+    /// `Window::wake_platform`).
+    pub fn wake_platform(self: *Window) void {
+        const waker = self.platform_waker_ orelse return;
+        waker.func(waker.ctx);
+    }
+
+    /// How many invalidations this window has seen (GPUI `Window::update_count`). Input dispatch
+    /// compares it before and after an event to learn whether the event caused a redraw.
+    pub fn update_count(self: *const Window) usize {
+        return self.update_count_;
+    }
+
+    /// Takes the set of views that may not reuse their cached output (GPUI `Window::take_views`).
+    /// The caller owns the returned map and frees it with `window.allocator`, or hands it back with
+    /// `replace_views`.
+    pub fn take_views(self: *Window) std.AutoHashMapUnmanaged(EntityId, void) {
+        const views = self.dirty_views;
+        self.dirty_views = .empty;
+        return views;
+    }
+
+    /// Replaces the set of views that may not reuse their cached output, freeing the old one (GPUI
+    /// `Window::replace_views`). Pairs with `take_views`.
+    pub fn replace_views(self: *Window, views: std.AutoHashMapUnmanaged(EntityId, void)) void {
+        self.dirty_views.deinit(self.allocator);
+        self.dirty_views = views;
+    }
+
+    /// Whether every frame of `data` is in the sprite atlas (GPUI `Window::has_image_atlas_entry`).
+    /// Does not build the tiles. Tests use it to check that an image was uploaded.
+    pub fn has_image_atlas_entry(self: *const Window, data: *const assets_mod.RenderImage) bool {
+        if (data.frame_count() == 0) return false;
+        for (0..data.frame_count()) |frame| {
+            if (!self.sprite_atlas.contains(.{ .image = assets_mod.image_atlas_key(data.id, frame) })) return false;
+        }
+        return true;
+    }
+
+    /// The quads of the most recently rendered frame, unclipped (GPUI `Window::painted_quads`). Tests
+    /// assert on them without rasterizing. The slice points into the frame and is valid until the
+    /// next draw.
+    pub fn painted_quads(self: *const Window) []const scene_mod.Quad {
+        return self.rendered_frame.scene.quads.items;
+    }
+
+    /// The underlines of the most recently rendered frame (GPUI `Window::painted_underlines`). Valid
+    /// until the next draw, like `painted_quads`.
+    pub fn painted_underlines(self: *const Window) []const scene_mod.Underline {
+        return self.rendered_frame.scene.underlines.items;
+    }
+
+    /// Runs the callbacks registered with `on_next_frame`, as if the next frame had been delivered,
+    /// and returns how many ran (GPUI `Window::simulate_next_frame`). Nothing is drawn. Naive: it
+    /// copies the callback list, as `draw` does, and could hand the list over without the copy.
+    pub fn simulate_next_frame(self: *Window, cx: *App) usize {
+        if (self.next_frame_callbacks.items.len == 0) return 0;
+        const cbs = self.allocator.dupe(FrameCallback, self.next_frame_callbacks.items) catch oom();
+        defer self.allocator.free(cbs);
+        self.next_frame_callbacks.clearRetainingCapacity();
+        for (cbs) |cb| cb.func(cb.ctx, self, cx);
+        return cbs.len;
+    }
+
+    /// Presents the last drawn frame if it has not been presented yet (GPUI
+    /// `Window::present_if_needed`). `present` already does nothing when nothing is pending; this is
+    /// the GPUI name for the same call.
+    pub fn present_if_needed(self: *Window) void {
+        self.present();
+    }
+
+    /// Whether no frame is being drawn (GPUI `WindowInvalidator::not_drawing`).
+    pub fn not_drawing(self: *const Window) bool {
+        return !self.drawing;
+    }
+
+    /// Marks a view and its ancestors. Marking stops at a marked view, since its ancestors already
+    /// are (GPUI `mark_view_dirty`).
+    fn mark_view_dirty(self: *Window, view_id: EntityId) void {
+        var path = self.rendered_frame.dispatch_tree.view_path_reversed(view_id);
+        while (path.next()) |id| {
+            const entry = self.dirty_views.getOrPut(self.allocator, id) catch oom();
+            if (entry.found_existing) break;
+        }
+    }
+
+    /// Redraws because the view whose listener is running changed how it looks (GPUI's
+    /// `cx.notify(current_view)`). With no view current, such as in a timer, everything renders again.
+    pub fn notify_current_view(self: *Window) void {
+        if (self.current_view()) |view| {
+            _ = self.invalidate_view(view);
+        } else {
+            self.refresh();
         }
     }
 
@@ -514,12 +1106,43 @@ pub const Window = struct {
         return self.dirty;
     }
 
+    /// Sets whether the next frame must be drawn (GPUI `WindowInvalidator::set_dirty`). Setting it
+    /// wakes the platform the first time it becomes true, so an idle window draws. `refresh` does
+    /// the same, except that it does nothing while the window is drawing.
+    pub fn set_dirty(self: *Window, dirty: bool) void {
+        const became_dirty = dirty and !self.dirty;
+        if (dirty) self.update_count_ += 1;
+        self.dirty = dirty;
+        if (became_dirty) {
+            self.platform_window.request_frame();
+            self.wake_platform();
+        }
+    }
+
+    /// Whether this window can be resized, as its options said (GPUI `is_resizable`).
+    pub fn is_resizable(self: *const Window) bool {
+        return self.is_resizable_;
+    }
+
+    /// Whether this window can be minimized, as its options said (GPUI `is_minimizable`).
+    pub fn is_minimizable(self: *const Window) bool {
+        return self.is_minimizable_;
+    }
+
     pub fn on_entity_notified(self: *Window, id: EntityId) void {
-        if (self.rendered_entities.contains(id)) self.refresh();
+        if (!self.rendered_entities.contains(id)) return;
+        // Something other than a view has no place in the tree to invalidate from.
+        if (self.rendered_frame.dispatch_tree.view_nodes.contains(id)) {
+            _ = self.invalidate_view(id);
+        } else {
+            self.refresh();
+        }
     }
 
     /// Requests that another frame be drawn after the current one (for animations).
     pub fn request_animation_frame(self: *Window) void {
+        // The next frame must render this view again, even if it is cached.
+        if (self.current_view()) |view| self.animation_views.append(self.allocator, view) catch oom();
         self.animation_requested = true;
         self.platform_window.request_frame();
     }
@@ -535,10 +1158,69 @@ pub const Window = struct {
         self.platform_window.request_frame();
     }
 
+    /// Runs `f(window, cx)` at the end of the current effect cycle, if the window still exists, so
+    /// that entities on the stack can be returned to the app first (GPUI `Window::defer`).
+    pub fn @"defer"(self: *Window, cx: *App, comptime f: fn (*Window, *App) void) void {
+        cx.defer_window(self.handle_id, f);
+    }
+
     // -- properties ---------------------------------------------------
 
     pub fn scale_factor(self: *const Window) f32 {
         return self.scale_factor_;
+    }
+
+    /// Overrides the scale factor and redraws (GPUI `Window::set_scale_factor`, a test helper there).
+    /// The platform sets the factor again on its next resize, so the override lasts until then.
+    pub fn set_scale_factor(self: *Window, scale: f32) void {
+        self.scale_factor_ = scale;
+        self.refresh();
+    }
+
+    /// Rounds half toward zero (GPUI `round_half_toward_zero`), which is how device pixels are chosen.
+    fn round_half_toward_zero(value: f32) f32 {
+        return std.math.copysign(@ceil(@abs(value) - 0.5), value);
+    }
+    fn round_half_toward_zero_f64(value: f64) f64 {
+        return std.math.copysign(@ceil(@abs(value) - 0.5), value);
+    }
+
+    /// Asks the scrolling containers around the element being prepainted to scroll `bounds` into
+    /// view. They prepaint again with the new offset (GPUI `request_autoscroll`).
+    pub fn request_autoscroll(self: *Window, area: Bounds(Pixels)) void {
+        self.requested_autoscroll = area;
+    }
+
+    /// Returns and clears the request from `request_autoscroll` (GPUI `take_autoscroll`).
+    pub fn take_autoscroll(self: *Window) ?Bounds(Pixels) {
+        const r = self.requested_autoscroll;
+        self.requested_autoscroll = null;
+        return r;
+    }
+
+    /// Snaps `value` to the nearest device pixel (GPUI `pixel_snap`).
+    pub fn pixel_snap(self: *const Window, value: Pixels) Pixels {
+        const sf = self.scale_factor();
+        return round_half_toward_zero(value * sf) / sf;
+    }
+
+    /// The f64 form of `pixel_snap` (GPUI `pixel_snap_f64`).
+    pub fn pixel_snap_f64(self: *const Window, value: f64) f64 {
+        const sf: f64 = self.scale_factor();
+        return round_half_toward_zero_f64(value * sf) / sf;
+    }
+
+    /// Snaps a point's coordinates to device pixels (GPUI `pixel_snap_point`).
+    pub fn pixel_snap_point(self: *const Window, position: Point(Pixels)) Point(Pixels) {
+        return .{ .x = self.pixel_snap(position.x), .y = self.pixel_snap(position.y) };
+    }
+
+    /// Snaps the origin and size of `bounds` to device pixels (GPUI `pixel_snap_bounds`).
+    pub fn pixel_snap_bounds(self: *const Window, area: Bounds(Pixels)) Bounds(Pixels) {
+        return .{ .origin = self.pixel_snap_point(area.origin), .size = .{
+            .width = self.pixel_snap(area.size.width),
+            .height = self.pixel_snap(area.size.height),
+        } };
     }
     pub fn rem_size(self: *const Window) Pixels {
         if (self.rem_size_override_stack.items.len > 0) return self.rem_size_override_stack.items[self.rem_size_override_stack.items.len - 1];
@@ -556,8 +1238,9 @@ pub const Window = struct {
     pub fn modifiers(self: *const Window) keystroke_mod.Modifiers {
         return self.modifiers_;
     }
-    pub fn viewport_size_(self: *const Window) Size(Pixels) {
-        return self.viewport_size;
+    /// The size of the drawable area within the window (GPUI `viewport_size`).
+    pub fn viewport_size(self: *const Window) Size(Pixels) {
+        return self.viewport_size_;
     }
     pub fn bounds(self: *const Window) Bounds(Pixels) {
         return self.platform_window.bounds();
@@ -570,6 +1253,153 @@ pub const Window = struct {
     }
     pub fn appearance(self: *const Window) platform_mod.WindowAppearance {
         return self.appearance_;
+    }
+
+    /// Shows a prompt over the window with one button per answer (GPUI `prompt`). Answers are
+    /// strings read as GPUI reads them (`"OK"`, `"Cancel"`) or `PromptButton` values. When one is
+    /// chosen, `listener` (a `Listener(PromptResponse)` or a plain `fn(*const PromptResponse,
+    /// *Window, *App) void`) gets its index. A prompt that is replaced or whose window closes
+    /// is never answered. GPUI's Linux platforms have no native prompt, so this draws the fallback
+    /// unless the app set another builder with `App.set_prompt_builder`.
+    pub fn prompt(
+        self: *Window,
+        level: PromptLevel,
+        message: []const u8,
+        detail: ?[]const u8,
+        answers: anytype,
+        cx: *App,
+        listener: anytype,
+    ) void {
+        self.close_prompt(cx);
+        const gpa = self.allocator;
+        const arena = gpa.create(std.heap.ArenaAllocator) catch oom();
+        arena.* = .init(gpa);
+        const a = arena.allocator();
+        const buttons = prompts.copy_buttons(a, answers);
+        const text = a.dupe(u8, message) catch oom();
+        const detail_text: ?[]const u8 = if (detail) |d| (a.dupe(u8, d) catch oom()) else null;
+
+        const previous_focus = self.focus_id;
+        const builder = cx.prompt_builder orelse prompts.fallback_prompt_renderer;
+        const handle = builder(level, text, detail_text, buttons, .{ .window_id = self.handle_id }, self, cx);
+        self.prompt_ = .{
+            .handle = handle,
+            .listener = app_mod.to_listener(PromptResponse, listener),
+            .previous_focus = previous_focus,
+            .arena = arena,
+        };
+        self.refresh();
+    }
+
+    /// Whether a prompt drawn in this window is open (GPUI `has_active_prompt`). Platform
+    /// prompts are not drawn here, so they do not count.
+    pub fn has_active_prompt(self: *const Window) bool {
+        return self.prompt_ != null;
+    }
+
+    /// Drops the open prompt without an answer, as a replaced or closing window does.
+    fn close_prompt(self: *Window, app: *App) void {
+        const active = self.prompt_ orelse return;
+        self.prompt_ = null;
+        active.handle.subscription.unsubscribe();
+        app.release_entity(active.handle.view.entity_id);
+        prompts.free_arena(self.allocator, active.arena);
+    }
+
+    /// Runs `f(window, cx)` whenever the window moves or is resized (GPUI `observe_window_bounds`).
+    /// `Context.observe_window_bounds` does the same with an entity.
+    pub fn observe_window_bounds(self: *Window, comptime f: fn (*Window, *App) void) app_mod.Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const win: *Window = @ptrCast(@alignCast(@constCast(payload.?)));
+                f(win, app);
+                return true;
+            }
+        };
+        return self.app.add_window_subscriber(.window_bounds, self.handle_id, 0, S.call);
+    }
+
+    /// Whether the platform is presenting this window's frames (GPUI `visibility`).
+    pub fn visibility(self: *const Window) platform_mod.WindowVisibility {
+        return self.visibility_;
+    }
+
+    /// Whether frames drawn for this window will be shown. A shown window that is covered, minimized
+    /// or suspended is not visible here (GPUI `is_visible`).
+    pub fn is_visible(self: *const Window) bool {
+        return self.visibility_.is_visible();
+    }
+
+    /// Runs `f(visibility, window, app)` when the visibility of this window changes (GPUI
+    /// `observe_window_visibility`).
+    pub fn observe_window_visibility(self: *Window, comptime f: fn (platform_mod.WindowVisibility, *Window, *App) void) app_mod.Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const win: *Window = @ptrCast(@alignCast(@constCast(payload.?)));
+                f(win.visibility_, win, app);
+                return true;
+            }
+        };
+        return self.app.add_window_subscriber(.window_visibility, self.handle_id, 0, S.call);
+    }
+
+    /// Runs `f(window, app)` when this window moves to another display, or its display changes
+    /// (GPUI `observe_window_display`).
+    pub fn observe_window_display(self: *Window, comptime f: fn (*Window, *App) void) app_mod.Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const win: *Window = @ptrCast(@alignCast(@constCast(payload.?)));
+                f(win, app);
+                return true;
+            }
+        };
+        return self.app.add_window_subscriber(.window_display, self.handle_id, 0, S.call);
+    }
+
+    /// Reads the platform's visibility and tells the observers if it changed (GPUI `refresh_visibility`).
+    fn refresh_visibility(self: *Window) void {
+        const v = self.platform_window.visibility();
+        if (v == self.visibility_) return;
+        self.visibility_ = v;
+        self.app.dispatch_window_observers(.window_visibility, self);
+    }
+
+    /// Reads the platform's display of this window. If it moved, the observers hear it, after the
+    /// app has learned about the display (GPUI `display_changed`).
+    fn refresh_display(self: *Window) void {
+        const id = self.platform_window.display_id();
+        if (id == self.display_id_) return;
+        self.display_id_ = id;
+        if (id) |new_id| if (!self.app.knows_display(new_id)) self.app.displays_changed();
+        self.notify_display_observers(self.app);
+    }
+
+    /// The time between refreshes of the display this window is on, in nanoseconds, as of the
+    /// platform's last display notification. Null when the platform does not report it (GPUI
+    /// `refresh_interval`).
+    pub fn refresh_interval(self: *const Window, cx: *App) ?u64 {
+        const id = self.display_id_ orelse return null;
+        const display = cx.find_display(id) orelse return null;
+        return display.refresh_interval;
+    }
+
+    /// Runs the display observers of this window (GPUI `notify_display_observers`).
+    pub fn notify_display_observers(self: *Window, app: *App) void {
+        app.dispatch_window_observers(.window_display, self);
+    }
+
+    /// The GPU this window renders with, if the platform can tell (GPUI `gpu_specs`).
+    pub fn gpu_specs(self: *Window) ?platform_mod.GpuSpecs {
+        return self.platform_window.gpu_specs();
+    }
+
+    /// Compares the platform's bounds with the last ones seen, and tells the observers if they changed.
+    fn bounds_changed(self: *Window) void {
+        const now = self.platform_window.bounds();
+        if (now.origin.x == self.observed_bounds.origin.x and now.origin.y == self.observed_bounds.origin.y and
+            now.size.width == self.observed_bounds.size.width and now.size.height == self.observed_bounds.size.height) return;
+        self.observed_bounds = now;
+        self.app.dispatch_window_observers(.window_bounds, self);
     }
     pub fn text_system(self: *Window) *text_system_mod.TextSystem {
         return self.app.text_system();
@@ -593,8 +1423,88 @@ pub const Window = struct {
     pub fn start_window_move(self: *Window) void {
         self.platform_window.start_window_move();
     }
+    /// Closes this window (GPUI `remove_window`). The close waits until the current update
+    /// ends, so an action can close the window it is running in.
     pub fn remove_window(self: *Window) void {
-        self.app.close_window(self);
+        self.app.close_window_later(self);
+    }
+    /// Who draws the frame (GPUI `window_decorations`).
+    pub fn window_decorations(self: *const Window) Decorations {
+        return self.platform_window.window_decorations();
+    }
+    /// The shadow area of a client-decorated window, in logical pixels (GPUI `set_client_inset`).
+    pub fn set_client_inset(self: *Window, inset: Pixels) void {
+        self.client_inset_value = inset;
+        self.platform_window.set_client_inset(inset);
+    }
+    /// Sets the window's background appearance (GPUI `set_background_appearance`). The frame is
+    /// redrawn, since transparent windows clear to transparent.
+    pub fn set_background_appearance(self: *Window, background: WindowBackgroundAppearance) void {
+        self.platform_window.set_background_appearance(background);
+        self.refresh();
+    }
+    /// The background appearance last set, or given at creation (GPUI `WindowOptions::window_background`).
+    pub fn background_appearance(self: *const Window) WindowBackgroundAppearance {
+        return self.platform_window.background_appearance();
+    }
+    /// Corner radii of a client-drawn window, so a blur matches its shape (GPUI `set_client_corner_radii`).
+    pub fn set_client_corner_radii(self: *Window, radii: Corners(Pixels)) void {
+        self.platform_window.set_client_corner_radii(radii);
+    }
+    /// Starts an interactive resize from an edge, as a press on that edge would (GPUI `start_window_resize`).
+    pub fn start_window_resize(self: *Window, edge: ResizeEdge) void {
+        self.platform_window.start_window_resize(edge);
+    }
+    /// Shows the compositor's window menu at `position` (GPUI `show_window_menu`).
+    pub fn show_window_menu(self: *Window, position: Point(Pixels)) void {
+        self.platform_window.show_window_menu(position);
+    }
+    /// The bounds and the state they are in: fullscreen and maximized windows report their own
+    /// variant (GPUI `window_bounds`).
+    pub fn window_bounds(self: *const Window) WindowBounds {
+        const b = self.bounds();
+        if (self.is_fullscreen()) return .{ .fullscreen = b };
+        if (self.is_maximized()) return .{ .maximized = b };
+        return .{ .windowed = b };
+    }
+    /// `window_bounds` without the insets the platform draws around the window, such as the shadow
+    /// of client decorations (GPUI `inner_window_bounds`). Tiling is not considered yet.
+    pub fn inner_window_bounds(self: *const Window) WindowBounds {
+        const b = self.bounds();
+        if (self.is_fullscreen()) return .{ .fullscreen = b };
+        if (self.is_maximized()) return .{ .maximized = b };
+        const inset: Pixels = switch (self.window_decorations()) {
+            .server => 0,
+            .client => self.client_inset_value orelse 0,
+        };
+        return .{ .windowed = b.inset(inset) };
+    }
+    /// Whether the platform reports the window as maximized (GPUI `is_maximized`).
+    pub fn is_maximized(self: *const Window) bool {
+        return self.platform_window.is_maximized();
+    }
+    /// Whether the platform reports the window as fullscreen (GPUI `is_fullscreen`).
+    pub fn is_fullscreen(self: *const Window) bool {
+        return self.platform_window.is_fullscreen();
+    }
+    /// Whether the window is in simple (borderless) fullscreen, which covers the menu bar and notch too
+    /// (GPUI `is_simple_fullscreen`). Only macOS has that mode, so this is always false here, as
+    /// GPUI's platform default is on the other platforms.
+    pub fn is_simple_fullscreen(_: *const Window) bool {
+        return false;
+    }
+    /// What the window manager lets this window do: fullscreen, maximize, minimize and the window
+    /// menu (GPUI `window_controls`). Wayland reports it from xdg_toplevel.wm_capabilities.
+    pub fn window_controls(self: *const Window) platform_mod.WindowControls {
+        return self.platform_window.window_controls();
+    }
+    /// Sets the app id: xdg_toplevel's app_id on Wayland, WM_CLASS on X11 (GPUI `set_app_id`).
+    pub fn set_app_id(self: *Window, app_id: []const u8) void {
+        self.platform_window.set_app_id(app_id);
+    }
+    /// Asks for server or client decorations where the platform can choose (GPUI `request_decorations`).
+    pub fn request_decorations(self: *Window, decorations: WindowDecorations) void {
+        self.platform_window.request_decorations(decorations);
     }
     pub fn resize(self: *Window, size: Size(Pixels)) void {
         self.platform_window.resize(size);
@@ -602,21 +1512,36 @@ pub const Window = struct {
     pub fn window_handle_id(self: *const Window) WindowId {
         return self.handle_id;
     }
-    pub fn prevent_default(self: *Window) void {
-        self.default_prevented = true;
+    pub fn window_handle(self: *const Window) AnyWindowHandle {
+        return .{ .id = self.handle_id };
     }
-    pub fn is_default_prevented(self: *const Window) bool {
-        return self.default_prevented;
+    pub fn prevent_default(self: *Window) void {
+        self.default_prevented_ = true;
+    }
+    pub fn default_prevented(self: *const Window) bool {
+        return self.default_prevented_;
     }
     /// Stops the current event from propagating (GPUI `cx.stop_propagation`).
     pub fn stop_propagation(self: *Window) void {
         self.propagate_event = false;
     }
+    /// The current state of the keyboard's capslock (GPUI `capslock`).
+    pub fn capslock(self: *const Window) keystroke_mod.Capslock {
+        return self.capslock_state;
+    }
+    /// The hitbox that has captured the pointer, if any (GPUI `captured_hitbox`).
+    pub fn captured_hitbox(self: *const Window) ?HitboxId {
+        return self.pointer_capture;
+    }
+    /// The shadow area last set with `set_client_inset`, or null if never set (GPUI `client_inset`).
+    pub fn client_inset(self: *const Window) ?Pixels {
+        return self.client_inset_value;
+    }
     pub fn capture_pointer(self: *Window, hitbox_id: HitboxId) void {
-        self.captured_hitbox = hitbox_id;
+        self.pointer_capture = hitbox_id;
     }
     pub fn release_pointer(self: *Window) void {
-        self.captured_hitbox = null;
+        self.pointer_capture = null;
     }
 
     // -- focus -------------------------------------------------------
@@ -625,13 +1550,131 @@ pub const Window = struct {
         if (!self.focus_enabled or self.focus_id == handle.id) return;
         self.focus_id = handle.id;
         self.pending_focus_events = true;
+        self.clear_pending_keystrokes();
         self.refresh();
     }
 
     pub fn blur(self: *Window) void {
+        self.clear_pending_keystrokes();
         if (!self.focus_enabled) return;
         self.focus_id = null;
         self.refresh();
+    }
+
+    /// While focus-lost listeners run, the nearest ancestor of the lost focus that can still take
+    /// focus, so that the listener can move focus back into the window (GPUI `focus_lost_restore_target`).
+    /// Null at all other times.
+    pub fn focus_lost_restore_target(self: *const Window, cx: *const App) ?FocusHandle {
+        _ = cx;
+        const path = self.focus_lost_path;
+        if (path.len == 0) return null;
+        const tree = &self.rendered_frame.dispatch_tree;
+        var i = path.len - 1;
+        while (i > 0) {
+            i -= 1;
+            const node_id = tree.focusable_node_id(path[i]) orelse continue;
+            const node = tree.node(node_id);
+            return .{ .id = path[i], .tab_index_ = node.tab_index, .tab_stop_ = node.tab_stop };
+        }
+        return null;
+    }
+
+    /// Opens a tab group at `index` on the frame being drawn, so that tab stops created until the
+    /// matching `end_group` are ordered as one block (GPUI `TabStopMap::begin_group`). Call it during
+    /// prepaint, where tab stops are registered. Pair it with `end_group`.
+    pub fn begin_group(self: *Window, index: isize) void {
+        self.next_frame.dispatch_tree.push_node();
+        self.next_frame.dispatch_tree.set_tab_group(index);
+    }
+
+    /// Closes the tab group opened by `begin_group` (GPUI `TabStopMap::end_group`).
+    pub fn end_group(self: *Window) void {
+        self.next_frame.dispatch_tree.pop_node();
+    }
+
+    /// Runs `f` inside a tab group at `index`, or without one when `index` is null (GPUI
+    /// `with_tab_group`).
+    pub fn with_tab_group(self: *Window, index: ?isize, comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        if (index) |i| self.begin_group(i);
+        defer if (index != null) self.end_group();
+        return @call(.auto, f, .{self} ++ args);
+    }
+
+    // -- view caching ----------------------------------------------------
+
+    fn line_layouts(self: *Window) *text_system_mod.LineLayoutCache {
+        return self.text_system().active_cache;
+    }
+
+    /// How much prepaint has added to the frame being drawn (GPUI `prepaint_index`).
+    pub fn prepaint_index(self: *Window) PrepaintStateIndex {
+        return .{
+            .hitboxes_index = self.next_frame.hitboxes.items.len,
+            .tooltips_index = self.next_frame.tooltip_requests.items.len,
+            .deferred_draws_index = self.next_frame.deferred_draws.items.len,
+            .dispatch_tree_index = self.next_frame.dispatch_tree.len(),
+            .accessed_element_states_index = self.next_frame.accessed_element_states.items.len,
+            .accessed_entities_index = self.next_frame.accessed_entities.items.len,
+            .line_layout_index = self.line_layouts().layout_index(),
+        };
+    }
+
+    /// How much paint has added to the frame being drawn (GPUI `paint_index`).
+    pub fn paint_index(self: *Window) PaintIndex {
+        return .{
+            .scene_index = self.next_frame.scene.len(),
+            .mouse_listeners_index = self.next_frame.mouse_listeners.items.len,
+            .input_handlers_index = self.next_frame.input_handlers.items.len,
+            .cursor_styles_index = self.next_frame.cursor_styles.items.len,
+            .accessed_element_states_index = self.next_frame.accessed_element_states.items.len,
+            .accessed_entities_index = self.next_frame.accessed_entities.items.len,
+            .line_layout_index = self.line_layouts().layout_index(),
+        };
+    }
+
+    fn reuse_accessed(self: *Window, states: []const ElementStateKey, entities: []const EntityId) void {
+        self.next_frame.accessed_element_states.appendSlice(self.allocator, states) catch oom();
+        for (states) |key| {
+            if (self.element_states.getPtr(key)) |state| state.frame = self.frame_count;
+        }
+        for (entities) |id| self.record_entity(id);
+    }
+
+    /// Copies what `start..end` of the rendered frame added in prepaint, instead of running it
+    /// (GPUI `reuse_prepaint`).
+    pub fn reuse_prepaint(self: *Window, start: PrepaintStateIndex, end: PrepaintStateIndex) void {
+        const old = &self.rendered_frame;
+        const new = &self.next_frame;
+        new.hitboxes.appendSlice(self.allocator, old.hitboxes.items[start.hitboxes_index..end.hitboxes_index]) catch oom();
+        new.tooltip_requests.appendSlice(self.allocator, old.tooltip_requests.items[start.tooltips_index..end.tooltips_index]) catch oom();
+        self.reuse_accessed(
+            old.accessed_element_states.items[start.accessed_element_states_index..end.accessed_element_states_index],
+            old.accessed_entities.items[start.accessed_entities_index..end.accessed_entities_index],
+        );
+        self.line_layouts().reuse_layouts(start.line_layout_index, end.line_layout_index) catch oom();
+        const reused = new.dispatch_tree.reuse_subtree(start.dispatch_tree_index, end.dispatch_tree_index, &old.dispatch_tree, self.focus_id);
+        for (old.deferred_draws.items[start.deferred_draws_index..end.deferred_draws_index]) |draw_| {
+            var copy = draw_;
+            copy.element = null;
+            copy.parent_node = reused.refresh_node_id(draw_.parent_node);
+            new.deferred_draws.append(self.allocator, copy) catch oom();
+        }
+    }
+
+    /// Copies what `start..end` of the rendered frame added in paint, instead of running it
+    /// (GPUI `reuse_paint`).
+    pub fn reuse_paint(self: *Window, start: PaintIndex, end: PaintIndex) void {
+        const old = &self.rendered_frame;
+        const new = &self.next_frame;
+        new.cursor_styles.appendSlice(self.allocator, old.cursor_styles.items[start.cursor_styles_index..end.cursor_styles_index]) catch oom();
+        new.input_handlers.appendSlice(self.allocator, old.input_handlers.items[start.input_handlers_index..end.input_handlers_index]) catch oom();
+        new.mouse_listeners.appendSlice(self.allocator, old.mouse_listeners.items[start.mouse_listeners_index..end.mouse_listeners_index]) catch oom();
+        self.reuse_accessed(
+            old.accessed_element_states.items[start.accessed_element_states_index..end.accessed_element_states_index],
+            old.accessed_entities.items[start.accessed_entities_index..end.accessed_entities_index],
+        );
+        self.line_layouts().reuse_layouts(start.line_layout_index, end.line_layout_index) catch oom();
+        new.scene.replay(.{ .start = start.scene_index, .end = end.scene_index }, &old.scene) catch oom();
     }
 
     pub fn disable_focus(self: *Window) void {
@@ -687,6 +1730,7 @@ pub const Window = struct {
     /// States not accessed during a frame are dropped.
     pub fn element_state(self: *Window, comptime S: type, gid: GlobalElementId, init: S) *S {
         const key: ElementStateKey = .{ .gid = gid.hash, .tid = app_mod.type_id(S) };
+        if (self.drawing) self.next_frame.accessed_element_states.append(self.allocator, key) catch oom();
         const gop = self.element_states.getOrPut(self.allocator, key) catch oom();
         if (!gop.found_existing) {
             const p = self.allocator.create(S) catch oom();
@@ -703,6 +1747,16 @@ pub const Window = struct {
         return @ptrCast(@alignCast(gop.value_ptr.ptr));
     }
 
+    /// True while `ptr` is still a live element state of this window. Timers check this,
+    /// because an element can disappear before one fires.
+    pub fn owns_element_state(self: *const Window, ptr: *const anyopaque) bool {
+        var it = self.element_states.valueIterator();
+        while (it.next()) |entry| {
+            if (entry.ptr == @constCast(ptr)) return true;
+        }
+        return false;
+    }
+
     /// GPUI `with_element_state`: `f(?*S, window) struct{R, S}`-style callers
     /// should prefer `element_state`; this form mirrors GPUI's signature.
     pub fn with_element_state(self: *Window, comptime S: type, gid: GlobalElementId, comptime f: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
@@ -711,7 +1765,44 @@ pub const Window = struct {
         return f(existing, self);
     }
 
+    /// GPUI `with_optional_element_state`, for an element that may have no id. Without one, `f` gets
+    /// null and nothing is kept. With one, `f` gets a pointer to the state, which is null until `f`
+    /// stores a value there. The value is kept for the id, as `element_state` keeps its state.
+    pub fn with_optional_element_state(self: *Window, comptime S: type, gid: ?GlobalElementId, comptime f: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        if (gid) |g| {
+            const slot = self.element_state(OptionalStateSlot(S), g, .{});
+            return f(&slot.value, self);
+        }
+        return f(null, self);
+    }
+
     /// Keyed entity state (GPUI `use_keyed_state`): creates the entity on first use.
+    /// State that lives while this element is rendered in consecutive frames, keyed by the call site.
+    /// Pass `@src()`: GPUI's `use_state` gets the same identity from `#[track_caller]`. Use
+    /// `use_keyed_state` when one call site renders many elements (GPUI `use_state`).
+    pub fn use_state(self: *Window, src: std.lang.SourceLocation, cx: *App, comptime init: anytype) app_mod.Entity(app_mod.EntityTypeOf(@TypeOf(init))) {
+        var hash = std.hash.Wyhash.hash(0x75736573, src.file);
+        hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&[_]u32{ src.line, src.column }));
+        return self.use_keyed_state(ElementId{ .code_location = @truncate(hash) }, cx, init);
+    }
+
+    /// Runs `f(arg, window)` during prepaint. If it fails, what it added to the frame is removed, so
+    /// the caller can prepaint again with other values (GPUI `transact`).
+    pub fn transact(self: *Window, arg: anytype, comptime f: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        const index = self.prepaint_index();
+        const result = f(arg, self);
+        if (result) |_| {} else |_| {
+            self.next_frame.hitboxes.shrinkRetainingCapacity(index.hitboxes_index);
+            self.next_frame.tooltip_requests.shrinkRetainingCapacity(index.tooltips_index);
+            self.next_frame.deferred_draws.shrinkRetainingCapacity(index.deferred_draws_index);
+            self.next_frame.dispatch_tree.truncate(index.dispatch_tree_index);
+            self.next_frame.accessed_element_states.shrinkRetainingCapacity(index.accessed_element_states_index);
+            self.next_frame.accessed_entities.shrinkRetainingCapacity(index.accessed_entities_index);
+            self.line_layouts().truncate_layouts(index.line_layout_index);
+        }
+        return result;
+    }
+
     pub fn use_keyed_state(self: *Window, key: anytype, cx: *App, comptime init: anytype) app_mod.Entity(app_mod.EntityTypeOf(@TypeOf(init))) {
         const T = app_mod.EntityTypeOf(@TypeOf(init));
         const gid = self.push_element_id(ElementId.from(key));
@@ -743,18 +1834,61 @@ pub const Window = struct {
 
     pub fn push_view(self: *Window, id: EntityId) void {
         self.view_stack.append(self.allocator, id) catch oom();
+        self.record_entity(id);
+    }
+    fn record_entity(self: *Window, id: EntityId) void {
         self.next_rendered_entities.put(self.allocator, id, {}) catch oom();
+        self.next_frame.accessed_entities.append(self.allocator, id) catch oom();
     }
     pub fn pop_view(self: *Window) void {
         _ = self.view_stack.pop();
+    }
+    /// Sets the view id for the current element, which `view_path_reversed` walks from. Only called
+    /// during prepaint, where the element's dispatch node is active (GPUI `Window::set_view_id`).
+    pub fn set_view_id(self: *Window, view_id: EntityId) void {
+        self.next_frame.dispatch_tree.set_view_id(view_id);
     }
     pub fn current_view(self: *const Window) ?EntityId {
         if (self.view_stack.items.len == 0) return null;
         return self.view_stack.items[self.view_stack.items.len - 1];
     }
+
+    // -- image caches and assets -----------------------------------------
+
+    pub fn push_image_cache(self: *Window, cache: image_cache_mod.AnyImageCache) void {
+        self.image_cache_stack.append(self.allocator, cache) catch oom();
+    }
+    pub fn pop_image_cache(self: *Window) void {
+        _ = self.image_cache_stack.pop();
+    }
+    /// The image cache in scope, if an ancestor set one (GPUI `image_cache_stack.last()`).
+    pub fn current_image_cache(self: *const Window) ?image_cache_mod.AnyImageCache {
+        const stack = self.image_cache_stack.items;
+        return if (stack.len == 0) null else stack[stack.len - 1];
+    }
+
+    /// The loaded `A` for `source`, or null while it loads. The current view is redrawn when it
+    /// arrives, and a load starts only once per source (GPUI `use_asset`).
+    pub fn use_asset(self: *Window, comptime A: type, source: A.Source, cx: *App) ?A.Output {
+        return cx.asset_loads.entry(A, source).use_by(self.current_view());
+    }
+
+    /// The loaded `A` for `source`, or null while it loads. Starts the load if needed, but does not
+    /// redraw when it arrives (GPUI `get_asset`).
+    pub fn get_asset(self: *Window, comptime A: type, source: A.Source, cx: *App) ?A.Output {
+        _ = self;
+        return cx.fetch_asset(A, source);
+    }
+
+    /// Removes this window's sprite atlas tiles for `image` (see `App.drop_image`).
+    pub fn forget_image(self: *Window, image: *const assets_mod.RenderImage) void {
+        for (0..image.frame_count()) |frame| {
+            self.sprite_atlas.remove(.{ .image = assets_mod.image_atlas_key(image.id, frame) });
+        }
+    }
     /// Records that the current frame depends on `id` (redraws when it notifies).
     pub fn observe_entity_for_redraw(self: *Window, id: EntityId) void {
-        self.next_rendered_entities.put(self.allocator, id, {}) catch oom();
+        self.record_entity(id);
     }
 
     // -- text style ---------------------------------------------------
@@ -809,7 +1943,7 @@ pub const Window = struct {
 
     pub fn content_mask(self: *const Window) ContentMask(Pixels) {
         if (self.content_mask_stack.items.len == 0) {
-            return .{ .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = self.viewport_size } };
+            return .{ .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = self.viewport_size_ } };
         }
         return self.content_mask_stack.items[self.content_mask_stack.items.len - 1];
     }
@@ -870,7 +2004,34 @@ pub const Window = struct {
     }
 
     fn hitbox_is_hovered(self: *const Window, id: HitboxId) bool {
-        if (self.captured_hitbox) |c| return c == id;
+        if (self.pointer_capture) |c| return c == id;
+        if (self.last_input_modality == .keyboard) return false;
+        return self.hitbox_is_hovered_ignoring_last_input(id);
+    }
+
+    /// Claims the current long press for `owner`, so that others can see that it was taken (GPUI `capture_long_press`).
+    pub fn capture_long_press(self: *Window, owner: anytype) void {
+        self.long_press_capture = owner.entity_id();
+    }
+
+    /// Whether `owner` claimed the current long press (GPUI `has_long_press_capture`).
+    pub fn has_long_press_capture(self: *const Window, owner: anytype) bool {
+        const id = self.long_press_capture orelse return false;
+        return id.as_u64() == owner.entity_id().as_u64();
+    }
+
+    /// Whether the last input event came from the keyboard (GPUI `last_input_was_keyboard`).
+    pub fn last_input_was_keyboard(self: *const Window) bool {
+        return self.last_input_modality == .keyboard;
+    }
+
+    /// Whether the last input event came from a touch screen (GPUI `last_input_was_touch`).
+    pub fn last_input_was_touch(self: *const Window) bool {
+        return self.last_input_modality == .touch;
+    }
+
+    fn hitbox_is_hovered_ignoring_last_input(self: *const Window, id: HitboxId) bool {
+        if (self.pointer_capture) |c| return c == id;
         const ht = &self.mouse_hit_test;
         for (ht.ids.items[0..ht.hover_hitbox_count]) |h| if (h == id) return true;
         return false;
@@ -882,11 +2043,21 @@ pub const Window = struct {
     }
 
     fn hit_test(self: *Window, position: Point(Pixels)) void {
+        self.hit_test_frame(&self.rendered_frame, position);
+    }
+
+    fn set_mouse_position(self: *Window, position: Point(Pixels)) void {
+        self.mouse_position_ = position;
+        self.mouse_position_known = true;
+    }
+
+    fn hit_test_frame(self: *Window, frame: *const Frame, position: Point(Pixels)) void {
         const ht = &self.mouse_hit_test;
         ht.ids.clearRetainingCapacity();
         ht.hover_hitbox_count = 0;
+        if (!self.mouse_position_known) return;
         var set_hover_count = false;
-        const boxes = self.rendered_frame.hitboxes.items;
+        const boxes = frame.hitboxes.items;
         var i = boxes.len;
         while (i > 0) {
             i -= 1;
@@ -923,7 +2094,7 @@ pub const Window = struct {
                 handler(c, @ptrCast(@alignCast(ev)), phase, w, a);
             }
         };
-        self.next_frame.mouse_listeners.append(self.allocator, .{ .event_type = app_mod.type_id(E), .ctx = ctx, .func = S.call }) catch oom();
+        self.next_frame.mouse_listeners.append(self.allocator, .{ .view = self.current_view(), .event_type = app_mod.type_id(E), .ctx = ctx, .func = S.call }) catch oom();
     }
 
     /// Registers a key event listener on the current dispatch node.
@@ -951,20 +2122,65 @@ pub const Window = struct {
         if (self.focus_id == handle.id) self.next_frame.focus = handle.id;
     }
 
-    /// Registers the input handler for the focused element (text input).
-    pub fn handle_input(self: *Window, focus_handle: *const FocusHandle, handler: platform_mod.PlatformInputHandler, cx: *App) void {
+    /// Registers the input handler for the focused element (text input). Takes a
+    /// `PlatformInputHandler` or anything with `platform_input_handler()`, such as
+    /// `ElementInputHandler`. Call it during paint.
+    pub fn handle_input(self: *Window, focus_handle: *const FocusHandle, handler: anytype, cx: anytype) void {
         _ = cx;
-        if (self.focus_id == focus_handle.id) {
-            self.next_frame.input_handlers.append(self.allocator, .{ .handler = handler, .focus_id = focus_handle.id }) catch oom();
-        }
+        if (self.focus_id != focus_handle.id) return;
+        const erased: platform_mod.PlatformInputHandler = blk: {
+            const H = @TypeOf(handler);
+            if (@typeInfo(H) == .pointer) break :blk handler.platform_input_handler();
+            break :blk handler;
+        };
+        self.next_frame.input_handlers.append(self.allocator, .{ .handler = erased, .focus_id = focus_handle.id }) catch oom();
+    }
+
+    /// Tells the platform the caret moved, so IME candidates can follow it. Call this
+    /// after scrolling or moving the caret other than through typing.
+    pub fn invalidate_character_coordinates(self: *Window) void {
+        const S = struct {
+            fn call(window: *Window, cx: *App) void {
+                if (window.ime_area_in(cx)) |area| window.platform_window.update_ime_position(area);
+            }
+        };
+        self.on_next_frame(S.call);
+    }
+
+    /// Tells native text services that the focused field's text changed. Call this after
+    /// edits made by the application. Other fields are ignored.
+    pub fn notify_text_input_changed(self: *Window, focus_handle: *const FocusHandle) void {
+        if (self.focused_text_input == focus_handle.id) self.ime_position_dirty = true;
+    }
+
+    /// Tells native text services that the focused field's selection changed.
+    pub fn notify_text_selection_changed(self: *Window, focus_handle: *const FocusHandle) void {
+        if (self.focused_text_input == focus_handle.id) self.ime_position_dirty = true;
+    }
+
+    /// Opens the software keyboard. Linux desktops have none to ask for.
+    pub fn request_virtual_keyboard(_: *const Window) void {}
+
+    /// Opens the system emoji and symbol picker. Only macOS has one to open.
+    pub fn show_character_palette(_: *const Window) void {}
+
+    pub fn play_system_bell(self: *Window) void {
+        self.platform_window.play_system_bell();
+    }
+
+    fn ime_area_in(self: *Window, cx: *App) ?Bounds(Pixels) {
+        var handler = self.platform_window.input_handler() orelse return null;
+        return handler.selected_bounds(self, cx);
     }
 
     /// Draws `element` after the current tree, on top (GPUI `defer_draw`).
     pub fn defer_draw(self: *Window, element: AnyElement, absolute_offset: Point(Pixels), priority: usize) void {
-        const stack = self.next_frame.arena.allocator().dupe(TextStyleRefinement, self.text_style_stack.items) catch oom();
+        const stack = frame_arena().dupe(TextStyleRefinement, self.text_style_stack.items) catch oom();
         self.next_frame.deferred_draws.append(self.allocator, .{
             .priority = priority,
             .element = element,
+            .arena = current_frame_arena,
+            .view = self.current_view(),
             .absolute_offset = absolute_offset,
             .text_style_stack = stack,
             .parent_node = self.next_frame.dispatch_tree.active_node_id(),
@@ -988,20 +2204,57 @@ pub const Window = struct {
         if (!empty) self.next_frame.scene.pop_layer() catch oom();
     }
 
-    /// Paints box shadows outside `bounds`.
-    pub fn paint_shadows(self: *Window, b: Bounds(Pixels), corner_radii: Corners(Pixels), shadows: []const style_mod.BoxShadow) void {
+    /// Paints the drop (non-inset) shadows of `shadows` outside `b` (GPUI `paint_drop_shadows`).
+    /// Paint them before the background; inset shadows go after it.
+    pub fn paint_drop_shadows(self: *Window, b: Bounds(Pixels), corner_radii: Corners(Pixels), shadows: []const style_mod.BoxShadow) void {
         const sf = self.scale_factor_;
         const opacity = self.element_opacity();
+        const element_bounds = b.scale(sf);
+        const element_corner_radii = corner_radii.scale(sf);
         for (shadows) |s| {
             if (s.inset) continue;
-            const shadow_bounds = (Bounds(Pixels){ .origin = b.origin.add(s.offset), .size = b.size }).dilate(s.spread_radius);
+            const shadow_bounds = (Bounds(Pixels){ .origin = b.origin.add(s.offset), .size = b.size }).dilate(s.spread_radius_);
             insertPrim(&self.next_frame.scene, .{ .shadow = .{
                 .order = 0,
-                .blur_radius = s.blur_radius * sf,
+                .blur_radius = s.blur_radius_ * sf,
                 .bounds = shadow_bounds.scale(sf),
                 .content_mask = self.scaled_content_mask(),
                 .corner_radii = corner_radii.scale(sf),
                 .color = s.color.opacity(opacity),
+                .element_bounds = element_bounds,
+                .element_corner_radii = element_corner_radii,
+                .inset = 0,
+            } });
+        }
+    }
+
+    /// Paints the inset shadows of `shadows` inside `b`, after the background so they layer on
+    /// top of the fill (GPUI `paint_inset_shadows`). Drop shadows are skipped.
+    pub fn paint_inset_shadows(self: *Window, b: Bounds(Pixels), corner_radii: Corners(Pixels), shadows: []const style_mod.BoxShadow) void {
+        const sf = self.scale_factor_;
+        const opacity = self.element_opacity();
+        const element_bounds = b.scale(sf);
+        const element_corner_radii = corner_radii.scale(sf);
+        for (shadows) |s| {
+            if (!s.inset) continue;
+            const hole = (Bounds(Pixels){ .origin = b.origin.add(s.offset), .size = b.size }).dilate(-s.spread_radius_);
+            // Clamped at zero: a negative radius would break the SDF in the shader.
+            const hole_corner_radii: Corners(Pixels) = .{
+                .top_left = @max(corner_radii.top_left - s.spread_radius_, 0),
+                .top_right = @max(corner_radii.top_right - s.spread_radius_, 0),
+                .bottom_right = @max(corner_radii.bottom_right - s.spread_radius_, 0),
+                .bottom_left = @max(corner_radii.bottom_left - s.spread_radius_, 0),
+            };
+            insertPrim(&self.next_frame.scene, .{ .shadow = .{
+                .order = 0,
+                .blur_radius = s.blur_radius_ * sf,
+                .bounds = hole.scale(sf),
+                .content_mask = self.scaled_content_mask(),
+                .corner_radii = hole_corner_radii.scale(sf),
+                .color = s.color.opacity(opacity),
+                .element_bounds = element_bounds,
+                .element_corner_radii = element_corner_radii,
+                .inset = 1,
             } });
         }
     }
@@ -1032,12 +2285,11 @@ pub const Window = struct {
         insertPrim(&self.next_frame.scene, .{ .path = scaled });
     }
 
-    /// Paints an underline.
-    pub fn paint_underline(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle) void {
+    fn underline_primitive(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle) scene_mod.Underline {
         const sf = self.scale_factor_;
         const height: Pixels = if (style.wavy) style.thickness * 3 else style.thickness;
         const b: Bounds(Pixels) = .{ .origin = origin, .size = .{ .width = width, .height = height } };
-        insertPrim(&self.next_frame.scene, .{ .underline = .{
+        return .{
             .order = 0,
             .pad = 0,
             .bounds = b.scale(sf),
@@ -1045,7 +2297,77 @@ pub const Window = struct {
             .color = (style.color orelse color_mod.black()).opacity(self.element_opacity()),
             .thickness = style.thickness * sf,
             .wavy = .from(style.wavy),
-        } });
+        };
+    }
+
+    /// The device-space bounds an underline at `origin` with `width` is painted in, snapped to device
+    /// pixels: the origin is rounded, and the thickness is at least one device pixel. A wavy underline
+    /// is three times as thick (GPUI `underline_bounds`).
+    pub fn underline_bounds(self: *const Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle) Bounds(ScaledPixels) {
+        const sf = self.scale_factor_;
+        const snap_stroke = struct {
+            fn snap(value: f32, scale: f32) f32 {
+                if (value == 0) return 0;
+                return @max(Window.round_half_toward_zero(@max(value, 0) * scale), 1);
+            }
+        }.snap;
+        const thickness = snap_stroke(style.thickness, sf);
+        const height = if (style.wavy) thickness * 3 else thickness;
+        return .{
+            .origin = .{ .x = Window.round_half_toward_zero(origin.x * sf), .y = Window.round_half_toward_zero(origin.y * sf) },
+            .size = .{ .width = snap_stroke(width, sf), .height = height },
+        };
+    }
+
+    /// Paints an underline (GPUI `paint_underline`).
+    pub fn paint_underline(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle) void {
+        insertPrim(&self.next_frame.scene, .{ .underline = self.underline_primitive(origin, width, style) });
+    }
+
+    /// Paints an underline with the device-space horizontal spans in `exclusions` left out, for
+    /// text that must not be underlined where descenders cross (GPUI `paint_underline_with_exclusions`).
+    /// Each span is cut from the underline as ScaledPixels x-ranges.
+    pub fn paint_underline_with_exclusions(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle, exclusions: []const ScaledRange) void {
+        const underline = self.underline_primitive(origin, width, style);
+        if (exclusions.len == 0) return insertPrim(&self.next_frame.scene, .{ .underline = underline });
+
+        const clip = underline.bounds.intersect(underline.content_mask.bounds);
+        if (clip.is_empty()) return;
+        const left = clip.origin.x;
+        const right = clip.origin.x + clip.size.width;
+
+        const spans = self.next_frame.arena.allocator().alloc(ScaledRange, exclusions.len) catch oom();
+        var count: usize = 0;
+        for (exclusions) |span| {
+            const start = @max(span.start, left);
+            const end = @min(span.end, right);
+            if (start < end) {
+                spans[count] = .{ .start = start, .end = end };
+                count += 1;
+            }
+        }
+        if (count == 0) return insertPrim(&self.next_frame.scene, .{ .underline = underline });
+        std.mem.sort(ScaledRange, spans[0..count], {}, struct {
+            fn less(_: void, a: ScaledRange, b: ScaledRange) bool {
+                return a.start < b.start;
+            }
+        }.less);
+
+        var start = left;
+        for (spans[0..count]) |span| {
+            if (start < span.start) self.paint_underline_span(underline, start, span.start, clip);
+            start = @max(start, span.end);
+        }
+        if (start < right) self.paint_underline_span(underline, start, right, clip);
+    }
+
+    fn paint_underline_span(self: *Window, underline: scene_mod.Underline, start: ScaledPixels, end: ScaledPixels, clip: Bounds(ScaledPixels)) void {
+        var piece = underline;
+        piece.content_mask = .{ .bounds = .{
+            .origin = .{ .x = start, .y = clip.origin.y },
+            .size = .{ .width = end - start, .height = clip.size.height },
+        } };
+        insertPrim(&self.next_frame.scene, .{ .underline = piece });
     }
 
     /// Paints a strikethrough.
@@ -1130,28 +2452,72 @@ pub const Window = struct {
         } });
     }
 
-    /// Paints an already-rasterized polychrome image tile.
-    pub fn paint_polychrome_tile(self: *Window, b: Bounds(Pixels), corner_radii: Corners(Pixels), tile: atlas_mod.AtlasTile, grayscale: bool) void {
+    /// Paints `frame_index` of `data` drawn at `image_bounds`, clipped to `b` and rounded by
+    /// `corner_radii` (GPUI `paint_image`). Nothing is painted when the visible part is empty.
+    pub fn paint_image(
+        self: *Window,
+        b: Bounds(Pixels),
+        image_bounds: Bounds(Pixels),
+        corner_radii: Corners(Pixels),
+        data: *assets_mod.RenderImage,
+        frame_index: usize,
+        grayscale: bool,
+    ) !void {
+        const visible = b.intersect(image_bounds);
+        if (visible.size.width <= 0 or visible.size.height <= 0) return;
+        if (image_bounds.size.width <= 0 or image_bounds.size.height <= 0) return;
+
+        var builder = ImageTile{ .image = data, .frame = frame_index };
+        const key = atlas_mod.AtlasKey{ .image = assets_mod.image_atlas_key(data.id, frame_index) };
+        const tile = (try self.sprite_atlas.get_or_insert_with(key, .{ .context = &builder, .build_fn = ImageTile.build })) orelse return;
+
         const sf = self.scale_factor_;
+        const radii = corner_radii.clamp_radii_for_quad_size(visible.size).scale(sf);
         insertPrim(&self.next_frame.scene, .{ .polychrome_sprite = .{
             .order = 0,
             .pad = 0,
             .grayscale = .from(grayscale),
             .opacity = self.element_opacity(),
-            .bounds = b.scale(sf),
+            .bounds = visible.scale(sf),
             .content_mask = self.scaled_content_mask(),
-            .corner_radii = corner_radii.scale(sf),
-            .tile = tile,
+            .corner_radii = radii,
+            .tile = sub_tile(tile, image_bounds, visible),
         } });
     }
 
-    /// Paints a monochrome tile (e.g. a rasterized SVG) tinted with `color`.
-    pub fn paint_monochrome_tile(self: *Window, b: Bounds(Pixels), tile: atlas_mod.AtlasTile, color: Hsla, transformation: scene_mod.TransformationMatrix) void {
+    /// Paints the SVG at `path`, or the bytes `data` when given, as a mask tinted with `color`,
+    /// centred in `b` (GPUI `paint_svg`). The mask is rasterized at SMOOTH_SVG_SCALE_FACTOR
+    /// times the device size and drawn at half of that, which smooths its edges.
+    pub fn paint_svg(
+        self: *Window,
+        b: Bounds(Pixels),
+        path: []const u8,
+        data: ?[]const u8,
+        transformation: scene_mod.TransformationMatrix,
+        color: Hsla,
+        cx: *App,
+    ) !void {
         const sf = self.scale_factor_;
+        const smooth = svg_renderer_mod.SMOOTH_SVG_SCALE_FACTOR;
+        const device_size: Size(DevicePixels) = .{
+            .width = @intFromFloat(@ceil(b.size.width * sf * smooth)),
+            .height = @intFromFloat(@ceil(b.size.height * sf * smooth)),
+        };
+        if (device_size.width <= 0 or device_size.height <= 0) return;
+
+        var builder = SvgTile{ .cache = &cx.asset_cache, .source = cx.asset_source().*, .path = path, .data = data, .size = device_size };
+        const key = atlas_mod.AtlasKey{ .svg = svg_key(path, data, device_size) };
+        const tile = (try self.sprite_atlas.get_or_insert_with(key, .{ .context = &builder, .build_fn = SvgTile.build })) orelse return;
+
+        const draw_w = @as(f32, @floatFromInt(tile.bounds.size.width)) / smooth;
+        const draw_h = @as(f32, @floatFromInt(tile.bounds.size.height)) / smooth;
+        const center = b.center();
+        const ox = @round(center.x * sf - draw_w / 2.0);
+        const oy = @round(center.y * sf - draw_h / 2.0);
         insertPrim(&self.next_frame.scene, .{ .monochrome_sprite = .{
             .order = 0,
             .pad = 0,
-            .bounds = b.scale(sf),
+            .bounds = .{ .origin = .{ .x = ox, .y = oy }, .size = .{ .width = draw_w, .height = draw_h } },
             .content_mask = self.scaled_content_mask(),
             .color = color.opacity(self.element_opacity()),
             .tile = tile,
@@ -1165,9 +2531,20 @@ pub const Window = struct {
     pub fn draw(self: *Window, cx: *App) void {
         self.drawing = true;
         defer self.drawing = false;
+        const ts = self.text_system();
+        if (self.line_layout_cache == null) self.line_layout_cache = ts.new_layout_cache();
+        const outer_cache = ts.active_cache;
+        ts.active_cache = &self.line_layout_cache.?;
+        defer ts.active_cache = outer_cache;
+        for (self.animation_views.items) |view| self.mark_view_dirty(view);
+        self.animation_views.clearRetainingCapacity();
         self.dirty = false;
         self.animation_requested = false;
         self.frame_count += 1;
+        if (self.pending_input_notify) {
+            self.pending_input_notify = false;
+            cx.dispatch_pending_input_observers(self);
+        }
 
         // Callbacks registered with on_next_frame.
         if (self.next_frame_callbacks.items.len > 0) {
@@ -1180,7 +2557,6 @@ pub const Window = struct {
         self.next_frame.clear();
         self.layout_engine.clear();
         self.next_rendered_entities.clearRetainingCapacity();
-        self.next_hitbox_id = 1;
         self.text_style_stack.clearRetainingCapacity();
         self.element_offset_stack.clearRetainingCapacity();
         self.content_mask_stack.clearRetainingCapacity();
@@ -1196,66 +2572,170 @@ pub const Window = struct {
         if (self.root) |root| {
             const el = root.into_any_element();
             el.prepaint_as_root(.{ .x = 0, .y = 0 }, .{
-                .width = .{ .definite = self.viewport_size.width },
-                .height = .{ .definite = self.viewport_size.height },
+                .width = .{ .definite = self.viewport_size_.width },
+                .height = .{ .definite = self.viewport_size_.height },
             }, self, cx);
             self.prepaint_deferred_draws(cx);
+            const prompt_element = self.prepaint_prompt(cx);
+            const overlay = self.prepaint_overlay(cx);
+            // Painting asks what is hovered, and hitbox ids do not carry over from frame to frame.
+            self.hit_test_frame(&self.next_frame, self.mouse_position_);
             el.paint(self, cx);
             self.paint_deferred_draws(cx);
+            if (prompt_element) |p| p.paint(self, cx);
+            if (overlay) |o| o.paint(self, cx);
         }
         cx.pending_updates -= 1;
 
+        self.refreshing = false;
+        self.dirty_views.clearRetainingCapacity();
         self.next_frame.scene.finish();
         self.next_frame.focus = self.focus_id;
         self.next_frame.window_active = self.active;
 
+        // Focus listeners compare the focus path of the frame drawn now with the previous one.
+        const previous_focus = focus_events.focus_path(&self.rendered_frame, self.allocator);
+        const previous_active = self.rendered_frame.window_active;
         std.mem.swap(Frame, &self.rendered_frame, &self.next_frame);
-        self.text_system().finish_frame();
+        focus_events.after_draw(self, cx, previous_focus, previous_active);
+        self.line_layout_cache.?.finish_frame();
+        ts.finish_frame();
         std.mem.swap(std.AutoHashMapUnmanaged(EntityId, void), &self.rendered_entities, &self.next_rendered_entities);
         self.gc_element_states();
         self.hit_test(self.mouse_position_);
         self.update_cursor();
-        self.update_input_handler();
+        self.update_input_handler(cx);
         self.needs_present = true;
         // Effects queued during render (e.g. notify) are processed now.
         cx.flush_effects();
+        // Glyphs this frame could not draw go to `on_missing_glyphs`, after the frame has finished.
+        cx.dispatch_missing_glyphs();
     }
 
-    fn prepaint_deferred_draws(self: *Window, cx: *App) void {
-        const draws = self.next_frame.deferred_draws.items;
-        std.sort.pdq(DeferredDraw, draws, {}, struct {
-            fn lt(_: void, a: DeferredDraw, b: DeferredDraw) bool {
-                return a.priority < b.priority;
+    /// The prompt covers the window, over the root view and its deferred draws.
+    fn prepaint_prompt(self: *Window, cx: *App) ?element_mod.AnyElement {
+        const active = self.prompt_ orelse return null;
+        const el = active.handle.view.into_any_element();
+        el.prepaint_as_root(.{ .x = 0, .y = 0 }, .{
+            .width = .{ .definite = self.viewport_size_.width },
+            .height = .{ .definite = self.viewport_size_.height },
+        }, self, cx);
+        return el;
+    }
+
+    /// The dragged view follows the pointer, and hides any tooltip while it does.
+    fn prepaint_overlay(self: *Window, cx: *App) ?element_mod.AnyElement {
+        if (cx.active_drag) |drag| {
+            const el = drag.view.into_any_element();
+            el.prepaint_as_root(self.mouse_position_.sub(drag.cursor_offset), taffy_mod.AvailableSpace.min_size(), self, cx);
+            return el;
+        }
+        return self.prepaint_tooltip(cx);
+    }
+
+    pub fn set_tooltip(self: *Window, request: AnyTooltip) void {
+        self.next_frame.tooltip_requests.append(self.allocator, request) catch oom();
+    }
+
+    /// Places the last tooltip that still wants showing, keeping it inside the window.
+    fn prepaint_tooltip(self: *Window, cx: *App) ?element_mod.AnyElement {
+        self.tooltip_bounds = null;
+        var i = self.next_frame.tooltip_requests.items.len;
+        while (i > 0) {
+            i -= 1;
+            const request = self.next_frame.tooltip_requests.items[i];
+            const el = request.view.into_any_element();
+            const tooltip_size = el.layout_as_root(taffy_mod.AvailableSpace.min_size(), self, cx);
+            const origin = tooltip_origin(request.mouse_position, tooltip_size, self.viewport_size_);
+            const tooltip_area: Bounds(Pixels) = .{ .origin = origin, .size = tooltip_size };
+            if (!request.check_visible_and_update(request.ctx, tooltip_area, self, cx)) continue;
+            el.prepaint_at(origin, self, cx);
+            self.tooltip_bounds = tooltip_area;
+            return el;
+        }
+        return null;
+    }
+
+    fn deferred_by_priority(self: *Window, start: usize, end: usize) []usize {
+        const order = frame_arena().alloc(usize, end - start) catch oom();
+        for (order, start..) |*slot, i| slot.* = i;
+        std.mem.sort(usize, order, self.next_frame.deferred_draws.items, struct {
+            fn lt(draws: []const DeferredDraw, a: usize, b: usize) bool {
+                return draws[a].priority < draws[b].priority;
             }
         }.lt);
-        var i: usize = 0;
-        while (i < self.next_frame.deferred_draws.items.len) : (i += 1) {
-            const d = self.next_frame.deferred_draws.items[i];
-            const saved = self.text_style_stack.items.len;
-            self.text_style_stack.appendSlice(self.allocator, d.text_style_stack) catch oom();
-            // The deferred child was laid out by `Deferred.request_layout`; GPUI only prepaints it here.
-            d.element.prepaint_at(d.absolute_offset, self, cx);
-            self.text_style_stack.shrinkRetainingCapacity(saved);
+        return order;
+    }
+
+    /// Prepaints in rounds, since a deferred element can defer more. The list stays in the order
+    /// the draws were added, because reused views name parts of it by index (GPUI `prepaint_deferred_draws`).
+    fn prepaint_deferred_draws(self: *Window, cx: *App) void {
+        var round_start: usize = 0;
+        var depth: usize = 0;
+        while (round_start < self.next_frame.deferred_draws.items.len) : (depth += 1) {
+            if (depth >= 10) @panic("exceeded the maximum (10) deferred depth");
+            const round_end = self.next_frame.deferred_draws.items.len;
+            for (self.deferred_by_priority(round_start, round_end)) |ix| {
+                const d = self.next_frame.deferred_draws.items[ix];
+                const saved = self.text_style_stack.items.len;
+                self.text_style_stack.appendSlice(self.allocator, d.text_style_stack) catch oom();
+                const start = self.prepaint_index();
+                if (d.element) |element| {
+                    const outer_arena = swap_frame_arena(d.arena);
+                    defer _ = swap_frame_arena(outer_arena);
+                    if (d.view) |view| self.push_view(view);
+                    defer if (d.view != null) self.pop_view();
+                    // The deferred child was laid out by `Deferred.request_layout`; GPUI only prepaints it here.
+                    element.prepaint_at(d.absolute_offset, self, cx);
+                } else {
+                    self.reuse_prepaint(d.prepaint_start, d.prepaint_end);
+                }
+                const end = self.prepaint_index();
+                const slot = &self.next_frame.deferred_draws.items[ix];
+                slot.prepaint_start = start;
+                slot.prepaint_end = end;
+                self.text_style_stack.shrinkRetainingCapacity(saved);
+            }
+            round_start = round_end;
         }
     }
 
     fn paint_deferred_draws(self: *Window, cx: *App) void {
-        for (self.next_frame.deferred_draws.items) |d| {
+        for (self.deferred_by_priority(0, self.next_frame.deferred_draws.items.len)) |ix| {
+            const d = self.next_frame.deferred_draws.items[ix];
             const saved = self.text_style_stack.items.len;
             self.text_style_stack.appendSlice(self.allocator, d.text_style_stack) catch oom();
-            d.element.paint(self, cx);
+            const start = self.paint_index();
+            if (d.element) |element| {
+                const outer_arena = swap_frame_arena(d.arena);
+                defer _ = swap_frame_arena(outer_arena);
+                if (d.view) |view| self.push_view(view);
+                defer if (d.view != null) self.pop_view();
+                element.paint(self, cx);
+            } else {
+                self.reuse_paint(d.paint_start, d.paint_end);
+            }
+            const end = self.paint_index();
+            const slot = &self.next_frame.deferred_draws.items[ix];
+            slot.paint_start = start;
+            slot.paint_end = end;
             self.text_style_stack.shrinkRetainingCapacity(saved);
         }
     }
 
+    /// A drag can start before the next paint records its cursor in the frame, so it comes first.
     fn update_cursor(self: *Window) void {
+        if (self.app.active_drag_cursor_style()) |drag_style| {
+            self.app.platform.set_cursor_style(drag_style);
+            return;
+        }
         var style: CursorStyle = .arrow;
         var i = self.rendered_frame.cursor_styles.items.len;
         while (i > 0) {
             i -= 1;
             const r = self.rendered_frame.cursor_styles.items[i];
             if (r.hitbox_id) |hid| {
-                if (self.hitbox_is_hovered(hid)) {
+                if (self.hitbox_is_hovered_ignoring_last_input(hid)) {
                     style = r.style;
                     break;
                 }
@@ -1267,13 +2747,30 @@ pub const Window = struct {
         self.app.platform.set_cursor_style(style);
     }
 
-    fn update_input_handler(self: *Window) void {
+    fn update_input_handler(self: *Window, cx: *App) void {
         const handlers = self.rendered_frame.input_handlers.items;
+        var field: ?FocusId = null;
         if (handlers.len > 0) {
-            self.platform_window.set_input_handler(handlers[handlers.len - 1].handler);
+            const entry = handlers[handlers.len - 1];
+            self.platform_window.set_input_handler(entry.handler);
+            var handler = entry.handler;
+            if (handler.accepts_text_input(self, cx)) field = entry.focus_id;
         } else {
             self.platform_window.take_input_handler();
         }
+        if (field == self.focused_text_input) {
+            // After painting, layouts match the text, so the caret's position is real.
+            if (field != null and self.ime_position_dirty) {
+                if (self.ime_area_in(cx)) |area| self.platform_window.update_ime_position(area);
+            }
+            self.ime_position_dirty = false;
+            return;
+        }
+        self.ime_position_dirty = false;
+        // Text-input protocols must hear about every change of field, not only on and off.
+        if (self.focused_text_input != null) self.platform_window.update_ime_enabled(false);
+        self.focused_text_input = field;
+        if (field != null) self.platform_window.update_ime_enabled(true);
     }
 
     /// Presents the last drawn frame to the platform window.
@@ -1287,8 +2784,17 @@ pub const Window = struct {
 
     /// Dispatches platform input; returns whether it was handled.
     pub fn dispatch_event(self: *Window, event: interactive.PlatformInput, cx: *App) bool {
-        self.default_prevented = false;
+        self.default_prevented_ = false;
         self.propagate_event = true;
+        // Focus-visible styles and hover suppression follow the modality of the last input (GPUI).
+        const old_modality = self.last_input_modality;
+        self.last_input_modality = switch (event) {
+            .key_down => .keyboard,
+            .mouse_move, .mouse_down => .mouse,
+            .touch => .touch,
+            else => self.last_input_modality,
+        };
+        if (self.last_input_modality != old_modality) self.refresh();
         cx.pending_updates += 1;
         defer {
             cx.pending_updates -= 1;
@@ -1299,52 +2805,106 @@ pub const Window = struct {
         defer current_frame_arena = prev_arena;
         switch (event) {
             .mouse_move => |e| {
-                self.mouse_position_ = e.position;
+                self.set_mouse_position(e.position);
                 self.modifiers_ = e.modifiers;
-                self.last_input_was_keyboard = false;
                 self.dispatch_mouse(interactive.MouseMoveEvent, &e, cx);
             },
             .mouse_down => |e| {
-                self.mouse_position_ = e.position;
+                self.set_mouse_position(e.position);
                 self.modifiers_ = e.modifiers;
-                self.last_input_was_keyboard = false;
                 self.dispatch_mouse(interactive.MouseDownEvent, &e, cx);
             },
             .mouse_up => |e| {
-                self.mouse_position_ = e.position;
+                self.set_mouse_position(e.position);
                 self.modifiers_ = e.modifiers;
                 self.dispatch_mouse(interactive.MouseUpEvent, &e, cx);
             },
             .mouse_exited => |e| {
-                self.mouse_position_ = e.position;
+                self.set_mouse_position(e.position);
                 self.modifiers_ = e.modifiers;
                 self.dispatch_mouse(interactive.MouseExitEvent, &e, cx);
             },
             .scroll_wheel => |e| {
-                self.mouse_position_ = e.position;
+                self.set_mouse_position(e.position);
                 self.modifiers_ = e.modifiers;
                 self.dispatch_mouse(interactive.ScrollWheelEvent, &e, cx);
             },
             .modifiers_changed => |e| {
                 self.modifiers_ = e.modifiers;
-                self.capslock = e.capslock;
+                self.capslock_state = e.capslock;
                 self.dispatch_mouse(interactive.ModifiersChangedEvent, &e, cx);
+                self.dispatch_modifier_tap(&e, cx);
             },
             .key_down => |e| {
                 self.modifiers_ = e.keystroke.modifiers;
-                self.last_input_was_keyboard = true;
                 self.dispatch_key_event(interactive.KeyDownEvent, &e, cx);
             },
             .key_up => |e| {
                 self.modifiers_ = e.keystroke.modifiers;
                 self.dispatch_key_event(interactive.KeyUpEvent, &e, cx);
             },
-            .file_drop => |e| {
-                self.dispatch_mouse(interactive.FileDropEvent, &e, cx);
+            // A file drag behaves like a drag started inside the window, so elements handle
+            // both the same way, as in GPUI.
+            .long_press => |e| {
+                self.set_mouse_position(if (e.phase == .started) e.start_position else e.position);
+                if (e.phase == .started) self.long_press_capture = null;
+                self.dispatch_mouse(interactive.LongPressEvent, &e, cx);
+            },
+            .file_drop => |e| switch (e) {
+                .entered => |d| {
+                    self.set_mouse_position(d.position);
+                    if (cx.active_drag == null) {
+                        const view = cx.new(d.paths);
+                        const value = cx.allocator.create(interactive.ExternalPaths) catch oom();
+                        value.* = d.paths;
+                        cx.active_drag = .{
+                            .value = .{ .ptr = value, .type_id = app_mod.type_id(interactive.ExternalPaths) },
+                            .view = view_mod.AnyView.from(view),
+                            .cursor_offset = d.position,
+                            .free_value = struct {
+                                fn free(a: std.mem.Allocator, raw: *anyopaque) void {
+                                    a.destroy(@as(*interactive.ExternalPaths, @ptrCast(@alignCast(raw))));
+                                }
+                            }.free,
+                        };
+                    }
+                    return self.dispatch_event(.{ .mouse_move = .{ .position = d.position, .pressed_button = .left } }, cx);
+                },
+                .pending => |d| {
+                    self.set_mouse_position(d.position);
+                    return self.dispatch_event(.{ .mouse_move = .{ .position = d.position, .pressed_button = .left } }, cx);
+                },
+                .submit => |d| {
+                    cx.activate(true);
+                    self.set_mouse_position(d.position);
+                    return self.dispatch_event(.{ .mouse_up = .{ .button = .left, .position = d.position, .click_count = 1 } }, cx);
+                },
+                .exited, .ended => {
+                    cx.clear_active_drag();
+                    self.refresh();
+                    self.dispatch_mouse(interactive.FileDropEvent, &e, cx);
+                },
+            },
+            .pinch => |e| {
+                self.modifiers_ = e.modifiers;
+                self.dispatch_mouse(interactive.PinchEvent, &e, cx);
+            },
+            .mouse_pressure => |e| {
+                self.set_mouse_position(e.position);
+                self.modifiers_ = e.modifiers;
+                self.dispatch_mouse(interactive.MousePressureEvent, &e, cx);
             },
             else => {},
         }
-        return !self.propagate_event or self.default_prevented;
+        return !self.propagate_event or self.default_prevented_;
+    }
+
+    fn call_mouse_listener(self: *Window, l: MouseListener, event: *const anyopaque, phase: DispatchPhase, cx: *App) void {
+        if (l.view) |view| self.view_stack.append(self.allocator, view) catch oom();
+        defer if (l.view != null) {
+            _ = self.view_stack.pop();
+        };
+        l.func(l.ctx, event, phase, self, cx);
     }
 
     fn dispatch_mouse(self: *Window, comptime E: type, event: *const E, cx: *App) void {
@@ -1354,7 +2914,7 @@ pub const Window = struct {
         // Capture phase: back to front.
         for (listeners) |l| {
             if (l.event_type != tid) continue;
-            l.func(l.ctx, event, .capture, self, cx);
+            self.call_mouse_listener(l, event, .capture, cx);
             if (!self.propagate_event) break;
         }
         if (self.propagate_event) {
@@ -1363,29 +2923,173 @@ pub const Window = struct {
                 i -= 1;
                 const l = listeners[i];
                 if (l.event_type != tid) continue;
-                l.func(l.ctx, event, .bubble, self, cx);
+                self.call_mouse_listener(l, event, .bubble, cx);
                 if (!self.propagate_event) break;
             }
         }
-        if (E == interactive.MouseMoveEvent) self.update_cursor();
+        // A drag follows the pointer, and any release no element took cancels it.
+        if (cx.has_active_drag()) {
+            if (E == interactive.MouseMoveEvent) {
+                self.refresh();
+            } else if (E == interactive.MouseUpEvent) {
+                cx.clear_active_drag();
+                self.refresh();
+            }
+        }
+        // After the listeners, so a drag they started or ended takes effect in this event. Any
+        // earlier would briefly select whatever is under the pointer (GPUI `dispatch_mouse_event`).
+        self.update_cursor();
+    }
+
+    /// The rendered frame is what events are matched against, so bring it up to date first.
+    fn draw_if_dirty(self: *Window, cx: *App) void {
+        if (!self.dirty) return;
+        self.draw(cx);
+        current_frame_arena = &self.rendered_frame.arena;
     }
 
     fn dispatch_key_event(self: *Window, comptime E: type, event: *const E, cx: *App) void {
+        self.draw_if_dirty(cx);
+        if (E == interactive.KeyDownEvent) {
+            self.pending_modifier.saw_other_input = true;
+            // Typing hides the mouse cursor until the mouse moves (GPUI `dispatch_key_event`).
+            if (event.keystroke.key_char != null and cx.cursor_hide_mode() != .never) cx.hide_cursor_until_mouse_moves();
+            self.dispatch_keystroke(E, event, event.keystroke, cx);
+            return;
+        }
+        const path = self.rendered_frame.dispatch_tree.dispatch_path(self.focus_id, self.allocator);
+        defer self.allocator.free(path);
+        self.dispatch_key_listeners(E, event, path, cx);
+    }
+
+    /// Pressing and releasing one modifier alone is a keystroke of its own, such as a binding
+    /// for "shift" (GPUI `pending_modifier`).
+    fn dispatch_modifier_tap(self: *Window, event: *const interactive.ModifiersChangedEvent, cx: *App) void {
+        const held = event.modifiers.number_of_modifiers();
+        const previous = self.pending_modifier.modifiers;
+        const was_clean = !self.pending_modifier.saw_other_input;
+        if (previous.number_of_modifiers() == 0 and held == 1) {
+            self.pending_modifier.saw_other_input = false;
+        } else if (held > 1) {
+            self.pending_modifier.saw_other_input = true;
+        }
+        self.pending_modifier.modifiers = event.modifiers;
+        if (held != 0 or previous.number_of_modifiers() != 1 or !was_clean) return;
+
+        const key: []const u8 = if (previous.shift)
+            "shift"
+        else if (previous.control)
+            "control"
+        else if (previous.alt)
+            "alt"
+        else if (previous.platform)
+            "platform"
+        else if (previous.function)
+            "function"
+        else
+            return;
+        self.draw_if_dirty(cx);
+        self.dispatch_keystroke(interactive.ModifiersChangedEvent, event, .{ .key = key }, cx);
+    }
+
+    /// Matches one keystroke against the keymap and handles the result (the keystroke half of
+    /// GPUI `dispatch_key_event`).
+    fn dispatch_keystroke(self: *Window, comptime E: type, event: *const E, keystroke: keystroke_mod.Keystroke, cx: *App) void {
         const tree = &self.rendered_frame.dispatch_tree;
         const path = tree.dispatch_path(self.focus_id, self.allocator);
         defer self.allocator.free(path);
-        const tid = app_mod.type_id(E);
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const contexts = tree.context_stack(path, arena);
 
-        // Keybindings first (key down only).
-        if (E == interactive.KeyDownEvent) {
-            const contexts = tree.context_stack(path, self.allocator);
-            defer self.allocator.free(contexts);
-            if (cx.keymap.binding_for(event.keystroke, contexts)) |binding| {
-                const action = binding.action;
-                self.dispatch_action_on_path(path, action, cx);
-                if (!self.propagate_event) return;
+        const preference = self.input_preference(E, event, cx);
+        self.propagate_event = true;
+        const intercepted: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .input_preference = preference, .context_stack = contexts };
+        cx.dispatch_keystroke_interceptors(&intercepted, self);
+        if (!self.propagate_event) {
+            self.finish_dispatch_keystroke(E, event, keystroke, preference, contexts, path, cx);
+            return;
+        }
+
+        // Taken out because actions may clear it, and freed last because replays read its strings.
+        var previous = self.pending_keystrokes;
+        self.pending_keystrokes = .empty;
+        defer free_keystrokes(self.allocator, &previous);
+        const stale = self.pending_focus != null and self.pending_focus != self.focus_id;
+        const had_timeout = self.pending_timeout != null and !stale;
+        const had_pending = previous.items.len > 0;
+        self.drop_pending_timeout();
+        self.pending_timeout_generation +%= 1;
+
+        const input: []const keystroke_mod.Keystroke = if (stale) &.{} else previous.items;
+        const result = key_dispatch.dispatch_key(arena, &cx.keymap, input, keystroke, contexts) catch oom();
+
+        if (result.to_replay.len > 0) {
+            self.replay_pending_input(result.to_replay, path, cx);
+            self.propagate_event = true;
+        }
+
+        if (result.pending.len > 0) {
+            self.store_pending_keystrokes(result.pending);
+            self.pending_focus = self.focus_id;
+            var needs_timeout = had_timeout or result.pending_has_binding;
+            if (!needs_timeout and keystroke.key_char != null) {
+                if (self.platform_window.input_handler()) |h| {
+                    var handler = h;
+                    needs_timeout = handler.accepts_text_input(self, cx);
+                }
+            }
+            if (!needs_timeout and result.pending.len == 1 and result.pending[0].is_modifier_key()) needs_timeout = true;
+            if (needs_timeout) self.start_pending_input_timeout(cx);
+            cx.dispatch_pending_input_observers(self);
+            self.propagate_event = false;
+            return;
+        }
+
+        const pending_changed = had_pending;
+        defer if (pending_changed) cx.dispatch_pending_input_observers(self);
+        // Interceptors or replayed actions may have changed whether the input handler accepts text,
+        // so the preference is checked again before bindings run (GPUI `dispatch_key_event`).
+        const recheck = self.input_preference(E, event, cx);
+        if (recheck == .key_bindings) {
+            for (result.bindings) |binding| {
+                self.dispatch_action_on_path(path, binding.action, cx);
+                if (!self.propagate_event) {
+                    const observed: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .input_preference = recheck, .action = binding.action, .context_stack = contexts };
+                    cx.dispatch_keystroke_observers(&observed, self);
+                    return;
+                }
             }
         }
+        self.finish_dispatch_keystroke(E, event, keystroke, recheck, contexts, path, cx);
+    }
+
+    /// Whether a key down prefers typing text over key bindings (GPUI `Window::input_preference`).
+    /// That holds only when the platform asks for it (AltGr on Windows, for one) and the focused
+    /// input accepts text. Other events always go to key bindings.
+    fn input_preference(self: *Window, comptime E: type, event: *const E, cx: *App) app_mod.InputPreference {
+        if (comptime E != interactive.KeyDownEvent) return .key_bindings;
+        if (!event.prefer_character_input) return .key_bindings;
+        var handler = self.platform_window.input_handler() orelse return .key_bindings;
+        return if (handler.accepts_text_input(self, cx)) .character_input else .key_bindings;
+    }
+
+    fn finish_dispatch_keystroke(self: *Window, comptime E: type, event: *const E, keystroke: keystroke_mod.Keystroke, preference: app_mod.InputPreference, contexts: []const key_dispatch.KeyContext, path: []const key_dispatch.DispatchNodeId, cx: *App) void {
+        if (E == interactive.KeyDownEvent) {
+            self.dispatch_key_listeners(E, event, path, cx);
+            if (!self.propagate_event) return;
+            self.deliver_key_text(keystroke, cx);
+        } else if (!self.propagate_event) {
+            return;
+        }
+        const observed: app_mod.KeystrokeEvent = .{ .keystroke = keystroke, .input_preference = preference, .context_stack = contexts };
+        cx.dispatch_keystroke_observers(&observed, self);
+    }
+
+    fn dispatch_key_listeners(self: *Window, comptime E: type, event: *const E, path: []const key_dispatch.DispatchNodeId, cx: *App) void {
+        const tree = &self.rendered_frame.dispatch_tree;
+        const tid = app_mod.type_id(E);
         // Capture.
         for (path) |nid| {
             for (tree.node(nid).key_listeners.items) |l| {
@@ -1404,17 +3108,149 @@ pub const Window = struct {
                 if (!self.propagate_event) return;
             }
         }
-        // Unhandled key-down: deliver text to the input handler.
-        if (E == interactive.KeyDownEvent) {
-            if (event.keystroke.key_char) |text| {
-                if (!event.keystroke.modifiers.control and !event.keystroke.modifiers.platform) {
-                    if (self.platform_window.input_handler()) |h| {
-                        var handler = h;
-                        handler.replace_text_in_range(null, text, self, cx);
-                    }
+    }
+
+    /// An unhandled key press types its text into the focused field.
+    fn deliver_key_text(self: *Window, keystroke: keystroke_mod.Keystroke, cx: *App) void {
+        const text = keystroke.key_char orelse return;
+        if (keystroke.modifiers.control or keystroke.modifiers.platform) return;
+        var handler = self.platform_window.input_handler() orelse return;
+        self.ime_position_dirty = true;
+        handler.replace_text_in_range(null, text, self, cx);
+    }
+
+    /// Handles keystrokes that did not become a sequence as if they had been typed alone.
+    fn replay_pending_input(self: *Window, replays: []const key_dispatch.Replay, path: []const key_dispatch.DispatchNodeId, cx: *App) void {
+        next: for (replays) |replay| {
+            const event: interactive.KeyDownEvent = .{ .keystroke = replay.keystroke };
+            self.propagate_event = true;
+            for (replay.bindings) |binding| {
+                self.dispatch_action_on_path(path, binding.action, cx);
+                if (!self.propagate_event) {
+                    const observed: app_mod.KeystrokeEvent = .{ .keystroke = replay.keystroke, .input_preference = .key_bindings, .action = binding.action };
+                    cx.dispatch_keystroke_observers(&observed, self);
+                    continue :next;
                 }
             }
+            self.dispatch_key_listeners(interactive.KeyDownEvent, &event, path, cx);
+            if (!self.propagate_event) continue;
+            self.deliver_key_text(replay.keystroke, cx);
         }
+    }
+
+    fn store_pending_keystrokes(self: *Window, keystrokes: []const keystroke_mod.Keystroke) void {
+        for (keystrokes) |keystroke| {
+            var owned = keystroke;
+            owned.key = self.allocator.dupe(u8, keystroke.key) catch oom();
+            if (keystroke.key_char) |text| owned.key_char = self.allocator.dupe(u8, text) catch oom();
+            self.pending_keystrokes.append(self.allocator, owned) catch oom();
+        }
+    }
+
+    fn start_pending_input_timeout(self: *Window, cx: *App) void {
+        self.drop_pending_timeout();
+        self.pending_timeout = .{ .duration_ns = PENDING_INPUT_TIMEOUT_NS, .remaining_ns = PENDING_INPUT_TIMEOUT_NS };
+        self.run_pending_timeout(cx);
+    }
+
+    /// Starts a timer for the time left on the timeout, and records when it started. Each timer
+    /// carries a generation, so one started before a pause or a new key is ignored when it fires.
+    fn run_pending_timeout(self: *Window, cx: *App) void {
+        if (self.pending_timeout) |*timeout| {
+            self.pending_timeout_generation +%= 1;
+            timeout.started_at_ns = executor_mod.now_ns();
+            const timer: PendingInputTimer = .{ .app = cx, .window_id = self.window_handle_id(), .generation = self.pending_timeout_generation };
+            cx.background_executor().after(cx.foreground_executor(), timeout.remaining_ns, PendingInputTimer.fire, timer);
+        }
+    }
+
+    /// Forgets the timeout, and the pause subscription it held (if any).
+    fn drop_pending_timeout(self: *Window) void {
+        if (self.pending_timeout) |timeout| {
+            if (timeout.pause) |pause| pause.release.unsubscribe();
+        }
+        self.pending_timeout = null;
+    }
+
+    /// The timeout of the pending input, when that input belongs to the focus that is current.
+    fn focused_pending_timeout(self: *Window) ?*PendingTimeout {
+        if (self.pending_keystrokes.items.len == 0) return null;
+        if (self.pending_focus != null and self.pending_focus != self.focus_id) return null;
+        if (self.pending_timeout) |*timeout| return timeout;
+        return null;
+    }
+
+    /// The pending input that can still complete a multi-stroke binding, with its timeout (GPUI `pending_input`).
+    pub fn pending_input(self: *const Window) ?PendingInputStatus {
+        if (self.pending_keystrokes.items.len == 0) return null;
+        if (self.pending_focus != null and self.pending_focus != self.focus_id) return null;
+        return .{
+            .keystroke_list = self.pending_keystrokes.items,
+            .timeout_status = if (self.pending_timeout) |timeout| timeout.status() else null,
+        };
+    }
+
+    /// Pauses or resumes the pending-input timeout on behalf of `owner`. A paused timeout resumes by
+    /// itself when `owner` is released. Returns whether the state changed. A timeout paused by one
+    /// owner cannot be resumed by another (GPUI `set_pending_input_timeout_paused`).
+    pub fn set_pending_input_timeout_paused(self: *Window, owner: anytype, paused: bool, cx: *App) bool {
+        const owner_id = owner.entity_id();
+        if (!paused) return self.resume_pending_input_timeout(owner_id, cx);
+
+        const timeout = self.focused_pending_timeout() orelse return false;
+        if (timeout.pause != null) return false;
+        const release = cx.observe_release_in(owner, self, end_pending_timeout_pause);
+        if (timeout.started_at_ns) |started| {
+            timeout.remaining_ns -|= executor_mod.now_ns() -| started;
+        }
+        timeout.started_at_ns = null;
+        timeout.pause = .{ .owner_id = owner_id, .release = release };
+        // The timer that is running must not flush while paused.
+        self.pending_timeout_generation +%= 1;
+        self.pending_input_notify = true;
+        return true;
+    }
+
+    fn resume_pending_input_timeout(self: *Window, owner_id: app_mod.EntityId, cx: *App) bool {
+        const timeout = self.focused_pending_timeout() orelse return false;
+        const pause = timeout.pause orelse return false;
+        if (pause.owner_id != owner_id) return false;
+        pause.release.unsubscribe();
+        timeout.pause = null;
+        self.run_pending_timeout(cx);
+        self.pending_input_notify = true;
+        return true;
+    }
+
+    /// Runs when the owner of a pause is released. Only the current pause can fire: the subscriptions
+    /// of earlier pauses are unsubscribed when they end.
+    fn end_pending_timeout_pause(_: anytype, window: *Window, cx: *App) void {
+        const timeout = window.focused_pending_timeout() orelse return;
+        if (timeout.pause == null) return;
+        timeout.pause = null;
+        window.run_pending_timeout(cx);
+        window.pending_input_notify = true;
+    }
+
+    /// Whether a potential multi-stroke binding is in progress.
+    pub fn has_pending_keystrokes(self: *const Window) bool {
+        return self.pending_input_keystrokes() != null;
+    }
+
+    /// The input that can still complete a multi-stroke binding. Input left over from a previous
+    /// focus never can.
+    pub fn pending_input_keystrokes(self: *const Window) ?[]const keystroke_mod.Keystroke {
+        if (self.pending_keystrokes.items.len == 0) return null;
+        if (self.pending_focus != null and self.pending_focus != self.focus_id) return null;
+        return self.pending_keystrokes.items;
+    }
+
+    pub fn clear_pending_keystrokes(self: *Window) void {
+        if (self.pending_keystrokes.items.len == 0) return;
+        free_keystrokes(self.allocator, &self.pending_keystrokes);
+        self.drop_pending_timeout();
+        self.pending_timeout_generation +%= 1;
+        self.pending_input_notify = true;
     }
 
     /// Dispatches a boxed action along the focus path, then globally.
@@ -1440,20 +3276,182 @@ pub const Window = struct {
             i -= 1;
             for (tree.node(path[i]).action_listeners.items) |l| {
                 if (l.action_type != action.type_id) continue;
+                // Bubble listeners stop the action unless they call `App.propagate`.
                 self.propagate_event = false;
+                cx.propagate_event = false;
                 l.func(l.ctx, action.ptr, .bubble, self, cx);
-                if (!self.propagate_event) return;
+                if (!cx.propagate_event and !self.propagate_event) return;
+                // Whoever dispatched this reads the window's flag: a propagating action must not
+                // look handled, or a key binding would swallow its key.
+                self.propagate_event = true;
             }
         }
         cx.dispatch_global_action(action);
     }
 
-    pub fn is_action_available(self: *Window, action_type: app_mod.TypeId) bool {
+    /// The actions that have a listener on the focus path, built from the app's action registry
+    /// (GPUI `available_actions`). An action the registry cannot build is left out. Allocated in
+    /// the frame arena.
+    pub fn available_actions(self: *const Window, cx: *const App) []action_mod.AnyAction {
+        const arena = frame_arena();
         const tree = &self.rendered_frame.dispatch_tree;
         const path = tree.dispatch_path(self.focus_id, self.allocator);
         defer self.allocator.free(path);
+        var out: std.ArrayList(action_mod.AnyAction) = .empty;
+        for (path) |nid| for (tree.node(nid).action_listeners.items) |l| {
+            var seen = false;
+            for (out.items) |a| {
+                if (a.type_id == l.action_type) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            const action = cx.actions.build_action_type(l.action_type, arena) catch continue;
+            out.append(arena, action) catch oom();
+        };
+        return out.toOwnedSlice(arena) catch oom();
+    }
+
+    /// The highest-precedence binding that dispatches `action` in the focused element's context,
+    /// or null if it is unbound or shadowed (GPUI `highest_precedence_binding_for_action`).
+    /// Actions match by type, as `Keymap.bindings_for_action` does, not by value.
+    pub fn highest_precedence_binding_for_action(self: *Window, action: anytype) ?keymap_mod.KeyBinding {
+        const T = @TypeOf(action);
+        const probe: action_mod.AnyAction = .{ .type_id = app_mod.type_id(T), .ptr = &action, .name = action_mod.action_name(T) };
+        const keymap = &self.app.keymap;
+        const tree = &self.rendered_frame.dispatch_tree;
+        const path = tree.dispatch_path(self.focus_id, self.allocator);
+        defer self.allocator.free(path);
+        const contexts = tree.context_stack(path, self.allocator);
+        defer self.allocator.free(contexts);
+        const candidates = keymap.bindings_for_action(self.allocator, probe) catch oom();
+        defer self.allocator.free(candidates);
+        // Newest first: the first binding that wins at its own keystrokes is the highest precedence.
+        for (candidates) |binding| {
+            const typed = plain_keystrokes(self.allocator, binding.keystrokes);
+            defer self.allocator.free(typed);
+            const found = keymap.bindings_for_input(self.allocator, typed, contexts) catch oom();
+            defer self.allocator.free(found.bindings);
+            if (found.bindings.len > 0 and keymap_mod.same_binding(&found.bindings[0], &binding)) return binding;
+        }
+        return null;
+    }
+
+    pub fn is_action_available(self: *Window, action_type: app_mod.TypeId) bool {
+        return self.action_available_from(self.focus_id, action_type);
+    }
+
+    /// Whether `action_type` has a listener on the path to `focus_handle`'s element in the
+    /// rendered frame (GPUI `is_action_available_in`).
+    pub fn is_action_available_in(self: *Window, action_type: app_mod.TypeId, focus_handle: FocusHandle) bool {
+        return self.action_available_from(focus_handle.id, action_type);
+    }
+
+    fn action_available_from(self: *Window, focus_id: ?u64, action_type: app_mod.TypeId) bool {
+        const tree = &self.rendered_frame.dispatch_tree;
+        const path = tree.dispatch_path(focus_id, self.allocator);
+        defer self.allocator.free(path);
         for (path) |nid| for (tree.node(nid).action_listeners.items) |l| if (l.action_type == action_type) return true;
         return false;
+    }
+
+    /// The keystrokes of a binding as plain keystrokes, for matching input against it. The slice is
+    /// owned by `gpa`.
+    fn plain_keystrokes(gpa: std.mem.Allocator, keystrokes: []const keymap_mod.KeybindingKeystroke) []keystroke_mod.Keystroke {
+        const out = gpa.alloc(keystroke_mod.Keystroke, keystrokes.len) catch oom();
+        for (keystrokes, out) |keystroke, *slot| slot.* = keystroke.inner;
+        return out;
+    }
+
+    /// The keystrokes bound to `action` in the focused element's context, displayed for the
+    /// platform and joined with spaces, or the action's name when nothing is bound (GPUI
+    /// `keystroke_text_for`). The text lives in the frame arena.
+    pub fn keystroke_text_for(self: *Window, action: anytype, cx: *App) []const u8 {
+        const T = @TypeOf(action);
+        const binding = self.highest_precedence_binding_for_action(action) orelse return action_mod.action_name(T);
+        const os = cx.platform_info().os;
+        const arena = frame_arena();
+        const parts = arena.alloc([]const u8, binding.keystrokes.len) catch oom();
+        for (binding.keystrokes, parts) |keystroke, *part| part.* = format("{f}", .{keystroke.as_keystroke().display(os)});
+        return std.mem.join(arena, " ", parts) catch oom();
+    }
+
+    /// The part of the window the platform shows, in window-local pixels (GPUI
+    /// `visual_viewport_bounds`). Nothing reports a smaller visual viewport yet, so this is the
+    /// whole content area.
+    pub fn visual_viewport_bounds(self: *const Window) Bounds(Pixels) {
+        return .{ .origin = .{}, .size = self.viewport_size_ };
+    }
+
+    /// The viewport less the insets, clipped to the visual viewport (GPUI `fully_visible_bounds`).
+    pub fn fully_visible_bounds(self: *const Window) Bounds(Pixels) {
+        const avoid = self.insets().effective();
+        const viewport = self.viewport_size_;
+        const left = @min(@max(avoid.left, 0), viewport.width);
+        const top = @min(@max(avoid.top, 0), viewport.height);
+        const right = @max(viewport.width - @max(avoid.right, 0), left);
+        const bottom = @max(viewport.height - @max(avoid.bottom, 0), top);
+        const safe_bounds = Bounds(Pixels).from_corners(.{ .x = left, .y = top }, .{ .x = right, .y = bottom });
+        var visible = safe_bounds.intersect(self.visual_viewport_bounds());
+        visible.size.width = @max(visible.size.width, 0);
+        visible.size.height = @max(visible.size.height, 0);
+        return visible;
+    }
+
+    /// The areas the platform covers (GPUI `insets`). No backend reports any yet.
+    pub fn insets(_: *const Window) WindowInsets {
+        return .{};
+    }
+
+    /// Hides the software keyboard (GPUI `dismiss_virtual_keyboard`). Linux has none, so this does
+    /// nothing, as GPUI's Linux backends do.
+    pub fn dismiss_virtual_keyboard(_: *const Window) void {}
+
+    /// The scene of the most recently rendered frame (GPUI `rendered_scene`).
+    pub fn rendered_scene(self: *const Window) *const scene_mod.Scene {
+        return &self.rendered_frame.scene;
+    }
+
+    /// Runs `f(window, args...)` with `mask` intersected into the content mask, or with the mask
+    /// as it is when `mask` is null (GPUI `with_content_mask`).
+    pub fn with_content_mask(self: *Window, mask: ?ContentMask(Pixels), comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        if (mask) |m| self.push_content_mask(m);
+        defer if (mask != null) self.pop_content_mask();
+        return @call(.auto, f, .{self} ++ args);
+    }
+
+    /// Runs `f(window, args...)` with the element offset moved by `offset` (GPUI `with_element_offset`).
+    pub fn with_element_offset(self: *Window, offset: Point(Pixels), comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        self.push_element_offset(offset);
+        defer self.pop_element_offset();
+        return @call(.auto, f, .{self} ++ args);
+    }
+
+    /// Runs `f(window, args...)` with `rem_size` as the rem size, or the current one when it is
+    /// null (GPUI `with_rem_size`).
+    pub fn with_rem_size(self: *Window, override: ?Pixels, comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        if (override) |size| self.rem_size_override_stack.append(self.allocator, size) catch oom();
+        defer if (override != null) {
+            _ = self.rem_size_override_stack.pop();
+        };
+        return @call(.auto, f, .{self} ++ args);
+    }
+
+    /// Runs `f(global_id, window, args...)` with `element_id` pushed onto the element id stack
+    /// (GPUI `with_global_id`).
+    pub fn with_global_id(self: *Window, element_id: anytype, comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        const global_id = self.push_element_id(ElementId.from(element_id));
+        defer self.pop_element_id();
+        return @call(.auto, f, .{ global_id, self } ++ args);
+    }
+
+    /// Runs `f(window, args...)` with `element_id` pushed, so that element ids inside it are
+    /// namespaced by it (GPUI `with_element_namespace`).
+    pub fn with_element_namespace(self: *Window, element_id: anytype, comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        _ = self.push_element_id(ElementId.from(element_id));
+        defer self.pop_element_id();
+        return @call(.auto, f, .{self} ++ args);
     }
 
     // -- platform callbacks ---------------------------------------------
@@ -1469,13 +3467,44 @@ pub const Window = struct {
     fn onInput(ctx: *anyopaque, event: interactive.PlatformInput) platform_mod.DispatchEventResult {
         const self: *Window = @ptrCast(@alignCast(ctx));
         const handled = self.dispatch_event(event, self.app);
-        return .{ .propagate = !handled, .default_prevented = self.default_prevented };
+        return .{ .propagate = !handled, .default_prevented = self.default_prevented_ };
+    }
+
+    fn onIme(ctx: *anyopaque, ime: platform_mod.ImeInput) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.handle_ime(ime, self.app);
+    }
+
+    fn onImeArea(ctx: *anyopaque) ?Bounds(Pixels) {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        return self.ime_area_in(self.app);
+    }
+
+    /// Applies an input method's request to the focused field.
+    pub fn handle_ime(self: *Window, ime: platform_mod.ImeInput, cx: *App) void {
+        var handler = self.platform_window.input_handler() orelse return;
+        cx.pending_updates += 1;
+        defer {
+            cx.pending_updates -= 1;
+            if (cx.pending_updates == 0) cx.flush_effects();
+        }
+        const prev_arena = current_frame_arena;
+        current_frame_arena = &self.rendered_frame.arena;
+        defer current_frame_arena = prev_arena;
+        self.ime_position_dirty = true;
+        switch (ime) {
+            .insert_text => |text| handler.replace_text_in_range(null, text, self, cx),
+            .set_marked_text => |m| handler.replace_and_mark_text_in_range(null, m.text, m.selected, self, cx),
+            .unmark_text => handler.unmark_text(self, cx),
+            .delete_text => if (handler.marked_text_range(self, cx)) |marked| handler.replace_text_in_range(marked, "", self, cx),
+        }
     }
 
     fn onActiveStatusChange(ctx: *anyopaque, active: bool) void {
         const self: *Window = @ptrCast(@alignCast(ctx));
         self.active = active;
         self.refresh();
+        self.app.dispatch_window_observers(.window_activation, self);
     }
 
     fn onHoverStatusChange(ctx: *anyopaque, hovered: bool) void {
@@ -1485,9 +3514,15 @@ pub const Window = struct {
 
     fn onResize(ctx: *anyopaque, size: Size(Pixels), scale: f32) void {
         const self: *Window = @ptrCast(@alignCast(ctx));
-        self.viewport_size = size;
+        self.viewport_size_ = size;
         self.scale_factor_ = scale;
         self.refresh();
+        self.bounds_changed();
+    }
+
+    fn onMoved(ctx: *anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.bounds_changed();
     }
 
     fn onShouldClose(ctx: *anyopaque) bool {
@@ -1504,7 +3539,35 @@ pub const Window = struct {
     fn onAppearanceChanged(ctx: *anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(ctx));
         self.appearance_ = self.platform_window.appearance();
+        self.app.dispatch_window_appearance(self);
         self.refresh();
+    }
+
+    fn onButtonLayoutChanged(ctx: *anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.app.dispatch_window_button_layout(self);
+    }
+
+    /// Runs `f(window, app)` when the titlebar button layout changes (GPUI `observe_button_layout_changed`).
+    pub fn observe_button_layout_changed(self: *Window, comptime f: fn (*Window, *App) void) app_mod.Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, payload: ?*const anyopaque) bool {
+                const win: *Window = @ptrCast(@alignCast(@constCast(payload.?)));
+                f(win, app);
+                return true;
+            }
+        };
+        return self.app.add_window_subscriber(.window_button_layout, self.handle_id, 0, S.call);
+    }
+
+    fn onVisibilityChanged(ctx: *anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.refresh_visibility();
+    }
+
+    fn onDisplayChanged(ctx: *anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.refresh_display();
     }
 };
 
@@ -1512,6 +3575,148 @@ fn oom() noreturn {
     @panic("out of memory");
 }
 
+/// Atlas builder for one frame of a decoded image. The pixels stay owned by the `RenderImage`.
+const ImageTile = struct {
+    image: *assets_mod.RenderImage,
+    frame: usize,
+
+    fn build(raw: *anyopaque) anyerror!?atlas_mod.TileData {
+        const self: *const ImageTile = @ptrCast(@alignCast(raw));
+        const bytes = self.image.as_bytes(self.frame) orelse return null;
+        return .{ .size = self.image.size(self.frame), .bytes = bytes };
+    }
+};
+
+/// The part of the atlas `tile` that shows `visible`, where `image` is the full drawn rectangle.
+fn sub_tile(tile: atlas_mod.AtlasTile, image: Bounds(Pixels), visible: Bounds(Pixels)) atlas_mod.AtlasTile {
+    if (visible.eq(image)) return tile;
+    const iw = image.size.width;
+    const ih = image.size.height;
+    const tw: f32 = @floatFromInt(tile.bounds.size.width);
+    const th: f32 = @floatFromInt(tile.bounds.size.height);
+    var out = tile;
+    const x_off = (visible.origin.x - image.origin.x) / iw;
+    const y_off = (visible.origin.y - image.origin.y) / ih;
+    out.bounds.origin.x = tile.bounds.origin.x + @as(DevicePixels, @intFromFloat(@round(x_off * tw)));
+    out.bounds.origin.y = tile.bounds.origin.y + @as(DevicePixels, @intFromFloat(@round(y_off * th)));
+    out.bounds.size.width = @max(1, @as(DevicePixels, @intFromFloat(@round(visible.size.width / iw * tw))));
+    out.bounds.size.height = @max(1, @as(DevicePixels, @intFromFloat(@round(visible.size.height / ih * th))));
+    return out;
+}
+
+/// Key for a rasterized SVG mask: its path, its bytes when given inline, and the device size.
+fn svg_key(path: []const u8, data: ?[]const u8, size: Size(DevicePixels)) u64 {
+    var h = std.hash.Wyhash.hash(0x73766700, path);
+    if (data) |bytes| h = std.hash.Wyhash.hash(h, bytes);
+    const dims = [_]u64{ @intCast(size.width), @intCast(size.height) };
+    return std.hash.Wyhash.hash(h, std.mem.sliceAsBytes(&dims));
+}
+
+/// Atlas builder: rasterizes an SVG to an alpha mask. The mask is copied into the atlas right away.
+const SvgTile = struct {
+    cache: *assets_mod.AssetCache,
+    source: assets_mod.AssetSource,
+    path: []const u8,
+    data: ?[]const u8,
+    size: Size(DevicePixels),
+
+    fn build(raw: *anyopaque) anyerror!?atlas_mod.TileData {
+        const self: *SvgTile = @ptrCast(@alignCast(raw));
+        const arena = frame_arena();
+        const bytes = self.data orelse (self.source.load(self.path) orelse return null);
+        const renderer = try self.cache.svg_renderer();
+        const parsed = renderer.parse_svg(arena, bytes) catch return null;
+        defer parsed.deinit();
+        const mask = renderer.render_alpha_mask(arena, parsed, .{ .size = self.size }) catch return null;
+        return .{
+            .size = .{ .width = @intCast(mask.width), .height = @intCast(mask.height) },
+            .bytes = mask.pixels,
+        };
+    }
+};
+
 fn insertPrim(scene: *scene_mod.Scene, p: scene_mod.Primitive) void {
     scene.insert_primitive(p) catch oom();
+}
+
+test "sub_tile crops the atlas tile to the visible part" {
+    const tile: atlas_mod.AtlasTile = .{
+        .texture_id = .{ .index = 0, .kind = .polychrome },
+        .tile_id = .{ .value = 1 },
+        .padding = 0,
+        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 200, .height = 100 } },
+    };
+    // Image drawn at 200x100 but only the right half is visible.
+    const image: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 200, .height = 100 } };
+    const visible: Bounds(Pixels) = .{ .origin = .{ .x = 100, .y = 0 }, .size = .{ .width = 100, .height = 100 } };
+    const sub = sub_tile(tile, image, visible);
+    try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.origin.x);
+    try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.size.width);
+    try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.size.height);
+}
+
+/// The element state `with_optional_element_state` keeps: an optional `S`, empty until first stored.
+fn OptionalStateSlot(comptime S: type) type {
+    return struct {
+        value: ?S = null,
+
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.value) |*v| {
+                if (comptime has_deinit(S)) v.deinit(allocator);
+            }
+        }
+
+        fn has_deinit(comptime T: type) bool {
+            return switch (@typeInfo(T)) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, "deinit"),
+                else => false,
+            };
+        }
+    };
+}
+
+test "with_optional_element_state: no id keeps nothing, an id keeps its value" {
+    const TestAppContext = @import("app/test_context.zig").TestAppContext;
+    const V = struct {
+        pub fn render(_: *@This(), _: *Window, _: *app_mod.Context(@This())) *@import("elements/div.zig").Div {
+            return @import("elements/div.zig").div();
+        }
+        fn build(_: *Window, app: *app_mod.App) app_mod.Entity(@This()) {
+            return app.new(@This(){});
+        }
+    };
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(V.build);
+    const window = vcx.window;
+
+    const Store = struct {
+        fn f(state: ?*?u32, _: *Window) void {
+            const s = state orelse return;
+            if (s.* == null) s.* = 1 else s.*.? += 1;
+        }
+    };
+    // Without an id nothing is stored, and `f` sees null every time.
+    window.with_optional_element_state(u32, null, Store.f);
+    window.with_optional_element_state(u32, null, Store.f);
+
+    const gid: GlobalElementId = .{ .hash = 42 };
+    window.with_optional_element_state(u32, gid, Store.f);
+    window.with_optional_element_state(u32, gid, Store.f);
+    const Read = struct {
+        fn f(state: ?*?u32, _: *Window) u32 {
+            return if (state) |s| s.* orelse 0 else 99;
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 2), window.with_optional_element_state(u32, gid, Read.f));
+    try std.testing.expectEqual(@as(u32, 99), window.with_optional_element_state(u32, null, Read.f));
+}
+
+test "svg key depends on path, inline bytes and size" {
+    const size16: Size(DevicePixels) = .{ .width = 16, .height = 16 };
+    const size32: Size(DevicePixels) = .{ .width = 32, .height = 16 };
+    const a = svg_key("a.svg", null, size16);
+    try std.testing.expect(a != svg_key("a.svg", null, size32));
+    try std.testing.expect(a != svg_key("b.svg", null, size16));
+    try std.testing.expect(svg_key("", "<svg/>", size16) != svg_key("", "<svg></svg>", size16));
 }
