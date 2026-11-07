@@ -215,6 +215,130 @@ pub const GraphicalEnvironment = struct {
     }
 };
 
+/// Reads the variable `name` from this process's environment, or null when it is unset (no GPUI
+/// counterpart: GPUI reads the environment with `std::env::var_os`).
+fn env_value(name: [*:0]const u8) ?[]const u8 {
+    const v = std.c.getenv(name) orelse return null;
+    return std.mem.span(v);
+}
+
+/// Reads the display variables from this process's environment (GPUI `GraphicalEnvironment::detect`).
+/// Leaves `activation_token` unset: a token is used once, by the first window of the process that set it.
+pub fn detect_graphical_environment() GraphicalEnvironment {
+    return .{
+        .wayland_display = env_value("WAYLAND_DISPLAY"),
+        .x11_display = env_value("DISPLAY"),
+        .xdg_runtime_dir = env_value("XDG_RUNTIME_DIR"),
+    };
+}
+
+/// The windowing modes a platform may start in or switch to (GPUI `WindowingModes`, a bitflags set).
+pub const WindowingModes = packed struct(u8) {
+    /// Connected to a Wayland compositor.
+    wayland: bool = false,
+    /// Connected to an X server.
+    x11: bool = false,
+    /// No display server. Windows lay out and handle input but draw nothing.
+    headless: bool = false,
+    _padding: u5 = 0,
+
+    pub const WAYLAND: WindowingModes = .{ .wayland = true };
+    pub const X11: WindowingModes = .{ .x11 = true };
+    pub const HEADLESS: WindowingModes = .{ .headless = true };
+
+    /// Every mode (GPUI `WindowingModes::all`).
+    pub fn all() WindowingModes {
+        return .{ .wayland = true, .x11 = true, .headless = true };
+    }
+
+    /// The union of two sets (GPUI `WindowingModes::union`, the `|` operator).
+    pub fn @"union"(self: WindowingModes, other: WindowingModes) WindowingModes {
+        return @bitCast(@as(u8, @bitCast(self)) | @as(u8, @bitCast(other)));
+    }
+
+    /// Whether every mode in `other` is in `self` (GPUI `WindowingModes::contains`).
+    pub fn contains(self: WindowingModes, other: WindowingModes) bool {
+        const mine: u8 = @bitCast(self);
+        const theirs: u8 = @bitCast(other);
+        return mine & theirs == theirs;
+    }
+};
+
+/// A display mode for `App.request_windowing` to switch to, or the mode a platform starts in (GPUI
+/// `WindowingRequest`).
+pub const WindowingRequest = union(enum) {
+    /// No display server. Windows lay out and handle input but draw nothing.
+    headless,
+    /// Connected to the display server that the environment names.
+    windowed: GraphicalEnvironment,
+};
+
+/// A `WindowingRequest` that owns its strings, for a request applied after the caller returned
+/// (GPUI keeps the request's `GraphicalEnvironment` by value; ZUI's slices are borrowed, so they are
+/// copied here). Free it with `deinit`.
+///
+/// Deliberately naive: every request copies its strings into one fresh allocation. A faster version
+/// would keep the strings in a fixed buffer owned by the platform, which no request ever outgrows
+/// in practice.
+pub const OwnedWindowingRequest = struct {
+    gpa: std.mem.Allocator,
+    request: WindowingRequest,
+    /// The copied strings of a windowed request, in one allocation (empty for headless).
+    storage: []u8,
+
+    /// Copies `request` (GPUI has no counterpart: it moves the request).
+    pub fn dupe(gpa: std.mem.Allocator, request: WindowingRequest) std.mem.Allocator.Error!OwnedWindowingRequest {
+        switch (request) {
+            .headless => return .{ .gpa = gpa, .request = .headless, .storage = try gpa.alloc(u8, 0) },
+            .windowed => |env| {
+                const fields = [_]?[]const u8{ env.wayland_display, env.x11_display, env.xdg_runtime_dir, env.activation_token };
+                var total: usize = 0;
+                for (fields) |field| total += if (field) |s| s.len else 0;
+                const storage = try gpa.alloc(u8, total);
+                var offset: usize = 0;
+                const copied: GraphicalEnvironment = .{
+                    .wayland_display = copy_into(storage, &offset, env.wayland_display),
+                    .x11_display = copy_into(storage, &offset, env.x11_display),
+                    .xdg_runtime_dir = copy_into(storage, &offset, env.xdg_runtime_dir),
+                    .activation_token = copy_into(storage, &offset, env.activation_token),
+                };
+                return .{ .gpa = gpa, .request = .{ .windowed = copied }, .storage = storage };
+            },
+        }
+    }
+
+    fn copy_into(storage: []u8, offset: *usize, field: ?[]const u8) ?[]const u8 {
+        const s = field orelse return null;
+        const start = offset.*;
+        @memcpy(storage[start .. start + s.len], s);
+        offset.* += s.len;
+        return storage[start..offset.*];
+    }
+
+    /// Frees the copied strings (no GPUI counterpart: Rust drops them).
+    pub fn deinit(self: OwnedWindowingRequest) void {
+        self.gpa.free(self.storage);
+    }
+};
+
+test "WindowingModes: all, union and contains (GPUI WindowingModes)" {
+    const all = WindowingModes.all();
+    try std.testing.expect(all.contains(WindowingModes.HEADLESS));
+    try std.testing.expect(all.contains(WindowingModes.WAYLAND.@"union"(WindowingModes.X11)));
+    try std.testing.expect(!WindowingModes.HEADLESS.contains(WindowingModes.X11));
+    try std.testing.expect(!WindowingModes.WAYLAND.contains(WindowingModes.WAYLAND.@"union"(WindowingModes.X11)));
+}
+
+test "OwnedWindowingRequest keeps its strings when the caller's buffer changes" {
+    var buffer = "wayland-0".*;
+    const environment: GraphicalEnvironment = .{ .wayland_display = &buffer };
+    const owned = try OwnedWindowingRequest.dupe(std.testing.allocator, .{ .windowed = environment });
+    defer owned.deinit();
+    buffer[0] = 'x';
+    try std.testing.expectEqualStrings("wayland-0", owned.request.windowed.wayland_display.?);
+    try std.testing.expect(owned.request.windowed.x11_display == null);
+}
+
 /// A keyboard layout (GPUI `PlatformKeyboardLayout`).
 pub const KeyboardLayout = struct {
     /// Unique to the layout.
@@ -884,7 +1008,20 @@ pub const Platform = struct {
         path_for_auxiliary_executable: *const fn (*Platform, []const u8) anyerror![]const u8 = noAuxiliaryExecutable,
         /// GPUI `Platform::register_url_scheme`.
         register_url_scheme: *const fn (*Platform, []const u8) anyerror!void = noRegisterUrlScheme,
+        /// Sets the mode the platform starts in, before `run` (GPUI `Platform::set_initial_windowing`).
+        /// Platforms that cannot switch modes answer `error.WindowingNotSupported`.
+        set_initial_windowing: *const fn (*Platform, WindowingRequest) anyerror!void = noSetInitialWindowing,
+        /// Switches between headless and windowed modes (GPUI `Platform::request_windowing`). Called
+        /// from the main thread between event-loop iterations, never from inside event dispatch.
+        request_windowing: *const fn (*Platform, WindowingRequest) anyerror!void = noRequestWindowing,
     };
+
+    fn noSetInitialWindowing(_: *Platform, _: WindowingRequest) anyerror!void {
+        return error.WindowingNotSupported;
+    }
+    fn noRequestWindowing(_: *Platform, _: WindowingRequest) anyerror!void {
+        return error.WindowingNotSupported;
+    }
 
     fn lightAppearance(_: *Platform) WindowAppearance {
         return .light;
@@ -1105,6 +1242,14 @@ pub const Platform = struct {
     pub fn unhide_other_apps(self: *Platform) void {
         self.vtable.unhide_other_apps(self);
     }
+    /// Sets the mode the platform starts in (GPUI `Platform::set_initial_windowing`).
+    pub fn set_initial_windowing(self: *Platform, request: WindowingRequest) anyerror!void {
+        return self.vtable.set_initial_windowing(self, request);
+    }
+    /// Switches the platform's mode now (GPUI `Platform::request_windowing`; the App defers the call).
+    pub fn request_windowing(self: *Platform, request: WindowingRequest) anyerror!void {
+        return self.vtable.request_windowing(self, request);
+    }
 };
 
 /// A system notification to post (GPUI `SystemNotification`).
@@ -1162,16 +1307,25 @@ pub const PathCompletion = struct {
 
 pub const headless = @import("platform/headless.zig");
 
-/// The platform for the current OS (falls back to headless when no display is available).
+/// The platform for the current OS (GPUI `gpui_platform::current_platform`). On Linux this is the
+/// Linux platform allowing every windowing mode, which starts headless when the environment names no
+/// display server and can switch to one later. Tests and `ZUI_HEADLESS` get the headless platform.
 pub fn current_platform(allocator: std.mem.Allocator) *Platform {
     if (builtin.is_test) return headless_platform(allocator);
     if (std.c.getenv("ZUI_HEADLESS") != null) return headless_platform(allocator);
     if (builtin.os.tag == .linux) {
-        if (@import("platform/linux.zig").create(allocator)) |p| return p else |err| {
-            std.log.warn("no native display ({s}); running headless", .{@errorName(err)});
+        if (linux_platform(allocator, WindowingModes.all())) |p| return p else |err| {
+            std.log.warn("linux platform unavailable ({s}); running headless", .{@errorName(err)});
         }
     }
     return headless_platform(allocator);
+}
+
+/// The Linux platform, allowed to start or switch to the modes in `allowed_modes` (GPUI
+/// `gpui_platform::linux`). Only Linux has one: other systems get `error.LinuxOnly`.
+pub fn linux_platform(allocator: std.mem.Allocator, allowed_modes: WindowingModes) !*Platform {
+    if (builtin.os.tag != .linux) return error.LinuxOnly;
+    return @import("platform/linux.zig").create(allocator, allowed_modes);
 }
 
 /// A platform with no OS windows (tests, servers, snapshots).

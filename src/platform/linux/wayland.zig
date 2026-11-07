@@ -339,15 +339,15 @@ pub const WaylandConnection = struct {
     const data_source_listener: proto.DataSourceListener = .{ .target = dataSourceTarget, .send = dataSourceSend, .cancelled = dataSourceCancelled, .dnd_drop_performed = dataSourceDndNoop, .dnd_finished = dataSourceDndNoop, .action = dataSourceActionNoop };
     const wm_listener: proto.XdgWmBaseListener = .{ .ping = xdgPing };
 
-    /// Connects to the compositor named by WAYLAND_DISPLAY.
-    pub fn connect(allocator: std.mem.Allocator) !*WaylandConnection {
-        if (std.c.getenv("WAYLAND_DISPLAY") == null) return error.NoWaylandDisplay;
+    /// Connects to the compositor at `socket`, an absolute path (GPUI `WaylandConnection::attach`
+    /// with the socket it resolved from the environment). The caller resolves relative names.
+    pub fn connect(allocator: std.mem.Allocator, socket: [:0]const u8) !*WaylandConnection {
         var lib = dl.Library.open(&.{ "libwayland-client.so.0", "libwayland-client.so" }) orelse return error.LibraryNotFound;
         const api = proto.WaylandApi.load(lib) orelse {
             lib.close();
             return error.MissingSymbols;
         };
-        const display = api.wl_display_connect(null) orelse {
+        const display = api.wl_display_connect(socket.ptr) orelse {
             lib.close();
             return error.CannotConnect;
         };
