@@ -17,24 +17,24 @@ Like the other non-source files, this stays off `main` (see `AGENTS.md` §1.5).
 
 ## API parity
 
-The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1344 of 1411
-functions that should be ported (95.3%)**. Of GPUI's 1642, 231 are set aside below because they should not be ported now: 40 mean nothing in Zig,
-132 are debug tooling and accessibility, 51 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: every one is sorted below.
+The goal comes first, before performance. On 2026-11-06, by name, comparing GPUI's public functions with ZUI: **1367 of 1412
+functions that should be ported (96.8%)**. Of GPUI's 1642, 230 are set aside below because they should not be ported now: 40 mean nothing in Zig,
+131 are debug tooling and accessibility, 51 wait on macOS or Windows, and 8 wait on portal work over D-Bus. Types: every one is sorted below.
 A name-only comparison: coincidences flatter it, and it says nothing about behaviour. Port a name or move it, and delete it either way.
 
 <details><summary>Still to port, by GPUI file</summary>
 
-#### window.rs (26)
-defer, frame_duration_snapshot, has_image_atlas_entry, input_latency_snapshot, is_high_rate, native_window_state, paint_surface, painted_quads, painted_underlines, present_if_needed, record_input, replace_views, restore_native_window_state, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_platform_waker, set_scale_factor, set_touch_prediction_enabled, set_traffic_light_position, simulate_next_frame, take_views, touch_prediction_enabled, update_count, wake_platform
+#### window.rs (15)
+defer, frame_duration_snapshot, input_latency_snapshot, is_high_rate, native_window_state, paint_surface, record_input, restore_native_window_state, set_exclusive_edge, set_exclusive_zone, set_input_region, set_phase, set_touch_prediction_enabled, set_traffic_light_position, touch_prediction_enabled
 
-#### app.rs (12)
-defer, foreground_journal, init_visible, new_inaccessible, register_inspector_element, request_windowing, run_embedded, set_inspector_renderer, start_hang_monitor, test, with_platform, with_windowing
-
-#### platform.rs (12)
-detect, gestures, metadata, on_app_menu_action, on_displays_changed, on_validate_app_menu_command, on_will_open_app_menu, request_windowing, set_initial_windowing, stream, uuid, visible_bounds
+#### app.rs (9)
+defer, foreground_journal, init_visible, new_inaccessible, register_inspector_element, run_embedded, set_inspector_renderer, start_hang_monitor, test
 
 #### elements/div.rs (4)
 external_drag_payload, interactivity, on_a11y_action, on_back_gesture
+
+#### platform.rs (4)
+detect, gestures, metadata, stream
 
 #### arena.rs (3)
 alloc, begin_scope, end_scope
@@ -96,15 +96,18 @@ These exist, so the comparison counts them, but they do nothing yet.
 - [ ] Long press: no platform emits it, so it has only run with simulated events
 - [ ] `last_input_was_touch` works, but raw touch events are not dispatched to elements
 - [ ] `transact` does not roll back dispatch-tree nodes or accessed element states, which GPUI's does
-- [ ] `refresh_interval`: X11 `displays()` is one whole-screen display, so per-monitor refresh needs per-monitor displays first,
-      and its value is whole milliseconds. Neither backend's path has run. `inner_window_bounds` ignores tiling
 
 ## Missing, needing real work
 
+- [ ] `refresh_interval` is whole milliseconds on X11, and has not been checked against a real monitor's rate. `inner_window_bounds` ignores tiling
+- [ ] A cancelled foreground task run through `run_pending` was seen leaking its `TaskState` (`executor.zig:154`) under the leak checker. Not chased, and not reproduced by a test yet
+- [ ] Multi-monitor: X11 has one display per RandR CRTC, unlike GPUI's one per X screen. Run on two virtual monitors: both reported, windows opened on each. Never run on real monitors, or with monitors changing while running
+- [ ] `has_image_atlas_entry` has only been tested with an empty image
+- [ ] `visible_bounds` is the full bounds, as in every GPUI Linux backend: no work area is read
 - [ ] Transparency on a real compositor: alpha was read from pixels and protocol, never seen blended. Blur has never run: mutter offers no `ext_background_effect_manager_v1`
 - [ ] Test scheduler: `once`, `many`, `assert_correct_thread`, `blocked_sessions`, `spawn_dedicated`, `spawn_realtime`, `next_notification`. Asset and remote image tests stay on real workers
 - [ ] Screen capture (portal), `focus_lost_restore_target` beyond the current path
-- [ ] App menu callbacks: `on_app_menu_action`, `on_validate_app_menu_command` (`set_menus` itself exists and is stored)
+- [ ] App menu callbacks are stored and registered, but nothing on Linux calls them, as in GPUI's Linux backend. They wait for macOS
 - [ ] Popups: grabs and outside-click dismissal have not run with a real pointer; `xdg_popup.reposition` is not ported
 - [ ] Power mode has only run against a fake bus; a daemon that never answers leaves it at its last value
 - [ ] Action schemas have no field descriptions, since Zig keeps no doc comments
@@ -204,7 +207,6 @@ These exist, so the comparison counts them, but they do nothing yet.
 
 Each must run headless with a correct snapshot, and be driven for real: first frames hide most bugs.
 
-- [ ] toggle_headless: needs switching windowing modes at runtime (`request_windowing`)
 - [ ] layer_shell, a11y
 
 ## Performance (after API parity)
@@ -228,6 +230,20 @@ Each must run headless with a correct snapshot, and be driven for real: first fr
 - [ ] Benchmarks against GPUI
 - [ ] `paths_bench` has no numbers: a Debug build drew no first frame in 25 s on the CPU renderer. Measure
       it in release, on the GPU too, since 2000 path stars that slow may be a real problem
+
+### Left naive on purpose (the owner asked for the API first)
+
+Each is also said in a comment where it is written.
+
+- [ ] `Window.simulate_next_frame` copies the callback list; it could take the list
+- [ ] X11 `displays()` rebuilds its array on every call; it could rebuild only when RandR reports a change
+- [ ] X11 `display_id_at` scans the CRTCs linearly, which is fine for the monitors a desktop has
+- [ ] X11 `refresh_crtcs` asks for every output's name on every RandR event; it could ask only when the outputs change
+- [ ] `uuid_v5` runs SHA-1 per call; cache per output if it ever shows up in a profile
+- [ ] `OwnedWindowingRequest.dupe` allocates per request; a platform-owned buffer would do
+- [ ] A headless Linux platform paces frames with a fixed 16 ms timer, not a frame clock
+- [ ] `replace_backend` tears down and reconnects on every mode switch; it could keep an unused connection alive
+- [ ] `HeadlessPlatform.draw_requested_frames` and `frames_pending` walk every window on every pump; a list of windows asking for frames would do
 
 ## Project
 

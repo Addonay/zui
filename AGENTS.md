@@ -42,7 +42,7 @@ code is still in git history (`main` before this push, commit `d7a2017`).
 it current, and do not repeat it here.
 
 On Linux, X11 and Wayland, with Vulkan and a CPU fallback, about 91% of the GPUI functions worth porting exist by name,
-and every GPUI example is ported except `toggle_headless`, `layer_shell` and `a11y`. macOS, Windows and web are not
+and every GPUI example is ported except `layer_shell` and `a11y`. macOS, Windows and web are not
 started, though CI's checks keep the shared code compiling for Windows and macOS. CI itself is off for now: the
 owner's GitHub account has a billing lock, which the owner will sort out, so PRs are checked locally.
 
@@ -243,8 +243,8 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   main-thread continuation (replacement for `cx.spawn(async { bg.await; this.update })`).
 - **Platform** interfaces are vtables embedded in backend structs and recovered
   with `@fieldParentPtr` (`Platform`, `PlatformWindow`); `PlatformAtlas` is a
-  `{ptr, vtable}` value. `current_platform()` picks Linux (Wayland, then X11)
-  or headless (`ZUI_HEADLESS=1`, tests, or no display).
+  `{ptr, vtable}` value. `current_platform()` gives the Linux platform, or
+  `HeadlessPlatform` under `ZUI_HEADLESS=1` and tests (see Windowing modes).
 - **CPU renderer** follows GPUI's WGSL literally: straight alpha, sRGB-space
   blending (as wgpu ALPHA_BLENDING), gradient color-space handling via LUT,
   erf-blur shadows, 4x MSAA paths with Loop-Blinn curves, gamma 1.8/contrast.
@@ -357,6 +357,17 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   - A process still running at its timeout proves nothing: check for frames and protocol errors.
     Send output to a file, since pipes can lose it when `timeout` kills the job. `xdotool
     windowclose` destroys the window under the app, which logs harmless X11 protocol errors.
+- **Windowing modes**: on Linux one `LinuxPlatform` lives for the whole app, and its `Backend` is a union of headless, Wayland and
+  X11, replaced in place by `App.request_windowing`, which runs on the foreground executor and refuses while windows are
+  open (GPUI too switches the connection, not the platform). Connections take the display name as an argument rather than
+  reading the environment. The app connects in `run`, not at creation, so `displays()` is empty before `on_launch`. With no
+  display named it logs a warning, stays headless and blocks until quit; GPUI panics if the named server cannot be reached, ZUI
+  falls back when headless is allowed. Tests, snapshots and `ZUI_HEADLESS` still use `HeadlessPlatform`. The loop no longer
+  ends with the last window: `QuitMode` decides.
+- **Displays on X11**: one per active RandR CRTC, which differs from GPUI's one per X screen: real monitors have real positions and
+  rates. `uuid` is a version 5 UUID of the output name, as GPUI does for Wayland outputs.
+- **Wayland listeners**: libwayland aborts the process on an event whose listener entry is null, so raising a bound version means adding
+  a handler for every new event, even an empty one. Unit tests cannot catch this: run against mutter.
 - **Frame benchmark**: `examples/frame_bench.zig` (not a GPUI example) times `Window.draw` headless. See Performance in `todo.md` for numbers and how to profile.
 - **Headless snapshots**: `ZUI_HEADLESS=1 ZUI_SNAPSHOT=out.ppm zig build run-<example>`.
   `ZUI_SCALE=2` sets the headless scale factor.
@@ -392,6 +403,8 @@ See `todo.md`. In order: finish the API, with naive implementations where that i
   (see section 7). Keep builds to two at a time, without ReleaseFast: the machine has limited memory, and builds
   have filled the disk (`.zig-cache` reached 60 GB). Agents delete their own build output, and scratch goes under
   `.zig-cache/scratch`, because `/tmp` is small.
+- Stage files by name, never `git add -A`, and read `git status` first. The repo is public, and a core dump in the root once went out
+  through `add -A` with the process's environment, API keys included.
 - Nothing may reach the real desktop: no `zig build run-*` without isolation, no window, notification, program or file
   dialog on the real session, and no `gsettings` or `dconf`.
 - Check what a library does from its source or the web, not from memory: Wuffs' WebP support was misremembered.
