@@ -90,12 +90,15 @@ pub fn add_rounded_rect(area: IRect, radii: geometry.Corners(f32), context: anyt
     if (height > 0) add(context, .{ .x = area.x, .y = area.y + top_height, .width = area.width, .height = height });
 }
 
-/// wl_output events (version 3 is bound: geometry, mode, done, scale).
+/// wl_output events (version 4 is bound: geometry, mode, done, scale, name). `description` is
+/// opcode 5, which is listed so that libwayland indexes the rest correctly.
 const OutputListener = extern struct {
     geometry: ?*const fn (?*anyopaque, *anyopaque, i32, i32, i32, i32, i32, ?[*:0]const u8, ?[*:0]const u8, i32) callconv(.c) void = null,
     mode: ?*const fn (?*anyopaque, *anyopaque, u32, i32, i32, i32) callconv(.c) void = null,
     done: ?*const fn (?*anyopaque, *anyopaque) callconv(.c) void = null,
     scale: ?*const fn (?*anyopaque, *anyopaque, i32) callconv(.c) void = null,
+    name: ?*const fn (?*anyopaque, *anyopaque, ?[*:0]const u8) callconv(.c) void = null,
+    description: ?*const fn (?*anyopaque, *anyopaque, ?[*:0]const u8) callconv(.c) void = null,
 };
 
 const max_outputs = 8;
@@ -114,6 +117,9 @@ const Output = struct {
     pending_h: i32 = 0,
     /// The current mode's refresh rate in millihertz, 0 when unknown (wl_output.mode `refresh`).
     refresh_mhz: i32 = 0,
+    /// Version 5 of the name the output announced (wl_output.name), as GPUI's display `uuid`. Null
+    /// until the name arrives, or for an output that never names itself.
+    uuid: ?platform.Uuid = null,
     pending_refresh_mhz: i32 = 0,
     /// The connection that owns this output; `done` reports changes through it.
     conn: ?*WaylandConnection = null,
@@ -314,7 +320,7 @@ pub const WaylandConnection = struct {
         .modifiers = keyboardModifiers,
         .repeat_info = keyboardRepeatInfo,
     };
-    const output_listener: OutputListener = .{ .geometry = outputGeometry, .mode = outputMode, .done = outputDone, .scale = outputScale };
+    const output_listener: OutputListener = .{ .geometry = outputGeometry, .mode = outputMode, .done = outputDone, .scale = outputScale, .name = outputName };
     const data_device_listener: proto.DataDeviceListener = .{
         .data_offer = dataDeviceOffer,
         .enter = dataDeviceEnter,
@@ -551,7 +557,7 @@ pub const WaylandConnection = struct {
             const h: f32 = if (out.height > 0) @as(f32, @floatFromInt(out.height)) / scale else 1080;
             // wl_output reports millihertz; the platform wants nanoseconds between refreshes.
             const refresh_interval: ?u64 = if (out.refresh_mhz > 0) @intCast(@divTrunc(@as(i64, 1_000_000_000_000), out.refresh_mhz)) else null;
-            self.displays_[self.display_count] = .{ .id = out.name, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = w, .height = h } }, .scale_factor = scale, .refresh_interval = refresh_interval };
+            self.displays_[self.display_count] = .{ .id = out.name, .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = w, .height = h } }, .scale_factor = scale, .refresh_interval = refresh_interval, .uuid_bytes = out.uuid };
             self.display_count += 1;
         }
         if (self.display_count == 0) {
@@ -1273,7 +1279,7 @@ fn registryGlobal(data: ?*anyopaque, reg: *proto.Registry, name: u32, iface: [*:
         self.primary_manager = @ptrCast(api.wl_proxy_marshal_flags(@ptrCast(reg), 0, &proto.primary_device_manager_interface, @as(u32, 1), 0, name, proto.primary_device_manager_interface.name, @as(u32, 1), @as(?*anyopaque, null)));
     } else if (std.mem.eql(u8, iface_name, "wl_output")) {
         if (free_output_slot(self)) |slot| {
-            const ver: u32 = @min(version, 3);
+            const ver: u32 = @min(version, 4);
             const out_iface = self.lib.lookup(*const proto.Interface, "wl_output_interface") orelse return;
             const proxy = api.wl_proxy_marshal_flags(@ptrCast(reg), 0, out_iface, ver, 0, name, out_iface.name, ver, out_iface);
             if (proxy) |p| {
@@ -1315,6 +1321,14 @@ fn seatCapabilities(data: ?*anyopaque, _: *proto.Seat, caps: u32) callconv(.c) v
 fn seatName(_: ?*anyopaque, _: *proto.Seat, _: [*:0]const u8) callconv(.c) void {}
 
 fn outputGeometry(_: ?*anyopaque, _: *anyopaque, _: i32, _: i32, _: i32, _: i32, _: i32, _: ?[*:0]const u8, _: ?[*:0]const u8, _: i32) callconv(.c) void {}
+
+/// wl_output.name: the output's name (for example "DP-1"), from which the display's uuid is made
+/// the way GPUI's Wayland display does it: a version 5 UUID over the DNS namespace.
+fn outputName(data: ?*anyopaque, _: *anyopaque, name: ?[*:0]const u8) callconv(.c) void {
+    const out: *Output = @ptrCast(@alignCast(data.?));
+    const n = name orelse return;
+    out.uuid = platform.uuid_v5(platform.uuid_namespace_dns, std.mem.span(n));
+}
 
 fn outputMode(data: ?*anyopaque, _: *anyopaque, flags: u32, w: i32, h: i32, refresh: i32) callconv(.c) void {
     const out: *Output = @ptrCast(@alignCast(data.?));

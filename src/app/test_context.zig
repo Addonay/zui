@@ -2395,6 +2395,96 @@ test "menus: set_menus stores copies that get_menus returns" {
     try std.testing.expect(menus[0].items[0].action_item.checked);
 }
 
+test "app menus: a pick dispatches its action, and validation asks the app" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Ping = action_mod.Action("test", "AppMenuPing");
+    const Other = action_mod.Action("test", "AppMenuOther");
+    const Seen = struct {
+        var count: usize = 0;
+        fn on_ping(_: *const Ping, _: *App) void {
+            count += 1;
+        }
+    };
+    Seen.count = 0;
+    // Nothing is bound yet, so the menu item is not offered.
+    try std.testing.expect(!cx.app.is_action_available(Ping));
+    cx.app.on_action(Ping, Seen.on_ping);
+    try std.testing.expect(cx.app.is_action_available(Ping));
+    const boxed = action_mod.box_action(cx.app.effect_arena.allocator(), Ping{});
+    try std.testing.expect(cx.app.platform.emit_validate_app_menu_command(boxed));
+    try std.testing.expect(!cx.app.platform.emit_validate_app_menu_command(action_mod.box_action(cx.app.effect_arena.allocator(), Other{})));
+    cx.app.platform.emit_app_menu_action(boxed);
+    try std.testing.expectEqual(@as(usize, 1), Seen.count);
+}
+
+test "window test hooks: scale, next-frame callbacks, painted quads, update count and views" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(Counter.build);
+    _ = view;
+    const win = vcx.window;
+
+    win.set_scale_factor(2);
+    try std.testing.expectEqual(@as(f32, 2), win.scale_factor());
+
+    const Ran = struct {
+        var n: usize = 0;
+        fn on_frame(_: *Window, _: *App) void {
+            n += 1;
+        }
+    };
+    Ran.n = 0;
+    win.on_next_frame(Ran.on_frame);
+    try std.testing.expectEqual(@as(usize, 1), win.simulate_next_frame(cx.app));
+    try std.testing.expectEqual(@as(usize, 0), win.simulate_next_frame(cx.app));
+    try std.testing.expectEqual(@as(usize, 1), Ran.n);
+
+    const before = win.update_count();
+    win.refresh();
+    try std.testing.expect(win.update_count() > before);
+
+    const Woken = struct {
+        var n: usize = 0;
+        fn wake(_: *anyopaque) void {
+            n += 1;
+        }
+    };
+    Woken.n = 0;
+    // Installing a waker while the window is dirty wakes the platform at once.
+    win.dirty = true;
+    win.set_platform_waker(.{ .ctx = win, .func = Woken.wake });
+    try std.testing.expectEqual(@as(usize, 1), Woken.n);
+    win.wake_platform();
+    try std.testing.expectEqual(@as(usize, 2), Woken.n);
+    // A window becoming dirty wakes the platform too.
+    win.dirty = false;
+    win.refresh();
+    try std.testing.expectEqual(@as(usize, 3), Woken.n);
+    win.set_platform_waker(null);
+    win.wake_platform();
+    try std.testing.expectEqual(@as(usize, 3), Woken.n);
+
+    try std.testing.expectEqual(@as(usize, 0), win.dirty_views.count());
+    try win.dirty_views.put(win.allocator, app_mod.EntityId.from_u64(7), {});
+    const taken = win.take_views();
+    try std.testing.expectEqual(@as(usize, 1), taken.count());
+    try std.testing.expectEqual(@as(usize, 0), win.dirty_views.count());
+    win.replace_views(taken);
+    try std.testing.expectEqual(@as(usize, 1), win.dirty_views.count());
+
+    // Painted quads come from the last rendered frame; the Hover view paints a coloured div.
+    const hover_view, const hvcx = cx.add_window_view(Hover.build);
+    _ = hover_view;
+    try std.testing.expect(hvcx.window.painted_quads().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), hvcx.window.painted_underlines().len);
+
+    // No frames means nothing in the atlas, so no image can be there.
+    const empty = try @import("../assets.zig").RenderImage.new(std.testing.allocator, &.{});
+    defer empty.deinit();
+    try std.testing.expect(!win.has_image_atlas_entry(empty));
+}
+
 test "notifications: a response from the platform reaches the registered handler" {
     var cx = TestAppContext.init();
     defer cx.deinit();

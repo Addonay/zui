@@ -429,6 +429,11 @@ pub const GpuAtlas = struct {
         return tile;
     }
 
+    /// Whether a tile is cached under `key`. Does not build one (GPUI `PlatformAtlas::contains`).
+    pub fn contains(self: *const GpuAtlas, key: AtlasKey) bool {
+        return self.tiles_by_key.contains(key);
+    }
+
     /// Drops the tile cached under `key`; its space is reused by later tiles of the same texture.
     pub fn remove(self: *GpuAtlas, key: AtlasKey) void {
         const entry = self.tiles_by_key.fetchRemove(key) orelse return;
@@ -571,6 +576,12 @@ pub const GpuAtlas = struct {
             fn call(ptr: *anyopaque, key: AtlasKey) void {
                 const self: *GpuAtlas = @ptrCast(@alignCast(ptr));
                 self.remove(key);
+            }
+        }.call,
+        .contains = struct {
+            fn call(ptr: *anyopaque, key: AtlasKey) bool {
+                const self: *GpuAtlas = @ptrCast(@alignCast(ptr));
+                return self.contains(key);
             }
         }.call,
     };

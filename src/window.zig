@@ -798,6 +798,10 @@ pub const Window = struct {
     active: bool = true,
     hovered: bool = false,
     dirty: bool = true,
+    /// Counts invalidations; read it with `update_count`.
+    update_count_: usize = 0,
+    /// Set by `set_platform_waker`; read it through `wake_platform`.
+    platform_waker_: ?Waker = null,
     drawing: bool = false,
     needs_present: bool = false,
     /// Set by `request_animation_frame`; another frame is drawn after this one.
@@ -962,19 +966,115 @@ pub const Window = struct {
     pub fn refresh(self: *Window) void {
         if (!self.drawing) {
             self.refreshing = true;
-            self.dirty = true;
-            self.platform_window.request_frame();
+            self.update_count_ += 1;
+            self.request_draw();
         }
+    }
+
+    /// Marks the window dirty and asks the platform for a frame every time, as `refresh` and
+    /// `invalidate_view` always did. Wakes the platform waker when the window just became dirty.
+    fn request_draw(self: *Window) void {
+        const became_dirty = !self.dirty;
+        self.dirty = true;
+        self.platform_window.request_frame();
+        if (became_dirty) self.wake_platform();
     }
 
     /// Redraws the window, with `entity` and the views above it rendering again. False if a frame
     /// is being drawn, which cannot be changed now (GPUI `WindowInvalidator::invalidate_view`).
     pub fn invalidate_view(self: *Window, entity: EntityId) bool {
         self.mark_view_dirty(entity);
+        self.update_count_ += 1;
         if (self.drawing) return false;
-        self.dirty = true;
-        self.platform_window.request_frame();
+        self.request_draw();
         return true;
+    }
+
+    /// The platform's frame waker (GPUI `frame_waker`), the callback that wakes its event loop so a
+    /// frame request is delivered. Passed to `set_platform_waker`.
+    pub const Waker = struct {
+        ctx: *anyopaque,
+        func: *const fn (*anyopaque) void,
+    };
+
+    /// Installs the platform's frame waker, or removes it with null (GPUI
+    /// `Window::set_platform_waker`). If the window is already dirty, the waker runs at once so the
+    /// pending frame is not lost.
+    pub fn set_platform_waker(self: *Window, waker: ?Waker) void {
+        self.platform_waker_ = waker;
+        if (self.dirty) self.wake_platform();
+    }
+
+    /// Runs the platform waker, if one is installed, so a frame request is delivered even when the
+    /// platform stopped asking for frames for idle windows. Does nothing without a waker (GPUI
+    /// `Window::wake_platform`).
+    pub fn wake_platform(self: *Window) void {
+        const waker = self.platform_waker_ orelse return;
+        waker.func(waker.ctx);
+    }
+
+    /// How many invalidations this window has seen (GPUI `Window::update_count`). Input dispatch
+    /// compares it before and after an event to learn whether the event caused a redraw.
+    pub fn update_count(self: *const Window) usize {
+        return self.update_count_;
+    }
+
+    /// Takes the set of views that may not reuse their cached output (GPUI `Window::take_views`).
+    /// The caller owns the returned map and frees it with `window.allocator`, or hands it back with
+    /// `replace_views`.
+    pub fn take_views(self: *Window) std.AutoHashMapUnmanaged(EntityId, void) {
+        const views = self.dirty_views;
+        self.dirty_views = .empty;
+        return views;
+    }
+
+    /// Replaces the set of views that may not reuse their cached output, freeing the old one (GPUI
+    /// `Window::replace_views`). Pairs with `take_views`.
+    pub fn replace_views(self: *Window, views: std.AutoHashMapUnmanaged(EntityId, void)) void {
+        self.dirty_views.deinit(self.allocator);
+        self.dirty_views = views;
+    }
+
+    /// Whether every frame of `data` is in the sprite atlas (GPUI `Window::has_image_atlas_entry`).
+    /// Does not build the tiles. Tests use it to check that an image was uploaded.
+    pub fn has_image_atlas_entry(self: *const Window, data: *const assets_mod.RenderImage) bool {
+        if (data.frame_count() == 0) return false;
+        for (0..data.frame_count()) |frame| {
+            if (!self.sprite_atlas.contains(.{ .image = assets_mod.image_atlas_key(data.id, frame) })) return false;
+        }
+        return true;
+    }
+
+    /// The quads of the most recently rendered frame, unclipped (GPUI `Window::painted_quads`). Tests
+    /// assert on them without rasterizing. The slice points into the frame and is valid until the
+    /// next draw.
+    pub fn painted_quads(self: *const Window) []const scene_mod.Quad {
+        return self.rendered_frame.scene.quads.items;
+    }
+
+    /// The underlines of the most recently rendered frame (GPUI `Window::painted_underlines`). Valid
+    /// until the next draw, like `painted_quads`.
+    pub fn painted_underlines(self: *const Window) []const scene_mod.Underline {
+        return self.rendered_frame.scene.underlines.items;
+    }
+
+    /// Runs the callbacks registered with `on_next_frame`, as if the next frame had been delivered,
+    /// and returns how many ran (GPUI `Window::simulate_next_frame`). Nothing is drawn. Naive: it
+    /// copies the callback list, as `draw` does, and could hand the list over without the copy.
+    pub fn simulate_next_frame(self: *Window, cx: *App) usize {
+        if (self.next_frame_callbacks.items.len == 0) return 0;
+        const cbs = self.allocator.dupe(FrameCallback, self.next_frame_callbacks.items) catch oom();
+        defer self.allocator.free(cbs);
+        self.next_frame_callbacks.clearRetainingCapacity();
+        for (cbs) |cb| cb.func(cb.ctx, self, cx);
+        return cbs.len;
+    }
+
+    /// Presents the last drawn frame if it has not been presented yet (GPUI
+    /// `Window::present_if_needed`). `present` already does nothing when nothing is pending; this is
+    /// the GPUI name for the same call.
+    pub fn present_if_needed(self: *Window) void {
+        self.present();
     }
 
     /// Whether no frame is being drawn (GPUI `WindowInvalidator::not_drawing`).
@@ -1011,8 +1111,12 @@ pub const Window = struct {
     /// the same, except that it does nothing while the window is drawing.
     pub fn set_dirty(self: *Window, dirty: bool) void {
         const became_dirty = dirty and !self.dirty;
+        if (dirty) self.update_count_ += 1;
         self.dirty = dirty;
-        if (became_dirty) self.platform_window.request_frame();
+        if (became_dirty) {
+            self.platform_window.request_frame();
+            self.wake_platform();
+        }
     }
 
     /// Whether this window can be resized, as its options said (GPUI `is_resizable`).
@@ -1064,6 +1168,13 @@ pub const Window = struct {
 
     pub fn scale_factor(self: *const Window) f32 {
         return self.scale_factor_;
+    }
+
+    /// Overrides the scale factor and redraws (GPUI `Window::set_scale_factor`, a test helper there).
+    /// The platform sets the factor again on its next resize, so the override lasts until then.
+    pub fn set_scale_factor(self: *Window, scale: f32) void {
+        self.scale_factor_ = scale;
+        self.refresh();
     }
 
     /// Rounds half toward zero (GPUI `round_half_toward_zero`), which is how device pixels are chosen.
