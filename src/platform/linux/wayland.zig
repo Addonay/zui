@@ -90,8 +90,8 @@ pub fn add_rounded_rect(area: IRect, radii: geometry.Corners(f32), context: anyt
     if (height > 0) add(context, .{ .x = area.x, .y = area.y + top_height, .width = area.width, .height = height });
 }
 
-/// wl_output events (version 4 is bound: geometry, mode, done, scale, name). `description` is
-/// opcode 5, which is listed so that libwayland indexes the rest correctly.
+/// wl_output events (version 4 is bound: geometry, mode, done, scale, name, description). Every one
+/// needs a handler: libwayland aborts on an event whose listener entry is null.
 const OutputListener = extern struct {
     geometry: ?*const fn (?*anyopaque, *anyopaque, i32, i32, i32, i32, i32, ?[*:0]const u8, ?[*:0]const u8, i32) callconv(.c) void = null,
     mode: ?*const fn (?*anyopaque, *anyopaque, u32, i32, i32, i32) callconv(.c) void = null,
@@ -320,7 +320,7 @@ pub const WaylandConnection = struct {
         .modifiers = keyboardModifiers,
         .repeat_info = keyboardRepeatInfo,
     };
-    const output_listener: OutputListener = .{ .geometry = outputGeometry, .mode = outputMode, .done = outputDone, .scale = outputScale, .name = outputName };
+    const output_listener: OutputListener = .{ .geometry = outputGeometry, .mode = outputMode, .done = outputDone, .scale = outputScale, .name = outputName, .description = outputDescription };
     const data_device_listener: proto.DataDeviceListener = .{
         .data_offer = dataDeviceOffer,
         .enter = dataDeviceEnter,
@@ -1329,6 +1329,9 @@ fn outputName(data: ?*anyopaque, _: *anyopaque, name: ?[*:0]const u8) callconv(.
     const n = name orelse return;
     out.uuid = platform.uuid_v5(platform.uuid_namespace_dns, std.mem.span(n));
 }
+
+/// wl_output.description. Unused, but libwayland aborts the process if a bound event has no handler.
+fn outputDescription(_: ?*anyopaque, _: *anyopaque, _: ?[*:0]const u8) callconv(.c) void {}
 
 fn outputMode(data: ?*anyopaque, _: *anyopaque, flags: u32, w: i32, h: i32, refresh: i32) callconv(.c) void {
     const out: *Output = @ptrCast(@alignCast(data.?));
