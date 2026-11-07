@@ -351,7 +351,8 @@ pub const UniformList = struct {
 
         const hitbox = window.insert_hitbox(bounds, .normal);
         pp.hitbox = hitbox;
-        pp.style = self.interactivity.compute_style(&hitbox, pp.state, window, cx);
+        // Without the hitbox: what is hovered is only known once prepaint has finished.
+        pp.style = self.interactivity.compute_style(null, pp.state, window, cx);
         const style_ = &pp.style;
 
         const rem = window.rem_size();
@@ -521,6 +522,7 @@ pub const UniformList = struct {
 
     pub fn paint(self: *Self, gid: ?*const GlobalElementId, bounds: Bounds(Pixels), rl: *RequestLayoutState, pp: *PrepaintState, window: *Window, cx: *App) void {
         _ = gid;
+        pp.style = self.interactivity.compute_style(if (pp.hitbox) |*hbx| hbx else null, pp.state, window, cx);
         const s = &pp.style;
         if (s.visibility == .hidden) return;
 
