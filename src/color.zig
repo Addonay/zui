@@ -369,8 +369,9 @@ pub const LinearColorStop = extern struct {
 pub const Background = extern struct {
     /// Which kind of fill this is.
     tag: BackgroundTag,
-    /// Interpolation color space for gradients.
-    color_space: ColorSpace,
+    /// Interpolation color space for gradients. Named with a trailing underscore: `color_space` is the
+    /// GPUI builder that sets it.
+    color_space_: ColorSpace,
     /// Solid color, or the pattern color for pattern backgrounds.
     solid: Hsla,
     /// Gradient angle in degrees, or pattern size.
@@ -382,7 +383,7 @@ pub const Background = extern struct {
 
     pub const default: Background = .{
         .tag = .solid,
-        .color_space = ColorSpace.default,
+        .color_space_ = ColorSpace.default,
         .solid = Hsla.default,
         .gradient_angle_or_pattern_height = 0,
         .colors = .{ LinearColorStop.default, LinearColorStop.default },
@@ -394,12 +395,13 @@ pub const Background = extern struct {
         return if (self.tag == .solid) self.solid else null;
     }
 
-    /// Returns the background with its interpolation color space set to `color_space`.
-    pub fn with_color_space(self: Background, color_space: ColorSpace) Background {
+    /// Use specified color space for color interpolation (GPUI `Background::color_space`).
+    pub fn color_space(self: Background, space: ColorSpace) Background {
         var background = self;
-        background.color_space = color_space;
+        background.color_space_ = space;
         return background;
     }
+    pub const with_color_space = color_space;
 
     /// Returns the background with its alpha multiplied by `factor`.
     pub fn opacity(self: Background, factor: f32) Background {

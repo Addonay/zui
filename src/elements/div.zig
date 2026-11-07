@@ -16,6 +16,8 @@ const taffy = @import("../taffy.zig");
 const interactive = @import("../interactive.zig");
 const key_dispatch = @import("../key_dispatch.zig");
 const action_mod = @import("../action.zig");
+const image_cache_mod = @import("../image_cache.zig");
+const animation_mod = @import("animation.zig");
 
 const App = app_mod.App;
 const Window = window_mod.Window;
@@ -40,7 +42,11 @@ const MouseDownEvent = interactive.MouseDownEvent;
 const MouseUpEvent = interactive.MouseUpEvent;
 const MouseMoveEvent = interactive.MouseMoveEvent;
 const ScrollWheelEvent = interactive.ScrollWheelEvent;
+const MouseExitEvent = interactive.MouseExitEvent;
+const FileDropEvent = interactive.FileDropEvent;
 const ClickEvent = interactive.ClickEvent;
+const PinchEvent = interactive.PinchEvent;
+const MousePressureEvent = interactive.MousePressureEvent;
 const KeyDownEvent = interactive.KeyDownEvent;
 const KeyUpEvent = interactive.KeyUpEvent;
 const ModifiersChangedEvent = interactive.ModifiersChangedEvent;
@@ -65,7 +71,7 @@ pub const GroupStyle = struct {
 
 /// Converts `fn(*StyleRefinement) *StyleRefinement`-style callbacks or a
 /// ready-made `*StyleRefinement` (see `style()`) into a refinement pointer.
-fn to_style_refinement(f: anytype) *StyleRefinement {
+pub fn to_style_refinement(f: anytype) *StyleRefinement {
     const T = @TypeOf(f);
     if (T == *StyleRefinement) return f;
     if (T == *StyleBuilder) return f.s;
@@ -3325,6 +3331,120 @@ pub fn style() *StyleBuilder {
 const MouseDownL = struct { button: ?MouseButton, phase: DispatchPhase, listener: Listener(MouseDownEvent) };
 const MouseUpL = struct { button: ?MouseButton, phase: DispatchPhase, listener: Listener(MouseUpEvent) };
 const DownOutL = struct { listener: Listener(MouseDownEvent) };
+const view_mod = @import("../view.zig");
+const DROP_DRAG_THRESHOLD: f32 = 2;
+const DEFAULT_TOOLTIP_SHOW_DELAY_NS: u64 = 500 * std.time.ns_per_ms;
+const HOVERABLE_TOOLTIP_HIDE_DELAY_NS: u64 = 500 * std.time.ns_per_ms;
+
+const DropL = struct {
+    type_id: app_mod.TypeId,
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, value: *anyopaque, window: *Window, cx: *App) void,
+};
+const DragListener = struct {
+    /// Makes the app's copy of the value and the view that shows it.
+    start: *const fn (value: *anyopaque, offset: Point(Pixels), window: *Window, cx: *App) app_mod.AnyDrag,
+    value: *anyopaque,
+};
+const DragOverStyle = struct { type_id: app_mod.TypeId, style: *StyleRefinement };
+
+/// GPUI `DragMoveEvent<T>`: a drag of `T` moved. `event` is the mouse move, `bounds` the element's.
+pub fn DragMoveEvent(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        event: MouseMoveEvent,
+        bounds: Bounds(Pixels),
+        item: *const T,
+
+        /// The value being dragged (GPUI `drag`).
+        pub fn drag(_: *const Self, cx: *const App) *const T {
+            return cx.active_drag.?.value.downcast(T).?;
+        }
+
+        /// The item about to be dropped (GPUI `dragged_item`).
+        pub fn dragged_item(self: *const Self) *const T {
+            return self.item;
+        }
+    };
+}
+
+const DragMoveL = struct {
+    type_id: app_mod.TypeId,
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, event: *const MouseMoveEvent, bounds: Bounds(Pixels), item: *anyopaque, window: *Window, cx: *App) void,
+};
+
+/// GPUI `HoverListenerMode`: whether `on_hover` honours the last input being the keyboard.
+pub const HoverListenerMode = enum {
+    input_modality_aware,
+    input_modality_independent,
+
+    pub fn is_hovered(self: HoverListenerMode, hitbox: *const Hitbox, window: *const Window) bool {
+        return switch (self) {
+            .input_modality_aware => hitbox.is_hovered(window),
+            .input_modality_independent => hitbox.is_hovered_ignoring_last_input(window),
+        };
+    }
+};
+
+/// What `on_children_prepainted` hears: the bounds of the children in child order (GPUI passes a
+/// `Vec<Bounds>`). Listeners take `*const PrepaintedChildren`, and `cx.listener` works with them.
+pub const PrepaintedChildren = struct {
+    bounds: []const Bounds(Pixels),
+};
+
+/// GPUI `ScrollAnchor`: scrolls an element that need not be a direct child of the scroll container.
+pub const ScrollAnchor = struct {
+    handle: ScrollHandle,
+    /// Where the element was last painted, relative to the scroll content.
+    last_origin: *Point(Pixels),
+
+    pub fn for_handle(handle: ScrollHandle) ScrollAnchor {
+        const allocator = handle.state.allocator orelse std.heap.page_allocator;
+        const origin = allocator.create(Point(Pixels)) catch oom();
+        origin.* = .{ .x = 0, .y = 0 };
+        return .{ .handle = handle, .last_origin = origin };
+    }
+
+    /// Asks the handle's container to scroll this element to the top of its viewport. The container
+    /// does it in its next prepaint (GPUI `scroll_to`, which runs on the next frame).
+    pub fn scroll_to(self: ScrollAnchor, window: *Window, cx: *App) void {
+        _ = cx;
+        self.handle.state.anchor_request = self;
+        window.notify_current_view();
+    }
+};
+const GroupDragOverStyle = struct { type_id: app_mod.TypeId, group: []const u8, style: *StyleRefinement };
+
+/// Builds the view a tooltip shows. `ctx` may live in the frame arena: elements register
+/// their builder again on every frame, so a timer firing later finds a live one.
+pub const TooltipBuilder = struct {
+    ctx: *anyopaque = undefined,
+    build: *const fn (ctx: *anyopaque, window: *Window, cx: *App) view_mod.AnyView,
+
+    pub fn from_fn(comptime f: fn (*Window, *App) view_mod.AnyView) TooltipBuilder {
+        return .{ .build = struct {
+            fn call(_: *anyopaque, window: *Window, cx: *App) view_mod.AnyView {
+                return f(window, cx);
+            }
+        }.call };
+    }
+
+    pub fn with(ctx: anytype, comptime f: anytype) TooltipBuilder {
+        const Ctx = @TypeOf(ctx);
+        return .{ .ctx = @ptrCast(ctx), .build = struct {
+            fn call(raw: *anyopaque, window: *Window, cx: *App) view_mod.AnyView {
+                return f(@as(Ctx, @ptrCast(@alignCast(raw))), window, cx);
+            }
+        }.call };
+    }
+};
+
+/// Where a tooltip is in its life (GPUI `ActiveTooltip`). Timers cannot be cancelled, so
+/// each scheduled one carries a generation and does nothing if it has moved on.
+pub const TooltipPhase = enum { none, waiting_for_show, visible, waiting_for_hide };
+
+const UpOutL = struct { button: MouseButton, listener: Listener(MouseUpEvent) };
 
 const ActionL = struct { action_type: app_mod.TypeId, phase: DispatchPhase, ctx: *anyopaque, func: key_dispatch.ActionFn };
 
@@ -3349,8 +3469,31 @@ pub const ScrollHandle = struct {
     pub fn bounds(self: ScrollHandle) Bounds(Pixels) {
         return self.state.bounds;
     }
+    /// Scrolls to the bottom in the next prepaint, once the content size is known (GPUI).
     pub fn scroll_to_bottom(self: ScrollHandle) void {
-        self.state.offset.y = -self.state.max_offset.height;
+        self.state.scroll_to_bottom = true;
+    }
+    /// The child at the top of the viewport (GPUI `top_item`).
+    pub fn top_item(self: ScrollHandle) usize {
+        return child_index_at(self.state.child_bounds.items, self.state.bounds.top() - self.state.offset.y);
+    }
+    /// The child at the bottom of the viewport (GPUI `bottom_item`).
+    pub fn bottom_item(self: ScrollHandle) usize {
+        return child_index_at(self.state.child_bounds.items, self.state.bounds.bottom() - self.state.offset.y);
+    }
+    /// The top child, and how far its top is above the viewport's top (GPUI `logical_scroll_top`).
+    pub fn logical_scroll_top(self: ScrollHandle) struct { usize, Pixels } {
+        const ix = self.top_item();
+        const children = self.state.child_bounds.items;
+        if (ix >= children.len) return .{ ix, 0 };
+        return .{ ix, children[ix].top() + self.state.offset.y - self.state.bounds.top() };
+    }
+    /// The bottom child, and how far its bottom is below the viewport's bottom (GPUI `logical_scroll_bottom`).
+    pub fn logical_scroll_bottom(self: ScrollHandle) struct { usize, Pixels } {
+        const ix = self.bottom_item();
+        const children = self.state.child_bounds.items;
+        if (ix >= children.len) return .{ ix, 0 };
+        return .{ ix, children[ix].bottom() + self.state.offset.y - self.state.bounds.bottom() };
     }
     pub fn scroll_to_top(self: ScrollHandle) void {
         self.state.offset.y = 0;
@@ -3362,9 +3505,50 @@ pub const ScrollHandle = struct {
         if (ix >= self.state.child_bounds.items.len) return null;
         return self.state.child_bounds.items[ix];
     }
-    /// Scrolls so that child `ix` is visible.
+    /// Scrolls the least needed to make child `ix` fully visible, in the next prepaint (GPUI `scroll_to_item`).
     pub fn scroll_to_item(self: ScrollHandle, ix: usize) void {
-        self.state.requested_scroll_top = ix;
+        self.state.active_item = .{ .index = ix, .strategy = .first_visible };
+    }
+    /// Scrolls so that child `ix` is the top one visible, in the next prepaint (GPUI `scroll_to_top_of_item`).
+    pub fn scroll_to_top_of_item(self: ScrollHandle, ix: usize) void {
+        self.state.active_item = .{ .index = ix, .strategy = .top };
+    }
+
+    /// Applies the requests made since the last prepaint, against the child bounds of that prepaint
+    /// (GPUI `scroll_to_active_item`, and the `ScrollAnchor` request).
+    fn scroll_to_active_item(self: ScrollHandle) void {
+        const st = self.state;
+        if (st.anchor_request) |anchor| {
+            st.anchor_request = null;
+            st.offset = .{ .x = st.bounds.origin.x - anchor.last_origin.x, .y = st.bounds.origin.y - anchor.last_origin.y };
+        }
+        const active = st.active_item orelse return;
+        if (active.index >= st.child_bounds.items.len) return;
+        const b = st.child_bounds.items[active.index];
+        var off = st.offset;
+        switch (active.strategy) {
+            .first_visible => if (st.overflow.y == .scroll) {
+                if (b.size.height > st.bounds.size.height) {
+                    off.y = st.bounds.top() - b.top();
+                } else if (b.top() + off.y < st.bounds.top()) {
+                    off.y = st.bounds.top() - b.top();
+                } else if (b.bottom() + off.y > st.bounds.bottom()) {
+                    off.y = st.bounds.bottom() - b.bottom();
+                }
+            },
+            .top => off.y = st.bounds.top() - b.top(),
+        }
+        if (st.overflow.x == .scroll) {
+            if (b.size.width > st.bounds.size.width) {
+                off.x = st.bounds.left() - b.left();
+            } else if (b.left() + off.x < st.bounds.left()) {
+                off.x = st.bounds.left() - b.left();
+            } else if (b.right() + off.x > st.bounds.right()) {
+                off.x = st.bounds.right() - b.right();
+            }
+        }
+        st.offset = off;
+        st.active_item = null;
     }
 };
 
@@ -3373,11 +3557,224 @@ pub const ScrollHandleState = struct {
     bounds: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } },
     max_offset: Size(Pixels) = .{ .width = 0, .height = 0 },
     child_bounds: std.ArrayList(Bounds(Pixels)) = .empty,
-    requested_scroll_top: ?usize = null,
+    /// The child to scroll to in the next prepaint (GPUI `active_item`).
+    active_item: ?ActiveScrollItem = null,
+    /// Scroll to the bottom in the next prepaint (GPUI `scroll_to_bottom`).
+    scroll_to_bottom: bool = false,
+    /// An element asked to be scrolled to (GPUI `ScrollAnchor::scroll_to`), applied in the next prepaint.
+    anchor_request: ?ScrollAnchor = null,
+    /// The overflow of the tracked element, from its last prepaint.
+    overflow: Point(style_mod.Overflow) = .{ .x = .visible, .y = .visible },
     allocator: ?std.mem.Allocator = null,
 };
 
+const ActiveScrollItem = struct {
+    index: usize,
+    strategy: enum { first_visible, top },
+};
+
+/// GPUI's binary search over child bounds, with its comparison: the child that contains `y`, or the
+/// nearest one when none does.
+fn child_index_at(children: []const Bounds(Pixels), y: Pixels) usize {
+    if (children.len == 0) return 0;
+    var size = children.len;
+    var base: usize = 0;
+    while (size > 1) {
+        const half = size / 2;
+        const mid = base + half;
+        if (compare_child(children[mid], y) != .gt) base = mid;
+        size -= half;
+    }
+    const c = compare_child(children[base], y);
+    if (c == .eq) return base;
+    return @min(base + @intFromBool(c == .lt), children.len - 1);
+}
+
+fn compare_child(child: Bounds(Pixels), y: Pixels) std.math.Order {
+    if (y < child.top()) return .gt;
+    if (y > child.bottom()) return .lt;
+    return .eq;
+}
+
 /// Per-element state persisted across frames (GPUI `InteractiveElementState`).
+fn to_tooltip_builder(build_tooltip: anytype) TooltipBuilder {
+    const B = @TypeOf(build_tooltip);
+    if (B == TooltipBuilder) return build_tooltip;
+    return TooltipBuilder.from_fn(build_tooltip);
+}
+
+// -- tooltip state machine, ported from GPUI's register_tooltip_mouse_handlers ----
+
+/// Opens the tooltip right away, for a long press at `position` (GPUI `show_tooltip` from the long-press
+/// handler). Returns false if the element has no tooltip to show.
+fn show_long_press_tooltip(st: *InteractiveElementState, position: Point(Pixels), window: *Window, cx: *App) bool {
+    const builder = st.tooltip_builder orelse return false;
+    st.tooltip_generation +%= 1;
+    cx.pending_updates += 1;
+    st.tooltip_view = builder.build(builder.ctx, window, cx);
+    cx.pending_updates -= 1;
+    if (st.tooltip_view == null) return false;
+    st.tooltip_mouse = position;
+    st.tooltip_phase = .visible;
+    window.notify_current_view();
+    return true;
+}
+
+fn clear_tooltip(st: *InteractiveElementState, window: *Window, cx: *App) void {
+    st.tooltip_generation +%= 1;
+    const had = st.tooltip_phase != .none;
+    st.tooltip_phase = .none;
+    if (st.tooltip_view) |view| {
+        st.tooltip_view = null;
+        cx.release_entity(view.entity_id);
+    }
+    if (had) window.notify_current_view();
+}
+
+fn pointer_on_tooltip(window: *const Window) bool {
+    const b = window.tooltip_bounds orelse return false;
+    return b.contains(window.mouse_position());
+}
+
+/// A click or a scroll closes a tooltip, unless it can be interacted with.
+fn dismiss_tooltip_on_input(st: *InteractiveElementState, window: *Window, cx: *App) void {
+    if (st.tooltip_hoverable or pointer_on_tooltip(window)) return;
+    clear_tooltip(st, window, cx);
+}
+
+fn tooltip_on_mouse_move(st: *InteractiveElementState, hovered_now: bool, phase: DispatchPhase, show_delay_ns: u64, window: *Window, cx: *App) void {
+    const hovered = hovered_now and st.pending_mouse_down == null;
+    switch (st.tooltip_phase) {
+        .none => if (hovered and phase == .bubble) {
+            st.tooltip_generation +%= 1;
+            st.tooltip_phase = .waiting_for_show;
+            schedule_tooltip_timer(st, TooltipTimer.show, show_delay_ns, window, cx);
+        },
+        .waiting_for_show => if (!hovered) {
+            st.tooltip_generation +%= 1;
+            st.tooltip_phase = .none;
+        },
+        .visible => if (phase == .capture and !hovered and !(st.tooltip_hoverable and pointer_on_tooltip(window))) {
+            window.notify_current_view();
+        },
+        .waiting_for_hide => if (phase == .capture and (hovered or pointer_on_tooltip(window))) {
+            window.notify_current_view();
+        },
+    }
+}
+
+/// Runs while the tooltip is being placed. An element that stopped painting has no mouse
+/// handlers left, so this is what finally closes its tooltip.
+fn tooltip_check_visible(raw: *anyopaque, tooltip_bounds: Bounds(Pixels), window: *Window, cx: *App) bool {
+    const st: *InteractiveElementState = @ptrCast(@alignCast(raw));
+    if (st.long_press_tooltip_active) return true;
+    const mouse = window.mouse_position();
+    const hovered = !window.last_input_was_keyboard() and st.pending_mouse_down == null and
+        (st.tooltip_source_bounds.contains(mouse) or (st.tooltip_hoverable and tooltip_bounds.contains(mouse)));
+    switch (st.tooltip_phase) {
+        .visible => if (!hovered) {
+            if (st.tooltip_hoverable) {
+                st.tooltip_generation +%= 1;
+                st.tooltip_phase = .waiting_for_hide;
+                schedule_tooltip_timer(st, TooltipTimer.hide, HOVERABLE_TOOLTIP_HIDE_DELAY_NS, window, cx);
+            } else {
+                clear_tooltip(st, window, cx);
+            }
+        },
+        .waiting_for_hide => if (hovered) {
+            st.tooltip_generation +%= 1;
+            st.tooltip_phase = .visible;
+        },
+        .none, .waiting_for_show => {},
+    }
+    return st.tooltip_phase == .visible or st.tooltip_phase == .waiting_for_hide;
+}
+
+/// A pending timer. Windows and elements can be gone by the time it fires, so it holds ids.
+const TooltipTimer = struct {
+    app: *App,
+    window_id: window_mod.WindowId,
+    state: *InteractiveElementState,
+    generation: u64,
+
+    /// Finds the state, if its window and element still exist and nothing else happened.
+    fn live(self: TooltipTimer) ?*Window {
+        const window = self.app.window_by_id(self.window_id) orelse return null;
+        if (!window.owns_element_state(self.state) or self.state.tooltip_generation != self.generation) return null;
+        return window;
+    }
+
+    fn show(self: TooltipTimer) void {
+        const window = self.live() orelse return;
+        const st = self.state;
+        if (st.tooltip_phase != .waiting_for_show) return;
+        const builder = st.tooltip_builder orelse return;
+        self.app.pending_updates += 1;
+        st.tooltip_view = builder.build(builder.ctx, window, self.app);
+        self.app.pending_updates -= 1;
+        st.tooltip_mouse = window.mouse_position();
+        st.tooltip_phase = .visible;
+        window.notify_current_view();
+        self.app.flush_effects();
+    }
+
+    fn hide(self: TooltipTimer) void {
+        const window = self.live() orelse return;
+        if (self.state.tooltip_phase != .waiting_for_hide) return;
+        clear_tooltip(self.state, window, self.app);
+        self.app.flush_effects();
+    }
+};
+
+fn schedule_tooltip_timer(st: *InteractiveElementState, comptime f: fn (TooltipTimer) void, delay_ns: u64, window: *Window, cx: *App) void {
+    const timer: TooltipTimer = .{ .app = cx, .window_id = window.window_handle_id(), .state = st, .generation = st.tooltip_generation };
+    cx.background_executor().after(cx.foreground_executor(), delay_ns, f, timer);
+}
+
+/// How far a scroll moves each axis (GPUI `paint_scroll_listener`). An axis that scrolls takes its own
+/// delta, or the other delta when only it scrolls and the scroll is not restricted to one axis. Unless
+/// concurrent scrolling is allowed, only the dominant axis moves.
+fn scroll_step(delta: Point(Pixels), ox: style_mod.Overflow, oy: style_mod.Overflow, restrict: bool, concurrent: bool) Point(Pixels) {
+    var dx: Pixels = if (ox == .scroll and delta.x != 0) delta.x else if (ox == .scroll and !restrict and oy != .scroll) delta.y else 0;
+    var dy: Pixels = if (oy == .scroll and delta.y != 0) delta.y else if (oy == .scroll and !restrict and ox != .scroll) delta.x else 0;
+    if (!concurrent and dx != 0 and dy != 0) {
+        if (@abs(dx) > @abs(dy)) dy = 0 else dx = 0;
+    }
+    return .{ .x = dx, .y = dy };
+}
+
+fn clamp_scroll(offset: Point(Pixels), max: Size(Pixels)) Point(Pixels) {
+    return .{ .x = std.math.clamp(offset.x, -max.width, 0), .y = std.math.clamp(offset.y, -max.height, 0) };
+}
+
+/// How far the children can scroll inside `bounds`, with the box's padding (GPUI
+/// `clamp_scroll_position`).
+fn scroll_max(bounds: Bounds(Pixels), s: *const Style, child_layout_ids: []const LayoutId, window: *Window) Size(Pixels) {
+    if (child_layout_ids.len == 0) return .{ .width = 0, .height = 0 };
+    const inf = std.math.inf(f32);
+    var min_x = inf;
+    var min_y = inf;
+    var max_x = -inf;
+    var max_y = -inf;
+    for (child_layout_ids) |lid| {
+        const child = window.layout_bounds(lid);
+        min_x = @min(min_x, child.left());
+        min_y = @min(min_y, child.top());
+        max_x = @max(max_x, child.right());
+        max_y = @max(max_y, child.bottom());
+    }
+    const rem = window.rem_size();
+    const basis_x: geometry.AbsoluteLength = .{ .pixels = bounds.size.width };
+    const basis_y: geometry.AbsoluteLength = .{ .pixels = bounds.size.height };
+    const width = (max_x - min_x) + s.padding.left.to_pixels(basis_x, rem) + s.padding.right.to_pixels(basis_x, rem);
+    const height = (max_y - min_y) + s.padding.top.to_pixels(basis_y, rem) + s.padding.bottom.to_pixels(basis_y, rem);
+    // Layout results differ after about five decimals, which must not make a box scrollable.
+    return .{
+        .width = @max(0, @round((width - bounds.size.width) * 100) / 100),
+        .height = @max(0, @round((height - bounds.size.height) * 100) / 100),
+    };
+}
+
 pub const InteractiveElementState = struct {
     focus_handle: ?FocusHandle = null,
     pending_mouse_down: ?MouseDownEvent = null,
@@ -3386,7 +3783,20 @@ pub const InteractiveElementState = struct {
     group_hovered: bool = false,
     active: bool = false,
     scroll_offset: Point(Pixels) = .{ .x = 0, .y = 0 },
+    /// How far the content could scroll in the last frame.
+    scroll_max: ?Size(Pixels) = null,
     hover_listener_state: bool = false,
+    /// Set in capture, fired in bubble, so stopped propagation cannot leave it stuck.
+    captured_mouse_down: ?MouseDownEvent = null,
+    tooltip_phase: TooltipPhase = .none,
+    tooltip_generation: u64 = 0,
+    tooltip_view: ?view_mod.AnyView = null,
+    tooltip_mouse: Point(Pixels) = .{ .x = 0, .y = 0 },
+    tooltip_builder: ?TooltipBuilder = null,
+    tooltip_hoverable: bool = false,
+    tooltip_source_bounds: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } },
+    /// The tooltip was opened by a long press and stays until the touch ends (GPUI `long_press_tooltip_active`).
+    long_press_tooltip_active: bool = false,
 };
 
 /// All interactive and stateful behavior of a styled element (GPUI `Interactivity`).
@@ -3408,6 +3818,20 @@ pub const Interactivity = struct {
     mouse_down_listeners: List(MouseDownL) = .empty,
     mouse_up_listeners: List(MouseUpL) = .empty,
     mouse_down_out_listeners: List(DownOutL) = .empty,
+    mouse_up_out_listeners: List(UpOutL) = .empty,
+    aux_click_listeners: List(Listener(ClickEvent)) = .empty,
+    pinch_listeners: List(Listener(PinchEvent)) = .empty,
+    capture_pinch_listeners: List(Listener(PinchEvent)) = .empty,
+    mouse_pressure_listeners: List(Listener(MousePressureEvent)) = .empty,
+    capture_mouse_pressure_listeners: List(Listener(MousePressureEvent)) = .empty,
+    drop_listeners: List(DropL) = .empty,
+    can_drop_predicate: ?*const fn (value: app_mod.AnyDragValue, window: *Window, cx: *App) bool = null,
+    drag_listener: ?DragListener = null,
+    drag_over_styles: List(DragOverStyle) = .empty,
+    group_drag_over_styles: List(GroupDragOverStyle) = .empty,
+    tooltip_builder: ?TooltipBuilder = null,
+    tooltip_hoverable: bool = false,
+    tooltip_show_delay_ns: ?u64 = null,
     mouse_move_listeners: List(Listener(MouseMoveEvent)) = .empty,
     scroll_wheel_listeners: List(Listener(ScrollWheelEvent)) = .empty,
     key_down_listeners: List(struct { phase: DispatchPhase, l: Listener(KeyDownEvent) }) = .empty,
@@ -3416,27 +3840,50 @@ pub const Interactivity = struct {
     action_listeners: List(ActionL) = .empty,
     click_listeners: List(Listener(ClickEvent)) = .empty,
     hover_listener: ?Listener(bool) = null,
-    occlude_mouse: bool = false,
+    hover_listener_mode: HoverListenerMode = .input_modality_aware,
+    mouse_exit_listeners: List(Listener(MouseExitEvent)) = .empty,
+    file_drop_exit_listeners: List(Listener(FileDropEvent)) = .empty,
+    drag_move_listeners: List(DragMoveL) = .empty,
+    scroll_anchor: ?ScrollAnchor = null,
+    occlude_mouse_: bool = false,
     block_mouse_except_scroll_: bool = false,
     tab_index: ?isize = null,
     tab_stop: ?bool = null,
+    tab_group_: bool = false,
+
+    /// Blocks mouse events from reaching the elements behind this one (GPUI `occlude_mouse`).
+    pub fn occlude_mouse(self: *Interactivity) void {
+        self.occlude_mouse_ = true;
+    }
 
     fn needs_hitbox(self: *const Interactivity) bool {
         return self.element_id != null or self.focusable or self.tracked_focus_handle != null or self.hover_style != null or
-            self.active_style != null or self.group != null or self.occlude_mouse or self.block_mouse_except_scroll_ or
+            self.active_style != null or self.group != null or self.occlude_mouse_ or self.block_mouse_except_scroll_ or
             self.mouse_down_listeners.items.len > 0 or self.mouse_up_listeners.items.len > 0 or self.mouse_down_out_listeners.items.len > 0 or
             self.mouse_move_listeners.items.len > 0 or self.scroll_wheel_listeners.items.len > 0 or self.click_listeners.items.len > 0 or
-            self.hover_listener != null or self.base_style.mouse_cursor != null;
+            self.mouse_exit_listeners.items.len > 0 or self.file_drop_exit_listeners.items.len > 0 or self.drag_move_listeners.items.len > 0 or
+            self.hover_listener != null or self.base_style.mouse_cursor != null or
+            self.aux_click_listeners.items.len > 0 or self.pinch_listeners.items.len > 0 or self.capture_pinch_listeners.items.len > 0 or
+            self.mouse_pressure_listeners.items.len > 0 or self.capture_mouse_pressure_listeners.items.len > 0 or
+            self.drop_listeners.items.len > 0 or self.drag_listener != null or self.drag_over_styles.items.len > 0 or
+            self.tooltip_builder != null or self.mouse_up_out_listeners.items.len > 0;
     }
 
     /// The style for this frame: base refined by focus/hover/active states (GPUI `compute_style`).
     pub fn compute_style(self: *const Interactivity, hitbox: ?*const Hitbox, state: ?*const InteractiveElementState, window: *Window, cx: *App) Style {
-        var s: Style = .{};
-        s.refine(&self.base_style);
+        var base: Style = .{};
+        base.refine(&self.base_style);
+        return self.compute_style_from(&base, hitbox, state, window, cx);
+    }
+
+    /// `compute_style` from `base`, which is this element's `base_style` over the defaults. An element
+    /// asks for its style in layout, prepaint and paint, so it refines its base only once.
+    pub fn compute_style_from(self: *const Interactivity, base: *const Style, hitbox: ?*const Hitbox, state: ?*const InteractiveElementState, window: *Window, cx: *App) Style {
+        var s = base.*;
         if (self.tracked_focus_handle) |h| {
             if (self.in_focus_style) |r| if (h.within_focused(window, cx)) s.refine(r);
             if (self.focus_style) |r| if (h.is_focused(window)) s.refine(r);
-            if (self.focus_visible_style) |r| if (h.is_focused(window) and window.last_input_was_keyboard) s.refine(r);
+            if (self.focus_visible_style) |r| if (h.is_focused(window) and window.last_input_was_keyboard()) s.refine(r);
         }
         if (hitbox) |hb| {
             if (self.hover_style) |r| if (hb.is_hovered(window)) s.refine(r);
@@ -3448,6 +3895,21 @@ pub const Interactivity = struct {
             }
         }
         if (self.group_active_style) |g| if (group_active(g.group)) s.refine(g.style);
+        if (cx.active_drag) |drag| {
+            const allowed = if (self.can_drop_predicate) |predicate| predicate(drag.value, window, cx) else true;
+            if (allowed) {
+                for (self.group_drag_over_styles.items) |g| {
+                    if (g.type_id != drag.value.type_id) continue;
+                    if (group_hitbox(g.group)) |gh| if (window_hovered(gh, window)) s.refine(g.style);
+                }
+                if (hitbox) |hb| {
+                    for (self.drag_over_styles.items) |d| {
+                        if (d.type_id == drag.value.type_id and hb.is_hovered(window)) s.refine(d.style);
+                    }
+                }
+            }
+            s.mouse_cursor = drag.cursor_style;
+        }
         return s;
     }
 
@@ -3475,6 +3937,8 @@ pub const Interactivity = struct {
 /// The per-frame state between layout, prepaint and paint.
 pub const DivFrameState = struct {
     child_layout_ids: []LayoutId = &.{},
+    /// `base_style` over the defaults, before an element's own hook changed it.
+    base_style: Style = .{},
 };
 
 pub const DivPrepaintState = struct {
@@ -3487,7 +3951,7 @@ pub const DivPrepaintState = struct {
 /// The shared implementation of every styled element.
 ///
 /// `Ext` adds element-specific state and hooks:
-/// - `fn request_layout_ext(self: *StyledElement(Ext), style: *Style, window, cx) ?LayoutId` (e.g. measured images)
+/// - `fn request_layout_ext(self: *StyledElement(Ext), gid: ?*const GlobalElementId, style: *Style, window, cx) ?LayoutId` (e.g. measured images; `gid` is null without an element id)
 /// - `fn paint_ext(self: *StyledElement(Ext), bounds, style: *const Style, window, cx) void` (painted after background, before children)
 pub fn StyledElement(comptime Ext: type) type {
     return struct {
@@ -3499,6 +3963,12 @@ pub fn StyledElement(comptime Ext: type) type {
         interactivity: Interactivity = .{},
         children_list: element_mod.Children = .empty,
         ext: Ext = .{},
+        /// The image cache for the images under this element (set with `image_cache`).
+        image_cache_provider: ?image_cache_mod.ImageCacheProvider = null,
+        /// Set by `on_children_prepainted` (GPUI `prepaint_listener`).
+        prepaint_listener: ?Listener(PrepaintedChildren) = null,
+        /// Set by `with_dynamic_prepaint_order` (GPUI `prepaint_order_fn`).
+        prepaint_order_fn: ?*const fn (window: *Window, cx: *App) []const usize = null,
 
         pub const RequestLayoutState = DivFrameState;
         pub const PrepaintState = DivPrepaintState;
@@ -3515,6 +3985,13 @@ pub fn StyledElement(comptime Ext: type) type {
 
         pub fn children_mut(self: *Self) *element_mod.Children {
             return &self.children_list;
+        }
+
+        /// Sets the image cache for the images under this element (GPUI `image_cache`). Those images
+        /// load through it instead of the app's own cache; see `image_cache.zig`.
+        pub fn image_cache(self: *Self, provider: anytype) *Self {
+            self.image_cache_provider = image_cache_mod.ImageCacheProvider.from(provider);
+            return self;
         }
 
         pub fn element_id(self: *Self) ?ElementId {
@@ -3572,8 +4049,19 @@ pub fn StyledElement(comptime Ext: type) type {
             return self;
         }
 
+        /// Sets where this element comes in tab order, which makes it focusable and a tab stop.
         pub fn tab_index(self: *Self, index: isize) *Self {
+            self.interactivity.focusable = true;
             self.interactivity.tab_index = index;
+            self.interactivity.tab_stop = true;
+            return self;
+        }
+
+        /// Gives this element one place in the tab order, inside which its children's tab
+        /// indices start over.
+        pub fn tab_group(self: *Self) *Self {
+            self.interactivity.tab_group_ = true;
+            if (self.interactivity.tab_index == null) self.interactivity.tab_index = 0;
             return self;
         }
 
@@ -3657,13 +4145,92 @@ pub fn StyledElement(comptime Ext: type) type {
             return self;
         }
 
+        /// Fires when `button` is released outside this element, as for ending a drag.
+        pub fn on_mouse_up_out(self: *Self, button: MouseButton, listener: anytype) *Self {
+            self.interactivity.mouse_up_out_listeners.append(arena(), .{ .button = button, .listener = app_mod.to_listener(MouseUpEvent, listener) }) catch oom();
+            return self;
+        }
+
         pub fn on_mouse_move(self: *Self, listener: anytype) *Self {
             self.interactivity.mouse_move_listeners.append(arena(), app_mod.to_listener(MouseMoveEvent, listener)) catch oom();
             return self;
         }
 
-        pub fn on_scroll_wheel(self: *Self, listener: anytype) *Self {
+        /// Scroll events over this element, in the bubble phase (GPUI `on_scroll`).
+        pub fn on_scroll(self: *Self, listener: anytype) *Self {
             self.interactivity.scroll_wheel_listeners.append(arena(), app_mod.to_listener(ScrollWheelEvent, listener)) catch oom();
+            return self;
+        }
+
+        /// The former name of `on_scroll` (GPUI `on_scroll_wheel`, deprecated).
+        pub fn on_scroll_wheel(self: *Self, listener: anytype) *Self {
+            return self.on_scroll(listener);
+        }
+
+        /// Called when the mouse leaves the window while over this element (GPUI `on_mouse_exit`).
+        pub fn on_mouse_exit(self: *Self, listener: anytype) *Self {
+            self.interactivity.mouse_exit_listeners.append(arena(), app_mod.to_listener(MouseExitEvent, listener)) catch oom();
+            return self;
+        }
+
+        /// Called with `FileDropEvent.exited` when a file drag leaves the window while over this
+        /// element (GPUI `on_file_drop_exit`).
+        pub fn on_file_drop_exit(self: *Self, listener: anytype) *Self {
+            self.interactivity.file_drop_exit_listeners.append(arena(), app_mod.to_listener(FileDropEvent, listener)) catch oom();
+            return self;
+        }
+
+        /// Called for every move during a drag of a `T` that started with this element under the
+        /// pointer, whether or not the pointer is over this element (GPUI `on_drag_move::<T>`). The
+        /// listener takes `*const DragMoveEvent(T)`. Useful for resizing and other drags that drop nothing.
+        pub fn on_drag_move(self: *Self, comptime T: type, listener: anytype) *Self {
+            const E = DragMoveEvent(T);
+            const held = arena().create(Listener(E)) catch oom();
+            held.* = app_mod.to_listener(E, listener);
+            self.interactivity.drag_move_listeners.append(arena(), .{ .type_id = app_mod.type_id(T), .ctx = held, .call = struct {
+                fn call(raw: *anyopaque, event: *const MouseMoveEvent, bounds: Bounds(Pixels), item: *anyopaque, window: *Window, cx: *App) void {
+                    const l: *const Listener(E) = @ptrCast(@alignCast(raw));
+                    const ev: E = .{ .event = event.*, .bounds = bounds, .item = @ptrCast(@alignCast(item)) };
+                    l.call(&ev, window, cx);
+                }
+            }.call }) catch oom();
+            return self;
+        }
+
+        /// Sets the hit testing `on_hover` uses (GPUI `hover_listener_mode`).
+        pub fn hover_listener_mode(self: *Self, mode: HoverListenerMode) *Self {
+            self.interactivity.hover_listener_mode = mode;
+            return self;
+        }
+
+        /// Keeps this element scrolled into view by its scroll container (GPUI `anchor_scroll`).
+        pub fn anchor_scroll(self: *Self, scroll_anchor: ?ScrollAnchor) *Self {
+            self.interactivity.scroll_anchor = scroll_anchor;
+            return self;
+        }
+
+        /// Scrolls along the axis the gesture starts on (GPUI `restrict_scroll_to_axis`).
+        pub fn restrict_scroll_to_axis(self: *Self) *Self {
+            self.interactivity.base_style.restrict_scroll_to_axis = true;
+            return self;
+        }
+
+        /// Lets a scroll move both axes at once; by default only the dominant axis moves (GPUI `allow_concurrent_scroll`).
+        pub fn allow_concurrent_scroll(self: *Self) *Self {
+            self.interactivity.base_style.allow_concurrent_scroll = true;
+            return self;
+        }
+
+        /// Runs `listener` with the bounds of the children once they are prepainted (GPUI `on_children_prepainted`).
+        pub fn on_children_prepainted(self: *Self, listener: anytype) *Self {
+            self.prepaint_listener = app_mod.to_listener(PrepaintedChildren, listener);
+            return self;
+        }
+
+        /// Prepaints the children in the order `order_fn` returns their indices (GPUI `with_dynamic_prepaint_order`).
+        /// Each index must appear once. The order is asked for in every prepaint.
+        pub fn with_dynamic_prepaint_order(self: *Self, comptime order_fn: fn (*Window, *App) []const usize) *Self {
+            self.prepaint_order_fn = &order_fn;
             return self;
         }
 
@@ -3723,7 +4290,7 @@ pub fn StyledElement(comptime Ext: type) type {
 
         /// Blocks mouse events from reaching elements behind this one.
         pub fn occlude(self: *Self) *Self {
-            self.interactivity.occlude_mouse = true;
+            self.interactivity.occlude_mouse();
             return self;
         }
 
@@ -3735,6 +4302,113 @@ pub fn StyledElement(comptime Ext: type) type {
         // -- StatefulInteractiveElement ------------------------------------
 
         /// Click handler (requires `.id(...)`).
+        /// Fires for clicks with any button but the left one.
+        pub fn on_aux_click(self: *Self, listener: anytype) *Self {
+            self.interactivity.aux_click_listeners.append(arena(), app_mod.to_listener(ClickEvent, listener)) catch oom();
+            return self;
+        }
+
+        pub fn on_pinch(self: *Self, listener: anytype) *Self {
+            self.interactivity.pinch_listeners.append(arena(), app_mod.to_listener(PinchEvent, listener)) catch oom();
+            return self;
+        }
+
+        pub fn capture_pinch(self: *Self, listener: anytype) *Self {
+            self.interactivity.capture_pinch_listeners.append(arena(), app_mod.to_listener(PinchEvent, listener)) catch oom();
+            return self;
+        }
+
+        /// Pressure changes over this element (GPUI `on_mouse_pressure`). Only macOS trackpads
+        /// report pressure; no other platform emits these events.
+        pub fn on_mouse_pressure(self: *Self, listener: anytype) *Self {
+            self.interactivity.mouse_pressure_listeners.append(arena(), app_mod.to_listener(MousePressureEvent, listener)) catch oom();
+            return self;
+        }
+
+        /// The capture-phase form of `on_mouse_pressure` (GPUI `capture_mouse_pressure`).
+        pub fn capture_mouse_pressure(self: *Self, listener: anytype) *Self {
+            self.interactivity.capture_mouse_pressure_listeners.append(arena(), app_mod.to_listener(MousePressureEvent, listener)) catch oom();
+            return self;
+        }
+
+        /// Makes this element draggable once the pointer moves past a small threshold.
+        /// `constructor(value, cursor_offset, window, cx)` returns the entity to show under the
+        /// pointer. `value` is copied for the length of the drag. The element needs an id.
+        pub fn on_drag(self: *Self, value: anytype, comptime constructor: anytype) *Self {
+            const T = @TypeOf(value);
+            const held = arena().create(T) catch oom();
+            held.* = value;
+            self.interactivity.drag_listener = .{ .value = held, .start = struct {
+                fn start(raw: *anyopaque, offset: Point(Pixels), window: *Window, cx: *App) app_mod.AnyDrag {
+                    const source: *const T = @ptrCast(@alignCast(raw));
+                    const copy = cx.allocator.create(T) catch oom();
+                    copy.* = source.*;
+                    return .{
+                        .value = .{ .ptr = copy, .type_id = app_mod.type_id(T) },
+                        .view = view_mod.AnyView.from(constructor(@as(*const T, copy), offset, window, cx)),
+                        .cursor_offset = offset,
+                        .free_value = struct {
+                            fn free(a: std.mem.Allocator, held_value: *anyopaque) void {
+                                a.destroy(@as(*T, @ptrCast(@alignCast(held_value))));
+                            }
+                        }.free,
+                    };
+                }
+            }.start };
+            return self;
+        }
+
+        /// Receives a dragged `T` released over this element. File drags arrive as `ExternalPaths`.
+        pub fn on_drop(self: *Self, comptime T: type, listener: anytype) *Self {
+            const held = arena().create(Listener(T)) catch oom();
+            held.* = app_mod.to_listener(T, listener);
+            self.interactivity.drop_listeners.append(arena(), .{ .type_id = app_mod.type_id(T), .ctx = held, .call = struct {
+                fn call(raw: *anyopaque, value: *anyopaque, window: *Window, cx: *App) void {
+                    const l: *const Listener(T) = @ptrCast(@alignCast(raw));
+                    l.call(@ptrCast(@alignCast(value)), window, cx);
+                }
+            }.call }) catch oom();
+            return self;
+        }
+
+        /// Decides whether the drag may be dropped here, and whether drag_over styles apply.
+        pub fn can_drop(self: *Self, predicate: *const fn (app_mod.AnyDragValue, *Window, *App) bool) *Self {
+            self.interactivity.can_drop_predicate = predicate;
+            return self;
+        }
+
+        /// Style applied while a dragged `T` is over this element.
+        pub fn drag_over(self: *Self, comptime T: type, s: anytype) *Self {
+            self.interactivity.drag_over_styles.append(arena(), .{ .type_id = app_mod.type_id(T), .style = to_style_refinement(s) }) catch oom();
+            return self;
+        }
+
+        /// Style applied while a dragged `T` is over the named group.
+        pub fn group_drag_over(self: *Self, comptime T: type, group_name: []const u8, s: anytype) *Self {
+            self.interactivity.group_drag_over_styles.append(arena(), .{ .type_id = app_mod.type_id(T), .group = group_name, .style = to_style_refinement(s) }) catch oom();
+            return self;
+        }
+
+        /// Shows a view after the pointer rests here. Takes a `fn(*Window, *App) AnyView` or
+        /// a `TooltipBuilder`. The element needs an id.
+        pub fn tooltip(self: *Self, build_tooltip: anytype) *Self {
+            self.interactivity.tooltip_builder = to_tooltip_builder(build_tooltip);
+            self.interactivity.tooltip_hoverable = false;
+            return self;
+        }
+
+        /// Like `tooltip`, but the pointer may move onto the tooltip without it closing.
+        pub fn hoverable_tooltip(self: *Self, build_tooltip: anytype) *Self {
+            self.interactivity.tooltip_builder = to_tooltip_builder(build_tooltip);
+            self.interactivity.tooltip_hoverable = true;
+            return self;
+        }
+
+        pub fn tooltip_show_delay(self: *Self, delay_ms: u64) *Self {
+            self.interactivity.tooltip_show_delay_ns = delay_ms * std.time.ns_per_ms;
+            return self;
+        }
+
         pub fn on_click(self: *Self, listener: anytype) *Self {
             self.interactivity.click_listeners.append(arena(), app_mod.to_listener(ClickEvent, listener)) catch oom();
             return self;
@@ -3743,6 +4417,23 @@ pub fn StyledElement(comptime Ext: type) type {
         /// Called with `true`/`false` when hover starts/ends.
         pub fn on_hover(self: *Self, listener: anytype) *Self {
             self.interactivity.hover_listener = app_mod.to_listener(bool, listener);
+            return self;
+        }
+
+        /// Runs `listener` for the action when it is dispatched to this element, in the bubble phase
+        /// (GPUI `on_boxed_action`). `action` is type-erased, so it must outlive the frame.
+        pub fn on_boxed_action(self: *Self, action: action_mod.AnyAction, comptime listener: fn (*const action_mod.AnyAction, *Window, *App) void) *Self {
+            const Held = struct {
+                action: action_mod.AnyAction,
+                fn call(raw: *anyopaque, _: *const anyopaque, phase: DispatchPhase, window: *Window, cx: *App) void {
+                    if (phase != .bubble) return;
+                    const held: *const @This() = @ptrCast(@alignCast(raw));
+                    listener(&held.action, window, cx);
+                }
+            };
+            const held = arena().create(Held) catch oom();
+            held.* = .{ .action = action };
+            self.interactivity.action_listeners.append(arena(), .{ .action_type = action.type_id, .phase = .bubble, .ctx = held, .func = Held.call }) catch oom();
             return self;
         }
 
@@ -3755,25 +4446,37 @@ pub fn StyledElement(comptime Ext: type) type {
         // -- Element protocol ---------------------------------------------
 
         pub fn request_layout(self: *Self, gid: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, DivFrameState } {
-            _ = gid;
             var s: Style = .{};
             s.refine(&self.interactivity.base_style);
+            const base_style = s;
             const has_text = s.text_style() != null;
             if (has_text) window.push_text_style(s.text);
             defer if (has_text) window.pop_text_style();
 
+            // Set before the element's own hook and its children, so `img` sees its own cache on top.
+            const pushed_cache = if (self.image_cache_provider) |provider| blk: {
+                window.push_image_cache(provider.provide(window, cx));
+                break :blk true;
+            } else false;
+            defer if (pushed_cache) window.pop_image_cache();
+
             if (@hasDecl(Ext, "request_layout_ext")) {
-                if (Ext.request_layout_ext(self, &s, window, cx)) |lid| return .{ lid, .{} };
+                if (Ext.request_layout_ext(self, gid, &s, window, cx)) |lid| return .{ lid, .{ .base_style = base_style } };
             }
             const ids = arena().alloc(LayoutId, self.children_list.items.len) catch oom();
             for (self.children_list.items, 0..) |c, i| ids[i] = c.request_layout(window, cx);
-            return .{ window.request_layout(&s, ids, cx), .{ .child_layout_ids = ids } };
+            return .{ window.request_layout(&s, ids, cx), .{ .child_layout_ids = ids, .base_style = base_style } };
         }
 
         pub fn prepaint(self: *Self, gid: ?*const GlobalElementId, bounds: Bounds(Pixels), rl: *DivFrameState, window: *Window, cx: *App) DivPrepaintState {
             const it = &self.interactivity;
             var pp: DivPrepaintState = .{};
             if (gid) |g| pp.state = window.element_state(InteractiveElementState, g.*, .{});
+            // Where an anchored element is, so its container can scroll to it (GPUI `scroll_anchor`).
+            if (it.scroll_anchor) |anchor| {
+                const offset = window.element_offset();
+                anchor.last_origin.* = .{ .x = bounds.origin.x - offset.x, .y = bounds.origin.y - offset.y };
+            }
 
             // Focus handle: tracked, or an implicit one stored in element state.
             if (it.focusable and it.tracked_focus_handle == null) {
@@ -3788,7 +4491,20 @@ pub fn StyledElement(comptime Ext: type) type {
                 if (it.tab_stop) |ts| hh.tab_stop_ = ts;
                 window.set_focus_handle(&hh, cx);
             }
+            if (it.tab_group_) window.next_frame.dispatch_tree.set_tab_group(it.tab_index.?);
             if (it.key_context) |kc| window.set_key_context(kc);
+
+            // A tooltip that is showing asks to be drawn at the end of the frame.
+            if (pp.state) |st| {
+                st.tooltip_builder = it.tooltip_builder;
+                st.tooltip_hoverable = it.tooltip_hoverable;
+                st.tooltip_source_bounds = bounds;
+                if (it.tooltip_builder == null) {
+                    clear_tooltip(st, window, cx);
+                } else if (st.tooltip_view) |view| {
+                    window.set_tooltip(.{ .view = view, .mouse_position = st.tooltip_mouse, .ctx = st, .check_visible_and_update = tooltip_check_visible });
+                }
+            }
 
             // Key & action listeners attach to this element's dispatch node.
             for (it.key_down_listeners.items) |*kl| registerKey(KeyDownEvent, window, kl.phase, &kl.l);
@@ -3796,7 +4512,7 @@ pub fn StyledElement(comptime Ext: type) type {
             for (it.action_listeners.items) |al| window.on_action(al.action_type, al.ctx, al.func);
 
             if (it.needs_hitbox()) {
-                const behavior: window_mod.HitboxBehavior = if (it.occlude_mouse) .block_mouse else if (it.block_mouse_except_scroll_) .block_mouse_except_scroll else .normal;
+                const behavior: window_mod.HitboxBehavior = if (it.occlude_mouse_) .block_mouse else if (it.block_mouse_except_scroll_) .block_mouse_except_scroll else .normal;
                 pp.hitbox = window.insert_hitbox(bounds, behavior);
                 if (it.group) |g| {
                     if (Interactivity.groups_frame != window.frame_count) {
@@ -3808,19 +4524,43 @@ pub fn StyledElement(comptime Ext: type) type {
                 }
             }
 
-            pp.style = it.compute_style(if (pp.hitbox) |*hbx| hbx else null, pp.state, window, cx);
+            // Without the hitbox: what is hovered is only known once prepaint has finished. Paint
+            // computes it again with the hitbox, as GPUI does.
+            pp.style = it.compute_style_from(&rl.base_style, null, pp.state, window, cx);
             const s = &pp.style;
 
             const has_text = s.text_style() != null;
             if (has_text) window.push_text_style(s.text);
             defer if (has_text) window.pop_text_style();
 
-            // Scroll offset.
+            // Scroll offset, clamped before the children use it (GPUI `clamp_scroll_position`):
+            // a wheel event past the end must not paint a frame out there.
             var scroll: Point(Pixels) = .{ .x = 0, .y = 0 };
+            // The children are measured, and the requests made since the last frame applied, before the
+            // offset is clamped (GPUI `Div::prepaint` and `scroll_to_active_item`).
+            if (it.tracked_scroll_handle) |sh| {
+                sh.state.child_bounds.clearRetainingCapacity();
+                const allocator = sh.state.allocator orelse std.heap.page_allocator;
+                for (rl.child_layout_ids) |lid| sh.state.child_bounds.append(allocator, window.layout_bounds(lid)) catch oom();
+                sh.scroll_to_active_item();
+            }
             if (s.overflow.x == .scroll or s.overflow.y == .scroll) {
+                const max = scroll_max(bounds, s, rl.child_layout_ids, window);
                 if (it.tracked_scroll_handle) |sh| {
-                    scroll = sh.offset();
-                } else if (pp.state) |st| scroll = st.scroll_offset;
+                    sh.state.max_offset = max;
+                    sh.state.bounds = bounds;
+                    sh.state.overflow = s.overflow;
+                    const to_bottom = sh.state.scroll_to_bottom;
+                    sh.state.scroll_to_bottom = false;
+                    scroll = clamp_scroll(sh.offset(), max);
+                    if (to_bottom) scroll.y = -max.height;
+                    sh.set_offset(scroll);
+                }
+                if (pp.state) |st| {
+                    st.scroll_max = max;
+                    if (it.tracked_scroll_handle == null) scroll = clamp_scroll(st.scroll_offset, max);
+                    st.scroll_offset = scroll;
+                }
             }
             pp.scroll_offset = scroll;
 
@@ -3829,47 +4569,43 @@ pub fn StyledElement(comptime Ext: type) type {
             defer if (mask != null) window.pop_content_mask();
 
             window.push_element_offset(scroll);
-            for (self.children_list.items) |c| c.prepaint(window, cx);
-            window.pop_element_offset();
-
-            // Content size for scroll clamping.
-            if (s.overflow.x == .scroll or s.overflow.y == .scroll) {
-                var content = bounds;
-                for (rl.child_layout_ids) |lid| {
-                    const cb = window.layout_bounds(lid);
-                    content = content.@"union"(cb.@"union"(cb));
+            if (self.prepaint_order_fn) |order_fn| {
+                for (order_fn(window, cx)) |ix| {
+                    if (ix < self.children_list.items.len) self.children_list.items[ix].prepaint(window, cx);
                 }
-                const pad_r = s.padding.right.to_pixels(.{ .pixels = bounds.size.width }, window.rem_size());
-                const pad_b = s.padding.bottom.to_pixels(.{ .pixels = bounds.size.height }, window.rem_size());
-                const max: Size(Pixels) = .{
-                    .width = @max(0, content.right() + pad_r - bounds.right()),
-                    .height = @max(0, content.bottom() + pad_b - bounds.bottom()),
-                };
-                if (it.tracked_scroll_handle) |sh| {
-                    sh.state.max_offset = max;
-                    sh.state.bounds = bounds;
-                    sh.state.child_bounds.clearRetainingCapacity();
-                    const a = sh.state.allocator orelse std.heap.page_allocator;
-                    for (rl.child_layout_ids) |lid| sh.state.child_bounds.append(a, window.layout_bounds(lid)) catch oom();
-                }
-                if (pp.state) |st| {
-                    st.scroll_offset.x = std.math.clamp(st.scroll_offset.x, -max.width, 0);
-                    st.scroll_offset.y = std.math.clamp(st.scroll_offset.y, -max.height, 0);
-                }
+            } else {
+                for (self.children_list.items) |c| c.prepaint(window, cx);
             }
+            window.pop_element_offset();
+            if (self.prepaint_listener) |listener| {
+                const child_bounds = arena().alloc(Bounds(Pixels), rl.child_layout_ids.len) catch oom();
+                for (rl.child_layout_ids, 0..) |lid, i| child_bounds[i] = window.layout_bounds(lid);
+                const prepainted: PrepaintedChildren = .{ .bounds = child_bounds };
+                listener.call(&prepainted, window, cx);
+            }
+            if (@hasDecl(Ext, "prepaint_ext")) Ext.prepaint_ext(self, bounds, window, cx);
+
             return pp;
         }
 
         pub fn paint(self: *Self, gid: ?*const GlobalElementId, bounds: Bounds(Pixels), rl: *DivFrameState, pp: *DivPrepaintState, window: *Window, cx: *App) void {
             _ = gid;
-            _ = rl;
+            // Only these depend on the hit test, which prepaint could not know.
+            const hover_dependent = self.interactivity.hover_style != null or self.interactivity.group_hover_style != null or
+                self.interactivity.drag_over_styles.items.len > 0 or self.interactivity.group_drag_over_styles.items.len > 0;
+            if (hover_dependent) pp.style = self.interactivity.compute_style_from(&rl.base_style, if (pp.hitbox) |*hbx| hbx else null, pp.state, window, cx);
             const s = &pp.style;
             if (s.visibility == .hidden) return;
             const it = &self.interactivity;
 
             if (pp.hitbox) |*hb| {
                 self.register_mouse_listeners(hb, pp.state, window);
-                if (s.mouse_cursor) |c| window.set_cursor_style(c, hb);
+                // During a drag its cursor applies everywhere, not just over this element.
+                if (cx.active_drag) |drag| {
+                    if (drag.cursor_style) |c| window.set_window_cursor_style(c);
+                } else if (s.mouse_cursor) |c| {
+                    window.set_cursor_style(c, hb);
+                }
             }
 
             const has_text = s.text_style() != null;
@@ -3881,14 +4617,14 @@ pub fn StyledElement(comptime Ext: type) type {
             const rem = window.rem_size();
             const radii = s.corner_radii.to_pixels(rem).clamp_radii_for_quad_size(bounds.size);
 
-            // Shadows and background.
-            window.paint_shadows(bounds, radii, s.box_shadow);
+            window.paint_drop_shadows(bounds, radii, s.box_shadow);
             if (s.background) |bgf| {
                 const bgc = bgf.get_color() orelse color_mod.to_background(color_mod.transparent_black());
                 if (!bgc.is_transparent()) {
                     window.paint_quad(.{ .bounds = bounds, .corner_radii = radii, .background = bgc });
                 }
             }
+            window.paint_inset_shadows(bounds, radii, s.box_shadow);
 
             if (@hasDecl(Ext, "paint_ext")) Ext.paint_ext(self, bounds, s, window, cx);
 
@@ -3943,20 +4679,51 @@ pub fn StyledElement(comptime Ext: type) type {
             ctx.* = .{ .self = self, .hitbox = hb.*, .state = state };
 
             const needs_down = it.mouse_down_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or
-                it.tracked_focus_handle != null or it.group_active_style != null or it.mouse_down_out_listeners.items.len > 0;
+                it.tracked_focus_handle != null or it.group_active_style != null or it.mouse_down_out_listeners.items.len > 0 or
+                it.aux_click_listeners.items.len > 0 or it.drag_listener != null or it.tooltip_builder != null;
             if (needs_down) window.on_mouse_event(MouseDownEvent, ctx, onMouseDown);
-            if (it.mouse_up_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or it.group != null)
+            if (it.pinch_listeners.items.len > 0 or it.capture_pinch_listeners.items.len > 0) window.on_mouse_event(PinchEvent, ctx, onPinch);
+            if (it.mouse_pressure_listeners.items.len > 0 or it.capture_mouse_pressure_listeners.items.len > 0) window.on_mouse_event(MousePressureEvent, ctx, onMousePressure);
+            if (it.drop_listeners.items.len > 0 or it.aux_click_listeners.items.len > 0 or it.drag_listener != null or it.tooltip_builder != null or it.mouse_up_out_listeners.items.len > 0 or it.mouse_up_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or it.group != null)
                 window.on_mouse_event(MouseUpEvent, ctx, onMouseUp);
-            if (it.mouse_move_listeners.items.len > 0 or it.hover_style != null or it.hover_listener != null or it.group_hover_style != null or it.group != null)
+            if (it.drag_listener != null or it.tooltip_builder != null or it.drag_over_styles.items.len > 0 or it.mouse_move_listeners.items.len > 0 or it.hover_style != null or it.hover_listener != null or it.group_hover_style != null or it.group != null or it.drag_move_listeners.items.len > 0)
                 window.on_mouse_event(MouseMoveEvent, ctx, onMouseMove);
-            if (it.scroll_wheel_listeners.items.len > 0 or it.base_style.overflow.x == .scroll or it.base_style.overflow.y == .scroll)
+            if (it.mouse_exit_listeners.items.len > 0 or it.hover_listener != null) window.on_mouse_event(MouseExitEvent, ctx, onMouseExit);
+            if (it.file_drop_exit_listeners.items.len > 0) window.on_mouse_event(FileDropEvent, ctx, onFileDrop);
+            if (it.tooltip_builder != null or it.scroll_wheel_listeners.items.len > 0 or it.base_style.overflow.x == .scroll or it.base_style.overflow.y == .scroll)
                 window.on_mouse_event(ScrollWheelEvent, ctx, onScrollWheel);
+            if (it.tooltip_builder != null) window.on_mouse_event(interactive.LongPressEvent, ctx, onLongPress);
+        }
+
+        /// Shows the tooltip at once when a long press starts over this element, and hides it when the
+        /// touch ends (GPUI `register_tooltip_mouse_handlers`, the long-press half).
+        fn onLongPress(raw: *anyopaque, e: *const interactive.LongPressEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
+            const c: *MouseCtx = @ptrCast(@alignCast(raw));
+            const st = c.state orelse return;
+            if (phase != .bubble) return;
+            switch (e.phase) {
+                .started => {
+                    if (window.default_prevented() or !c.hitbox.is_hovered_at(e.start_position, window)) return;
+                    if (!show_long_press_tooltip(st, e.start_position, window, cx)) return;
+                    st.long_press_tooltip_active = true;
+                    window.prevent_default();
+                    window.stop_propagation();
+                },
+                .ended, .cancelled => {
+                    if (!st.long_press_tooltip_active) return;
+                    st.long_press_tooltip_active = false;
+                    clear_tooltip(st, window, cx);
+                    window.stop_propagation();
+                },
+                .moved => {},
+            }
         }
 
         fn onMouseDown(raw: *anyopaque, e: *const MouseDownEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
             const it = &c.self.interactivity;
             const hovered = c.hitbox.is_hovered(window);
+            if (it.tooltip_builder != null) if (c.state) |st| dismiss_tooltip_on_input(st, window, cx);
             if (phase == .bubble and !hovered) {
                 for (it.mouse_down_out_listeners.items) |l| l.listener.call(e, window, cx);
             }
@@ -3969,15 +4736,19 @@ pub fn StyledElement(comptime Ext: type) type {
             }
             if (phase != .bubble) return;
             if (it.tracked_focus_handle) |fh| {
-                if (!window.default_prevented) {
+                if (!window.default_prevented()) {
                     window.focus(fh);
+                    // A focusable parent must not take focus back as the event bubbles.
+                    window.prevent_default();
                 }
             }
             if (c.state) |st| {
+                if ((it.drag_listener != null and e.button == .left) or it.aux_click_listeners.items.len > 0 and e.button != .left) st.pending_mouse_down = e.*;
+                if (it.tooltip_builder != null) st.pending_mouse_down = e.*;
                 if (it.click_listeners.items.len > 0 and e.button == .left) st.pending_mouse_down = e.*;
                 if (it.active_style != null or it.group != null) {
                     st.active = true;
-                    window.refresh();
+                    window.notify_current_view();
                 }
             }
         }
@@ -3986,6 +4757,12 @@ pub fn StyledElement(comptime Ext: type) type {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
             const it = &c.self.interactivity;
             const hovered = c.hitbox.is_hovered(window);
+            // Capture phase, as in GPUI: nothing outside may stop the element hearing it.
+            if (phase == .capture and !hovered) {
+                for (it.mouse_up_out_listeners.items) |l| {
+                    if (l.button.eql(e.button)) l.listener.call(e, window, cx);
+                }
+            }
             if (hovered) {
                 for (it.mouse_up_listeners.items) |l| {
                     if (l.phase != phase) continue;
@@ -3994,17 +4771,46 @@ pub fn StyledElement(comptime Ext: type) type {
                     if (!window.propagate_event) return;
                 }
             }
-            if (phase != .bubble) return;
+            if (phase == .capture) {
+                // Done here so another handler stopping propagation cannot leave it set. Off
+                // the element it just clears, which keeps an element that moved under the
+                // pointer from starting a drag on its own.
+                if (c.state) |st| {
+                    if (st.pending_mouse_down) |down| {
+                        st.pending_mouse_down = null;
+                        if (hovered) st.captured_mouse_down = down;
+                        window.notify_current_view();
+                    }
+                }
+                return;
+            }
+            if (hovered and it.drop_listeners.items.len > 0) {
+                if (cx.active_drag) |drag| {
+                    for (it.drop_listeners.items) |l| {
+                        if (l.type_id != drag.value.type_id) continue;
+                        const allowed = if (it.can_drop_predicate) |predicate| predicate(drag.value, window, cx) else true;
+                        if (allowed) {
+                            l.call(l.ctx, drag.value.ptr, window, cx);
+                            window.refresh();
+                            window.stop_propagation();
+                        }
+                        cx.clear_active_drag();
+                        break;
+                    }
+                }
+            }
             if (c.state) |st| {
                 if (st.active) {
                     st.active = false;
-                    window.refresh();
+                    window.notify_current_view();
                 }
-                if (st.pending_mouse_down) |down| {
-                    st.pending_mouse_down = null;
-                    if (hovered and e.button == .left) {
-                        const click: ClickEvent = .{ .mouse = .{ .down = down, .up = e.* } };
+                if (st.captured_mouse_down) |down| {
+                    st.captured_mouse_down = null;
+                    const click: ClickEvent = .{ .mouse = .{ .down = down, .up = e.* } };
+                    if (down.button == .left) {
                         for (it.click_listeners.items) |l| l.call(&click, window, cx);
+                    } else {
+                        for (it.aux_click_listeners.items) |l| l.call(&click, window, cx);
                     }
                 }
             }
@@ -4014,43 +4820,119 @@ pub fn StyledElement(comptime Ext: type) type {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
             const it = &c.self.interactivity;
             const hovered = c.hitbox.is_hovered(window);
+            // Drag-move listeners hear every move of a drag of their type, wherever the pointer is.
+            if (phase == .capture) if (cx.active_drag) |drag| {
+                for (it.drag_move_listeners.items) |l| {
+                    if (l.type_id != drag.value.type_id) continue;
+                    l.call(l.ctx, e, c.hitbox.bounds, drag.value.ptr, window, cx);
+                }
+            };
+            if (it.tooltip_builder != null) if (c.state) |st| tooltip_on_mouse_move(st, hovered, phase, it.tooltip_show_delay_ns orelse DEFAULT_TOOLTIP_SHOW_DELAY_NS, window, cx);
             if (phase == .bubble and hovered) {
                 for (it.mouse_move_listeners.items) |l| l.call(e, window, cx);
+            }
+            if (phase == .bubble and !cx.has_active_drag()) {
+                if (it.drag_listener) |listener| if (c.state) |st| if (st.pending_mouse_down) |down| {
+                    const dx = e.position.x - down.position.x;
+                    const dy = e.position.y - down.position.y;
+                    if (down.button == .left and @sqrt(dx * dx + dy * dy) > DROP_DRAG_THRESHOLD) {
+                        st.active = false;
+                        st.pending_mouse_down = null;
+                        const offset: Point(Pixels) = .{ .x = e.position.x - c.hitbox.bounds.origin.x, .y = e.position.y - c.hitbox.bounds.origin.y };
+                        var drag = listener.start(listener.value, offset, window, cx);
+                        drag.cursor_style = it.base_style.mouse_cursor;
+                        cx.set_active_drag(drag);
+                        window.refresh();
+                        window.stop_propagation();
+                        return;
+                    }
+                };
             }
             if (phase != .capture) return;
             if (c.state) |st| {
                 if (st.hovered != hovered) {
                     st.hovered = hovered;
-                    if (it.hover_listener) |hl| hl.call(&hovered, window, cx);
-                    if (it.hover_style != null or it.group != null) window.refresh();
+                    if (it.hover_style != null or it.group != null) window.notify_current_view();
+                }
+                if (it.hover_listener) |hl| {
+                    // Not while a button is held or a drag runs, as in GPUI.
+                    const listener_hovered = st.pending_mouse_down == null and !cx.has_active_drag() and
+                        it.hover_listener_mode.is_hovered(&c.hitbox, window);
+                    if (st.hover_listener_state != listener_hovered) {
+                        st.hover_listener_state = listener_hovered;
+                        hl.call(&listener_hovered, window, cx);
+                    }
                 }
             } else if (it.hover_style != null) {
                 // Without persistent state, refresh whenever hover may have changed.
-                window.refresh();
+                window.notify_current_view();
             }
-            if (it.group_hover_style != null) window.refresh();
+            if (it.group_hover_style != null) window.notify_current_view();
+        }
+
+        fn onMouseExit(raw: *anyopaque, e: *const MouseExitEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
+            const c: *MouseCtx = @ptrCast(@alignCast(raw));
+            const it = &c.self.interactivity;
+            if (phase != .bubble) return;
+            if (c.hitbox.is_hovered(window)) {
+                for (it.mouse_exit_listeners.items) |l| l.call(e, window, cx);
+            }
+            // The pointer can leave without a last move, so the hover listener is cleared here too.
+            if (it.hover_listener) |hl| if (c.state) |st| {
+                if (st.hover_listener_state) {
+                    st.hover_listener_state = false;
+                    const off = false;
+                    hl.call(&off, window, cx);
+                }
+            };
+        }
+
+        fn onFileDrop(raw: *anyopaque, e: *const FileDropEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
+            const c: *MouseCtx = @ptrCast(@alignCast(raw));
+            const it = &c.self.interactivity;
+            if (phase != .bubble or std.meta.activeTag(e.*) != .exited) return;
+            if (!c.hitbox.is_hovered_ignoring_last_input(window)) return;
+            for (it.file_drop_exit_listeners.items) |l| l.call(e, window, cx);
+        }
+
+        fn onPinch(raw: *anyopaque, e: *const PinchEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
+            const c: *MouseCtx = @ptrCast(@alignCast(raw));
+            const it = &c.self.interactivity;
+            if (!c.hitbox.is_hovered(window)) return;
+            const list = if (phase == .capture) it.capture_pinch_listeners.items else it.pinch_listeners.items;
+            for (list) |l| l.call(e, window, cx);
+        }
+
+        fn onMousePressure(raw: *anyopaque, e: *const MousePressureEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
+            const c: *MouseCtx = @ptrCast(@alignCast(raw));
+            const it = &c.self.interactivity;
+            if (!c.hitbox.is_hovered(window)) return;
+            const list = if (phase == .capture) it.capture_mouse_pressure_listeners.items else it.mouse_pressure_listeners.items;
+            for (list) |l| l.call(e, window, cx);
         }
 
         fn onScrollWheel(raw: *anyopaque, e: *const ScrollWheelEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
             const it = &c.self.interactivity;
+            if (it.tooltip_builder != null) if (c.state) |st| dismiss_tooltip_on_input(st, window, cx);
             if (phase != .bubble or !c.hitbox.should_handle_scroll(window)) return;
             for (it.scroll_wheel_listeners.items) |l| l.call(e, window, cx);
             const s = it.base_style.overflow;
             if (s.x != .scroll and s.y != .scroll) return;
             const delta = e.delta.pixel_delta(window.line_height());
-            var off: Point(Pixels) = if (it.tracked_scroll_handle) |sh| sh.offset() else if (c.state) |st| st.scroll_offset else return;
-            if (s.x == .scroll) off.x += delta.x;
-            if (s.y == .scroll) off.y += delta.y;
-            if (it.tracked_scroll_handle) |sh| {
-                const max = sh.max_offset();
-                off.x = std.math.clamp(off.x, -max.width, 0);
-                off.y = std.math.clamp(off.y, -max.height, 0);
-                sh.set_offset(off);
-            }
+            const old: Point(Pixels) = if (it.tracked_scroll_handle) |sh| sh.offset() else if (c.state) |st| st.scroll_offset else return;
+            // Unset refinements read as the defaults: visible overflow, and both flags off.
+            const step = scroll_step(delta, s.x orelse .visible, s.y orelse .visible, it.base_style.restrict_scroll_to_axis orelse false, it.base_style.allow_concurrent_scroll orelse false);
+            var off: Point(Pixels) = .{ .x = old.x + step.x, .y = old.y + step.y };
+            // Unknown until the first frame; prepaint clamps again in any case.
+            const max: ?Size(Pixels) = if (it.tracked_scroll_handle) |sh| sh.max_offset() else if (c.state) |st| st.scroll_max else null;
+            if (max) |limit| off = clamp_scroll(off, limit);
+            // At the limit nothing moved, so nothing needs drawing. Unlike the old behaviour, the event
+            // is not stopped: an outer scroll container under this one scrolls too, as in GPUI.
+            if (off.x == old.x and off.y == old.y) return;
+            if (it.tracked_scroll_handle) |sh| sh.set_offset(off);
             if (c.state) |st| st.scroll_offset = off;
-            window.refresh();
-            window.stop_propagation();
+            window.notify_current_view();
         }
 
         // Styled methods (generated from styled.zig).
@@ -7281,6 +8163,11 @@ pub fn StyledElement(comptime Ext: type) type {
         pub const external_path = if (@hasDecl(Ext, "external_path")) Ext.external_path else {};
         pub const data = if (@hasDecl(Ext, "data")) Ext.data else {};
         pub const with_transformation = if (@hasDecl(Ext, "with_transformation")) Ext.with_transformation else {};
+
+        // -- GPUI `AnimationExt` for every styled element.
+        pub const with_animation = animation_mod.AnimationExt(*Self).with_animation;
+        pub const with_animations = animation_mod.AnimationExt(*Self).with_animations;
+        pub const with_spring = animation_mod.AnimationExt(*Self).with_spring;
     };
 }
 

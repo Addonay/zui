@@ -1,9 +1,11 @@
 //! Port of GPUI `elements/img.rs`: the `img()` element, a styled element that
 //! paints a decoded image with object-fit, grayscale and fallback support.
 //!
-//! Loads are synchronous (see `assets.zig`), so the `loading` state is stored
-//! for API parity but never shown. The fallback element is laid out and painted
-//! from `paint_ext`, since `StyledElement` has no prepaint hook for extensions.
+//! URLs load in the background (see `assets.zig`); `with_loading` shows while they do. GPUI waits
+//! `LOADING_DELAY` before showing it, which ZUI does not yet. Images load through the image cache
+//! in scope (`image_cache`, see `image_cache.zig`), or else through the app's own cache. The fallback
+//! element is laid out and painted from `paint_ext`, since `StyledElement` has no prepaint hook for
+//! extensions.
 
 const std = @import("std");
 const geometry = @import("../geometry.zig");
@@ -14,6 +16,7 @@ const window_mod = @import("../window.zig");
 const app_mod = @import("../app.zig");
 const atlas = @import("../atlas.zig");
 const assets = @import("../assets.zig");
+const executor = @import("../executor.zig");
 const div = @import("div.zig");
 
 const Window = window_mod.Window;
@@ -24,6 +27,7 @@ const DevicePixels = geometry.DevicePixels;
 const Size = geometry.Size;
 const Bounds = geometry.Bounds;
 const AnyElement = element_mod.AnyElement;
+const GlobalElementId = element_mod.GlobalElementId;
 const LayoutId = taffy.LayoutId;
 
 /// An image element (GPUI `Img`).
@@ -42,52 +46,71 @@ pub fn extensions() []const []const u8 {
     return assets.supported_extensions();
 }
 
+/// The style of an image element (GPUI `ImageStyle`).
+pub const ImageStyle = struct {
+    /// Draws the image in grayscale.
+    grayscale: bool = false,
+    /// How the image fits its bounds.
+    object_fit: style_mod.ObjectFit = .contain,
+    /// Element shown while the image loads.
+    loading: ?*const fn () AnyElement = null,
+    /// Element shown when the image fails to load.
+    fallback: ?*const fn () AnyElement = null,
+};
+
 /// Element-specific state and style for `Img`. Per-frame fields are set by `request_layout_ext`.
 pub const ImgExt = struct {
     source: ?assets.ImageSource = null,
-    object_fit_: style_mod.ObjectFit = .contain,
-    grayscale_: bool = false,
-    loading_: ?*const fn () AnyElement = null,
-    fallback_: ?*const fn () AnyElement = null,
+    style: ImageStyle = .{},
 
     /// The decoded image for this frame, or null if it failed to load.
     data: ?*assets.RenderImage = null,
     /// The fallback element, when loading failed and a fallback was set.
     replacement: ?AnyElement = null,
+    /// The frame of a multi-frame image to paint this frame (GPUI `ImgLayoutState::frame_index`).
+    frame_index: usize = 0,
+
+    /// The image's style (GPUI `image_style`): this is where `grayscale`, `object_fit`, `with_loading`
+    /// and `with_fallback` store their values.
+    pub fn image_style(self: anytype) *ImageStyle {
+        return &self.ext.style;
+    }
 
     /// How the image fits its bounds (GPUI `object_fit`).
     pub fn object_fit(self: anytype, v: style_mod.ObjectFit) @TypeOf(self) {
-        self.ext.object_fit_ = v;
+        image_style(self).object_fit = v;
         return self;
     }
 
     /// Draws the image in grayscale (GPUI `grayscale`).
     pub fn grayscale(self: anytype, v: bool) @TypeOf(self) {
-        self.ext.grayscale_ = v;
+        image_style(self).grayscale = v;
         return self;
     }
 
     /// Element shown when the image fails to load (GPUI `with_fallback`).
     pub fn with_fallback(self: anytype, f: *const fn () AnyElement) @TypeOf(self) {
-        self.ext.fallback_ = f;
+        image_style(self).fallback = f;
         return self;
     }
 
-    /// Element shown while loading (GPUI `with_loading`). Loads are synchronous, so it is not shown yet.
+    /// Element shown while loading (GPUI `with_loading`).
     pub fn with_loading(self: anytype, f: *const fn () AnyElement) @TypeOf(self) {
-        self.ext.loading_ = f;
+        image_style(self).loading = f;
         return self;
     }
 
-    pub fn request_layout_ext(self: anytype, s: *Style, window: *Window, cx: *App) ?LayoutId {
+    pub fn request_layout_ext(self: anytype, gid: ?*const GlobalElementId, s: *Style, window: *Window, cx: *App) ?LayoutId {
         const e = &self.ext;
         e.data = null;
         e.replacement = null;
+        e.frame_index = 0;
         const source = e.source orelse return null;
 
-        const data = source.use_data(&cx.asset_cache, cx.asset_source) catch {
-            if (e.fallback_) |fallback| {
-                const rep = fallback();
+        const data = load_image(source, window, cx) catch |err| {
+            const placeholder = if (err == error.Loading) e.style.loading else e.style.fallback;
+            if (placeholder) |build| {
+                const rep = build();
                 const child = rep.request_layout(window, cx);
                 e.replacement = rep;
                 return window.request_layout(s, &.{child}, cx);
@@ -95,10 +118,11 @@ pub const ImgExt = struct {
             return window.request_layout(s, &.{}, cx);
         };
         e.data = data;
+        e.frame_index = advance_frame(data, gid, window, cx);
 
         // Intrinsic size in logical pixels; the measure callback fills whichever dimension is auto.
         const measure = window_mod.frame_arena().create(Measure) catch @panic("OOM");
-        measure.* = .{ .intrinsic = data.render_size(0) };
+        measure.* = .{ .intrinsic = data.render_size(e.frame_index) };
         return window.request_measured_layout(s, .{ .ctx = measure, .func = Measure.measure });
     }
 
@@ -106,24 +130,50 @@ pub const ImgExt = struct {
         const e = &self.ext;
         if (e.data) |data| {
             if (data.frame_count() == 0) return;
-            const frame: usize = 0;
-            const new_bounds = e.object_fit_.get_bounds(bounds, data.size(frame));
-            const visible = bounds.intersect(new_bounds);
-            if (visible.size.width <= 0 or visible.size.height <= 0) return;
-            if (new_bounds.size.width <= 0 or new_bounds.size.height <= 0) return;
-
-            var builder = ImageTile{ .image = data, .frame = frame };
-            const key = atlas.AtlasKey{ .image = image_key(data.id, frame) };
-            const tile = (window.sprite_atlas.get_or_insert_with(key, .{ .context = &builder, .build_fn = ImageTile.build }) catch return) orelse return;
-
-            const radii = s.corner_radii.to_pixels(window.rem_size()).clamp_radii_for_quad_size(visible.size);
-            window.paint_polychrome_tile(visible, radii, sub_tile(tile, new_bounds, visible), e.grayscale_);
+            const frame = e.frame_index;
+            const new_bounds = e.style.object_fit.get_bounds(bounds, data.size(frame));
+            window.paint_image(bounds, new_bounds, s.corner_radii.to_pixels(window.rem_size()), data, frame, e.style.grayscale) catch |err| {
+                std.log.err("img: paint_image failed: {s}", .{@errorName(err)});
+            };
         } else if (e.replacement) |rep| {
             rep.prepaint(window, cx);
             rep.paint(window, cx);
         }
     }
 };
+
+/// Per-element animation state of a multi-frame image (GPUI `ImgState`).
+const ImgState = struct {
+    frame_index: usize = 0,
+    /// Awake-clock time the current frame started; null while the image is not animating.
+    last_frame_time: ?u64 = null,
+};
+
+/// Moves a GIF on to its next frame once the current frame's delay has passed, and asks the window
+/// for another frame while it does. Without an element id there is no state, so nothing animates.
+fn advance_frame(data: *assets.RenderImage, gid: ?*const GlobalElementId, window: *Window, cx: *App) usize {
+    const frame_count = data.frame_count();
+    const state = window.element_state(ImgState, (gid orelse return 0).*, .{});
+    state.frame_index = @min(state.frame_index, frame_count -| 1);
+
+    const animating = frame_count > 1 and window.is_window_active() and !cx.reduce_motion();
+    if (!animating) {
+        state.last_frame_time = null;
+        return state.frame_index;
+    }
+    const now = executor.now_ns();
+    if (state.last_frame_time) |last| {
+        const frame_duration = @as(u64, data.delay(state.frame_index)) * std.time.ns_per_ms;
+        if (now -| last >= frame_duration) {
+            state.frame_index = (state.frame_index + 1) % frame_count;
+            state.last_frame_time = last + frame_duration;
+        }
+    } else {
+        state.last_frame_time = now;
+    }
+    window.request_animation_frame();
+    return state.frame_index;
+}
 
 const Measure = struct {
     intrinsic: Size(Pixels),
@@ -149,40 +199,18 @@ const Measure = struct {
     }
 };
 
-/// Atlas builder for one frame of a decoded image. The pixels stay owned by the `RenderImage`.
-const ImageTile = struct {
-    image: *assets.RenderImage,
-    frame: usize,
-
-    fn build(raw: *anyopaque) anyerror!?atlas.TileData {
-        const self: *const ImageTile = @ptrCast(@alignCast(raw));
-        const bytes = self.image.as_bytes(self.frame) orelse return null;
-        const s = self.image.size(self.frame);
-        return .{ .size = s, .bytes = bytes };
+/// Loads `source` (GPUI `ImageSource::use_data`). A URL, file or asset name goes through the image
+/// cache in scope, if an ancestor set one: that is where `null` means "still loading". Otherwise it
+/// goes through the app's own cache. A custom source is always asked, with this window.
+fn load_image(source: assets.ImageSource, window: *Window, cx: *App) assets.ImageCacheError!*assets.RenderImage {
+    switch (source) {
+        .resource => |resource| if (window.current_image_cache()) |cache| {
+            return cache.load(resource, window, cx) orelse error.Loading;
+        },
+        .custom => |custom| return custom.load_fn(custom.ptr, window, cx) orelse error.Loading,
+        else => {},
     }
-};
-
-/// Atlas key for one frame of an image: a hash of the image id and frame index.
-fn image_key(id: u64, frame: usize) u64 {
-    const parts = [_]u64{ id, frame };
-    return std.hash.Wyhash.hash(0x696d6720, std.mem.sliceAsBytes(&parts));
-}
-
-/// The part of `tile` that shows `visible`, where `image` is the full drawn rectangle (GPUI's sub-tile for clipped images).
-fn sub_tile(tile: atlas.AtlasTile, image: Bounds(Pixels), visible: Bounds(Pixels)) atlas.AtlasTile {
-    if (visible.eq(image)) return tile;
-    const iw = image.size.width;
-    const ih = image.size.height;
-    const tw: f32 = @floatFromInt(tile.bounds.size.width);
-    const th: f32 = @floatFromInt(tile.bounds.size.height);
-    var out = tile;
-    const x_off = (visible.origin.x - image.origin.x) / iw;
-    const y_off = (visible.origin.y - image.origin.y) / ih;
-    out.bounds.origin.x = tile.bounds.origin.x + @as(DevicePixels, @intFromFloat(@round(x_off * tw)));
-    out.bounds.origin.y = tile.bounds.origin.y + @as(DevicePixels, @intFromFloat(@round(y_off * th)));
-    out.bounds.size.width = @max(1, @as(DevicePixels, @intFromFloat(@round(visible.size.width / iw * tw))));
-    out.bounds.size.height = @max(1, @as(DevicePixels, @intFromFloat(@round(visible.size.height / ih * th))));
-    return out;
+    return source.use_data(&cx.asset_cache, cx.asset_source().*);
 }
 
 test "measure keeps the aspect ratio of the intrinsic size" {
@@ -200,19 +228,32 @@ test "measure keeps the aspect ratio of the intrinsic size" {
     try std.testing.expectEqual(@as(f32, 25), width_known.height);
 }
 
-test "sub_tile crops the atlas tile to the visible part" {
-    const tile: atlas.AtlasTile = .{
-        .texture_id = .{ .index = 0, .kind = .polychrome },
-        .tile_id = .{ .value = 1 },
-        .padding = 0,
-        .bounds = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 200, .height = 100 } },
+/// Whether `T` has GPUI's `StyledImage` methods (`grayscale`, `object_fit`, `with_fallback`,
+/// `with_loading`). ZUI has no trait, so `Img` and any element that forwards these methods qualify.
+pub fn is_styled_image(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => has_image_style_methods(T),
+        else => false,
     };
-    // Image drawn at 100x100 but only the right half of a 200x100 cover is visible.
-    const image: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 200, .height = 100 } };
-    const visible: Bounds(Pixels) = .{ .origin = .{ .x = 50, .y = 0 }, .size = .{ .width = 100, .height = 100 } };
-    const sub = sub_tile(tile, image, visible);
-    try std.testing.expectEqual(@as(DevicePixels, 50), sub.bounds.origin.x);
-    try std.testing.expectEqual(@as(DevicePixels, 100), sub.bounds.size.width);
+}
+
+fn has_image_style_methods(comptime T: type) bool {
+    const names = [_][]const u8{ "grayscale", "object_fit", "with_fallback", "with_loading" };
+    inline for (names) |name| {
+        if (!@hasDecl(T, name)) return false;
+    }
+    return true;
+}
+
+/// Compile error unless `T` is a `StyledImage` (GPUI's bound on image style builders).
+pub fn assert_styled_image(comptime T: type) void {
+    if (comptime !is_styled_image(T)) @compileError(@typeName(T) ++ " must provide the StyledImage methods");
+}
+
+test "StyledImage is checked by its methods" {
+    try std.testing.expect(is_styled_image(Img));
+    try std.testing.expect(!is_styled_image(u32));
+    assert_styled_image(Img);
 }
 
 test "element protocol instantiates the image hooks" {

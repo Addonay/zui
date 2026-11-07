@@ -55,6 +55,7 @@ pub const FocusIn: c_int = 9;
 pub const FocusOut: c_int = 10;
 pub const DestroyNotify: c_int = 17;
 pub const ConfigureNotify: c_int = 22;
+pub const PropertyNotify: c_int = 28;
 pub const ClientMessage: c_int = 33;
 
 pub const XConfigureEvent = extern struct {
@@ -155,6 +156,390 @@ pub const XSelectionRequestEvent = extern struct {
     time: Time,
 };
 
+// -- XInput2 (XInput2.h), RandR (Xrandr.h), XSync (sync.h) ----------------------
+// Layouts measured with offsetof on x86_64 Linux; see the comptime checks below.
+
+pub const GenericEvent: c_int = 35;
+pub const VisibilityNotify: c_int = 15;
+pub const VisibilityFullyObscured: c_int = 2;
+pub const VisibilityChangeMask: c_long = 1 << 16;
+pub const PropertyChangeMask: c_long = 1 << 22;
+pub const UnmapNotify: c_int = 18;
+pub const MapNotify: c_int = 19;
+pub const XI_DeviceChanged: c_int = 1;
+pub const XI_ButtonPress: c_int = 4;
+pub const XI_ButtonRelease: c_int = 5;
+pub const XI_Motion: c_int = 6;
+pub const XI_Enter: c_int = 7;
+pub const XI_Leave: c_int = 8;
+pub const XI_HierarchyChanged: c_int = 11;
+pub const XIAllDevices: c_int = 0;
+pub const XIAllMasterDevices: c_int = 1;
+pub const XISlavePointer: c_int = 3;
+pub const XIScrollClass: c_int = 3;
+pub const XIScrollTypeVertical: c_int = 1;
+pub const XIScrollTypeHorizontal: c_int = 2;
+pub const XIPointerEmulated: c_int = 1 << 16;
+pub const NotifyNormal: c_int = 0;
+
+pub const XGenericEventCookie = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    extension: c_int,
+    evtype: c_int,
+    cookie: c_uint,
+    data: ?*anyopaque,
+};
+pub const XIButtonState = extern struct { mask_len: c_int, mask: ?[*]u8 };
+pub const XIValuatorState = extern struct { mask_len: c_int, mask: ?[*]u8, values: ?[*]f64 };
+pub const XIModifierState = extern struct { base: c_int, latched: c_int, locked: c_int, effective: c_int };
+pub const XIGroupState = XIModifierState;
+pub const XIDeviceEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    extension: c_int,
+    evtype: c_int,
+    time: Time,
+    deviceid: c_int,
+    sourceid: c_int,
+    detail: c_int,
+    root: Window,
+    event: Window,
+    child: Window,
+    root_x: f64,
+    root_y: f64,
+    event_x: f64,
+    event_y: f64,
+    flags: c_int,
+    buttons: XIButtonState,
+    valuators: XIValuatorState,
+    mods: XIModifierState,
+    group: XIGroupState,
+};
+pub const XIEnterEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    extension: c_int,
+    evtype: c_int,
+    time: Time,
+    deviceid: c_int,
+    sourceid: c_int,
+    detail: c_int,
+    root: Window,
+    event: Window,
+    child: Window,
+    root_x: f64,
+    root_y: f64,
+    event_x: f64,
+    event_y: f64,
+    mode: c_int,
+    focus: Bool,
+    same_screen: Bool,
+    buttons: XIButtonState,
+    mods: XIModifierState,
+    group: XIGroupState,
+};
+pub const XI_GesturePinchBegin: c_int = 27;
+pub const XI_GesturePinchUpdate: c_int = 28;
+pub const XI_GesturePinchEnd: c_int = 29;
+pub const XIGesturePinchEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    extension: c_int,
+    evtype: c_int,
+    time: Time,
+    deviceid: c_int,
+    sourceid: c_int,
+    detail: c_int,
+    root: Window,
+    event: Window,
+    child: Window,
+    root_x: f64,
+    root_y: f64,
+    event_x: f64,
+    event_y: f64,
+    delta_x: f64,
+    delta_y: f64,
+    delta_unaccel_x: f64,
+    delta_unaccel_y: f64,
+    scale: f64,
+    delta_angle: f64,
+    flags: c_int,
+    mods: XIModifierState,
+    group: XIGroupState,
+};
+pub const XIAnyClassInfo = extern struct { type: c_int, sourceid: c_int };
+pub const XIScrollClassInfo = extern struct {
+    type: c_int,
+    sourceid: c_int,
+    number: c_int,
+    scroll_type: c_int,
+    increment: f64,
+    flags: c_int,
+};
+pub const XIDeviceInfo = extern struct {
+    deviceid: c_int,
+    name: ?[*:0]const u8,
+    use: c_int,
+    attachment: c_int,
+    enabled: Bool,
+    num_classes: c_int,
+    classes: ?[*]*XIAnyClassInfo,
+};
+pub const XIEventMask = extern struct { deviceid: c_int, mask_len: c_int, mask: [*]u8 };
+
+/// libXi.so.6. Absent, or too old for smooth scrolling, means plain core events.
+pub const XiApi = struct {
+    XIQueryVersion: *const fn (*Display, *c_int, *c_int) callconv(.c) Status,
+    XISelectEvents: *const fn (*Display, Window, [*]XIEventMask, c_int) callconv(.c) c_int,
+    XIQueryDevice: *const fn (*Display, c_int, *c_int) callconv(.c) ?[*]XIDeviceInfo,
+    XIFreeDeviceInfo: *const fn ([*]XIDeviceInfo) callconv(.c) void,
+
+    pub fn load(lib: dl.Library) ?XiApi {
+        var out: XiApi = undefined;
+        inline for (@typeInfo(XiApi).@"struct".field_names, @typeInfo(XiApi).@"struct".field_types) |name, T| {
+            @field(out, name) = lib.lookup(T, name.ptr) orelse return null;
+        }
+        return out;
+    }
+};
+
+pub const XRRModeInfo = extern struct {
+    id: c_ulong,
+    width: c_uint,
+    height: c_uint,
+    dotClock: c_ulong,
+    hSyncStart: c_uint,
+    hSyncEnd: c_uint,
+    hTotal: c_uint,
+    hSkew: c_uint,
+    vSyncStart: c_uint,
+    vSyncEnd: c_uint,
+    vTotal: c_uint,
+    name: ?[*]const u8,
+    nameLength: c_uint,
+    modeFlags: c_ulong,
+};
+pub const XRRScreenResources = extern struct {
+    timestamp: Time,
+    configTimestamp: Time,
+    ncrtc: c_int,
+    crtcs: ?[*]c_ulong,
+    noutput: c_int,
+    outputs: ?[*]c_ulong,
+    nmode: c_int,
+    modes: ?[*]XRRModeInfo,
+};
+/// The leading fields of `XRROutputInfo`: the ones read to name a monitor. The rest of the struct
+/// is never touched, so it is left out.
+pub const XRROutputInfo = extern struct {
+    timestamp: Time,
+    crtc: c_ulong,
+    name: ?[*]u8,
+    nameLen: c_int,
+};
+pub const XRRCrtcInfo = extern struct {
+    timestamp: Time,
+    x: c_int,
+    y: c_int,
+    width: c_uint,
+    height: c_uint,
+    mode: c_ulong,
+    rotation: c_ushort,
+    noutput: c_int,
+    outputs: ?[*]c_ulong,
+    rotations: c_ushort,
+    npossible: c_int,
+    possible: ?[*]c_ulong,
+};
+pub const RRScreenChangeNotify: c_int = 0;
+pub const RRScreenChangeNotifyMask: c_int = 1;
+pub const RRNotify: c_int = 1;
+pub const RRCrtcChangeNotifyMask: c_int = 2;
+
+/// libXrandr.so.2. Absent means the 60 Hz default.
+pub const XrandrApi = struct {
+    XRRQueryExtension: *const fn (*Display, *c_int, *c_int) callconv(.c) Bool,
+    XRRSelectInput: *const fn (*Display, Window, c_int) callconv(.c) void,
+    XRRUpdateConfiguration: *const fn (*XEvent) callconv(.c) c_int,
+    XRRGetScreenResourcesCurrent: *const fn (*Display, Window) callconv(.c) ?*XRRScreenResources,
+    XRRFreeScreenResources: *const fn (*XRRScreenResources) callconv(.c) void,
+    XRRGetCrtcInfo: *const fn (*Display, *XRRScreenResources, c_ulong) callconv(.c) ?*XRRCrtcInfo,
+    XRRFreeCrtcInfo: *const fn (*XRRCrtcInfo) callconv(.c) void,
+    XRRGetOutputInfo: *const fn (*Display, *XRRScreenResources, c_ulong) callconv(.c) ?*XRROutputInfo,
+    XRRFreeOutputInfo: *const fn (*XRROutputInfo) callconv(.c) void,
+
+    pub fn load(lib: dl.Library) ?XrandrApi {
+        var out: XrandrApi = undefined;
+        inline for (@typeInfo(XrandrApi).@"struct".field_names, @typeInfo(XrandrApi).@"struct".field_types) |name, T| {
+            @field(out, name) = lib.lookup(T, name.ptr) orelse return null;
+        }
+        return out;
+    }
+};
+
+pub const XSyncValue = extern struct { hi: c_int, lo: c_uint };
+
+/// libXext.so.6. Absent means no resize synchronization, which only costs some tearing.
+pub const XsyncApi = struct {
+    XSyncQueryExtension: *const fn (*Display, *c_int, *c_int) callconv(.c) Bool,
+    XSyncInitialize: *const fn (*Display, *c_int, *c_int) callconv(.c) Status,
+    XSyncCreateCounter: *const fn (*Display, XSyncValue) callconv(.c) c_ulong,
+    XSyncSetCounter: *const fn (*Display, c_ulong, XSyncValue) callconv(.c) Status,
+    XSyncDestroyCounter: *const fn (*Display, c_ulong) callconv(.c) Status,
+
+    pub fn load(lib: dl.Library) ?XsyncApi {
+        var out: XsyncApi = undefined;
+        inline for (@typeInfo(XsyncApi).@"struct".field_names, @typeInfo(XsyncApi).@"struct".field_types) |name, T| {
+            @field(out, name) = lib.lookup(T, name.ptr) orelse return null;
+        }
+        return out;
+    }
+};
+
+comptime {
+    if (@sizeOf(usize) == 8) {
+        const checks = .{
+            .{ @sizeOf(XGenericEventCookie), 56 },     .{ @offsetOf(XGenericEventCookie, "data"), 48 },
+            .{ @sizeOf(XIDeviceEvent), 200 },          .{ @offsetOf(XIDeviceEvent, "event_x"), 104 },
+            .{ @offsetOf(XIDeviceEvent, "flags"), 120 }, .{ @offsetOf(XIDeviceEvent, "buttons"), 128 },
+            .{ @offsetOf(XIDeviceEvent, "valuators"), 144 }, .{ @offsetOf(XIDeviceEvent, "mods"), 168 },
+            .{ @sizeOf(XIGesturePinchEvent), 208 },    .{ @offsetOf(XIGesturePinchEvent, "scale"), 152 },
+            .{ @offsetOf(XIGesturePinchEvent, "mods"), 172 },
+            .{ @sizeOf(XIEnterEvent), 184 },           .{ @offsetOf(XIEnterEvent, "mode"), 120 },
+            .{ @offsetOf(XIEnterEvent, "buttons"), 136 }, .{ @offsetOf(XIEnterEvent, "mods"), 152 },
+            .{ @sizeOf(XIDeviceInfo), 40 },            .{ @offsetOf(XIDeviceInfo, "classes"), 32 },
+            .{ @sizeOf(XIScrollClassInfo), 32 },       .{ @offsetOf(XIScrollClassInfo, "increment"), 16 },
+            .{ @sizeOf(XIValuatorState), 24 },         .{ @sizeOf(XIEventMask), 16 },
+            .{ @sizeOf(XRRModeInfo), 80 },             .{ @offsetOf(XRRModeInfo, "dotClock"), 16 },
+            .{ @offsetOf(XRRModeInfo, "hTotal"), 32 }, .{ @offsetOf(XRRModeInfo, "vTotal"), 48 },
+            .{ @offsetOf(XRRModeInfo, "modeFlags"), 72 }, .{ @sizeOf(XRRScreenResources), 64 },
+            .{ @offsetOf(XRRScreenResources, "crtcs"), 24 }, .{ @offsetOf(XRRScreenResources, "modes"), 56 },
+            .{ @sizeOf(XRRCrtcInfo), 64 },             .{ @offsetOf(XRRCrtcInfo, "mode"), 24 },
+            .{ @offsetOf(XRROutputInfo, "crtc"), 8 },  .{ @offsetOf(XRROutputInfo, "name"), 16 },
+            .{ @offsetOf(XRROutputInfo, "nameLen"), 24 },
+        };
+        for (checks) |c| {
+            if (c[0] != c[1]) @compileError("X11 extension struct layout mismatch");
+        }
+    }
+}
+
+// -- X input methods (Xlib.h) --------------------------------------------------
+
+pub const XIM = opaque {};
+pub const XIC = opaque {};
+pub const XPointS = extern struct { x: c_short, y: c_short };
+pub const XIMCallback = extern struct {
+    client_data: ?*anyopaque,
+    callback: ?*const anyopaque,
+};
+pub const XIMStyles = extern struct {
+    count_styles: c_ushort,
+    supported_styles: [*]c_ulong,
+};
+pub const XIMText = extern struct {
+    length: c_ushort,
+    feedback: ?*anyopaque,
+    encoding_is_wchar: Bool,
+    string: extern union { multi_byte: ?[*:0]const u8, wide_char: ?[*]const c_int },
+};
+pub const XIMPreeditDrawCallbackStruct = extern struct {
+    caret: c_int,
+    chg_first: c_int,
+    chg_length: c_int,
+    text: ?*XIMText,
+};
+pub const XIMPreeditCallbacks: c_ulong = 0x0002;
+pub const XIMPreeditNothing: c_ulong = 0x0008;
+pub const XIMStatusNothing: c_ulong = 0x0400;
+pub const XBufferOverflow: c_int = -1;
+pub const XLookupNone: c_int = 1;
+pub const XLookupChars: c_int = 2;
+pub const XLookupKeySym: c_int = 3;
+pub const XLookupBoth: c_int = 4;
+
+/// Input method functions. All optional: an Xlib without them means no IME, not a failure.
+pub const XimApi = struct {
+    XSetLocaleModifiers: *const fn (?[*:0]const u8) callconv(.c) ?[*:0]const u8,
+    XSupportsLocale: *const fn () callconv(.c) Bool,
+    XOpenIM: *const fn (*Display, ?*anyopaque, ?[*:0]const u8, ?[*:0]const u8) callconv(.c) ?*XIM,
+    XCloseIM: *const fn (*XIM) callconv(.c) c_int,
+    XGetIMValues: *const fn (*XIM, ...) callconv(.c) ?[*:0]const u8,
+    XSetIMValues: *const fn (*XIM, ...) callconv(.c) ?[*:0]const u8,
+    XCreateIC: *const fn (*XIM, ...) callconv(.c) ?*XIC,
+    XDestroyIC: *const fn (*XIC) callconv(.c) void,
+    XGetICValues: *const fn (*XIC, ...) callconv(.c) ?[*:0]const u8,
+    XSetICValues: *const fn (*XIC, ...) callconv(.c) ?[*:0]const u8,
+    XSetICFocus: *const fn (*XIC) callconv(.c) void,
+    XUnsetICFocus: *const fn (*XIC) callconv(.c) void,
+    Xutf8ResetIC: *const fn (*XIC) callconv(.c) ?[*:0]u8,
+    Xutf8LookupString: *const fn (*XIC, *XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*c_int) callconv(.c) c_int,
+    XFilterEvent: *const fn (*XEvent, c_ulong) callconv(.c) Bool,
+    XVaCreateNestedList: *const fn (c_int, ...) callconv(.c) ?*anyopaque,
+    XFree: *const fn (?*anyopaque) callconv(.c) c_int,
+    XRegisterIMInstantiateCallback: *const fn (*Display, ?*anyopaque, ?[*:0]const u8, ?[*:0]const u8, *const anyopaque, ?*anyopaque) callconv(.c) Bool,
+    XUnregisterIMInstantiateCallback: *const fn (*Display, ?*anyopaque, ?[*:0]const u8, ?[*:0]const u8, *const anyopaque, ?*anyopaque) callconv(.c) Bool,
+
+    pub fn load(lib: dl.Library) ?XimApi {
+        var out: XimApi = undefined;
+        inline for (@typeInfo(XimApi).@"struct".field_names, @typeInfo(XimApi).@"struct".field_types) |name, T| {
+            @field(out, name) = lib.lookup(T, name.ptr) orelse return null;
+        }
+        return out;
+    }
+};
+
+/// Xlib's XPropertyEvent: a property of the window changed (or was deleted).
+pub const XPropertyEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    window: Window,
+    atom: Atom,
+    time: Time,
+    state: c_int,
+};
+
+pub const XVisibilityEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    window: Window,
+    state: c_int,
+};
+
+pub const XMappingEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    window: Window,
+    request: c_int,
+    first_keycode: c_int,
+    count: c_int,
+};
+
+pub const XSelectionClearEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    window: Window,
+    selection: Atom,
+    time: Time,
+};
+
 pub const XSelectionEvent = extern struct {
     type: c_int,
     serial: c_ulong,
@@ -196,6 +581,11 @@ pub const XEvent = extern union {
     xexpose: XExposeEvent,
     xselection: XSelectionEvent,
     xselectionrequest: XSelectionRequestEvent,
+    xselectionclear: XSelectionClearEvent,
+    xmapping: XMappingEvent,
+    xcookie: XGenericEventCookie,
+    xvisibility: XVisibilityEvent,
+    xproperty: XPropertyEvent,
     pad: [24]c_long,
 };
 
@@ -249,8 +639,59 @@ pub const SelectionClear: c_int = 29;
 pub const SelectionRequest: c_int = 30;
 pub const SelectionNotify: c_int = 31;
 
+pub const MappingNotify: c_int = 34;
 pub const XA_PRIMARY: Atom = 1;
 pub const XA_ATOM: Atom = 4;
+pub const XA_WINDOW: Atom = 33;
+pub const Pixmap = c_ulong;
+/// Xlib's `XColor` (64-bit layout).
+pub const XColor = extern struct { pixel: c_ulong, red: u16, green: u16, blue: u16, flags: u8, pad: u8 };
+/// XKB event mask bits and the core keyboard device (XKBlib.h).
+pub const XkbNewKeyboardNotifyMask: c_ulong = 1 << 0;
+pub const XkbMapNotifyMask: c_ulong = 1 << 1;
+pub const XkbStateNotifyMask: c_ulong = 1 << 2;
+pub const XkbUseCoreKbd: c_uint = 0x0100;
+pub const XA_CARDINAL: Atom = 6;
+pub const CW_OVERRIDE_REDIRECT: c_ulong = 1 << 9;
+pub const CW_BORDER_PIXEL: c_ulong = 1 << 3;
+pub const CW_COLORMAP: c_ulong = 1 << 13;
+pub const INPUT_OUTPUT: c_uint = 1;
+pub const TRUE_COLOR: c_int = 4;
+pub const ALLOC_NONE: c_int = 0;
+pub const Colormap = c_ulong;
+
+/// Xlib's `XVisualInfo` (Xutil.h), in the C layout Xlib writes.
+pub const VisualInfo = extern struct {
+    visual: *Visual,
+    visualid: c_ulong,
+    screen: c_int,
+    depth: c_uint,
+    class: c_int,
+    red_mask: c_ulong,
+    green_mask: c_ulong,
+    blue_mask: c_ulong,
+    colormap_size: c_int,
+    bits_per_rgb: c_int,
+};
+
+/// Xlib's `XSetWindowAttributes`, in the C layout Xlib reads.
+pub const SetWindowAttributes = extern struct {
+    background_pixmap: c_ulong = 0,
+    background_pixel: c_ulong = 0,
+    border_pixmap: c_ulong = 0,
+    border_pixel: c_ulong = 0,
+    bit_gravity: c_int = 0,
+    win_gravity: c_int = 0,
+    backing_store: c_int = 0,
+    backing_planes: c_ulong = 0,
+    backing_pixel: c_ulong = 0,
+    save_under: c_int = 0,
+    event_mask: c_long = 0,
+    do_not_propagate_mask: c_long = 0,
+    override_redirect: c_int = 0,
+    colormap: c_ulong = 0,
+    cursor: c_ulong = 0,
+};
 pub const XA_STRING: Atom = 31;
 pub const XA_ANY_PROPERTY_TYPE: Atom = 0;
 pub const PROP_MODE_REPLACE: c_int = 0;
@@ -352,6 +793,12 @@ pub const Api = struct {
     XDefaultGC: *const fn (*Display, c_int) callconv(.c) GC,
     XDefaultVisual: *const fn (*Display, c_int) callconv(.c) *Visual,
     XDefaultDepth: *const fn (*Display, c_int) callconv(.c) c_int,
+    XMatchVisualInfo: *const fn (*Display, c_int, c_int, c_int, *VisualInfo) callconv(.c) Status,
+    XCreateColormap: *const fn (*Display, Window, *Visual, c_int) callconv(.c) Colormap,
+    XFreeColormap: *const fn (*Display, Colormap) callconv(.c) c_int,
+    XCreateWindow: *const fn (*Display, Window, c_int, c_int, c_uint, c_uint, c_uint, c_int, c_uint, *Visual, c_ulong, *const SetWindowAttributes) callconv(.c) Window,
+    XCreateGC: *const fn (*Display, Drawable, c_ulong, ?*anyopaque) callconv(.c) GC,
+    XFreeGC: *const fn (*Display, GC) callconv(.c) c_int,
     XCreateImage: *const fn (*Display, *Visual, c_uint, c_int, c_int, ?[*]u8, c_uint, c_uint, c_int, c_int) callconv(.c) ?*XImage,
     XDestroyImage: *const fn (*XImage) callconv(.c) c_int,
     XPutImage: *const fn (*Display, Drawable, GC, *XImage, c_int, c_int, c_int, c_int, c_uint, c_uint) callconv(.c) c_int,
@@ -359,11 +806,25 @@ pub const Api = struct {
     XSync: *const fn (*Display, Bool) callconv(.c) c_int,
     XConnectionNumber: *const fn (*Display) callconv(.c) c_int,
     XLookupString: *const fn (*XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int,
+    XBell: *const fn (*Display, c_int) callconv(.c) c_int,
+    XQueryExtension: *const fn (*Display, [*:0]const u8, *c_int, *c_int, *c_int) callconv(.c) Bool,
+    XGetEventData: *const fn (*Display, *XGenericEventCookie) callconv(.c) Bool,
+    XFreeEventData: *const fn (*Display, *XGenericEventCookie) callconv(.c) void,
+    XTranslateCoordinates: *const fn (*Display, Window, Window, c_int, c_int, *c_int, *c_int, *Window) callconv(.c) Bool,
+    XRefreshKeyboardMapping: *const fn (*XMappingEvent) callconv(.c) c_int,
+    XkbSetDetectableAutoRepeat: ?*const fn (*Display, c_int, ?*c_int) callconv(.c) c_int,
     XKeycodeToKeysym: ?*const fn (*Display, c_uint, c_int) callconv(.c) c_ulong = null,
     XChangeProperty: *const fn (*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int,
+    XChangeWindowAttributes: *const fn (*Display, Window, c_ulong, *const SetWindowAttributes) callconv(.c) c_int,
     XDeleteProperty: *const fn (*Display, Window, Atom) callconv(.c) c_int,
     XGetWindowProperty: *const fn (*Display, Window, Atom, c_long, c_long, Bool, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *[*]u8) callconv(.c) c_int,
     XFree: *const fn (*anyopaque) callconv(.c) c_int,
+    XCreateBitmapFromData: *const fn (*Display, Drawable, [*]const u8, c_uint, c_uint) callconv(.c) Pixmap,
+    XCreatePixmapCursor: *const fn (*Display, Pixmap, Pixmap, *XColor, *XColor, c_uint, c_uint) callconv(.c) Cursor,
+    XFreePixmap: *const fn (*Display, Pixmap) callconv(.c) c_int,
+    /// Optional: without XKB events a layout change by another client is only seen on the next key.
+    XkbQueryExtension: ?*const fn (*Display, *c_int, *c_int, *c_int, *c_int, *c_int) callconv(.c) Bool = null,
+    XkbSelectEvents: ?*const fn (*Display, c_uint, c_ulong, c_ulong) callconv(.c) Bool = null,
     XConvertSelection: *const fn (*Display, Atom, Atom, Atom, Window, Time) callconv(.c) c_int,
     XSetSelectionOwner: *const fn (*Display, Atom, Window, Time) callconv(.c) c_int,
     XGetSelectionOwner: *const fn (*Display, Atom) callconv(.c) Window,
@@ -397,18 +858,37 @@ pub const Api = struct {
             .XDefaultGC = lib.lookup(*const fn (*Display, c_int) callconv(.c) GC, "XDefaultGC") orelse return null,
             .XDefaultVisual = lib.lookup(*const fn (*Display, c_int) callconv(.c) *Visual, "XDefaultVisual") orelse return null,
             .XDefaultDepth = lib.lookup(*const fn (*Display, c_int) callconv(.c) c_int, "XDefaultDepth") orelse return null,
+            .XMatchVisualInfo = lib.lookup(*const fn (*Display, c_int, c_int, c_int, *VisualInfo) callconv(.c) Status, "XMatchVisualInfo") orelse return null,
+            .XCreateColormap = lib.lookup(*const fn (*Display, Window, *Visual, c_int) callconv(.c) Colormap, "XCreateColormap") orelse return null,
+            .XFreeColormap = lib.lookup(*const fn (*Display, Colormap) callconv(.c) c_int, "XFreeColormap") orelse return null,
+            .XCreateWindow = lib.lookup(*const fn (*Display, Window, c_int, c_int, c_uint, c_uint, c_uint, c_int, c_uint, *Visual, c_ulong, *const SetWindowAttributes) callconv(.c) Window, "XCreateWindow") orelse return null,
+            .XCreateGC = lib.lookup(*const fn (*Display, Drawable, c_ulong, ?*anyopaque) callconv(.c) GC, "XCreateGC") orelse return null,
+            .XFreeGC = lib.lookup(*const fn (*Display, GC) callconv(.c) c_int, "XFreeGC") orelse return null,
             .XCreateImage = lib.lookup(*const fn (*Display, *Visual, c_uint, c_int, c_int, ?[*]u8, c_uint, c_uint, c_int, c_int) callconv(.c) ?*XImage, "XCreateImage") orelse return null,
             .XDestroyImage = lib.lookup(*const fn (*XImage) callconv(.c) c_int, "XDestroyImage") orelse return null,
             .XPutImage = lib.lookup(*const fn (*Display, Drawable, GC, *XImage, c_int, c_int, c_int, c_int, c_uint, c_uint) callconv(.c) c_int, "XPutImage") orelse return null,
             .XFlush = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XFlush") orelse return null,
             .XSync = lib.lookup(*const fn (*Display, Bool) callconv(.c) c_int, "XSync") orelse return null,
             .XConnectionNumber = lib.lookup(*const fn (*Display) callconv(.c) c_int, "XConnectionNumber") orelse return null,
+            .XQueryExtension = lib.lookup(*const fn (*Display, [*:0]const u8, *c_int, *c_int, *c_int) callconv(.c) Bool, "XQueryExtension") orelse return null,
+            .XGetEventData = lib.lookup(*const fn (*Display, *XGenericEventCookie) callconv(.c) Bool, "XGetEventData") orelse return null,
+            .XFreeEventData = lib.lookup(*const fn (*Display, *XGenericEventCookie) callconv(.c) void, "XFreeEventData") orelse return null,
+            .XTranslateCoordinates = lib.lookup(*const fn (*Display, Window, Window, c_int, c_int, *c_int, *c_int, *Window) callconv(.c) Bool, "XTranslateCoordinates") orelse return null,
+            .XBell = lib.lookup(*const fn (*Display, c_int) callconv(.c) c_int, "XBell") orelse return null,
+            .XRefreshKeyboardMapping = lib.lookup(*const fn (*XMappingEvent) callconv(.c) c_int, "XRefreshKeyboardMapping") orelse return null,
+            .XkbSetDetectableAutoRepeat = lib.lookup(*const fn (*Display, c_int, ?*c_int) callconv(.c) c_int, "XkbSetDetectableAutoRepeat"),
             .XLookupString = lib.lookup(*const fn (*XKeyEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int, "XLookupString") orelse return null,
             .XKeycodeToKeysym = lib.lookup(*const fn (*Display, c_uint, c_int) callconv(.c) c_ulong, "XKeycodeToKeysym"),
             .XChangeProperty = lib.lookup(*const fn (*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int, "XChangeProperty") orelse return null,
+            .XChangeWindowAttributes = lib.lookup(*const fn (*Display, Window, c_ulong, *const SetWindowAttributes) callconv(.c) c_int, "XChangeWindowAttributes") orelse return null,
             .XDeleteProperty = lib.lookup(*const fn (*Display, Window, Atom) callconv(.c) c_int, "XDeleteProperty") orelse return null,
             .XGetWindowProperty = lib.lookup(*const fn (*Display, Window, Atom, c_long, c_long, Bool, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *[*]u8) callconv(.c) c_int, "XGetWindowProperty") orelse return null,
             .XFree = lib.lookup(*const fn (*anyopaque) callconv(.c) c_int, "XFree") orelse return null,
+            .XCreateBitmapFromData = lib.lookup(*const fn (*Display, Drawable, [*]const u8, c_uint, c_uint) callconv(.c) Pixmap, "XCreateBitmapFromData") orelse return null,
+            .XCreatePixmapCursor = lib.lookup(*const fn (*Display, Pixmap, Pixmap, *XColor, *XColor, c_uint, c_uint) callconv(.c) Cursor, "XCreatePixmapCursor") orelse return null,
+            .XFreePixmap = lib.lookup(*const fn (*Display, Pixmap) callconv(.c) c_int, "XFreePixmap") orelse return null,
+            .XkbQueryExtension = lib.lookup(*const fn (*Display, *c_int, *c_int, *c_int, *c_int, *c_int) callconv(.c) Bool, "XkbQueryExtension"),
+            .XkbSelectEvents = lib.lookup(*const fn (*Display, c_uint, c_ulong, c_ulong) callconv(.c) Bool, "XkbSelectEvents"),
             .XConvertSelection = lib.lookup(*const fn (*Display, Atom, Atom, Atom, Window, Time) callconv(.c) c_int, "XConvertSelection") orelse return null,
             .XSetSelectionOwner = lib.lookup(*const fn (*Display, Atom, Window, Time) callconv(.c) c_int, "XSetSelectionOwner") orelse return null,
             .XGetSelectionOwner = lib.lookup(*const fn (*Display, Atom) callconv(.c) Window, "XGetSelectionOwner") orelse return null,

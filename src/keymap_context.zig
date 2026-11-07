@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const keystroke = @import("keystroke.zig");
 
 /// Maximum number of entries in one `KeyContext`.
 pub const max_entries = 8;
@@ -73,6 +74,23 @@ pub const KeyContext = struct {
                 try ctx.add(key);
             }
         }
+        return ctx;
+    }
+
+    /// A context that holds the host operating system as `os` (GPUI `KeyContext::new_with_defaults`):
+    /// `macos`, `linux`, `windows`, `ios`, `android` or `unknown`. FreeBSD counts as `linux`.
+    pub fn new_with_defaults(os: keystroke.OperatingSystem) KeyContext {
+        const name: []const u8 = switch (os) {
+            .mac => "macos",
+            .linux, .free_bsd => "linux",
+            .windows => "windows",
+            .ios => "ios",
+            .android => "android",
+            .unknown => "unknown",
+        };
+        var ctx: KeyContext = .{};
+        // An empty context has room for the one entry, and the identifiers are short.
+        ctx.set("os", name) catch unreachable;
         return ctx;
     }
 
@@ -438,6 +456,14 @@ fn parse_test(arena: Allocator, source: []const u8) !P {
 
 fn kc(source: []const u8) KeyContext {
     return KeyContext.parse(source) catch unreachable;
+}
+
+test "new_with_defaults sets the os entry" {
+    const mac = KeyContext.new_with_defaults(.mac);
+    try testing.expectEqualStrings("macos", mac.get("os").?);
+    try testing.expectEqualStrings("linux", KeyContext.new_with_defaults(.free_bsd).get("os").?);
+    try testing.expectEqualStrings("unknown", KeyContext.new_with_defaults(.unknown).get("os").?);
+    try testing.expect(KeyContext.new_with_defaults(.linux).contains("os"));
 }
 
 test "parse context" {

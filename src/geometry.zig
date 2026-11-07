@@ -943,6 +943,30 @@ pub inline fn auto() Length {
     return .auto;
 }
 
+/// A fraction of a full turn (GPUI `Percentage`). Arithmetic on it is not ported.
+pub const Percentage = struct {
+    value: f32,
+
+    /// The angle in radians: a full turn is `tau`.
+    pub fn to_radians(self: Percentage) f32 {
+        return self.value * std.math.tau;
+    }
+};
+
+/// A fraction of a full turn, from 0 to 1 (GPUI `percentage`).
+pub fn percentage(value: f32) Percentage {
+    std.debug.assert(value >= 0 and value <= 1);
+    return .{ .value = value };
+}
+
+/// An angle in radians from a plain `f32` or a `Percentage` (GPUI `Into<Radians>`).
+pub fn to_radians(value: anytype) f32 {
+    return switch (@TypeOf(value)) {
+        Percentage => value.to_radians(),
+        else => value,
+    };
+}
+
 /// Converts a pixel value, length type or number to `Length`.
 pub fn to_length(value: anytype) Length {
     const Value = @TypeOf(value);
@@ -986,6 +1010,44 @@ pub fn pixels_to_i32(value: Pixels) i32 {
     if (value >= @as(f32, @floatFromInt(math.maxInt(i32)))) return math.maxInt(i32);
     if (value <= @as(f32, @floatFromInt(math.minInt(i32)))) return math.minInt(i32);
     return @intFromFloat(value);
+}
+
+/// Rounds down to a whole number (GPUI `Pixels::floor`). `Pixels` is `f32`, so this is a free function.
+pub fn floor(value: Pixels) Pixels {
+    return @floor(value);
+}
+
+/// Rounds to the nearest whole number, halfway cases away from zero (GPUI `Pixels::round`).
+pub fn round(value: Pixels) Pixels {
+    return @round(value);
+}
+
+/// Rounds up to a whole number (GPUI `Pixels::ceil`).
+pub fn ceil(value: Pixels) Pixels {
+    return @ceil(value);
+}
+
+/// `value` raised to `exponent` (GPUI `Pixels::pow`).
+pub fn pow(value: Pixels, exponent: f32) Pixels {
+    return math.pow(f32, value, exponent);
+}
+
+test "pixel rounding helpers" {
+    try testing.expectEqual(@as(Pixels, 2), floor(2.9));
+    try testing.expectEqual(@as(Pixels, -3), floor(-2.5));
+    try testing.expectEqual(@as(Pixels, 3), ceil(2.1));
+    try testing.expectEqual(@as(Pixels, -2), ceil(-2.9));
+    try testing.expectEqual(@as(Pixels, 3), round(2.5));
+    try testing.expectEqual(@as(Pixels, -3), round(-2.5));
+    try testing.expectEqual(@as(Pixels, 2), round(2.4));
+    try testing.expectEqual(@as(Pixels, 9), pow(3, 2));
+    try testing.expectEqual(@as(Pixels, 1), pow(5, 0));
+}
+
+test "percentage is a fraction of a full turn" {
+    try std.testing.expectApproxEqAbs(std.math.pi, percentage(0.5).to_radians(), 1e-6);
+    try std.testing.expectApproxEqAbs(std.math.tau, percentage(1).to_radians(), 1e-6);
+    try std.testing.expectEqual(@as(f32, 2.0), to_radians(@as(f32, 2.0)));
 }
 
 test "pixels_to_i32" {

@@ -14,8 +14,69 @@ const app_mod = @import("app.zig");
 const Window = @import("window.zig").Window;
 const App = app_mod.App;
 const TypeId = app_mod.TypeId;
+const keymap_mod = @import("keymap.zig");
+const Keymap = keymap_mod.Keymap;
+const KeyBinding = keymap_mod.KeyBinding;
+const Keystroke = @import("keystroke.zig").Keystroke;
 
 pub const KeyContext = @import("keymap_context.zig").KeyContext;
+
+/// A keystroke that turned out not to complete a sequence, to be handled as if typed alone.
+pub const Replay = struct {
+    keystroke: Keystroke,
+    bindings: []const KeyBinding = &.{},
+};
+
+pub const DispatchResult = struct {
+    /// Non-empty when the input may still complete a longer binding.
+    pending: []const Keystroke = &.{},
+    /// The pending input is also a complete binding of its own.
+    pending_has_binding: bool = false,
+    bindings: []const KeyBinding = &.{},
+    to_replay: []const Replay = &.{},
+};
+
+/// Matches `keystroke` after the pending `input` (GPUI `DispatchTree::dispatch_key`). `arena` owns
+/// everything returned; the keystrokes are not copied.
+pub fn dispatch_key(arena: Allocator, keymap: *const Keymap, input: []const Keystroke, keystroke: Keystroke, contexts: []const KeyContext) Allocator.Error!DispatchResult {
+    const full = try arena.alloc(Keystroke, input.len + 1);
+    @memcpy(full[0..input.len], input);
+    full[input.len] = keystroke;
+    const found = try keymap.bindings_for_input(arena, full, contexts);
+    if (found.pending) return .{ .pending = full, .pending_has_binding = found.bindings.len > 0 };
+    if (found.bindings.len > 0) return .{ .bindings = found.bindings };
+    if (input.len == 0) return .{};
+
+    var to_replay: std.ArrayList(Replay) = .empty;
+    const suffix = try replay_prefix(arena, keymap, input, contexts, &to_replay);
+    var result = try dispatch_key(arena, keymap, suffix, keystroke, contexts);
+    try to_replay.appendSlice(arena, result.to_replay);
+    result.to_replay = to_replay.items;
+    return result;
+}
+
+/// Turns input that waited too long into replays (GPUI `DispatchTree::flush_dispatch`).
+pub fn flush_dispatch(arena: Allocator, keymap: *const Keymap, input: []const Keystroke, contexts: []const KeyContext) Allocator.Error![]const Replay {
+    var to_replay: std.ArrayList(Replay) = .empty;
+    var rest = input;
+    while (rest.len > 0) rest = try replay_prefix(arena, keymap, rest, contexts, &to_replay);
+    return to_replay.items;
+}
+
+/// Replays the longest prefix of `input` that is a binding, or else its first keystroke, and
+/// returns the rest.
+fn replay_prefix(arena: Allocator, keymap: *const Keymap, input: []const Keystroke, contexts: []const KeyContext, to_replay: *std.ArrayList(Replay)) Allocator.Error![]const Keystroke {
+    var end = input.len;
+    while (end > 0) : (end -= 1) {
+        const found = try keymap.bindings_for_input(arena, input[0..end], contexts);
+        if (found.bindings.len > 0) {
+            try to_replay.append(arena, .{ .keystroke = input[end - 1], .bindings = found.bindings });
+            return input[end..];
+        }
+    }
+    try to_replay.append(arena, .{ .keystroke = input[0] });
+    return input[1..];
+}
 
 /// Index of a node within a `DispatchTree`. Not stable across frames.
 pub const DispatchNodeId = u32;
@@ -57,6 +118,11 @@ pub const DispatchNode = struct {
     focus_id: ?u64 = null,
     tab_index: isize = 0,
     tab_stop: bool = false,
+    /// This node and its descendants sort as one block at this index, and their own indices
+    /// only order them inside it (GPUI `TabStopMap::begin_group`).
+    tab_group: ?isize = null,
+    /// The view whose element tree this node was pushed in (GPUI `DispatchNode::view_id`).
+    view_id: ?app_mod.EntityId = null,
 
     /// Clears the node for reuse, keeping listener capacity.
     fn reset(self: *DispatchNode, parent: ?DispatchNodeId) void {
@@ -67,6 +133,42 @@ pub const DispatchNode = struct {
         self.focus_id = null;
         self.tab_index = 0;
         self.tab_stop = false;
+        self.tab_group = null;
+        self.view_id = null;
+    }
+};
+
+/// Walks from a view's node up to the root, yielding the views on the way (GPUI
+/// `view_path_reversed`). Nodes that have no view are skipped.
+pub const ViewPath = struct {
+    tree: *const DispatchTree,
+    current: ?DispatchNodeId,
+
+    pub fn next(self: *ViewPath) ?app_mod.EntityId {
+        while (self.current) |id| {
+            const node = &self.tree.nodes.items[id];
+            self.current = node.parent;
+            if (node.view_id) |view_id| return view_id;
+        }
+        return null;
+    }
+};
+
+/// Where `reuse_subtree` put the nodes it moved (GPUI `ReusedSubtree`).
+pub const ReusedSubtree = struct {
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    contains_focus_: bool,
+
+    /// The id in the new tree of a node that was in the moved range.
+    pub fn refresh_node_id(self: ReusedSubtree, node_id: DispatchNodeId) DispatchNodeId {
+        std.debug.assert(node_id >= self.old_start and node_id < self.old_end);
+        return @intCast(node_id - self.old_start + self.new_start);
+    }
+
+    pub fn contains_focus(self: ReusedSubtree) bool {
+        return self.contains_focus_;
     }
 };
 
@@ -81,6 +183,7 @@ pub const DispatchTree = struct {
     count: usize = 0,
     node_stack: std.ArrayList(DispatchNodeId) = .empty,
     focusable: std.AutoHashMapUnmanaged(u64, DispatchNodeId) = .empty,
+    view_nodes: std.AutoHashMapUnmanaged(app_mod.EntityId, DispatchNodeId) = .empty,
 
     pub fn init(gpa: Allocator) DispatchTree {
         return .{ .gpa = gpa };
@@ -94,6 +197,7 @@ pub const DispatchTree = struct {
         self.nodes.deinit(self.gpa);
         self.node_stack.deinit(self.gpa);
         self.focusable.deinit(self.gpa);
+        self.view_nodes.deinit(self.gpa);
     }
 
     /// Empties the tree for the next frame, keeping allocated capacity.
@@ -101,6 +205,44 @@ pub const DispatchTree = struct {
         self.count = 0;
         self.node_stack.clearRetainingCapacity();
         self.focusable.clearRetainingCapacity();
+        self.view_nodes.clearRetainingCapacity();
+    }
+
+    /// The root node, which is the first one pushed (GPUI `root_node_id`).
+    pub fn root_node_id(self: *const DispatchTree) DispatchNodeId {
+        std.debug.assert(self.count > 0);
+        return 0;
+    }
+
+    /// The node that carries focus `target` in this frame, if there is one (GPUI `focusable_node_id`).
+    pub fn focusable_node_id(self: *const DispatchTree, target: u64) ?DispatchNodeId {
+        return self.focusable.get(target);
+    }
+
+    /// Records the active node as the node of `view_id`, so that `view_path_reversed` can walk up
+    /// from the view (GPUI `set_view_id`).
+    pub fn set_view_id(self: *DispatchTree, view_id: app_mod.EntityId) void {
+        const node_id = self.active_node_id();
+        self.nodes.items[node_id].view_id = view_id;
+        self.view_nodes.put(self.gpa, view_id, node_id) catch oom();
+    }
+
+    /// The views from `view_id` up to the root, nearest first (GPUI `view_path_reversed`). Empty
+    /// if the view has no node in this frame.
+    pub fn view_path_reversed(self: *const DispatchTree, view_id: app_mod.EntityId) ViewPath {
+        return .{ .tree = self, .current = self.view_nodes.get(view_id) };
+    }
+
+    /// Makes `node_id` the active node: pops back to its parent, then pushes it (GPUI
+    /// `set_active_node`). Nodes pushed after the parent are no longer on the stack afterwards.
+    pub fn set_active_node(self: *DispatchTree, node_id: DispatchNodeId) void {
+        std.debug.assert(node_id < self.count);
+        const next_parent = self.nodes.items[node_id].parent;
+        while (self.node_stack.items.len > 0 and self.node_stack.items[self.node_stack.items.len - 1] != next_parent) {
+            _ = self.node_stack.pop();
+        }
+        const matches_parent = if (self.node_stack.items.len == 0) next_parent == null else self.node_stack.items[self.node_stack.items.len - 1] == next_parent;
+        if (matches_parent) self.node_stack.append(self.gpa, node_id) catch oom();
     }
 
     /// Number of live nodes.
@@ -122,6 +264,49 @@ pub const DispatchTree = struct {
         }
         self.count += 1;
         self.node_stack.append(self.gpa, id) catch oom();
+    }
+
+    /// Drops the nodes from `index` on, which a failed `Window.transact` rolled back (GPUI `truncate`).
+    pub fn truncate(self: *DispatchTree, index: usize) void {
+        for (self.nodes.items[index..self.count]) |*n| {
+            if (n.focus_id) |id| _ = self.focusable.remove(id);
+            if (n.view_id) |id| _ = self.view_nodes.remove(id);
+        }
+        self.count = index;
+    }
+
+    /// Takes a node of the previous frame's tree, listeners and all (GPUI `move_node`). Listeners
+    /// are swapped, so the source keeps the (empty) lists of the node they replace.
+    fn move_node(self: *DispatchTree, source: *DispatchNode) void {
+        self.push_node();
+        if (source.context) |context| self.set_key_context(context);
+        if (source.focus_id) |id| self.set_focus_id(id, source.tab_index, source.tab_stop);
+        if (source.tab_group) |group| self.set_tab_group(group);
+        if (source.view_id) |id| self.set_view_id(id);
+        const target = self.active_node();
+        std.mem.swap(std.ArrayList(KeyListener), &target.key_listeners, &source.key_listeners);
+        std.mem.swap(std.ArrayList(ActionListener), &target.action_listeners, &source.action_listeners);
+    }
+
+    /// Rebuilds nodes `old_start..old_end` of `source` under the active node, without running the
+    /// prepaint that made them (GPUI `reuse_subtree`).
+    pub fn reuse_subtree(self: *DispatchTree, old_start: usize, old_end: usize, source: *DispatchTree, focus: ?u64) ReusedSubtree {
+        const new_start = self.count;
+        var contains_focus = false;
+        // Ancestors within the range.
+        var stack: std.ArrayList(DispatchNodeId) = .empty;
+        defer stack.deinit(self.gpa);
+        for (source.nodes.items[old_start..old_end], old_start..) |*source_node, source_id| {
+            while (stack.items.len > 0 and source_node.parent != stack.items[stack.items.len - 1]) {
+                _ = stack.pop();
+                self.pop_node();
+            }
+            stack.append(self.gpa, @intCast(source_id)) catch oom();
+            if (source_node.focus_id != null and source_node.focus_id == focus) contains_focus = true;
+            self.move_node(source_node);
+        }
+        for (stack.items) |_| self.pop_node();
+        return .{ .old_start = old_start, .old_end = old_end, .new_start = new_start, .contains_focus_ = contains_focus };
     }
 
     /// Makes the parent of the active node active again.
@@ -153,6 +338,11 @@ pub const DispatchTree = struct {
         active.tab_index = tab_index;
         active.tab_stop = tab_stop;
         self.focusable.put(self.gpa, id, node_id) catch oom();
+    }
+
+    /// Makes the active node a tab group.
+    pub fn set_tab_group(self: *DispatchTree, tab_index: isize) void {
+        self.active_node().tab_group = tab_index;
     }
 
     /// Attaches a key listener to the active node.
@@ -201,6 +391,21 @@ pub const DispatchTree = struct {
         return path.toOwnedSlice(allocator) catch oom();
     }
 
+    /// Focus ids from the root down to `focus_id`, one per node that has one (GPUI `focus_path`).
+    /// Empty if the id is unknown. The caller frees the slice with `allocator`.
+    pub fn focus_path(self: *const DispatchTree, focus_id: u64, allocator: Allocator) Allocator.Error![]u64 {
+        var out: std.ArrayList(u64) = .empty;
+        errdefer out.deinit(allocator);
+        var current = self.focusable.get(focus_id);
+        while (current) |id| {
+            const dn = &self.nodes.items[id];
+            if (dn.focus_id) |fid| try out.append(allocator, fid);
+            current = dn.parent;
+        }
+        std.mem.reverse(u64, out.items);
+        return out.toOwnedSlice(allocator);
+    }
+
     /// The key contexts along `path`, root first. The caller frees the slice with `allocator`.
     pub fn context_stack(self: *const DispatchTree, path: []const DispatchNodeId, allocator: Allocator) []KeyContext {
         var out: std.ArrayList(KeyContext) = .empty;
@@ -212,12 +417,13 @@ pub const DispatchTree = struct {
     }
 
     /// The next (`forward`) or previous focusable tab stop after `current`, wrapping around.
-    /// Stops are ordered by `tab_index`, then by tree order, as in GPUI's tab_stop.rs. Without a
+    /// Stops are ordered by their tab groups and `tab_index`, then by tree order, as in GPUI's
+    /// tab_stop.rs. Without a
     /// current focus (or if it is unknown) this returns the first, or last when going backward.
     pub fn next_tab_stop(self: *const DispatchTree, current: ?u64, forward: bool) ?u64 {
         const cur: ?TabKey = if (current) |fid| blk: {
             const nid = self.focusable.get(fid) orelse break :blk null;
-            break :blk TabKey.of(&self.nodes.items[nid], nid);
+            break :blk self.tab_key(nid);
         } else null;
 
         var nearest: ?Candidate = null;
@@ -225,7 +431,7 @@ pub const DispatchTree = struct {
         for (self.nodes.items[0..self.count], 0..) |*n, i| {
             if (!n.tab_stop) continue;
             const focus = n.focus_id orelse continue;
-            const key = TabKey.of(n, @intCast(i));
+            const key = self.tab_key(@intCast(i));
             const cand = Candidate{ .key = key, .focus = focus };
 
             // Overall extreme: first stop going forward, last going backward (wrap target).
@@ -254,16 +460,37 @@ pub const DispatchTree = struct {
         return null;
     }
 
+    /// The groups enclosing a node, outermost first, then its own index. The node's own group
+    /// counts: a focusable group container sorts inside its group, so moving on from it enters
+    /// the group rather than jumping past every sibling group.
+    fn tab_key(self: *const DispatchTree, id: DispatchNodeId) TabKey {
+        var reversed: [TabKey.MAX_DEPTH]isize = undefined;
+        reversed[0] = self.nodes.items[id].tab_index;
+        var count: usize = 1;
+        var current: ?DispatchNodeId = id;
+        while (current) |nid| : (current = self.nodes.items[nid].parent) {
+            const group = self.nodes.items[nid].tab_group orelse continue;
+            // Groups nested this deep lose their outermost levels.
+            if (count == reversed.len) break;
+            reversed[count] = group;
+            count += 1;
+        }
+        var key: TabKey = .{ .len = count, .node = id };
+        for (0..count) |i| key.path[i] = reversed[count - 1 - i];
+        return key;
+    }
+
     const TabKey = struct {
-        tab_index: isize,
+        const MAX_DEPTH = 16;
+        path: [MAX_DEPTH]isize = undefined,
+        len: usize,
         node: DispatchNodeId,
 
-        fn of(n: *const DispatchNode, id: DispatchNodeId) TabKey {
-            return .{ .tab_index = n.tab_index, .node = id };
-        }
-
         fn less(a: TabKey, b: TabKey) bool {
-            if (a.tab_index != b.tab_index) return a.tab_index < b.tab_index;
+            for (a.path[0..@min(a.len, b.len)], b.path[0..@min(a.len, b.len)]) |x, y| {
+                if (x != y) return x < y;
+            }
+            if (a.len != b.len) return a.len < b.len;
             return a.node < b.node;
         }
     };
@@ -275,6 +502,36 @@ pub const DispatchTree = struct {
 // Tests (ported from GPUI tab_stop.rs, plus path and focus checks)
 
 const testing = std.testing;
+
+test "focus_path: root to focused, skipping nodes without a focus id" {
+    var b = Builder.init();
+    defer b.deinit();
+    // root(0) -> outer(focus 1) -> { plain, inner(focus 2) -> child(focus 3) }
+    b.tree.push_node();
+    b.tree.set_focus_id(1, 0, false);
+    b.tree.push_node();
+    b.tree.pop_node();
+    b.tree.push_node();
+    b.tree.set_focus_id(2, 0, false);
+    b.tree.push_node();
+    b.tree.set_focus_id(3, 0, false);
+    b.tree.pop_node();
+    b.tree.pop_node();
+    b.tree.pop_node();
+    b.tree.pop_node();
+
+    const inner = try b.tree.focus_path(2, testing.allocator);
+    defer testing.allocator.free(inner);
+    try testing.expectEqualSlices(u64, &.{ 1, 2 }, inner);
+
+    const deepest = try b.tree.focus_path(3, testing.allocator);
+    defer testing.allocator.free(deepest);
+    try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, deepest);
+
+    const unknown = try b.tree.focus_path(99, testing.allocator);
+    defer testing.allocator.free(unknown);
+    try testing.expectEqual(@as(usize, 0), unknown.len);
+}
 
 /// Builds a flat tree: root node 0 with one child per focus handle.
 const Builder = struct {
@@ -307,6 +564,92 @@ const Builder = struct {
         self.tree.pop_node();
     }
 };
+
+/// Each stop is given its expected place in the order, as in GPUI's `TabStopMapTest`.
+const GroupTest = struct {
+    builder: Builder,
+    by_order: [16]u64 = @splat(0),
+    count: usize = 0,
+
+    fn stop(self: *GroupTest, tab_index: isize, order: usize) void {
+        self.by_order[order] = self.builder.handle(tab_index, true);
+        self.count += 1;
+    }
+    fn begin(self: *GroupTest, tab_index: isize) void {
+        self.builder.tree.push_node();
+        self.builder.tree.set_tab_group(tab_index);
+    }
+    fn end(self: *GroupTest) void {
+        self.builder.tree.pop_node();
+    }
+    fn check(self: *GroupTest) !void {
+        defer self.builder.deinit();
+        const tree = &self.builder.tree;
+        try testing.expectEqual(@as(?u64, self.by_order[0]), tree.next_tab_stop(null, true));
+        try testing.expectEqual(@as(?u64, self.by_order[self.count - 1]), tree.next_tab_stop(null, false));
+        for (0..self.count) |i| {
+            const after = self.by_order[(i + 1) % self.count];
+            try testing.expectEqual(@as(?u64, after), tree.next_tab_stop(self.by_order[i], true));
+            try testing.expectEqual(@as(?u64, self.by_order[i]), tree.next_tab_stop(after, false));
+        }
+    }
+};
+
+test "tab groups: siblings" {
+    var t = GroupTest{ .builder = Builder.init() };
+    t.stop(0, 0);
+    t.stop(1, 1);
+    t.begin(2);
+    t.stop(0, 2);
+    t.stop(1, 3);
+    t.end();
+    t.stop(3, 4);
+    t.stop(4, 5);
+    t.begin(6);
+    t.stop(0, 6);
+    t.stop(1, 7);
+    t.end();
+    t.stop(7, 8);
+    t.stop(8, 9);
+    try t.check();
+}
+
+test "tab groups: nested" {
+    var t = GroupTest{ .builder = Builder.init() };
+    t.stop(0, 0);
+    t.stop(1, 1);
+    t.begin(2);
+    t.begin(0);
+    t.stop(0, 2);
+    t.stop(1, 3);
+    t.end();
+    t.stop(1, 4);
+    t.end();
+    t.stop(3, 5);
+    t.stop(4, 6);
+    try t.check();
+}
+
+test "tab groups: sibling nested groups, out of order" {
+    var t = GroupTest{ .builder = Builder.init() };
+    t.stop(9, 9);
+    t.stop(8, 8);
+    t.begin(7);
+    t.stop(0, 2);
+    t.stop(2, 5);
+    t.begin(3);
+    t.stop(1, 7);
+    t.stop(0, 6);
+    t.end();
+    t.begin(1);
+    t.stop(0, 3);
+    t.stop(1, 4);
+    t.end();
+    t.end();
+    t.stop(3, 0);
+    t.stop(4, 1);
+    try t.check();
+}
 
 test "tab handles follow tab_index then tree order" {
     var b = Builder.init();
@@ -424,4 +767,102 @@ test "clear reuses node storage" {
     b.tree.push_node();
     try testing.expectEqual(@as(DispatchNodeId, 0), b.tree.active_node_id());
     try testing.expect(b.tree.nodes.capacity >= cap_before);
+}
+
+test "root, focusable and view nodes" {
+    var tree = DispatchTree.init(testing.allocator);
+    defer tree.deinit();
+    const view_a: app_mod.EntityId = @enumFromInt(1);
+    const view_b: app_mod.EntityId = @enumFromInt(2);
+
+    tree.push_node(); // 0: root, view a
+    tree.set_view_id(view_a);
+    tree.push_node(); // 1: child of root, focusable
+    tree.set_focus_id(77, 0, true);
+    tree.push_node(); // 2: child of 1, view b
+    tree.set_view_id(view_b);
+    tree.pop_node();
+    tree.pop_node();
+    tree.pop_node();
+
+    try testing.expectEqual(@as(DispatchNodeId, 0), tree.root_node_id());
+    try testing.expectEqual(@as(?DispatchNodeId, 1), tree.focusable_node_id(77));
+    try testing.expectEqual(@as(?DispatchNodeId, null), tree.focusable_node_id(78));
+
+    // From the deepest view up to the root.
+    var path = tree.view_path_reversed(view_b);
+    try testing.expectEqual(@as(?app_mod.EntityId, view_b), path.next());
+    try testing.expectEqual(@as(?app_mod.EntityId, view_a), path.next());
+    try testing.expectEqual(@as(?app_mod.EntityId, null), path.next());
+
+    // A view with no node in this frame has an empty path.
+    var missing = tree.view_path_reversed(@enumFromInt(9));
+    try testing.expectEqual(@as(?app_mod.EntityId, null), missing.next());
+}
+
+test "set_active_node pops to the parent before pushing" {
+    var tree = DispatchTree.init(testing.allocator);
+    defer tree.deinit();
+    tree.push_node(); // 0
+    tree.push_node(); // 1, child of 0
+    tree.pop_node();
+    tree.pop_node();
+    // Node 1's parent is not on the stack, so nothing is activated.
+    tree.set_active_node(1);
+    try testing.expectEqual(@as(usize, 0), tree.node_stack.items.len);
+    tree.set_active_node(0);
+    try testing.expectEqual(@as(usize, 1), tree.node_stack.items.len);
+    tree.set_active_node(1);
+    try testing.expectEqual(@as(DispatchNodeId, 1), tree.active_node_id());
+    try testing.expectEqual(@as(usize, 2), tree.node_stack.items.len);
+}
+
+test "dispatch_key: sequences, prefixes and replays" {
+    const action_mod = @import("action.zig");
+    const A = action_mod.Action("test", "DispatchA");
+    const AB = action_mod.Action("test", "DispatchAB");
+    var keymap = Keymap.init(std.testing.allocator);
+    defer keymap.deinit();
+    try keymap.add_bindings(&.{ KeyBinding.new("a", A{}, null), KeyBinding.new("a b", AB{}, null), KeyBinding.new("x y z", AB{}, null) });
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const key = struct {
+        fn of(comptime name: []const u8) Keystroke {
+            return .{ .key = name };
+        }
+    }.of;
+    const none: []const KeyContext = &.{};
+
+    // Nothing bound.
+    var r = try dispatch_key(arena, &keymap, &.{}, key("q"), none);
+    try std.testing.expect(r.pending.len == 0 and r.bindings.len == 0 and r.to_replay.len == 0);
+
+    // A binding that is also a prefix waits.
+    r = try dispatch_key(arena, &keymap, &.{}, key("a"), none);
+    try std.testing.expect(r.pending.len == 1 and r.pending_has_binding);
+
+    // It completes.
+    r = try dispatch_key(arena, &keymap, &.{key("a")}, key("b"), none);
+    try std.testing.expect(r.pending.len == 0 and r.bindings.len == 1 and r.to_replay.len == 0);
+
+    // Or falls back: "a" runs its own binding, then "q" is an ordinary key.
+    r = try dispatch_key(arena, &keymap, &.{key("a")}, key("q"), none);
+    try std.testing.expectEqual(@as(usize, 1), r.to_replay.len);
+    try std.testing.expectEqual(@as(usize, 1), r.to_replay[0].bindings.len);
+    try std.testing.expectEqualStrings("a", r.to_replay[0].keystroke.key);
+    try std.testing.expect(r.pending.len == 0 and r.bindings.len == 0);
+
+    // A failed prefix replays key by key, and the new key can start another sequence.
+    r = try dispatch_key(arena, &keymap, &.{ key("x"), key("y") }, key("a"), none);
+    try std.testing.expectEqual(@as(usize, 2), r.to_replay.len);
+    try std.testing.expectEqualStrings("x", r.to_replay[0].keystroke.key);
+    try std.testing.expectEqualStrings("y", r.to_replay[1].keystroke.key);
+    try std.testing.expect(r.pending.len == 1 and r.pending_has_binding);
+
+    // A timeout flushes everything.
+    const flushed = try flush_dispatch(arena, &keymap, &.{ key("x"), key("y") }, none);
+    try std.testing.expectEqual(@as(usize, 2), flushed.len);
+    const bound = try flush_dispatch(arena, &keymap, &.{key("a")}, none);
+    try std.testing.expect(bound.len == 1 and bound[0].bindings.len == 1);
 }

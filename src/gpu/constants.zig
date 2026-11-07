@@ -1,0 +1,15 @@
+pub const invalid_id: usize = 0;
+pub const num_inflight_frames: usize = 2;
+pub const max_color_attachments: usize = 8;
+pub const max_uniformblock_members: usize = 16;
+pub const max_vertex_attributes: usize = 16;
+pub const max_mipmaps: usize = 16;
+pub const max_vertexbuffer_bindslots: usize = 8;
+pub const max_uniformblock_bindslots: usize = 8;
+pub const max_view_bindslots: usize = 32;
+pub const max_sampler_bindslots: usize = 12;
+pub const max_texture_sampler_pairs: usize = 32;
+pub const max_portable_color_attachments: usize = 4;
+pub const max_portable_texture_bindings_per_stage: usize = 16;
+pub const max_portable_storagebuffer_bindings_per_stage: usize = 8;
+pub const max_portable_storageimage_bindings_per_stage: usize = 4;

@@ -89,9 +89,10 @@ const Contour = struct {
 pub const PathBuilder = struct {
     allocator: std.mem.Allocator,
     contours: std.ArrayList(Contour) = .empty,
-    transform: ?Transform = null,
+    // Named with a trailing underscore because `transform` is also the GPUI method that sets it.
+    transform_: ?Transform = null,
     style: PathStyle,
-    dash_array: std.ArrayList(Pixels) = .empty,
+    dash_array_: std.ArrayList(Pixels) = .empty,
 
     /// Creates a builder for a filled path.
     pub fn fill(allocator: std.mem.Allocator) PathBuilder {
@@ -107,7 +108,7 @@ pub const PathBuilder = struct {
     pub fn deinit(self: *PathBuilder) void {
         for (self.contours.items) |*contour| contour.points.deinit(self.allocator);
         self.contours.deinit(self.allocator);
-        self.dash_array.deinit(self.allocator);
+        self.dash_array_.deinit(self.allocator);
     }
 
     pub fn with_style(self: *PathBuilder, style: PathStyle) *PathBuilder {
@@ -116,10 +117,19 @@ pub const PathBuilder = struct {
     }
 
     /// Sets the stroke dash pattern. An odd-length pattern is repeated to even length, as in SVG.
+    /// Fails only when out of memory; `dash_array` is the same thing with the failure turned into a panic.
     pub fn dash_array_set(self: *PathBuilder, pattern: []const Pixels) !void {
-        self.dash_array.clearRetainingCapacity();
-        try self.dash_array.appendSlice(self.allocator, pattern);
-        if (pattern.len % 2 == 1) try self.dash_array.appendSlice(self.allocator, pattern);
+        self.dash_array_.clearRetainingCapacity();
+        try self.dash_array_.appendSlice(self.allocator, pattern);
+        if (pattern.len % 2 == 1) try self.dash_array_.appendSlice(self.allocator, pattern);
+    }
+
+    /// Sets the dash array of the builder (GPUI `PathBuilder::dash_array`). An odd-length array is
+    /// repeated to even length, so `5,3,2` is the same as `5,3,2,5,3,2`. Panics when out of memory,
+    /// as GPUI does.
+    pub fn dash_array(self: *PathBuilder, pattern: []const Pixels) *PathBuilder {
+        self.dash_array_set(pattern) catch @panic("out of memory");
+        return self;
     }
 
     /// Starts a new sub-path at `to`.
@@ -264,34 +274,36 @@ pub const PathBuilder = struct {
         self.contours.items[self.contours.items.len - 1].closed = true;
     }
 
-    /// Applies `transform` to the path when it is built.
-    pub fn transform_by(self: *PathBuilder, transform: Transform) void {
-        self.transform = transform;
+    /// Applies `transform` to the path when it is built (GPUI `transform`). Replaces any transform
+    /// set before.
+    pub fn transform_by(self: *PathBuilder, t: Transform) void {
+        self.transform_ = t;
     }
+    pub const transform = transform_by;
 
     /// Translates the path by `to` when it is built.
     pub fn translate(self: *PathBuilder, to: Point(Pixels)) void {
-        self.transform = (self.transform orelse Transform{}).then(Transform.translation(to.x, to.y));
+        self.transform_ = (self.transform_ orelse Transform{}).then(Transform.translation(to.x, to.y));
     }
 
     /// Scales the path uniformly when it is built.
     pub fn scale(self: *PathBuilder, factor: f32) void {
-        self.transform = (self.transform orelse Transform{}).then(Transform.scale(factor, factor));
+        self.transform_ = (self.transform_ orelse Transform{}).then(Transform.scale(factor, factor));
     }
 
     /// Rotates the path by `degrees` when it is built.
     pub fn rotate(self: *PathBuilder, degrees: f32) void {
         const radians = degrees * std.math.pi / 180.0;
-        self.transform = (self.transform orelse Transform{}).then(Transform.rotation(radians));
+        self.transform_ = (self.transform_ orelse Transform{}).then(Transform.rotation(radians));
     }
 
     /// Tessellates the commands into a `Path`. Consumes the builder, releasing its storage.
     pub fn build(self: *PathBuilder) !Path(Pixels) {
         defer self.deinit();
 
-        if (self.transform) |transform| {
+        if (self.transform_) |applied| {
             for (self.contours.items) |*contour| {
-                for (contour.points.items) |*point| point.* = transform.apply(point.*);
+                for (contour.points.items) |*point| point.* = applied.apply(point.*);
             }
         }
 
@@ -326,12 +338,29 @@ pub const PathBuilder = struct {
     }
 
     fn tessellate_fill(self: *PathBuilder, triangles: *std.ArrayList([3]Point(Pixels))) !void {
+        var contours: std.ArrayList([]const Point(Pixels)) = .empty;
+        defer {
+            for (contours.items) |points| self.allocator.free(points);
+            contours.deinit(self.allocator);
+        }
         for (self.contours.items) |*contour| {
             const points = try dedupe(self.allocator, contour.points.items);
-            defer self.allocator.free(points);
-            if (points.len < 3) continue;
-            try ear_clip(self.allocator, points, triangles);
+            if (points.len < 3) {
+                self.allocator.free(points);
+                continue;
+            }
+            contours.append(self.allocator, points) catch |err| {
+                self.allocator.free(points);
+                return err;
+            };
         }
+        // One simple polygon, the usual case, gives the fewest triangles by clipping ears.
+        if (contours.items.len == 1 and !self_intersects(contours.items[0])) {
+            const start = triangles.items.len;
+            if (try ear_clip(self.allocator, contours.items[0], triangles)) return;
+            triangles.shrinkRetainingCapacity(start);
+        }
+        try fill_even_odd(self.allocator, contours.items, triangles);
     }
 
     fn tessellate_stroke(self: *PathBuilder, triangles: *std.ArrayList([3]Point(Pixels)), half_width: f32) !void {
@@ -341,10 +370,10 @@ pub const PathBuilder = struct {
             if (points.len < 2) continue;
             const closed = contour.closed and points.len >= 3;
 
-            if (self.dash_array.items.len == 0) {
+            if (self.dash_array_.items.len == 0) {
                 try stroke_polyline(self.allocator, points, closed, half_width, triangles);
             } else {
-                try stroke_dashed(self.allocator, points, closed, self.dash_array.items, half_width, triangles);
+                try stroke_dashed(self.allocator, points, closed, self.dash_array_.items, half_width, triangles);
             }
         }
     }
@@ -379,14 +408,111 @@ fn point_in_triangle(p: Point(Pixels), a: Point(Pixels), b: Point(Pixels), c: Po
     return d1 >= -epsilon and d2 >= -epsilon and d3 >= -epsilon;
 }
 
-/// Triangulates one simple polygon by repeatedly clipping convex ears. Self-intersecting input
-/// that leaves no ear is cut short.
-fn ear_clip(allocator: std.mem.Allocator, points: []const Point(Pixels), triangles: *std.ArrayList([3]Point(Pixels))) !void {
+/// Whether two non-adjacent edges of a closed polygon cross.
+fn self_intersects(points: []const Point(Pixels)) bool {
+    const count = points.len;
+    for (0..count) |i| {
+        const a = points[i];
+        const b = points[(i + 1) % count];
+        var j = i + 2;
+        while (j < count) : (j += 1) {
+            // The last edge shares a vertex with the first.
+            if (i == 0 and j == count - 1) continue;
+            const c = points[j];
+            const d = points[(j + 1) % count];
+            const d1 = cross(b.sub(a), c.sub(a));
+            const d2 = cross(b.sub(a), d.sub(a));
+            const d3 = cross(d.sub(c), a.sub(c));
+            const d4 = cross(d.sub(c), b.sub(c));
+            if (((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))) return true;
+        }
+    }
+    return false;
+}
+
+/// Fills any set of closed contours with the even-odd rule, lyon's default, so crossings and holes
+/// come out right. Cuts the shape at every vertex and crossing into horizontal bands. Within a band
+/// no edges cross, so sorting them by x and pairing them gives trapezoids.
+fn fill_even_odd(allocator: std.mem.Allocator, contours: []const []const Point(Pixels), triangles: *std.ArrayList([3]Point(Pixels))) !void {
+    const Edge = struct {
+        top: Point(Pixels),
+        bottom: Point(Pixels),
+
+        fn x_at(edge: @This(), y: f32) f32 {
+            const t = (y - edge.top.y) / (edge.bottom.y - edge.top.y);
+            return edge.top.x + (edge.bottom.x - edge.top.x) * t;
+        }
+    };
+    var edges: std.ArrayList(Edge) = .empty;
+    defer edges.deinit(allocator);
+    var cuts: std.ArrayList(f32) = .empty;
+    defer cuts.deinit(allocator);
+    for (contours) |points| {
+        for (points, 0..) |a, index| {
+            const b = points[(index + 1) % points.len];
+            try cuts.append(allocator, a.y);
+            if (a.y == b.y) continue;
+            try edges.append(allocator, if (a.y < b.y) .{ .top = a, .bottom = b } else .{ .top = b, .bottom = a });
+        }
+    }
+    for (edges.items, 0..) |e, i| {
+        for (edges.items[i + 1..]) |f| {
+            const r = e.bottom.sub(e.top);
+            const q = f.bottom.sub(f.top);
+            const denominator = cross(r, q);
+            if (denominator == 0) continue;
+            const to_f = f.top.sub(e.top);
+            const t = cross(to_f, q) / denominator;
+            const u = cross(to_f, r) / denominator;
+            if (t > 0 and t < 1 and u > 0 and u < 1) try cuts.append(allocator, e.top.y + r.y * t);
+        }
+    }
+    std.mem.sort(f32, cuts.items, {}, std.sort.asc(f32));
+
+    const Crossing = struct {
+        x: f32,
+        edge: usize,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            return a.x < b.x;
+        }
+    };
+    var active: std.ArrayList(Crossing) = .empty;
+    defer active.deinit(allocator);
+    var band: usize = 0;
+    while (band + 1 < cuts.items.len) : (band += 1) {
+        const y0 = cuts.items[band];
+        const y1 = cuts.items[band + 1];
+        if (y1 - y0 < 1e-4) continue;
+        const middle = (y0 + y1) / 2;
+        active.clearRetainingCapacity();
+        for (edges.items, 0..) |edge, index| {
+            if (edge.top.y <= middle and edge.bottom.y > middle) {
+                try active.append(allocator, .{ .x = edge.x_at(middle), .edge = index });
+            }
+        }
+        std.mem.sort(Crossing, active.items, {}, Crossing.less);
+        var pair: usize = 0;
+        while (pair + 1 < active.items.len) : (pair += 2) {
+            const left = edges.items[active.items[pair].edge];
+            const right = edges.items[active.items[pair + 1].edge];
+            const top_left: Point(Pixels) = .{ .x = left.x_at(y0), .y = y0 };
+            const top_right: Point(Pixels) = .{ .x = right.x_at(y0), .y = y0 };
+            const bottom_left: Point(Pixels) = .{ .x = left.x_at(y1), .y = y1 };
+            const bottom_right: Point(Pixels) = .{ .x = right.x_at(y1), .y = y1 };
+            if (top_right.x - top_left.x > epsilon) try triangles.append(allocator, .{ top_left, top_right, bottom_right });
+            if (bottom_right.x - bottom_left.x > epsilon) try triangles.append(allocator, .{ top_left, bottom_right, bottom_left });
+        }
+    }
+}
+
+/// Triangulates one simple polygon by repeatedly clipping convex ears. Returns false if it runs out
+/// of ears, which leaves the polygon unfinished.
+fn ear_clip(allocator: std.mem.Allocator, points: []const Point(Pixels), triangles: *std.ArrayList([3]Point(Pixels))) !bool {
     var area: f32 = 0;
     for (points, 0..) |point, index| {
         area += cross(point, points[(index + 1) % points.len]);
     }
-    if (@abs(area) < epsilon) return;
+    if (@abs(area) < epsilon) return true;
     const sign: f32 = if (area > 0) 1 else -1;
 
     var remaining: std.ArrayList(usize) = .empty;
@@ -422,7 +548,7 @@ fn ear_clip(allocator: std.mem.Allocator, points: []const Point(Pixels), triangl
             clipped = true;
             break;
         }
-        if (!clipped) return;
+        if (!clipped) return false;
     }
 
     if (remaining.items.len == 3) {
@@ -431,6 +557,7 @@ fn ear_clip(allocator: std.mem.Allocator, points: []const Point(Pixels), triangl
         const c = points[remaining.items[2]];
         if (@abs(cross(b.sub(a), c.sub(a))) > epsilon) try triangles.append(allocator, .{ a, b, c });
     }
+    return true;
 }
 
 /// Emits a quad per segment and a bevel triangle per join, so an open or closed polyline is covered.
@@ -609,6 +736,69 @@ test "ear clipping handles a concave L shape" {
     defer path.deinit();
     try testing.expectEqual(@as(usize, 12), path.vertices.items.len);
     try testing.expectApproxEqAbs(@as(f32, 75), sum_triangle_area(&path), 1e-3);
+}
+
+fn covered_area(triangles: []const [3]Point(Pixels)) f32 {
+    var total: f32 = 0;
+    for (triangles) |t| total += @abs(cross(t[1].sub(t[0]), t[2].sub(t[0]))) / 2;
+    return total;
+}
+
+fn covers(triangles: []const [3]Point(Pixels), p: Point(Pixels)) bool {
+    for (triangles) |t| {
+        const sign: f32 = if (cross(t[1].sub(t[0]), t[2].sub(t[0])) > 0) 1 else -1;
+        if (point_in_triangle(p, t[0], t[1], t[2], sign)) return true;
+    }
+    return false;
+}
+
+fn fill_test(contours: []const []const Point(Pixels)) !std.ArrayList([3]Point(Pixels)) {
+    var builder = PathBuilder.fill(std.testing.allocator);
+    defer builder.deinit();
+    for (contours) |points| try builder.add_polygon(points, true);
+    var triangles: std.ArrayList([3]Point(Pixels)) = .empty;
+    try builder.tessellate_fill(&triangles);
+    return triangles;
+}
+
+test "fill: a self-intersecting bowtie covers both lobes and not the gaps" {
+    var triangles = try fill_test(&.{&.{ .{ .x = 0, .y = 0 }, .{ .x = 2, .y = 2 }, .{ .x = 2, .y = 0 }, .{ .x = 0, .y = 2 } }});
+    defer triangles.deinit(std.testing.allocator);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), covered_area(triangles.items), 0.001);
+    try std.testing.expect(covers(triangles.items, .{ .x = 0.2, .y = 1 }));
+    try std.testing.expect(covers(triangles.items, .{ .x = 1.8, .y = 1 }));
+    try std.testing.expect(!covers(triangles.items, .{ .x = 1, .y = 0.2 }));
+    try std.testing.expect(!covers(triangles.items, .{ .x = 1, .y = 1.8 }));
+}
+
+test "fill: an inner contour is a hole" {
+    var triangles = try fill_test(&.{
+        &.{ .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 0 }, .{ .x = 4, .y = 4 }, .{ .x = 0, .y = 4 } },
+        &.{ .{ .x = 1, .y = 1 }, .{ .x = 3, .y = 1 }, .{ .x = 3, .y = 3 }, .{ .x = 1, .y = 3 } },
+    });
+    defer triangles.deinit(std.testing.allocator);
+    try std.testing.expectApproxEqAbs(@as(f32, 12), covered_area(triangles.items), 0.001);
+    try std.testing.expect(!covers(triangles.items, .{ .x = 2, .y = 2 }));
+    try std.testing.expect(covers(triangles.items, .{ .x = 0.5, .y = 2 }));
+}
+
+test "fill: a pentagram has an even-odd hole in the middle" {
+    var points: [5]Point(Pixels) = undefined;
+    for (&points, 0..) |*point, i| {
+        const pi: f32 = std.math.pi;
+        const angle = @as(f32, @floatFromInt(i)) * 4 * pi / 5 - pi / 2;
+        point.* = .{ .x = 10 * @cos(angle), .y = 10 * @sin(angle) };
+    }
+    var triangles = try fill_test(&.{&points});
+    defer triangles.deinit(std.testing.allocator);
+    try std.testing.expect(!covers(triangles.items, .{ .x = 0, .y = 0 }));
+    try std.testing.expect(covers(triangles.items, .{ .x = 0, .y = -8 }));
+}
+
+test "fill: a simple polygon still clips ears" {
+    var triangles = try fill_test(&.{&.{ .{ .x = 0, .y = 0 }, .{ .x = 2, .y = 0 }, .{ .x = 2, .y = 2 }, .{ .x = 0, .y = 2 } }});
+    defer triangles.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), triangles.items.len);
 }
 
 test "stroked segment covers its width" {

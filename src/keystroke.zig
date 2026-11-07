@@ -273,6 +273,83 @@ pub const Keystroke = struct {
         }
         return other.key_char == null;
     }
+
+    /// The keystroke itself (GPUI `AsKeystroke::as_keystroke`). Lets code take either a `Keystroke`
+    /// or a `KeybindingKeystroke`.
+    pub fn as_keystroke(self: *const Keystroke) *const Keystroke {
+        return self;
+    }
+
+    /// Fills in `key_char` the way a typed key would produce it, for a keystroke the platform
+    /// gave none (GPUI `Keystroke::with_simulated_ime`): "space", "tab" and "enter" type their
+    /// characters, a printable key types itself, and shift uppercases an ASCII letter. Any other
+    /// key with shift is left as it is: GPUI's `to_uppercase` can change the length of non-ASCII
+    /// text, and no static buffer here could hold that.
+    pub fn with_simulated_ime(self: Keystroke) Keystroke {
+        var out = self;
+        if (self.key_char != null or self.modifiers.platform or self.modifiers.control or self.modifiers.function or self.modifiers.alt) {
+            return out;
+        }
+        if (std.mem.eql(u8, self.key, "space")) {
+            out.key_char = " ";
+        } else if (std.mem.eql(u8, self.key, "tab")) {
+            out.key_char = "\t";
+        } else if (std.mem.eql(u8, self.key, "enter")) {
+            out.key_char = "\n";
+        } else if (self.key.len == 0 or !is_printable_key(self.key)) {
+            out.key_char = null;
+        } else if (self.modifiers.shift and self.key.len == 1 and std.ascii.isLower(self.key[0])) {
+            const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            out.key_char = upper[self.key[0] - 'a' ..][0..1];
+        } else {
+            out.key_char = self.key;
+        }
+        return out;
+    }
+};
+
+/// A keystroke as a keybinding holds it (GPUI `KeybindingKeystroke`). On Linux and the headless
+/// platform it is only the keystroke; GPUI's Windows build adds display fields, which ZUI does not
+/// have yet. `KeyBinding` still stores a plain `Keystroke`.
+pub const KeybindingKeystroke = struct {
+    inner: Keystroke,
+
+    /// Wraps a keystroke without any platform mapping (GPUI `from_keystroke`).
+    pub fn from_keystroke(keystroke: Keystroke) KeybindingKeystroke {
+        return .{ .inner = keystroke };
+    }
+
+    /// Wraps a keystroke after the platform's key equivalents mapping (GPUI `new_with_mapper`).
+    /// `mapper` is any value with `map_key_equivalent(Keystroke, bool) Keystroke`, such as
+    /// `platform.KeyboardMapper`.
+    pub fn new_with_mapper(inner: Keystroke, use_key_equivalents: bool, mapper: anytype) KeybindingKeystroke {
+        return .{ .inner = mapper.map_key_equivalent(inner, use_key_equivalents) };
+    }
+
+    /// The keystroke (GPUI `AsKeystroke::as_keystroke`).
+    pub fn as_keystroke(self: *const KeybindingKeystroke) *const Keystroke {
+        return &self.inner;
+    }
+
+    /// Sets the modifiers (GPUI `set_modifiers`).
+    pub fn set_modifiers(self: *KeybindingKeystroke, modifiers: Modifiers) void {
+        self.inner.modifiers = modifiers;
+    }
+
+    /// Sets the key (GPUI `set_key`). The slice must outlive the keystroke, as `Keystroke.key` does.
+    pub fn set_key(self: *KeybindingKeystroke, key: []const u8) void {
+        self.inner.key = key;
+    }
+
+    /// Removes the key_char (GPUI `remove_key_char`).
+    pub fn remove_key_char(self: *KeybindingKeystroke) void {
+        self.inner.key_char = null;
+    }
+
+    /// Serializes this binding with the host OS's modifier spelling (GPUI `unparse`).
+    pub fn unparse(self: *const KeybindingKeystroke, allocator: std.mem.Allocator, os: OperatingSystem) ![]u8 {
+        return self.inner.unparse_with_os(allocator, os);
+    }
 };
 
 /// A keystroke formatted for a specific OS. Use with `{f}`.
@@ -580,4 +657,33 @@ test "is_printable_key and ime state" {
     try std.testing.expect(typing.is_ime_in_progress());
     const chorded = Keystroke{ .modifiers = .{ .control = true }, .key = "a" };
     try std.testing.expect(!chorded.is_ime_in_progress());
+}
+
+test "with_simulated_ime fills key_char like a typed key" {
+    try std.testing.expectEqualStrings(" ", Keystroke.with_simulated_ime(.{ .key = "space" }).key_char.?);
+    try std.testing.expectEqualStrings("\t", Keystroke.with_simulated_ime(.{ .key = "tab" }).key_char.?);
+    try std.testing.expectEqualStrings("\n", Keystroke.with_simulated_ime(.{ .key = "enter" }).key_char.?);
+    try std.testing.expectEqualStrings("a", Keystroke.with_simulated_ime(.{ .key = "a" }).key_char.?);
+    try std.testing.expectEqualStrings("B", Keystroke.with_simulated_ime(.{ .key = "b", .modifiers = .{ .shift = true } }).key_char.?);
+    // Not typed: escape, function keys, and chords with command, control, alt or fn.
+    try std.testing.expect(Keystroke.with_simulated_ime(.{ .key = "escape" }).key_char == null);
+    try std.testing.expect(Keystroke.with_simulated_ime(.{ .key = "f1" }).key_char == null);
+    try std.testing.expect(Keystroke.with_simulated_ime(.{ .key = "a", .modifiers = .{ .control = true } }).key_char == null);
+    try std.testing.expect(Keystroke.with_simulated_ime(.{ .key = "a", .modifiers = .{ .platform = true } }).key_char == null);
+    // An existing key_char is kept.
+    try std.testing.expectEqualStrings("x", Keystroke.with_simulated_ime(.{ .key = "a", .key_char = "x" }).key_char.?);
+}
+
+test "keybinding keystroke setters" {
+    var ks = KeybindingKeystroke.from_keystroke(.{ .key = "a", .key_char = "a" });
+    try std.testing.expectEqualStrings("a", ks.as_keystroke().key);
+    ks.set_key("b");
+    ks.set_modifiers(.{ .control = true });
+    try std.testing.expectEqualStrings("b", ks.as_keystroke().key);
+    try std.testing.expect(ks.as_keystroke().modifiers.control);
+    ks.remove_key_char();
+    try std.testing.expect(ks.as_keystroke().key_char == null);
+
+    const plain: Keystroke = .{ .key = "c" };
+    try std.testing.expect(plain.as_keystroke() == &plain);
 }

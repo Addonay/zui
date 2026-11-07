@@ -10,11 +10,19 @@ const std = @import("std");
 const geometry = @import("../geometry.zig");
 const text_system = @import("../text_system.zig");
 const line_wrapper = @import("line_wrapper.zig");
+const line_mod = @import("line.zig");
+const style = @import("../style.zig");
+const window_mod = @import("../window.zig");
+const app_mod = @import("../app.zig");
 
 const Allocator = std.mem.Allocator;
 const Pixels = geometry.Pixels;
 const Point = geometry.Point;
 const Size = geometry.Size;
+const TextAlign = style.TextAlign;
+const DecorationRun = line_mod.DecorationRun;
+const Window = window_mod.Window;
+const App = app_mod.App;
 const FontId = text_system.FontId;
 const GlyphId = text_system.GlyphId;
 
@@ -134,6 +142,108 @@ pub const LineLayout = struct {
         allocator.free(self.text);
         self.* = .{};
     }
+
+    /// Splits the layout at byte `byte_index` into `(prefix, suffix)` (GPUI `LineLayout::split_at`).
+    ///
+    /// - `prefix` keeps the glyphs for bytes `[0, byte_index)` at their positions. Its width is the
+    ///   x-advance up to the split point.
+    /// - `suffix` keeps the glyphs for bytes `[byte_index, len)`, shifted left so its first glyph is at
+    ///   x=0, with byte indices rebased to 0.
+    ///
+    /// Both halves copy `font_size`, `ascent` and `descent`. Their runs are allocated with `allocator`
+    /// and hold no text: `text` is empty.
+    pub fn split_at(self: *const LineLayout, allocator: Allocator, byte_index: usize) !struct { LineLayout, LineLayout } {
+        const x_offset = self.x_for_index(byte_index);
+
+        var left_runs: std.ArrayList(ShapedRun) = .empty;
+        errdefer {
+            for (left_runs.items) |run| allocator.free(run.glyphs);
+            left_runs.deinit(allocator);
+        }
+        var right_runs: std.ArrayList(ShapedRun) = .empty;
+        errdefer {
+            for (right_runs.items) |run| allocator.free(run.glyphs);
+            right_runs.deinit(allocator);
+        }
+
+        for (self.runs) |run| {
+            // The same search as GPUI's `partition_point`, which the suffix's order depends on for glyphs
+            // that shaping put out of byte order.
+            const split_pos = partition_point_glyphs(run.glyphs, byte_index);
+
+            if (split_pos > 0) {
+                const glyphs = try allocator.dupe(ShapedGlyph, run.glyphs[0..split_pos]);
+                errdefer allocator.free(glyphs);
+                try left_runs.append(allocator, .{ .font_id = run.font_id, .glyphs = glyphs });
+            }
+            if (split_pos < run.glyphs.len) {
+                const glyphs = try allocator.alloc(ShapedGlyph, run.glyphs.len - split_pos);
+                errdefer allocator.free(glyphs);
+                for (run.glyphs[split_pos..], glyphs) |g, *out| {
+                    out.* = .{
+                        .id = g.id,
+                        .position = .{ .x = g.position.x - x_offset, .y = g.position.y },
+                        .index = g.index - byte_index,
+                        .is_emoji = g.is_emoji,
+                    };
+                }
+                try right_runs.append(allocator, .{ .font_id = run.font_id, .glyphs = glyphs });
+            }
+        }
+
+        const left_owned = try left_runs.toOwnedSlice(allocator);
+        errdefer {
+            for (left_owned) |run| allocator.free(run.glyphs);
+            allocator.free(left_owned);
+        }
+        const right_owned = try right_runs.toOwnedSlice(allocator);
+        const left: LineLayout = .{
+            .font_size = self.font_size,
+            .width = x_offset,
+            .ascent = self.ascent,
+            .descent = self.descent,
+            .runs = left_owned,
+            .len = byte_index,
+        };
+        const right: LineLayout = .{
+            .font_size = self.font_size,
+            .width = self.width - x_offset,
+            .ascent = self.ascent,
+            .descent = self.descent,
+            .runs = right_owned,
+            .len = self.len - byte_index,
+        };
+        return .{ left, right };
+    }
+
+    /// Paints this layout at `origin` (GPUI `LineLayout::paint`). `decoration_runs` color the glyphs and
+    /// draw the underlines and strikethroughs.
+    pub fn paint(
+        self: *const LineLayout,
+        origin: Point(Pixels),
+        line_height: Pixels,
+        text_align: TextAlign,
+        align_width: ?Pixels,
+        decoration_runs: []const DecorationRun,
+        window: *Window,
+        cx: *App,
+    ) !void {
+        return line_mod.paint_layout(self, origin, line_height, text_align, align_width, decoration_runs, window, cx);
+    }
+
+    /// Paints the background colors of this layout at `origin` (GPUI `LineLayout::paint_background`).
+    pub fn paint_background(
+        self: *const LineLayout,
+        origin: Point(Pixels),
+        line_height: Pixels,
+        text_align: TextAlign,
+        align_width: ?Pixels,
+        decoration_runs: []const DecorationRun,
+        window: *Window,
+        cx: *App,
+    ) !void {
+        return line_mod.paint_layout_background(self, origin, line_height, text_align, align_width, decoration_runs, window, cx);
+    }
 };
 
 /// A glyph index pair marking where a wrapped line breaks (GPUI `WrapBoundary`).
@@ -158,16 +268,22 @@ pub const WrappedLineLayout = struct {
     /// The line layout before wrapping. Owned by the line cache.
     unwrapped_layout: *const LineLayout = undefined,
     /// Where the line was wrapped. Owned by the cache entry.
-    wrap_boundaries: []WrapBoundary = &.{},
+    boundaries: []WrapBoundary = &.{},
     /// The width the line was wrapped to, if any.
     wrap_width: ?Pixels = null,
     /// The text of this line. Owned by the cache entry.
     text: []const u8 = &.{},
 
     pub fn deinit(self: *WrappedLineLayout, allocator: Allocator) void {
-        allocator.free(self.wrap_boundaries);
+        allocator.free(self.boundaries);
         allocator.free(self.text);
         self.* = .{};
+    }
+
+    /// The boundaries at which the line was wrapped (GPUI `wrap_boundaries`). The field is `boundaries`
+    /// because Zig does not allow a field and a method of the same name.
+    pub fn wrap_boundaries(self: *const WrappedLineLayout) []const WrapBoundary {
+        return self.boundaries;
     }
 
     /// The length of the underlying text in UTF-8 bytes.
@@ -184,7 +300,7 @@ pub const WrappedLineLayout = struct {
     pub fn size(self: *const WrappedLineLayout, line_height: Pixels) Size(Pixels) {
         return .{
             .width = self.width(),
-            .height = line_height * @as(f32, @floatFromInt(self.wrap_boundaries.len + 1)),
+            .height = line_height * @as(f32, @floatFromInt(self.boundaries.len + 1)),
         };
     }
 
@@ -222,8 +338,8 @@ pub const WrappedLineLayout = struct {
         var wrapped_line_start_index: usize = 0;
         var wrapped_line_start_x: Pixels = 0;
         if (wrapped_line_ix > 0) {
-            if (wrapped_line_ix - 1 >= self.wrap_boundaries.len) return .{ .err = 0 };
-            const b = self.wrap_boundaries[wrapped_line_ix - 1];
+            if (wrapped_line_ix - 1 >= self.boundaries.len) return .{ .err = 0 };
+            const b = self.boundaries[wrapped_line_ix - 1];
             const glyph = self.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix];
             wrapped_line_start_index = glyph.index;
             wrapped_line_start_x = glyph.position.x;
@@ -231,8 +347,8 @@ pub const WrappedLineLayout = struct {
 
         var wrapped_line_end_index: usize = undefined;
         var wrapped_line_end_x: Pixels = undefined;
-        if (wrapped_line_ix < self.wrap_boundaries.len) {
-            const b = self.wrap_boundaries[wrapped_line_ix];
+        if (wrapped_line_ix < self.boundaries.len) {
+            const b = self.boundaries[wrapped_line_ix];
             const glyph = self.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix];
             wrapped_line_end_index = glyph.index;
             wrapped_line_end_x = glyph.position.x;
@@ -255,9 +371,9 @@ pub const WrappedLineLayout = struct {
     pub fn position_for_index(self: *const WrappedLineLayout, index: usize, line_height: Pixels) ?Point(Pixels) {
         var line_start_ix: usize = 0;
         var ix: usize = 0;
-        while (ix <= self.wrap_boundaries.len) : (ix += 1) {
-            const line_end_ix: usize = if (ix < self.wrap_boundaries.len) blk: {
-                const b = self.wrap_boundaries[ix];
+        while (ix <= self.boundaries.len) : (ix += 1) {
+            const line_end_ix: usize = if (ix < self.boundaries.len) blk: {
+                const b = self.boundaries[ix];
                 break :blk self.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix].index;
             } else self.len();
             const line_y = @as(f32, @floatFromInt(ix)) * line_height;
@@ -439,6 +555,9 @@ fn FrameCache(comptime V: type) type {
         /// Entries that collided with a hash already in use; they live for the same two frames.
         current_extra: std.ArrayList(*Entry) = .empty,
         previous_extra: std.ArrayList(*Entry) = .empty,
+        /// Every entry asked for in a frame, in order, so a cached view can name the ones it used.
+        current_used: std.ArrayList(*Entry) = .empty,
+        previous_used: std.ArrayList(*Entry) = .empty,
 
         fn hash_key(k: Key) u64 {
             var h = std.hash.Wyhash.init(0x5a17_c0de);
@@ -465,7 +584,10 @@ fn FrameCache(comptime V: type) type {
         /// Finds `k` in the current frame, or moves it from the previous frame into the current one.
         fn take(self: *Self, allocator: Allocator, h: u64, k: Key) !?*Entry {
             if (self.current.get(h)) |e| {
-                if (matches(e, k)) return e;
+                if (matches(e, k)) {
+                    try self.current_used.append(allocator, e);
+                    return e;
+                }
             }
             if (self.previous.get(h)) |e| {
                 if (matches(e, k)) {
@@ -477,7 +599,25 @@ fn FrameCache(comptime V: type) type {
             return null;
         }
 
+        /// Keeps the entries that `start..end` of the previous frame used alive for another frame
+        /// (GPUI `reuse_layouts`). They are live: entries are only freed when a frame finishes.
+        fn reuse(self: *Self, allocator: Allocator, start: usize, end: usize) !void {
+            for (self.previous_used.items[start..end]) |e| {
+                if (self.previous.get(e.hash) == e) {
+                    _ = self.previous.remove(e.hash);
+                    try self.insert(allocator, e);
+                } else if (std.mem.indexOfScalar(*Entry, self.previous_extra.items, e)) |i| {
+                    _ = self.previous_extra.swapRemove(i);
+                    try self.insert(allocator, e);
+                } else {
+                    // Already moved over, by this list or by a request in the current frame.
+                    try self.current_used.append(allocator, e);
+                }
+            }
+        }
+
         fn insert(self: *Self, allocator: Allocator, e: *Entry) !void {
+            try self.current_used.append(allocator, e);
             if (self.current.contains(e.hash)) {
                 try self.current_extra.append(allocator, e);
             } else {
@@ -495,6 +635,8 @@ fn FrameCache(comptime V: type) type {
 
             std.mem.swap(std.AutoHashMapUnmanaged(u64, *Entry), &self.previous, &self.current);
             std.mem.swap(std.ArrayList(*Entry), &self.previous_extra, &self.current_extra);
+            self.previous_used.clearRetainingCapacity();
+            std.mem.swap(std.ArrayList(*Entry), &self.previous_used, &self.current_used);
         }
 
         fn destroy(allocator: Allocator, e: *Entry) void {
@@ -514,9 +656,17 @@ fn FrameCache(comptime V: type) type {
             self.previous.deinit(allocator);
             self.current_extra.deinit(allocator);
             self.previous_extra.deinit(allocator);
+            self.current_used.deinit(allocator);
+            self.previous_used.deinit(allocator);
         }
     };
 }
+
+/// A position in the layouts used by the frame being drawn (GPUI `LineLayoutIndex`).
+pub const LineLayoutIndex = struct {
+    lines_index: usize = 0,
+    wrapped_lines_index: usize = 0,
+};
 
 /// Shapes lines of text and caches the results across frames (GPUI `LineLayoutCache`).
 pub const LineLayoutCache = struct {
@@ -601,10 +751,29 @@ pub const LineLayoutCache = struct {
             .runs = owned_runs,
             .wrap_width = wrap_width,
             .force_width = null,
-            .value = .{ .unwrapped_layout = unwrapped, .wrap_boundaries = boundaries, .wrap_width = wrap_width, .text = owned_text },
+            .value = .{ .unwrapped_layout = unwrapped, .boundaries = boundaries, .wrap_width = wrap_width, .text = owned_text },
         };
         try self.wrapped.insert(self.allocator, e);
         return &e.value;
+    }
+
+    /// How many layouts the frame being drawn has asked for so far (GPUI `layout_index`).
+    pub fn layout_index(self: *const LineLayoutCache) LineLayoutIndex {
+        return .{ .lines_index = self.lines.current_used.items.len, .wrapped_lines_index = self.wrapped.current_used.items.len };
+    }
+
+    /// Carries the layouts that `start..end` of the previous frame used into this one, because the
+    /// view that used them is being reused without laying them out again (GPUI `reuse_layouts`).
+    pub fn reuse_layouts(self: *LineLayoutCache, start: LineLayoutIndex, end: LineLayoutIndex) !void {
+        try self.lines.reuse(self.allocator, start.lines_index, end.lines_index);
+        try self.wrapped.reuse(self.allocator, start.wrapped_lines_index, end.wrapped_lines_index);
+    }
+
+    /// Forgets the layouts asked for since `index`, which a failed `Window.transact` rolled back
+    /// (GPUI `truncate_layouts`). They stay cached, and are freed as usual if nothing asks again.
+    pub fn truncate_layouts(self: *LineLayoutCache, index: LineLayoutIndex) void {
+        self.lines.current_used.shrinkRetainingCapacity(index.lines_index);
+        self.wrapped.current_used.shrinkRetainingCapacity(index.wrapped_lines_index);
     }
 
     /// Ends the frame: frees layouts unused since the previous frame and rotates the caches.
@@ -639,6 +808,51 @@ fn free_test_layout(layout: *LineLayout) void {
 fn glyph_x_positions(layout: *const LineLayout, out: []f32) []f32 {
     for (layout.runs[0].glyphs, 0..) |g, i| out[i] = g.position.x;
     return out[0..layout.runs[0].glyphs.len];
+}
+
+const FakeShaper = struct {
+    fn shape(_: *anyopaque, allocator: Allocator, text: []const u8, font_size: Pixels, _: []const FontRun, _: ?Pixels) anyerror!LineLayout {
+        return .{ .font_size = font_size, .width = 0, .ascent = 0, .descent = 0, .runs = try allocator.alloc(ShapedRun, 0), .len = text.len };
+    }
+};
+
+test "reuse_layouts keeps a skipped view's layouts alive, and only those" {
+    var dummy: u8 = 0;
+    var cache = LineLayoutCache.init(testing.allocator, .{ .ctx = &dummy, .shape_fn = FakeShaper.shape });
+    defer cache.deinit();
+
+    // Frame 1: "a" is in the range of a cached view, "b" is not.
+    const start = cache.layout_index();
+    const a = try cache.layout_line("a", 16, &.{}, null);
+    const end = cache.layout_index();
+    try testing.expectEqual(@as(usize, 1), end.lines_index - start.lines_index);
+    _ = try cache.layout_line("b", 16, &.{}, null);
+    cache.finish_frame();
+
+    // Many frames that lay nothing out but reuse the range.
+    var from = start;
+    var to = end;
+    for (0..4) |_| {
+        const next_start = cache.layout_index();
+        try cache.reuse_layouts(from, to);
+        from = next_start;
+        to = cache.layout_index();
+        cache.finish_frame();
+    }
+    try testing.expect(cache.lines.previous.count() == 1);
+    try testing.expectEqualStrings("a", a.text);
+    // The same entry comes back, so it was never shaped again.
+    try testing.expectEqual(a, try cache.layout_line("a", 16, &.{}, null));
+}
+
+test "truncate_layouts forgets what a failed transaction asked for" {
+    var dummy: u8 = 0;
+    var cache = LineLayoutCache.init(testing.allocator, .{ .ctx = &dummy, .shape_fn = FakeShaper.shape });
+    defer cache.deinit();
+    const index = cache.layout_index();
+    _ = try cache.layout_line("a", 16, &.{}, null);
+    cache.truncate_layouts(index);
+    try testing.expectEqual(index.lines_index, cache.layout_index().lines_index);
 }
 
 test "wrap preserves shaped clusters" {
@@ -806,4 +1020,153 @@ test "wrapped cache keeps its unwrapped layout alive" {
     cache.finish_frame();
     try testing.expectEqual(@as(f32, 48), w2.unwrapped_layout.width);
     cache.finish_frame();
+}
+
+/// The number of leading glyphs whose index is below `byte_index`, found by binary search as Rust's
+/// `slice::partition_point` does. The search is part of the contract when the glyphs are not in order.
+fn partition_point_glyphs(glyphs: []const ShapedGlyph, byte_index: usize) usize {
+    if (glyphs.len == 0) return 0;
+    var size = glyphs.len;
+    var base: usize = 0;
+    while (size > 1) {
+        const half = size / 2;
+        const mid = base + half;
+        if (glyphs[mid].index < byte_index) base = mid;
+        size -= half;
+    }
+    return base + @intFromBool(glyphs[base].index < byte_index);
+}
+
+/// Frees the runs of a layout returned by `split_at`.
+fn free_split_pieces(left: LineLayout, right: LineLayout) void {
+    for (left.runs) |run| testing.allocator.free(run.glyphs);
+    testing.allocator.free(left.runs);
+    for (right.runs) |run| testing.allocator.free(run.glyphs);
+    testing.allocator.free(right.runs);
+}
+
+/// Frees a layout built by `make_split_layout`.
+fn free_split_layout(layout: *LineLayout) void {
+    for (layout.runs) |run| testing.allocator.free(run.glyphs);
+    testing.allocator.free(layout.runs);
+}
+
+/// Two runs over "abcdef" with glyph ids `index * 10`: run 0 (font 0) holds bytes 0..3 at x 0, 10, 20;
+/// run 1 (font 1) holds bytes 3..6 at x 30, 40, 50.
+fn make_split_layout() !LineLayout {
+    const runs = try testing.allocator.alloc(ShapedRun, 2);
+    const a = try testing.allocator.alloc(ShapedGlyph, 3);
+    const b = try testing.allocator.alloc(ShapedGlyph, 3);
+    for (a, 0..) |*g, i| g.* = .{ .id = @intCast(i * 10), .position = .{ .x = @as(f32, @floatFromInt(i)) * 10, .y = 0 }, .index = i, .is_emoji = false };
+    for (b, 0..) |*g, i| g.* = .{ .id = @intCast((i + 3) * 10), .position = .{ .x = 30 + @as(f32, @floatFromInt(i)) * 10, .y = 0 }, .index = i + 3, .is_emoji = false };
+    runs[0] = .{ .font_id = 0, .glyphs = a };
+    runs[1] = .{ .font_id = 1, .glyphs = b };
+    return .{ .font_size = 16, .width = 60, .ascent = 12, .descent = 4, .runs = runs, .len = 6 };
+}
+
+/// The glyph ids of every run of `layout`, in run order, written to `buf`.
+fn collect_glyph_ids(layout: *const LineLayout, buf: []GlyphId) []GlyphId {
+    var n: usize = 0;
+    for (layout.runs) |run| for (run.glyphs) |g| {
+        buf[n] = g.id;
+        n += 1;
+    };
+    return buf[0..n];
+}
+
+test "split_at keeps every glyph at every boundary, with widths and lengths adding up" {
+    var layout = try make_split_layout();
+    defer free_split_layout(&layout);
+    var all_buf: [6]GlyphId = undefined;
+    const all = collect_glyph_ids(&layout, &all_buf);
+    for (0..layout.len + 1) |i| {
+        const left, const right = try layout.split_at(testing.allocator, i);
+        defer free_split_pieces(left, right);
+        try testing.expectEqual(layout.len, left.len + right.len);
+        try testing.expectApproxEqAbs(layout.width, left.width + right.width, 0.0001);
+        try testing.expectEqual(layout.font_size, left.font_size);
+        try testing.expectEqual(layout.ascent, right.ascent);
+        try testing.expectEqual(layout.descent, left.descent);
+
+        // Every glyph lands in exactly one half, in order, with its id intact.
+        var left_buf: [6]GlyphId = undefined;
+        var right_buf: [6]GlyphId = undefined;
+        const lg = collect_glyph_ids(&left, &left_buf);
+        const rg = collect_glyph_ids(&right, &right_buf);
+        var joined: [6]GlyphId = undefined;
+        @memcpy(joined[0..lg.len], lg);
+        @memcpy(joined[lg.len .. lg.len + rg.len], rg);
+        try testing.expectEqualSlices(GlyphId, all, joined[0 .. lg.len + rg.len]);
+
+        // The suffix starts at x = 0 and its byte indices are rebased; the prefix ends at the split.
+        const x_offset = layout.x_for_index(i);
+        try testing.expectApproxEqAbs(x_offset, left.width, 0.0001);
+        for (right.runs) |run| for (run.glyphs) |g| {
+            try testing.expect(g.index < right.len);
+            try testing.expectApproxEqAbs(layout.x_for_index(g.index + i) - x_offset, g.position.x, 0.0001);
+        };
+        for (left.runs) |run| for (run.glyphs) |g| try testing.expect(g.index < left.len);
+    }
+}
+
+test "split_at inside a run and at the run boundary" {
+    var layout = try make_split_layout();
+    defer free_split_layout(&layout);
+
+    // Boundary 3 falls between the runs: the prefix is run 0 alone, the suffix run 1 alone.
+    const left, const right = try layout.split_at(testing.allocator, 3);
+    defer free_split_pieces(left, right);
+    try testing.expectEqual(@as(usize, 1), left.runs.len);
+    try testing.expectEqual(@as(usize, 1), right.runs.len);
+    try testing.expectEqual(@as(FontId, 1), right.runs[0].font_id);
+    try testing.expectEqual(@as(f32, 0), right.runs[0].glyphs[0].position.x);
+    try testing.expectEqual(@as(usize, 0), right.runs[0].glyphs[0].index);
+    try testing.expectEqual(@as(f32, 30), left.width);
+
+    // Boundary 2 cuts run 0 in two: its last glyph (x=20) starts the suffix, and run 1 follows it there.
+    const l2, const r2 = try layout.split_at(testing.allocator, 2);
+    defer free_split_pieces(l2, r2);
+    try testing.expectEqual(@as(usize, 1), l2.runs.len);
+    try testing.expectEqual(@as(usize, 2), r2.runs.len);
+    try testing.expectEqual(@as(usize, 1), r2.runs[0].glyphs.len);
+    try testing.expectEqual(@as(usize, 0), r2.runs[0].glyphs[0].index);
+    try testing.expectEqual(@as(f32, 0), r2.runs[0].glyphs[0].position.x);
+    try testing.expectEqual(@as(usize, 1), r2.runs[1].glyphs[0].index);
+    try testing.expectEqual(@as(f32, 10), r2.runs[1].glyphs[0].position.x);
+    try testing.expectEqual(@as(f32, 20), l2.width);
+}
+
+test "split_at with multi-byte characters and an emoji" {
+    // "aé😀b": 'a' at 0, 'é' at 1..3, '😀' at 3..7 (4 bytes), 'b' at 7. One glyph per cluster.
+    const glyphs = try testing.allocator.dupe(ShapedGlyph, &.{
+        glyph_at(0, 0),
+        glyph_at(8, 1),
+        .{ .id = 7, .position = .{ .x = 16, .y = 0 }, .index = 3, .is_emoji = true },
+        glyph_at(32, 7),
+    });
+    const runs = try testing.allocator.alloc(ShapedRun, 1);
+    runs[0] = .{ .font_id = 0, .glyphs = glyphs };
+    var layout: LineLayout = .{ .font_size = 16, .width = 40, .ascent = 12, .descent = 4, .runs = runs, .len = 8 };
+    defer free_split_layout(&layout);
+
+    for ([_]usize{ 0, 1, 3, 7, 8 }) |i| {
+        const left, const right = try layout.split_at(testing.allocator, i);
+        defer free_split_pieces(left, right);
+        try testing.expectEqual(@as(usize, 8), left.len + right.len);
+        try testing.expectApproxEqAbs(@as(f32, 40), left.width + right.width, 0.0001);
+        var n: usize = 0;
+        for (left.runs) |run| n += run.glyphs.len;
+        for (right.runs) |run| n += run.glyphs.len;
+        try testing.expectEqual(@as(usize, 4), n);
+    }
+
+    // Split before 'b': the emoji stays on the left with its flag, and 'b' starts the suffix at x = 0.
+    const left, const right = try layout.split_at(testing.allocator, 7);
+    defer free_split_pieces(left, right);
+    try testing.expectEqual(@as(usize, 7), left.len);
+    try testing.expect(left.runs[0].glyphs[2].is_emoji);
+    try testing.expectEqual(@as(usize, 0), right.runs[0].glyphs[0].index);
+    try testing.expectEqual(@as(f32, 0), right.runs[0].glyphs[0].position.x);
+    try testing.expectEqual(@as(f32, 32), left.width);
+    try testing.expectEqual(@as(f32, 8), right.width);
 }
