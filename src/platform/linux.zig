@@ -709,7 +709,11 @@ fn connect_initially(self: *LinuxPlatform) void {
         .headless => return,
         .windowed => |environment| {
             if (!names_allowed_server(self.allowed_modes, environment)) {
-                if (self.allowed_modes.headless) return;
+                if (self.allowed_modes.headless) {
+                    // Otherwise an app started with no display just sits there, with no window and no word why.
+                    std.log.warn("linux: no display server named; running headless until the app asks for one", .{});
+                    return;
+                }
                 std.debug.panic("{any} does not allow headless mode, and no allowed display server was given", .{self.allowed_modes});
             }
             const next = connect_any(self, environment) catch |err| {

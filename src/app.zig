@@ -1267,12 +1267,6 @@ pub const App = struct {
         };
         platform.set_callbacks(.{
             .ctx = app,
-            .displays_changed = struct {
-                fn f(ctx: *anyopaque) void {
-                    const self: *App = @ptrCast(@alignCast(ctx));
-                    self.displays_changed();
-                }
-            }.f,
             .keyboard_layout_changed = struct {
                 fn f(ctx: *anyopaque) void {
                     const self: *App = @ptrCast(@alignCast(ctx));
@@ -1280,6 +1274,31 @@ pub const App = struct {
                 }
             }.f,
         });
+        // GPUI's `App::new` registers displays and the app menu callbacks the same way.
+        platform.on_displays_changed(.{ .ctx = app, .func = struct {
+            fn f(ctx: *anyopaque) void {
+                const self: *App = @ptrCast(@alignCast(ctx));
+                self.displays_changed();
+            }
+        }.f });
+        platform.on_will_open_app_menu(.{ .ctx = app, .func = struct {
+            fn f(ctx: *anyopaque) void {
+                const self: *App = @ptrCast(@alignCast(ctx));
+                self.clear_pending_keystrokes();
+            }
+        }.f });
+        platform.on_validate_app_menu_command(.{ .ctx = app, .func = struct {
+            fn f(ctx: *anyopaque, action: action_mod.AnyAction) bool {
+                const self: *App = @ptrCast(@alignCast(ctx));
+                return self.is_action_type_available(action.type_id);
+            }
+        }.f });
+        platform.on_app_menu_action(.{ .ctx = app, .func = struct {
+            fn f(ctx: *anyopaque, action: action_mod.AnyAction) void {
+                const self: *App = @ptrCast(@alignCast(ctx));
+                self.dispatch_any_action(action);
+            }
+        }.f });
         app.read_display_snapshot() catch oom();
         return app;
     }
@@ -1287,7 +1306,7 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         self.shutdown();
         // The platform must not call back into an app that is going away.
-        self.platform.callbacks = null;
+        self.platform.clear_app_listeners();
         if (self.pending_windowing) |pending| pending.request.deinit();
         self.pending_windowing = null;
         self.display_snapshot.deinit(self.allocator);
@@ -2775,10 +2794,35 @@ pub const App = struct {
         }
     }
 
-    pub fn is_action_available(self: *App, comptime A: type) bool {
-        for (self.global_action_listeners.items) |l| if (l.action_type == type_id(A)) return true;
-        if (self.active_window()) |w| return w.is_action_available(type_id(A));
+    /// Dispatches an action that is already boxed, to the active window's focus path, then globally.
+    /// Platforms pass menu picks this way (GPUI `dispatch_action` on a `&dyn Action`).
+    pub fn dispatch_any_action(self: *App, action: action_mod.AnyAction) void {
+        if (self.active_window()) |w| {
+            w.dispatch_action(action, self);
+        } else {
+            self.dispatch_global_action(action);
+        }
+    }
+
+    /// Whether an action of this type is bound now, as GPUI's `is_action_available` decides it
+    /// (global listeners, then the active window's focus path). Used for menu validation.
+    pub fn is_action_type_available(self: *App, tid: TypeId) bool {
+        for (self.global_action_listeners.items) |l| if (l.action_type == tid) return true;
+        if (self.active_window()) |w| return w.is_action_available(tid);
         return false;
+    }
+
+    /// Clears the multi-stroke keystrokes pending in every window (GPUI `clear_pending_keystrokes`).
+    /// Runs when an application menu opens, so a half-typed sequence does not outlive it.
+    pub fn clear_pending_keystrokes(self: *App) void {
+        for (self.windows.items) |maybe_win| {
+            const win = maybe_win orelse continue;
+            win.clear_pending_keystrokes();
+        }
+    }
+
+    pub fn is_action_available(self: *App, comptime A: type) bool {
+        return self.is_action_type_available(type_id(A));
     }
 };
 

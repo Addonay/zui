@@ -209,7 +209,17 @@ Each must run headless with a correct snapshot, and be driven for real: first fr
 
 ## Performance (after API parity)
 
-- [ ] Compare view caching with GPUI in a release build. So far only Debug: 128 ms uncached, 4.7 ms cached, for 20 views of 60 rows
+- On hold: the owner wants the API finished first, with naive implementations, and performance after.
+- Benchmark: `zig build run-frame_bench -Doptimize=ReleaseFast -j1`, isolated. It times `Window.draw` on the headless
+  platform, so no renderer or display counts. On a Ryzen 5 5625U, 2026-11-07, median per frame:
+  20 views of 60 rows 10.6 ms uncached, 0.72 ms cached with none dirty, 1.5 ms cached with one dirty; 10k quads 36 ms; 2000 lines 5.8 ms.
+- Profile: `perf` needs a kernel setting, so use callgrind. Build with `-Dcpu=x86_64`, because valgrind rejects native instructions, and pass
+  `--toggle-collect='window.Window.draw'`, or font startup swamps it. Before the first fixes, of instructions in `draw`:
+  `BoundsTree.insert` about 20%, `memcpy` 13% (`compute_style` 3%, element building 2%), layout in zafi most of the rest. Re-profile: the fixes below changed this.
+  - Done: tree nodes are no longer copied while searching, and their indices are u32. An element refines its base style once, and paint recomputes style only if it has hover or drag styles.
+- [ ] Find what still costs in `BoundsTree.insert`, and why `10k quads` costs about 3.6 us per element
+- [ ] `Interactivity` and `Style` are large and copied per element: size them, and shrink what is usually empty
+- [ ] Compare view caching with GPUI in a release build. GPUI itself has not been built here
 - [ ] Run a cached view on a real Wayland and X11 window; no example uses `cached` yet
 - [ ] Tooltip and throttled animation timers refresh the whole window, because no view is current in a timer. They could remember theirs
 - [ ] Avoid full layout when nothing changed

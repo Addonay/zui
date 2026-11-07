@@ -95,6 +95,7 @@ pub const PlatformAtlas = struct {
     pub const VTable = struct {
         get_or_insert_with: *const fn (ptr: *anyopaque, key: AtlasKey, build: TileBuilder) anyerror!?AtlasTile,
         remove: *const fn (ptr: *anyopaque, key: AtlasKey) void,
+        contains: *const fn (ptr: *anyopaque, key: AtlasKey) bool,
     };
 
     /// Returns the cached tile for `key`, or builds and inserts it.
@@ -104,6 +105,11 @@ pub const PlatformAtlas = struct {
 
     pub fn remove(self: PlatformAtlas, key: AtlasKey) void {
         self.vtable.remove(self.ptr, key);
+    }
+
+    /// Whether a tile is cached under `key` (GPUI `PlatformAtlas::contains`). Does not build one.
+    pub fn contains(self: PlatformAtlas, key: AtlasKey) bool {
+        return self.vtable.contains(self.ptr, key);
     }
 };
 
@@ -223,6 +229,11 @@ pub const CpuAtlas = struct {
         const tile = try self.insert(key.texture_kind(), data.size, data.bytes);
         try self.tiles_by_key.put(self.allocator, key, tile);
         return tile;
+    }
+
+    /// Whether a tile is cached under `key`. Does not build one (GPUI `PlatformAtlas::contains`).
+    pub fn contains(self: *const CpuAtlas, key: AtlasKey) bool {
+        return self.tiles_by_key.contains(key);
     }
 
     /// Removes the tile cached under `key`, freeing its texture if it was the last tile.
@@ -349,6 +360,12 @@ pub const CpuAtlas = struct {
             fn call(ptr: *anyopaque, key: AtlasKey) void {
                 const atlas: *CpuAtlas = @ptrCast(@alignCast(ptr));
                 atlas.remove(key);
+            }
+        }.call,
+        .contains = struct {
+            fn call(ptr: *anyopaque, key: AtlasKey) bool {
+                const atlas: *CpuAtlas = @ptrCast(@alignCast(ptr));
+                return atlas.contains(key);
             }
         }.call,
     };

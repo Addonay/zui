@@ -36,6 +36,7 @@ const examples = [_][]const u8{
     "mouse_pressure",
     "set_menus",
     "paths_bench",
+    "frame_bench",
     "system_notifications",
     "testing",
     "window",

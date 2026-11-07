@@ -357,13 +357,15 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   - A process still running at its timeout proves nothing: check for frames and protocol errors.
     Send output to a file, since pipes can lose it when `timeout` kills the job. `xdotool
     windowclose` destroys the window under the app, which logs harmless X11 protocol errors.
+- **Frame benchmark**: `examples/frame_bench.zig` (not a GPUI example) times `Window.draw` headless. See Performance in `todo.md` for numbers and how to profile.
 - **Headless snapshots**: `ZUI_HEADLESS=1 ZUI_SNAPSHOT=out.ppm zig build run-<example>`.
   `ZUI_SCALE=2` sets the headless scale factor.
 
 ## 8. Known gaps / next steps
 
-See `todo.md`. In order: finish the API, then performance against GPUI (view caching and benchmarks first), and the
-other platforms when the owner asks.
+See `todo.md`. In order: finish the API, with naive implementations where that is quicker, then performance against GPUI
+(the owner asked for this order on 2026-11-07), and the other platforms when the owner asks. Whatever is left naive goes in
+`todo.md` under Performance, and is said in a doc comment where it is written.
 
 ## 9. Zig 0.17 gotchas met during the port
 

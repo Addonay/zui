@@ -3871,8 +3871,15 @@ pub const Interactivity = struct {
 
     /// The style for this frame: base refined by focus/hover/active states (GPUI `compute_style`).
     pub fn compute_style(self: *const Interactivity, hitbox: ?*const Hitbox, state: ?*const InteractiveElementState, window: *Window, cx: *App) Style {
-        var s: Style = .{};
-        s.refine(&self.base_style);
+        var base: Style = .{};
+        base.refine(&self.base_style);
+        return self.compute_style_from(&base, hitbox, state, window, cx);
+    }
+
+    /// `compute_style` from `base`, which is this element's `base_style` over the defaults. An element
+    /// asks for its style in layout, prepaint and paint, so it refines its base only once.
+    pub fn compute_style_from(self: *const Interactivity, base: *const Style, hitbox: ?*const Hitbox, state: ?*const InteractiveElementState, window: *Window, cx: *App) Style {
+        var s = base.*;
         if (self.tracked_focus_handle) |h| {
             if (self.in_focus_style) |r| if (h.within_focused(window, cx)) s.refine(r);
             if (self.focus_style) |r| if (h.is_focused(window)) s.refine(r);
@@ -3930,6 +3937,8 @@ pub const Interactivity = struct {
 /// The per-frame state between layout, prepaint and paint.
 pub const DivFrameState = struct {
     child_layout_ids: []LayoutId = &.{},
+    /// `base_style` over the defaults, before an element's own hook changed it.
+    base_style: Style = .{},
 };
 
 pub const DivPrepaintState = struct {
@@ -4439,6 +4448,7 @@ pub fn StyledElement(comptime Ext: type) type {
         pub fn request_layout(self: *Self, gid: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, DivFrameState } {
             var s: Style = .{};
             s.refine(&self.interactivity.base_style);
+            const base_style = s;
             const has_text = s.text_style() != null;
             if (has_text) window.push_text_style(s.text);
             defer if (has_text) window.pop_text_style();
@@ -4451,11 +4461,11 @@ pub fn StyledElement(comptime Ext: type) type {
             defer if (pushed_cache) window.pop_image_cache();
 
             if (@hasDecl(Ext, "request_layout_ext")) {
-                if (Ext.request_layout_ext(self, gid, &s, window, cx)) |lid| return .{ lid, .{} };
+                if (Ext.request_layout_ext(self, gid, &s, window, cx)) |lid| return .{ lid, .{ .base_style = base_style } };
             }
             const ids = arena().alloc(LayoutId, self.children_list.items.len) catch oom();
             for (self.children_list.items, 0..) |c, i| ids[i] = c.request_layout(window, cx);
-            return .{ window.request_layout(&s, ids, cx), .{ .child_layout_ids = ids } };
+            return .{ window.request_layout(&s, ids, cx), .{ .child_layout_ids = ids, .base_style = base_style } };
         }
 
         pub fn prepaint(self: *Self, gid: ?*const GlobalElementId, bounds: Bounds(Pixels), rl: *DivFrameState, window: *Window, cx: *App) DivPrepaintState {
@@ -4516,7 +4526,7 @@ pub fn StyledElement(comptime Ext: type) type {
 
             // Without the hitbox: what is hovered is only known once prepaint has finished. Paint
             // computes it again with the hitbox, as GPUI does.
-            pp.style = it.compute_style(null, pp.state, window, cx);
+            pp.style = it.compute_style_from(&rl.base_style, null, pp.state, window, cx);
             const s = &pp.style;
 
             const has_text = s.text_style() != null;
@@ -4580,8 +4590,10 @@ pub fn StyledElement(comptime Ext: type) type {
 
         pub fn paint(self: *Self, gid: ?*const GlobalElementId, bounds: Bounds(Pixels), rl: *DivFrameState, pp: *DivPrepaintState, window: *Window, cx: *App) void {
             _ = gid;
-            _ = rl;
-            pp.style = self.interactivity.compute_style(if (pp.hitbox) |*hbx| hbx else null, pp.state, window, cx);
+            // Only these depend on the hit test, which prepaint could not know.
+            const hover_dependent = self.interactivity.hover_style != null or self.interactivity.group_hover_style != null or
+                self.interactivity.drag_over_styles.items.len > 0 or self.interactivity.group_drag_over_styles.items.len > 0;
+            if (hover_dependent) pp.style = self.interactivity.compute_style_from(&rl.base_style, if (pp.hitbox) |*hbx| hbx else null, pp.state, window, cx);
             const s = &pp.style;
             if (s.visibility == .hidden) return;
             const it = &self.interactivity;
