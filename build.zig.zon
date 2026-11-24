@@ -15,8 +15,8 @@
             .lazy = true,
         },
         .zafi = .{
-            .url = "git+https://github.com/Addonay/zafi.git#04086f7a21f120a5ea52f921fb2034d75e10264f",
-            .hash = "zafi-0.4.1-gvFdNm2TFABhWk0z8IvfPUm8cq1RoQ_mztSiQ5IoZyyr",
+            .url = "git+https://github.com/Addonay/zafi#4ea7e55534f89cb546465098f69496a6dd752729",
+            .hash = "zafi-0.4.2-gvFdNiW2FAAeXtvAqheJ5BoaLTt1r1GsAKtqJz9tTFYI",
         },
     },
     .paths = .{

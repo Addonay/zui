@@ -1,5 +1,7 @@
 # Root reference checkouts are reconstructed by tools/fetch-references.sh.
 /.references/
+/.ref/
+/.claude/
 
 # Reference checkouts and local build products inside ports are never source.
 /.ports/**/.reference/
