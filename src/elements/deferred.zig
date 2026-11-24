@@ -40,7 +40,7 @@ pub const Deferred = struct {
     pub fn prepaint(self: *Deferred, _: ?*const GlobalElementId, _: Bounds(Pixels), _: *void, window: *Window, _: *App) void {
         const child = self.child orelse unreachable;
         self.child = null;
-        window.defer_draw(child, window.element_offset(), self.priority_value);
+        window.defer_draw(child, window.element_offset(), self.priority_value, null);
     }
 
     pub fn paint(_: *Deferred, _: ?*const GlobalElementId, _: Bounds(Pixels), _: *void, _: *void, _: *Window, _: *App) void {}
@@ -187,4 +187,53 @@ test "deferred: nested draws keep their focus and key ancestors after cache repl
     vcx.simulate_keystrokes("cmd-s");
     try std.testing.expectEqual(@as(usize, 2), panel.read(cx.app).saves);
     try std.testing.expectEqual(@as(usize, 2), panel.read(cx.app).field_saves);
+}
+
+test "deferred: content mask clips hitboxes during prepaint" {
+    const canvas_mod = @import("canvas.zig");
+    const MaskedOverlayView = struct {
+        clicks: usize = 0,
+
+        fn on_bg_click(self: *@This(), _: *const @import("../interactive.zig").MouseDownEvent, _: *Window, _: *app_mod.Context(@This())) void {
+            self.clicks += 1;
+        }
+
+        fn prepaint_overlay(_: void, b: Bounds(Pixels), window: *Window, cx: *App) void {
+            const overlay = element_mod.into_any_element(div_mod.div().size(200).occlude());
+            _ = overlay.layout_as_root(.{ .width = .min_content, .height = .min_content }, window, cx);
+            const mask: window_mod.ContentMask(Pixels) = .{
+                .bounds = .{ .origin = b.origin, .size = .{ .width = 100, .height = 200 } },
+            };
+            window.defer_draw(overlay, b.origin, 1, mask);
+        }
+
+        fn paint_overlay(_: void, _: Bounds(Pixels), _: *void, _: *Window, _: *App) void {}
+
+        pub fn render(_: *@This(), _: *Window, cx: *app_mod.Context(@This())) *div_mod.Div {
+            return div_mod.div()
+                .size_full()
+                .child(
+                    div_mod.div()
+                        .absolute()
+                        .size(200)
+                        .on_mouse_down(.left, cx.listener(on_bg_click)),
+                )
+                .child(canvas_mod.canvas({}, prepaint_overlay, paint_overlay).size_full());
+        }
+
+        fn build(_: *Window, app: *App) app_mod.Entity(@This()) {
+            return app.new(@This(){});
+        }
+    };
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(MaskedOverlayView.build);
+    vcx.run_until_parked();
+
+    vcx.simulate_click(.{ .x = 50, .y = 50 }, .{});
+    try std.testing.expectEqual(@as(usize, 0), view.read(cx.app).clicks);
+
+    vcx.simulate_click(.{ .x = 150, .y = 50 }, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.read(cx.app).clicks);
 }

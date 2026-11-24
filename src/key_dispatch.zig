@@ -879,3 +879,15 @@ test "dispatch_key: sequences, prefixes and replays" {
     const bound = try flush_dispatch(arena, &keymap, &.{key("a")}, none);
     try std.testing.expect(bound.len == 1 and bound[0].bindings.len == 1);
 }
+
+test "lazy tab stop order updates after inserting lower-index handle post-query" {
+    var b = Builder.init();
+    defer b.deinit();
+    const second = b.handle(1, true);
+    try testing.expectEqual(@as(?u64, second), b.tree.next_tab_stop(null, true));
+
+    const first = b.handle(0, true);
+    try testing.expectEqual(@as(?u64, first), b.tree.next_tab_stop(null, true));
+    try testing.expectEqual(@as(?u64, second), b.tree.next_tab_stop(first, true));
+    try testing.expectEqual(@as(?u64, second), b.tree.next_tab_stop(first, false));
+}

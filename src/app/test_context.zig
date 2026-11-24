@@ -209,6 +209,15 @@ pub const TestAppContext = struct {
     pub fn set_name(self: *TestAppContext, name: []const u8) void {
         self.app.name_ = name;
     }
+
+    /// Simulates the window moving to a display with a different scale factor, preserving logical
+    /// size (GPUI `TestAppContext::simulate_window_scale_factor_change`).
+    pub fn simulate_window_scale_factor_change(self: *TestAppContext, window: *Window, scale_factor: f32) void {
+        const hw = headless.HeadlessWindow.from(window.platform_window);
+        hw.scale = scale_factor;
+        window.platform_window.resize(hw.size);
+        self.run_until_parked();
+    }
 };
 
 /// A window-scoped test context that simulates platform input (GPUI `VisualTestContext`).
@@ -266,6 +275,12 @@ pub const VisualTestContext = struct {
     pub fn simulate_move(self: *VisualTestContext, origin: Point(Pixels)) void {
         headless.HeadlessWindow.from(self.window.platform_window).move_to(origin);
         self.cx.run_until_parked();
+    }
+
+    /// Simulates the window moving to a display with a different scale factor
+    /// (GPUI `VisualTestContext::simulate_scale_factor_change`).
+    pub fn simulate_scale_factor_change(self: *VisualTestContext, scale_factor: f32) void {
+        self.cx.simulate_window_scale_factor_change(self.window, scale_factor);
     }
 
     pub fn dispatch_action(self: *VisualTestContext, action: anytype) void {
@@ -1027,7 +1042,13 @@ test "img: a saved copy is replaced when the URL's content changed" {
     FakeHttp.served.store(0, .release);
     FakeHttp.released.store(true, .release);
     DiskCacheFixture.wait_served(vcx, 1);
-    const second = try cx.app.asset_cache.load_resource(.empty, .{ .uri = RemoteImageView.url });
+    var second = try cx.app.asset_cache.load_resource(.empty, .{ .uri = RemoteImageView.url });
+    var tries: usize = 0;
+    while (second.size(0).width != 2 and tries < 200) : (tries += 1) {
+        @import("../executor.zig").sleep_ns(5 * std.time.ns_per_ms);
+        vcx.run_until_parked();
+        second = try cx.app.asset_cache.load_resource(.empty, .{ .uri = RemoteImageView.url });
+    }
     try std.testing.expectEqual(@as(i32, 2), second.size(0).width);
 }
 
@@ -5940,4 +5961,22 @@ test "window background: set at creation, then changed, and read back" {
     window.set_background_appearance(.@"opaque");
     try std.testing.expectEqual(window_mod.WindowBackgroundAppearance.@"opaque", window.background_appearance());
     window.set_client_corner_radii(.{ .top_left = 8, .top_right = 8, .bottom_left = 8, .bottom_right = 8 });
+}
+
+test "simulate_window_scale_factor_change updates scale factor and preserves logical size" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(Counter.build);
+    vcx.simulate_resize(.{ .width = 640, .height = 480 });
+    try std.testing.expectEqual(@as(f32, 1), vcx.window.scale_factor());
+
+    vcx.simulate_scale_factor_change(2.5);
+    try std.testing.expectEqual(@as(f32, 2.5), vcx.window.scale_factor());
+    try std.testing.expectEqual(@as(Pixels, 640), vcx.window.viewport_size().width);
+    try std.testing.expectEqual(@as(Pixels, 480), vcx.window.viewport_size().height);
+
+    cx.simulate_window_scale_factor_change(vcx.window, 1.25);
+    try std.testing.expectEqual(@as(f32, 1.25), vcx.window.scale_factor());
+    try std.testing.expectEqual(@as(Pixels, 640), vcx.window.viewport_size().width);
+    try std.testing.expectEqual(@as(Pixels, 480), vcx.window.viewport_size().height);
 }

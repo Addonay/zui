@@ -168,15 +168,19 @@ const AnimationFrame = struct {
     animation_ix: usize,
     delta: f32,
     done: bool,
+    handed_off: bool = false,
 };
 
 /// Advances `state` to `now` and returns the normalized, un-eased progress.
 fn advance_animation(animations: []const Animation, state: *AnimationState, now: u64, synced_epoch: u64, reduce_motion: bool) AnimationFrame {
+    std.debug.assert(animations.len > 0);
     if (reduce_motion) {
         const last = animations.len - 1;
         return .{ .animation_ix = last, .delta = if (animations[last].oneshot) 1.0 else 0.0, .done = true };
     }
 
+    // The chain can be shorter than on the render that handed off to this index.
+    state.animation_ix = @min(state.animation_ix, animations.len - 1);
     const animation_ix = state.animation_ix;
     const animation = animations[animation_ix];
     // A synced animation reads the shared clock, reduced modulo its duration first so the f64
@@ -204,7 +208,12 @@ fn advance_animation(animations: []const Animation, state: *AnimationState, now:
             delta = @rem(delta, 1.0);
         }
     }
-    return .{ .animation_ix = animation_ix, .delta = delta, .done = done };
+    return .{
+        .animation_ix = animation_ix,
+        .delta = delta,
+        .done = done,
+        .handed_off = state.animation_ix != animation_ix,
+    };
 }
 
 /// An element animated by `animator(element, animation_index, eased_delta)` (GPUI `AnimationElement`).
@@ -233,8 +242,11 @@ pub fn AnimationElement(comptime E: type, comptime animator: anytype) type {
             self.element = null;
             const any = element_mod.into_any_element(animator(element, frame.animation_ix, eased));
             if (!frame.done) {
-                if (throttle_interval(self.animations[frame.animation_ix].max_fps)) |interval| {
-                    request_throttled_frame(window, cx, interval);
+                // A hand-off requests the next frame so the next animation's cap counts from its
+                // first render, as it does after mounting.
+                const interval = if (!frame.handed_off) throttle_interval(self.animations[frame.animation_ix].max_fps) else null;
+                if (interval) |ns| {
+                    request_throttled_frame(window, cx, ns);
                 } else {
                     window.request_animation_frame();
                 }
@@ -648,4 +660,66 @@ test "with_spring drives the element from its initial value and keeps animating"
     _, const vcx = cx.add_window_view(SpringTestView.build);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), test_spring_first orelse return error.TestExpectedEqual, 1e-6);
     try std.testing.expect(vcx.window.animation_requested);
+}
+
+test "chained animation hands off without previous stage max_fps cap" {
+    const chain = [_]Animation{
+        Animation.new(1_000).with_max_fps(0.5),
+        Animation.new(1_000).with_max_fps(2.0),
+    };
+    var state: AnimationState = .{ .start_ns = 0 };
+
+    const running = advance_animation(&chain, &state, 500, 0, false);
+    try std.testing.expect(!running.handed_off);
+    try std.testing.expect(!running.done);
+
+    const handoff = advance_animation(&chain, &state, 1_500, 0, false);
+    try std.testing.expectEqual(@as(usize, 0), handoff.animation_ix);
+    try std.testing.expectEqual(@as(usize, 1), state.animation_ix);
+    try std.testing.expect(handoff.handed_off);
+    try std.testing.expect(!handoff.done);
+
+    const CappedChainView = struct {
+        pub fn render(_: *@This(), _: *Window, _: *Context(@This())) *Div {
+            const c = [_]Animation{
+                Animation.new(1).with_max_fps(0.5),
+                Animation.new(60 * std.time.ns_per_s).with_max_fps(2.0),
+            };
+            return div_mod.div().size_full().child(
+                div_mod.div().id("capped-chain").w(geometry.px(10)).h(geometry.px(10)).with_animations("chain", &c, keep_div),
+            );
+        }
+        fn keep_div(element: *Div, _: usize, _: f32) *Div {
+            return element;
+        }
+        fn build(_: *Window, app: *App) app_mod.Entity(@This()) {
+            return app.new(@This(){});
+        }
+    };
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(CappedChainView.build);
+    // Let 1ns animation expire and redraw: hand-off must request an immediate animation frame,
+    // not wait on stage 0's 0.5 fps timer.
+    @import("../executor.zig").sleep_ns(2 * std.time.ns_per_ms);
+    vcx.window.throttled_frame_pending = false;
+    vcx.window.draw(cx.app);
+    try std.testing.expect(vcx.window.animation_requested);
+    try std.testing.expect(!vcx.window.throttled_frame_pending);
+}
+
+test "animation chain survives shrinking to fewer stages after a hand-off" {
+    const two = [_]Animation{ Animation.new(1_000), Animation.new(1_000) };
+    var state: AnimationState = .{ .start_ns = 0 };
+
+    const first = advance_animation(&two, &state, 1_500, 0, false);
+    try std.testing.expectEqual(@as(usize, 0), first.animation_ix);
+    try std.testing.expectEqual(@as(usize, 1), state.animation_ix);
+
+    const one = [_]Animation{Animation.new(1_000)};
+    const shrunk = advance_animation(&one, &state, 1_750, 0, false);
+    try std.testing.expectEqual(@as(usize, 0), shrunk.animation_ix);
+    try std.testing.expectEqual(@as(usize, 0), state.animation_ix);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), shrunk.delta, 1e-6);
+    try std.testing.expect(!shrunk.done);
 }
