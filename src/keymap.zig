@@ -267,8 +267,8 @@ pub const Keymap = struct {
         for (0..count) |n| {
             const ix = if (candidates) |c| c[n] else self.entries.items.len - 1 - n;
             const binding = &self.entries.items[ix];
-            const depth = binding_enabled(binding, contexts) orelse continue;
             const pending = binding.match_keystrokes(input) orelse continue;
+            const depth = binding_enabled(binding, contexts) orelse continue;
             if (pending) {
                 try pending_ix.append(allocator, ix);
             } else {
@@ -1188,6 +1188,25 @@ test "keymap: load reports invalid input" {
     const ok = try KeyBinding.load(arena.allocator(), "ctrl-k ctrl-s", any, "editor");
     try testing.expectEqual(@as(usize, 2), ok.keystrokes.len);
     try testing.expect(ok.context_predicate != null);
+}
+
+test "keymap: non-matching keystrokes skip context evaluation cleanly and matching keystrokes resolve" {
+    var keymap = Keymap.init(testing.allocator);
+    defer keymap.deinit();
+    try keymap.add_bindings(&.{
+        KeyBinding.new("ctrl-x", ActionAlpha{}, "Editor && mode==insert && !readonly"),
+        KeyBinding.new("ctrl-y", ActionBeta{}, "Editor && mode==insert"),
+    });
+
+    const found = try keymap.bindings_for_input(testing.allocator, &.{ks("ctrl-y")}, &.{kc("Editor mode=insert")});
+    defer free_result(testing.allocator, found);
+    try testing.expectEqual(@as(usize, 1), found.bindings.len);
+    try testing.expect(is_action(found.bindings[0], ActionBeta));
+
+    const none = try keymap.bindings_for_input(testing.allocator, &.{ks("ctrl-z")}, &.{kc("Editor mode=insert")});
+    defer free_result(testing.allocator, none);
+    try testing.expectEqual(@as(usize, 0), none.bindings.len);
+    try testing.expect(!none.pending);
 }
 
 fn box(action: anytype) AnyAction {
