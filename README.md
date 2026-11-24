@@ -57,7 +57,7 @@ Zig has no closures, traits or `async`, so a few things read differently:
 
 ## Installation
 
-ZUI 0.1.0 requires Zig 0.17.0 and supports Linux on Wayland and X11, with
+ZUI 0.1.0 requires Zig 0.17.1 and supports Linux on Wayland and X11, with
 Vulkan rendering and a CPU fallback.
 
 Add ZUI to an existing Zig project:

@@ -23,15 +23,15 @@ agent (or human) can pick the work up. Read it fully before changing code.
 3. Once API parity is ~99.99%, focus on **performance — beat GPUI**.
 4. Dependencies only where they make sense (C/C++/Zig), minimal; otherwise
    write the code.
-5. Workflow: all development on a **`dev`** branch via PRs (feature branch →
-   PR → merge into `dev`); eventually `dev` → `main`, where `main` should hold
-   **only source**: `src/`, `examples/`, build files, `third_party/`,
-   `LICENSE`, `README.md` (no docs folders, ports, plans, reports). This file
-   (`AGENTS.md`) is the explicit exception and must live on `main`.
+5. Workflow: merge feature branches into **`dev`** via PRs. For a release,
+   promote `src/`, `examples/`, `third_party/`, `build.zig`, `build.zig.zon`,
+   `LICENSE`, `NOTICE.md`, `README.md`, and `AGENTS.md` from `dev` to
+   **`main`** via a promotion PR. CI, trackers, and development files live on
+   `dev`. Tag releases from the promoted commit on `main`.
 6. Agent usage policy: use cheap subagents (Haiku) for most porting work and
    PRs; use a strong model (Opus) only occasionally for adversarial review.
    Don't review every turn — keep working.
-7. Toolchain: **Zig 0.17.0 stable**, never a dev build.
+7. Toolchain: **Zig 0.17.1 stable**, never a dev build.
 
 ## 2. Status
 
@@ -92,8 +92,7 @@ third_party/             Wuffs, nanosvg, images.c shim
 
 ## 4. Toolchain, dependencies and the container setup
 
-- Zig **0.17.0** stable: `https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz`
-  (installed at `~/tools/zig-x86_64-linux-0.17.0`, symlinked to `/usr/local/bin/zig`).
+- Zig **0.17.1** stable: `https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz`.
   Note: Zig 0.17 changed a lot vs older versions — see §9.
 - `build.zig.zon` dependencies:
   - `cozmic` — `git+https://github.com/Addonay/cozmic.git#bd7e29cf11b9db0c046647dd58d8c8622c9b8683`
