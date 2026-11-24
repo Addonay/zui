@@ -55,14 +55,30 @@ Zig has no closures, traits or `async`, so a few things read differently:
 - Element text: `gpui.format("...", .{...})` allocates in the frame arena.
 - Entities are released explicitly (`entity.release(cx)`); windows release their root view.
 
-## Building
+## Installation
 
-Requires Zig 0.17.0.
+ZUI 0.1.0 requires Zig 0.17.1 and supports Linux on Wayland and X11, with
+Vulkan rendering and a CPU fallback.
+
+Add ZUI to an existing Zig project:
+
+```sh
+zig fetch --save git+https://github.com/Addonay/zui.git#v0.1.0
+```
+
+Import the module in your `build.zig`, where `exe` is your executable:
+
+```zig
+const zui = b.dependency("zui", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("zui", zui.module("zui"));
+```
+
+## Building from source
 
 ```sh
 zig build test              # unit tests
 zig build run-hello_world   # run an example
-ZUI_HEADLESS=1 zig build run-hello_world
+ZUI_HEADLESS=1 ZUI_SNAPSHOT=hello.ppm zig build run-hello_world
 ```
 
 Dependencies: [cozmic](https://github.com/Addonay/cozmic) (text shaping and
