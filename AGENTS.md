@@ -221,9 +221,10 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   the dispatch-tree path to the focused node (capture then bubble), keybindings
   matched first via `key_dispatch.dispatch_key` (see multi-stroke bindings below); unhandled
   key-downs with `key_char` go to the platform input handler.
-- Key and action listeners are registered during **prepaint** (when the
-  element's dispatch node is pushed), not paint as in GPUI — `element.zig`
-  pushes/pops dispatch nodes around prepaint only.
+- Elements create their dispatch nodes during **prepaint**, where the built-in
+  elements register key and action listeners. `element.zig` reactivates the node
+  during paint so custom elements can register listeners there too. Deferred
+  draws restore their dispatch ancestry, element namespace, and rem size.
 - **Div paint order** matches GPUI: shadows → background → ext paint →
   children (in overflow mask, scroll-offset) → border on top.
 - **Layout**: zafi tree cleared per frame (like GPUI), styles converted to

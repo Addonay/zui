@@ -51,9 +51,6 @@ insert_pending, retain
 #### app/entity_map.rs (1)
 restore_accessed
 
-#### elements/list.rs (1)
-set_item_measurement_readiness
-
 #### platform/scap_screen_capture.rs (1)
 scap_screen_sources
 
@@ -89,16 +86,16 @@ Debug tooling: `DebugBelow`, `DebugFrameOverlayMode`, `DivInspectorState`, `Leak
 
 These exist, so the comparison counts them, but they do nothing yet.
 
-- [ ] `set_active_node` is not used by prepaint
 - [ ] `insets()` is always zero, so `fully_visible_bounds` equals the viewport
 - [ ] `KeyBinding.keystrokes` is still plain `Keystroke`, so `KeybindingKeystroke` does not affect bindings
 - [ ] `ActivationPolicy` is stored only; `on_reopen` never fires on Linux, as in GPUI
 - [ ] Long press: no platform emits it, so it has only run with simulated events
 - [ ] `last_input_was_touch` works, but raw touch events are not dispatched to elements
-- [ ] `transact` does not roll back dispatch-tree nodes or accessed element states, which GPUI's does
 
 ## Missing, needing real work
 
+- [ ] Failed prepaint transactions truncate the recorded state/entity accesses, but attempted
+      accesses still count toward element-state lifetime and window invalidation for that frame.
 - [ ] `refresh_interval` is whole milliseconds on X11, and has not been checked against a real monitor's rate. `inner_window_bounds` ignores tiling
 - [ ] A cancelled foreground task run through `run_pending` was seen leaking its `TaskState` (`executor.zig:154`) under the leak checker. Not chased, and not reproduced by a test yet
 - [ ] Multi-monitor: X11 has one display per RandR CRTC, unlike GPUI's one per X screen. Run on two virtual monitors: both reported, windows opened on each. Never run on real monitors, or with monitors changing while running
@@ -199,8 +196,8 @@ These exist, so the comparison counts them, but they do nothing yet.
 
 - [ ] Bug: Twemoji, a non-color font, rasterizes about 4.6x too big (76x72 for a heart at 16px). The cause is not
       isolated. `U+FE0E` handling skips faces named `*emoji*` to avoid it, which is a heuristic
-- [ ] `InteractiveText::tooltip`: needs the tooltip state machine extracted from `elements/div.zig`
-- [ ] GPUI's `LineWrapper` emergency-wrap and truncation tests, and `force width multiple combining marks`, not ported
+- [ ] Long-press tooltips on `InteractiveText`
+- [ ] Remaining GPUI `LineWrapper` truncation fixtures and `force width multiple combining marks`
 - [ ] cozmic `-Dsystem-libs` builds have no COLRv1, since hb-raster is a separate shared library
 
 ## Examples still to port

@@ -2,9 +2,7 @@
 //! rendered on demand and their measured heights are cached, so only the visible range plus
 //! overdraw is laid out. Keep a `ListState` on your view and pass it to `list` each frame.
 //!
-//! Divergences from GPUI: heights live in a Fenwick tree instead of a sum tree, every item is
-//! treated as ready (no `set_item_measurement_readiness`), and autoscroll requests are not
-//! honored because the window has no autoscroll channel yet.
+//! Item heights are indexed by a Fenwick tree.
 
 const std = @import("std");
 const geometry = @import("../geometry.zig");
@@ -66,6 +64,17 @@ pub const ListScrollEvent = struct {
 pub const ScrollHandler = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, event: *const ListScrollEvent, window: *Window, cx: *App) void,
+};
+
+/// Predicate used by `ListState.set_item_measurement_readiness` to say whether an item's measured
+/// size is stable. Unready sizes remain as hints and are measured again on later layouts.
+pub const ItemMeasurementReadiness = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, index: usize, cx: *const App) bool,
+
+    pub fn call(self: ItemMeasurementReadiness, index: usize, cx: *const App) bool {
+        return self.func(self.ctx, index, cx);
+    }
 };
 
 /// Renders the item at an index into the frame arena (GPUI `render_item`).
@@ -134,6 +143,8 @@ const PendingScroll = union(enum) {
 const ScrollAnchor = struct {
     position: ListOffset,
     pending: ?PendingScroll = null,
+    provisional: bool = false,
+    pending_end: bool = false,
 };
 
 const FollowState = enum {
@@ -255,6 +266,7 @@ const StateInner = struct {
     overdraw: Pixels,
     reset: bool = false,
     scroll_handler: ?ScrollHandler = null,
+    item_measurement_readiness: ?ItemMeasurementReadiness = null,
     measuring_behavior: ListMeasuringBehavior = .visible,
     follow_state: FollowState = .normal,
     /// Content height when a scrollbar drag began; null when no drag is in progress.
@@ -262,6 +274,11 @@ const StateInner = struct {
 
     fn count(self: *const StateInner) usize {
         return self.items.items.len;
+    }
+
+    fn item_is_ready(self: *const StateInner, index: usize, cx: *const App) bool {
+        const readiness = self.item_measurement_readiness orelse return true;
+        return readiness.call(index, cx);
     }
 
     fn total_height(self: *const StateInner) Pixels {
@@ -328,6 +345,7 @@ const StateInner = struct {
                     pending = switch (p) {
                         .absolute => .{ .absolute = pos.offset_in_item },
                         .proportional => blk: {
+                            if (anchor.provisional) break :blk .{ .absolute = pos.offset_in_item };
                             const hint = self.items.items[pos.item_ix].size_hint orelse break :blk null;
                             if (hint.height <= 0) break :blk null;
                             break :blk PendingScroll{ .proportional = std.math.clamp(pos.offset_in_item / hint.height, 0, 1) };
@@ -383,28 +401,28 @@ const StateInner = struct {
         return .{ .item_ix = ix, .offset_in_item = h - self.prefix_px(ix) };
     }
 
-    /// Lays out every item once, for `ListMeasuringBehavior.measure`.
+    /// Lays out every item for `ListMeasuringBehavior.measure`, retrying provisional sizes.
     fn layout_all_items(self: *StateInner, available_width: Pixels, renderer: ItemRenderer, window: *Window, cx: *App) void {
         switch (self.measuring_behavior) {
             .visible => return,
-            .measure => |has_measured| {
-                if (has_measured) return;
-                self.measuring_behavior = .{ .measure = true };
-            },
+            .measure => |has_measured| if (has_measured) return,
         }
         const available_item_space: Size(AvailableSpace) = .{
             .width = .{ .definite = available_width },
             .height = .min_content,
         };
+        var has_unready = false;
         for (0..self.count()) |ix| {
             const item = self.items.items[ix];
             const size_ = item.measured orelse blk: {
                 const element = renderer.call(ix, window, cx);
                 break :blk element.layout_as_root(available_item_space, window, cx);
             };
-            self.set_item(ix, .{ .measured = size_ });
+            const ready = self.item_is_ready(ix, cx);
+            self.set_item(ix, if (ready) .{ .measured = size_ } else .{ .size_hint = size_ });
+            if (!ready) has_unready = true;
         }
-        self.measuring_behavior = .{ .measure = true };
+        self.measuring_behavior = .{ .measure = !has_unready };
     }
 
     fn any_laid_out_item_focused(self: *const StateInner, layouts: []const ItemLayout, window: *const Window, cx: *const App) bool {
@@ -429,8 +447,10 @@ const StateInner = struct {
         const arena = window_mod.frame_arena();
         var rendered_height: Pixels = padding.top;
         var max_item_width: Pixels = 0;
+        var provisional = false;
         var scroll_top = self.logical_scroll_top();
-        if (self.follow_state == .tail_following) {
+        const pending_end = if (self.scroll_anchor) |anchor| anchor.pending_end else false;
+        if (self.follow_state == .tail_following or pending_end) {
             scroll_top = .{ .item_ix = self.count(), .offset_in_item = 0 };
             self.set_scroll_anchor(scroll_top);
         }
@@ -445,7 +465,7 @@ const StateInner = struct {
         // Forward walk over visible items and trailing overdraw, from the scroll top.
         const forward_start = scroll_top.item_ix;
         var forward_layouts: std.ArrayList(ItemLayout) = .empty;
-        var forward_sizes: std.ArrayList(Size(Pixels)) = .empty;
+        var forward_sizes: std.ArrayList(Measurement) = .empty;
         var ix = forward_start;
         while (ix < self.count()) : (ix += 1) {
             const local_ix = ix - forward_start;
@@ -453,12 +473,15 @@ const StateInner = struct {
             if (visible_height >= available_height + self.overdraw) break;
             const item = self.items.items[ix];
             var element_size: Size(Pixels) = undefined;
+            var ready: bool = undefined;
             if (visible_height >= available_height and item.measured != null) {
                 element_size = item.measured.?;
+                ready = self.item_is_ready(ix, cx);
             } else {
                 const element = renderer.call(ix, window, cx);
                 element_size = element.layout_as_root(available_item_space, window, cx);
-                if (local_ix == 0) {
+                ready = self.item_is_ready(ix, cx);
+                if (local_ix == 0 and ready) {
                     if (self.scroll_anchor) |*anchor| {
                         if (anchor.pending) |pending| {
                             scroll_top.offset_in_item = switch (pending) {
@@ -476,45 +499,64 @@ const StateInner = struct {
             }
             rendered_height += element_size.height;
             max_item_width = @max(max_item_width, element_size.width);
-            forward_sizes.append(arena, element_size) catch oom();
+            provisional = provisional or !ready;
+            forward_sizes.append(arena, .{ .size = element_size, .ready = ready }) catch oom();
+            if (!ready and visible_height >= available_height) break;
         }
         rendered_height += padding.bottom;
 
         // Items before the scroll top are rendered when the visible ones do not fill the list.
         var first_ix = @min(forward_start, self.count());
         var backward_layouts: std.ArrayList(ItemLayout) = .empty;
-        var backward_sizes: std.ArrayList(Size(Pixels)) = .empty;
-        if (rendered_height - scroll_top.offset_in_item < available_height) {
+        var backward_sizes: std.ArrayList(Measurement) = .empty;
+        if (!provisional and rendered_height - scroll_top.offset_in_item < available_height) {
             while (rendered_height < available_height) {
                 if (first_ix == 0) break;
                 first_ix -= 1;
                 const element = renderer.call(first_ix, window, cx);
                 const element_size = element.layout_as_root(available_item_space, window, cx);
+                const ready = self.item_is_ready(first_ix, cx);
+                provisional = provisional or !ready;
                 rendered_height += element_size.height;
-                backward_sizes.append(arena, element_size) catch oom();
+                backward_sizes.append(arena, .{ .size = element_size, .ready = ready }) catch oom();
                 backward_layouts.append(arena, .{ .index = first_ix, .element = element, .size = element_size }) catch oom();
+                if (preserve_anchor and provisional) break;
             }
-            scroll_top = .{ .item_ix = first_ix, .offset_in_item = rendered_height - available_height };
-            switch (self.alignment) {
-                .top => {
-                    scroll_top.offset_in_item = @max(scroll_top.offset_in_item, 0);
-                    self.set_scroll_anchor(scroll_top);
-                },
-                .bottom => self.set_scroll_anchor(null),
+            if (provisional and preserve_anchor) {
+                // An unready item has only a provisional size. Keep the user's anchor and avoid
+                // painting the backward fill until a later layout reports stable measurements.
+                backward_layouts.clearRetainingCapacity();
+            } else {
+                scroll_top = .{ .item_ix = first_ix, .offset_in_item = rendered_height - available_height };
+                switch (self.alignment) {
+                    .top => {
+                        scroll_top.offset_in_item = @max(scroll_top.offset_in_item, 0);
+                        self.set_scroll_anchor(scroll_top);
+                    },
+                    .bottom => self.set_scroll_anchor(null),
+                }
             }
+        }
+
+        if (self.scroll_anchor) |*anchor| {
+            anchor.provisional = preserve_anchor and provisional;
+            anchor.pending_end = !preserve_anchor and provisional;
         }
 
         // Measure items in the leading overdraw, which are not painted.
         var leading_overdraw = scroll_top.offset_in_item;
-        while (leading_overdraw < self.overdraw) {
+        while (!provisional and leading_overdraw < self.overdraw) {
             if (first_ix == 0) break;
             first_ix -= 1;
-            const size_ = self.items.items[first_ix].measured orelse blk: {
+            const item = self.items.items[first_ix];
+            const size_ = item.measured orelse blk: {
                 const element = renderer.call(first_ix, window, cx);
                 break :blk element.layout_as_root(available_item_space, window, cx);
             };
+            const ready = self.item_is_ready(first_ix, cx);
             leading_overdraw += size_.height;
-            backward_sizes.append(arena, size_) catch oom();
+            backward_sizes.append(arena, .{ .size = size_, .ready = ready }) catch oom();
+            if (!ready) break;
         }
 
         // Write back the measurements: backward items in ascending order, then forward items.
@@ -522,11 +564,12 @@ const StateInner = struct {
         var k = backward_sizes.items.len;
         while (k > 0) {
             k -= 1;
-            self.set_item(write_ix, .{ .measured = backward_sizes.items[k] });
+            const measurement = backward_sizes.items[k];
+            self.set_item(write_ix, if (measurement.ready) .{ .measured = measurement.size } else .{ .size_hint = measurement.size });
             write_ix += 1;
         }
-        for (forward_sizes.items) |s| {
-            self.set_item(write_ix, .{ .measured = s });
+        for (forward_sizes.items) |measurement| {
+            self.set_item(write_ix, if (measurement.ready) .{ .measured = measurement.size } else .{ .size_hint = measurement.size });
             write_ix += 1;
         }
 
@@ -552,7 +595,7 @@ const StateInner = struct {
         }
 
         // Resume following once the user scrolls back to the bottom.
-        if (self.follow_state == .tail_stopped) {
+        if (!provisional and self.follow_state == .tail_stopped) {
             const last_padding = self.last_padding orelse Edges(Pixels){};
             const total = self.total_height() + last_padding.top + last_padding.bottom;
             const scroll_offset = self.scroll_top_px(scroll_top);
@@ -693,6 +736,11 @@ const ItemLayout = struct {
     size: Size(Pixels),
 };
 
+const Measurement = struct {
+    size: Size(Pixels),
+    ready: bool,
+};
+
 /// Frame state of the `List` element after prepaint (GPUI `ListPrepaintState`).
 pub const ListPrepaintState = struct {
     hitbox: Hitbox,
@@ -821,6 +869,10 @@ pub const ListState = struct {
         const end = @max(start, @min(old_range.end, state.count()));
         state.splice_items(start, end - start, count);
         if (state.scroll_anchor) |*anchor| {
+            if (anchor.provisional and start <= anchor.position.item_ix) {
+                anchor.provisional = false;
+                anchor.pending = null;
+            }
             if (anchor.position.item_ix >= start and anchor.position.item_ix < end) {
                 anchor.position = .{ .item_ix = start, .offset_in_item = 0 };
                 anchor.pending = null;
@@ -847,6 +899,13 @@ pub const ListState = struct {
     /// Sets the handler called after the list scrolls.
     pub fn set_scroll_handler(self: ListState, handler: ScrollHandler) void {
         self.inner.scroll_handler = handler;
+    }
+
+    /// Sets a predicate queried after an item is laid out. Items reported as not ready keep their
+    /// size as a hint and are laid out again on later frames; the owner should request a frame when
+    /// the predicate may change to ready.
+    pub fn set_item_measurement_readiness(self: ListState, readiness: ItemMeasurementReadiness) void {
+        self.inner.item_measurement_readiness = readiness;
     }
 
     /// The current scroll offset, in terms of the list's items.
@@ -929,7 +988,11 @@ pub const ListState = struct {
 
     /// Freezes the list at its current position, keeping tail mode so it resumes at the bottom.
     pub fn pause_following_tail(self: ListState) void {
-        self.inner.follow_state.stop_following();
+        const state = self.inner;
+        if (state.follow_state == .tail_following) {
+            if (state.scroll_anchor) |*anchor| anchor.pending_end = false;
+        }
+        state.follow_state.stop_following();
     }
 
     /// Whether the list is actively following the tail.
@@ -4463,6 +4526,61 @@ test "list: heights index answers prefix sums and offset searches" {
     // Left search: boundaries belong to the item above them.
     try std.testing.expectEqual(@as(usize, 1), state.inner.heights.search(29.9, true));
     try std.testing.expectEqual(@as(usize, 1), state.inner.heights.search(30, true));
+}
+
+test "list: unready item measurements retry and remeasurement invalidates the cache" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    var ready = false;
+    const readiness = struct {
+        fn check(raw: *anyopaque, _: usize, _: *const App) bool {
+            return @as(*bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    const state = ListState.new(4, .top, 0);
+    defer state.deinit();
+    state.set_item_measurement_readiness(.{ .ctx = &ready, .func = readiness.check });
+    const opened = open_list(&cx, state, 20, 100, 40);
+    opened.vcx.run_until_parked();
+
+    try std.testing.expectEqual(@as(?Size(Pixels), null), state.inner.items.items[0].measured);
+    try std.testing.expectEqual(@as(?Size(Pixels), .{ .width = 100, .height = 20 }), state.inner.items.items[0].size_hint);
+
+    ready = true;
+    opened.vcx.window.refresh();
+    opened.vcx.run_until_parked();
+    try std.testing.expectEqual(@as(?Size(Pixels), .{ .width = 100, .height = 20 }), state.inner.items.items[0].measured);
+
+    state.remeasure_items(.{ .start = 0, .end = 1 });
+    try std.testing.expectEqual(@as(?Size(Pixels), null), state.inner.items.items[0].measured);
+    try std.testing.expectEqual(@as(?Size(Pixels), .{ .width = 100, .height = 20 }), state.inner.items.items[0].size_hint);
+    opened.vcx.window.refresh();
+    opened.vcx.run_until_parked();
+    try std.testing.expectEqual(@as(?Size(Pixels), .{ .width = 100, .height = 20 }), state.inner.items.items[0].measured);
+}
+
+test "list: a scroll to the end survives provisional measurements" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    var ready = false;
+    const readiness = struct {
+        fn check(raw: *anyopaque, _: usize, _: *const App) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    const state = ListState.new(4, .top, 0);
+    defer state.deinit();
+    state.set_item_measurement_readiness(.{ .ctx = &ready, .func = readiness.check });
+    state.scroll_to_end();
+    const opened = open_list(&cx, state, 20, 100, 40);
+    try std.testing.expect(state.inner.scroll_anchor.?.pending_end);
+
+    ready = true;
+    cx.update_entity(opened.view, TestListView.set_item_height, .{30});
+    opened.vcx.window.refresh();
+    opened.vcx.run_until_parked();
+    try std.testing.expectEqual(ListOffset{ .item_ix = 2, .offset_in_item = 20 }, state.logical_scroll_top());
+    try std.testing.expect(!state.inner.scroll_anchor.?.pending_end);
 }
 
 test "list: splice keeps the scroll anchor on surviving items" {

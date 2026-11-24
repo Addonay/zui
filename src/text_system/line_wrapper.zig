@@ -956,6 +956,38 @@ test "wrap_line with extra columns keeps a fitting indent and drops an overflowi
     try testing.expectEqualSlices(Boundary, &.{Boundary.new(9, 0)}, collect(&it, &buf));
 }
 
+test "emergency wrapping keeps an emoji grapheme together" {
+    var cw: CharWidthCache = .{};
+    defer cw.deinit(testing.allocator);
+    const cell: Pixels = 1;
+    var w = test_wrapper(&cw, &cell);
+    defer w.deinit();
+    var buf: [8]Boundary = undefined;
+
+    // The emoji is multiple codepoints and UTF-8 sequences, but one grapheme.
+    const text = "x👩‍💻y";
+    var it = try w.wrap_line(&.{LineFragment.text_fragment(text)}, 1, .no_indent);
+    try testing.expectEqualSlices(Boundary, &.{ Boundary.new(1, 0), Boundary.new(12, 0) }, collect(&it, &buf));
+}
+
+test "emergency wrapping rejects a word break before an oversized inline element" {
+    var cw: CharWidthCache = .{};
+    defer cw.deinit(testing.allocator);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
+    defer w.deinit();
+    var buf: [8]Boundary = undefined;
+
+    // Taking the word break would carry its final character and the 100px element
+    // onto a line whose width is only 100px. Break before the element instead.
+    const fragments = [_]LineFragment{
+        LineFragment.text_fragment("aaaaaaaaaaaaaaaaaaa a"),
+        LineFragment.element_fragment(100, 1),
+    };
+    var it = try w.wrap_line(&fragments, 100, .{ .extra_columns = 2 });
+    try testing.expectEqualSlices(Boundary, &.{ Boundary.new(10, 2), Boundary.new(18, 2), Boundary.new(21, 0) }, collect(&it, &buf));
+}
+
 test "multiline truncation fits within the requested wrapped lines" {
     var cw: CharWidthCache = .{};
     defer cw.deinit(testing.allocator);
