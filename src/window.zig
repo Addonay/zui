@@ -405,6 +405,7 @@ const DeferredDraw = struct {
     text_style_stack: []const TextStyleRefinement,
     parent_node: key_dispatch.DispatchNodeId,
     element_id_hash: u64,
+    rem_size: Pixels,
 };
 
 /// A position in what prepaint added to the frame (GPUI `PrepaintStateIndex`).
@@ -2185,6 +2186,7 @@ pub const Window = struct {
             .text_style_stack = stack,
             .parent_node = self.next_frame.dispatch_tree.active_node_id(),
             .element_id_hash = self.current_global_id().hash,
+            .rem_size = self.rem_size(),
         }) catch oom();
     }
 
@@ -2670,6 +2672,8 @@ pub const Window = struct {
     /// Prepaints in rounds, since a deferred element can defer more. The list stays in the order
     /// the draws were added, because reused views name parts of it by index (GPUI `prepaint_deferred_draws`).
     fn prepaint_deferred_draws(self: *Window, cx: *App) void {
+        const tree = &self.next_frame.dispatch_tree;
+        defer tree.node_stack.clearRetainingCapacity();
         var round_start: usize = 0;
         var depth: usize = 0;
         while (round_start < self.next_frame.deferred_draws.items.len) : (depth += 1) {
@@ -2677,8 +2681,8 @@ pub const Window = struct {
             const round_end = self.next_frame.deferred_draws.items.len;
             for (self.deferred_by_priority(round_start, round_end)) |ix| {
                 const d = self.next_frame.deferred_draws.items[ix];
-                const saved = self.text_style_stack.items.len;
-                self.text_style_stack.appendSlice(self.allocator, d.text_style_stack) catch oom();
+                const text_style_len = self.begin_deferred_draw(d);
+                defer self.end_deferred_draw(text_style_len);
                 const start = self.prepaint_index();
                 if (d.element) |element| {
                     const outer_arena = swap_frame_arena(d.arena);
@@ -2694,17 +2698,18 @@ pub const Window = struct {
                 const slot = &self.next_frame.deferred_draws.items[ix];
                 slot.prepaint_start = start;
                 slot.prepaint_end = end;
-                self.text_style_stack.shrinkRetainingCapacity(saved);
             }
             round_start = round_end;
         }
     }
 
     fn paint_deferred_draws(self: *Window, cx: *App) void {
+        const tree = &self.next_frame.dispatch_tree;
+        defer tree.node_stack.clearRetainingCapacity();
         for (self.deferred_by_priority(0, self.next_frame.deferred_draws.items.len)) |ix| {
             const d = self.next_frame.deferred_draws.items[ix];
-            const saved = self.text_style_stack.items.len;
-            self.text_style_stack.appendSlice(self.allocator, d.text_style_stack) catch oom();
+            const text_style_len = self.begin_deferred_draw(d);
+            defer self.end_deferred_draw(text_style_len);
             const start = self.paint_index();
             if (d.element) |element| {
                 const outer_arena = swap_frame_arena(d.arena);
@@ -2719,8 +2724,22 @@ pub const Window = struct {
             const slot = &self.next_frame.deferred_draws.items[ix];
             slot.paint_start = start;
             slot.paint_end = end;
-            self.text_style_stack.shrinkRetainingCapacity(saved);
         }
+    }
+
+    fn begin_deferred_draw(self: *Window, draw_: DeferredDraw) usize {
+        self.next_frame.dispatch_tree.set_active_node(draw_.parent_node);
+        self.element_id_hashes.append(self.allocator, draw_.element_id_hash) catch oom();
+        self.rem_size_override_stack.append(self.allocator, draw_.rem_size) catch oom();
+        const text_style_len = self.text_style_stack.items.len;
+        self.text_style_stack.appendSlice(self.allocator, draw_.text_style_stack) catch oom();
+        return text_style_len;
+    }
+
+    fn end_deferred_draw(self: *Window, text_style_len: usize) void {
+        _ = self.element_id_hashes.pop();
+        _ = self.rem_size_override_stack.pop();
+        self.text_style_stack.shrinkRetainingCapacity(text_style_len);
     }
 
     /// A drag can start before the next paint records its cursor in the frame, so it comes first.

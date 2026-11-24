@@ -92,3 +92,99 @@ test "deferred: the child is laid out and drawn in its place" {
     }
     return error.TestExpectedEqual;
 }
+
+const DeferredActionView = struct {
+    const Save = @import("../action.zig").Action("test", "DeferredSave");
+
+    parent_focus: window_mod.FocusHandle,
+    child_focus: window_mod.FocusHandle,
+    saves: usize = 0,
+    field_saves: usize = 0,
+    renders: usize = 0,
+
+    pub fn render(self: *DeferredActionView, _: *Window, cx: *app_mod.Context(DeferredActionView)) *div_mod.Div {
+        self.renders += 1;
+        const field = window_mod.frame_arena().create(PaintActionField) catch @panic("out of memory");
+        field.* = .{
+            .view = self,
+            .child = element_mod.into_any_element(div_mod.div().id("field").size(40).track_focus(&self.child_focus)),
+        };
+        return div_mod.div().size_full().id("panel").track_focus(&self.parent_focus)
+            .key_context("Panel").on_action(Save, cx.listener(save))
+            .child(deferred(deferred(field)));
+    }
+
+    fn save(self: *DeferredActionView, _: *const Save, _: *Window, _: *app_mod.Context(DeferredActionView)) void {
+        self.saves += 1;
+    }
+};
+
+const PaintActionField = struct {
+    pub const RequestLayoutState = void;
+    pub const PrepaintState = void;
+
+    view: *DeferredActionView,
+    child: AnyElement,
+
+    pub fn request_layout(self: *PaintActionField, _: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, void } {
+        return .{ self.child.request_layout(window, cx), {} };
+    }
+
+    pub fn prepaint(self: *PaintActionField, _: ?*const GlobalElementId, _: Bounds(Pixels), _: *void, window: *Window, cx: *App) void {
+        self.child.prepaint(window, cx);
+    }
+
+    pub fn paint(self: *PaintActionField, _: ?*const GlobalElementId, _: Bounds(Pixels), _: *void, _: *void, window: *Window, cx: *App) void {
+        window.on_action(app_mod.type_id(DeferredActionView.Save), self.view, on_save);
+        self.child.paint(window, cx);
+    }
+
+    fn on_save(ctx: *anyopaque, _: *const anyopaque, phase: window_mod.DispatchPhase, _: *Window, cx: *App) void {
+        if (phase != .bubble) return;
+        const view: *DeferredActionView = @ptrCast(@alignCast(ctx));
+        view.field_saves += 1;
+        cx.propagate();
+    }
+};
+
+const CachedDeferredRoot = struct {
+    panel: app_mod.Entity(DeferredActionView),
+
+    pub fn render(self: *CachedDeferredRoot, _: *Window, _: *app_mod.Context(CachedDeferredRoot)) *div_mod.Div {
+        return div_mod.div().size_full().child(self.panel.cached(div_mod.style().size_full()));
+    }
+
+    fn build(_: *Window, app: *App) app_mod.Entity(CachedDeferredRoot) {
+        const panel = app.new(DeferredActionView{
+            .parent_focus = app.focus_handle(),
+            .child_focus = app.focus_handle(),
+        });
+        return app.new(CachedDeferredRoot{ .panel = panel });
+    }
+};
+
+test "deferred: nested draws keep their focus and key ancestors after cache replay" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const KeyBinding = @import("../keymap.zig").KeyBinding;
+    cx.app.bind_keys(&.{KeyBinding.new("cmd-s", DeferredActionView.Save{}, "Panel")});
+
+    const root, const vcx = cx.add_window_view(CachedDeferredRoot.build);
+    const panel = root.read(cx.app).panel;
+    const child_focus = panel.read(cx.app).child_focus;
+    child_focus.focus(vcx.window);
+    vcx.run_until_parked();
+
+    try std.testing.expect(panel.read(cx.app).parent_focus.contains_focused(vcx.window, cx.app));
+    vcx.simulate_keystrokes("cmd-s");
+    try std.testing.expectEqual(@as(usize, 1), panel.read(cx.app).saves);
+    try std.testing.expectEqual(@as(usize, 1), panel.read(cx.app).field_saves);
+
+    const renders = panel.read(cx.app).renders;
+    vcx.window.draw(cx.app);
+    try std.testing.expectEqual(renders, panel.read(cx.app).renders);
+    try std.testing.expect(panel.read(cx.app).parent_focus.contains_focused(vcx.window, cx.app));
+    vcx.simulate_keystrokes("cmd-s");
+    try std.testing.expectEqual(@as(usize, 2), panel.read(cx.app).saves);
+    try std.testing.expectEqual(@as(usize, 2), panel.read(cx.app).field_saves);
+}

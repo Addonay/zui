@@ -3620,7 +3620,7 @@ fn show_long_press_tooltip(st: *InteractiveElementState, position: Point(Pixels)
     return true;
 }
 
-fn clear_tooltip(st: *InteractiveElementState, window: *Window, cx: *App) void {
+pub fn clear_tooltip(st: *InteractiveElementState, window: *Window, cx: *App) void {
     st.tooltip_generation +%= 1;
     const had = st.tooltip_phase != .none;
     st.tooltip_phase = .none;
@@ -3642,7 +3642,7 @@ fn dismiss_tooltip_on_input(st: *InteractiveElementState, window: *Window, cx: *
     clear_tooltip(st, window, cx);
 }
 
-fn tooltip_on_mouse_move(st: *InteractiveElementState, hovered_now: bool, phase: DispatchPhase, show_delay_ns: u64, window: *Window, cx: *App) void {
+pub fn tooltip_on_mouse_move(st: *InteractiveElementState, hovered_now: bool, phase: DispatchPhase, show_delay_ns: u64, window: *Window, cx: *App) void {
     const hovered = hovered_now and st.pending_mouse_down == null;
     switch (st.tooltip_phase) {
         .none => if (hovered and phase == .bubble) {
@@ -3665,12 +3665,13 @@ fn tooltip_on_mouse_move(st: *InteractiveElementState, hovered_now: bool, phase:
 
 /// Runs while the tooltip is being placed. An element that stopped painting has no mouse
 /// handlers left, so this is what finally closes its tooltip.
-fn tooltip_check_visible(raw: *anyopaque, tooltip_bounds: Bounds(Pixels), window: *Window, cx: *App) bool {
+pub fn tooltip_check_visible(raw: *anyopaque, tooltip_bounds: Bounds(Pixels), window: *Window, cx: *App) bool {
     const st: *InteractiveElementState = @ptrCast(@alignCast(raw));
     if (st.long_press_tooltip_active) return true;
     const mouse = window.mouse_position();
+    const source_hovered = if (st.tooltip_optional_builder != null) st.tooltip_text_hovered else st.tooltip_source_bounds.contains(mouse);
     const hovered = !window.last_input_was_keyboard() and st.pending_mouse_down == null and
-        (st.tooltip_source_bounds.contains(mouse) or (st.tooltip_hoverable and tooltip_bounds.contains(mouse)));
+        (source_hovered or (st.tooltip_hoverable and tooltip_bounds.contains(mouse)));
     switch (st.tooltip_phase) {
         .visible => if (!hovered) {
             if (st.tooltip_hoverable) {
@@ -3708,10 +3709,19 @@ const TooltipTimer = struct {
         const window = self.live() orelse return;
         const st = self.state;
         if (st.tooltip_phase != .waiting_for_show) return;
-        const builder = st.tooltip_builder orelse return;
         self.app.pending_updates += 1;
-        st.tooltip_view = builder.build(builder.ctx, window, self.app);
+        st.tooltip_view = if (st.tooltip_optional_builder) |builder|
+            builder.build(builder.ctx, window, self.app)
+        else if (st.tooltip_builder) |builder|
+            builder.build(builder.ctx, window, self.app)
+        else
+            null;
         self.app.pending_updates -= 1;
+        if (st.tooltip_view == null) {
+            st.tooltip_phase = .none;
+            self.app.flush_effects();
+            return;
+        }
         st.tooltip_mouse = window.mouse_position();
         st.tooltip_phase = .visible;
         window.notify_current_view();
@@ -3793,8 +3803,14 @@ pub const InteractiveElementState = struct {
     tooltip_view: ?view_mod.AnyView = null,
     tooltip_mouse: Point(Pixels) = .{ .x = 0, .y = 0 },
     tooltip_builder: ?TooltipBuilder = null,
+    tooltip_optional_builder: ?struct {
+        ctx: *anyopaque,
+        build: *const fn (*anyopaque, *Window, *App) ?view_mod.AnyView,
+    } = null,
     tooltip_hoverable: bool = false,
     tooltip_source_bounds: Bounds(Pixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } },
+    /// InteractiveText tooltips require a hit on the text itself.
+    tooltip_text_hovered: bool = false,
     /// The tooltip was opened by a long press and stays until the touch ends (GPUI `long_press_tooltip_active`).
     long_press_tooltip_active: bool = false,
 };

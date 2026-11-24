@@ -11,9 +11,11 @@ const taffy = @import("../taffy.zig");
 const element = @import("../element.zig");
 const window_mod = @import("../window.zig");
 const app_mod = @import("../app.zig");
+const div_mod = @import("div.zig");
 const interactive = @import("../interactive.zig");
 const text_system = @import("../text_system.zig");
 const line_wrapper = @import("../text_system/line_wrapper.zig");
+const view_mod = @import("../view.zig");
 
 const Pixels = geometry.Pixels;
 const Point = geometry.Point;
@@ -357,10 +359,9 @@ const MeasureCtx = struct {
             }
         }
 
-        // A cached measurement is reused when the wrap width matches and no truncation is involved.
-        if (st.measured and st.size != null and (wrap_width == null or wrap_width == st.wrap_width) and truncate_width == null and st.truncate_width == null) {
-            return st.size.?;
-        }
+        // A measurement is reusable only when both available-width inputs match. In particular,
+        // an unconstrained probe must not inherit the size of a previously wrapped measurement.
+        if (cached_measurement_size(st, wrap_width, truncate_width)) |cached| return cached;
 
         var wrapper = ts.line_wrapper(text_style.font(), font_size);
         defer wrapper.deinit();
@@ -419,6 +420,11 @@ const MeasureCtx = struct {
         return size;
     }
 };
+
+fn cached_measurement_size(state: *const TextLayout.State, wrap_width: ?Pixels, truncate_width: ?Pixels) ?Size(Pixels) {
+    if (!state.measured or state.wrap_width != wrap_width or state.truncate_width != truncate_width) return null;
+    return state.size;
+}
 
 // ---------------------------------------------------------------------------
 // StyledText.
@@ -575,6 +581,11 @@ pub const ClickHandler = struct { ctx: *anyopaque, func: ClickFn };
 /// A hover handler bound to its context.
 pub const HoverHandler = struct { ctx: *anyopaque, func: HoverFn };
 
+/// Builds the tooltip for the hovered byte index, or returns null to show no tooltip.
+pub const TooltipFn = *const fn (ctx: *anyopaque, index: usize, window: *Window, cx: *App) ?view_mod.AnyView;
+/// A tooltip callback bound to its context.
+pub const TooltipHandler = struct { ctx: *anyopaque, func: TooltipFn };
+
 /// The byte index of an exact hit, or null (GPUI `Result::ok`).
 fn ok_index(r: IndexResult) ?usize {
     return switch (r) {
@@ -587,6 +598,16 @@ fn ok_index(r: IndexResult) ?usize {
 pub const InteractiveTextState = struct {
     mouse_down_index: ?usize = null,
     hovered_index: ?usize = null,
+    tooltip_handler: ?TooltipHandler = null,
+    tooltip_index: ?usize = null,
+    tooltip_state: ?*div_mod.InteractiveElementState = null,
+
+    fn build_tooltip(raw: *anyopaque, window: *Window, cx: *App) ?view_mod.AnyView {
+        const self: *InteractiveTextState = @ptrCast(@alignCast(raw));
+        const handler = self.tooltip_handler orelse return null;
+        const index = self.tooltip_index orelse return null;
+        return handler.func(handler.ctx, index, window, cx);
+    }
 };
 
 /// Styled text that reacts to clicks on ranges and to hovering (GPUI `InteractiveText`).
@@ -596,6 +617,7 @@ pub const InteractiveText = struct {
     clickable_ranges: []const ByteRange = &.{},
     click: ?ClickHandler = null,
     hover: ?HoverHandler = null,
+    tooltip_builder: ?TooltipHandler = null,
 
     pub const RequestLayoutState = void;
     pub const PrepaintState = Hitbox;
@@ -619,6 +641,14 @@ pub const InteractiveText = struct {
         return out;
     }
 
+    /// Builds a tooltip for the byte index under the pointer (GPUI `InteractiveText::tooltip`).
+    /// The callback may return null to suppress a tooltip at that index.
+    pub fn tooltip(self: InteractiveText, ctx: *anyopaque, func: TooltipFn) InteractiveText {
+        var out = self;
+        out.tooltip_builder = .{ .ctx = ctx, .func = func };
+        return out;
+    }
+
     pub fn id(self: *InteractiveText) ?element.ElementId {
         return self.element_id;
     }
@@ -629,9 +659,34 @@ pub const InteractiveText = struct {
     }
 
     pub fn prepaint(self: *InteractiveText, id_: ?*const element.GlobalElementId, bounds: Bounds(Pixels), rl: *void, window: *Window, cx: *App) Hitbox {
-        _ = id_;
         self.text.prepaint(null, bounds, rl, window, cx);
-        return window.insert_hitbox(bounds, .normal);
+        const hitbox = window.insert_hitbox(bounds, .normal);
+        const gid = id_ orelse return hitbox;
+        const state = window.element_state(InteractiveTextState, gid.*, .{});
+        state.tooltip_handler = self.tooltip_builder;
+        if (self.tooltip_builder != null) {
+            const tooltip_id: element.GlobalElementId = .{
+                .hash = element.extend_path_hash(gid.hash, .{ .path = "InteractiveText.tooltip" }),
+            };
+            const tooltip_state = window.element_state(div_mod.InteractiveElementState, tooltip_id, .{});
+            state.tooltip_state = tooltip_state;
+            tooltip_state.tooltip_optional_builder = .{ .ctx = state, .build = InteractiveTextState.build_tooltip };
+            const layout = self.text.layout();
+            const mouse = window.mouse_position();
+            state.tooltip_index = if (bounds.contains(mouse)) ok_index(layout.index_for_position(mouse)) else null;
+            tooltip_state.tooltip_text_hovered = state.tooltip_index != null and state.mouse_down_index == null;
+            if (tooltip_state.tooltip_view) |view| {
+                const visible = window_mod.frame_arena().create(TextTooltipCheck) catch @panic("OOM");
+                visible.* = .{ .layout = layout, .bounds = bounds, .text_state = state, .tooltip_state = tooltip_state };
+                window.set_tooltip(.{ .view = view, .mouse_position = tooltip_state.tooltip_mouse, .ctx = visible, .check_visible_and_update = check_text_tooltip_visible });
+            }
+        } else if (state.tooltip_state) |tooltip_state| {
+            div_mod.clear_tooltip(tooltip_state, window, cx);
+            tooltip_state.tooltip_optional_builder = null;
+            state.tooltip_index = null;
+            state.tooltip_state = null;
+        }
+        return hitbox;
     }
 
     /// Per-interaction state: the pressed index and the one the pointer last hovered.
@@ -664,6 +719,8 @@ pub const InteractiveText = struct {
             if (ok_index(text_layout.index_for_position(mouse))) |ix| {
                 if (any_contains(self.clickable_ranges, ix)) window.set_cursor_style(.pointing_hand, hitbox);
             }
+        }
+        if (self.click != null or self.tooltip_builder != null) {
             window.on_mouse_event(interactive.MouseDownEvent, ctx, on_mouse_down);
             window.on_mouse_event(interactive.MouseUpEvent, ctx, on_mouse_up);
         }
@@ -678,39 +735,61 @@ pub const InteractiveText = struct {
     }
 
     fn on_mouse_down(ctx_ptr: *anyopaque, event: *const interactive.MouseDownEvent, phase: window_mod.DispatchPhase, window: *Window, cx: *App) void {
-        _ = cx;
         const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
         if (phase != .bubble or !ctx.hitbox.is_hovered(window)) return;
         if (ok_index(ctx.layout.index_for_position(event.position))) |ix| {
             ctx.state.mouse_down_index = ix;
+            if (ctx.state.tooltip_state) |tooltip_state| div_mod.clear_tooltip(tooltip_state, window, cx);
             window.notify_current_view();
         }
     }
 
     fn on_mouse_up(ctx_ptr: *anyopaque, event: *const interactive.MouseUpEvent, phase: window_mod.DispatchPhase, window: *Window, cx: *App) void {
         const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
-        if (phase != .bubble or !ctx.hitbox.is_hovered(window)) return;
+        if (phase != .bubble) return;
         const down = ctx.state.mouse_down_index orelse return;
-        if (ok_index(ctx.layout.index_for_position(event.position))) |up| {
-            if (ctx.click) |c| {
+        ctx.state.mouse_down_index = null;
+        if (ctx.click) |c| {
+            if (ctx.hitbox.is_hovered(window)) if (ok_index(ctx.layout.index_for_position(event.position))) |up| {
                 for (ctx.ranges, 0..) |range, i| {
                     if (range.contains(down) and range.contains(up)) c.func(c.ctx, i, window, cx);
                 }
-            }
+            };
         }
-        ctx.state.mouse_down_index = null;
         window.notify_current_view();
     }
 
     fn on_mouse_move(ctx_ptr: *anyopaque, event: *const interactive.MouseMoveEvent, phase: window_mod.DispatchPhase, window: *Window, cx: *App) void {
         const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
-        if (phase != .bubble or !ctx.hitbox.is_hovered(window)) return;
-        const updated: ?usize = ok_index(ctx.layout.index_for_position(event.position));
+        const hovered = ctx.hitbox.is_hovered(window);
+        const updated = if (hovered) ok_index(ctx.layout.index_for_position(event.position)) else null;
+        if (ctx.state.tooltip_state) |tooltip_state| {
+            ctx.state.tooltip_index = updated;
+            tooltip_state.tooltip_text_hovered = updated != null and ctx.state.mouse_down_index == null;
+            div_mod.tooltip_on_mouse_move(tooltip_state, tooltip_state.tooltip_text_hovered, phase, 500 * std.time.ns_per_ms, window, cx);
+        }
+        if (phase != .bubble or !hovered) return;
         if (ctx.state.hovered_index != updated) {
             ctx.state.hovered_index = updated;
             if (ctx.hover) |h| h.func(h.ctx, updated, event, window, cx);
             window.notify_current_view();
         }
+    }
+
+    const TextTooltipCheck = struct {
+        layout: TextLayout,
+        bounds: Bounds(Pixels),
+        text_state: *InteractiveTextState,
+        tooltip_state: *div_mod.InteractiveElementState,
+    };
+
+    fn check_text_tooltip_visible(raw: *anyopaque, tooltip_bounds: Bounds(Pixels), window: *Window, cx: *App) bool {
+        const check: *TextTooltipCheck = @ptrCast(@alignCast(raw));
+        const mouse = window.mouse_position();
+        const index = if (check.bounds.contains(mouse)) ok_index(check.layout.index_for_position(mouse)) else null;
+        check.text_state.tooltip_index = index;
+        check.tooltip_state.tooltip_text_hovered = index != null and check.text_state.mouse_down_index == null;
+        return div_mod.tooltip_check_visible(@ptrCast(check.tooltip_state), tooltip_bounds, window, cx);
     }
 };
 
@@ -750,4 +829,77 @@ test "byte range contains is half-open" {
     try testing.expect(r.contains(1));
     try testing.expect(r.contains(2));
     try testing.expect(!r.contains(3));
+}
+
+test "text measurement cache distinguishes wrapped and unconstrained inputs" {
+    const narrow: Size(Pixels) = .{ .width = 60, .height = 80 };
+    var state: TextLayout.State = .{
+        .measured = true,
+        .wrap_width = 60,
+        .size = narrow,
+    };
+
+    try testing.expect(cached_measurement_size(&state, null, null) == null);
+    try testing.expectEqual(narrow, cached_measurement_size(&state, 60, null).?);
+    try testing.expect(cached_measurement_size(&state, 60, 120) == null);
+}
+
+const InteractiveTextTooltipTest = struct {
+    allow_tooltip: bool = false,
+    hovered_byte: ?usize = null,
+
+    const Tip = struct {
+        pub fn render(_: *Tip, _: *Window, _: *app_mod.Context(Tip)) *div_mod.Div {
+            return div_mod.div().size(20);
+        }
+    };
+
+    pub fn render(self: *InteractiveTextTooltipTest, _: *Window, _: *app_mod.Context(InteractiveTextTooltipTest)) *div_mod.Div {
+        const text = InteractiveText.new("label", StyledText.new("Wide text"));
+        return div_mod.div().size(120).flex().items_start().child(text.tooltip(self, build_tooltip));
+    }
+
+    fn build_tooltip(raw: *anyopaque, index: usize, _: *Window, cx: *App) ?view_mod.AnyView {
+        const self: *InteractiveTextTooltipTest = @ptrCast(@alignCast(raw));
+        self.hovered_byte = index;
+        if (!self.allow_tooltip) return null;
+        return view_mod.AnyView.from(cx.new(Tip{}));
+    }
+
+    fn enable(self: *InteractiveTextTooltipTest, _: *app_mod.Context(InteractiveTextTooltipTest)) void {
+        self.allow_tooltip = true;
+    }
+
+    fn build(_: *Window, app: *App) app_mod.Entity(InteractiveTextTooltipTest) {
+        return app.new(InteractiveTextTooltipTest{});
+    }
+};
+
+test "interactive text: shows a byte-index tooltip after the delay and dismisses it on exit" {
+    const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(InteractiveTextTooltipTest.build);
+    const delay = 500 * std.time.ns_per_ms;
+
+    vcx.simulate_mouse_move(.{ .x = 1, .y = 4 }, null, .{});
+    vcx.run_until_parked();
+    cx.executor().advance_clock(delay);
+    vcx.run_until_parked();
+    try testing.expectEqual(@as(?usize, 0), view.read(cx.app).hovered_byte);
+    try testing.expect(vcx.window.tooltip_bounds == null);
+
+    cx.update_entity(view, InteractiveTextTooltipTest.enable, .{});
+    vcx.simulate_mouse_move(.{ .x = 2, .y = 4 }, null, .{});
+    vcx.run_until_parked();
+    cx.executor().advance_clock(delay - 1);
+    vcx.run_until_parked();
+    try testing.expect(vcx.window.tooltip_bounds == null);
+    cx.executor().advance_clock(1);
+    vcx.run_until_parked();
+    try testing.expect(vcx.window.tooltip_bounds != null);
+
+    vcx.simulate_mouse_move(.{ .x = 200, .y = 4 }, null, .{});
+    vcx.run_until_parked();
+    try testing.expect(vcx.window.tooltip_bounds == null);
 }

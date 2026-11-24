@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const geometry = @import("geometry.zig");
+const key_dispatch = @import("key_dispatch.zig");
 const taffy = @import("taffy.zig");
 const window_mod = @import("window.zig");
 const app_mod = @import("app.zig");
@@ -129,6 +130,7 @@ pub fn Drawable(comptime EPtr: type) type {
         element: EPtr,
         phase: Phase = .start,
         layout_id: LayoutId = undefined,
+        dispatch_node_id: key_dispatch.DispatchNodeId = undefined,
         global_id: ?GlobalElementId = null,
         bounds: Bounds(Pixels) = undefined,
         rl: E.RequestLayoutState = undefined,
@@ -176,10 +178,12 @@ pub fn Drawable(comptime EPtr: type) type {
             const eid = self.elementId();
             if (eid) |e| _ = window.push_element_id(e);
             self.bounds = window.layout_bounds(self.layout_id);
-            window.next_frame.dispatch_tree.push_node();
+            const tree = &window.next_frame.dispatch_tree;
+            tree.push_node();
+            self.dispatch_node_id = tree.active_node_id();
             const gid_ptr: ?*const GlobalElementId = if (self.global_id) |*g| g else null;
             self.pp = self.element.prepaint(gid_ptr, self.bounds, &self.rl, window, cx);
-            window.next_frame.dispatch_tree.pop_node();
+            tree.pop_node();
             if (eid != null) window.pop_element_id();
             self.phase = .prepaint;
         }
@@ -189,6 +193,14 @@ pub fn Drawable(comptime EPtr: type) type {
             std.debug.assert(self.phase == .prepaint);
             const eid = self.elementId();
             if (eid) |e| _ = window.push_element_id(e);
+            const tree = &window.next_frame.dispatch_tree;
+            const previous_node = tree.node_stack.getLastOrNull();
+            tree.set_active_node(self.dispatch_node_id);
+            defer if (previous_node) |id| {
+                tree.set_active_node(id);
+            } else {
+                tree.node_stack.clearRetainingCapacity();
+            };
             const gid_ptr: ?*const GlobalElementId = if (self.global_id) |*g| g else null;
             self.element.paint(gid_ptr, self.bounds, &self.rl, &self.pp, window, cx);
             if (eid != null) window.pop_element_id();
