@@ -648,17 +648,18 @@ const PrepaintAttempt = struct {
 
     fn run(self: *PrepaintAttempt, window: *Window) error{Autoscroll}!void {
         const state = self.state;
+        const item_width = self.bounds.size.width - self.padding.left - self.padding.right;
         switch (state.measuring_behavior) {
-            .measure => |has_measured| if (!has_measured) state.layout_all_items(self.bounds.size.width, self.renderer, window, self.cx),
+            .measure => |has_measured| if (!has_measured) state.layout_all_items(item_width, self.renderer, window, self.cx),
             .visible => {},
         }
-        var response = state.layout_items(self.bounds.size.width, self.bounds.size.height, self.padding, self.renderer, window, self.cx);
+        var response = state.layout_items(item_width, self.bounds.size.height, self.padding, self.renderer, window, self.cx);
         // A request made while laying out came from outside the items, so it is not ours to honor.
         _ = window.take_autoscroll();
 
         // Paint only the visible items, when there is space for them past the padding.
         if (self.bounds.size.height > self.padding.top + self.padding.bottom) {
-            var item_origin = self.bounds.origin.add(point(@as(Pixels, 0), self.padding.top));
+            var item_origin = self.bounds.origin.add(point(self.padding.left, self.padding.top));
             item_origin.y -= response.scroll_top.offset_in_item;
             for (response.item_layouts.items) |*item| {
                 window.push_content_mask(.{ .bounds = self.bounds });
@@ -717,8 +718,9 @@ const PrepaintAttempt = struct {
     /// The height of item `ix`: its measured one, or one it is laid out for now (GPUI `size` or `layout_as_root`).
     fn item_height(self: *PrepaintAttempt, ix: usize, window: *Window) Pixels {
         if (self.state.items.items[ix].measured) |measured| return measured.height;
+        const item_width = self.bounds.size.width - self.padding.left - self.padding.right;
         const element = self.renderer.call(ix, window, self.cx);
-        const laid_out = element.layout_as_root(.{ .width = .{ .definite = self.bounds.size.width }, .height = .min_content }, window, self.cx);
+        const laid_out = element.layout_as_root(.{ .width = .{ .definite = item_width }, .height = .min_content }, window, self.cx);
         return laid_out.height;
     }
 };
@@ -1035,6 +1037,7 @@ pub const ListState = struct {
     pub fn bounds_for_item(self: ListState, ix: usize) ?Bounds(Pixels) {
         const state = self.inner;
         const bounds = state.last_layout_bounds orelse Bounds(Pixels){};
+        const padding = state.last_padding orelse Edges(Pixels){};
         const scroll_top = state.logical_scroll_top();
         if (ix < scroll_top.item_ix or ix >= state.count()) return null;
         const item = state.items.items[ix];
@@ -1042,8 +1045,8 @@ pub const ListState = struct {
         const scroll_top_px = state.scroll_top_px(scroll_top);
         const top = bounds.top() + state.prefix_px(ix) - scroll_top_px;
         return Bounds(Pixels).from_corners(
-            point(bounds.left(), top),
-            point(bounds.right(), top + measured.height),
+            point(bounds.left() + padding.left, top),
+            point(bounds.right() - padding.right, top + measured.height),
         );
     }
 
@@ -1131,6 +1134,20 @@ pub const List = struct {
         }
     };
 
+    fn content_insets(s: *const Style, bounds_size: Size(Pixels), rem_size: Pixels) Edges(Pixels) {
+        const pad_px = s.padding.to_pixels(.{
+            Size(geometry.AbsoluteLength){ .width = .{ .pixels = bounds_size.width }, .height = .{ .pixels = bounds_size.height } },
+            rem_size,
+        });
+        const border_px = s.border_widths.to_pixels(.{rem_size});
+        return .{
+            .top = pad_px.top + border_px.top,
+            .right = pad_px.right + border_px.right,
+            .bottom = pad_px.bottom + border_px.bottom,
+            .left = pad_px.left + border_px.left,
+        };
+    }
+
     pub fn request_layout(self: *List, gid: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, RequestLayoutState } {
         _ = gid;
         const state = self.state.inner;
@@ -1145,10 +1162,7 @@ pub const List = struct {
 
                 const available_height = if (state.last_layout_bounds) |b| b.size.height else state.overdraw;
                 const bounds_size = if (state.last_layout_bounds) |b| b.size else Size(Pixels){};
-                const padding = style_.padding.to_pixels(.{
-                    Size(geometry.AbsoluteLength){ .width = .{ .pixels = bounds_size.width }, .height = .{ .pixels = bounds_size.height } },
-                    window.rem_size(),
-                });
+                const padding = content_insets(&style_, bounds_size, window.rem_size());
                 const response = state.layout_items(null, available_height, padding, self.render_item, window, cx);
                 const measured = window_mod.frame_arena().create(MeasuredSize) catch oom();
                 measured.* = .{ .max_item_width = response.max_item_width, .total_height = state.total_height() };
@@ -1174,17 +1188,20 @@ pub const List = struct {
         style_.refine(&self.base_style);
         const hitbox = window.insert_hitbox(bounds, .normal);
 
-        // A new width invalidates every cached height, since text wraps differently.
-        if (state.last_layout_bounds == null or state.last_layout_bounds.?.size.width != bounds.size.width) {
+        const padding = content_insets(&style_, bounds.size, window.rem_size());
+
+        // If the width of the list or the list content insets have changed,
+        // invalidate all cached item heights, since text/aspect items size differently.
+        const last_item_width: ?Pixels = if (state.last_layout_bounds) |last_b|
+            if (state.last_padding) |last_p| last_b.size.width - last_p.left - last_p.right else null
+        else
+            null;
+        if (last_item_width == null or last_item_width.? != bounds.size.width - padding.left - padding.right) {
             for (state.items.items) |*item| item.* = .{ .focus_handle = item.focus_handle };
             state.rebuild_heights();
             state.measuring_behavior.reset();
         }
 
-        const padding = style_.padding.to_pixels(.{
-            Size(geometry.AbsoluteLength){ .width = .{ .pixels = bounds.size.width }, .height = .{ .pixels = bounds.size.height } },
-            window.rem_size(),
-        });
         const layout = state.prepaint_items(bounds, padding, self.render_item, window, cx);
         state.last_layout_bounds = bounds;
         state.last_padding = padding;
@@ -4912,4 +4929,263 @@ fn open_focus_test(cx: *TestAppContext) *VisualTestContext {
     visual.* = .{ .window = handle.window(cx.app) orelse unreachable, .cx = cx };
     cx.visual_contexts.append(cx.allocator, visual) catch @panic("OOM");
     return visual;
+}
+
+const HorizontalPaddingTestView = struct {
+    const Self = @This();
+    state: ListState,
+    bounds_log: *std.ArrayList(Bounds(Pixels)),
+    padding_left: Pixels = 10,
+    padding_right: Pixels = 30,
+    border_left: Pixels = 0,
+    border_right: Pixels = 0,
+    sizing: ListSizingBehavior = .auto,
+    inferred_first_item_w: Pixels = 50,
+
+    pub fn render(self: *Self, _: *Window, cx: *Context(Self)) *Div {
+        var lst = list(self.state, cx.item_processor(render_item))
+            .with_sizing_behavior(self.sizing)
+            .pl(geometry.px(self.padding_left))
+            .pr(geometry.px(self.padding_right))
+            .border_l(geometry.px(self.border_left))
+            .border_r(geometry.px(self.border_right))
+            .h_full();
+        if (self.sizing == .auto) {
+            lst = lst.w_full();
+        }
+        return div_mod.div().flex().size_full().child(lst);
+    }
+
+    fn render_item(self: *Self, ix: usize, _: *Window, _: *Context(Self)) AnyElement {
+        if (self.sizing == .infer) {
+            if (ix == 0) {
+                return div_mod.div().w(geometry.px(self.inferred_first_item_w)).h(geometry.px(20)).into_any_element();
+            }
+            return div_mod.div().h(geometry.px(20)).w_full().child(canvas_mod.canvas(self.bounds_log, record_bounds, paint_nothing).size_full()).into_any_element();
+        }
+        return div_mod.div().w_full().aspect_ratio(2.0).child(canvas_mod.canvas(self.bounds_log, record_bounds, paint_nothing).size_full()).into_any_element();
+    }
+
+    fn record_bounds(log: *std.ArrayList(Bounds(Pixels)), bounds: Bounds(Pixels), _: *Window, _: *App) void {
+        log.append(std.testing.allocator, bounds) catch @panic("OOM");
+    }
+
+    fn paint_nothing(_: *std.ArrayList(Bounds(Pixels)), _: Bounds(Pixels), _: *void, _: *Window, _: *App) void {}
+
+    fn set_padding_right(self: *Self, pr_val: Pixels, cx: *Context(Self)) void {
+        self.padding_right = pr_val;
+        cx.notify();
+    }
+};
+
+test "list: horizontal padding insets items" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const state = ListState.new(10, .top, 0).measure_all();
+    defer state.deinit();
+    var item_bounds: std.ArrayList(Bounds(Pixels)) = .empty;
+    defer item_bounds.deinit(std.testing.allocator);
+
+    const Builder = struct {
+        var s: ListState = undefined;
+        var b: *std.ArrayList(Bounds(Pixels)) = undefined;
+        fn build(_: *Window, app: *App) Entity(HorizontalPaddingTestView) {
+            return app.new(HorizontalPaddingTestView{ .state = s, .bounds_log = b });
+        }
+    };
+    Builder.s = state;
+    Builder.b = &item_bounds;
+
+    const handle = cx.add_window_with_options(.{
+        .window_bounds = .{ .windowed = geometry.bounds(geometry.point(geometry.px(0), geometry.px(0)), geometry.size(geometry.px(100), geometry.px(100))) },
+    }, Builder.build);
+    const vcx = cx.allocator.create(VisualTestContext) catch @panic("OOM");
+    vcx.* = .{ .window = handle.window(cx.app) orelse unreachable, .cx = &cx };
+    cx.visual_contexts.append(cx.allocator, vcx) catch @panic("OOM");
+    vcx.run_until_parked();
+
+    try std.testing.expect(item_bounds.items.len > 0);
+    for (item_bounds.items) |b| {
+        try std.testing.expectEqual(@as(Pixels, 10), b.origin.x);
+        try std.testing.expectEqual(@as(Pixels, 60), b.size.width);
+    }
+    // Each item is 60px wide, so 30px tall: 300px in total over a 100px viewport -> 200px max offset.
+    try std.testing.expectEqual(@as(Pixels, 200), state.max_offset_for_scrollbar().y);
+
+    const reported = state.bounds_for_item(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(Pixels, 10), reported.origin.x);
+    try std.testing.expectEqual(@as(Pixels, 60), reported.size.width);
+}
+
+test "list: inferred width includes horizontal padding" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const state = ListState.new(2, .top, 10);
+    defer state.deinit();
+    var item_bounds: std.ArrayList(Bounds(Pixels)) = .empty;
+    defer item_bounds.deinit(std.testing.allocator);
+
+    const Builder = struct {
+        var s: ListState = undefined;
+        var b: *std.ArrayList(Bounds(Pixels)) = undefined;
+        fn build(_: *Window, app: *App) Entity(HorizontalPaddingTestView) {
+            return app.new(HorizontalPaddingTestView{
+                .state = s,
+                .bounds_log = b,
+                .sizing = .infer,
+            });
+        }
+    };
+    Builder.s = state;
+    Builder.b = &item_bounds;
+
+    const handle = cx.add_window_with_options(.{
+        .window_bounds = .{ .windowed = geometry.bounds(geometry.point(geometry.px(0), geometry.px(0)), geometry.size(geometry.px(200), geometry.px(100))) },
+    }, Builder.build);
+    const vcx = cx.allocator.create(VisualTestContext) catch @panic("OOM");
+    vcx.* = .{ .window = handle.window(cx.app) orelse unreachable, .cx = &cx };
+    cx.visual_contexts.append(cx.allocator, vcx) catch @panic("OOM");
+    vcx.run_until_parked();
+
+    try std.testing.expectEqual(@as(usize, 1), item_bounds.items.len);
+    const b = item_bounds.items[0];
+    try std.testing.expectEqual(@as(Pixels, 10), b.origin.x);
+    try std.testing.expectEqual(@as(Pixels, 50), b.size.width);
+}
+
+const AutoscrollPadView = struct {
+    state: ListState,
+
+    fn build(_: *Window, app: *App) Entity(@This()) {
+        return app.new(@This(){ .state = focus_test_state.? });
+    }
+
+    pub fn render(self: *@This(), _: *Window, cx: *Context(@This())) *Div {
+        return div_mod.div().w_full().h_full().child(
+            list(self.state, cx.item_processor(render_item))
+                .pl(geometry.px(10))
+                .pr(geometry.px(30))
+                .w_full()
+                .h_full(),
+        );
+    }
+
+    fn render_item(_: *@This(), ix: usize, _: *Window, _: *Context(@This())) AnyElement {
+        if (ix == 2) {
+            return div_mod.div().w_full().aspect_ratio(2.0).child(canvas_mod.canvas({}, request_above, paint_nothing).size_full()).into_any_element();
+        }
+        return div_mod.div().w_full().aspect_ratio(2.0).into_any_element();
+    }
+
+    fn request_above(_: void, bounds: Bounds(Pixels), window: *Window, _: *App) void {
+        window.request_autoscroll(Bounds(Pixels).from_corners(
+            point(bounds.left(), bounds.top() - 30),
+            point(bounds.right(), bounds.top() + 5),
+        ));
+    }
+
+    fn paint_nothing(_: void, _: Bounds(Pixels), _: *void, _: *Window, _: *App) void {}
+};
+
+test "list: autoscroll above item top with horizontal padding" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const state = ListState.new(5, .top, 0);
+    defer state.deinit();
+    state.scroll_to(.{ .item_ix = 2, .offset_in_item = 0 });
+
+    focus_test_state = state;
+    const handle = cx.add_window_with_options(.{
+        .window_bounds = .{ .windowed = geometry.bounds(geometry.point(geometry.px(0), geometry.px(0)), geometry.size(geometry.px(100), geometry.px(60))) },
+    }, AutoscrollPadView.build);
+    const vcx = cx.allocator.create(VisualTestContext) catch @panic("OOM");
+    vcx.* = .{ .window = handle.window(cx.app) orelse unreachable, .cx = &cx };
+    cx.visual_contexts.append(cx.allocator, vcx) catch @panic("OOM");
+    vcx.run_until_parked();
+
+    // Items are 60px wide, so 30px tall: 30px above item 2 is the top of item 1.
+    const scroll_top = state.logical_scroll_top();
+    try std.testing.expectEqual(@as(usize, 1), scroll_top.item_ix);
+    try std.testing.expectEqual(@as(Pixels, 0), scroll_top.offset_in_item);
+}
+
+test "list: horizontal padding change remeasures items" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const state = ListState.new(10, .top, 0).measure_all();
+    defer state.deinit();
+    var item_bounds: std.ArrayList(Bounds(Pixels)) = .empty;
+    defer item_bounds.deinit(std.testing.allocator);
+
+    const Builder = struct {
+        var s: ListState = undefined;
+        var b: *std.ArrayList(Bounds(Pixels)) = undefined;
+        fn build(_: *Window, app: *App) Entity(HorizontalPaddingTestView) {
+            return app.new(HorizontalPaddingTestView{ .state = s, .bounds_log = b, .padding_right = 30 });
+        }
+    };
+    Builder.s = state;
+    Builder.b = &item_bounds;
+
+    const handle = cx.add_window_with_options(.{
+        .window_bounds = .{ .windowed = geometry.bounds(geometry.point(geometry.px(0), geometry.px(0)), geometry.size(geometry.px(100), geometry.px(100))) },
+    }, Builder.build);
+    const vcx = cx.allocator.create(VisualTestContext) catch @panic("OOM");
+    vcx.* = .{ .window = handle.window(cx.app) orelse unreachable, .cx = &cx };
+    cx.visual_contexts.append(cx.allocator, vcx) catch @panic("OOM");
+    vcx.run_until_parked();
+
+    // 60px wide -> 30px tall -> 300px total -> 200px max offset.
+    try std.testing.expectEqual(@as(Pixels, 200), state.max_offset_for_scrollbar().y);
+
+    // Shrink right padding from 30 to 10 while list width stays 100 -> 80px wide -> 40px tall -> 300px max offset.
+    const view = handle.root(cx.app) catch unreachable;
+    cx.update_entity(view, HorizontalPaddingTestView.set_padding_right, .{@as(Pixels, 10)});
+    vcx.run_until_parked();
+    try std.testing.expectEqual(@as(Pixels, 300), state.max_offset_for_scrollbar().y);
+}
+
+test "list: border and padding inset items" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const state = ListState.new(10, .top, 0).measure_all();
+    defer state.deinit();
+    var item_bounds: std.ArrayList(Bounds(Pixels)) = .empty;
+    defer item_bounds.deinit(std.testing.allocator);
+
+    const Builder = struct {
+        var s: ListState = undefined;
+        var b: *std.ArrayList(Bounds(Pixels)) = undefined;
+        fn build(_: *Window, app: *App) Entity(HorizontalPaddingTestView) {
+            return app.new(HorizontalPaddingTestView{
+                .state = s,
+                .bounds_log = b,
+                .border_left = 4,
+                .padding_left = 6,
+                .border_right = 8,
+                .padding_right = 22,
+            });
+        }
+    };
+    Builder.s = state;
+    Builder.b = &item_bounds;
+
+    const handle = cx.add_window_with_options(.{
+        .window_bounds = .{ .windowed = geometry.bounds(geometry.point(geometry.px(0), geometry.px(0)), geometry.size(geometry.px(100), geometry.px(100))) },
+    }, Builder.build);
+    const vcx = cx.allocator.create(VisualTestContext) catch @panic("OOM");
+    vcx.* = .{ .window = handle.window(cx.app) orelse unreachable, .cx = &cx };
+    cx.visual_contexts.append(cx.allocator, vcx) catch @panic("OOM");
+    vcx.run_until_parked();
+
+    try std.testing.expect(item_bounds.items.len > 0);
+    for (item_bounds.items) |b| {
+        try std.testing.expectEqual(@as(Pixels, 10), b.origin.x);
+        try std.testing.expectEqual(@as(Pixels, 60), b.size.width);
+    }
+    try std.testing.expectEqual(@as(Pixels, 200), state.max_offset_for_scrollbar().y);
+
+    const reported = state.bounds_for_item(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(Pixels, 10), reported.origin.x);
+    try std.testing.expectEqual(@as(Pixels, 60), reported.size.width);
 }

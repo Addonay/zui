@@ -363,31 +363,37 @@ const MeasureCtx = struct {
         // an unconstrained probe must not inherit the size of a previously wrapped measurement.
         if (cached_measurement_size(st, wrap_width, truncate_width)) |cached| return cached;
 
-        var wrapper = ts.line_wrapper(text_style.font(), font_size);
-        defer wrapper.deinit();
-        const arena = window_mod.frame_arena();
-
         var text = self.text;
         var runs = self.runs;
+        var pre_shaped_lines: ?[]const WrappedLine = null;
         if (truncate_width) |tw| {
-            if (text_style.line_clamp) |max_lines| {
-                if (wrap_width) |ww| {
-                    const t = try wrapper.truncate_wrapped_line(arena, text, ww, max_lines, truncation_affix, runs, truncate_from);
-                    text = t.text;
-                    runs = t.runs;
-                }
-            }
-            if (text_style.line_clamp == null or wrap_width == null) {
+            const arena = window_mod.frame_arena();
+            if (text_style.line_clamp != null and wrap_width != null) {
+                var wrapper = ts.line_wrapper(text_style.font(), font_size);
+                defer wrapper.deinit();
+                const t = try wrapper.truncate_wrapped_line(arena, text, wrap_width.?, text_style.line_clamp.?, truncation_affix, runs, truncate_from);
+                text = t.text;
+                runs = t.runs;
+            } else {
                 // The unclipped text fits: keep it whole. The per-character width sum overestimates
-                // shaped width (no kerning), so check the shaped result first.
+                // shaped width (no kerning), so check the shaped result first without acquiring a
+                // LineWrapper.
+                var unclipped_ok: ?[]const WrappedLine = null;
                 const fits = blk: {
                     const unclipped = ts.shape_text(text, font_size, runs, null, null) catch break :blk false;
                     for (unclipped) |line| {
                         if (line.size(line_height).width > tw) break :blk false;
                     }
+                    unclipped_ok = unclipped;
                     break :blk true;
                 };
-                if (!fits) {
+                if (fits) {
+                    if (wrap_width == null and text_style.line_clamp == null) {
+                        pre_shaped_lines = unclipped_ok;
+                    }
+                } else {
+                    var wrapper = ts.line_wrapper(text_style.font(), font_size);
+                    defer wrapper.deinit();
                     const t = try wrapper.truncate_line(arena, text, tw, truncation_affix, runs, truncate_from);
                     text = t.text;
                     runs = t.runs;
@@ -395,10 +401,10 @@ const MeasureCtx = struct {
             }
         }
 
-        const lines = ts.shape_text(text, font_size, runs, wrap_width, text_style.line_clamp) catch {
+        const lines = pre_shaped_lines orelse (ts.shape_text(text, font_size, runs, wrap_width, text_style.line_clamp) catch {
             st.* = .{ .measured = true, .len = 0, .lines = &.{}, .line_height = line_height, .wrap_width = wrap_width, .truncate_width = truncate_width, .size = Size(Pixels){ .width = 0, .height = 0 } };
             return .{ .width = 0, .height = 0 };
-        };
+        });
 
         var size: Size(Pixels) = .{ .width = 0, .height = 0 };
         for (lines) |line| {
@@ -902,4 +908,53 @@ test "interactive text: shows a byte-index tooltip after the delay and dismisses
     vcx.simulate_mouse_move(.{ .x = 200, .y = 4 }, null, .{});
     vcx.run_until_parked();
     try testing.expect(vcx.window.tooltip_bounds == null);
+}
+
+const FastPathTextView = struct {
+    truncate_overflow: bool = false,
+    long_text: bool = false,
+
+    pub fn render(self: *FastPathTextView, _: *Window, _: *app_mod.Context(FastPathTextView)) *div_mod.Div {
+        const msg = if (self.long_text)
+            "this is a very long string that should definitely overflow a forty pixel box"
+        else
+            "hi";
+        var d = div_mod.div().w(40).h(40).child(text_element(msg));
+        if (self.truncate_overflow) d = d.text_ellipsis();
+        return d;
+    }
+
+    fn build(_: *Window, app: *App) app_mod.Entity(FastPathTextView) {
+        return app.new(FastPathTextView{});
+    }
+
+    fn set_mode(self: *FastPathTextView, truncate_overflow: bool, long_text: bool, cx: *app_mod.Context(FastPathTextView)) void {
+        self.truncate_overflow = truncate_overflow;
+        self.long_text = long_text;
+        cx.notify();
+    }
+};
+
+test "text measurement skips LineWrapper when not truncating or when text already fits" {
+    const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(FastPathTextView.build);
+    vcx.run_until_parked();
+
+    const ts = cx.app.text_system();
+    // Plain non-truncating text never touches LineWrapper / char_widths.
+    try testing.expectEqual(@as(usize, 0), ts.char_widths.count());
+
+    // Truncating text that fits inside 40px also skips LineWrapper when unclipped shape fits.
+    cx.update_entity(view, FastPathTextView.set_mode, .{ true, false });
+    vcx.run_until_parked();
+    try testing.expectEqual(@as(usize, 0), ts.char_widths.count());
+
+    // Truncating text that overflows acquires LineWrapper (populates char_widths) when fonts exist.
+    if (ts.fs.hasShaper() and ts.fs.fontIds().len > 0) {
+        cx.update_entity(view, FastPathTextView.set_mode, .{ true, true });
+        vcx.run_until_parked();
+        try testing.expect(ts.char_widths.count() > 0);
+    }
 }

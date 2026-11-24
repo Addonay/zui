@@ -287,9 +287,9 @@ pub const LineWrapper = struct {
         var indent: ?u32 = null;
         var truncate_ix: usize = 0;
 
-        var breaks: std.ArrayList(usize) = .empty;
-        defer breaks.deinit(self.allocator);
-        try break_indices_into(self.allocator, text, &breaks);
+        self.break_scratch.clearRetainingCapacity();
+        try break_indices_into(self.allocator, text, &self.break_scratch);
+        const breaks = self.break_scratch.items;
         var break_ix: usize = 0;
 
         var it = Chars.init(text);
@@ -298,7 +298,7 @@ pub const LineWrapper = struct {
             const c = ch.c;
             // Consume boundaries on newlines too, so skipping an empty line does not
             // leave the iterator stuck before subsequent text.
-            const is_break = break_ix < breaks.items.len and breaks.items[break_ix] == ix;
+            const is_break = break_ix < breaks.len and breaks[break_ix] == ix;
             if (is_break) break_ix += 1;
             if (c == '\n') {
                 if (line >= max_lines - 1 and !is_blank(text[ix + 1 ..])) {

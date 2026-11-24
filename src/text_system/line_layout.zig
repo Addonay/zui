@@ -271,12 +271,11 @@ pub const WrappedLineLayout = struct {
     boundaries: []WrapBoundary = &.{},
     /// The width the line was wrapped to, if any.
     wrap_width: ?Pixels = null,
-    /// The text of this line. Owned by the cache entry.
+    /// The text of this line. Borrows `unwrapped_layout.text`, which outlives this layout.
     text: []const u8 = &.{},
 
     pub fn deinit(self: *WrappedLineLayout, allocator: Allocator) void {
         allocator.free(self.boundaries);
-        allocator.free(self.text);
         self.* = .{};
     }
 
@@ -395,6 +394,7 @@ pub const WrappedLineLayout = struct {
 /// Scratch space reused by wrap-boundary computation.
 pub const WrapScratch = struct {
     glyph_indices: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    raw_breaks: std.ArrayList(usize) = .empty,
     break_indices: std.ArrayList(usize) = .empty,
     items: std.ArrayList(Item) = .empty,
 
@@ -402,6 +402,7 @@ pub const WrapScratch = struct {
 
     pub fn deinit(self: *WrapScratch, allocator: Allocator) void {
         self.glyph_indices.deinit(allocator);
+        self.raw_breaks.deinit(allocator);
         self.break_indices.deinit(allocator);
         self.items.deinit(allocator);
     }
@@ -420,11 +421,10 @@ pub fn compute_wrap_boundaries(
     // break opportunities that would separate those characters.
     scratch.glyph_indices.clearRetainingCapacity();
     for (layout.runs) |run| for (run.glyphs) |glyph| try scratch.glyph_indices.put(allocator, glyph.index, {});
+    scratch.raw_breaks.clearRetainingCapacity();
+    try line_wrapper.break_indices_into(allocator, text, &scratch.raw_breaks);
     scratch.break_indices.clearRetainingCapacity();
-    var breaks: std.ArrayList(usize) = .empty;
-    defer breaks.deinit(allocator);
-    try line_wrapper.break_indices_into(allocator, text, &breaks);
-    for (breaks.items) |b| {
+    for (scratch.raw_breaks.items) |b| {
         if (scratch.glyph_indices.contains(b)) try scratch.break_indices.append(allocator, b);
     }
     const break_indices = scratch.break_indices.items;
@@ -538,6 +538,7 @@ fn FrameCache(comptime V: type) type {
             font_size: Pixels,
             runs: []const FontRun,
             wrap_width: ?Pixels,
+            max_lines: ?usize = null,
             force_width: ?Pixels,
         };
 
@@ -546,6 +547,7 @@ fn FrameCache(comptime V: type) type {
             font_size: Pixels,
             runs: []FontRun,
             wrap_width: ?Pixels,
+            max_lines: ?usize = null,
             force_width: ?Pixels,
             value: V,
         };
@@ -559,26 +561,45 @@ fn FrameCache(comptime V: type) type {
         current_used: std.ArrayList(*Entry) = .empty,
         previous_used: std.ArrayList(*Entry) = .empty,
 
+        fn hash_opt_pixels(h: *std.hash.Wyhash, opt: ?Pixels) void {
+            if (opt) |v| {
+                const tag: u8 = 1;
+                const bits = text_system.canonical_float_bits(v);
+                h.update(&.{tag});
+                h.update(std.mem.asBytes(&bits));
+            } else {
+                h.update(&.{0});
+            }
+        }
+
         fn hash_key(k: Key) u64 {
             var h = std.hash.Wyhash.init(0x5a17_c0de);
             h.update(k.text);
-            h.update(std.mem.asBytes(&k.font_size));
+            const size_bits = text_system.canonical_float_bits(k.font_size);
+            h.update(std.mem.asBytes(&size_bits));
             for (k.runs) |run| {
                 h.update(std.mem.asBytes(&run.len));
                 h.update(std.mem.asBytes(&run.font_id));
             }
-            h.update(std.mem.asBytes(&k.wrap_width));
-            h.update(std.mem.asBytes(&k.force_width));
+            hash_opt_pixels(&h, k.wrap_width);
+            if (k.max_lines) |ml| {
+                h.update(&.{1});
+                h.update(std.mem.asBytes(&ml));
+            } else {
+                h.update(&.{0});
+            }
+            hash_opt_pixels(&h, k.force_width);
             return h.final();
         }
 
         fn matches(e: *const Entry, k: Key) bool {
-            if (e.font_size != k.font_size or e.wrap_width != k.wrap_width or e.force_width != k.force_width) return false;
+            if (e.value.text.len != k.text.len) return false;
+            if (e.font_size != k.font_size or e.wrap_width != k.wrap_width or e.max_lines != k.max_lines or e.force_width != k.force_width) return false;
             if (e.runs.len != k.runs.len) return false;
             for (e.runs, k.runs) |a, b| {
                 if (a.len != b.len or a.font_id != b.font_id) return false;
             }
-            return std.mem.eql(u8, e.value.text, k.text);
+            return e.value.text.ptr == k.text.ptr or std.mem.eql(u8, e.value.text, k.text);
         }
 
         /// Finds `k` in the current frame, or moves it from the previous frame into the current one.
@@ -588,12 +609,25 @@ fn FrameCache(comptime V: type) type {
                     try self.current_used.append(allocator, e);
                     return e;
                 }
+                for (self.current_extra.items) |extra| {
+                    if (extra.hash == h and matches(extra, k)) {
+                        try self.current_used.append(allocator, extra);
+                        return extra;
+                    }
+                }
             }
             if (self.previous.get(h)) |e| {
                 if (matches(e, k)) {
                     _ = self.previous.remove(h);
                     try self.insert(allocator, e);
                     return e;
+                }
+                for (self.previous_extra.items, 0..) |extra, i| {
+                    if (extra.hash == h and matches(extra, k)) {
+                        _ = self.previous_extra.swapRemove(i);
+                        try self.insert(allocator, extra);
+                        return extra;
+                    }
                 }
             }
             return null;
@@ -723,12 +757,13 @@ pub const LineLayoutCache = struct {
         max_lines: ?usize,
     ) !*const WrappedLineLayout {
         const Wrapped = FrameCache(WrappedLineLayout);
-        const key: Wrapped.Key = .{ .text = text, .font_size = font_size, .runs = runs, .wrap_width = wrap_width, .force_width = null };
+        const key: Wrapped.Key = .{ .text = text, .font_size = font_size, .runs = runs, .wrap_width = wrap_width, .max_lines = max_lines, .force_width = null };
         const h = Wrapped.hash_key(key);
         // The unwrapped layout must stay alive as long as this entry does, so fetch it
         // (which also moves it into the current frame) on every request.
         if (try self.wrapped.take(self.allocator, h, key)) |e| {
             e.value.unwrapped_layout = try self.layout_line(text, font_size, runs, null);
+            e.value.text = e.value.unwrapped_layout.text;
             return &e.value;
         }
 
@@ -736,10 +771,8 @@ pub const LineLayoutCache = struct {
         const boundaries: []WrapBoundary = if (wrap_width) |ww|
             try compute_wrap_boundaries(self.allocator, unwrapped, text, ww, max_lines, &self.wrap_scratch)
         else
-            try self.allocator.alloc(WrapBoundary, 0);
+            &.{};
         errdefer self.allocator.free(boundaries);
-        const owned_text = try self.allocator.dupe(u8, text);
-        errdefer self.allocator.free(owned_text);
         const owned_runs = try self.allocator.dupe(FontRun, runs);
         errdefer self.allocator.free(owned_runs);
 
@@ -750,8 +783,9 @@ pub const LineLayoutCache = struct {
             .font_size = font_size,
             .runs = owned_runs,
             .wrap_width = wrap_width,
+            .max_lines = max_lines,
             .force_width = null,
-            .value = .{ .unwrapped_layout = unwrapped, .boundaries = boundaries, .wrap_width = wrap_width, .text = owned_text },
+            .value = .{ .unwrapped_layout = unwrapped, .boundaries = boundaries, .wrap_width = wrap_width, .text = unwrapped.text },
         };
         try self.wrapped.insert(self.allocator, e);
         return &e.value;
@@ -1169,4 +1203,47 @@ test "split_at with multi-byte characters and an emoji" {
     try testing.expectEqual(@as(f32, 0), right.runs[0].glyphs[0].position.x);
     try testing.expectEqual(@as(f32, 32), left.width);
     try testing.expectEqual(@as(f32, 8), right.width);
+}
+
+test "wrap cache ignores the sign of zero wrap_width and font_size" {
+    var dummy: u8 = 0;
+    const runs = [_]FontRun{.{ .len = 2, .font_id = 1 }};
+
+    var cold = LineLayoutCache.init(testing.allocator, .{ .ctx = &dummy, .shape_fn = test_shape });
+    defer cold.deinit();
+    const cold_layout = try cold.layout_wrapped_line("ab", 0.0, &runs, 0.0, null);
+
+    var warm = LineLayoutCache.init(testing.allocator, .{ .ctx = &dummy, .shape_fn = test_shape });
+    defer warm.deinit();
+    const neg_entry = try warm.layout_wrapped_line("ab", -0.0, &runs, -0.0, null);
+    const pos_entry = try warm.layout_wrapped_line("ab", 0.0, &runs, 0.0, null);
+
+    try testing.expect(neg_entry == pos_entry);
+    try testing.expectEqual(cold_layout.wrap_boundaries().len, pos_entry.wrap_boundaries().len);
+}
+
+test "wrap cache distinguishes max_lines" {
+    var dummy: u8 = 0;
+    var cache = LineLayoutCache.init(testing.allocator, .{ .ctx = &dummy, .shape_fn = test_shape });
+    defer cache.deinit();
+    const text = "one two three four five six";
+    const runs = [_]FontRun{.{ .len = text.len, .font_id = 1 }};
+
+    const unclamped = try cache.layout_wrapped_line(text, 14, &runs, 50, null);
+    try testing.expect(unclamped.wrap_boundaries().len > 1);
+
+    const clamped = try cache.layout_wrapped_line(text, 14, &runs, 50, 1);
+    try testing.expect(clamped != unclamped);
+    try testing.expectEqual(@as(usize, 0), clamped.wrap_boundaries().len);
+}
+
+test "wrapped layout shares unwrapped text without copying" {
+    var dummy: u8 = 0;
+    var cache = LineLayoutCache.init(testing.allocator, .{ .ctx = &dummy, .shape_fn = test_shape });
+    defer cache.deinit();
+    const runs = [_]FontRun{.{ .len = 11, .font_id = 0 }};
+
+    const wrapped = try cache.layout_wrapped_line("hello world", 16, &runs, 40, null);
+    try testing.expectEqual(wrapped.unwrapped_layout.text.ptr, wrapped.text.ptr);
+    try testing.expectEqualStrings("hello world", wrapped.text);
 }
