@@ -167,30 +167,22 @@ fn srgb_to_linear_scalar(v: f32) f32 {
     return std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
 }
 
-const srgb_lut_size = 4096;
-/// `srgb_to_linear` sampled on a uniform grid; linear interpolation error is below 1e-7.
-const srgb_lut: [srgb_lut_size + 1]f32 = blk: {
-    @setEvalBranchQuota(10_000_000);
-    var table: [srgb_lut_size + 1]f32 = undefined;
-    for (0..srgb_lut_size + 1) |i| {
-        table[i] = srgb_to_linear_scalar(@as(f32, @floatFromInt(i)) / srgb_lut_size);
-    }
-    break :blk table;
-};
-
-/// `srgb_to_linear` for the lanes of a vector of pixels (values outside [0, 1] are clamped).
-fn srgb_to_linear4(v: F4) F4 {
+inline fn sat_safe(v: F4) F4 {
     const finite = @select(f32, v > zero4, v, zero4);
-    const x: [4]f32 = @min(finite, one4) * s4(srgb_lut_size);
-    var out: [4]f32 = undefined;
-    for (0..4) |i| {
-        const f = @min(x[i], srgb_lut_size - 1);
-        const base = @floor(f);
-        const idx: usize = @intFromFloat(base);
-        const frac = f - base;
-        out[i] = srgb_lut[idx] + (srgb_lut[idx + 1] - srgb_lut[idx]) * frac;
-    }
-    return out;
+    return @min(finite, one4);
+}
+
+/// `srgb_to_linear` for 4 pixel lanes using a branchless degree-5 minimax polynomial
+/// over [0.04045, 1.0] (max error < 3.5e-5, < 0.01/255 = zero 8-bit error).
+fn srgb_to_linear4(v: F4) F4 {
+    const c = sat_safe(v);
+    const low = c * s4(1.0 / 12.92);
+    var hi = s4(0.0530167195) * c + s4(-0.223318591);
+    hi = hi * c + s4(0.594468506);
+    hi = hi * c + s4(0.545740165);
+    hi = hi * c + s4(0.0290462519);
+    hi = hi * c + s4(0.0010585045);
+    return @select(f32, c < s4(0.04045), low, @min(hi, one4));
 }
 
 /// `oklab_to_linear_srgb` on channel vectors (`ch[3]` is alpha and passes through).
@@ -238,6 +230,13 @@ const BgPrep = struct {
     dir: [2]f32 = .{ 0, 0 },
     dir_len: f32 = 1,
     long_x: bool = true,
+    /// Precomputed linear-gradient affine coefficients: `t(x, py) = grad_t0 + (x - cx)*grad_dt_dx + (py - cy)*grad_dt_dy`.
+    grad_dt_dx: f32 = 0,
+    grad_dt_dy: f32 = 0,
+    grad_t0: f32 = 0,
+    grad_degenerate: bool = false,
+    grad_opaque: bool = false,
+    grad_ds: [4]f32 = .{ 0, 0, 0, 0 },
     /// Pattern height or checkerboard cell size.
     param: f32 = 0,
     cos: f32 = 1,
@@ -271,6 +270,18 @@ const BgPrep = struct {
                         p.stop[i] = .{ linear_to_srgb_scalar(c[0]), linear_to_srgb_scalar(c[1]), linear_to_srgb_scalar(c[2]), c[3] };
                     }
                 }
+                const extent = if (p.long_x) w else h;
+                const stop_span = p.stop_pct[1] - p.stop_pct[0];
+                const denom = p.dir_len * extent * stop_span;
+                if (denom != 0 and std.math.isFinite(denom)) {
+                    p.grad_dt_dx = p.dir[0] / denom;
+                    p.grad_dt_dy = p.dir[1] / denom;
+                    p.grad_t0 = (0.5 - p.stop_pct[0]) / stop_span;
+                } else {
+                    p.grad_degenerate = true;
+                }
+                p.grad_opaque = p.stop[0][3] >= 1.0 and p.stop[1][3] >= 1.0;
+                for (0..4) |k| p.grad_ds[k] = p.stop[1][k] - p.stop[0][k];
             },
             .pattern_slash => {
                 const g = bg.gradient_angle_or_pattern_height;
@@ -299,7 +310,20 @@ fn background_lanes(bp: *const BgPrep, ox: f32, oy: f32, x: F4, py: f32) Rgba4 {
     };
 }
 
-fn gradient_lanes(bp: *const BgPrep, ox: f32, oy: f32, x: F4, py: f32) Rgba4 {
+inline fn gradient_eval_t(bp: *const BgPrep, t: F4) Rgba4 {
+    var ch: [4]F4 = undefined;
+    inline for (0..4) |k| ch[k] = s4(bp.stop[0][k]) + s4(bp.grad_ds[k]) * t;
+    if (bp.oklab) {
+        oklab_to_linear4(&ch);
+    } else {
+        ch[0] = srgb_to_linear4(ch[0]);
+        ch[1] = srgb_to_linear4(ch[1]);
+        ch[2] = srgb_to_linear4(ch[2]);
+    }
+    return .{ .r = ch[0], .g = ch[1], .b = ch[2], .a = ch[3] };
+}
+
+fn gradient_lanes_degenerate(bp: *const BgPrep, ox: f32, oy: f32, x: F4, py: f32) Rgba4 {
     const hw = bp.size[0] * 0.5;
     const hh = bp.size[1] * 0.5;
     const ctp_x = x - s4(ox + hw);
@@ -311,18 +335,15 @@ fn gradient_lanes(bp: *const BgPrep, ox: f32, oy: f32, x: F4, py: f32) Rgba4 {
         t = (t + s4(hh)) / s4(bp.size[1]);
     }
     t = (t - s4(bp.stop_pct[0])) / s4(bp.stop_pct[1] - bp.stop_pct[0]);
-    t = sat(t);
-    const inv_t = one4 - t;
-    var ch: [4]F4 = undefined;
-    for (0..4) |k| ch[k] = s4(bp.stop[0][k]) * inv_t + s4(bp.stop[1][k]) * t;
-    if (bp.oklab) {
-        oklab_to_linear4(&ch);
-    } else {
-        ch[0] = srgb_to_linear4(ch[0]);
-        ch[1] = srgb_to_linear4(ch[1]);
-        ch[2] = srgb_to_linear4(ch[2]);
-    }
-    return .{ .r = ch[0], .g = ch[1], .b = ch[2], .a = ch[3] };
+    return gradient_eval_t(bp, sat(t));
+}
+
+fn gradient_lanes(bp: *const BgPrep, ox: f32, oy: f32, x: F4, py: f32) Rgba4 {
+    if (bp.grad_degenerate) return gradient_lanes_degenerate(bp, ox, oy, x, py);
+    const hw = bp.size[0] * 0.5;
+    const hh = bp.size[1] * 0.5;
+    const t_row = bp.grad_t0 + (py - (oy + hh)) * bp.grad_dt_dy - (ox + hw) * bp.grad_dt_dx;
+    return gradient_eval_t(bp, sat(s4(t_row) + x * s4(bp.grad_dt_dx)));
 }
 
 fn pattern_lanes(bp: *const BgPrep, ox: f32, oy: f32, x: F4, py: f32) Rgba4 {
@@ -490,36 +511,152 @@ inline fn blend_lanes(t: Target, y: usize, x0: usize, n: usize, c: Rgba4) void {
     for (0..n) |i| blend_px(t, x0 + i, y, .{ ra[i], ga[i], ba[i], aa[i] });
 }
 
-fn fill_opaque(t: Target, y: usize, x0: usize, x1: usize, c: [4]f32) void {
-    const px = t.pack(c);
-    var pattern: [16]u8 = undefined;
-    for (0..4) |i| pattern[i * 4 ..][0..4].* = px;
-    const pattern_v: U16 = pattern;
+/// Precomputed per-primitive solid fill coefficients (packed 32-byte SIMD pattern for opaque
+/// fills, or pre-shuffled `Blend16` for translucent fills) so row loops avoid per-span prep.
+const SolidFill = struct {
+    opaque_fill: bool,
+    visible: bool,
+    px_bytes: [4]u8,
+    pattern16: U16,
+    pattern32: @Vector(32, u8),
+    blend16: Blend16,
+    scalar: [4]f32,
+
+    fn init(t: Target, c: [4]f32) SolidFill {
+        if (!(c[3] > 0)) return .{
+            .opaque_fill = false,
+            .visible = false,
+            .px_bytes = .{ 0, 0, 0, 0 },
+            .pattern16 = @splat(0),
+            .pattern32 = @splat(0),
+            .blend16 = undefined,
+            .scalar = c,
+        };
+        const px = t.pack(c);
+        const px32: u32 = @bitCast(px);
+        return .{
+            .opaque_fill = c[3] >= 1.0,
+            .visible = true,
+            .px_bytes = px,
+            .pattern16 = @bitCast(@as(@Vector(4, u32), @splat(px32))),
+            .pattern32 = @bitCast(@as(@Vector(8, u32), @splat(px32))),
+            .blend16 = if (c[3] >= 1.0) undefined else Blend16.from(Rgba4.splat(c), t.bgra),
+            .scalar = c,
+        };
+    }
+
+    fn init_overwrite(t: Target, c: [4]f32) SolidFill {
+        const px = t.pack(c);
+        const px32: u32 = @bitCast(px);
+        return .{
+            .opaque_fill = true,
+            .visible = true,
+            .px_bytes = px,
+            .pattern16 = @bitCast(@as(@Vector(4, u32), @splat(px32))),
+            .pattern32 = @bitCast(@as(@Vector(8, u32), @splat(px32))),
+            .blend16 = undefined,
+            .scalar = c,
+        };
+    }
+
+    inline fn fill_row(self: *const SolidFill, t: Target, y: usize, x0: usize, x1: usize) void {
+        if (!self.visible or x0 >= x1) return;
+        var off = t.offset(x0, y);
+        var x = x0;
+        if (self.opaque_fill) {
+            while (x + 8 <= x1) : (x += 8) {
+                t.bytes[off..][0..32].* = self.pattern32;
+                off += 32;
+            }
+            if (x + 4 <= x1) {
+                t.bytes[off..][0..16].* = self.pattern16;
+                off += 16;
+                x += 4;
+            }
+            while (x < x1) : (x += 1) {
+                t.bytes[off..][0..4].* = self.px_bytes;
+                off += 4;
+            }
+            return;
+        }
+        while (x + 4 <= x1) : (x += 4) {
+            blend4(t, off, self.blend16);
+            off += 16;
+        }
+        while (x < x1) : (x += 1) {
+            t.store(off, over_straight(t.load(off), self.scalar));
+            off += 4;
+        }
+    }
+};
+
+inline fn store_opaque4(t: Target, off: usize, r: F4, g: F4, b: F4) void {
+    if (comptime builtin.cpu.arch.endian() == .little) {
+        const c0 = if (t.bgra) b else r;
+        const c2 = if (t.bgra) r else b;
+        const c0_u: @Vector(4, u32) = @intFromFloat(sat_safe(c0) * s4(255.0) + s4(0.5));
+        const g_u: @Vector(4, u32) = @intFromFloat(sat_safe(g) * s4(255.0) + s4(0.5));
+        const c2_u: @Vector(4, u32) = @intFromFloat(sat_safe(c2) * s4(255.0) + s4(0.5));
+        const packed4: @Vector(4, u32) = c0_u |
+            (g_u << @as(@Vector(4, u5), @splat(8))) |
+            (c2_u << @as(@Vector(4, u5), @splat(16))) |
+            @as(@Vector(4, u32), @splat(0xff000000));
+        t.bytes[off..][0..16].* = @bitCast(packed4);
+    } else {
+        blend4(t, off, Blend16.from(.{ .r = r, .g = g, .b = b, .a = one4 }, t.bgra));
+    }
+}
+
+fn fill_linear_gradient_span(t: Target, y: usize, x0: usize, x1: usize, bp: *const BgPrep, ox: f32, oy: f32) void {
+    if (x0 >= x1) return;
+    const py = @as(f32, @floatFromInt(y)) + 0.5;
+    if (bp.grad_degenerate) {
+        var x = x0;
+        while (x < x1) : (x += 4) {
+            const n = @min(4, x1 - x);
+            blend_lanes(t, y, x, n, gradient_lanes_degenerate(bp, ox, oy, x_lanes(x), py));
+        }
+        return;
+    }
+    const t_row = bp.grad_t0 + (py - (oy + bp.size[1] * 0.5)) * bp.grad_dt_dy - (ox + bp.size[0] * 0.5) * bp.grad_dt_dx;
+    var t_vec = s4(t_row) + x_lanes(x0) * s4(bp.grad_dt_dx);
+    const step_t = s4(4.0 * bp.grad_dt_dx);
     var x = x0;
-    while (x + 4 <= x1) : (x += 4) t.bytes[t.offset(x, y)..][0..16].* = pattern_v;
-    while (x < x1) : (x += 1) t.bytes[t.offset(x, y)..][0..4].* = px;
+    var off = t.offset(x0, y);
+    if (bp.grad_opaque) {
+        while (x + 4 <= x1) : (x += 4) {
+            const rgba = gradient_eval_t(bp, sat(t_vec));
+            store_opaque4(t, off, rgba.r, rgba.g, rgba.b);
+            off += 16;
+            t_vec += step_t;
+        }
+    } else {
+        while (x + 4 <= x1) : (x += 4) {
+            const rgba = gradient_eval_t(bp, sat(t_vec));
+            blend4(t, off, Blend16.from(rgba, t.bgra));
+            off += 16;
+            t_vec += step_t;
+        }
+    }
+    if (x < x1) {
+        const rgba = gradient_eval_t(bp, sat(t_vec));
+        blend_lanes(t, y, x, x1 - x, rgba);
+    }
 }
 
 /// Fills pixels [x0, x1) of row `y` with a background (solid, gradient or pattern).
-fn fill_span(t: Target, y: usize, x0: usize, x1: usize, bp: *const BgPrep, ox: f32, oy: f32) void {
-    if (bp.tag == .solid) {
-        const c = bp.solid;
-        if (!(c[3] > 0)) return;
-        if (c[3] >= 1) {
-            fill_opaque(t, y, x0, x1, c);
-            return;
-        }
-        const bl = Blend16.from(Rgba4.splat(c), t.bgra);
-        var x = x0;
-        while (x + 4 <= x1) : (x += 4) blend4(t, t.offset(x, y), bl);
-        while (x < x1) : (x += 1) blend_px(t, x, y, .{ c[0], c[1], c[2], c[3] });
-        return;
-    }
-    const py = @as(f32, @floatFromInt(y)) + 0.5;
-    var x = x0;
-    while (x < x1) : (x += 4) {
-        const n = @min(4, x1 - x);
-        blend_lanes(t, y, x, n, background_lanes(bp, ox, oy, x_lanes(x), py));
+fn fill_span_fast(t: Target, y: usize, x0: usize, x1: usize, bp: *const BgPrep, sf: *const SolidFill, ox: f32, oy: f32) void {
+    switch (bp.tag) {
+        .solid => sf.fill_row(t, y, x0, x1),
+        .linear_gradient => fill_linear_gradient_span(t, y, x0, x1, bp, ox, oy),
+        .pattern_slash, .checkerboard => {
+            const py = @as(f32, @floatFromInt(y)) + 0.5;
+            var x = x0;
+            while (x < x1) : (x += 4) {
+                const n = @min(4, x1 - x);
+                blend_lanes(t, y, x, n, background_lanes(bp, ox, oy, x_lanes(x), py));
+            }
+        },
     }
 }
 
@@ -899,10 +1036,18 @@ fn draw_quad(t: Target, q: *const Quad) void {
     if (q.background.is_transparent() and !border_visible) return;
     const r = rect_pixels(q.bounds, q.content_mask.bounds, t) orelse return;
     const g = QuadGeom.init(q);
+    const sf = if (g.bg.tag == .solid) SolidFill.init(t, g.bg.solid) else SolidFill.init(t, .{ 0, 0, 0, 0 });
 
     const no_border = bw.top == 0 and bw.right == 0 and bw.bottom == 0 and bw.left == 0;
     if (g.unrounded and no_border) {
-        for (r.y0..r.y1) |y| fill_span(t, y, r.x0, r.x1, &g.bg, g.rr.ox, g.rr.oy);
+        switch (g.bg.tag) {
+            .solid => {
+                if (!sf.visible) return;
+                for (r.y0..r.y1) |y| sf.fill_row(t, y, r.x0, r.x1);
+            },
+            .linear_gradient => for (r.y0..r.y1) |y| fill_linear_gradient_span(t, y, r.x0, r.x1, &g.bg, g.rr.ox, g.rr.oy),
+            .pattern_slash, .checkerboard => for (r.y0..r.y1) |y| fill_span_fast(t, y, r.x0, r.x1, &g.bg, &sf, g.rr.ox, g.rr.oy),
+        }
         return;
     }
 
@@ -911,7 +1056,7 @@ fn draw_quad(t: Target, q: *const Quad) void {
         const inner = quad_interior(&g, py, r.x0, r.x1);
         if (inner[0] < inner[1]) {
             quad_edge(t, y, r.x0, inner[0], &g);
-            fill_span(t, y, inner[0], inner[1], &g.bg, g.rr.ox, g.rr.oy);
+            fill_span_fast(t, y, inner[0], inner[1], &g.bg, &sf, g.rr.ox, g.rr.oy);
             quad_edge(t, y, inner[1], r.x1, &g);
         } else {
             quad_edge(t, y, r.x0, r.x1, &g);
@@ -1076,10 +1221,8 @@ fn draw_underline(t: Target, u: *const Underline) void {
     const col = hsla_to_rgba(u.color);
     if (u.wavy.value == 0) {
         // blend_color(color, color.a) multiplies alpha by alpha again, as the shader does.
-        const c = [4]f32{ col[0], col[1], col[2], col[3] * col[3] };
-        for (r.y0..r.y1) |y| {
-            for (r.x0..r.x1) |x| blend_px(t, x, y, .{ c[0], c[1], c[2], c[3] });
-        }
+        const sf = SolidFill.init(t, .{ col[0], col[1], col[2], col[3] * col[3] });
+        for (r.y0..r.y1) |y| sf.fill_row(t, y, r.x0, r.x1);
         return;
     }
 
@@ -1248,6 +1391,13 @@ inline fn gamma_correct(s: f32, k: f32, adj: f32, off: f32) f32 {
     return ca + ca * (1.0 - ca) * corr;
 }
 
+/// Applies `apply_contrast_and_gamma_correction` to 4 coverage lanes.
+inline fn gamma_correct4(s: F4, k: F4, adj: F4, off: F4) F4 {
+    const ca = s * (k + one4) / (s * k + one4);
+    const corr = adj * ca + off;
+    return ca + ca * (one4 - ca) * corr;
+}
+
 fn draw_mono(t: Target, tex: *const CpuTexture, sp: *const MonochromeSprite) void {
     if (sp.color.a == 0) return;
     const xf = SpriteXf.init(sp.transformation, sp.bounds) orelse return;
@@ -1258,6 +1408,63 @@ fn draw_mono(t: Target, tex: *const CpuTexture, sp: *const MonochromeSprite) voi
     const adj = gamma_ratios[0] * brightness + gamma_ratios[1];
     const off = gamma_ratios[2] * brightness + gamma_ratios[3];
     const tile = tile_texels(sp.tile);
+
+    // Fast path for 1:1 pixel-aligned unscaled monochrome glyphs (99%+ of shaped UI text).
+    if (tex.bytes_per_pixel == 1 and xf.b == 0 and xf.c == 0 and xf.a == 1 and xf.d == 1 and
+        xf.w == tile[2] and xf.h == tile[3])
+    {
+        const ox_d = xf.ox + xf.tx;
+        const oy_d = xf.oy + xf.ty;
+        if (@floor(ox_d) == ox_d and @floor(oy_d) == oy_d) {
+            const tile_x0: isize = sp.tile.bounds.origin.x;
+            const tile_y0: isize = sp.tile.bounds.origin.y;
+            const ox_i: isize = @intFromFloat(ox_d);
+            const oy_i: isize = @intFromFloat(oy_d);
+            const tx_start_i = tile_x0 + (@as(isize, @intCast(r.x0)) - ox_i);
+            const ty_start_i = tile_y0 + (@as(isize, @intCast(r.y0)) - oy_i);
+            const span_w = r.x1 - r.x0;
+            const span_h = r.y1 - r.y0;
+            if (tx_start_i >= 0 and ty_start_i >= 0 and
+                @as(usize, @intCast(tx_start_i)) + span_w <= tex.width and
+                @as(usize, @intCast(ty_start_i)) + span_h <= tex.height)
+            {
+                const tx_start: usize = @intCast(tx_start_i);
+                const ty_start: usize = @intCast(ty_start_i);
+                const tex_stride: usize = tex.width;
+                const k4 = s4(k);
+                const adj4 = s4(adj);
+                const off4 = s4(off);
+                const r4 = s4(col[0]);
+                const g4 = s4(col[1]);
+                const b4 = s4(col[2]);
+                const a4 = s4(col[3]);
+                for (0..span_h) |dy| {
+                    const y = r.y0 + dy;
+                    const tex_row = tex.bytes[(ty_start + dy) * tex_stride + tx_start ..];
+                    var dst_off = t.offset(r.x0, y);
+                    var dx: usize = 0;
+                    while (dx + 4 <= span_w) : ({
+                        dx += 4;
+                        dst_off += 16;
+                    }) {
+                        const raw4: [4]u8 = tex_row[dx..][0..4].*;
+                        if (@as(u32, @bitCast(raw4)) == 0) continue;
+                        const s = @as(F4, @floatFromInt(@as(@Vector(4, u8), raw4))) * s4(1.0 / 255.0);
+                        const alpha = gamma_correct4(s, k4, adj4, off4) * a4;
+                        blend4(t, dst_off, Blend16.from(.{ .r = r4, .g = g4, .b = b4, .a = alpha }, t.bgra));
+                    }
+                    while (dx < span_w) : (dx += 1) {
+                        const raw = tex_row[dx];
+                        if (raw == 0) continue;
+                        const alpha = gamma_correct(unorm(raw), k, adj, off);
+                        blend_px(t, r.x0 + dx, y, .{ col[0], col[1], col[2], col[3] * alpha });
+                    }
+                }
+                return;
+            }
+        }
+    }
+
     for (r.y0..r.y1) |y| {
         const py = @as(f32, @floatFromInt(y)) + 0.5;
         for (r.x0..r.x1) |x| {
@@ -1407,6 +1614,7 @@ fn draw_path(t: Target, p: *const scene.Path(ScaledPixels)) void {
     const clip = p.content_mask.bounds;
     const pb = p.paint_bounds();
     const bp = BgPrep.init(p.color, pb.size.width, pb.size.height);
+    const sf = if (bp.tag == .solid) SolidFill.init(t, bp.solid) else SolidFill.init(t, .{ 0, 0, 0, 0 });
     const ox = pb.origin.x;
     const oy = pb.origin.y;
     const even_odd = p.even_odd;
@@ -1420,24 +1628,25 @@ fn draw_path(t: Target, p: *const scene.Path(ScaledPixels)) void {
             },
         };
         const r = rect_pixels(tile_bounds, clip, t) orelse continue;
+        if (tile.curve_count == 0) {
+            for (r.y0..r.y1) |py_i| fill_span_fast(t, py_i, r.x0, r.x1, &bp, &sf, ox, oy);
+            continue;
+        }
         const tile_curves = curves[tile.curve_start .. tile.curve_start + tile.curve_count];
+        const x0_f: f32 = @floatFromInt(r.x0);
+        const x1_f: f32 = @floatFromInt(r.x1);
+        const cx_start: usize = @intFromFloat(std.math.clamp(@ceil(tile.curves_top_left.x - 0.5), x0_f, x1_f));
+        const cx_end: usize = @intFromFloat(std.math.clamp(@floor(tile.curves_bottom_right.x - 0.5) + 1.0, @as(f32, @floatFromInt(cx_start)), x1_f));
 
         for (r.y0..r.y1) |py_i| {
             const cy = @as(f32, @floatFromInt(py_i)) + 0.5;
-            if (tile.curve_count == 0 or (bp.tag == .solid and (cy < tile.curves_top_left.y or cy > tile.curves_bottom_right.y))) {
-                fill_span(t, py_i, r.x0, r.x1, &bp, ox, oy);
+            if (cy < tile.curves_top_left.y or cy > tile.curves_bottom_right.y) {
+                fill_span_fast(t, py_i, r.x0, r.x1, &bp, &sf, ox, oy);
                 continue;
             }
-            for (r.x0..r.x1) |px_i| {
+            if (r.x0 < cx_start) fill_span_fast(t, py_i, r.x0, cx_start, &bp, &sf, ox, oy);
+            for (cx_start..cx_end) |px_i| {
                 const cx = @as(f32, @floatFromInt(px_i)) + 0.5;
-                if (bp.tag == .solid and
-                    (cx < tile.curves_top_left.x or cy < tile.curves_top_left.y or
-                        cx > tile.curves_bottom_right.x or cy > tile.curves_bottom_right.y))
-                {
-                    blend_px(t, px_i, py_i, .{ bp.solid[0], bp.solid[1], bp.solid[2], bp.solid[3] });
-                    continue;
-                }
-
                 var wx: f32 = @floatFromInt(tile.backdrop);
                 var wy: f32 = wx;
                 var weight_x: f32 = 0.0;
@@ -1468,6 +1677,7 @@ fn draw_path(t: Target, p: *const scene.Path(ScaledPixels)) void {
                 const bgc = background_lanes(&bp, ox, oy, s4(cx), cy);
                 blend_px(t, px_i, py_i, .{ bgc.r[0], bgc.g[0], bgc.b[0], bgc.a[0] * coverage });
             }
+            if (cx_end < r.x1) fill_span_fast(t, py_i, cx_end, r.x1, &bp, &sf, ox, oy);
         }
     }
 }
@@ -1532,7 +1742,8 @@ pub const CpuRenderer = struct {
     fn draw_band(self: *CpuRenderer, index: usize, sc: *const Scene, atlas_: *const CpuAtlas, t: Target, clear_px: [4]f32) void {
         _ = self;
         _ = index;
-        for (t.y0..t.y1) |y| fill_opaque(t, y, 0, t.width, clear_px);
+        const clear_fill = SolidFill.init_overwrite(t, clear_px);
+        for (t.y0..t.y1) |y| clear_fill.fill_row(t, y, 0, t.width);
 
         var batches = sc.batches();
         while (batches.next()) |batch| switch (batch) {
@@ -2210,5 +2421,120 @@ test "a transparent clear is transparent and a half quad lands premultiplied" {
     try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, target.at(3, 3));
     // Red at half alpha, premultiplied: color 0.5 and alpha 0.5, i.e. 128 in each.
     try testing.expectEqual([4]u8{ 128, 0, 0, 128 }, target.at(1, 1));
+}
+
+test "srgb_to_linear4 polynomial matches exact pow(2.4) within 5e-5" {
+    var i: usize = 0;
+    while (i <= 1024) : (i += 4) {
+        const v: F4 = .{
+            @as(f32, @floatFromInt(i)) / 1024.0,
+            @as(f32, @floatFromInt(@min(i + 1, 1024))) / 1024.0,
+            @as(f32, @floatFromInt(@min(i + 2, 1024))) / 1024.0,
+            @as(f32, @floatFromInt(@min(i + 3, 1024))) / 1024.0,
+        };
+        const got: [4]f32 = srgb_to_linear4(v);
+        const va: [4]f32 = v;
+        for (0..4) |lane| {
+            const want = srgb_to_linear_scalar(va[lane]);
+            try testing.expectApproxEqAbs(want, got[lane], 5e-5);
+        }
+    }
+    // Out-of-range and NaN inputs clamp safely to [0, 1].
+    const edge: [4]f32 = srgb_to_linear4(.{ -0.5, 0.0, 1.5, std.math.nan(f32) });
+    try testing.expectEqual(@as(f32, 0.0), edge[0]);
+    try testing.expectEqual(@as(f32, 0.0), edge[1]);
+    try testing.expectEqual(@as(f32, 1.0), edge[2]);
+    try testing.expectEqual(@as(f32, 0.0), edge[3]);
+}
+
+test "draw_mono fast path matches bilinear fallback on aligned glyphs" {
+    var atlas_ = CpuAtlas.init(testing.allocator);
+    defer atlas_.deinit();
+    var glyph: [7 * 5]u8 = undefined;
+    for (&glyph, 0..) |*b, idx| b.* = @intCast((idx * 37) & 0xff);
+    const tile = try atlas_.insert(.monochrome, .{ .width = 7, .height = 5 }, &glyph);
+
+    var sc_fast = Scene.init(testing.allocator);
+    defer sc_fast.deinit();
+    try sc_fast.insert_primitive(.{ .monochrome_sprite = .{
+        .tile = tile,
+        .bounds = test_rect(3, 4, 7, 5),
+        .content_mask = test_mask(0, 0, 16, 16),
+        .color = color.hsla(0.1, 0.8, 0.6, 0.9),
+    } });
+    sc_fast.finish();
+
+    // Non-1:1 tiny scale perturbation exercises the general bilinear path for exact comparison.
+    var sc_general = Scene.init(testing.allocator);
+    defer sc_general.deinit();
+    try sc_general.insert_primitive(.{ .monochrome_sprite = .{
+        .tile = tile,
+        .bounds = test_rect(3, 4, 7.0001, 5),
+        .content_mask = test_mask(0, 0, 16, 16),
+        .color = color.hsla(0.1, 0.8, 0.6, 0.9),
+    } });
+    sc_general.finish();
+
+    var fb_fast = try TestFb.init(16, 16, .{ 20, 30, 40, 255 });
+    defer fb_fast.deinit();
+    var fb_general = try TestFb.init(16, 16, .{ 20, 30, 40, 255 });
+    defer fb_general.deinit();
+
+    var renderer = CpuRenderer.init(testing.allocator);
+    defer renderer.deinit();
+    renderer.threads = 1;
+    renderer.draw(&sc_fast, &atlas_, fb_fast.fb, color.black());
+    renderer.draw(&sc_general, &atlas_, fb_general.fb, color.black());
+    for (fb_fast.buffer, fb_general.buffer) |a, b| {
+        const diff = if (a > b) a - b else b - a;
+        try testing.expect(diff <= 1);
+    }
+}
+
+test "bench: 10k gradients & opaque quads at 1920x1080 (ReleaseFast only)" {
+    if (builtin.mode != .fast) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x5eed2);
+    const random = prng.random();
+    const width = 1920;
+    const height = 1080;
+    const full: Bounds(ScaledPixels) = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = width, .height = height } };
+
+    const pixels = try testing.allocator.alloc(u8, width * height * 4);
+    defer testing.allocator.free(pixels);
+    const fb: Framebuffer = .{ .pixels = pixels, .width = width, .height = height, .stride = width * 4, .format = .rgba8 };
+    var renderer = CpuRenderer.init(testing.allocator);
+    defer renderer.deinit();
+    var cpu_atlas = CpuAtlas.init(testing.allocator);
+    defer cpu_atlas.deinit();
+
+    inline for (.{ "opaque", "srgb_grad", "oklab_grad" }) |kind| {
+        var sc = Scene.init(testing.allocator);
+        defer sc.deinit();
+        for (0..10_000) |_| {
+            const w = 8 + random.float(f32) * 200;
+            const h = 8 + random.float(f32) * 100;
+            const x = random.float(f32) * (width - w);
+            const y = random.float(f32) * (height - h);
+            const c0 = color.hsla(random.float(f32), 0.7, 0.5, 1.0);
+            const c1 = color.hsla(random.float(f32), 0.7, 0.5, 1.0);
+            const bg = if (comptime std.mem.eql(u8, kind, "opaque"))
+                color.solid_background(c0)
+            else if (comptime std.mem.eql(u8, kind, "srgb_grad"))
+                color.linear_gradient(45, color.linear_color_stop(c0, 0), color.linear_color_stop(c1, 1))
+            else
+                color.linear_gradient(45, color.linear_color_stop(c0, 0), color.linear_color_stop(c1, 1)).with_color_space(.oklab);
+            try sc.insert_primitive(.{ .quad = .{
+                .bounds = .{ .origin = .{ .x = x, .y = y }, .size = .{ .width = w, .height = h } },
+                .content_mask = .{ .bounds = full },
+                .background = bg,
+            } });
+        }
+        sc.finish();
+        renderer.draw(&sc, &cpu_atlas, fb, color.black());
+        const start = now_ns();
+        for (0..20) |_| renderer.draw(&sc, &cpu_atlas, fb, color.black());
+        const mean_us = (now_ns() - start) / 20 / 1000;
+        std.debug.print("cpu bench ({s}): 10000 quads 1920x1080: {d} us/frame\n", .{ kind, mean_us });
+    }
 }
 

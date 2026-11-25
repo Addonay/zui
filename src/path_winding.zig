@@ -395,15 +395,10 @@ const Run = struct {
 
     fn shades_like(self: Run, other: Run, keys: []const u64) bool {
         if (self.backdrop != other.backdrop) return false;
-        const a = if (self.list_start <= self.list_end and self.list_end <= keys.len)
-            keys[self.list_start..self.list_end]
-        else
-            &[_]u64{};
-        const b = if (other.list_start <= other.list_end and other.list_end <= keys.len)
-            keys[other.list_start..other.list_end]
-        else
-            &[_]u64{};
-        return std.mem.eql(u64, a, b);
+        const len = self.list_end - self.list_start;
+        if (len != other.list_end - other.list_start) return false;
+        if (len == 0) return true;
+        return std.mem.eql(u64, keys[self.list_start..self.list_end], keys[other.list_start..other.list_end]);
     }
 };
 
@@ -591,16 +586,17 @@ pub const Binner = struct {
         var min_pt: Point(f32) = .{ .x = inf, .y = inf };
         var max_pt: Point(f32) = .{ .x = -inf, .y = -inf };
         var length: f32 = 0.0;
-        self.input.clearRetainingCapacity();
-        try self.input.ensureTotalCapacity(self.allocator, curves_in.len);
-        for (curves_in) |curve| {
+        try self.input.resize(self.allocator, curves_in.len);
+        for (curves_in, self.input.items) |curve, *slot| {
             const sc = curve.scaled(scale_factor);
-            min_pt.x = fastMin(min_pt.x, sc.min_x());
-            max_pt.x = fastMax(max_pt.x, sc.max_x());
+            const mn_x = sc.min_x();
+            const mx_x = sc.max_x();
+            min_pt.x = fastMin(min_pt.x, mn_x);
+            max_pt.x = fastMax(max_pt.x, mx_x);
             min_pt.y = fastMin(min_pt.y, sc.p0.y);
             max_pt.y = fastMax(max_pt.y, sc.p1.y);
-            length += sc.max_x() - sc.min_x() + sc.p1.y - sc.p0.y;
-            self.input.appendAssumeCapacity(sc);
+            length += mx_x - mn_x + sc.p1.y - sc.p0.y;
+            slot.* = sc;
         }
         return .{ .min = min_pt, .max = max_pt, .length = length };
     }
@@ -608,64 +604,77 @@ pub const Binner = struct {
     fn findSpans(self: *Binner, grid: Grid) !void {
         const cells = grid.rows * grid.columns;
         self.spans.clearRetainingCapacity();
+        try self.spans.ensureTotalCapacity(self.allocator, self.input.items.len);
         try self.cell_ends.resize(self.allocator, cells);
-        @memset(self.cell_ends.items, 0);
+        const cell_ends = self.cell_ends.items;
+        @memset(cell_ends, 0);
         try self.steps.resize(self.allocator, cells);
-        @memset(self.steps.items, 0);
+        const steps = self.steps.items;
+        @memset(steps, 0);
 
+        const cs = grid.cell_size;
+        const cols = grid.columns;
         for (self.input.items, 0..) |curve, index| {
             const key: u64 = (@as(u64, ordered_bits(curve.min_x())) << 32) | @as(u64, index);
             const row_first = grid.row_of(curve.p0.y - MARGIN);
             const row_last = grid.row_of(curve.p1.y + MARGIN);
-            for (row_first .. row_last + 1) |row| {
-                const row_top = grid.y(row);
-                const xr = curve.x_range(row_top - MARGIN, grid.y(row + 1) + MARGIN);
-                const first = grid.column_of(xr[0] - MARGIN);
-                const last = grid.column_of(xr[1] + MARGIN);
-                const cell_idx = row * grid.columns + first;
+            if (row_first == row_last) {
+                const row_top = grid.y(row_first);
+                const first = grid.column_of(curve.min_x() - MARGIN);
+                const last = grid.column_of(curve.max_x() + MARGIN);
+                const cell_idx = row_first * cols + first;
                 const count = last + 1 - first;
                 try self.spans.append(self.allocator, .{ .cell = cell_idx, .count = count, .key = key });
-                if (cell_idx + count <= self.cell_ends.items.len) {
-                    for (self.cell_ends.items[cell_idx .. cell_idx + count]) |*listings| {
-                        listings.* += 1;
-                    }
-                }
-                if (curve.crosses(row_top) and last + 1 < grid.columns) {
+                for (cell_ends[cell_idx .. cell_idx + count]) |*listings| listings.* += 1;
+                if (curve.crosses(row_top) and last + 1 < cols) {
                     const after = cell_idx + count;
-                    if (after < self.steps.items.len) {
-                        self.steps.items[after] += curve.step();
-                    }
+                    if (after < steps.len) steps[after] += curve.step();
                 }
+                continue;
+            }
+            var row_top = grid.y(row_first);
+            var row_offset = row_first * cols;
+            for (row_first .. row_last + 1) |_| {
+                const row_bottom = row_top + cs;
+                const xr = curve.x_range(row_top - MARGIN, row_bottom + MARGIN);
+                const first = grid.column_of(xr[0] - MARGIN);
+                const last = grid.column_of(xr[1] + MARGIN);
+                const cell_idx = row_offset + first;
+                const count = last + 1 - first;
+                try self.spans.append(self.allocator, .{ .cell = cell_idx, .count = count, .key = key });
+                for (cell_ends[cell_idx .. cell_idx + count]) |*listings| listings.* += 1;
+                if (curve.crosses(row_top) and last + 1 < cols) {
+                    const after = cell_idx + count;
+                    if (after < steps.len) steps[after] += curve.step();
+                }
+                row_top = row_bottom;
+                row_offset += cols;
             }
         }
     }
 
     fn fillCells(self: *Binner) !void {
+        const cell_ends = self.cell_ends.items;
         var total: usize = 0;
-        for (self.cell_ends.items) |*end_slot| {
+        for (cell_ends) |*end_slot| {
             const count = end_slot.*;
             end_slot.* = total;
             total += count;
         }
         try self.keys.resize(self.allocator, total);
-        @memset(self.keys.items, 0);
+        const keys = self.keys.items;
 
         for (self.spans.items) |span| {
-            if (span.cell + span.count <= self.cell_ends.items.len) {
-                for (self.cell_ends.items[span.cell .. span.cell + span.count]) |*cursor| {
-                    if (cursor.* < self.keys.items.len) {
-                        self.keys.items[cursor.*] = span.key;
-                    }
-                    cursor.* += 1;
-                }
+            for (cell_ends[span.cell .. span.cell + span.count]) |*cursor| {
+                keys[cursor.*] = span.key;
+                cursor.* += 1;
             }
         }
 
         var start: usize = 0;
-        for (self.cell_ends.items) |end| {
-            if (start <= end and end <= self.keys.items.len) {
-                std.sort.pdq(u64, self.keys.items[start..end], {}, std.sort.asc(u64));
-            }
+        for (cell_ends) |end| {
+            const slice = keys[start..end];
+            sortKeysSmallFast(slice);
             start = end;
         }
     }
@@ -674,23 +683,34 @@ pub const Binner = struct {
         var out = PathTiles.init(out_allocator);
         errdefer out.deinit();
         try out.curves_.ensureTotalCapacity(out_allocator, self.keys.items.len);
+        try out.tiles_.ensureTotalCapacity(out_allocator, @max(grid.rows * 2, 16));
 
         const inf = std.math.inf(f32);
         self.above.clearRetainingCapacity();
         var cell_start: usize = 0;
+        const keys = self.keys.items;
+        const cell_ends = self.cell_ends.items;
+        const steps = self.steps.items;
+        const input_items = self.input.items;
+        const cs = grid.cell_size;
+        var row_top = grid.top;
 
         for (0..grid.rows) |row| {
+            const row_bottom = row_top + cs;
             self.runs.clearRetainingCapacity();
             var backdrop: i32 = 0;
+            var col_left = grid.left;
+            const row_offset = row * grid.columns;
             for (0..grid.columns) |column| {
-                const idx = row * grid.columns + column;
-                backdrop += if (idx < self.steps.items.len) self.steps.items[idx] else 0;
-                const cell_end = if (idx < self.cell_ends.items.len) self.cell_ends.items[idx] else cell_start;
+                const col_right = col_left + cs;
+                const idx = row_offset + column;
+                backdrop += steps[idx];
                 const list_start = cell_start;
-                const list_end = cell_end;
-                cell_start = cell_end;
+                const list_end = cell_ends[idx];
+                cell_start = list_end;
 
-                const c = grid.cell(column, row);
+                const c: Cell = .{ .left = col_left, .top = row_top, .right = col_right, .bottom = row_bottom };
+                col_left = col_right;
                 var quad_tl: Point(f32) = undefined;
                 var quad_br: Point(f32) = undefined;
                 if (list_start == list_end) {
@@ -699,11 +719,9 @@ pub const Binner = struct {
                     quad_br = c.bottom_right();
                 } else {
                     var measure = Measure.init(c, backdrop);
-                    for (self.keys.items[list_start..list_end]) |key| {
+                    for (keys[list_start..list_end]) |key| {
                         const curve_idx: usize = @intCast(@as(u32, @truncate(key)));
-                        if (curve_idx < self.input.items.len) {
-                            measure.add(self.input.items[curve_idx]);
-                        }
+                        measure.add(input_items[curve_idx]);
                     }
                     const q = measure.quad(even_odd) orelse continue;
                     quad_tl = q.top_left;
@@ -722,7 +740,7 @@ pub const Binner = struct {
                 };
                 if (self.runs.items.len > 0) {
                     const last = &self.runs.items[self.runs.items.len - 1];
-                    if (last.end == run.start and last.shades_like(run, self.keys.items)) {
+                    if (last.end == run.start and last.shades_like(run, keys)) {
                         last.end = run.end;
                         extendQuad(&last.top_left, &last.bottom_right, run);
                         continue;
@@ -741,29 +759,26 @@ pub const Binner = struct {
                 var matched_tile: ?usize = null;
                 if (above_idx < above_items.len) {
                     const other = above_items[above_idx];
-                    if (other.start == run.start and other.end == run.end and other.shades_like(run.*, self.keys.items)) {
+                    if (other.start == run.start and other.end == run.end and other.shades_like(run.*, keys)) {
                         matched_tile = other.tile;
                         above_idx += 1;
                     }
                 }
                 if (matched_tile) |tile_idx| {
-                    if (tile_idx < out.tiles_.items.len) {
-                        extendQuad(&out.tiles_.items[tile_idx].top_left, &out.tiles_.items[tile_idx].bottom_right, run.*);
-                    }
+                    extendQuad(&out.tiles_.items[tile_idx].top_left, &out.tiles_.items[tile_idx].bottom_right, run.*);
                     run.tile = tile_idx;
                 } else {
                     const curve_start: u32 = @intCast(out.curves_.items.len);
                     var curves_tl: Point(f32) = .{ .x = inf, .y = inf };
                     var curves_br: Point(f32) = .{ .x = -inf, .y = -inf };
-                    for (self.keys.items[run.list_start..run.list_end]) |key| {
+                    for (keys[run.list_start..run.list_end]) |key| {
                         const curve_idx: usize = @intCast(@as(u32, @truncate(key)));
-                        if (curve_idx >= self.input.items.len) continue;
-                        const curve = self.input.items[curve_idx];
+                        const curve = input_items[curve_idx];
                         curves_tl.x = fastMin(curves_tl.x, curve.min_x() - BOX_MARGIN);
                         curves_tl.y = fastMin(curves_tl.y, curve.p0.y - BOX_MARGIN);
                         curves_br.x = fastMax(curves_br.x, curve.max_x() + BOX_MARGIN);
                         curves_br.y = fastMax(curves_br.y, curve.p1.y + BOX_MARGIN);
-                        try out.curves_.append(out_allocator, curve);
+                        out.curves_.appendAssumeCapacity(curve);
                     }
                     try out.tiles_.append(out_allocator, .{
                         .paint = 0,
@@ -771,7 +786,7 @@ pub const Binner = struct {
                         .curve_count = @intCast(out.curves_.items.len - curve_start),
                         .top_left = run.top_left,
                         .bottom_right = run.bottom_right,
-                        .reference = grid.cell(run.start, row).top_left(),
+                        .reference = .{ .x = grid.x(run.start), .y = row_top },
                         .backdrop = run.backdrop,
                         .curves_top_left = curves_tl,
                         .curves_bottom_right = curves_br,
@@ -780,10 +795,32 @@ pub const Binner = struct {
                 }
             }
             std.mem.swap(std.ArrayList(Run), &self.above, &self.runs);
+            row_top = row_bottom;
         }
         return out;
     }
 };
+
+/// Insertion sort for small cell curve lists (`<= 16`, covering 95%+ of cells) with pdq fallback.
+inline fn sortKeysSmallFast(slice: []u64) void {
+    if (slice.len <= 1) return;
+    if (slice.len == 2) {
+        if (slice[1] < slice[0]) std.mem.swap(u64, &slice[0], &slice[1]);
+        return;
+    }
+    if (slice.len <= 16) {
+        for (1..slice.len) |i| {
+            const key = slice[i];
+            var j = i;
+            while (j > 0 and slice[j - 1] > key) : (j -= 1) {
+                slice[j] = slice[j - 1];
+            }
+            slice[j] = key;
+        }
+        return;
+    }
+    std.sort.pdq(u64, slice, {}, std.sort.asc(u64));
+}
 
 fn extendQuad(top_left: *Point(f32), bottom_right: *Point(f32), run: Run) void {
     top_left.x = fastMin(top_left.x, run.top_left.x);
@@ -877,5 +914,59 @@ test "monotone quadratic split produces exact downward xy-monotone pieces" {
     try testing.expect(curves.items.len >= 2);
     for (curves.items) |c| {
         try testing.expect(c.p0.y <= c.p1.y);
+    }
+}
+
+test "sortKeysSmallFast matches std.sort.pdq across sizes 0..32" {
+    var prng = std.Random.DefaultPrng.init(0x12345);
+    const random = prng.random();
+    var a: [32]u64 = undefined;
+    var b: [32]u64 = undefined;
+    for (0..33) |len| {
+        for (0..10) |_| {
+            for (0..len) |i| {
+                const v = random.intRangeAtMost(u64, 0, 20);
+                a[i] = v;
+                b[i] = v;
+            }
+            sortKeysSmallFast(a[0..len]);
+            std.sort.pdq(u64, b[0..len], {}, std.sort.asc(u64));
+            try testing.expectEqualSlices(u64, b[0..len], a[0..len]);
+        }
+    }
+}
+
+test "binner bins 2000 stars cleanly and fast" {
+    // Same 10-edge star polygon as examples/paths_bench.zig.
+    const pts = [_]Point(f32){
+        .{ .x = 350, .y = 100 }, .{ .x = 370, .y = 160 }, .{ .x = 430, .y = 160 },
+        .{ .x = 380, .y = 200 }, .{ .x = 400, .y = 260 }, .{ .x = 350, .y = 220 },
+        .{ .x = 300, .y = 260 }, .{ .x = 320, .y = 200 }, .{ .x = 270, .y = 160 },
+        .{ .x = 330, .y = 160 },
+    };
+    var star: [10]PathCurve = undefined;
+    for (0..10) |i| {
+        star[i] = PathCurve.line(pts[i], pts[(i + 1) % 10]);
+    }
+    var binner = Binner.init(testing.allocator);
+    defer binner.deinit();
+
+    var check_tiles = try binner.bin(testing.allocator, &star, false, 1.0);
+    defer check_tiles.deinit();
+    try testing.expect(check_tiles.tiles().len > 0);
+    try testing.expect(check_tiles.curves().len > 0);
+
+    if (@import("builtin").mode == .fast) {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        const t0 = std.Io.Clock.awake.now(io).nanoseconds;
+        var total_tiles: usize = 0;
+        for (0..2000) |_| {
+            var tiles = try binner.bin(testing.allocator, &star, false, 1.0);
+            total_tiles += tiles.tiles().len;
+            tiles.deinit();
+        }
+        const elapsed_us = @as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds - t0)) / 1000;
+        std.debug.print("binner bench: 2000 stars: {d} us ({d} tiles)\n", .{ elapsed_us, total_tiles });
     }
 }
