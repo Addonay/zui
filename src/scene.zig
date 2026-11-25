@@ -4,7 +4,13 @@ const geometry = @import("geometry.zig");
 const color = @import("color.zig");
 const atlas = @import("atlas.zig");
 const bounds_tree = @import("bounds_tree.zig");
+const path_winding = @import("path_winding.zig");
+const svg_mod = @import("elements/svg.zig");
 const testing = std.testing;
+
+pub const PathCurve = path_winding.PathCurve;
+pub const PathTile = path_winding.PathTile;
+pub const PathTiles = path_winding.PathTiles;
 
 const Bounds = geometry.Bounds;
 const Corners = geometry.Corners;
@@ -177,9 +183,40 @@ pub const Shadow = struct {
     pad: u32 = 0,
 };
 
+/// Refers to an animation of the scene a sprite is inserted into (GPUI `SpriteAnimationId`).
+/// Fits in `MonochromeSprite`'s existing padding so the GPU instance layout is unchanged.
+pub const SpriteAnimationId = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+
+    pub const NONE: SpriteAnimationId = .none;
+};
+
+/// A `TimedTransformation` the window applies to a sprite right before every present,
+/// so the scene can be presented again without re-rendering views (GPUI `SpriteAnimation`).
+pub const SpriteAnimation = struct {
+    transformation: svg_mod.TimedTransformation,
+    center: Point(Pixels),
+    scale_factor: f32,
+    base_color: Hsla = Hsla.default,
+    sprite_index: usize = std.math.maxInt(usize),
+
+    pub fn init(
+        transformation: svg_mod.TimedTransformation,
+        center: Point(Pixels),
+        scale_factor: f32,
+    ) SpriteAnimation {
+        return .{
+            .transformation = transformation,
+            .center = center,
+            .scale_factor = scale_factor,
+        };
+    }
+};
+
 pub const MonochromeSprite = struct {
     order: DrawOrder = 0,
-    pad: u32 = 0,
+    animation: SpriteAnimationId = .none,
     tile: AtlasTile,
     bounds: Bounds(ScaledPixels) = .{},
     content_mask: ContentMask(ScaledPixels) = .{},
@@ -240,7 +277,8 @@ pub fn PathVertex(comptime P: type) type {
     };
 }
 
-/// A filled shape made of triangles, built by `PathBuilder` or by `move_to`/`line_to`/`curve_to`.
+/// A filled or stroked path represented as closed chains of xy-monotone quadratic
+/// `PathCurve`s, binned into `PathTiles` when inserted into a `Scene`.
 pub fn Path(comptime P: type) type {
     return struct {
         const Self = @This();
@@ -249,12 +287,16 @@ pub fn Path(comptime P: type) type {
         id: PathId = .{},
         order: DrawOrder = 0,
         bounds: Bounds(P) = .{},
+        paint_bounds_: Bounds(P) = .{},
         content_mask: ContentMask(P) = .{},
-        vertices: std.ArrayList(PathVertex(P)) = .empty,
         color: Background = Background.default,
-        start: Point(P),
-        current: Point(P),
-        contour_count: usize = 0,
+        even_odd: bool = true,
+        curves: std.ArrayList(PathCurve) = .empty,
+        tiles: ?PathTiles = null,
+        start: Point(P) = .{},
+        current: Point(P) = .{},
+        has_contour: bool = false,
+        closed_: bool = true,
 
         /// Creates an empty path starting at `start`.
         pub fn new(allocator: std.mem.Allocator, start: Point(P)) Self {
@@ -263,19 +305,34 @@ pub fn Path(comptime P: type) type {
                 .start = start,
                 .current = start,
                 .bounds = .{ .origin = start, .size = .{} },
+                .paint_bounds_ = .{ .origin = start, .size = .{} },
             };
         }
 
-        pub fn deinit(self: *Self) void {
-            self.vertices.deinit(self.allocator);
+        /// Wraps an owned slice of monotone curves produced by `PathBuilder`.
+        pub fn from_curves(allocator: std.mem.Allocator, owned_curves: []PathCurve, even_odd: bool) Self {
+            var p: Self = .{
+                .allocator = allocator,
+                .even_odd = even_odd,
+                .curves = std.ArrayList(PathCurve).fromOwnedSlice(owned_curves),
+            };
+            p.recompute_bounds();
+            return p;
         }
 
-        /// Returns a deep copy that owns its own vertices.
+        pub fn deinit(self: *Self) void {
+            self.curves.deinit(self.allocator);
+            if (self.tiles) |*t| t.deinit();
+        }
+
+        /// Returns a deep copy that owns its own curves and tiles.
         pub fn clone(self: *const Self) !Self {
             var copy = self.*;
-            copy.vertices = .empty;
+            copy.curves = .empty;
+            copy.tiles = null;
             errdefer copy.deinit();
-            try copy.vertices.appendSlice(self.allocator, self.vertices.items);
+            try copy.curves.appendSlice(self.allocator, self.curves.items);
+            if (self.tiles) |*t| copy.tiles = try t.clone();
             return copy;
         }
 
@@ -286,75 +343,123 @@ pub fn Path(comptime P: type) type {
                 .id = self.id,
                 .order = self.order,
                 .bounds = self.bounds.scale(factor),
+                .paint_bounds_ = self.paint_bounds_.scale(factor),
                 .content_mask = self.content_mask.scale(factor),
                 .color = self.color,
+                .even_odd = self.even_odd,
                 .start = self.start.scale(factor),
                 .current = self.current.scale(factor),
-                .contour_count = self.contour_count,
+                .has_contour = self.has_contour,
+                .closed_ = self.closed_,
             };
             errdefer scaled.deinit();
-            try scaled.vertices.ensureTotalCapacityPrecise(self.allocator, self.vertices.items.len);
-            for (self.vertices.items) |vertex| scaled.vertices.appendAssumeCapacity(vertex.scale(factor));
+            try scaled.curves.ensureTotalCapacityPrecise(self.allocator, self.curves.items.len);
+            for (self.curves.items) |curve| scaled.curves.appendAssumeCapacity(curve.scaled(factor));
             return scaled;
         }
 
-        /// Moves the start and current point to `to`.
+        /// Starts a new contour at `to`, closing any previous open contour.
         pub fn move_to(self: *Self, to: Point(P)) void {
-            self.contour_count += 1;
+            if (self.has_contour and !self.closed_) {
+                self.close() catch @panic("out of memory");
+            }
             self.start = to;
             self.current = to;
+            self.has_contour = true;
+            self.closed_ = false;
         }
 
         /// Draws a straight line from the current point to `to`.
         pub fn line_to(self: *Self, to: Point(P)) !void {
-            self.contour_count += 1;
-            if (self.contour_count > 1) {
-                try self.push_triangle(
-                    .{ self.start, self.current, to },
-                    .{ corner_st(0, 1), corner_st(0, 1), corner_st(0, 1) },
-                );
+            if (!self.has_contour) {
+                self.start = to;
+                self.current = to;
+                self.has_contour = true;
+                self.closed_ = false;
+                return;
             }
-            self.current = to;
+            if (to.x != self.current.x or to.y != self.current.y) {
+                const c = PathCurve.line(self.current, to);
+                try self.curves.append(self.allocator, c);
+                self.include_curve(c);
+                self.current = to;
+                self.closed_ = false;
+            }
         }
 
         /// Draws a curve from the current point to `to` using quadratic control point `ctrl`.
         pub fn curve_to(self: *Self, to: Point(P), ctrl: Point(P)) !void {
-            self.contour_count += 1;
-            if (self.contour_count > 1) {
-                try self.push_triangle(
-                    .{ self.start, self.current, to },
-                    .{ corner_st(0, 1), corner_st(0, 1), corner_st(0, 1) },
-                );
+            if (!self.has_contour) {
+                self.start = to;
+                self.current = to;
+                self.has_contour = true;
+                self.closed_ = false;
+                return;
             }
-            try self.push_triangle(
-                .{ self.current, ctrl, to },
-                .{ corner_st(0, 0), corner_st(0.5, 0), corner_st(1, 1) },
-            );
+            if (to.x == self.current.x and to.y == self.current.y and ctrl.x == self.current.x and ctrl.y == self.current.y) {
+                return;
+            }
+            const before = self.curves.items.len;
+            try PathCurve.push_monotone(&self.curves, self.allocator, self.current, ctrl, to);
+            for (self.curves.items[before..]) |c| self.include_curve(c);
             self.current = to;
+            self.closed_ = false;
         }
 
-        /// Appends a triangle, growing the path bounds to include its corners.
-        pub fn push_triangle(self: *Self, xy: [3]Point(P), st: [3]Point(f32)) !void {
-            for (xy) |corner| {
-                self.bounds = self.bounds.@"union"(.{ .origin = corner, .size = .{} });
+        /// Closes the current contour back to `start`.
+        pub fn close(self: *Self) !void {
+            if (!self.has_contour or self.closed_) return;
+            try self.line_to(self.start);
+            self.closed_ = true;
+        }
+
+        fn include_curve(self: *Self, c: PathCurve) void {
+            const cb = Bounds(P).from_corners(
+                .{ .x = c.min_x(), .y = c.p0.y },
+                .{ .x = c.max_x(), .y = c.p1.y },
+            );
+            if (self.curves.items.len == 1) {
+                self.bounds = cb;
+                self.paint_bounds_ = cb;
+            } else {
+                self.bounds = self.bounds.@"union"(cb);
+                self.paint_bounds_ = self.paint_bounds_.@"union"(cb);
             }
-            try self.vertices.ensureUnusedCapacity(self.allocator, 3);
-            for (xy, st) |position, texture_position| {
-                self.vertices.appendAssumeCapacity(.{
-                    .xy_position = position,
-                    .st_position = texture_position,
-                    .content_mask = .{},
-                });
+        }
+
+        fn recompute_bounds(self: *Self) void {
+            if (self.curves.items.len == 0) {
+                self.bounds = .{};
+                self.paint_bounds_ = .{};
+                return;
             }
+            const inf = std.math.inf(f32);
+            var min_pt: Point(P) = .{ .x = inf, .y = inf };
+            var max_pt: Point(P) = .{ .x = -inf, .y = -inf };
+            for (self.curves.items) |c| {
+                min_pt.x = @min(min_pt.x, c.min_x());
+                max_pt.x = @max(max_pt.x, c.max_x());
+                min_pt.y = @min(min_pt.y, c.p0.y);
+                max_pt.y = @max(max_pt.y, c.p1.y);
+            }
+            self.bounds = Bounds(P).from_corners(min_pt, max_pt);
+            self.paint_bounds_ = self.bounds;
+        }
+
+        /// The tight path bounds (without tile margin), used for gradient/pattern evaluation.
+        pub fn paint_bounds(self: *const Self) Bounds(P) {
+            if (self.tiles) |*t| return t.bounds();
+            return self.paint_bounds_;
+        }
+
+        pub fn tile_count(self: *const Self) usize {
+            if (self.tiles) |*t| return t.tiles().len;
+            return 0;
         }
 
         /// The path bounds intersected with its content mask.
         pub fn clipped_bounds(self: *const Self) Bounds(P) {
             return self.bounds.intersect(self.content_mask.bounds);
-        }
-
-        fn corner_st(x: f32, y: f32) Point(f32) {
-            return .{ .x = x, .y = y };
         }
     };
 }
@@ -657,6 +762,7 @@ pub const Scene = struct {
     allocator: std.mem.Allocator,
     paint_operations: std.ArrayList(PaintOperation) = .empty,
     primitive_bounds: BoundsTree(ScaledPixels),
+    path_binner: path_winding.Binner,
     layer_stack: std.ArrayList(usize) = .empty,
     layers: std.ArrayList(Layer) = .empty,
     sort_keys: std.ArrayList(SortEntry) = .empty,
@@ -668,11 +774,13 @@ pub const Scene = struct {
     subpixel_sprites: std.ArrayList(SubpixelSprite) = .empty,
     polychrome_sprites: std.ArrayList(PolychromeSprite) = .empty,
     surfaces: std.ArrayList(PaintSurface) = .empty,
+    animations: std.ArrayList(SpriteAnimation) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Scene {
         return .{
             .allocator = allocator,
             .primitive_bounds = BoundsTree(ScaledPixels).init(allocator),
+            .path_binner = path_winding.Binner.init(allocator),
         };
     }
 
@@ -681,6 +789,7 @@ pub const Scene = struct {
         self.release_layers();
         self.paint_operations.deinit(self.allocator);
         self.primitive_bounds.deinit();
+        self.path_binner.deinit();
         self.layer_stack.deinit(self.allocator);
         self.layers.deinit(self.allocator);
         self.sort_keys.deinit(self.allocator);
@@ -692,6 +801,7 @@ pub const Scene = struct {
         self.subpixel_sprites.deinit(self.allocator);
         self.polychrome_sprites.deinit(self.allocator);
         self.surfaces.deinit(self.allocator);
+        self.animations.deinit(self.allocator);
     }
 
     /// Removes all primitives and layers, retaining allocated capacity.
@@ -710,6 +820,44 @@ pub const Scene = struct {
         self.subpixel_sprites.clearRetainingCapacity();
         self.polychrome_sprites.clearRetainingCapacity();
         self.surfaces.clearRetainingCapacity();
+        self.animations.clearRetainingCapacity();
+    }
+
+    /// Inserts a sprite that `advance_animations` keeps moving (GPUI `insert_animated_sprite`).
+    pub fn insert_animated_sprite(
+        self: *Scene,
+        sprite_in: MonochromeSprite,
+        anim_in: SpriteAnimation,
+    ) !void {
+        var sprite = sprite_in;
+        var animation = anim_in;
+        sprite.animation = @enumFromInt(@as(u32, @intCast(self.animations.items.len)));
+        animation.base_color = sprite.color;
+        if (try self.try_insert_primitive(.{ .monochrome_sprite = sprite })) {
+            try self.animations.append(self.allocator, animation);
+        }
+    }
+
+    /// How long the window may wait between presents while only scene animations need a frame.
+    pub fn animation_frame_interval(self: *const Scene) ?u64 {
+        if (self.animations.items.len == 0) return null;
+        var min_interval: u64 = std.math.maxInt(u64);
+        for (self.animations.items) |animation| {
+            const interval = animation.transformation.min_frame_interval() orelse 0;
+            if (interval < min_interval) min_interval = interval;
+        }
+        return min_interval;
+    }
+
+    /// Moves every animated sprite to its pose at `elapsed_ns` without rebuilding the scene.
+    pub fn advance_animations(self: *Scene, elapsed_ns: u64) void {
+        for (self.animations.items) |animation| {
+            if (animation.sprite_index >= self.monochrome_sprites.items.len) continue;
+            const sprite = &self.monochrome_sprites.items[animation.sprite_index];
+            const pose = animation.transformation.at(elapsed_ns);
+            sprite.transformation = pose.into_matrix(animation.center, animation.scale_factor);
+            sprite.color = animation.base_color.opacity(pose.alpha_factor());
+        }
     }
 
     /// Frees path vertices referenced from paint operations and the path list.
@@ -768,13 +916,34 @@ pub const Scene = struct {
 
     /// Adds a primitive, assigning its draw order. Takes ownership; invisible primitives are dropped.
     pub fn insert_primitive(self: *Scene, primitive: Primitive) !void {
+        _ = try self.try_insert_primitive(primitive);
+    }
+
+    /// Returns whether the primitive was kept rather than clipped away.
+    fn try_insert_primitive(self: *Scene, primitive: Primitive) !bool {
         var owned = primitive;
         errdefer owned.deinit();
+
+        if (owned == .path) {
+            const p = &owned.path;
+            if (p.tiles == null) {
+                try p.close();
+                var tiles = try self.path_binner.bin(p.allocator, p.curves.items, p.even_odd, 1.0);
+                tiles.retain_visible(p.content_mask.bounds);
+                p.paint_bounds_ = tiles.bounds();
+                p.bounds = tiles.painted_bounds();
+                p.tiles = tiles;
+            }
+            if (p.tiles.?.tiles().len == 0) {
+                owned.deinit();
+                return false;
+            }
+        }
 
         const clipped_bounds = owned.clipped_bounds();
         if (clipped_bounds.is_empty()) {
             owned.deinit();
-            return;
+            return false;
         }
 
         try self.paint_operations.ensureUnusedCapacity(self.allocator, 1);
@@ -796,6 +965,7 @@ pub const Scene = struct {
         }
 
         self.paint_operations.appendAssumeCapacity(.{ .primitive = owned });
+        return true;
     }
 
     fn push_primitive(self: *Scene, primitive: *Primitive, order: DrawOrder) !void {
@@ -842,7 +1012,17 @@ pub const Scene = struct {
     pub fn replay(self: *Scene, range: Range, prev_scene: *const Scene) !void {
         for (prev_scene.paint_operations.items[range.start..range.end]) |operation| {
             switch (operation) {
-                .primitive => |primitive| try self.insert_primitive(try primitive.clone()),
+                .primitive => |primitive| {
+                    if (primitive == .monochrome_sprite) {
+                        const sprite = primitive.monochrome_sprite;
+                        const anim_idx = @intFromEnum(sprite.animation);
+                        if (sprite.animation != .none and anim_idx < prev_scene.animations.items.len) {
+                            try self.insert_animated_sprite(sprite, prev_scene.animations.items[anim_idx]);
+                            continue;
+                        }
+                    }
+                    try self.insert_primitive(try primitive.clone());
+                },
                 .start_layer => |bounds| try self.push_layer(bounds),
                 .end_layer => try self.pop_layer(),
             }
@@ -860,6 +1040,17 @@ pub const Scene = struct {
         sort_in_place(SubpixelSprite, self.subpixel_sprites.items, &self.sort_keys, self.allocator, order_texture_key(SubpixelSprite));
         sort_in_place(PolychromeSprite, self.polychrome_sprites.items, &self.sort_keys, self.allocator, order_texture_key(PolychromeSprite));
         sort_in_place(PaintSurface, self.surfaces.items, &self.sort_keys, self.allocator, order_key(PaintSurface));
+
+        // Sorting moved the sprites, so animations learn where theirs ended up.
+        if (self.animations.items.len > 0) {
+            for (self.monochrome_sprites.items, 0..) |sprite, index| {
+                if (sprite.animation == .none) continue;
+                const anim_idx = @intFromEnum(sprite.animation);
+                if (anim_idx < self.animations.items.len) {
+                    self.animations.items[anim_idx].sprite_index = index;
+                }
+            }
+        }
     }
 
     /// Iterates the sorted primitives as batches. Call `finish` first.
@@ -1210,7 +1401,7 @@ test "replay copies paint operations from another scene" {
     try testing.expectEqual(@as(usize, 0), target.quads.items.len);
 }
 
-test "paths are stored with their own copy of the vertices" {
+test "paths are stored with their own binned curves and tiles" {
     var scene = Scene.init(testing.allocator);
     defer scene.deinit();
 
@@ -1223,7 +1414,8 @@ test "paths are stored with their own copy of the vertices" {
 
     try testing.expectEqual(@as(usize, 1), scene.paths.items.len);
     try testing.expectEqual(@as(usize, 1), scene.len());
-    try testing.expectEqual(@as(usize, 6), scene.paths.items[0].vertices.items.len);
+    try testing.expectEqual(@as(usize, 3), scene.paths.items[0].curves.items.len);
+    try testing.expect(scene.paths.items[0].tile_count() > 0);
 }
 
 test "transformation matrix translate and scale" {
@@ -1236,4 +1428,46 @@ test "transformation matrix translate and scale" {
     const scaled_point = scaled.apply(.{ .x = 1, .y = 1 });
     try testing.expectEqual(@as(f32, 2), scaled_point.x);
     try testing.expectEqual(@as(f32, 3), scaled_point.y);
+}
+
+test "animated sprites survive finish sorting and scene replay" {
+    var source = Scene.init(testing.allocator);
+    defer source.deinit();
+
+    // Insert an animated sprite at order 2 and a static sprite at order 1 (via overlapping quad)
+    // so sorting moves the animated sprite's index in `monochrome_sprites`.
+    var animated = sprite_at(10, 10, 2);
+    animated.color = color.red();
+    const timed = svg_mod.TimedTransformation.rotation(std.time.ns_per_s, .{});
+    const anim = SpriteAnimation.init(timed, .{ .x = 15, .y = 15 }, 1.0);
+    try source.insert_animated_sprite(animated, anim);
+    try source.insert_primitive(.{ .quad = quad_at(10, 10, 20, 20) });
+    // Static sprite at order 1 in a separate region:
+    try source.insert_primitive(.{ .monochrome_sprite = sprite_at(100, 100, 1) });
+    source.finish();
+
+    try testing.expectEqual(@as(?u64, 0), source.animation_frame_interval());
+    source.advance_animations(250 * std.time.ns_per_ms);
+
+    var found_anim = false;
+    for (source.monochrome_sprites.items) |sp| {
+        if (sp.animation != .none) {
+            found_anim = true;
+            try testing.expectApproxEqAbs(@as(f32, 0.0), sp.transformation.rotation_scale[0][0], 1e-4);
+            try testing.expectApproxEqAbs(@as(f32, -1.0), sp.transformation.rotation_scale[0][1], 1e-4);
+        }
+    }
+    try testing.expect(found_anim);
+
+    var replayed = Scene.init(testing.allocator);
+    defer replayed.deinit();
+    try replayed.replay(.{ .start = 0, .end = source.len() }, &source);
+    replayed.finish();
+    try testing.expectEqual(@as(usize, 1), replayed.animations.items.len);
+    replayed.advance_animations(500 * std.time.ns_per_ms);
+    for (replayed.monochrome_sprites.items) |sp| {
+        if (sp.animation != .none) {
+            try testing.expectApproxEqAbs(@as(f32, -1.0), sp.transformation.rotation_scale[0][0], 1e-4);
+        }
+    }
 }

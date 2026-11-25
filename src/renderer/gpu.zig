@@ -142,19 +142,19 @@ pub const PolySpriteInstance = extern struct {
     params: [4]f32,
 };
 
-/// One vertex of a path triangle, with the clipped path bounds and its background.
-pub const PathVertex = extern struct {
-    xy_st: [4]f32,
+/// One tiled analytical path cell instance (11 vec4 attributes, matching path_tiles_vs).
+pub const PathTileInstance = extern struct {
+    rect: [4]f32,
+    curve_box: [4]f32,
+    meta: [4]f32,
+    flags: [4]f32,
     bounds: [4]f32,
-    bg: [4]f32,
+    clip: [4]f32,
     solid: [4]f32,
     color0: [4]f32,
     color1: [4]f32,
+    bg: [4]f32,
     bg2: [4]f32,
-};
-
-pub const PathSpriteInstance = extern struct {
-    bounds: [4]f32,
 };
 
 const VsParams = extern struct {
@@ -184,8 +184,7 @@ const shadow_attrs = vertexAttrs(ShadowInstance);
 const underline_attrs = vertexAttrs(UnderlineInstance);
 const mono_attrs = vertexAttrs(MonoSpriteInstance);
 const poly_attrs = vertexAttrs(PolySpriteInstance);
-const path_vertex_attrs = vertexAttrs(PathVertex);
-const path_sprite_attrs = vertexAttrs(PathSpriteInstance);
+const path_tile_attrs = vertexAttrs(PathTileInstance);
 
 // ---------------------------------------------------------------------------
 // Packing helpers
@@ -627,8 +626,7 @@ const Programs = struct {
     underlines: gpu.Pipeline = .invalid,
     mono: gpu.Pipeline = .invalid,
     poly: gpu.Pipeline = .invalid,
-    path_raster: gpu.Pipeline = .invalid,
-    path_composite: gpu.Pipeline = .invalid,
+    path_tiles: gpu.Pipeline = .invalid,
 };
 
 /// Offscreen 32-bit float depth attachment for `.attachment` render targets.
@@ -644,56 +642,41 @@ const DepthTarget = struct {
     }
 };
 
-/// Intermediate target for path coverage: multisampled when supported, resolved for sampling.
-const PathTarget = struct {
-    width: u32,
-    height: u32,
-    /// Only when multisampled.
-    msaa_image: gpu.Image = .invalid,
-    msaa_view: gpu.View = .invalid,
-    image: gpu.Image,
-    /// Color attachment of `image` (single-sampled) or the resolve attachment.
-    attachment: gpu.View,
-    sampled: gpu.View,
-    sample_count: u32,
-
-    fn deinit(self: *PathTarget, device: *gpu.Device) void {
-        device.destroy(self.sampled);
-        device.destroy(self.attachment);
-        device.destroy(self.image);
-        if (self.msaa_view != .invalid) device.destroy(self.msaa_view);
-        if (self.msaa_image != .invalid) device.destroy(self.msaa_image);
-    }
-};
-
 /// Draws scenes with zicr. Create one per device and color format; the device must outlive it.
 pub const GpuRenderer = struct {
     allocator: std.mem.Allocator,
     device: *gpu.Device,
     color_format: gpu.PixelFormat,
     options: Options,
-    shader_descs: [8]gpu.Shader = @splat(.invalid),
+    shader_descs: [7]gpu.Shader = @splat(.invalid),
     programs: Programs = .{},
     sampler: gpu.Sampler = .invalid,
+    nearest_sampler: gpu.Sampler = .invalid,
     /// Per-frame instance bytes; one transient vertex buffer holds them all.
     instances: gpu.Buffer = .invalid,
     instance_capacity: usize = 0,
     frame_bytes: std.ArrayList(u8) = .empty,
+    /// Packed `PathCurve`s uploaded to a 1024-wide `.rgba32f` texture (3 texels per curve).
+    curve_texels: std.ArrayList([4]f32) = .empty,
+    curve_image: gpu.Image = .invalid,
+    curve_view: gpu.View = .invalid,
+    curve_height: u32 = 0,
+    curve_staging: gpu.Buffer = .invalid,
+    curve_staging_capacity: usize = 0,
     opaque_quads: Range = .{ .offset = 0, .count = 0 },
     commands: std.ArrayList(Command) = .empty,
     depth_target: ?DepthTarget = null,
-    path_target: ?PathTarget = null,
-    path_sample_count: u32 = 1,
     stats: Stats = .{},
     gamma_ratios: [4]f32,
 
+    const curve_tex_width: u32 = 1024;
     const Range = struct { offset: usize, count: usize };
     const Command = union(enum) {
         quads: Range,
         shadows: struct { range: Range, depth: f32 },
         underlines: struct { range: Range, depth: f32 },
         sprites: struct { range: Range, texture: AtlasTextureId, poly: bool, depth: f32 },
-        paths: struct { raster: Range, composite: Range, depth: f32 },
+        path_tiles: struct { range: Range, depth: f32 },
     };
     const initial_instance_bytes = 64 * 1024;
 
@@ -721,17 +704,14 @@ pub const GpuRenderer = struct {
             .wrap_v = .clamp_to_edge,
             .label = "zui sprite sampler",
         });
-
-        // Multisampling for path coverage, when the format supports it.
-        self.path_sample_count = 1;
-        if (device.formatInfo(color_format).msaa) {
-            for ([_]u32{ 4, 2 }) |count| {
-                if (options.path_sample_count >= count) {
-                    self.path_sample_count = count;
-                    break;
-                }
-            }
-        }
+        self.nearest_sampler = try device.createSampler(.{
+            .min_filter = .nearest,
+            .mag_filter = .nearest,
+            .mipmap_filter = .nearest,
+            .wrap_u = .clamp_to_edge,
+            .wrap_v = .clamp_to_edge,
+            .label = "zui curve sampler",
+        });
 
         const blend_premul: gpu.Blend = .{ .src_rgb = .one, .dst_rgb = .one_minus_src_alpha, .op_rgb = .add, .src_alpha = .one, .dst_alpha = .one_minus_src_alpha };
         const blend_straight: gpu.Blend = .{ .src_rgb = .src_alpha, .dst_rgb = .one_minus_src_alpha, .op_rgb = .add, .src_alpha = .one, .dst_alpha = .one_minus_src_alpha };
@@ -748,8 +728,8 @@ pub const GpuRenderer = struct {
             .depth = depth_test,
             .label = "zui quads",
         });
-        self.shader_descs[7] = try self.createShader(shaders.opaque_quads.desc(backend));
-        self.programs.opaque_quads = try self.createPipeline(self.shader_descs[7], .{
+        self.shader_descs[6] = try self.createShader(shaders.opaque_quads.desc(backend));
+        self.programs.opaque_quads = try self.createPipeline(self.shader_descs[6], .{
             .stride = @sizeOf(OpaqueQuadInstance),
             .step = .per_instance,
             .attrs = &opaque_quad_attrs,
@@ -795,30 +775,20 @@ pub const GpuRenderer = struct {
             .label = "zui polychrome sprites",
             .views = 1,
         });
-        self.shader_descs[5] = try self.createShader(shaders.path_raster.desc(backend));
-        self.programs.path_raster = try self.createPipeline(self.shader_descs[5], .{
-            .stride = @sizeOf(PathVertex),
-            .step = .per_vertex,
-            .attrs = &path_vertex_attrs,
-            .blend = blend_premul,
-            .depth = .{ .format = .none },
-            .label = "zui path rasterization",
-            .sample_count = self.path_sample_count,
-        });
-        self.shader_descs[6] = try self.createShader(shaders.path_composite.desc(backend));
-        self.programs.path_composite = try self.createPipeline(self.shader_descs[6], .{
-            .stride = @sizeOf(PathSpriteInstance),
+        self.shader_descs[5] = try self.createShader(shaders.path_tiles.desc(backend));
+        self.programs.path_tiles = try self.createPipeline(self.shader_descs[5], .{
+            .stride = @sizeOf(PathTileInstance),
             .step = .per_instance,
-            .attrs = &path_sprite_attrs,
-            .blend = blend_premul,
+            .attrs = &path_tile_attrs,
+            .blend = window_blend,
             .depth = depth_test,
-            .label = "zui path composite",
+            .label = "zui path tiles",
             .views = 1,
         });
         return self;
     }
 
-    /// Releases pipelines, shaders, sampler and buffers. The device must still exist.
+    /// Releases pipelines, shaders, samplers and buffers. The device must still exist.
     pub fn deinit(self: *GpuRenderer) void {
         const device = self.device;
         inline for (@typeInfo(Programs).@"struct".field_names) |name| {
@@ -827,10 +797,14 @@ pub const GpuRenderer = struct {
         }
         for (self.shader_descs) |shader| if (shader != .invalid) device.destroy(shader);
         if (self.sampler != .invalid) device.destroy(self.sampler);
+        if (self.nearest_sampler != .invalid) device.destroy(self.nearest_sampler);
         if (self.instances != .invalid) device.destroy(self.instances);
+        if (self.curve_view != .invalid) device.destroy(self.curve_view);
+        if (self.curve_image != .invalid) device.destroy(self.curve_image);
+        if (self.curve_staging != .invalid) device.destroy(self.curve_staging);
         if (self.depth_target) |*target| target.deinit(device);
-        if (self.path_target) |*target| target.deinit(device);
         self.frame_bytes.deinit(self.allocator);
+        self.curve_texels.deinit(self.allocator);
         self.commands.deinit(self.allocator);
         self.* = undefined;
     }
@@ -872,20 +846,26 @@ pub const GpuRenderer = struct {
         self.stats = .{};
 
         try self.pack(sc, sprite_atlas, size.width, size.height);
-        if (self.frame_bytes.items.len + sprite_atlas.pending_bytes.items.len > self.options.max_frame_upload_bytes) return error.FrameTooLarge;
+        const total_upload = self.frame_bytes.items.len + sprite_atlas.pending_bytes.items.len + self.curve_texels.items.len * 16;
+        if (total_upload > self.options.max_frame_upload_bytes) return error.FrameTooLarge;
         try sprite_atlas.before_frame();
         if (self.frame_bytes.items.len > 0) try self.uploadFrame();
-        if (target == .attachment) try self.ensureDepthTarget(size.width, size.height);
 
-        var has_paths = false;
+        var has_path_tiles = false;
         for (self.commands.items) |command| {
-            if (command == .paths) {
-                has_paths = true;
+            if (command == .path_tiles) {
+                has_path_tiles = true;
                 break;
             }
         }
-        if (has_paths) try self.ensurePathTarget(size.width, size.height);
-        self.record(target, sprite_atlas, size, clear, has_paths);
+        if (has_path_tiles) {
+            if (self.curve_texels.items.len == 0 and self.curve_image == .invalid) {
+                try self.curve_texels.append(self.allocator, .{ 0, 0, 0, 0 });
+            }
+            if (self.curve_texels.items.len > 0) try self.uploadCurves();
+        }
+        if (target == .attachment) try self.ensureDepthTarget(size.width, size.height);
+        self.record(target, sprite_atlas, size, clear);
     }
 
     /// Packs the scene in batch order into `frame_bytes` and records one command per batch.
@@ -893,6 +873,7 @@ pub const GpuRenderer = struct {
         _ = width;
         _ = height;
         self.frame_bytes.clearRetainingCapacity();
+        self.curve_texels.clearRetainingCapacity();
         self.commands.clearRetainingCapacity();
 
         const depth_scale = scene.quad_depth_scale(sc.quads.items.len);
@@ -990,51 +971,112 @@ pub const GpuRenderer = struct {
         return .{ .offset = offset, .count = sprites.len };
     }
 
-    /// Path batches: every vertex of every path is rasterized into one intermediate target, then
-    /// one sprite (or one per path, when orders match) composites it. Mirrors draw_paths_*.
+    /// Packs tiled path primitives and their curves for analytical winding shading in the main pass.
     fn packPaths(self: *GpuRenderer, paths: []const scene.Path(ScaledPixels), depth: f32) !void {
-        var vertex_count: usize = 0;
-        for (paths) |path| vertex_count += path.vertices.items.len;
-        if (vertex_count == 0) return;
+        const tile_offset = self.frame_bytes.items.len;
+        var tile_count: usize = 0;
 
-        const raster_offset = self.frame_bytes.items.len;
-        try self.frame_bytes.ensureUnusedCapacity(self.allocator, vertex_count * @sizeOf(PathVertex));
         for (paths) |*path| {
-            const clipped = path.clipped_bounds();
-            const bounds = bounds4(clipped);
+            const ptiles = path.tiles orelse continue;
+            const tiles = ptiles.tiles();
+            if (tiles.len == 0) continue;
+
+            const curves = ptiles.curves();
+            const curve_base: u32 = @intCast(self.curve_texels.items.len / 3);
+            try self.curve_texels.ensureUnusedCapacity(self.allocator, curves.len * 3);
+            for (curves) |c| {
+                self.curve_texels.appendAssumeCapacity(.{ c.p0.x, c.p0.y, c.p1.x, c.p1.y });
+                self.curve_texels.appendAssumeCapacity(.{ c.a.x, c.a.y, c.b.x, c.b.y });
+                self.curve_texels.appendAssumeCapacity(.{ c.sign, 0, 0, 0 });
+            }
+
             const bg = backgroundFields(path.color);
-            for (path.vertices.items) |v| {
-                const vertex: PathVertex = .{
-                    .xy_st = .{ v.xy_position.x, v.xy_position.y, v.st_position.x, v.st_position.y },
-                    .bounds = bounds,
-                    .bg = bg.meta,
+            const pb = bounds4(path.paint_bounds());
+            const clip = bounds4(path.content_mask.bounds);
+            const even_odd_f: f32 = if (path.even_odd) 1.0 else 0.0;
+
+            try self.frame_bytes.ensureUnusedCapacity(self.allocator, tiles.len * @sizeOf(PathTileInstance));
+            for (tiles) |tile| {
+                const cbox: [4]f32 = if (tile.curve_count == 0)
+                    .{ 1e30, 1e30, -1e30, -1e30 }
+                else
+                    .{ tile.curves_top_left.x, tile.curves_top_left.y, tile.curves_bottom_right.x, tile.curves_bottom_right.y };
+                const instance: PathTileInstance = .{
+                    .rect = .{ tile.top_left.x, tile.top_left.y, tile.bottom_right.x, tile.bottom_right.y },
+                    .curve_box = cbox,
+                    .meta = .{
+                        tile.reference.x,
+                        tile.reference.y,
+                        @floatFromInt(curve_base + tile.curve_start),
+                        @floatFromInt(tile.curve_count),
+                    },
+                    .flags = .{ @floatFromInt(tile.backdrop), even_odd_f, depth, 0 },
+                    .bounds = pb,
+                    .clip = clip,
                     .solid = bg.solid,
                     .color0 = bg.color0,
                     .color1 = bg.color1,
-                    .bg2 = bg.extra,
+                    .bg = bg.meta,
+                    .bg2 = .{ bg.extra[0], 0, bg.extra[2], 0 },
                 };
-                self.frame_bytes.appendSliceAssumeCapacity(std.mem.asBytes(&vertex));
+                self.frame_bytes.appendSliceAssumeCapacity(std.mem.asBytes(&instance));
+                tile_count += 1;
             }
+            self.stats.paths += 1;
         }
-        const raster: Range = .{ .offset = raster_offset, .count = vertex_count };
+        if (tile_count == 0) return;
+        try self.commands.append(self.allocator, .{ .path_tiles = .{
+            .range = .{ .offset = tile_offset, .count = tile_count },
+            .depth = depth,
+        } });
+    }
 
-        // Sprites: one per path when the batch has a single order, else their union.
-        const sprite_offset = self.frame_bytes.items.len;
-        if (paths.len > 0 and paths[paths.len - 1].order == paths[0].order) {
-            for (paths) |*path| {
-                const sprite: PathSpriteInstance = .{ .bounds = bounds4(path.clipped_bounds()) };
-                try self.frame_bytes.appendSlice(self.allocator, std.mem.asBytes(&sprite));
-            }
-        } else {
-            var bounds = paths[0].clipped_bounds();
-            for (paths[1..]) |*path| bounds = bounds.@"union"(path.clipped_bounds());
-            const sprite: PathSpriteInstance = .{ .bounds = bounds4(bounds) };
-            try self.frame_bytes.appendSlice(self.allocator, std.mem.asBytes(&sprite));
+    fn uploadCurves(self: *GpuRenderer) !void {
+        const texel_count = self.curve_texels.items.len;
+        if (texel_count == 0) return;
+        const needed_height: u32 = @intCast((texel_count + curve_tex_width - 1) / curve_tex_width);
+        const padded_texels = @as(usize, needed_height) * curve_tex_width;
+        try self.curve_texels.appendNTimes(self.allocator, .{ 0, 0, 0, 0 }, padded_texels - texel_count);
+
+        if (self.curve_image == .invalid or needed_height > self.curve_height) {
+            const new_h = @max(needed_height, self.curve_height * 2, 16);
+            const img = try self.device.createImage(.{
+                .width = curve_tex_width,
+                .height = new_h,
+                .format = .rgba32f,
+                .usage = .{ .writes = .copy },
+                .label = "zui path curves",
+            });
+            errdefer self.device.destroy(img);
+            const view = try self.device.createView(.{ .texture = .{ .image = img } });
+            if (self.curve_view != .invalid) self.device.destroy(self.curve_view);
+            if (self.curve_image != .invalid) self.device.destroy(self.curve_image);
+            self.curve_image = img;
+            self.curve_view = view;
+            self.curve_height = new_h;
         }
-        const composite_count = (self.frame_bytes.items.len - sprite_offset) / @sizeOf(PathSpriteInstance);
-        const composite: Range = .{ .offset = sprite_offset, .count = composite_count };
-        self.stats.paths += paths.len;
-        try self.commands.append(self.allocator, .{ .paths = .{ .raster = raster, .composite = composite, .depth = depth } });
+
+        const byte_len = padded_texels * 16;
+        if (self.curve_staging == .invalid or byte_len > self.curve_staging_capacity) {
+            const capacity = @max(byte_len, self.curve_staging_capacity * 2, 64 * 1024);
+            const buf = try self.device.createBuffer(.{
+                .size = capacity,
+                .usage = .{ .staging = true, .copy_src = true, .writes = .transient },
+                .label = "zui path curve staging",
+            });
+            if (self.curve_staging != .invalid) self.device.destroy(self.curve_staging);
+            self.curve_staging = buf;
+            self.curve_staging_capacity = capacity;
+        }
+        self.device.writeBuffer(self.curve_staging, 0, std.mem.sliceAsBytes(self.curve_texels.items));
+        self.device.copyBufferToImage(.{
+            .src = self.curve_staging,
+            .src_offset = 0,
+            .layout = .{ .bytes_per_row = curve_tex_width * 16 },
+            .dst = self.curve_image,
+            .region = .{ .x = 0, .y = 0, .width = curve_tex_width, .height = needed_height },
+        });
+        self.stats.upload_bytes += byte_len;
     }
 
     /// Writes the frame's instance bytes to the transient vertex buffer, growing it when needed.
@@ -1074,54 +1116,17 @@ pub const GpuRenderer = struct {
         self.depth_target = .{ .width = width, .height = height, .image = image, .view = view };
     }
 
-    fn ensurePathTarget(self: *GpuRenderer, width: u32, height: u32) !void {
-        if (self.path_target) |target| {
-            if (target.width == width and target.height == height) return;
-            var old = target;
-            old.deinit(self.device);
-            self.path_target = null;
-        }
-        const samples = self.path_sample_count;
-        var target: PathTarget = .{ .width = width, .height = height, .sample_count = samples, .image = .invalid, .attachment = .invalid, .sampled = .invalid };
-        errdefer target.deinit(self.device);
-        if (samples > 1) {
-            target.msaa_image = try self.device.createImage(.{
-                .width = width,
-                .height = height,
-                .format = self.color_format,
-                .sample_count = samples,
-                .usage = .{ .color_attachment = true },
-                .label = "zui path msaa",
-            });
-            target.msaa_view = try self.device.createView(.{ .color_attachment = .{ .image = target.msaa_image } });
-        }
-        target.image = try self.device.createImage(.{
-            .width = width,
-            .height = height,
-            .format = self.color_format,
-            .usage = .{ .color_attachment = samples == 1, .resolve_attachment = samples > 1 },
-            .label = "zui path coverage",
-        });
-        target.attachment = if (samples > 1)
-            try self.device.createView(.{ .resolve_attachment = .{ .image = target.image } })
-        else
-            try self.device.createView(.{ .color_attachment = .{ .image = target.image } });
-        target.sampled = try self.device.createView(.{ .texture = .{ .image = target.image } });
-        self.path_target = target;
-    }
-
-    /// Records every command into one pass; path batches end it, render their coverage, and resume.
-    fn record(self: *GpuRenderer, target: Target, sprite_atlas: *GpuAtlas, size: TargetSize, clear: Hsla, has_paths: bool) void {
+    /// Records every command into a single render pass (including tiled paths).
+    fn record(self: *GpuRenderer, target: Target, sprite_atlas: *GpuAtlas, size: TargetSize, clear: Hsla) void {
         const rgba = clear.to_rgb();
         // Premultiplied targets clear to premultiplied colors, as the CPU canvas does (see cpu.premultiply).
         const scale: f32 = if (self.options.premultiplied_alpha) rgba.a else 1;
         var pass = self.beginFramePass(
             target,
             .{ .load = .{ .clear = .{ rgba.r * scale, rgba.g * scale, rgba.b * scale, rgba.a } }, .store = .store },
-            .{ .load = .{ .clear = 0.0 }, .store = if (has_paths) .store else .dont_care },
+            .{ .load = .{ .clear = 0.0 }, .store = .dont_care },
         );
         pass.setViewport(.{ .width = @intCast(size.width), .height = @intCast(size.height) }, .top_left);
-        const flip: f32 = if (self.device.features().origin_top_left) 0 else 1;
         const w_f: f32 = @floatFromInt(size.width);
         const h_f: f32 = @floatFromInt(size.height);
         const base_vs: VsParams = .{ .viewport = .{ w_f, h_f, 0, 0 } };
@@ -1131,42 +1136,28 @@ pub const GpuRenderer = struct {
         };
 
         if (self.opaque_quads.count > 0) {
-            self.drawInstances(&pass, self.programs.opaque_quads, self.opaque_quads, 4, &base_vs, &fs, &.{});
+            self.drawInstances(&pass, self.programs.opaque_quads, self.opaque_quads, 4, &base_vs, &fs, &.{}, self.sampler);
         }
 
-        for (self.commands.items, 0..) |command, cmd_idx| switch (command) {
-            .quads => |r| self.drawInstances(&pass, self.programs.quads, r, 4, &base_vs, &fs, &.{}),
+        for (self.commands.items) |command| switch (command) {
+            .quads => |r| self.drawInstances(&pass, self.programs.quads, r, 4, &base_vs, &fs, &.{}, self.sampler),
             .shadows => |c| {
                 const vs: VsParams = .{ .viewport = .{ w_f, h_f, 0, c.depth } };
-                self.drawInstances(&pass, self.programs.shadows, c.range, 4, &vs, &fs, &.{});
+                self.drawInstances(&pass, self.programs.shadows, c.range, 4, &vs, &fs, &.{}, self.sampler);
             },
             .underlines => |c| {
                 const vs: VsParams = .{ .viewport = .{ w_f, h_f, 0, c.depth } };
-                self.drawInstances(&pass, self.programs.underlines, c.range, 4, &vs, &fs, &.{});
+                self.drawInstances(&pass, self.programs.underlines, c.range, 4, &vs, &fs, &.{}, self.sampler);
             },
             .sprites => |s| {
                 const view = sprite_atlas.view(s.texture) orelse continue;
                 const pipeline = if (s.poly) self.programs.poly else self.programs.mono;
                 const vs: VsParams = .{ .viewport = .{ w_f, h_f, 0, s.depth } };
-                self.drawInstances(&pass, pipeline, s.range, 4, &vs, &fs, &.{view});
+                self.drawInstances(&pass, pipeline, s.range, 4, &vs, &fs, &.{view}, self.sampler);
             },
-            .paths => |p| {
-                var remaining_paths = false;
-                for (self.commands.items[cmd_idx + 1 ..]) |next_cmd| {
-                    if (next_cmd == .paths) {
-                        remaining_paths = true;
-                        break;
-                    }
-                }
-                pass.end();
-                self.rasterizePaths(p.raster, size, &base_vs);
-                pass = self.beginFramePass(
-                    target,
-                    .{ .load = .load, .store = .store },
-                    .{ .load = .load, .store = if (remaining_paths) .store else .dont_care },
-                );
-                pass.setViewport(.{ .width = @intCast(size.width), .height = @intCast(size.height) }, .top_left);
-                self.compositePaths(&pass, p.composite, size, flip, p.depth);
+            .path_tiles => |pt| {
+                const vs: VsParams = .{ .viewport = .{ w_f, h_f, 0, pt.depth } };
+                self.drawInstances(&pass, self.programs.path_tiles, pt.range, 4, &vs, &fs, &.{self.curve_view}, self.nearest_sampler);
             },
         };
         pass.end();
@@ -1191,7 +1182,7 @@ pub const GpuRenderer = struct {
     }
 
     /// Draws `range` instances of a per-instance pipeline; `count` vertices per instance.
-    fn drawInstances(self: *GpuRenderer, pass: *gpu.Pass, pipeline: gpu.Pipeline, range: Range, count: u32, vs: *const VsParams, fs: *const FsParams, views: []const gpu.View) void {
+    fn drawInstances(self: *GpuRenderer, pass: *gpu.Pass, pipeline: gpu.Pipeline, range: Range, count: u32, vs: *const VsParams, fs: *const FsParams, views: []const gpu.View, smp: gpu.Sampler) void {
         if (range.count == 0) return;
         pass.setPipeline(pipeline);
         pass.setUniforms(0, vs);
@@ -1199,43 +1190,9 @@ pub const GpuRenderer = struct {
         pass.setBindings(.{
             .vertex_buffers = &.{.{ .buffer = self.instances, .offset = @intCast(range.offset) }},
             .views = views,
-            .samplers = if (views.len > 0) &.{self.sampler} else &.{},
+            .samplers = if (views.len > 0) &.{smp} else &.{},
         });
         pass.draw(.{ .count = count, .instances = @intCast(range.count) });
-        self.stats.draw_calls += 1;
-    }
-
-    fn rasterizePaths(self: *GpuRenderer, raster: Range, size: TargetSize, vs: *const VsParams) void {
-        const target = self.path_target orelse return;
-        const color_view = if (target.sample_count > 1) target.msaa_view else target.attachment;
-        const resolves: []const gpu.View = if (target.sample_count > 1) &.{target.attachment} else &.{};
-        var pass = self.device.beginPass(.{
-            .target = .{ .attachments = .{ .colors = &.{color_view}, .resolves = resolves } },
-            .colors = &.{.{ .load = .{ .clear = .{ 0, 0, 0, 0 } }, .store = .store }},
-        });
-        pass.setViewport(.{ .width = @intCast(size.width), .height = @intCast(size.height) }, .top_left);
-        var raster_vs = vs.*;
-        raster_vs.viewport[2] = 0;
-        pass.setPipeline(self.programs.path_raster);
-        pass.setUniforms(0, &raster_vs);
-        pass.setBindings(.{ .vertex_buffers = &.{.{ .buffer = self.instances, .offset = @intCast(raster.offset) }} });
-        pass.draw(.{ .count = @intCast(raster.count) });
-        pass.end();
-        self.stats.draw_calls += 1;
-    }
-
-    fn compositePaths(self: *GpuRenderer, pass: *gpu.Pass, composite: Range, size: TargetSize, flip: f32, depth: f32) void {
-        const target = self.path_target orelse return;
-        if (composite.count == 0) return;
-        const vs: VsParams = .{ .viewport = .{ @floatFromInt(size.width), @floatFromInt(size.height), flip, depth } };
-        pass.setPipeline(self.programs.path_composite);
-        pass.setUniforms(0, &vs);
-        pass.setBindings(.{
-            .vertex_buffers = &.{.{ .buffer = self.instances, .offset = @intCast(composite.offset) }},
-            .views = &.{target.sampled},
-            .samplers = &.{self.sampler},
-        });
-        pass.draw(.{ .count = 4, .instances = @intCast(composite.count) });
         self.stats.draw_calls += 1;
     }
 };
@@ -1248,8 +1205,7 @@ test "instance layouts match the attribute counts in shaders.glsl" {
     try testing.expectEqual(4, underline_attrs.len);
     try testing.expectEqual(6, mono_attrs.len);
     try testing.expectEqual(5, poly_attrs.len);
-    try testing.expectEqual(7, path_vertex_attrs.len);
-    try testing.expectEqual(1, path_sprite_attrs.len);
+    try testing.expectEqual(11, path_tile_attrs.len);
     try testing.expectEqual(160, @sizeOf(QuadInstance));
     try testing.expectEqual(64, @sizeOf(OpaqueQuadInstance));
     try testing.expectEqual(@as(usize, 16), @sizeOf(VsParams));
