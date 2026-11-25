@@ -385,7 +385,7 @@ pub const Style = struct {
 
     /// The text style refinement carried by this style, if any.
     pub fn text_style(self: *const Style) ?*const TextStyleRefinement {
-        if (refineable.is_empty(TextStyle, &self.text)) return null;
+        if (is_text_empty(&self.text)) return null;
         return &self.text;
     }
 
@@ -416,8 +416,26 @@ pub const Style = struct {
 pub const StyleRefinement = Refinement(Style);
 
 /// True if no fields of `t` are set.
-pub fn is_text_empty(t: *const TextStyleRefinement) bool {
-    return refineable.is_empty(TextStyle, t);
+/// Uses a branchless bitmask over all 15 optional tags so plain elements pay one branch.
+pub inline fn is_text_empty(t: *const TextStyleRefinement) bool {
+    comptime std.debug.assert(@typeInfo(TextStyle).@"struct".field_names.len == 15);
+    const mask: u16 =
+        (@as(u16, @intFromBool(t.color != null))) |
+        (@as(u16, @intFromBool(t.font_size != null)) << 1) |
+        (@as(u16, @intFromBool(t.font_weight != null)) << 2) |
+        (@as(u16, @intFromBool(t.font_family != null)) << 3) |
+        (@as(u16, @intFromBool(t.line_height != null)) << 4) |
+        (@as(u16, @intFromBool(t.text_align != null)) << 5) |
+        (@as(u16, @intFromBool(t.white_space != null)) << 6) |
+        (@as(u16, @intFromBool(t.text_overflow != null)) << 7) |
+        (@as(u16, @intFromBool(t.background_color != null)) << 8) |
+        (@as(u16, @intFromBool(t.underline != null)) << 9) |
+        (@as(u16, @intFromBool(t.strikethrough != null)) << 10) |
+        (@as(u16, @intFromBool(t.font_style != null)) << 11) |
+        (@as(u16, @intFromBool(t.font_features != null)) << 12) |
+        (@as(u16, @intFromBool(t.font_fallbacks != null)) << 13) |
+        (@as(u16, @intFromBool(t.line_clamp != null)) << 14);
+    return mask == 0;
 }
 
 fn abs_px_opt(l: ?AbsoluteLength, rem_size: Pixels) Pixels {

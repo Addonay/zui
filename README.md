@@ -57,13 +57,13 @@ Zig has no closures, traits or `async`, so a few things read differently:
 
 ## Installation
 
-ZUI 0.3.0 requires Zig 0.17.1 and supports Linux on Wayland and X11, with
+ZUI 0.4.0 requires Zig 0.17.1 and supports Linux on Wayland and X11, with
 Vulkan rendering and a CPU fallback.
 
 Add ZUI to an existing Zig project:
 
 ```sh
-zig fetch --save git+https://github.com/Addonay/zui.git#v0.3.0
+zig fetch --save git+https://github.com/Addonay/zui.git#v0.4.0
 ```
 
 Import the module in your `build.zig`, where `exe` is your executable:

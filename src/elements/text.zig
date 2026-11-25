@@ -51,6 +51,10 @@ pub const TextElement = struct {
         return null;
     }
 
+    pub fn needs_dispatch_node(_: *const TextElement) bool {
+        return false;
+    }
+
     pub fn request_layout(self: *TextElement, id_: ?*const element.GlobalElementId, window: *Window, cx: *App) struct { LayoutId, TextLayout } {
         _ = id_;
         const state = TextLayout.new();
@@ -748,6 +752,10 @@ pub const StyledText = struct {
         return null;
     }
 
+    pub fn needs_dispatch_node(_: *const StyledText) bool {
+        return false;
+    }
+
     pub fn request_layout(self: *StyledText, id_: ?*const element.GlobalElementId, window: *Window, cx: *App) struct { LayoutId, void } {
         _ = id_;
         const overrides = self.delayed_font_family_overrides;
@@ -875,6 +883,10 @@ pub const InteractiveText = struct {
 
     pub fn id(self: *InteractiveText) ?element.ElementId {
         return self.element_id;
+    }
+
+    pub fn needs_dispatch_node(_: *const InteractiveText) bool {
+        return false;
     }
 
     pub fn request_layout(self: *InteractiveText, id_: ?*const element.GlobalElementId, window: *Window, cx: *App) struct { LayoutId, void } {

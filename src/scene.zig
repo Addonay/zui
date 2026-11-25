@@ -72,6 +72,12 @@ pub const TransformationMatrix = struct {
         return .{};
     }
 
+    pub inline fn is_unit(self: *const TransformationMatrix) bool {
+        return self.rotation_scale[0][0] == 1 and self.rotation_scale[0][1] == 0 and
+            self.rotation_scale[1][0] == 0 and self.rotation_scale[1][1] == 1 and
+            self.translation[0] == 0 and self.translation[1] == 0;
+    }
+
     /// Moves the origin by `point`.
     pub fn translate(self: TransformationMatrix, point: Point(ScaledPixels)) TransformationMatrix {
         return self.compose(.{ .translation = .{ point.x, point.y } });
@@ -466,16 +472,9 @@ pub fn Path(comptime P: type) type {
 
 /// Paint operation recorded in order, so layers and primitives can be replayed.
 pub const PaintOperation = union(enum) {
-    primitive: Primitive,
+    primitive: struct { kind: PrimitiveKind, index: u32 },
     start_layer: Bounds(ScaledPixels),
     end_layer,
-
-    fn deinit(self: *PaintOperation) void {
-        switch (self.*) {
-            .primitive => |*primitive| primitive.deinit(),
-            .start_layer, .end_layer => {},
-        }
-    }
 };
 
 /// A drawable item stored in a scene. Paths own their vertices.
@@ -766,6 +765,7 @@ pub const Scene = struct {
     layer_stack: std.ArrayList(usize) = .empty,
     layers: std.ArrayList(Layer) = .empty,
     sort_keys: std.ArrayList(SortEntry) = .empty,
+    remap_scratch: std.ArrayList(u32) = .empty,
     shadows: std.ArrayList(Shadow) = .empty,
     quads: std.ArrayList(Quad) = .empty,
     paths: std.ArrayList(Path(ScaledPixels)) = .empty,
@@ -793,6 +793,7 @@ pub const Scene = struct {
         self.layer_stack.deinit(self.allocator);
         self.layers.deinit(self.allocator);
         self.sort_keys.deinit(self.allocator);
+        self.remap_scratch.deinit(self.allocator);
         self.paths.deinit(self.allocator);
         self.shadows.deinit(self.allocator);
         self.quads.deinit(self.allocator);
@@ -833,7 +834,7 @@ pub const Scene = struct {
         var animation = anim_in;
         sprite.animation = @enumFromInt(@as(u32, @intCast(self.animations.items.len)));
         animation.base_color = sprite.color;
-        if (try self.try_insert_primitive(.{ .monochrome_sprite = sprite })) {
+        if (try self.tryInsertSimple(.monochrome_sprite, sprite)) {
             try self.animations.append(self.allocator, animation);
         }
     }
@@ -860,9 +861,8 @@ pub const Scene = struct {
         }
     }
 
-    /// Frees path vertices referenced from paint operations and the path list.
+    /// Frees path vertices and tiles referenced from the path list.
     fn release_paths(self: *Scene) void {
-        for (self.paint_operations.items) |*operation| operation.deinit();
         for (self.paths.items) |*path| path.deinit();
     }
 
@@ -905,9 +905,18 @@ pub const Scene = struct {
         if (layer.primitives.items.len == 0) return;
         const order = try self.primitive_bounds.insert(layer.bounds, layer.max_kind, layer.max_shared_kind);
         for (layer.primitives.items) |range| {
-            for (range.start..range.end) |index| {
-                switch (self.paint_operations.items[index]) {
-                    .primitive => |*primitive| try self.push_primitive(primitive, order),
+            for (self.paint_operations.items[range.start..range.end]) |operation| {
+                switch (operation) {
+                    .primitive => |ref| switch (ref.kind) {
+                        .shadow => self.shadows.items[ref.index].order = order,
+                        .quad => self.quads.items[ref.index].order = order,
+                        .path => self.paths.items[ref.index].order = order,
+                        .underline => self.underlines.items[ref.index].order = order,
+                        .monochrome_sprite => self.monochrome_sprites.items[ref.index].order = order,
+                        .subpixel_sprite => self.subpixel_sprites.items[ref.index].order = order,
+                        .polychrome_sprite => self.polychrome_sprites.items[ref.index].order = order,
+                        .surface => self.surfaces.items[ref.index].order = order,
+                    },
                     .start_layer, .end_layer => {},
                 }
             }
@@ -919,109 +928,170 @@ pub const Scene = struct {
         _ = try self.try_insert_primitive(primitive);
     }
 
-    /// Returns whether the primitive was kept rather than clipped away.
-    fn try_insert_primitive(self: *Scene, primitive: Primitive) !bool {
-        var owned = primitive;
-        errdefer owned.deinit();
+    pub fn insert_shadow(self: *Scene, item: Shadow) !void {
+        _ = try self.tryInsertSimple(.shadow, item);
+    }
 
-        if (owned == .path) {
-            const p = &owned.path;
-            if (p.tiles == null) {
-                try p.close();
-                var tiles = try self.path_binner.bin(p.allocator, p.curves.items, p.even_odd, 1.0);
-                tiles.retain_visible(p.content_mask.bounds);
-                p.paint_bounds_ = tiles.bounds();
-                p.bounds = tiles.painted_bounds();
-                p.tiles = tiles;
-            }
-            if (p.tiles.?.tiles().len == 0) {
-                owned.deinit();
-                return false;
-            }
-        }
+    pub fn insert_quad(self: *Scene, item: Quad) !void {
+        _ = try self.tryInsertSimple(.quad, item);
+    }
 
-        const clipped_bounds = owned.clipped_bounds();
-        if (clipped_bounds.is_empty()) {
-            owned.deinit();
-            return false;
-        }
+    pub fn insert_underline(self: *Scene, item: Underline) !void {
+        _ = try self.tryInsertSimple(.underline, item);
+    }
 
-        try self.paint_operations.ensureUnusedCapacity(self.allocator, 1);
-        const prim_kind = owned.kind();
+    pub fn insert_monochrome_sprite(self: *Scene, item: MonochromeSprite) !void {
+        _ = try self.tryInsertSimple(.monochrome_sprite, item);
+    }
+
+    pub fn insert_subpixel_sprite(self: *Scene, item: SubpixelSprite) !void {
+        _ = try self.tryInsertSimple(.subpixel_sprite, item);
+    }
+
+    pub fn insert_polychrome_sprite(self: *Scene, item: PolychromeSprite) !void {
+        _ = try self.tryInsertSimple(.polychrome_sprite, item);
+    }
+
+    pub fn insert_surface(self: *Scene, item: PaintSurface) !void {
+        _ = try self.tryInsertSimple(.surface, item);
+    }
+
+    pub fn insert_path(self: *Scene, item: Path(ScaledPixels)) !void {
+        _ = try self.try_insert_primitive(.{ .path = item });
+    }
+
+    fn assignOrder(self: *Scene, clipped_bounds: Bounds(ScaledPixels), prim_kind: PrimitiveKind) !DrawOrder {
         if (self.layer_stack.getLastOrNull()) |layer_idx| {
             const layer = &self.layers.items[layer_idx];
             layer.bounds = join_bounds(layer.bounds, clipped_bounds);
             layer.max_kind = @enumFromInt(@max(@intFromEnum(layer.max_kind), @intFromEnum(prim_kind)));
             layer.max_shared_kind = @enumFromInt(@min(@intFromEnum(layer.max_shared_kind), @intFromEnum(prim_kind.max_shared_kind())));
-            const index = self.paint_operations.items.len;
-            if (layer.primitives.items.len > 0 and layer.primitives.items[layer.primitives.items.len - 1].end == index) {
+            const op_index = self.paint_operations.items.len;
+            if (layer.primitives.items.len > 0 and layer.primitives.items[layer.primitives.items.len - 1].end == op_index) {
                 layer.primitives.items[layer.primitives.items.len - 1].end += 1;
             } else {
-                try layer.primitives.append(self.allocator, .{ .start = index, .end = index + 1 });
+                try layer.primitives.append(self.allocator, .{ .start = op_index, .end = op_index + 1 });
             }
-        } else {
-            const order = try self.primitive_bounds.insert(clipped_bounds, prim_kind, prim_kind.max_shared_kind());
-            try self.push_primitive(&owned, order);
+            return 0;
         }
+        return self.primitive_bounds.insert(clipped_bounds, prim_kind, prim_kind.max_shared_kind());
+    }
 
-        self.paint_operations.appendAssumeCapacity(.{ .primitive = owned });
+    fn tryInsertSimple(self: *Scene, comptime prim_kind: PrimitiveKind, item_in: anytype) !bool {
+        const clipped_bounds = switch (prim_kind) {
+            .shadow => blk: {
+                const b = if (item_in.inset != 0 and !item_in.element_bounds.is_empty())
+                    item_in.element_bounds
+                else if (item_in.inset == 0 and item_in.blur_radius > 0)
+                    item_in.bounds.dilate(3.0 * item_in.blur_radius)
+                else
+                    item_in.bounds;
+                break :blk b.intersect(item_in.content_mask.bounds);
+            },
+            .monochrome_sprite, .subpixel_sprite => blk: {
+                const b = if (item_in.transformation.is_unit())
+                    item_in.bounds
+                else
+                    item_in.transformation.transform_bounds(item_in.bounds);
+                break :blk b.intersect(item_in.content_mask.bounds);
+            },
+            .quad, .underline, .polychrome_sprite, .surface => item_in.bounds.intersect(item_in.content_mask.bounds),
+            .path => comptime unreachable,
+        };
+        if (clipped_bounds.is_empty()) return false;
+
+        try self.paint_operations.ensureUnusedCapacity(self.allocator, 1);
+        const order = try self.assignOrder(clipped_bounds, prim_kind);
+        const list = switch (prim_kind) {
+            .shadow => &self.shadows,
+            .quad => &self.quads,
+            .underline => &self.underlines,
+            .monochrome_sprite => &self.monochrome_sprites,
+            .subpixel_sprite => &self.subpixel_sprites,
+            .polychrome_sprite => &self.polychrome_sprites,
+            .surface => &self.surfaces,
+            .path => comptime unreachable,
+        };
+        const prim_index: u32 = @intCast(list.items.len);
+        const slot = try list.addOne(self.allocator);
+        slot.* = item_in;
+        slot.order = order;
+        self.paint_operations.appendAssumeCapacity(.{ .primitive = .{ .kind = prim_kind, .index = prim_index } });
         return true;
     }
 
-    fn push_primitive(self: *Scene, primitive: *Primitive, order: DrawOrder) !void {
-        switch (primitive.*) {
-            .shadow => |*shadow| {
-                shadow.order = order;
-                try self.shadows.append(self.allocator, shadow.*);
-            },
-            .quad => |*quad| {
-                quad.order = order;
-                try self.quads.append(self.allocator, quad.*);
-            },
-            .path => |*path| {
-                path.order = order;
-                path.id = .{ .value = self.paths.items.len };
-                var copy = try path.clone();
-                errdefer copy.deinit();
-                try self.paths.append(self.allocator, copy);
-            },
-            .underline => |*underline| {
-                underline.order = order;
-                try self.underlines.append(self.allocator, underline.*);
-            },
-            .monochrome_sprite => |*sprite| {
-                sprite.order = order;
-                try self.monochrome_sprites.append(self.allocator, sprite.*);
-            },
-            .subpixel_sprite => |*sprite| {
-                sprite.order = order;
-                try self.subpixel_sprites.append(self.allocator, sprite.*);
-            },
-            .polychrome_sprite => |*sprite| {
-                sprite.order = order;
-                try self.polychrome_sprites.append(self.allocator, sprite.*);
-            },
-            .surface => |*surface| {
-                surface.order = order;
-                try self.surfaces.append(self.allocator, surface.*);
-            },
+    /// Returns whether the primitive was kept rather than clipped away.
+    fn try_insert_primitive(self: *Scene, primitive: Primitive) !bool {
+        switch (primitive) {
+            .shadow => |v| return self.tryInsertSimple(.shadow, v),
+            .quad => |v| return self.tryInsertSimple(.quad, v),
+            .underline => |v| return self.tryInsertSimple(.underline, v),
+            .monochrome_sprite => |v| return self.tryInsertSimple(.monochrome_sprite, v),
+            .subpixel_sprite => |v| return self.tryInsertSimple(.subpixel_sprite, v),
+            .polychrome_sprite => |v| return self.tryInsertSimple(.polychrome_sprite, v),
+            .surface => |v| return self.tryInsertSimple(.surface, v),
+            .path => {},
         }
+
+        var owned = primitive.path;
+        var moved = false;
+        errdefer if (!moved) owned.deinit();
+
+        if (owned.tiles == null) {
+            try owned.close();
+            var tiles = try self.path_binner.bin(owned.allocator, owned.curves.items, owned.even_odd, 1.0);
+            tiles.retain_visible(owned.content_mask.bounds);
+            owned.paint_bounds_ = tiles.bounds();
+            owned.bounds = tiles.painted_bounds();
+            owned.tiles = tiles;
+        }
+        if (owned.tiles.?.tiles().len == 0) {
+            owned.deinit();
+            moved = true;
+            return false;
+        }
+
+        const clipped_bounds = owned.clipped_bounds();
+        if (clipped_bounds.is_empty()) {
+            owned.deinit();
+            moved = true;
+            return false;
+        }
+
+        try self.paint_operations.ensureUnusedCapacity(self.allocator, 1);
+        const order = try self.assignOrder(clipped_bounds, .path);
+        const prim_index: u32 = @intCast(self.paths.items.len);
+        owned.order = order;
+        owned.id = .{ .value = prim_index };
+        try self.paths.append(self.allocator, owned);
+        moved = true;
+        self.paint_operations.appendAssumeCapacity(.{ .primitive = .{ .kind = .path, .index = prim_index } });
+        return true;
     }
 
     /// Re-inserts the paint operations in `range` of `prev_scene` into this scene.
     pub fn replay(self: *Scene, range: Range, prev_scene: *const Scene) !void {
-        for (prev_scene.paint_operations.items[range.start..range.end]) |operation| {
+        const ops = prev_scene.paint_operations.items[range.start..range.end];
+        try self.paint_operations.ensureUnusedCapacity(self.allocator, ops.len);
+        for (ops) |operation| {
             switch (operation) {
-                .primitive => |primitive| {
-                    if (primitive == .monochrome_sprite) {
-                        const sprite = primitive.monochrome_sprite;
+                .primitive => |ref| switch (ref.kind) {
+                    .shadow => _ = try self.tryInsertSimple(.shadow, prev_scene.shadows.items[ref.index]),
+                    .quad => _ = try self.tryInsertSimple(.quad, prev_scene.quads.items[ref.index]),
+                    .path => try self.insert_path(try prev_scene.paths.items[ref.index].clone()),
+                    .underline => _ = try self.tryInsertSimple(.underline, prev_scene.underlines.items[ref.index]),
+                    .monochrome_sprite => {
+                        const sprite = prev_scene.monochrome_sprites.items[ref.index];
                         const anim_idx = @intFromEnum(sprite.animation);
                         if (sprite.animation != .none and anim_idx < prev_scene.animations.items.len) {
                             try self.insert_animated_sprite(sprite, prev_scene.animations.items[anim_idx]);
-                            continue;
+                        } else {
+                            _ = try self.tryInsertSimple(.monochrome_sprite, sprite);
                         }
-                    }
-                    try self.insert_primitive(try primitive.clone());
+                    },
+                    .subpixel_sprite => _ = try self.tryInsertSimple(.subpixel_sprite, prev_scene.subpixel_sprites.items[ref.index]),
+                    .polychrome_sprite => _ = try self.tryInsertSimple(.polychrome_sprite, prev_scene.polychrome_sprites.items[ref.index]),
+                    .surface => _ = try self.tryInsertSimple(.surface, prev_scene.surfaces.items[ref.index]),
                 },
                 .start_layer => |bounds| try self.push_layer(bounds),
                 .end_layer => try self.pop_layer(),
@@ -1029,17 +1099,43 @@ pub const Scene = struct {
         }
     }
 
+    fn remapKind(self: *Scene, kind: PrimitiveKind) void {
+        const map = self.remap_scratch.items;
+        for (self.paint_operations.items) |*op| {
+            if (op.* == .primitive and op.primitive.kind == kind) {
+                op.primitive.index = map[op.primitive.index];
+            }
+        }
+    }
+
     /// Sorts every primitive list by draw order (and texture for sprites). Call before `batches`.
     pub fn finish(self: *Scene) void {
         std.debug.assert(self.layer_stack.items.len == 0);
-        sort_in_place(Shadow, self.shadows.items, &self.sort_keys, self.allocator, order_key(Shadow));
-        sort_in_place(Quad, self.quads.items, &self.sort_keys, self.allocator, order_key(Quad));
-        sort_in_place(Path(ScaledPixels), self.paths.items, &self.sort_keys, self.allocator, order_key(Path(ScaledPixels)));
-        sort_in_place(Underline, self.underlines.items, &self.sort_keys, self.allocator, order_key(Underline));
-        sort_in_place(MonochromeSprite, self.monochrome_sprites.items, &self.sort_keys, self.allocator, order_texture_key(MonochromeSprite));
-        sort_in_place(SubpixelSprite, self.subpixel_sprites.items, &self.sort_keys, self.allocator, order_texture_key(SubpixelSprite));
-        sort_in_place(PolychromeSprite, self.polychrome_sprites.items, &self.sort_keys, self.allocator, order_texture_key(PolychromeSprite));
-        sort_in_place(PaintSurface, self.surfaces.items, &self.sort_keys, self.allocator, order_key(PaintSurface));
+        if (sort_in_place(Shadow, self.shadows.items, &self.sort_keys, &self.remap_scratch, self.allocator, order_key(Shadow))) {
+            self.remapKind(.shadow);
+        }
+        if (sort_in_place(Quad, self.quads.items, &self.sort_keys, &self.remap_scratch, self.allocator, order_key(Quad))) {
+            self.remapKind(.quad);
+        }
+        if (sort_in_place(Path(ScaledPixels), self.paths.items, &self.sort_keys, &self.remap_scratch, self.allocator, order_key(Path(ScaledPixels)))) {
+            for (self.paths.items, 0..) |*p, i| p.id = .{ .value = i };
+            self.remapKind(.path);
+        }
+        if (sort_in_place(Underline, self.underlines.items, &self.sort_keys, &self.remap_scratch, self.allocator, order_key(Underline))) {
+            self.remapKind(.underline);
+        }
+        if (sort_in_place(MonochromeSprite, self.monochrome_sprites.items, &self.sort_keys, &self.remap_scratch, self.allocator, order_texture_key(MonochromeSprite))) {
+            self.remapKind(.monochrome_sprite);
+        }
+        if (sort_in_place(SubpixelSprite, self.subpixel_sprites.items, &self.sort_keys, &self.remap_scratch, self.allocator, order_texture_key(SubpixelSprite))) {
+            self.remapKind(.subpixel_sprite);
+        }
+        if (sort_in_place(PolychromeSprite, self.polychrome_sprites.items, &self.sort_keys, &self.remap_scratch, self.allocator, order_texture_key(PolychromeSprite))) {
+            self.remapKind(.polychrome_sprite);
+        }
+        if (sort_in_place(PaintSurface, self.surfaces.items, &self.sort_keys, &self.remap_scratch, self.allocator, order_key(PaintSurface))) {
+            self.remapKind(.surface);
+        }
 
         // Sorting moved the sprites, so animations learn where theirs ended up.
         if (self.animations.items.len > 0) {
@@ -1101,45 +1197,127 @@ fn sort_entry_less(_: void, lhs: SortEntry, rhs: SortEntry) bool {
     return lhs.index < rhs.index;
 }
 
+fn oom() noreturn {
+    @panic("out of memory");
+}
+
 /// Sorts small `(key, index)` pairs instead of the large primitives themselves, then permutes
 /// primitives into place in a single pass of cycles. Ties preserve insertion order via `index`.
+/// Uses O(N) counting sort when order/texture spans are small; falls back to pdq otherwise.
+/// Returns `true` if `primitives` was reordered (and populates `remap` with `old_idx -> new_idx`).
 fn sort_in_place(
     comptime T: type,
     primitives: []T,
     keys: *std.ArrayList(SortEntry),
+    remap: *std.ArrayList(u32),
     allocator: std.mem.Allocator,
     comptime key_fn: fn (*const T) u64,
-) void {
-    if (primitives.len <= 1) return;
+) bool {
+    if (primitives.len <= 1) return false;
 
+    const has_tex = comptime @hasField(T, "tile");
     var sorted = true;
     var prev_key = key_fn(&primitives[0]);
+    var min_order: u32 = primitives[0].order;
+    var max_order: u32 = primitives[0].order;
+    var min_tex: u32 = if (has_tex) primitives[0].tile.texture_id.index else 0;
+    var max_tex: u32 = min_tex;
+
     for (primitives[1..]) |*item| {
         const k = key_fn(item);
-        if (k < prev_key) {
-            sorted = false;
-            break;
-        }
+        if (k < prev_key) sorted = false;
         prev_key = k;
+        if (item.order < min_order) min_order = item.order;
+        if (item.order > max_order) max_order = item.order;
+        if (has_tex) {
+            const tx = item.tile.texture_id.index;
+            if (tx < min_tex) min_tex = tx;
+            if (tx > max_tex) max_tex = tx;
+        }
     }
-    if (sorted) return;
+    if (sorted) return false;
 
-    keys.resize(allocator, primitives.len) catch {
-        // Fallback when scratch allocation fails: stable in-place sort with zero allocations.
-        std.sort.block(T, primitives, {}, struct {
-            fn less(_: void, lhs: T, rhs: T) bool {
-                return key_fn(&lhs) < key_fn(&rhs);
+    const n = primitives.len;
+    keys.resize(allocator, n) catch oom();
+    remap.resize(allocator, n) catch oom();
+
+    const order_span: u64 = @as(u64, max_order - min_order) + 1;
+    const tex_span: u64 = if (has_tex) @as(u64, max_tex - min_tex) + 1 else 1;
+
+    if (order_span <= 512 and tex_span <= 256) {
+        if (tex_span == 1) {
+            // Single-pass O(N) counting sort by `order`; forward iteration preserves insertion order.
+            var counts: [512]u32 = @splat(0);
+            for (primitives) |*item| {
+                counts[item.order - min_order] += 1;
             }
-        }.less);
-        return;
-    };
+            var acc: u32 = 0;
+            for (counts[0..@intCast(order_span)]) |*c| {
+                const count = c.*;
+                c.* = acc;
+                acc += count;
+            }
+            for (primitives, 0..) |*item, old_idx| {
+                const b = item.order - min_order;
+                const new_idx = counts[b];
+                counts[b] = new_idx + 1;
+                remap.items[old_idx] = new_idx;
+                keys.items[new_idx].index = @intCast(old_idx);
+            }
+        } else {
+            // Two-pass O(N) LSD counting sort: first by texture_id.index, then by order.
+            var tex_counts: [256]u32 = @splat(0);
+            for (primitives) |*item| {
+                tex_counts[item.tile.texture_id.index - min_tex] += 1;
+            }
+            var tex_acc: u32 = 0;
+            for (tex_counts[0..@intCast(tex_span)]) |*c| {
+                const count = c.*;
+                c.* = tex_acc;
+                tex_acc += count;
+            }
+            // Use `remap` temporarily to hold indices sorted by texture.
+            for (primitives, 0..) |*item, old_idx| {
+                const tb = item.tile.texture_id.index - min_tex;
+                const pos = tex_counts[tb];
+                tex_counts[tb] = pos + 1;
+                remap.items[pos] = @intCast(old_idx);
+            }
 
-    for (primitives, 0..) |*item, index| {
-        keys.items[index] = .{ .key = key_fn(item), .index = @intCast(index) };
+            var ord_counts: [512]u32 = @splat(0);
+            for (primitives) |*item| {
+                ord_counts[item.order - min_order] += 1;
+            }
+            var ord_acc: u32 = 0;
+            for (ord_counts[0..@intCast(order_span)]) |*c| {
+                const count = c.*;
+                c.* = ord_acc;
+                ord_acc += count;
+            }
+            // Iterate in texture-sorted order so ties on (order, tex) preserve original order;
+            // store `old_idx` into `keys[new_idx].index`, then fill `remap[old_idx] = new_idx`.
+            for (remap.items[0..n]) |old_idx| {
+                const b = primitives[old_idx].order - min_order;
+                const new_idx = ord_counts[b];
+                ord_counts[b] = new_idx + 1;
+                keys.items[new_idx].index = old_idx;
+            }
+            for (keys.items[0..n], 0..) |entry, new_idx| {
+                remap.items[entry.index] = @intCast(new_idx);
+            }
+        }
+    } else {
+        for (primitives, 0..) |*item, index| {
+            keys.items[index] = .{ .key = key_fn(item), .index = @intCast(index) };
+        }
+        std.sort.pdq(SortEntry, keys.items, {}, sort_entry_less);
+
+        for (keys.items, 0..) |entry, new_idx| {
+            remap.items[entry.index] = @intCast(new_idx);
+        }
     }
-    std.sort.pdq(SortEntry, keys.items, {}, sort_entry_less);
 
-    for (0..primitives.len) |start| {
+    for (0..n) |start| {
         if (keys.items[start].index == start) continue;
         const displaced = primitives[start];
         var target = start;
@@ -1154,6 +1332,7 @@ fn sort_in_place(
             target = source;
         }
     }
+    return true;
 }
 
 fn rect(x: f32, y: f32, width: f32, height: f32) Bounds(ScaledPixels) {
@@ -1254,6 +1433,8 @@ test "finish sorts primitives by draw order and preserves stability on ties" {
 test "fast sort_in_place handles already-sorted, reversed, and interleaved inputs stably" {
     var keys: std.ArrayList(SortEntry) = .empty;
     defer keys.deinit(testing.allocator);
+    var remap: std.ArrayList(u32) = .empty;
+    defer remap.deinit(testing.allocator);
 
     // Already sorted
     var sorted_quads = [_]Quad{
@@ -1261,7 +1442,7 @@ test "fast sort_in_place handles already-sorted, reversed, and interleaved input
         .{ .order = 1, .bounds = rect(2, 0, 1, 1) },
         .{ .order = 2, .bounds = rect(3, 0, 1, 1) },
     };
-    sort_in_place(Quad, &sorted_quads, &keys, testing.allocator, order_key(Quad));
+    try testing.expect(!sort_in_place(Quad, &sorted_quads, &keys, &remap, testing.allocator, order_key(Quad)));
     try testing.expectEqual(@as(f32, 1), sorted_quads[0].bounds.origin.x);
     try testing.expectEqual(@as(f32, 2), sorted_quads[1].bounds.origin.x);
     try testing.expectEqual(@as(f32, 3), sorted_quads[2].bounds.origin.x);
@@ -1274,12 +1455,13 @@ test "fast sort_in_place handles already-sorted, reversed, and interleaved input
         .{ .order = 1, .bounds = rect(30, 0, 1, 1) },
         .{ .order = 1, .bounds = rect(31, 0, 1, 1) },
     };
-    sort_in_place(Quad, &reversed_quads, &keys, testing.allocator, order_key(Quad));
+    try testing.expect(sort_in_place(Quad, &reversed_quads, &keys, &remap, testing.allocator, order_key(Quad)));
     try testing.expectEqual(@as(f32, 30), reversed_quads[0].bounds.origin.x);
     try testing.expectEqual(@as(f32, 31), reversed_quads[1].bounds.origin.x);
     try testing.expectEqual(@as(f32, 20), reversed_quads[2].bounds.origin.x);
     try testing.expectEqual(@as(f32, 21), reversed_quads[3].bounds.origin.x);
     try testing.expectEqual(@as(f32, 10), reversed_quads[4].bounds.origin.x);
+    try testing.expectEqualSlices(u32, &.{ 4, 2, 3, 0, 1 }, remap.items);
 
     // Interleaved sprites by (order, texture_id)
     var sprites = [_]MonochromeSprite{
@@ -1292,7 +1474,7 @@ test "fast sort_in_place handles already-sorted, reversed, and interleaved input
     sprites[1].order = 2;
     sprites[2].order = 1;
     sprites[3].order = 2;
-    sort_in_place(MonochromeSprite, &sprites, &keys, testing.allocator, order_texture_key(MonochromeSprite));
+    try testing.expect(sort_in_place(MonochromeSprite, &sprites, &keys, &remap, testing.allocator, order_texture_key(MonochromeSprite)));
     try testing.expectEqual(@as(f32, 3), sprites[0].bounds.origin.x); // order 1, tex 2
     try testing.expectEqual(@as(f32, 2), sprites[1].bounds.origin.x); // order 2, tex 1 (first)
     try testing.expectEqual(@as(f32, 4), sprites[2].bounds.origin.x); // order 2, tex 1 (second)
@@ -1470,4 +1652,49 @@ test "animated sprites survive finish sorting and scene replay" {
             try testing.expectApproxEqAbs(@as(f32, -1.0), sp.transformation.rotation_scale[0][0], 1e-4);
         }
     }
+}
+
+test "replay after out-of-order finish sort replays exact sub-range primitives" {
+    var source = Scene.init(testing.allocator);
+    defer source.deinit();
+
+    // Op 0..2: prefix quads at (0,0) -> order 1, (0,0) -> order 2.
+    try source.insert_primitive(.{ .quad = quad_at(0, 0, 10, 10) });
+    try source.insert_primitive(.{ .quad = quad_at(0, 0, 10, 10) });
+    const range_start = source.len();
+    // Op 2..5 (cached sub-range): distinct quads & sprite that get reordered by finish().
+    // Quad at (50,50) gets order 1 (moves before order 2 quad in source.quads!).
+    var q_sub1 = quad_at(50, 50, 12, 12);
+    q_sub1.border_widths = Edges(ScaledPixels).all(3);
+    try source.insert_primitive(.{ .quad = q_sub1 });
+    // Quad overlapping (50,50) gets order 2.
+    var q_sub2 = quad_at(50, 50, 14, 14);
+    q_sub2.border_widths = Edges(ScaledPixels).all(5);
+    try source.insert_primitive(.{ .quad = q_sub2 });
+    // Interleaved sprites of different textures that get reordered by finish().
+    try source.insert_primitive(.{ .monochrome_sprite = sprite_at(100, 100, 7) });
+    try source.insert_primitive(.{ .monochrome_sprite = sprite_at(200, 200, 1) });
+    const range_end = source.len();
+
+    // Op 6: trailing quad at (500,500) -> order 1 (sorts before order 2 quads!).
+    try source.insert_primitive(.{ .quad = quad_at(500, 500, 8, 8) });
+
+    // finish() permutes both quads and monochrome_sprites out of insertion order.
+    source.finish();
+
+    var replayed = Scene.init(testing.allocator);
+    defer replayed.deinit();
+    try replayed.replay(.{ .start = range_start, .end = range_end }, &source);
+    replayed.finish();
+
+    // Only the 2 quads and 2 sprites from range_start..range_end should be in replayed.
+    try testing.expectEqual(@as(usize, 2), replayed.quads.items.len);
+    try testing.expectEqual(@as(f32, 3), replayed.quads.items[0].border_widths.top);
+    try testing.expectEqual(@as(f32, 5), replayed.quads.items[1].border_widths.top);
+    try testing.expectEqual(@as(usize, 2), replayed.monochrome_sprites.items.len);
+    // Sprite tex 1 and tex 7 were both replayed (sorted to tex 1 then tex 7 by finish()).
+    try testing.expectEqual(@as(u32, 1), replayed.monochrome_sprites.items[0].tile.texture_id.index);
+    try testing.expectEqual(@as(f32, 200), replayed.monochrome_sprites.items[0].bounds.origin.x);
+    try testing.expectEqual(@as(u32, 7), replayed.monochrome_sprites.items[1].tile.texture_id.index);
+    try testing.expectEqual(@as(f32, 100), replayed.monochrome_sprites.items[1].bounds.origin.x);
 }

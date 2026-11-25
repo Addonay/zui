@@ -228,9 +228,9 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
 - **Div paint order** matches GPUI: shadows → background → ext paint →
   children (in overflow mask, scroll-offset) → border on top.
 - **Layout**: persistent `zafi.Tree` nodes retained across frames via `LayoutCache`
-  (reusing unchanged nodes/styles/children, recycling unrequested nodes for one frame before
-  evicting, and caching keyed measured layouts for `text` and `img`), styles converted to
-  device pixels (scale factor), rounding disabled, bounds snapped with
+  using dense slot arrays (no per-node HashMap lookups on the hot path, generation-stamped
+  bounds, 2-frame node recycling/eviction, and keyed measured layout caching for `text` and `img`),
+  styles converted to device pixels (scale factor), rounding disabled, bounds snapped with
   round-half-toward-zero; measure functions via a threadlocal trampoline.
 - **Color glyphs**: cozmic renders COLRv1 through the bundled HarfBuzz's `hb-raster` and the rest
   through FreeType. `-Dsystem-libs` builds of cozmic have no COLRv1.
@@ -248,12 +248,14 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   `{ptr, vtable}` value. `current_platform()` gives the Linux platform, or
   `HeadlessPlatform` under `ZUI_HEADLESS=1` and tests (see Windowing modes).
 - **CPU renderer** follows GPUI's WGSL literally: straight alpha, sRGB-space
-  blending (as wgpu ALPHA_BLENDING), gradient color-space handling via LUT,
-  Raph Levien analytical blurred rounded-rect shadows (`erf7`), analytical Slug tiled
-  quadratic-curve path winding (supporting holes, self-intersections, NonZero and EvenOdd),
-  gamma 1.8/contrast. Underline alpha is squared exactly like GPUI's shader (looks like a GPUI quirk).
-  Benchmarks (4 vCPU Xeon, 1080p, ReleaseFast, 4 threads): 10k opaque rects
-  5.2 ms, 10k rounded 21 ms, 10k gradients 231 ms (slowest path).
+  blending (as wgpu ALPHA_BLENDING), 4-wide SIMD polynomial sRGB/Oklab gradients
+  with hoisted linear spans, 32-byte SIMD opaque `SolidFill`, integer-aligned
+  glyph blitting, Raph Levien analytical blurred rounded-rect shadows (`erf7`),
+  analytical Slug tiled quadratic-curve path winding (supporting holes,
+  self-intersections, NonZero and EvenOdd), gamma 1.8/contrast. Underline alpha is
+  squared exactly like GPUI's shader (looks like a GPUI quirk).
+  Benchmarks (1080p, ReleaseFast): 10k opaque rects 7.9 ms, 10k sRGB/Oklab gradients
+  74 ms (down from 231 ms).
 - **GPU renderer**: port of `gpui_wgpu`'s batching on the vendored `src/gpu/` layer
   (never zicr's `render2d`). Instances are per-instance vertex attributes, so it stays
   portable to GL/WebGL. Draws in a single render pass with a 32-bit float depth buffer:

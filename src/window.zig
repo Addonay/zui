@@ -2381,7 +2381,7 @@ pub const Window = struct {
         for (shadows) |s| {
             if (s.inset) continue;
             const shadow_bounds = (Bounds(Pixels){ .origin = b.origin.add(s.offset), .size = b.size }).dilate(s.spread_radius_);
-            insertPrim(&self.next_frame.scene, .{ .shadow = .{
+            self.next_frame.scene.insert_shadow(.{
                 .order = 0,
                 .blur_radius = s.blur_radius_ * sf,
                 .bounds = shadow_bounds.scale(sf),
@@ -2391,7 +2391,7 @@ pub const Window = struct {
                 .element_bounds = element_bounds,
                 .element_corner_radii = element_corner_radii,
                 .inset = 0,
-            } });
+            }) catch oom();
         }
     }
 
@@ -2412,7 +2412,7 @@ pub const Window = struct {
                 .bottom_right = @max(corner_radii.bottom_right - s.spread_radius_, 0),
                 .bottom_left = @max(corner_radii.bottom_left - s.spread_radius_, 0),
             };
-            insertPrim(&self.next_frame.scene, .{ .shadow = .{
+            self.next_frame.scene.insert_shadow(.{
                 .order = 0,
                 .blur_radius = s.blur_radius_ * sf,
                 .bounds = hole.scale(sf),
@@ -2422,7 +2422,7 @@ pub const Window = struct {
                 .element_bounds = element_bounds,
                 .element_corner_radii = element_corner_radii,
                 .inset = 1,
-            } });
+            }) catch oom();
         }
     }
 
@@ -2430,7 +2430,7 @@ pub const Window = struct {
     pub fn paint_quad(self: *Window, q: PaintQuad) void {
         const sf = self.scale_factor_;
         const opacity = self.element_opacity();
-        insertPrim(&self.next_frame.scene, .{ .quad = .{
+        self.next_frame.scene.insert_quad(.{
             .order = 0,
             .border_style = q.border_style,
             .bounds = q.bounds.scale(sf),
@@ -2439,7 +2439,7 @@ pub const Window = struct {
             .border_color = q.border_color.opacity(opacity),
             .corner_radii = q.corner_radii.scale(sf),
             .border_widths = q.border_widths.scale(sf),
-        } });
+        }) catch oom();
     }
 
     /// Paints a path (GPUI `paint_path`). The scene takes ownership of `path`.
@@ -2466,7 +2466,7 @@ pub const Window = struct {
             .even_odd = p.even_odd,
             .tiles = tiles,
         };
-        insertPrim(&self.next_frame.scene, .{ .path = scaled });
+        self.next_frame.scene.insert_path(scaled) catch oom();
     }
 
     fn underline_primitive(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle) scene_mod.Underline {
@@ -2505,7 +2505,7 @@ pub const Window = struct {
 
     /// Paints an underline (GPUI `paint_underline`).
     pub fn paint_underline(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle) void {
-        insertPrim(&self.next_frame.scene, .{ .underline = self.underline_primitive(origin, width, style) });
+        self.next_frame.scene.insert_underline(self.underline_primitive(origin, width, style)) catch oom();
     }
 
     /// Paints an underline with the device-space horizontal spans in `exclusions` left out, for
@@ -2513,7 +2513,10 @@ pub const Window = struct {
     /// Each span is cut from the underline as ScaledPixels x-ranges.
     pub fn paint_underline_with_exclusions(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.UnderlineStyle, exclusions: []const ScaledRange) void {
         const underline = self.underline_primitive(origin, width, style);
-        if (exclusions.len == 0) return insertPrim(&self.next_frame.scene, .{ .underline = underline });
+        if (exclusions.len == 0) {
+            self.next_frame.scene.insert_underline(underline) catch oom();
+            return;
+        }
 
         const clip = underline.bounds.intersect(underline.content_mask.bounds);
         if (clip.is_empty()) return;
@@ -2530,7 +2533,10 @@ pub const Window = struct {
                 count += 1;
             }
         }
-        if (count == 0) return insertPrim(&self.next_frame.scene, .{ .underline = underline });
+        if (count == 0) {
+            self.next_frame.scene.insert_underline(underline) catch oom();
+            return;
+        }
         std.mem.sort(ScaledRange, spans[0..count], {}, struct {
             fn less(_: void, a: ScaledRange, b: ScaledRange) bool {
                 return a.start < b.start;
@@ -2551,14 +2557,14 @@ pub const Window = struct {
             .origin = .{ .x = start, .y = clip.origin.y },
             .size = .{ .width = end - start, .height = clip.size.height },
         } };
-        insertPrim(&self.next_frame.scene, .{ .underline = piece });
+        self.next_frame.scene.insert_underline(piece) catch oom();
     }
 
     /// Paints a strikethrough.
     pub fn paint_strikethrough(self: *Window, origin: Point(Pixels), width: Pixels, style: *const style_mod.StrikethroughStyle) void {
         const sf = self.scale_factor_;
         const b: Bounds(Pixels) = .{ .origin = origin, .size = .{ .width = width, .height = style.thickness } };
-        insertPrim(&self.next_frame.scene, .{ .underline = .{
+        self.next_frame.scene.insert_underline(.{
             .order = 0,
             .pad = 0,
             .bounds = b.scale(sf),
@@ -2566,7 +2572,7 @@ pub const Window = struct {
             .color = (style.color orelse color_mod.black()).opacity(self.element_opacity()),
             .thickness = style.thickness * sf,
             .wavy = .from(false),
-        } });
+        }) catch oom();
     }
 
     /// Paints a monochrome glyph (GPUI `paint_glyph`).
@@ -2593,7 +2599,7 @@ pub const Window = struct {
             .origin = .{ .x = @floor(qx) + @as(f32, @floatFromInt(rb.origin.x)), .y = @floor(qy) + @as(f32, @floatFromInt(rb.origin.y)) },
             .size = .{ .width = @floatFromInt(tile.bounds.size.width), .height = @floatFromInt(tile.bounds.size.height) },
         };
-        insertPrim(&self.next_frame.scene, .{ .monochrome_sprite = .{
+        self.next_frame.scene.insert_monochrome_sprite(.{
             .order = 0,
             .animation = .none,
             .bounds = b,
@@ -2601,7 +2607,7 @@ pub const Window = struct {
             .color = color.opacity(self.element_opacity()),
             .tile = tile,
             .transformation = scene_mod.TransformationMatrix.unit(),
-        } });
+        }) catch oom();
     }
 
     /// Paints a color (emoji) glyph (GPUI `paint_emoji`).
@@ -2624,7 +2630,7 @@ pub const Window = struct {
             .origin = .{ .x = @floor(go.x) + @as(f32, @floatFromInt(rb.origin.x)), .y = @floor(go.y) + @as(f32, @floatFromInt(rb.origin.y)) },
             .size = .{ .width = @floatFromInt(tile.bounds.size.width), .height = @floatFromInt(tile.bounds.size.height) },
         };
-        insertPrim(&self.next_frame.scene, .{ .polychrome_sprite = .{
+        self.next_frame.scene.insert_polychrome_sprite(.{
             .order = 0,
             .pad = 0,
             .grayscale = .from(false),
@@ -2633,7 +2639,7 @@ pub const Window = struct {
             .content_mask = self.scaled_content_mask(),
             .corner_radii = Corners(ScaledPixels).all(0),
             .tile = tile,
-        } });
+        }) catch oom();
     }
 
     /// Paints `frame_index` of `data` drawn at `image_bounds`, clipped to `b` and rounded by
@@ -2657,7 +2663,7 @@ pub const Window = struct {
 
         const sf = self.scale_factor_;
         const radii = corner_radii.clamp_radii_for_quad_size(visible.size).scale(sf);
-        insertPrim(&self.next_frame.scene, .{ .polychrome_sprite = .{
+        self.next_frame.scene.insert_polychrome_sprite(.{
             .order = 0,
             .pad = 0,
             .grayscale = .from(grayscale),
@@ -2666,7 +2672,7 @@ pub const Window = struct {
             .content_mask = self.scaled_content_mask(),
             .corner_radii = radii,
             .tile = sub_tile(tile, image_bounds, visible),
-        } });
+        }) catch oom();
     }
 
     /// Paints the SVG at `path`, or the bytes `data` when given, as a mask tinted with `color`,
@@ -2725,7 +2731,7 @@ pub const Window = struct {
         if (animation) |anim| {
             self.next_frame.scene.insert_animated_sprite(sprite, anim) catch oom();
         } else {
-            insertPrim(&self.next_frame.scene, .{ .monochrome_sprite = sprite });
+            self.next_frame.scene.insert_monochrome_sprite(sprite) catch oom();
         }
     }
 
@@ -3921,10 +3927,6 @@ const SvgTile = struct {
         };
     }
 };
-
-fn insertPrim(scene: *scene_mod.Scene, p: scene_mod.Primitive) void {
-    scene.insert_primitive(p) catch oom();
-}
 
 test "sub_tile crops the atlas tile to the visible part" {
     const tile: atlas_mod.AtlasTile = .{

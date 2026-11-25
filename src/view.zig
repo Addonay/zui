@@ -102,7 +102,7 @@ const ViewElement = struct {
     child: ?AnyElement = null,
 
     pub const RequestLayoutState = void;
-    pub const PrepaintState = void;
+    pub const PrepaintState = ?*ViewElementState;
 
     pub fn id(self: *ViewElement) ?element_mod.ElementId {
         return .{ .view = self.view.entity_id.as_u64() };
@@ -112,21 +112,28 @@ const ViewElement = struct {
         window.push_view(self.view.entity_id);
         defer window.pop_view();
         if (self.view.cached_style) |refinement| {
-            var root_style: Style = .{};
-            root_style.refine(refinement);
-            return .{ window.request_layout(&root_style, &.{}, cx), {} };
+            return .{ window.layout_engine.request_layout_refinement(
+                window.current_global_id().hash,
+                refinement,
+                window.rem_size(),
+                window.scale_factor(),
+                &.{},
+            ), {} };
         }
         const child = self.view.render_fn(self.view.entity_id, window, cx);
         self.child = child;
         return .{ child.request_layout(window, cx), {} };
     }
 
-    pub fn prepaint(self: *ViewElement, global_id: ?*const element_mod.GlobalElementId, bounds: geometry.Bounds(geometry.Pixels), _: *void, window: *Window, cx: *App) void {
+    pub fn prepaint(self: *ViewElement, global_id: ?*const element_mod.GlobalElementId, bounds: geometry.Bounds(geometry.Pixels), _: *void, window: *Window, cx: *App) ?*ViewElementState {
         const entity_id = self.view.entity_id;
         window.set_view_id(entity_id);
         window.push_view(entity_id);
         defer window.pop_view();
-        if (self.child) |child| return child.prepaint(window, cx);
+        if (self.child) |child| {
+            child.prepaint(window, cx);
+            return null;
+        }
 
         const state = window.element_state(ViewElementState, global_id.?.*, .{ .arenas = .{ .init(window.allocator), .init(window.allocator) } });
         const key: ViewElementCacheKey = .{
@@ -145,7 +152,7 @@ const ViewElement = struct {
             window.reuse_prepaint(state.prepaint_start, state.prepaint_end);
             state.prepaint_start = start;
             state.prepaint_end = window.prepaint_index();
-            return;
+            return state;
         }
 
         // Everything inside renders again too, since its bounds may have changed with this view's.
@@ -166,14 +173,15 @@ const ViewElement = struct {
         child.prepaint_at(bounds.origin, window, cx);
         state.prepaint_end = window.prepaint_index();
         state.cache_key = key;
+        return state;
     }
 
-    pub fn paint(self: *ViewElement, global_id: ?*const element_mod.GlobalElementId, _: geometry.Bounds(geometry.Pixels), _: *void, _: *void, window: *Window, cx: *App) void {
+    pub fn paint(self: *ViewElement, _: ?*const element_mod.GlobalElementId, _: geometry.Bounds(geometry.Pixels), _: *void, pp: *?*ViewElementState, window: *Window, cx: *App) void {
         window.push_view(self.view.entity_id);
         defer window.pop_view();
         if (self.view.cached_style == null) return self.child.?.paint(window, cx);
 
-        const state = window.element_state(ViewElementState, global_id.?.*, .{ .arenas = .{ .init(window.allocator), .init(window.allocator) } });
+        const state = pp.*.?;
         const start = window.paint_index();
         // Prepaint can only predict the opacity: an ancestor's hover style depends on this frame's
         // hit test. The key records what was painted, and output replayed under another
