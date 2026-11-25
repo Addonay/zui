@@ -97,7 +97,7 @@ third_party/             Wuffs, nanosvg, images.c shim
 - `build.zig.zon` dependencies:
   - `cozmic` — `git+https://github.com/Addonay/cozmic.git#bd7e29cf11b9db0c046647dd58d8c8622c9b8683`
     (its own deps: ezi_code, harfbuzz 14.1.0, freetype 2.14.3, zlib 1.3.1, libpng 1.6.50)
-  - `zafi` — `git+https://github.com/Addonay/zafi.git#04086f7a21f120a5ea52f921fb2034d75e10264f`
+  - `zafi` — `git+https://github.com/Addonay/zafi#4ea7e55534f89cb546465098f69496a6dd752729` (0.4.2)
   - `sokol_tools_bin` (lazy) — the `sokol-shdc` binaries, fetched only by
     `zig build shaders -Dregen-shaders=true`. Run that after editing `shaders.glsl`;
     normal builds use the committed `src/renderer/shaders_gen.zig`.
@@ -408,4 +408,4 @@ See `todo.md`. In order: finish the API, with naive implementations where that i
 - Nothing may reach the real desktop: no `zig build run-*` without isolation, no window, notification, program or file
   dialog on the real session, and no `gsettings` or `dconf`.
 - Check what a library does from its source or the web, not from memory: Wuffs' WebP support was misremembered.
-- When GPUI moves, read its new commits in `crates/gpui*` and port what applies. Last checked at `4a6121b`.
+- When GPUI moves, read its new commits in `crates/gpui*` and port what applies. Last checked at `67c513c8` (core/dispatch/text/list/div/platform synced in v0.2.0; rendering/layout pipeline items queued for v0.3.0).

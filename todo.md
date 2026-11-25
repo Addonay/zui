@@ -215,9 +215,9 @@ Each must run headless with a correct snapshot, and be driven for real: first fr
 - Profile: `perf` needs a kernel setting, so use callgrind. Build with `-Dcpu=x86_64`, because valgrind rejects native instructions, and pass
   `--toggle-collect='window.Window.draw'`, or font startup swamps it. Before the first fixes, of instructions in `draw`:
   `BoundsTree.insert` about 20%, `memcpy` 13% (`compute_style` 3%, element building 2%), layout in zafi most of the rest. Re-profile: the fixes below changed this.
-  - Done: tree nodes are no longer copied while searching, and their indices are u32. An element refines its base style once, and paint recomputes style only if it has hover or drag styles.
+  - Done: tree nodes are no longer copied while searching, and their indices are u32. An element refines its base style once, and paint recomputes style only if it has hover or drag styles. Cold `Interactivity` fields live out-of-line in `InteractivityExtra` and `DivPrepaintState` borrows `base_style` unless dynamic (`Div` 2656 B -> 1104 B, `DivPrepaintState` 904 B -> 80 B).
 - [ ] Find what still costs in `BoundsTree.insert`, and why `10k quads` costs about 3.6 us per element
-- [ ] `Interactivity` and `Style` are large and copied per element: size them, and shrink what is usually empty
+- [ ] Shrink `StyleRefinement` (968 B) and `Style` (848 B) further where usually empty
 - [ ] Compare view caching with GPUI in a release build. GPUI itself has not been built here
 - [ ] Run a cached view on a real Wayland and X11 window; no example uses `cached` yet
 - [ ] Tooltip and throttled animation timers refresh the whole window, because no view is current in a timer. They could remember theirs
