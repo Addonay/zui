@@ -167,6 +167,7 @@ pub fn Entity(comptime T: type) type {
             const app = app_of(cx);
             const slot = app.entities.get_slot_const(self.entity_id_) orelse @panic("entity released");
             if (slot.leased) @panic("cannot read entity while it is leased");
+            app.record_entity_access(self.entity_id_);
             return @ptrCast(@alignCast(slot.ptr.?));
         }
 
@@ -175,6 +176,7 @@ pub fn Entity(comptime T: type) type {
             const app = app_of(cx);
             const slot = app.entities.get_slot_const(self.entity_id_) orelse @panic("entity released");
             if (slot.leased) @panic("cannot read entity while it is leased");
+            app.record_entity_access(self.entity_id_);
             return @ptrCast(@alignCast(slot.ptr.?));
         }
 
@@ -193,6 +195,7 @@ pub fn Entity(comptime T: type) type {
                 app.pending_updates -= 1;
                 if (app.pending_updates == 0) app.flush_effects();
             }
+            app.record_entity_access(self.entity_id_);
             const raw = app.entities.begin_lease(self.entity_id_, "update") orelse @panic("entity released");
             defer app.entities.end_lease(self.entity_id_);
             const state: *T = @ptrCast(@alignCast(raw));
@@ -1434,8 +1437,20 @@ pub const App = struct {
             self.pending_updates -= 1;
         }
         self.entities.slots.items[id.index()].ptr = ptr;
+        self.record_entity_access(id);
         self.notify_new_entity(T, id, ptr);
         return .{ .entity_id_ = id };
+    }
+
+    fn record_entity_access(self: *App, id: EntityId) void {
+        if (self.windows.items.len == 0 or self.flushing_effects or self.pending_updates == 0) return;
+        for (self.windows.items) |maybe_win| {
+            const win = maybe_win orelse continue;
+            if (win.drawing) {
+                win.observe_entity_for_redraw(id);
+                break;
+            }
+        }
     }
 
     /// Creates a new entity (GPUI `cx.new(|cx| T)`).
@@ -1463,6 +1478,7 @@ pub const App = struct {
             self.pending_updates -= 1;
             if (self.pending_updates == 0) self.flush_effects();
         }
+        self.record_entity_access(handle.entity_id_);
         const raw = self.entities.begin_lease(handle.entity_id_, "update") orelse @panic("entity released");
         defer self.entities.end_lease(handle.entity_id_);
         const state: *T = @ptrCast(@alignCast(raw));
@@ -2104,6 +2120,23 @@ pub const App = struct {
             if (win.rendered_entities.contains(id)) return win;
         }
         return null;
+    }
+
+    /// Returns whether any open window's last frame read `entity_id` without drawing it as a view
+    /// (GPUI `App::is_read_without_view`). Notifying such an entity doesn't redraw the views that
+    /// read it.
+    ///
+    /// `false` covers only the views on the path from the entity's view node to the window root.
+    /// A frame keeps one view node per entity, so notifying doesn't redraw other cached views that
+    /// read the entity or draw it a second time.
+    pub fn is_read_without_view(self: *const App, entity_id: EntityId) bool {
+        for (self.windows.items) |maybe_window| {
+            const win = maybe_window orelse continue;
+            if (!win.rendered_entities.contains(entity_id)) continue;
+            var path = win.rendered_frame.dispatch_tree.view_path_reversed(entity_id);
+            if (path.next() == null) return true;
+        }
+        return false;
     }
 
     /// Runs `f(window, app, args...)` in the window that rendered `entity_id` (GPUI `with_window`).

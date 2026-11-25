@@ -84,6 +84,8 @@ pub fn text_element(s: []const u8) element.AnyElement {
 // ---------------------------------------------------------------------------
 // TextLayout.
 
+const default_node_style: style.Style = .{};
+
 /// Measured text: the lines, their size, and where the element was painted.
 /// A `TextLayout` is a handle to frame-arena state, so copies share it (GPUI `Rc<RefCell<..>>`).
 pub const TextLayout = struct {
@@ -128,11 +130,10 @@ pub const TextLayout = struct {
             .font_size = font_size,
             .line_height = lh,
         };
-        const font_generation = cx.text_system().fs.fontIds().len;
+        const font_generation = cx.text_system().font_generation;
         const key_hash = hashTextMeasureKey(source, used_runs, &text_style, font_size, lh, window.scale_factor(), font_generation);
-        var node_style: style.Style = .{};
         return window.request_keyed_measure(
-            &node_style,
+            &default_node_style,
             key_hash,
             .{ .ctx = measure, .func = MeasureCtx.measure, .final_func = MeasureCtx.measureFinal },
             MeasureCtx.reuse,
@@ -171,7 +172,15 @@ pub const TextLayout = struct {
         const b = st.bounds orelse return error.PrepaintNotPerformed;
         const lh = st.line_height;
         var line_origin = b.origin;
-        const text_align = window.text_style().text_align;
+        const text_align: TextAlign = blk: {
+            const stack = window.text_style_stack.items;
+            var i = stack.len;
+            while (i > 0) {
+                i -= 1;
+                if (stack[i].text_align) |ta| break :blk ta;
+            }
+            break :blk .left;
+        };
         for (st.lines) |line| {
             if (pass != .foreground) {
                 line.paint_background(line_origin, lh, text_align, b, window, cx) catch |e| log_paint_error(e);
@@ -375,7 +384,7 @@ fn hashTextMeasureKey(
     font_size: Pixels,
     line_height: Pixels,
     scale_factor: f32,
-    font_generation: usize,
+    font_generation: u64,
 ) u64 {
     var h = std.hash.Wyhash.init(0x74657874);
     h.update(std.mem.asBytes(&source.len));
@@ -494,13 +503,7 @@ const MeasureCtx = struct {
 
         const arena = window_mod.frame_arena();
         const cloned_lines = arena.alloc(WrappedLine, payload.lines.len) catch @panic("OOM");
-        for (payload.lines, cloned_lines) |src, *dst| {
-            dst.* = .{
-                .layout = src.layout,
-                .text = src.text,
-                .decoration_runs = arena.dupe(text_system.line.DecorationRun, src.decoration_runs) catch @panic("OOM"),
-            };
-        }
+        @memcpy(cloned_lines, payload.lines);
         self.state.* = .{
             .measured = true,
             .len = payload.len,
@@ -1274,4 +1277,10 @@ test "text layout skips re-measurement when inputs are unchanged and paints iden
     cx.update_entity(view, CachedTextView.touch, .{});
     cx.run_until_parked();
     try testing.expectEqual(@as(usize, 0), vcx.window.last_frame_measure_calls());
+
+    // Bumping TextSystem.font_generation invalidates text measurement cache.
+    cx.app.text_system().font_generation += 1;
+    cx.update_entity(view, CachedTextView.touch, .{});
+    cx.run_until_parked();
+    try testing.expect(vcx.window.last_frame_measure_calls() > 0);
 }
