@@ -152,6 +152,12 @@ pub fn underline_y_offset(line_height: Pixels, ascent: Pixels, descent: Pixels) 
     return padding_top + ascent + descent * UNDERLINE_DESCENT_OFFSET_FACTOR;
 }
 
+/// Returns the bit representation of `value` with `-0.0` normalized to `+0.0`
+/// so equal floats hash identically (GPUI `canonical_float_bits`).
+pub fn canonical_float_bits(value: f32) u32 {
+    return @bitCast(if (value == 0.0) @as(f32, 0.0) else value);
+}
+
 /// Parameters identifying one rasterized glyph (GPUI `RenderGlyphParams`).
 pub const RenderGlyphParams = struct {
     font_id: FontId,
@@ -166,11 +172,11 @@ pub const RenderGlyphParams = struct {
         var h = std.hash.Wyhash.init(0x67_6c_79_70_68);
         h.update(std.mem.asBytes(&self.font_id));
         h.update(std.mem.asBytes(&self.glyph_id));
-        const size_bits: u32 = @bitCast(self.font_size);
+        const size_bits: u32 = canonical_float_bits(self.font_size);
         h.update(std.mem.asBytes(&size_bits));
         h.update(std.mem.asBytes(&self.subpixel_variant.x));
         h.update(std.mem.asBytes(&self.subpixel_variant.y));
-        const scale_bits: u32 = @bitCast(self.scale_factor);
+        const scale_bits: u32 = canonical_float_bits(self.scale_factor);
         h.update(std.mem.asBytes(&scale_bits));
         h.update(std.mem.asBytes(&self.is_emoji));
         return .{ .glyph = .{
@@ -314,10 +320,10 @@ const RasterKey = struct {
         return .{
             .font_id = p.font_id,
             .glyph_id = p.glyph_id,
-            .size_bits = @bitCast(p.font_size),
+            .size_bits = canonical_float_bits(p.font_size),
             .sub_x = p.subpixel_variant.x,
             .sub_y = p.subpixel_variant.y,
-            .scale_bits = @bitCast(p.scale_factor),
+            .scale_bits = canonical_float_bits(p.scale_factor),
             .is_emoji = p.is_emoji,
         };
     }
@@ -356,8 +362,9 @@ pub const TextSystem = struct {
     raster_bounds_cache: std.AutoHashMapUnmanaged(RasterKey, Bounds(DevicePixels)) = .empty,
     char_widths: std.AutoHashMapUnmanaged(WidthKey, *lw_mod.CharWidthCache) = .empty,
 
-    /// Scratch runs reused by every shaping call.
+    /// Scratch runs and shaping buffer reused by shaping calls.
     font_runs_scratch: std.ArrayList(FontRun) = .empty,
+    shape_scratch: cozmic.shape.ShapeBuffer = cozmic.shape.ShapeBuffer.init(),
     tile_job: TileJob = undefined,
     tile_bytes: std.ArrayList(u8) = .empty,
 
@@ -414,6 +421,7 @@ pub const TextSystem = struct {
         }
         self.char_widths.deinit(allocator);
         self.font_runs_scratch.deinit(allocator);
+        self.shape_scratch.deinit(allocator);
         self.tile_bytes.deinit(allocator);
         self.clear_missing_glyph_seen();
         self.missing_glyph_seen.deinit(allocator);
@@ -866,32 +874,49 @@ pub const TextSystem = struct {
     pub fn shape_line(self: *TextSystem, text: []const u8, font_size: Pixels, runs: []const TextRun, force_width: ?Pixels) !ShapedLine {
         std.debug.assert(std.mem.indexOfScalar(u8, text, '\n') == null);
         const arena = window_mod.frame_arena();
-        var decorations: std.ArrayList(DecorationRun) = .empty;
-        for (runs) |run| {
-            if (decorations.items.len > 0) {
-                const last = &decorations.items[decorations.items.len - 1];
-                if (decoration_eql(last, run)) {
-                    last.len += @intCast(run.len);
-                    continue;
+        const decoration_runs: []DecorationRun = if (runs.len == 0)
+            &.{}
+        else if (runs.len == 1) blk: {
+            const one = try arena.alloc(DecorationRun, 1);
+            one[0] = decoration_of(runs[0]);
+            break :blk one;
+        } else blk: {
+            var decorations: std.ArrayList(DecorationRun) = .empty;
+            try decorations.ensureTotalCapacity(arena, runs.len);
+            for (runs) |run| {
+                if (decorations.items.len > 0) {
+                    const last = &decorations.items[decorations.items.len - 1];
+                    if (decoration_eql(last, run)) {
+                        last.len += @intCast(run.len);
+                        continue;
+                    }
                 }
+                decorations.appendAssumeCapacity(decoration_of(run));
             }
-            try decorations.append(arena, decoration_of(run));
-        }
+            break :blk decorations.items;
+        };
 
         try self.build_font_runs(runs);
         try self.apply_text_presentation(text, &self.font_runs_scratch);
         const layout = try self.active_cache.layout_line(text, font_size, self.font_runs_scratch.items, force_width);
-        return .{ .layout = layout, .text = layout.text, .decoration_runs = decorations.items };
+        return .{ .layout = layout, .text = layout.text, .decoration_runs = decoration_runs };
     }
 
     /// Shapes a possibly multi-line string, wrapping at `wrap_width` (GPUI `shape_text`).
     /// The result is allocated in the frame arena. Lines are split on `\n`.
     pub fn shape_text(self: *TextSystem, text: []const u8, font_size: Pixels, runs: []const TextRun, wrap_width: ?Pixels, line_clamp: ?usize) ![]WrappedLine {
         const arena = window_mod.frame_arena();
-        // Working copy of the runs; the lengths are consumed as lines are carved out.
-        var remaining: std.ArrayList(TextRun) = .empty;
-        for (runs) |run| if (run.len > 0) try remaining.append(arena, run);
         var run_ix: usize = 0;
+        while (run_ix < runs.len and runs[run_ix].len == 0) run_ix += 1;
+        var run_remaining: usize = if (run_ix < runs.len) runs[run_ix].len else 0;
+
+        // Fast path for single-line text (no newlines): avoids splitting and list growth.
+        if (std.mem.indexOfScalar(u8, text, '\n') == null) {
+            const wrapped_line = try self.shape_wrapped_line(arena, text, 0, text.len, font_size, runs, &run_ix, &run_remaining, wrap_width, line_clamp);
+            const out = try arena.alloc(WrappedLine, 1);
+            out[0] = wrapped_line;
+            return out;
+        }
 
         var lines: std.ArrayList(WrappedLine) = .empty;
         var wrapped_lines: usize = 0;
@@ -900,61 +925,85 @@ pub const TextSystem = struct {
         var split = std.mem.splitScalar(u8, text, '\n');
         while (split.next()) |line_text| {
             const line_end = line_start + line_text.len;
-            var decorations: std.ArrayList(DecorationRun) = .empty;
-            self.font_runs_scratch.clearRetainingCapacity();
-
-            var run_start = line_start;
-            while (run_start < line_end) {
-                if (run_ix >= remaining.items.len) break;
-                const run = &remaining.items[run_ix];
-                const len_within_line = @min(line_end - run_start, run.len);
-
-                var decoration_changed = true;
-                if (decorations.items.len > 0) {
-                    const last = &decorations.items[decorations.items.len - 1];
-                    if (decoration_eql(last, run.*)) {
-                        last.len += @intCast(len_within_line);
-                        decoration_changed = false;
-                    }
-                }
-                if (decoration_changed) {
-                    var d = decoration_of(run.*);
-                    d.len = @intCast(len_within_line);
-                    try decorations.append(arena, d);
-                }
-
-                const fid = self.resolve_font(&run.font);
-                if (self.font_runs_scratch.items.len > 0) {
-                    const last = &self.font_runs_scratch.items[self.font_runs_scratch.items.len - 1];
-                    if (last.font_id == fid and !decoration_changed) {
-                        last.len += len_within_line;
-                    } else {
-                        try self.font_runs_scratch.append(self.allocator, .{ .len = len_within_line, .font_id = fid });
-                    }
-                } else {
-                    try self.font_runs_scratch.append(self.allocator, .{ .len = len_within_line, .font_id = fid });
-                }
-
-                run.len -= len_within_line;
-                if (run.len == 0) run_ix += 1;
-                run_start += len_within_line;
-            }
-
-            try self.apply_text_presentation(line_text, &self.font_runs_scratch);
             const max_lines: ?usize = if (line_clamp) |max| max -| wrapped_lines else null;
-            const layout = try self.active_cache.layout_wrapped_line(line_text, font_size, self.font_runs_scratch.items, wrap_width, max_lines);
-            wrapped_lines += layout.wrap_boundaries().len;
-            try lines.append(arena, .{ .layout = layout, .text = layout.unwrapped_layout.text, .decoration_runs = decorations.items });
+            const wrapped_line = try self.shape_wrapped_line(arena, line_text, line_start, line_end, font_size, runs, &run_ix, &run_remaining, wrap_width, max_lines);
+            wrapped_lines += wrapped_line.layout.wrap_boundaries().len;
+            try lines.append(arena, wrapped_line);
 
             // Skip the `\n` that ends this line.
-            if (run_ix < remaining.items.len) {
-                const run = &remaining.items[run_ix];
-                run.len -= 1;
-                if (run.len == 0) run_ix += 1;
+            if (run_ix < runs.len) {
+                run_remaining -= 1;
+                if (run_remaining == 0) {
+                    run_ix += 1;
+                    while (run_ix < runs.len and runs[run_ix].len == 0) run_ix += 1;
+                    run_remaining = if (run_ix < runs.len) runs[run_ix].len else 0;
+                }
             }
             line_start = line_end + 1;
         }
         return lines.items;
+    }
+
+    fn shape_wrapped_line(
+        self: *TextSystem,
+        arena: Allocator,
+        line_text: []const u8,
+        line_start: usize,
+        line_end: usize,
+        font_size: Pixels,
+        runs: []const TextRun,
+        run_ix: *usize,
+        run_remaining: *usize,
+        wrap_width: ?Pixels,
+        max_lines: ?usize,
+    ) !WrappedLine {
+        var decorations: std.ArrayList(DecorationRun) = .empty;
+        self.font_runs_scratch.clearRetainingCapacity();
+
+        var run_start = line_start;
+        while (run_start < line_end) {
+            if (run_ix.* >= runs.len) break;
+            const run = runs[run_ix.*];
+            const len_within_line = @min(line_end - run_start, run_remaining.*);
+
+            var decoration_changed = true;
+            if (decorations.items.len > 0) {
+                const last = &decorations.items[decorations.items.len - 1];
+                if (decoration_eql(last, run)) {
+                    last.len += @intCast(len_within_line);
+                    decoration_changed = false;
+                }
+            }
+            if (decoration_changed) {
+                var d = decoration_of(run);
+                d.len = @intCast(len_within_line);
+                try decorations.append(arena, d);
+            }
+
+            const fid = self.resolve_font(&run.font);
+            if (self.font_runs_scratch.items.len > 0) {
+                const last = &self.font_runs_scratch.items[self.font_runs_scratch.items.len - 1];
+                if (last.font_id == fid and !decoration_changed) {
+                    last.len += len_within_line;
+                } else {
+                    try self.font_runs_scratch.append(self.allocator, .{ .len = len_within_line, .font_id = fid });
+                }
+            } else {
+                try self.font_runs_scratch.append(self.allocator, .{ .len = len_within_line, .font_id = fid });
+            }
+
+            run_remaining.* -= len_within_line;
+            if (run_remaining.* == 0) {
+                run_ix.* += 1;
+                while (run_ix.* < runs.len and runs[run_ix.*].len == 0) run_ix.* += 1;
+                run_remaining.* = if (run_ix.* < runs.len) runs[run_ix.*].len else 0;
+            }
+            run_start += len_within_line;
+        }
+
+        try self.apply_text_presentation(line_text, &self.font_runs_scratch);
+        const layout = try self.active_cache.layout_wrapped_line(line_text, font_size, self.font_runs_scratch.items, wrap_width, max_lines);
+        return .{ .layout = layout, .text = layout.unwrapped_layout.text, .decoration_runs = decorations.items };
     }
 
     /// Converts `runs` into `font_runs_scratch`, merging runs that share a font and decorations.
@@ -1064,7 +1113,7 @@ pub const TextSystem = struct {
     /// A `LineWrapper` for `font` at `font_size`, sharing this text system's width cache.
     pub fn line_wrapper(self: *TextSystem, f: Font, font_size: Pixels) LineWrapper {
         const id = self.resolve_font(&f);
-        const key: WidthKey = .{ .font_id = id, .size_bits = @bitCast(font_size) };
+        const key: WidthKey = .{ .font_id = id, .size_bits = canonical_float_bits(font_size) };
         const gop = self.char_widths.getOrPut(self.allocator, key) catch @panic("OOM");
         if (!gop.found_existing) {
             const cache = self.allocator.create(lw_mod.CharWidthCache) catch @panic("OOM");
@@ -1097,48 +1146,64 @@ pub const TextSystem = struct {
         return self.shape(allocator, text, font_size, runs);
     }
 
+    fn fill_cozmic_attrs(e: *const FontEntry, a: *cozmic.attrs.Attrs) !void {
+        a.family = switch (e.family_kind) {
+            .name => .{ .name = e.family_name },
+            .serif => .serif,
+            .sans_serif => .sans_serif,
+            .cursive => .cursive,
+            .fantasy => .fantasy,
+            .monospace => .monospace,
+        };
+        _ = a.with_weight(.{ .value = e.weight }).with_style(e.style);
+        for (e.features) |feature| {
+            _ = try a.font_features.set(cozmic.attrs.FeatureTag.new(&feature.tag), feature.value);
+        }
+    }
+
     /// Shapes `text` with cozmic: one attribute span per run, no cozmic wrapping.
     fn shape(self: *TextSystem, allocator: Allocator, text: []const u8, font_size: Pixels, runs: []const FontRun) !LineLayout {
         const adapter = self.fs.shaper() orelse return self.empty_layout(allocator, font_size, text, runs);
+        const cz_alloc = self.allocator;
 
-        var defaults = cozmic.attrs.Attrs.init(allocator);
-        defer defaults.deinit();
-        var list = try cozmic.attrs.AttrsList.init(allocator, &defaults);
-        defer list.deinit();
-        var offset: usize = 0;
+        var non_empty_runs: usize = 0;
+        var single_run_id: FontId = 0;
         for (runs) |run| {
-            if (run.len == 0) continue;
-            const e = self.entry(run.font_id);
-            var a = cozmic.attrs.Attrs.init(allocator);
-            defer a.deinit();
-            a.family = switch (e.family_kind) {
-                .name => .{ .name = e.family_name },
-                .serif => .serif,
-                .sans_serif => .sans_serif,
-                .cursive => .cursive,
-                .fantasy => .fantasy,
-                .monospace => .monospace,
-            };
-            _ = a.with_weight(.{ .value = e.weight }).with_style(e.style);
-            for (e.features) |feature| {
-                _ = try a.font_features.set(cozmic.attrs.FeatureTag.new(&feature.tag), feature.value);
+            if (run.len > 0) {
+                non_empty_runs += 1;
+                single_run_id = run.font_id;
             }
-            try list.add_span(offset, offset + run.len, &a);
-            offset += run.len;
+        }
+
+        var defaults = cozmic.attrs.Attrs.init(cz_alloc);
+        defer defaults.deinit();
+        if (non_empty_runs == 1) {
+            try fill_cozmic_attrs(self.entry(single_run_id), &defaults);
+        }
+        var list = try cozmic.attrs.AttrsList.init(cz_alloc, &defaults);
+        defer list.deinit();
+        if (non_empty_runs > 1) {
+            var offset: usize = 0;
+            for (runs) |run| {
+                if (run.len == 0) continue;
+                var a = cozmic.attrs.Attrs.init(cz_alloc);
+                defer a.deinit();
+                try fill_cozmic_attrs(self.entry(run.font_id), &a);
+                try list.add_span(offset, offset + run.len, &a);
+                offset += run.len;
+            }
         }
 
         var shaped: cozmic.shape.ShapeLine = .{};
-        defer shaped.deinit(allocator);
-        var scratch = cozmic.shape.ShapeBuffer.init();
-        defer scratch.deinit(allocator);
-        try shaped.build(allocator, adapter, &scratch, text, &list, .advanced, 4, .auto);
+        defer shaped.deinit(cz_alloc);
+        try shaped.build(cz_alloc, adapter, &self.shape_scratch, text, &list, .advanced, 4, .auto);
 
         var out: std.ArrayList(cozmic.layout.LayoutLine) = .empty;
         defer {
             for (out.items) |*l| l.deinit();
-            out.deinit(allocator);
+            out.deinit(cz_alloc);
         }
-        try shaped.layoutToBuffer(allocator, &scratch, font_size, null, .none, .{ .none = {} }, null, &out, null, .disabled);
+        try shaped.layoutToBuffer(cz_alloc, &self.shape_scratch, font_size, null, .none, .{ .none = {} }, null, &out, null, .disabled);
 
         var result_runs: std.ArrayList(ShapedRun) = .empty;
         errdefer {
@@ -1153,6 +1218,7 @@ pub const TextSystem = struct {
         var width: Pixels = 0;
         var cur_face: u32 = NO_FACE;
         var cur_font: FontId = 0;
+        var cur_is_emoji = false;
         var have_run = false;
 
         for (out.items) |*ll| {
@@ -1160,6 +1226,9 @@ pub const TextSystem = struct {
             desc = @max(desc, ll.max_descent);
             width = @max(width, ll.w);
             for (ll.glyphs.items) |g| {
+                const is_emoji = if (have_run and g.font_id == cur_face) cur_is_emoji else self.face_info(g.font_id).is_color;
+                // Prevent issues caused by variation selectors in color emoji fonts (GPUI cosmic_text_system).
+                if (g.glyph_id == 3 and is_emoji) continue;
                 if (!have_run or g.font_id != cur_face) {
                     if (have_run) {
                         try result_runs.append(allocator, .{ .font_id = cur_font, .glyphs = try glyphs.toOwnedSlice(allocator) });
@@ -1167,14 +1236,14 @@ pub const TextSystem = struct {
                     }
                     cur_face = g.font_id;
                     cur_font = try self.font_for_glyph(g.font_id, g.start, runs);
+                    cur_is_emoji = is_emoji;
                     have_run = true;
                 }
-                const face_data = self.face_info(g.font_id);
                 try glyphs.append(allocator, .{
                     .id = g.glyph_id,
                     .position = .{ .x = g.x + font_size * g.x_offset, .y = g.y - font_size * g.y_offset },
                     .index = g.start,
-                    .is_emoji = face_data.is_color,
+                    .is_emoji = cur_is_emoji,
                 });
             }
         }
@@ -1239,7 +1308,7 @@ pub const TextSystem = struct {
         const key: cozmic.glyph_cache.CacheKey = .{
             .font_id = e.face,
             .glyph_id = @intCast(params.glyph_id),
-            .font_size_bits = @bitCast(size),
+            .font_size_bits = canonical_float_bits(size),
             .x_bin = @enumFromInt(@min(params.subpixel_variant.x, 3)),
             .y_bin = @enumFromInt(@min(params.subpixel_variant.y, 3)),
             .font_weight = e.weight,
@@ -1818,4 +1887,133 @@ test "missing glyphs are reported once per grapheme while reporting is on" {
     const repeat = try ts.take_missing_glyphs();
     defer ts.free_missing_glyphs(repeat);
     try testing.expectEqual(@as(usize, 0), repeat.len);
+}
+
+test "atlas key and raster key collapse signed zero font_size and scale_factor" {
+    const pos_zero: RenderGlyphParams = .{
+        .font_id = 1,
+        .glyph_id = 2,
+        .font_size = 0.0,
+        .subpixel_variant = .{ .x = 0, .y = 0 },
+        .scale_factor = 0.0,
+        .is_emoji = false,
+    };
+    const neg_size: RenderGlyphParams = .{
+        .font_id = 1,
+        .glyph_id = 2,
+        .font_size = -0.0,
+        .subpixel_variant = .{ .x = 0, .y = 0 },
+        .scale_factor = 0.0,
+        .is_emoji = false,
+    };
+    const neg_scale: RenderGlyphParams = .{
+        .font_id = 1,
+        .glyph_id = 2,
+        .font_size = 0.0,
+        .subpixel_variant = .{ .x = 0, .y = 0 },
+        .scale_factor = -0.0,
+        .is_emoji = false,
+    };
+    const neg_both: RenderGlyphParams = .{
+        .font_id = 1,
+        .glyph_id = 2,
+        .font_size = -0.0,
+        .subpixel_variant = .{ .x = 0, .y = 0 },
+        .scale_factor = -0.0,
+        .is_emoji = false,
+    };
+
+    const expected_id = pos_zero.atlas_key().glyph.id;
+    try testing.expectEqual(expected_id, neg_size.atlas_key().glyph.id);
+    try testing.expectEqual(expected_id, neg_scale.atlas_key().glyph.id);
+    try testing.expectEqual(expected_id, neg_both.atlas_key().glyph.id);
+
+    try testing.expectEqual(RasterKey.from(&pos_zero), RasterKey.from(&neg_size));
+    try testing.expectEqual(RasterKey.from(&pos_zero), RasterKey.from(&neg_scale));
+    try testing.expectEqual(RasterKey.from(&pos_zero), RasterKey.from(&neg_both));
+}
+
+test "combining mark glyph positions apply cozmic x_offset and y_offset scaled by font_size" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    if (!ts.fs.hasShaper() or ts.fs.fontIds().len == 0) return error.SkipZigTest;
+
+    const f = font(".SystemUIFont");
+    const fid = try ts.font_id(&f);
+    const e = ts.entry(fid);
+    const adapter = ts.fs.shaper() orelse return error.SkipZigTest;
+
+    // Shape with cozmic directly to compare raw LayoutGlyph (x, y, x_offset, y_offset)
+    // against TextSystem's ShapedGlyph positions at two different font sizes.
+    const samples = [_][]const u8{ "e\u{0301}", "a\u{0308}", "o\u{0302}" };
+    for (samples) |text| {
+        const runs = [_]FontRun{.{ .len = text.len, .font_id = fid }};
+        for ([_]Pixels{ 16.0, 32.0 }) |font_size| {
+            var defaults = cozmic.attrs.Attrs.init(testing.allocator);
+            defer defaults.deinit();
+            try TextSystem.fill_cozmic_attrs(e, &defaults);
+            var list = try cozmic.attrs.AttrsList.init(testing.allocator, &defaults);
+            defer list.deinit();
+
+            var shaped: cozmic.shape.ShapeLine = .{};
+            defer shaped.deinit(testing.allocator);
+            var scratch = cozmic.shape.ShapeBuffer.init();
+            defer scratch.deinit(testing.allocator);
+            try shaped.build(testing.allocator, adapter, &scratch, text, &list, .advanced, 4, .auto);
+
+            var out: std.ArrayList(cozmic.layout.LayoutLine) = .empty;
+            defer {
+                for (out.items) |*l| l.deinit();
+                out.deinit(testing.allocator);
+            }
+            try shaped.layoutToBuffer(testing.allocator, &scratch, font_size, null, .none, .{ .none = {} }, null, &out, null, .disabled);
+
+            const layout = try ts.layout_line(text, font_size, &runs, null);
+            var flat_idx: usize = 0;
+            for (out.items) |ll| {
+                for (ll.glyphs.items) |cg| {
+                    var found: ?ShapedGlyph = null;
+                    var cur: usize = 0;
+                    for (layout.runs) |r| {
+                        for (r.glyphs) |sg| {
+                            if (cur == flat_idx) found = sg;
+                            cur += 1;
+                        }
+                    }
+                    const sg = found orelse return error.TestUnexpectedResult;
+                    try testing.expectApproxEqAbs(cg.x + font_size * cg.x_offset, sg.position.x, 0.0001);
+                    try testing.expectApproxEqAbs(cg.y - font_size * cg.y_offset, sg.position.y, 0.0001);
+                    flat_idx += 1;
+                }
+            }
+        }
+    }
+    ts.finish_frame();
+}
+
+test "shape_text preserves multiple runs across newline splits without copying runs" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    const f = font(".SystemUIFont");
+    const c1: @import("color.zig").Hsla = .{ .h = 0.1, .s = 0.5, .l = 0.5, .a = 1 };
+    const c2: @import("color.zig").Hsla = .{ .h = 0.6, .s = 0.5, .l = 0.5, .a = 1 };
+    // "ab\ncde" -> run 0 covers "ab\nc" (4 bytes), run 1 covers "de" (2 bytes).
+    const runs = [_]TextRun{
+        .{ .len = 4, .font = f, .color = c1 },
+        .{ .len = 2, .font = f, .color = c2 },
+    };
+    const lines = try ts.shape_text("ab\ncde", 16, &runs, null, null);
+    try testing.expectEqual(@as(usize, 2), lines.len);
+    try testing.expectEqualStrings("ab", lines[0].text);
+    try testing.expectEqual(@as(usize, 1), lines[0].decoration_runs.len);
+    try testing.expectEqual(@as(u32, 2), lines[0].decoration_runs[0].len);
+    try testing.expectEqual(c1, lines[0].decoration_runs[0].color);
+
+    try testing.expectEqualStrings("cde", lines[1].text);
+    try testing.expectEqual(@as(usize, 2), lines[1].decoration_runs.len);
+    try testing.expectEqual(@as(u32, 1), lines[1].decoration_runs[0].len);
+    try testing.expectEqual(c1, lines[1].decoration_runs[0].color);
+    try testing.expectEqual(@as(u32, 2), lines[1].decoration_runs[1].len);
+    try testing.expectEqual(c2, lines[1].decoration_runs[1].color);
+    ts.finish_frame();
 }

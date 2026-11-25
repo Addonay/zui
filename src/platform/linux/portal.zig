@@ -28,6 +28,7 @@ const color_scheme_key = "color-scheme";
 const desktop_namespace = "org.gnome.desktop.interface";
 const cursor_theme_key = "cursor-theme";
 const cursor_size_key = "cursor-size";
+const text_scale_factor_key = "text-scaling-factor";
 const wm_namespace = "org.gnome.desktop.wm.preferences";
 const button_layout_key = "button-layout";
 
@@ -71,6 +72,7 @@ pub const Setting = union(enum) {
     /// The titlebar button layout, as the desktop writes it (`close,minimize:maximize`). Valid during
     /// the callback only.
     button_layout: []const u8,
+    text_scale_factor: f32,
 };
 
 /// Receives settings as they are read and as they change. Valid for the state's lifetime.
@@ -272,6 +274,7 @@ pub const State = struct {
         try read_setting(bus, appearance_namespace, color_scheme_key, dbus.Handler.of(self, on_read_color_scheme));
         try read_setting(bus, desktop_namespace, cursor_theme_key, dbus.Handler.of(self, on_read_cursor_theme));
         try read_setting(bus, desktop_namespace, cursor_size_key, dbus.Handler.of(self, on_read_cursor_size));
+        try read_setting(bus, desktop_namespace, text_scale_factor_key, dbus.Handler.of(self, on_read_text_scale_factor));
         try read_setting(bus, wm_namespace, button_layout_key, dbus.Handler.of(self, on_read_button_layout));
     }
 
@@ -489,6 +492,10 @@ pub const State = struct {
     fn on_read_cursor_size(self: *State, msg: *const dbus.Message) void {
         self.on_read(desktop_namespace, cursor_size_key, msg);
     }
+
+    fn on_read_text_scale_factor(self: *State, msg: *const dbus.Message) void {
+        self.on_read(desktop_namespace, text_scale_factor_key, msg);
+    }
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -561,6 +568,17 @@ fn unwrap(v: dbus.Value) dbus.Value {
     }
 }
 
+const MIN_TEXT_SCALE_FACTOR: f32 = 0.5;
+const MAX_TEXT_SCALE_FACTOR: f32 = 3.0;
+
+/// Validates and clamps the desktop `text-scaling-factor` (`f64`) to a usable `f32` range
+/// (GPUI `xdg_desktop_portal::text_scale_factor`).
+pub fn text_scale_factor(value: f64) ?f32 {
+    if (!std.math.isFinite(value) or value <= 0.0) return null;
+    const clamped = std.math.clamp(value, @as(f64, MIN_TEXT_SCALE_FACTOR), @as(f64, MAX_TEXT_SCALE_FACTOR));
+    return @floatCast(clamped);
+}
+
 /// The setting `key` of `namespace` as its value, when it is one this state reports.
 fn to_setting(namespace: []const u8, key: []const u8, value: dbus.Value) ?Setting {
     if (std.mem.eql(u8, namespace, appearance_namespace) and std.mem.eql(u8, key, color_scheme_key)) {
@@ -584,6 +602,13 @@ fn to_setting(namespace: []const u8, key: []const u8, value: dbus.Value) ?Settin
         };
         if (size <= 0) return null;
         return .{ .cursor_size = @intCast(size) };
+    }
+    if (std.mem.eql(u8, namespace, desktop_namespace) and std.mem.eql(u8, key, text_scale_factor_key)) {
+        const raw = switch (value) {
+            .double => |d| d,
+            else => return null,
+        };
+        return .{ .text_scale_factor = text_scale_factor(raw) orelse return null };
     }
     return null;
 }
@@ -744,6 +769,10 @@ const Script = struct {
     read_malformed: bool = false,
     /// After the color scheme read, send `SettingChanged` with this scheme.
     change_to: ?u32 = null,
+    /// When set, answer `text-scaling-factor` `Read` with this value.
+    text_scale: ?f64 = null,
+    /// After `text-scaling-factor` `Read`, emit `SettingChanged` signals for these values.
+    text_scale_changes: []const f64 = &.{},
     /// Refuse each request with this error name instead of answering it.
     request_error: ?[]const u8 = null,
     /// The request method the client must call, the first string it must send, and the options
@@ -865,6 +894,23 @@ fn answer_read(server: *Server, msg: dbus.Message, script: *Script) !void {
         try enc.end_variant();
         try enc.end_variant();
         try server.reply(msg, "v", enc.written());
+    } else if (std.mem.eql(u8, ns, desktop_namespace) and std.mem.eql(u8, key, text_scale_factor_key) and script.text_scale != null) {
+        try enc.begin_variant("v");
+        try enc.begin_variant("d");
+        try enc.double(script.text_scale.?);
+        try enc.end_variant();
+        try enc.end_variant();
+        try server.reply(msg, "v", enc.written());
+        for (script.text_scale_changes) |next_scale| {
+            var change = dbus.Encoder.init(testing.allocator);
+            defer change.deinit();
+            try change.string(desktop_namespace);
+            try change.string(text_scale_factor_key);
+            try change.begin_variant("d");
+            try change.double(next_scale);
+            try change.end_variant();
+            try server.signal_at(portal_path, settings_interface, "SettingChanged", "ssv", change.written());
+        }
     } else {
         try server.reply_error(msg, "org.freedesktop.portal.Error.NotFound");
     }
@@ -1042,6 +1088,8 @@ const Settings = struct {
     layout: [64]u8 = undefined,
     layout_len: ?usize = null,
     size: ?u32 = null,
+    text_scale: ?f32 = null,
+    text_scale_count: usize = 0,
 
     fn on_setting(ctx: *anyopaque, setting: Setting) void {
         const self: *Settings = @ptrCast(@alignCast(ctx));
@@ -1058,6 +1106,10 @@ const Settings = struct {
             .button_layout => |text| {
                 @memcpy(self.layout[0..text.len], text);
                 self.layout_len = text.len;
+            },
+            .text_scale_factor => |scale| {
+                self.text_scale = scale;
+                self.text_scale_count += 1;
             },
         }
     }
@@ -1352,4 +1404,47 @@ test "settings: the titlebar button layout is a string setting, and anything els
     const layout = to_setting(wm_namespace, button_layout_key, .{ .string = "close:maximize" }).?;
     try std.testing.expectEqualStrings("close:maximize", layout.button_layout);
     try std.testing.expect(to_setting(wm_namespace, button_layout_key, .{ .uint32 = 1 }) == null);
+}
+
+test "portal: text_scale_factor is clamped to a usable range (GPUI text_scale_factor_is_clamped_to_a_usable_range)" {
+    try testing.expectEqual(@as(?f32, 1.0), text_scale_factor(1.0));
+    try testing.expectEqual(@as(?f32, 1.25), text_scale_factor(1.25));
+    try testing.expectEqual(@as(?f32, 2.0), text_scale_factor(2.0));
+    try testing.expectEqual(@as(?f32, 0.5), text_scale_factor(0.1));
+    try testing.expectEqual(@as(?f32, 3.0), text_scale_factor(10.0));
+    try testing.expectEqual(@as(?f32, 3.0), text_scale_factor(1e100));
+    try testing.expectEqual(@as(?f32, null), text_scale_factor(0.0));
+    try testing.expectEqual(@as(?f32, null), text_scale_factor(-1.0));
+    try testing.expectEqual(@as(?f32, null), text_scale_factor(std.math.nan(f64)));
+    try testing.expectEqual(@as(?f32, null), text_scale_factor(std.math.inf(f64)));
+    try testing.expectEqual(@as(?f32, null), text_scale_factor(-std.math.inf(f64)));
+
+    const valid = to_setting(desktop_namespace, text_scale_factor_key, .{ .double = 1.5 }).?;
+    try testing.expectEqual(@as(f32, 1.5), valid.text_scale_factor);
+    try testing.expect(to_setting(desktop_namespace, text_scale_factor_key, .{ .string = "1.5" }) == null);
+    try testing.expect(to_setting(desktop_namespace, text_scale_factor_key, .{ .double = -1.0 }) == null);
+}
+
+test "portal: text-scaling-factor is read on startup and followed on SettingChanged" {
+    var script = Script{
+        .text_scale = 1.25,
+        // Invalid values (0.0) are ignored; valid out-of-range values clamp to [0.5, 3.0].
+        .text_scale_changes = &.{ 0.0, 5.0, 1.75 },
+    };
+    var settings = Settings{};
+    var state: State = undefined;
+    {
+        var fake: Fake = .{};
+        try fake.start(&script, &state, &settings);
+        defer fake.thread.join();
+        defer state.deinit();
+        try pump(&state, &settings, struct {
+            fn done(s: *Settings) bool {
+                return s.text_scale_count >= 3;
+            }
+        }.done);
+    }
+    try testing.expectEqual(@as(?[]const u8, null), script.failure);
+    try testing.expectEqual(@as(usize, 3), settings.text_scale_count);
+    try testing.expectEqual(@as(?f32, 1.75), settings.text_scale);
 }

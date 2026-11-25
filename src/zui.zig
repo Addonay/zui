@@ -230,6 +230,7 @@ pub const div = elements.div.div;
 /// Builds a standalone style refinement for `.hover(...)`, `.active(...)`, etc.
 pub const style_refinement = elements.div.style;
 pub const StyledText = elements.text.StyledText;
+pub const InteractiveText = elements.text.InteractiveText;
 pub const empty = elements.empty.empty;
 pub const Img = elements.img.Img;
 /// Creates an image element (GPUI `img`).
@@ -291,6 +292,7 @@ pub const ListHorizontalSizingBehavior = elements.list.ListHorizontalSizingBehav
 pub const ListMeasuringBehavior = elements.list.ListMeasuringBehavior;
 pub const FollowMode = elements.list.FollowMode;
 pub const ItemRenderer = elements.list.ItemRenderer;
+pub const ItemMeasurementReadiness = elements.list.ItemMeasurementReadiness;
 
 // -- animation / spring -------------------------------------------------------
 pub const Animation = elements.animation.Animation;

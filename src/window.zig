@@ -74,7 +74,7 @@ pub const ScaledRange = struct {
 // Frame arena (GPUI's ELEMENT_ARENA).
 
 threadlocal var current_frame_arena: ?*std.heap.ArenaAllocator = null;
-var fallback_arena_storage: ?std.heap.ArenaAllocator = null;
+threadlocal var fallback_arena_storage: ?std.heap.ArenaAllocator = null;
 
 /// The allocator for transient per-frame data (elements, listeners, strings).
 /// Sends `frame_arena` to `arena`, returning the one to restore. A cached view's elements and
@@ -89,6 +89,16 @@ pub fn frame_arena() std.mem.Allocator {
     if (current_frame_arena) |a| return a.allocator();
     if (fallback_arena_storage == null) fallback_arena_storage = .init(std.heap.page_allocator);
     return fallback_arena_storage.?.allocator();
+}
+
+/// Frees the current thread's fallback frame arena, if one was initialized.
+/// Elements constructed outside a `Window.draw` (for example in unit tests or on a background
+/// thread) use this thread-local arena; call this to release its backing pages before thread exit.
+pub fn deinit_fallback_arena() void {
+    if (fallback_arena_storage) |*arena| {
+        arena.deinit();
+        fallback_arena_storage = null;
+    }
 }
 
 /// Formats into the frame arena (the `format!` analogue for element text).
@@ -405,6 +415,8 @@ const DeferredDraw = struct {
     text_style_stack: []const TextStyleRefinement,
     parent_node: key_dispatch.DispatchNodeId,
     element_id_hash: u64,
+    rem_size: Pixels,
+    content_mask: ?ContentMask(Pixels) = null,
 };
 
 /// A position in what prepaint added to the frame (GPUI `PrepaintStateIndex`).
@@ -429,6 +441,11 @@ pub const PaintIndex = struct {
     line_layout_index: text_system_mod.line_layout.LineLayoutIndex = .{},
 };
 
+pub const GroupHitboxInfo = struct {
+    hitbox: HitboxId,
+    active: bool,
+};
+
 pub const Frame = struct {
     scene: scene_mod.Scene,
     /// The element states this frame used, so reusing a cached view keeps its elements' states alive.
@@ -436,6 +453,8 @@ pub const Frame = struct {
     /// The entities this frame rendered, so reusing a cached view still redraws when they notify.
     accessed_entities: std.ArrayList(EntityId) = .empty,
     hitboxes: std.ArrayList(Hitbox) = .empty,
+    /// Named element groups registered during prepaint for `group_hover` / `group_active` / `group_drag_over`.
+    group_hitboxes: std.StringHashMapUnmanaged(GroupHitboxInfo) = .empty,
     mouse_listeners: std.ArrayList(MouseListener) = .empty,
     dispatch_tree: key_dispatch.DispatchTree,
     cursor_styles: std.ArrayList(CursorStyleRequest) = .empty,
@@ -459,6 +478,7 @@ pub const Frame = struct {
         self.accessed_element_states.deinit(gpa);
         self.accessed_entities.deinit(gpa);
         self.hitboxes.deinit(gpa);
+        self.group_hitboxes.deinit(gpa);
         self.mouse_listeners.deinit(gpa);
         self.dispatch_tree.deinit();
         self.cursor_styles.deinit(gpa);
@@ -473,6 +493,7 @@ pub const Frame = struct {
         self.accessed_element_states.clearRetainingCapacity();
         self.accessed_entities.clearRetainingCapacity();
         self.hitboxes.clearRetainingCapacity();
+        self.group_hitboxes.clearRetainingCapacity();
         self.mouse_listeners.clearRetainingCapacity();
         self.dispatch_tree.clear();
         self.cursor_styles.clearRetainingCapacity();
@@ -843,15 +864,79 @@ pub const Window = struct {
 
     pub const FrameCallback = struct { ctx: *anyopaque, func: *const fn (*anyopaque, *Window, *App) void };
 
+    fn default_bounds(active_window_bounds: ?WindowBounds, display: ?platform_mod.Display) WindowBounds {
+        const cascade_offset: Pixels = 25.0;
+        const default_placement: Bounds(Pixels) = .{
+            .origin = .{ .x = 0, .y = 0 },
+            .size = platform_mod.DEFAULT_WINDOW_SIZE,
+        };
+        const display_bounds = if (display) |d| d.visible_bounds() else default_placement;
+
+        const base_bounds: Bounds(Pixels), const kind: enum { windowed, maximized, fullscreen } = if (active_window_bounds) |b| switch (b) {
+            .windowed => |rect| .{ rect, .windowed },
+            .maximized => |rect| .{ rect, .maximized },
+            .fullscreen => |rect| .{ rect, .fullscreen },
+        } else .{
+            if (display) |d| d.default_bounds() else default_placement,
+            .windowed,
+        };
+
+        const proposed_origin: Point(Pixels) = .{
+            .x = base_bounds.origin.x + cascade_offset,
+            .y = base_bounds.origin.y + cascade_offset,
+        };
+        const display_right = display_bounds.origin.x + display_bounds.size.width;
+        const display_bottom = display_bounds.origin.y + display_bounds.size.height;
+        const fits_horizontally = proposed_origin.x + base_bounds.size.width <= display_right;
+        const fits_vertically = proposed_origin.y + base_bounds.size.height <= display_bottom;
+
+        const final_origin: Point(Pixels) = if (fits_horizontally and fits_vertically)
+            proposed_origin
+        else if (!fits_horizontally and fits_vertically)
+            .{ .x = display_bounds.origin.x, .y = base_bounds.origin.y }
+        else if (fits_horizontally and !fits_vertically)
+            .{ .x = base_bounds.origin.x, .y = display_bounds.origin.y }
+        else
+            display_bounds.origin;
+
+        const result: Bounds(Pixels) = .{ .origin = final_origin, .size = base_bounds.size };
+        return switch (kind) {
+            .windowed => .{ .windowed = result },
+            .maximized => .{ .maximized = result },
+            .fullscreen => .{ .fullscreen = result },
+        };
+    }
+
+    fn resolve_window_options(app: *App, options: WindowOptions) WindowOptions {
+        var resolved = options;
+        const active_placement = app.active_window_placement();
+        const target_display_id = options.display_id orelse if (options.window_bounds == null and active_placement != null)
+            active_placement.?.display_id
+        else
+            null;
+        const display = (if (target_display_id) |id| app.find_display(id) else null) orelse app.primary_display();
+        const resolved_display_id: ?platform_mod.DisplayId = if (display) |d| d.id else target_display_id;
+        const active_bounds: ?WindowBounds = if (active_placement) |ap|
+            (if (ap.display_id == resolved_display_id) ap.bounds else null)
+        else
+            null;
+        resolved.display_id = resolved_display_id;
+        if (resolved.window_bounds == null) {
+            resolved.window_bounds = default_bounds(active_bounds, display);
+        }
+        return resolved;
+    }
+
     pub fn create(app: *App, options: WindowOptions) !*Window {
         const gpa = app.allocator;
         const self = try gpa.create(Window);
+        const resolved_options = resolve_window_options(app, options);
         // An anchored popup names its parent by handle; the platform wants the parent's OS window.
-        const parent: ?*platform_mod.PlatformWindow = switch (options.kind) {
+        const parent: ?*platform_mod.PlatformWindow = switch (resolved_options.kind) {
             .anchored_popup => |popup| (app.window_by_id(popup.parent.id) orelse return error.PopupParentNotFound).platform_window,
             else => null,
         };
-        const pw = try app.platform.open_window(options, parent);
+        const pw = try app.platform.open_window(resolved_options, parent);
         self.* = .{
             .allocator = gpa,
             .app = app,
@@ -2174,7 +2259,15 @@ pub const Window = struct {
     }
 
     /// Draws `element` after the current tree, on top (GPUI `defer_draw`).
-    pub fn defer_draw(self: *Window, element: AnyElement, absolute_offset: Point(Pixels), priority: usize) void {
+    /// When `content_mask` is provided, the deferred element is clipped to that region during
+    /// prepaint and paint.
+    pub fn defer_draw(
+        self: *Window,
+        element: AnyElement,
+        absolute_offset: Point(Pixels),
+        priority: usize,
+        content_mask_: ?ContentMask(Pixels),
+    ) void {
         const stack = frame_arena().dupe(TextStyleRefinement, self.text_style_stack.items) catch oom();
         self.next_frame.deferred_draws.append(self.allocator, .{
             .priority = priority,
@@ -2185,13 +2278,35 @@ pub const Window = struct {
             .text_style_stack = stack,
             .parent_node = self.next_frame.dispatch_tree.active_node_id(),
             .element_id_hash = self.current_global_id().hash,
+            .rem_size = self.rem_size(),
+            .content_mask = content_mask_,
         }) catch oom();
     }
 
     // -- painting ------------------------------------------------------
 
+    /// Floors the near edge and ceils the far edge to device pixels, preserving empty bounds
+    /// (GPUI `cover_bounds`).
+    fn cover_bounds(self: *const Window, b: Bounds(Pixels)) Bounds(ScaledPixels) {
+        const sf = self.scale_factor_;
+        const left = @floor(b.left() * sf);
+        const top = @floor(b.top() * sf);
+        // Rounding outward would turn an empty region into a 1px strip at fractional positions,
+        // so return a zero size instead. Negative sizes become zero too.
+        if (b.is_empty()) {
+            return .{ .origin = .{ .x = left, .y = top }, .size = .{} };
+        }
+        const right = @max(@ceil(b.right() * sf), left);
+        const bottom = @max(@ceil(b.bottom() * sf), top);
+        return Bounds(ScaledPixels).from_corners(.{ .x = left, .y = top }, .{ .x = right, .y = bottom });
+    }
+
+    pub fn snapped_content_mask(self: *const Window) ContentMask(ScaledPixels) {
+        return .{ .bounds = self.cover_bounds(self.content_mask().bounds) };
+    }
+
     fn scaled_content_mask(self: *const Window) ContentMask(ScaledPixels) {
-        return self.content_mask().scale(self.scale_factor_);
+        return self.snapped_content_mask();
     }
 
     /// Paints layers of `paint` with a clipping layer (GPUI `paint_layer`).
@@ -2670,6 +2785,8 @@ pub const Window = struct {
     /// Prepaints in rounds, since a deferred element can defer more. The list stays in the order
     /// the draws were added, because reused views name parts of it by index (GPUI `prepaint_deferred_draws`).
     fn prepaint_deferred_draws(self: *Window, cx: *App) void {
+        const tree = &self.next_frame.dispatch_tree;
+        defer tree.node_stack.clearRetainingCapacity();
         var round_start: usize = 0;
         var depth: usize = 0;
         while (round_start < self.next_frame.deferred_draws.items.len) : (depth += 1) {
@@ -2677,8 +2794,8 @@ pub const Window = struct {
             const round_end = self.next_frame.deferred_draws.items.len;
             for (self.deferred_by_priority(round_start, round_end)) |ix| {
                 const d = self.next_frame.deferred_draws.items[ix];
-                const saved = self.text_style_stack.items.len;
-                self.text_style_stack.appendSlice(self.allocator, d.text_style_stack) catch oom();
+                const deferred_state = self.begin_deferred_draw(d);
+                defer self.end_deferred_draw(deferred_state);
                 const start = self.prepaint_index();
                 if (d.element) |element| {
                     const outer_arena = swap_frame_arena(d.arena);
@@ -2694,17 +2811,18 @@ pub const Window = struct {
                 const slot = &self.next_frame.deferred_draws.items[ix];
                 slot.prepaint_start = start;
                 slot.prepaint_end = end;
-                self.text_style_stack.shrinkRetainingCapacity(saved);
             }
             round_start = round_end;
         }
     }
 
     fn paint_deferred_draws(self: *Window, cx: *App) void {
+        const tree = &self.next_frame.dispatch_tree;
+        defer tree.node_stack.clearRetainingCapacity();
         for (self.deferred_by_priority(0, self.next_frame.deferred_draws.items.len)) |ix| {
             const d = self.next_frame.deferred_draws.items[ix];
-            const saved = self.text_style_stack.items.len;
-            self.text_style_stack.appendSlice(self.allocator, d.text_style_stack) catch oom();
+            const deferred_state = self.begin_deferred_draw(d);
+            defer self.end_deferred_draw(deferred_state);
             const start = self.paint_index();
             if (d.element) |element| {
                 const outer_arena = swap_frame_arena(d.arena);
@@ -2719,8 +2837,29 @@ pub const Window = struct {
             const slot = &self.next_frame.deferred_draws.items[ix];
             slot.paint_start = start;
             slot.paint_end = end;
-            self.text_style_stack.shrinkRetainingCapacity(saved);
         }
+    }
+
+    const DeferredDrawState = struct {
+        text_style_len: usize,
+        has_content_mask: bool,
+    };
+
+    fn begin_deferred_draw(self: *Window, draw_: DeferredDraw) DeferredDrawState {
+        self.next_frame.dispatch_tree.set_active_node(draw_.parent_node);
+        self.element_id_hashes.append(self.allocator, draw_.element_id_hash) catch oom();
+        self.rem_size_override_stack.append(self.allocator, draw_.rem_size) catch oom();
+        const text_style_len = self.text_style_stack.items.len;
+        self.text_style_stack.appendSlice(self.allocator, draw_.text_style_stack) catch oom();
+        if (draw_.content_mask) |mask| self.push_content_mask(mask);
+        return .{ .text_style_len = text_style_len, .has_content_mask = draw_.content_mask != null };
+    }
+
+    fn end_deferred_draw(self: *Window, state: DeferredDrawState) void {
+        if (state.has_content_mask) self.pop_content_mask();
+        _ = self.element_id_hashes.pop();
+        _ = self.rem_size_override_stack.pop();
+        self.text_style_stack.shrinkRetainingCapacity(state.text_style_len);
     }
 
     /// A drag can start before the next paint records its cursor in the frame, so it comes first.
@@ -3719,4 +3858,139 @@ test "svg key depends on path, inline bytes and size" {
     try std.testing.expect(a != svg_key("a.svg", null, size32));
     try std.testing.expect(a != svg_key("b.svg", null, size16));
     try std.testing.expect(svg_key("", "<svg/>", size16) != svg_key("", "<svg></svg>", size16));
+}
+
+test "fallback_arena_storage is thread-local and deinit_fallback_arena frees it" {
+    defer deinit_fallback_arena();
+    const main_ptr = try frame_arena().alloc(u8, 16);
+    main_ptr[0] = 0xAA;
+
+    const Worker = struct {
+        fn run() void {
+            defer deinit_fallback_arena();
+            const bg_ptr = frame_arena().alloc(u8, 64) catch unreachable;
+            bg_ptr[0] = 0x55;
+            std.debug.assert(fallback_arena_storage != null);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{});
+    t.join();
+
+    try std.testing.expectEqual(@as(u8, 0xAA), main_ptr[0]);
+    try std.testing.expect(fallback_arena_storage != null);
+    deinit_fallback_arena();
+    try std.testing.expect(fallback_arena_storage == null);
+}
+
+test "empty content masks remain empty when snapped to device pixels" {
+    const TestAppContext = @import("app/test_context.zig").TestAppContext;
+    const V = struct {
+        pub fn render(_: *@This(), _: *Window, _: *app_mod.Context(@This())) *@import("elements/div.zig").Div {
+            return @import("elements/div.zig").div();
+        }
+        fn build(_: *Window, app: *app_mod.App) app_mod.Entity(@This()) {
+            return app.new(@This(){});
+        }
+    };
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(V.build);
+    const window = vcx.window;
+
+    const viewport: ContentMask(Pixels) = .{
+        .bounds = Bounds(Pixels).from_corners(.{ .x = 20, .y = 20 }, .{ .x = 100, .y = 100 }),
+    };
+    for ([_]f32{ 1.0, 1.5, 2.0 }) |sf| {
+        window.scale_factor_ = sf;
+        for ([_]f32{ 0.0, 0.25, 0.5, 0.75 }) |fraction| {
+            const cases = [_]Bounds(Pixels){
+                .{ .origin = .{ .x = 30, .y = 120 + fraction }, .size = .{ .width = 40, .height = 20 } },
+                .{ .origin = .{ .x = 120 + fraction, .y = 30 }, .size = .{ .width = 20, .height = 40 } },
+                .{ .origin = .{ .x = 120 + fraction, .y = 120 + fraction }, .size = .{ .width = 20, .height = 20 } },
+                .{ .origin = .{ .x = 30 + fraction, .y = 40 + fraction }, .size = .{ .width = 0, .height = 20 } },
+                .{ .origin = .{ .x = 30 + fraction, .y = 40 + fraction }, .size = .{ .width = 20, .height = 0 } },
+            };
+            for (cases) |b| {
+                window.push_content_mask(viewport);
+                defer window.pop_content_mask();
+                window.push_content_mask(.{ .bounds = b });
+                defer window.pop_content_mask();
+
+                try std.testing.expect(window.content_mask().bounds.is_empty());
+                try std.testing.expect(window.snapped_content_mask().bounds.is_empty());
+
+                const count = window.next_frame.scene.len();
+                window.paint_quad(.{
+                    .bounds = b,
+                    .background = color_mod.to_background(color_mod.red()),
+                });
+                try std.testing.expectEqual(count, window.next_frame.scene.len());
+            }
+        }
+    }
+}
+
+test "nonempty content masks cover fractional edges when snapped" {
+    const TestAppContext = @import("app/test_context.zig").TestAppContext;
+    const V = struct {
+        pub fn render(_: *@This(), _: *Window, _: *app_mod.Context(@This())) *@import("elements/div.zig").Div {
+            return @import("elements/div.zig").div();
+        }
+        fn build(_: *Window, app: *app_mod.App) app_mod.Entity(@This()) {
+            return app.new(@This(){});
+        }
+    };
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    _, const vcx = cx.add_window_view(V.build);
+    const window = vcx.window;
+
+    const b: Bounds(Pixels) = .{
+        .origin = .{ .x = 30.25, .y = 40.25 },
+        .size = .{ .width = 0.125, .height = 0.125 },
+    };
+    for ([_]f32{ 1.0, 1.5, 2.0 }) |sf| {
+        window.scale_factor_ = sf;
+        window.push_content_mask(.{ .bounds = b });
+        defer window.pop_content_mask();
+
+        const snapped = window.snapped_content_mask().bounds;
+        try std.testing.expect(!snapped.is_empty());
+        try std.testing.expectEqual(@floor(30.25 * sf), snapped.left());
+        try std.testing.expectEqual(@floor(40.25 * sf), snapped.top());
+        try std.testing.expectEqual(@ceil(30.375 * sf), snapped.right());
+        try std.testing.expectEqual(@ceil(40.375 * sf), snapped.bottom());
+    }
+}
+
+test "default_bounds cascades from active window and wraps at display edges" {
+    const display: platform_mod.Display = .{
+        .id = 1,
+        .bounds = .{ .origin = .{ .x = 100, .y = 50 }, .size = .{ .width = 1000, .height = 800 } },
+    };
+
+    const initial = Window.default_bounds(null, display);
+    try std.testing.expectEqual(display.bounds.size, initial.get_bounds().size);
+    try std.testing.expectEqual(display.bounds.origin, initial.get_bounds().origin);
+
+    const active: WindowBounds = .{ .windowed = .{
+        .origin = .{ .x = 200, .y = 150 },
+        .size = .{ .width = 400, .height = 300 },
+    } };
+    const cascaded = Window.default_bounds(active, display);
+    try std.testing.expectEqual(Bounds(Pixels){
+        .origin = .{ .x = 225, .y = 175 },
+        .size = .{ .width = 400, .height = 300 },
+    }, cascaded.get_bounds());
+
+    // Pushing past the right edge resets x to display origin while keeping y.
+    const near_right: WindowBounds = .{ .windowed = .{
+        .origin = .{ .x = 700, .y = 150 },
+        .size = .{ .width = 400, .height = 300 },
+    } };
+    const wrapped_x = Window.default_bounds(near_right, display);
+    try std.testing.expectEqual(Bounds(Pixels){
+        .origin = .{ .x = 100, .y = 150 },
+        .size = .{ .width = 400, .height = 300 },
+    }, wrapped_x.get_bounds());
 }

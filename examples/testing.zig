@@ -99,12 +99,14 @@ const Counter = struct {
         this.update(cx, add_count, .{50}) catch {};
     }
 
-    fn set_count(self: *Counter, value: i32, _: *Context(Counter)) void {
+    fn set_count(self: *Counter, value: i32, cx: *Context(Counter)) void {
         self.count = value;
+        cx.notify();
     }
 
-    fn add_count(self: *Counter, delta: i32, _: *Context(Counter)) void {
+    fn add_count(self: *Counter, delta: i32, cx: *Context(Counter)) void {
         self.count += delta;
+        cx.notify();
     }
 
     fn emit_event(_: *Counter, cx: *Context(Counter)) void {
@@ -254,12 +256,22 @@ test "async operations" {
     defer cx.deinit();
 
     const counter = cx.new(Counter.init);
+    const S = struct {
+        var notifications: usize = 0;
+        fn on_notify(_: Entity(Counter), _: *App) void {
+            notifications += 1;
+        }
+    };
+    S.notifications = 0;
+    const sub = cx.app.observe(counter, S.on_notify);
+    defer sub.unsubscribe();
 
     // Tasks can be awaited directly
     var load = counter.update(&cx, Counter.load, .{});
     _ = load.wait();
 
     try std.testing.expectEqual(@as(i32, 100), counter.read(&cx).count);
+    try std.testing.expectEqual(@as(usize, 1), S.notifications);
 
     // But side effects don't run until you yield control
     counter.update(&cx, Counter.reload, .{});
@@ -270,6 +282,7 @@ test "async operations" {
     cx.run_until_parked();
 
     try std.testing.expectEqual(@as(i32, 150), counter.read(&cx).count);
+    try std.testing.expectEqual(@as(usize, 2), S.notifications);
 }
 
 // Property testing: the GPUI `iterations = 10` attribute, as a loop over fixed seeds.

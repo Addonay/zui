@@ -92,11 +92,39 @@ pub const EntityMap = struct {
     }
 
     pub fn get(self: *const EntityMap, id: EntityId) ?*anyopaque {
+        const s = self.get_slot_const(id) orelse return null;
+        return s.ptr;
+    }
+
+    fn get_slot_const(self: *const EntityMap, id: EntityId) ?*const EntitySlot {
         const i = id.index();
         if (i >= self.slots.items.len) return null;
         const s = &self.slots.items[i];
-        if (s.generation != id.generation()) return null;
+        if (s.generation != id.generation() or s.ptr == null) return null;
+        return s;
+    }
+
+    fn get_slot(self: *EntityMap, id: EntityId) ?*EntitySlot {
+        const i = id.index();
+        if (i >= self.slots.items.len) return null;
+        const s = &self.slots.items[i];
+        if (s.generation != id.generation() or s.ptr == null) return null;
+        return s;
+    }
+
+    fn begin_lease(self: *EntityMap, id: EntityId, comptime op: []const u8) ?*anyopaque {
+        const s = self.get_slot(id) orelse return null;
+        if (s.leased) @panic("cannot " ++ op ++ " entity while it is already leased");
+        s.leased = true;
         return s.ptr;
+    }
+
+    fn end_lease(self: *EntityMap, id: EntityId) void {
+        // Re-fetch by index: the callback may create entities and reallocate `slots`.
+        const i = id.index();
+        if (i >= self.slots.items.len) return;
+        const s = &self.slots.items[i];
+        if (s.generation == id.generation()) s.leased = false;
     }
 
     pub fn len(self: *const EntityMap) usize {
@@ -137,13 +165,17 @@ pub fn Entity(comptime T: type) type {
         /// Read-only access to the entity's state.
         pub fn read(self: Self, cx: anytype) *const T {
             const app = app_of(cx);
-            return @ptrCast(@alignCast(app.entities.get(self.entity_id_) orelse @panic("entity released")));
+            const slot = app.entities.get_slot_const(self.entity_id_) orelse @panic("entity released");
+            if (slot.leased) @panic("cannot read entity while it is leased");
+            return @ptrCast(@alignCast(slot.ptr.?));
         }
 
         /// Mutable access without a context (GPUI `as_mut`); prefer `update`.
         pub fn as_mut(self: Self, cx: anytype) *T {
             const app = app_of(cx);
-            return @ptrCast(@alignCast(app.entities.get(self.entity_id_) orelse @panic("entity released")));
+            const slot = app.entities.get_slot_const(self.entity_id_) orelse @panic("entity released");
+            if (slot.leased) @panic("cannot read entity while it is leased");
+            return @ptrCast(@alignCast(slot.ptr.?));
         }
 
         /// Calls `f(state, args..., cx)` style updates. `f` is
@@ -156,7 +188,14 @@ pub fn Entity(comptime T: type) type {
         /// Like `update`, but with access to a window (GPUI `update_in`).
         pub fn update_in(self: Self, window: *Window, cx: anytype, comptime f: anytype, args: anytype) ReturnOf(f) {
             const app = app_of(cx);
-            const state = self.as_mut(app);
+            app.pending_updates += 1;
+            defer {
+                app.pending_updates -= 1;
+                if (app.pending_updates == 0) app.flush_effects();
+            }
+            const raw = app.entities.begin_lease(self.entity_id_, "update") orelse @panic("entity released");
+            defer app.entities.end_lease(self.entity_id_);
+            const state: *T = @ptrCast(@alignCast(raw));
             var ctx: Context(T) = .{ .app = app, .entity_id_ = self.entity_id_ };
             return @call(.auto, f, .{state} ++ args ++ .{ window, &ctx });
         }
@@ -1006,6 +1045,8 @@ const SubscriberKind = enum {
     displays,
     /// The keyboard layout changed (`App.on_keyboard_layout_change`).
     keyboard_layout,
+    /// The text scale factor changed (`App.on_text_scale_factor_change`).
+    text_scale_factor,
     /// The app was reopened (`App.on_reopen`).
     reopen,
     /// The app is about to restart (`App.on_app_restart`).
@@ -1281,6 +1322,12 @@ pub const App = struct {
                 self.displays_changed();
             }
         }.f });
+        platform.on_text_scale_factor_change(.{ .ctx = app, .func = struct {
+            fn f(ctx: *anyopaque) void {
+                const self: *App = @ptrCast(@alignCast(ctx));
+                self.dispatch_text_scale_factor_change();
+            }
+        }.f });
         platform.on_will_open_app_menu(.{ .ctx = app, .func = struct {
             fn f(ctx: *anyopaque) void {
                 const self: *App = @ptrCast(@alignCast(ctx));
@@ -1356,28 +1403,27 @@ pub const App = struct {
 
     // -- entities --------------------------------------------------------
 
-    /// Creates a new entity (GPUI `cx.new(|cx| T)`).
-    ///
-    /// `init` is either a `T` value, or `fn(*Context(T)) T`.
-    pub fn new(self: *App, initializer: anytype) Entity(EntityTypeOf(@TypeOf(initializer))) {
-        const T = EntityTypeOf(@TypeOf(initializer));
-        const id = self.entities.reserve(self.allocator);
+    fn entity_destroy_fn(comptime T: type) *const fn (*App, *anyopaque) void {
+        return struct {
+            fn d(app: *App, p: *anyopaque) void {
+                const t: *T = @ptrCast(@alignCast(p));
+                if (@hasDecl(T, "deinit")) {
+                    const F = @typeInfo(@TypeOf(T.deinit)).@"fn";
+                    if (F.param_types.len == 1) t.deinit() else t.deinit(app);
+                }
+                app.allocator.destroy(t);
+            }
+        }.d;
+    }
+
+    fn fill_entity_slot(self: *App, comptime T: type, id: EntityId, initializer: anytype) Entity(T) {
         const ptr = self.allocator.create(T) catch oom();
         const slot = &self.entities.slots.items[id.index()];
         slot.* = .{
             .ptr = null,
             .tid = type_id(T),
             .generation = id.generation(),
-            .destroy = struct {
-                fn d(app: *App, p: *anyopaque) void {
-                    const t: *T = @ptrCast(@alignCast(p));
-                    if (@hasDecl(T, "deinit")) {
-                        const F = @typeInfo(@TypeOf(T.deinit)).@"fn";
-                        if (F.param_types.len == 1) t.deinit() else t.deinit(app);
-                    }
-                    app.allocator.destroy(t);
-                }
-            }.d,
+            .destroy = entity_destroy_fn(T),
         };
         if (@TypeOf(initializer) == T) {
             ptr.* = initializer;
@@ -1392,6 +1438,15 @@ pub const App = struct {
         return .{ .entity_id_ = id };
     }
 
+    /// Creates a new entity (GPUI `cx.new(|cx| T)`).
+    ///
+    /// `init` is either a `T` value, or `fn(*Context(T)) T`.
+    pub fn new(self: *App, initializer: anytype) Entity(EntityTypeOf(@TypeOf(initializer))) {
+        const T = EntityTypeOf(@TypeOf(initializer));
+        const id = self.entities.reserve(self.allocator);
+        return self.fill_entity_slot(T, id, initializer);
+    }
+
     /// Reserves an entity id to be filled later with `insert_entity`.
     pub fn reserve_entity(self: *App, comptime T: type) Reservation(T) {
         return .{ .entity_id_ = self.entities.reserve(self.allocator) };
@@ -1399,28 +1454,19 @@ pub const App = struct {
 
     pub fn insert_entity(self: *App, reservation: anytype, initializer: anytype) Entity(@TypeOf(reservation).Type) {
         const T = @TypeOf(reservation).Type;
-        const id = reservation.entity_id_;
-        const ptr = self.allocator.create(T) catch oom();
-        var ctx: Context(T) = .{ .app = self, .entity_id_ = id };
-        ptr.* = if (@TypeOf(initializer) == T) initializer else initializer(&ctx);
-        self.entities.slots.items[id.index()] = .{ .ptr = ptr, .tid = type_id(T), .generation = id.generation(), .destroy = struct {
-            fn d(app: *App, p: *anyopaque) void {
-                app.allocator.destroy(@as(*T, @ptrCast(@alignCast(p))));
-            }
-        }.d };
-        self.notify_new_entity(T, id, ptr);
-        return .{ .entity_id_ = id };
+        return self.fill_entity_slot(T, reservation.entity_id_, initializer);
     }
 
     pub fn update_entity(self: *App, comptime T: type, handle: Entity(T), comptime f: anytype, args: anytype) ReturnOf(f) {
-        const raw = self.entities.get(handle.entity_id_) orelse @panic("entity released");
-        const state: *T = @ptrCast(@alignCast(raw));
-        var ctx: Context(T) = .{ .app = self, .entity_id_ = handle.entity_id_ };
         self.pending_updates += 1;
         defer {
             self.pending_updates -= 1;
             if (self.pending_updates == 0) self.flush_effects();
         }
+        const raw = self.entities.begin_lease(handle.entity_id_, "update") orelse @panic("entity released");
+        defer self.entities.end_lease(handle.entity_id_);
+        const state: *T = @ptrCast(@alignCast(raw));
+        var ctx: Context(T) = .{ .app = self, .entity_id_ = handle.entity_id_ };
         return @call(.auto, f, .{state} ++ args ++ .{&ctx});
     }
 
@@ -1482,6 +1528,7 @@ pub const App = struct {
         const s = &self.entities.slots.items[i];
         if (s.destroy) |d| d(self, p);
         s.ptr = null;
+        s.leased = false;
         s.generation +%= 1;
         if (s.generation == 0) s.generation = 1;
         self.entities.free.append(self.allocator, @intCast(i)) catch oom();
@@ -2084,6 +2131,12 @@ pub const App = struct {
         return null;
     }
 
+    /// Display and bounds of the active window, for placing newly opened windows (GPUI `active_window_placement`).
+    pub fn active_window_placement(self: *App) ?struct { display_id: ?platform_mod.DisplayId, bounds: window_mod.WindowBounds } {
+        const win = self.active_window() orelse return null;
+        return .{ .display_id = win.display_id_, .bounds = win.window_bounds() };
+    }
+
     pub fn close_window(self: *App, win: *Window) void {
         var index: ?usize = null;
         for (self.windows.items, 0..) |w, i| if (w == win) {
@@ -2473,6 +2526,28 @@ pub const App = struct {
     /// The keyboard layout changed: runs the `on_keyboard_layout_change` observers.
     pub fn dispatch_keyboard_layout_change(self: *App) void {
         self.dispatch_global(.keyboard_layout, null);
+    }
+
+    /// The factor by which text should be scaled, on top of the window's scale factor
+    /// (GPUI `App::text_scale_factor`).
+    pub fn text_scale_factor(self: *const App) f32 {
+        return self.platform.text_scale_factor();
+    }
+
+    /// Runs `f(cx)` when the text scale factor changes (GPUI `App::on_text_scale_factor_change`).
+    pub fn on_text_scale_factor_change(self: *App, comptime f: fn (*App) void) Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, _: ?*const anyopaque) bool {
+                f(app);
+                return true;
+            }
+        };
+        return self.add_subscriber(.{ .kind = .text_scale_factor, .emitter = 0, .ctx = 0, .func = S.call, .id = 0 });
+    }
+
+    /// The text scale factor changed: runs the `on_text_scale_factor_change` observers.
+    pub fn dispatch_text_scale_factor_change(self: *App) void {
+        self.dispatch_global(.text_scale_factor, null);
     }
 
     /// Runs `f(cx)` when the app is reopened (GPUI `on_reopen`). Only macOS reports reopens, as
@@ -3091,4 +3166,183 @@ test "deprecation maps are empty without deprecated actions" {
     defer cx.deinit();
     try std.testing.expectEqual(@as(u32, 0), cx.app.deprecated_actions_to_preferred_actions().count());
     try std.testing.expectEqual(@as(u32, 0), cx.app.action_deprecation_messages().count());
+}
+
+test "EntitySlot.leased tracks update and update_in even across slot reallocation, and releases before flush_effects" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const Dummy = struct { v: u32 = 0 };
+    const Target = struct {
+        value: u32 = 0,
+        leased_during_update: bool = false,
+        leased_during_update_in: bool = false,
+
+        fn run_update(self: *@This(), target: Entity(@This()), c: *Context(@This())) void {
+            const slot = c.app.entities.get_slot_const(target.entity_id_).?;
+            self.leased_during_update = slot.leased;
+            // Force `slots` ArrayList reallocation while leased.
+            for (0..64) |i| _ = c.new(Dummy{ .v = @intCast(i) });
+            self.value = 7;
+            c.notify();
+        }
+
+        fn run_update_in(self: *@This(), target: Entity(@This()), _: *Window, c: *Context(@This())) void {
+            const slot = c.app.entities.get_slot_const(target.entity_id_).?;
+            self.leased_during_update_in = slot.leased;
+            for (0..64) |i| _ = c.new(Dummy{ .v = @intCast(i) });
+            self.value = 11;
+            c.notify();
+        }
+    };
+
+    const e = cx.new(Target{});
+    const Observer = struct {
+        var saw_value: u32 = 0;
+        var saw_calls: usize = 0;
+        fn on_notify(observed: Entity(Target), app: *App) void {
+            // Observer must be able to read the entity once the lease ended before flush_effects.
+            saw_value = observed.read(app).value;
+            saw_calls += 1;
+        }
+    };
+    Observer.saw_value = 0;
+    Observer.saw_calls = 0;
+    const sub = cx.app.observe(e, Observer.on_notify);
+    defer sub.unsubscribe();
+
+    e.update(&cx, Target.run_update, .{e});
+    try std.testing.expect(e.read(&cx).leased_during_update);
+    try std.testing.expect(!cx.app.entities.get_slot_const(e.entity_id_).?.leased);
+    try std.testing.expectEqual(@as(usize, 1), Observer.saw_calls);
+    try std.testing.expectEqual(@as(u32, 7), Observer.saw_value);
+
+    const PlainView = struct {
+        pub fn render(_: *@This(), _: *Window, _: *Context(@This())) *@import("elements/div.zig").Div {
+            return @import("elements/div.zig").div();
+        }
+        fn build(_: *Window, app: *App) Entity(@This()) {
+            return app.new(@This(){});
+        }
+    };
+    _, const vcx = cx.add_window_view(PlainView.build);
+    e.update_in(vcx.window, &cx, Target.run_update_in, .{e});
+    try std.testing.expect(e.read(&cx).leased_during_update_in);
+    try std.testing.expect(!cx.app.entities.get_slot_const(e.entity_id_).?.leased);
+    try std.testing.expectEqual(@as(usize, 2), Observer.saw_calls);
+    try std.testing.expectEqual(@as(u32, 11), Observer.saw_value);
+}
+
+test "Entity.update_in batches effects until outermost update finishes" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const PlainView = struct {
+        pub fn render(_: *@This(), _: *Window, _: *Context(@This())) *@import("elements/div.zig").Div {
+            return @import("elements/div.zig").div();
+        }
+        fn build(_: *Window, app: *App) Entity(@This()) {
+            return app.new(@This(){});
+        }
+    };
+    _, const vcx = cx.add_window_view(PlainView.build);
+
+    const State = struct {
+        var notifications_mid_call: usize = 0;
+        var notifications_total: usize = 0;
+        fn step(self: *@This(), _: *Window, c: *Context(@This())) void {
+            _ = self;
+            c.notify();
+            notifications_mid_call = notifications_total;
+        }
+        fn on_notify(_: Entity(@This()), _: *App) void {
+            notifications_total += 1;
+        }
+    };
+    State.notifications_mid_call = 999;
+    State.notifications_total = 0;
+    const e = cx.new(State{});
+    const sub = cx.app.observe(e, State.on_notify);
+    defer sub.unsubscribe();
+
+    e.update_in(vcx.window, &cx, State.step, .{});
+    try std.testing.expectEqual(@as(usize, 0), State.notifications_mid_call);
+    try std.testing.expectEqual(@as(usize, 1), State.notifications_total);
+}
+
+test "App.insert_entity runs deinit on release and shutdown" {
+    const Tracked = struct {
+        var deinit_count: usize = 0;
+        tag: u32,
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+            deinit_count += 1;
+        }
+    };
+    const TrackedWithApp = struct {
+        var deinit_count: usize = 0;
+        tag: u32,
+        pub fn deinit(self: *@This(), _: *App) void {
+            _ = self;
+            deinit_count += 1;
+        }
+    };
+    Tracked.deinit_count = 0;
+    TrackedWithApp.deinit_count = 0;
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+
+    const r1 = cx.app.reserve_entity(Tracked);
+    const e1 = cx.app.insert_entity(r1, Tracked{ .tag = 1 });
+    try std.testing.expectEqual(@as(u32, 1), e1.read(&cx).tag);
+    e1.release(&cx);
+    try std.testing.expectEqual(@as(usize, 1), Tracked.deinit_count);
+
+    const r2 = cx.app.reserve_entity(TrackedWithApp);
+    const e2 = cx.app.insert_entity(r2, struct {
+        fn init(_: *Context(TrackedWithApp)) TrackedWithApp {
+            return .{ .tag = 2 };
+        }
+    }.init);
+    try std.testing.expectEqual(@as(u32, 2), e2.read(&cx).tag);
+    e2.release(&cx);
+    try std.testing.expectEqual(@as(usize, 1), TrackedWithApp.deinit_count);
+}
+
+test "App.on_text_scale_factor_change fires only on actual changes and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const headless_mod = @import("platform/headless.zig");
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+
+    const S = struct {
+        var calls: usize = 0;
+        var last: f32 = 0;
+        fn on_change(app: *App) void {
+            calls += 1;
+            last = app.text_scale_factor();
+        }
+    };
+    S.calls = 0;
+    S.last = 0;
+
+    try std.testing.expectEqual(@as(f32, 1.0), cx.app.text_scale_factor());
+    const sub = cx.app.on_text_scale_factor_change(S.on_change);
+
+    // Setting the current value (1.0) is a no-op.
+    hp.set_text_scale_factor(1.0);
+    try std.testing.expectEqual(@as(usize, 0), S.calls);
+
+    hp.set_text_scale_factor(1.25);
+    try std.testing.expectEqual(@as(usize, 1), S.calls);
+    try std.testing.expectEqual(@as(f32, 1.25), S.last);
+    try std.testing.expectEqual(@as(f32, 1.25), cx.app.text_scale_factor());
+
+    // Repeating the same value does not re-fire.
+    hp.set_text_scale_factor(1.25);
+    try std.testing.expectEqual(@as(usize, 1), S.calls);
+
+    sub.unsubscribe();
+    hp.set_text_scale_factor(1.5);
+    try std.testing.expectEqual(@as(usize, 1), S.calls);
+    try std.testing.expectEqual(@as(f32, 1.5), cx.app.text_scale_factor());
 }

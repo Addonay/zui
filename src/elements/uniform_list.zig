@@ -258,7 +258,7 @@ pub const UniformList = struct {
 
     /// Tracks the scroll position in `handle`.
     pub fn track_scroll(self: *Self, handle: *const UniformListScrollHandle) *Self {
-        self.interactivity.tracked_scroll_handle = handle.state.base_handle;
+        self.interactivity.set_tracked_scroll_handle(handle.state.base_handle);
         self.scroll_handle = handle.*;
         return self;
     }
@@ -283,7 +283,7 @@ pub const UniformList = struct {
 
     /// Adds a scroll wheel listener on the list.
     pub fn on_scroll_wheel(self: *Self, listener: anytype) *Self {
-        self.interactivity.scroll_wheel_listeners.append(window_mod.frame_arena(), app_mod.to_listener(ScrollWheelEvent, listener)) catch oom();
+        self.interactivity.add_scroll_wheel_listener(app_mod.to_listener(ScrollWheelEvent, listener));
         return self;
     }
 
@@ -383,7 +383,7 @@ pub const UniformList = struct {
             handle.state.deferred_scroll_to_item = null;
         }
 
-        var scroll_offset: Point(Pixels) = if (self.interactivity.tracked_scroll_handle) |sh|
+        var scroll_offset: Point(Pixels) = if (self.interactivity.tracked_scroll_handle()) |sh|
             sh.offset()
         else if (pp.state) |st|
             st.scroll_offset
@@ -578,11 +578,12 @@ pub const UniformList = struct {
     fn onScrollWheel(raw: *anyopaque, e: *const ScrollWheelEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
         const c: *ScrollCtx = @ptrCast(@alignCast(raw));
         if (phase != .bubble or !c.hitbox.should_handle_scroll(window)) return;
-        for (c.list.interactivity.scroll_wheel_listeners.items) |l| l.call(e, window, cx);
+        for (c.list.interactivity.scroll_wheel_listeners()) |l| l.call(e, window, cx);
 
         const delta = e.delta.pixel_delta(window.line_height());
         const can_scroll_horizontally = c.list.horizontal_sizing_behavior == .unconstrained;
-        var offset: Point(Pixels) = if (c.list.interactivity.tracked_scroll_handle) |sh|
+        const tracked = c.list.interactivity.tracked_scroll_handle();
+        var offset: Point(Pixels) = if (tracked) |sh|
             sh.offset()
         else if (c.state) |st|
             st.scroll_offset
@@ -594,7 +595,7 @@ pub const UniformList = struct {
             offset.x = std.math.clamp(offset.x + delta.x, -c.max_scroll.width, 0);
         }
 
-        if (c.list.interactivity.tracked_scroll_handle) |sh| sh.set_offset(offset);
+        if (tracked) |sh| sh.set_offset(offset);
         if (c.state) |st| st.scroll_offset = offset;
         window.notify_current_view();
         window.stop_propagation();

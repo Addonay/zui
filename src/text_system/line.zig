@@ -455,6 +455,22 @@ const UnderlineRun = struct { origin: Point(Pixels), style: UnderlineStyle, rang
 const BackgroundRun = struct { origin: Point(Pixels), color: Hsla };
 const StrikethroughRun = struct { origin: Point(Pixels), style: StrikethroughStyle };
 
+/// Painting backgrounds walks every glyph and opens a layer, so callers skip it when there's
+/// nothing to paint.
+fn has_background(decoration_runs: []const DecorationRun) bool {
+    for (decoration_runs) |run| {
+        if (run.background_color != null) return true;
+    }
+    return false;
+}
+
+fn layout_has_glyphs(layout: *const LineLayout) bool {
+    for (layout.runs) |run| {
+        if (run.glyphs.len > 0) return true;
+    }
+    return false;
+}
+
 fn paint_line(
     origin: Point(Pixels),
     layout: *const LineLayout,
@@ -467,6 +483,7 @@ fn paint_line(
     window: *Window,
     cx: *App,
 ) !void {
+    if (!layout_has_glyphs(layout)) return;
     var args: PaintArgs = .{
         .origin = origin,
         .layout = layout,
@@ -492,6 +509,7 @@ fn paint_line_background(
     window: *Window,
     cx: *App,
 ) !void {
+    if (!has_background(decoration_runs) or !layout_has_glyphs(layout)) return;
     var args: PaintArgs = .{
         .origin = origin,
         .layout = layout,
@@ -541,6 +559,7 @@ fn paint_glyphs(args: *PaintArgs, window: *Window, cx: *App) !void {
     var prev_glyph_position: Point(Pixels) = .{ .x = 0, .y = 0 };
     var max_glyph_size: Size(Pixels) = .{ .width = 0, .height = 0 };
     var first_glyph_x = origin.x;
+    const content_mask_bounds = window.content_mask().bounds;
 
     for (layout.runs, 0..) |run, run_ix| {
         max_glyph_size = text_sys.bounding_box(run.font_id, layout.font_size).size;
@@ -648,7 +667,7 @@ fn paint_glyphs(args: *PaintArgs, window: *Window, cx: *App) !void {
             }
 
             const max_glyph_bounds: Bounds(Pixels) = .{ .origin = glyph_origin, .size = max_glyph_size };
-            if (max_glyph_bounds.intersects(window.content_mask().bounds)) {
+            if (max_glyph_bounds.intersects(content_mask_bounds)) {
                 const vertical: Point(Pixels) = .{ .x = 0, .y = glyph.position.y };
                 const at: Point(Pixels) = glyph_origin.add(baseline_offset).add(vertical);
                 if (glyph.is_emoji) {
@@ -1184,4 +1203,26 @@ test "cursor takes empty chunks and repeated boundaries" {
     try testing.expect(piece.text.len == 0);
     try testing.expectEqual(@as(usize, 0), piece.layout.runs.len);
     try testing.expectEqual(@as(f32, 0), piece.width());
+}
+
+test "has_background and layout_has_glyphs detect empty background and glyph passes" {
+    const plain = [_]DecorationRun{
+        .{ .len = 3, .color = test_color(0.1), .background_color = null },
+        .{ .len = 2, .color = test_color(0.2), .background_color = null },
+    };
+    try testing.expect(!has_background(&.{}));
+    try testing.expect(!has_background(&plain));
+
+    const with_bg = [_]DecorationRun{
+        .{ .len = 3, .color = test_color(0.1), .background_color = null },
+        .{ .len = 2, .color = test_color(0.2), .background_color = test_color(0.8) },
+    };
+    try testing.expect(has_background(&with_bg));
+
+    const empty_layout: LineLayout = .{};
+    try testing.expect(!layout_has_glyphs(&empty_layout));
+
+    const line = try make_test_line("ab", &.{ .{ 0, 5 }, .{ 1, 15 } }, 20, &.{});
+    defer free_test_line(line);
+    try testing.expect(layout_has_glyphs(line.layout));
 }

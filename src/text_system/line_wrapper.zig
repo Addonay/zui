@@ -287,9 +287,9 @@ pub const LineWrapper = struct {
         var indent: ?u32 = null;
         var truncate_ix: usize = 0;
 
-        var breaks: std.ArrayList(usize) = .empty;
-        defer breaks.deinit(self.allocator);
-        try break_indices_into(self.allocator, text, &breaks);
+        self.break_scratch.clearRetainingCapacity();
+        try break_indices_into(self.allocator, text, &self.break_scratch);
+        const breaks = self.break_scratch.items;
         var break_ix: usize = 0;
 
         var it = Chars.init(text);
@@ -298,7 +298,7 @@ pub const LineWrapper = struct {
             const c = ch.c;
             // Consume boundaries on newlines too, so skipping an empty line does not
             // leave the iterator stuck before subsequent text.
-            const is_break = break_ix < breaks.items.len and breaks.items[break_ix] == ix;
+            const is_break = break_ix < breaks.len and breaks[break_ix] == ix;
             if (is_break) break_ix += 1;
             if (c == '\n') {
                 if (line >= max_lines - 1 and !is_blank(text[ix + 1 ..])) {
@@ -954,6 +954,38 @@ test "wrap_line with extra columns keeps a fitting indent and drops an overflowi
     // 6 base columns plus 8 extra overflow a 10-column line, so the indent falls back to 0.
     var it = try w.wrap_line(&.{LineFragment.text_fragment("      ab cd ef gh")}, cell * 10, .{ .extra_columns = 8 });
     try testing.expectEqualSlices(Boundary, &.{Boundary.new(9, 0)}, collect(&it, &buf));
+}
+
+test "emergency wrapping keeps an emoji grapheme together" {
+    var cw: CharWidthCache = .{};
+    defer cw.deinit(testing.allocator);
+    const cell: Pixels = 1;
+    var w = test_wrapper(&cw, &cell);
+    defer w.deinit();
+    var buf: [8]Boundary = undefined;
+
+    // The emoji is multiple codepoints and UTF-8 sequences, but one grapheme.
+    const text = "x👩‍💻y";
+    var it = try w.wrap_line(&.{LineFragment.text_fragment(text)}, 1, .no_indent);
+    try testing.expectEqualSlices(Boundary, &.{ Boundary.new(1, 0), Boundary.new(12, 0) }, collect(&it, &buf));
+}
+
+test "emergency wrapping rejects a word break before an oversized inline element" {
+    var cw: CharWidthCache = .{};
+    defer cw.deinit(testing.allocator);
+    const cell: Pixels = 10;
+    var w = test_wrapper(&cw, &cell);
+    defer w.deinit();
+    var buf: [8]Boundary = undefined;
+
+    // Taking the word break would carry its final character and the 100px element
+    // onto a line whose width is only 100px. Break before the element instead.
+    const fragments = [_]LineFragment{
+        LineFragment.text_fragment("aaaaaaaaaaaaaaaaaaa a"),
+        LineFragment.element_fragment(100, 1),
+    };
+    var it = try w.wrap_line(&fragments, 100, .{ .extra_columns = 2 });
+    try testing.expectEqualSlices(Boundary, &.{ Boundary.new(10, 2), Boundary.new(18, 2), Boundary.new(21, 0) }, collect(&it, &buf));
 }
 
 test "multiline truncation fits within the requested wrapped lines" {

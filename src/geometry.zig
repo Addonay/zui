@@ -611,10 +611,15 @@ pub fn Bounds(comptime T: type) type {
             };
         }
 
-        /// Bounds of `sz` centered in the display, or the default 1920x1080 display.
-        /// `display_id` is ignored until display lookup is ported.
+        /// Bounds of `sz` centered in `display_id` (or the primary display), or the default 1920x1080 display.
         pub fn centered(display_id: ?DisplayId, sz: Size(Pixels), cx: anytype) Bounds(Pixels) {
-            _ = display_id;
+            if (comptime has_display_lookup(@TypeOf(cx))) {
+                const display = (if (display_id) |id| cx.find_display(id) else null) orelse cx.primary_display();
+                if (display) |d| {
+                    const visible = d.visible_bounds();
+                    return Bounds(Pixels).centered_at(visible.center(), sz.min(visible.size));
+                }
+            }
             const display_size: Size(Pixels) = if (comptime has_primary_display_size(@TypeOf(cx)))
                 cx.primary_display_size()
             else
@@ -623,10 +628,12 @@ pub fn Bounds(comptime T: type) type {
             return Bounds(Pixels).centered_at(visible.center(), sz.min(visible.size));
         }
 
-        /// Bounds covering the primary display, or a 1024x768 window if no display is known.
-        /// `display_id` is ignored until display lookup is ported.
+        /// Bounds covering `display_id` (or the primary display), or a 1024x768 window if no display is known.
         pub fn maximized(display_id: ?DisplayId, cx: anytype) Bounds(Pixels) {
-            _ = display_id;
+            if (comptime has_display_lookup(@TypeOf(cx))) {
+                const display = (if (display_id) |id| cx.find_display(id) else null) orelse cx.primary_display();
+                if (display) |d| return d.bounds;
+            }
             if (comptime has_primary_display_size(@TypeOf(cx))) {
                 return .{ .origin = point(0, 0), .size = cx.primary_display_size() };
             }
@@ -635,15 +642,23 @@ pub fn Bounds(comptime T: type) type {
     };
 }
 
-fn has_primary_display_size(comptime Context: type) bool {
+fn has_decl_in_context(comptime Context: type, comptime decl: []const u8) bool {
     const Child = switch (@typeInfo(Context)) {
         .pointer => |pointer| pointer.child,
         else => Context,
     };
     return switch (@typeInfo(Child)) {
-        .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(Child, "primary_display_size"),
+        .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(Child, decl),
         else => false,
     };
+}
+
+fn has_primary_display_size(comptime Context: type) bool {
+    return has_decl_in_context(Context, "primary_display_size");
+}
+
+fn has_display_lookup(comptime Context: type) bool {
+    return has_decl_in_context(Context, "find_display") and has_decl_in_context(Context, "primary_display");
 }
 
 /// Constructs a `Bounds` from an origin and a size.
@@ -744,6 +759,22 @@ pub fn Edges(comptime T: type) type {
         /// Largest edge.
         pub fn max(self: Edges(Pixels)) Pixels {
             return @max(@max(self.top, self.right), @max(self.bottom, self.left));
+        }
+
+        /// Sum of the two edges along `axis` (GPUI `Along::along`).
+        pub inline fn along(self: Self, axis: Axis) T {
+            return switch (axis) {
+                .horizontal => self.left + self.right,
+                .vertical => self.top + self.bottom,
+            };
+        }
+
+        /// Applies `f` to the two edges along `axis`, leaving the other two unchanged (GPUI `Along::apply_along`).
+        pub inline fn apply_along(self: Self, axis: Axis, f: fn (T) T) Self {
+            return switch (axis) {
+                .horizontal => .{ .top = self.top, .right = f(self.right), .bottom = self.bottom, .left = f(self.left) },
+                .vertical => .{ .top = f(self.top), .right = self.right, .bottom = f(self.bottom), .left = self.left },
+            };
         }
     };
 }
@@ -1030,6 +1061,48 @@ pub fn ceil(value: Pixels) Pixels {
 /// `value` raised to `exponent` (GPUI `Pixels::pow`).
 pub fn pow(value: Pixels, exponent: f32) Pixels {
     return math.pow(f32, value, exponent);
+}
+
+/// Returns the IEEE-754 bits of `value` with `-0.0` normalized to `+0.0` (GPUI `canonical_float_bits`).
+/// Equality treats `-0.0 == +0.0`, so hashing float bits directly would place equal values in different buckets.
+pub inline fn canonical_float_bits(value: f32) u32 {
+    return @bitCast(if (value == 0.0) @as(f32, 0.0) else value);
+}
+
+/// Normalizes `-0.0` to `+0.0` for any floating-point type so hashes agree with `==`.
+pub inline fn normalize_signed_zero(value: anytype) @TypeOf(value) {
+    const V = @TypeOf(value);
+    return switch (@typeInfo(V)) {
+        .float => if (value == 0.0) @as(V, 0.0) else value,
+        else => value,
+    };
+}
+
+/// Feeds `value` into `hasher` (any hasher with `.update([]const u8)`), normalizing `-0.0` to `+0.0`
+/// recursively across structs, unions, optionals, and arrays.
+pub fn hash_value(hasher: anytype, value: anytype) void {
+    const V = @TypeOf(value);
+    switch (@typeInfo(V)) {
+        .float => {
+            const normalized = normalize_signed_zero(value);
+            hasher.update(std.mem.asBytes(&normalized));
+        },
+        .bool, .int => hasher.update(std.mem.asBytes(&value)),
+        .@"enum" => hash_value(hasher, @intFromEnum(value)),
+        .optional => if (value) |inner| {
+            hash_value(hasher, true);
+            hash_value(hasher, inner);
+        } else hash_value(hasher, false),
+        .array => for (value) |item| hash_value(hasher, item),
+        .@"struct" => |info| inline for (info.field_names) |name| hash_value(hasher, @field(value, name)),
+        .@"union" => |info| if (info.tag_type != null) switch (value) {
+            inline else => |payload, tag| {
+                hash_value(hasher, tag);
+                hash_value(hasher, payload);
+            },
+        } else @compileError("cannot hash untagged union " ++ @typeName(V)),
+        else => @compileError("cannot hash " ++ @typeName(V)),
+    }
 }
 
 test "pixel rounding helpers" {
@@ -1322,4 +1395,75 @@ test "length resolution" {
     try testing.expect(relative(0).is_zero());
     try testing.expect(!auto().is_zero());
     try testing.expectEqual(DefiniteLength{ .fraction = 1.618_034 }, phi());
+}
+
+test "edges along and apply_along" {
+    const e = Edges(i32){ .top = 2, .right = 3, .bottom = 5, .left = 7 };
+    try testing.expectEqual(@as(i32, 10), e.along(.horizontal));
+    try testing.expectEqual(@as(i32, 7), e.along(.vertical));
+
+    const doubled_x = e.apply_along(.horizontal, struct {
+        fn f(v: i32) i32 {
+            return v * 2;
+        }
+    }.f);
+    try testing.expectEqual(Edges(i32){ .top = 2, .right = 6, .bottom = 5, .left = 14 }, doubled_x);
+
+    const doubled_y = e.apply_along(.vertical, struct {
+        fn f(v: i32) i32 {
+            return v * 2;
+        }
+    }.f);
+    try testing.expectEqual(Edges(i32){ .top = 4, .right = 3, .bottom = 10, .left = 7 }, doubled_y);
+}
+
+test "signed-zero float hashing collapses +0.0 and -0.0" {
+    try testing.expectEqual(canonical_float_bits(@as(f32, 0.0)), canonical_float_bits(@as(f32, -0.0)));
+    try testing.expect(canonical_float_bits(@as(f32, 1.5)) != canonical_float_bits(@as(f32, -1.5)));
+
+    const a = Bounds(Pixels){ .origin = point(px(0.0), px(-0.0)), .size = size(px(-0.0), px(10.0)) };
+    const b = Bounds(Pixels){ .origin = point(px(-0.0), px(0.0)), .size = size(px(0.0), px(10.0)) };
+    try testing.expect(a.eq(b));
+
+    var ha = std.hash.Wyhash.init(0);
+    var hb = std.hash.Wyhash.init(0);
+    hash_value(&ha, a);
+    hash_value(&hb, b);
+    try testing.expectEqual(ha.final(), hb.final());
+}
+
+test "bounds centered and maximized look up display_id when context provides displays" {
+    const FakeDisplay = struct {
+        id: DisplayId,
+        bounds: Bounds(Pixels),
+        pub fn visible_bounds(self: @This()) Bounds(Pixels) {
+            return self.bounds;
+        }
+    };
+    const FakeCx = struct {
+        primary: FakeDisplay,
+        secondary: FakeDisplay,
+        pub fn find_display(self: *const @This(), id: DisplayId) ?FakeDisplay {
+            if (id == self.primary.id) return self.primary;
+            if (id == self.secondary.id) return self.secondary;
+            return null;
+        }
+        pub fn primary_display(self: *const @This()) ?FakeDisplay {
+            return self.primary;
+        }
+    };
+    const fake_cx: FakeCx = .{
+        .primary = .{ .id = 1, .bounds = .{ .origin = point(px(0), px(0)), .size = size(px(1000), px(800)) } },
+        .secondary = .{ .id = 2, .bounds = .{ .origin = point(px(1000), px(100)), .size = size(px(600), px(400)) } },
+    };
+
+    const on_secondary = Bounds(Pixels).centered(2, size(px(200), px(100)), &fake_cx);
+    try testing.expectEqual(point(px(1200), px(250)), on_secondary.origin);
+    try testing.expectEqual(size(px(200), px(100)), on_secondary.size);
+
+    const on_primary = Bounds(Pixels).centered(null, size(px(200), px(100)), &fake_cx);
+    try testing.expectEqual(point(px(400), px(350)), on_primary.origin);
+
+    try testing.expectEqual(fake_cx.secondary.bounds, Bounds(Pixels).maximized(2, &fake_cx));
+    try testing.expectEqual(fake_cx.primary.bounds, Bounds(Pixels).maximized(null, &fake_cx));
 }

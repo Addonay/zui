@@ -233,16 +233,24 @@ pub const DispatchTree = struct {
         return .{ .tree = self, .current = self.view_nodes.get(view_id) };
     }
 
-    /// Makes `node_id` the active node: pops back to its parent, then pushes it (GPUI
-    /// `set_active_node`). Nodes pushed after the parent are no longer on the stack afterwards.
+    /// Makes `node_id` active, restoring its ancestor path when it is no longer on the stack.
     pub fn set_active_node(self: *DispatchTree, node_id: DispatchNodeId) void {
         std.debug.assert(node_id < self.count);
-        const next_parent = self.nodes.items[node_id].parent;
-        while (self.node_stack.items.len > 0 and self.node_stack.items[self.node_stack.items.len - 1] != next_parent) {
+        const parent = self.nodes.items[node_id].parent;
+        while (self.node_stack.items.len > 0 and self.node_stack.getLastOrNull() != parent) {
             _ = self.node_stack.pop();
         }
-        const matches_parent = if (self.node_stack.items.len == 0) next_parent == null else self.node_stack.items[self.node_stack.items.len - 1] == next_parent;
-        if (matches_parent) self.node_stack.append(self.gpa, node_id) catch oom();
+        if (self.node_stack.getLastOrNull() == parent) {
+            self.node_stack.append(self.gpa, node_id) catch oom();
+            return;
+        }
+
+        var ancestor: ?DispatchNodeId = node_id;
+        while (ancestor) |id| {
+            self.node_stack.append(self.gpa, id) catch oom();
+            ancestor = self.nodes.items[id].parent;
+        }
+        std.mem.reverse(DispatchNodeId, self.node_stack.items);
     }
 
     /// Number of live nodes.
@@ -800,21 +808,26 @@ test "root, focusable and view nodes" {
     try testing.expectEqual(@as(?app_mod.EntityId, null), missing.next());
 }
 
-test "set_active_node pops to the parent before pushing" {
+test "set_active_node restores ancestry when switching branches" {
     var tree = DispatchTree.init(testing.allocator);
     defer tree.deinit();
     tree.push_node(); // 0
     tree.push_node(); // 1, child of 0
     tree.pop_node();
+    tree.push_node(); // 2, child of 0
+    tree.push_node(); // 3, child of 2
     tree.pop_node();
-    // Node 1's parent is not on the stack, so nothing is activated.
+    tree.pop_node();
+    tree.pop_node();
+
     tree.set_active_node(1);
-    try testing.expectEqual(@as(usize, 0), tree.node_stack.items.len);
+    try testing.expectEqualSlices(DispatchNodeId, &.{ 0, 1 }, tree.node_stack.items);
+    tree.set_active_node(3);
+    try testing.expectEqualSlices(DispatchNodeId, &.{ 0, 2, 3 }, tree.node_stack.items);
     tree.set_active_node(0);
-    try testing.expectEqual(@as(usize, 1), tree.node_stack.items.len);
+    try testing.expectEqualSlices(DispatchNodeId, &.{0}, tree.node_stack.items);
     tree.set_active_node(1);
-    try testing.expectEqual(@as(DispatchNodeId, 1), tree.active_node_id());
-    try testing.expectEqual(@as(usize, 2), tree.node_stack.items.len);
+    try testing.expectEqualSlices(DispatchNodeId, &.{ 0, 1 }, tree.node_stack.items);
 }
 
 test "dispatch_key: sequences, prefixes and replays" {
@@ -865,4 +878,16 @@ test "dispatch_key: sequences, prefixes and replays" {
     try std.testing.expectEqual(@as(usize, 2), flushed.len);
     const bound = try flush_dispatch(arena, &keymap, &.{key("a")}, none);
     try std.testing.expect(bound.len == 1 and bound[0].bindings.len == 1);
+}
+
+test "lazy tab stop order updates after inserting lower-index handle post-query" {
+    var b = Builder.init();
+    defer b.deinit();
+    const second = b.handle(1, true);
+    try testing.expectEqual(@as(?u64, second), b.tree.next_tab_stop(null, true));
+
+    const first = b.handle(0, true);
+    try testing.expectEqual(@as(?u64, first), b.tree.next_tab_stop(null, true));
+    try testing.expectEqual(@as(?u64, second), b.tree.next_tab_stop(first, true));
+    try testing.expectEqual(@as(?u64, second), b.tree.next_tab_stop(first, false));
 }
