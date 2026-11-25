@@ -86,6 +86,83 @@ fn scene_shadow(sc: *Scene, _: Tiles) !void {
     } });
 }
 
+fn scene_shadow_inset_clipped(sc: *Scene, _: Tiles) !void {
+    try sc.insert_primitive(.{ .quad = .{ .bounds = rect(0, 0, 128, 128), .content_mask = mask(0, 0, 128, 128), .background = color.solid_background(color.white()) } });
+    // Clipped drop shadow with asymmetrical rounded corners.
+    try sc.insert_primitive(.{ .shadow = .{
+        .bounds = rect(16, 16, 48, 36),
+        .corner_radii = .{ .top_left = 12, .top_right = 4, .bottom_right = 16, .bottom_left = 0 },
+        .content_mask = mask(20, 10, 80, 90),
+        .color = color.hsla(0.6, 0.5, 0.2, 0.7),
+        .blur_radius = 8,
+    } });
+    // Inset shadow inside a rounded box.
+    try sc.insert_primitive(.{ .shadow = .{
+        .bounds = rect(68, 56, 44, 44),
+        .corner_radii = .{ .top_left = 10, .top_right = 10, .bottom_right = 10, .bottom_left = 10 },
+        .content_mask = mask(0, 0, 128, 128),
+        .color = color.hsla(0, 0, 0, 0.8),
+        .element_bounds = rect(64, 52, 52, 52),
+        .element_corner_radii = .{ .top_left = 12, .top_right = 12, .bottom_right = 12, .bottom_left = 12 },
+        .blur_radius = 6,
+        .inset = 1,
+    } });
+}
+
+fn scene_clipped_primitives(sc: *Scene, tiles: Tiles) !void {
+    const clip = mask(24, 24, 80, 80);
+    // Simple solid quad clipped on all four edges.
+    try sc.insert_primitive(.{ .quad = .{ .bounds = rect(8, 8, 112, 112), .content_mask = clip, .background = color.solid_background(color.hsla(0.55, 0.6, 0.4, 1)) } });
+    // Rounded bordered quad clipped at the bottom-right.
+    try sc.insert_primitive(.{ .quad = .{
+        .bounds = rect(60, 60, 60, 60),
+        .content_mask = clip,
+        .background = color.solid_background(color.hsla(0.1, 0.8, 0.5, 0.8)),
+        .border_color = color.white(),
+        .border_widths = .{ .top = 2, .right = 2, .bottom = 2, .left = 2 },
+        .corner_radii = .{ .top_left = 12, .top_right = 12, .bottom_right = 12, .bottom_left = 12 },
+    } });
+    // Clipped straight underline and polychrome sprite.
+    try sc.insert_primitive(.{ .underline = .{ .bounds = rect(10, 32, 100, 4), .content_mask = clip, .color = color.red(), .thickness = 4 } });
+    try sc.insert_primitive(.{ .polychrome_sprite = .{ .tile = tiles.poly, .bounds = rect(16, 48, 32, 32), .content_mask = clip } });
+}
+
+fn scene_opaque_depth(sc: *Scene, tiles: Tiles) !void {
+    const full = mask(0, 0, 128, 128);
+    // Back opaque quad (red).
+    try sc.insert_primitive(.{ .quad = .{ .bounds = rect(10, 10, 90, 90), .content_mask = full, .background = color.solid_background(color.red()) } });
+    // Semi-transparent quad partially covered by front opaque quad below.
+    try sc.insert_primitive(.{ .quad = .{ .bounds = rect(20, 20, 70, 70), .content_mask = full, .background = color.solid_background(color.hsla(0.3, 0.9, 0.5, 0.5)) } });
+    // Text sprite behind front opaque quad, partially exposed on the left.
+    try sc.insert_primitive(.{ .monochrome_sprite = .{ .tile = tiles.mono, .bounds = rect(28, 30, 32, 16), .content_mask = full, .color = color.white() } });
+    // Front opaque quad (blue) covering the right side of the red, transparent, and sprite primitives.
+    try sc.insert_primitive(.{ .quad = .{ .bounds = rect(44, 24, 60, 60), .content_mask = full, .background = color.solid_background(color.blue()) } });
+    // Text sprite ON TOP of front opaque quad.
+    try sc.insert_primitive(.{ .monochrome_sprite = .{ .tile = tiles.mono, .bounds = rect(56, 44, 24, 16), .content_mask = full, .color = color.white() } });
+    // Semi-transparent rounded quad ON TOP of front opaque quad.
+    try sc.insert_primitive(.{ .quad = .{
+        .bounds = rect(64, 56, 48, 48),
+        .content_mask = full,
+        .background = color.solid_background(color.hsla(0.15, 0.9, 0.5, 0.6)),
+        .corner_radii = .{ .top_left = 8, .top_right = 8, .bottom_right = 8, .bottom_left = 8 },
+    } });
+}
+
+fn scene_opaque_depth_with_path(sc: *Scene, _: Tiles) !void {
+    const full = mask(0, 0, 128, 128);
+    // Opaque quad before path (depth written before rasterizePaths interrupts main pass).
+    try sc.insert_primitive(.{ .quad = .{ .bounds = rect(16, 16, 96, 96), .content_mask = full, .background = color.solid_background(color.blue()) } });
+    var path = scene.Path(ScaledPixels).new(sc.allocator, .{ .x = 0, .y = 0 });
+    path.content_mask = full;
+    path.color = color.solid_background(color.red());
+    path.move_to(.{ .x = 24, .y = 24 });
+    try path.line_to(.{ .x = 104, .y = 32 });
+    try path.line_to(.{ .x = 64, .y = 104 });
+    try sc.insert_primitive(.{ .path = path });
+    // Opaque quad AFTER path (must occlude the path where they overlap!).
+    try sc.insert_primitive(.{ .quad = .{ .bounds = rect(48, 48, 40, 40), .content_mask = full, .background = color.solid_background(color.white()) } });
+}
+
 fn scene_underline(sc: *Scene, _: Tiles) !void {
     try sc.insert_primitive(.{ .underline = .{ .bounds = rect(10, 20, 100, 2), .content_mask = mask(0, 0, 128, 128), .color = color.white(), .thickness = 2 } });
     try sc.insert_primitive(.{ .underline = .{ .bounds = rect(10, 60, 100, 8), .content_mask = mask(0, 0, 128, 128), .color = color.white(), .thickness = 2, .wavy = .{ .value = 1 } } });
@@ -117,9 +194,13 @@ const cases = [_]struct { name: []const u8, build: SceneFn, tolerance: u8 }{
     .{ .name = "gradient", .build = scene_gradient, .tolerance = 4 },
     .{ .name = "pattern", .build = scene_pattern, .tolerance = 4 },
     .{ .name = "shadow", .build = scene_shadow, .tolerance = 4 },
+    .{ .name = "shadow_inset_clipped", .build = scene_shadow_inset_clipped, .tolerance = 8 },
+    .{ .name = "clipped_primitives", .build = scene_clipped_primitives, .tolerance = 8 },
+    .{ .name = "opaque_depth", .build = scene_opaque_depth, .tolerance = 8 },
+    // MSAA sample positions differ from the CPU pattern: an edge pixel may differ by one sample of four.
+    .{ .name = "opaque_depth_with_path", .build = scene_opaque_depth_with_path, .tolerance = 64 },
     .{ .name = "underline", .build = scene_underline, .tolerance = 8 },
     .{ .name = "sprites", .build = scene_sprites, .tolerance = 4 },
-    // MSAA sample positions differ from the CPU pattern: an edge pixel may differ by one sample of four.
     .{ .name = "path", .build = scene_path, .tolerance = 64 },
 };
 
@@ -142,7 +223,7 @@ test "GPU renderer matches the CPU renderer" {
     defer ctx.deinit();
     var device = gpu.Device.init(testing.allocator, .{
         .backend = ctx.device_options(),
-        .defaults = .{ .color_format = .rgba8, .depth_format = .none, .sample_count = 1 },
+        .defaults = .{ .color_format = .rgba8, .depth_format = .depth, .sample_count = 1 },
     }) catch return error.SkipZigTest;
     defer device.deinit();
 
@@ -175,6 +256,9 @@ test "GPU renderer matches the CPU renderer" {
             try case.build(&sc, gpu_tiles);
             sc.finish();
             try renderer.draw(&sc, &gpu_atlas, .{ .attachment = .{ .view = view, .width = size, .height = size } }, clear);
+            if (std.mem.eql(u8, case.name, "opaque_depth")) {
+                try testing.expectEqual(@as(usize, 2), renderer.stats.opaque_quads);
+            }
             device.commit();
             try device.readImage(image, .{}, &gpu_pixels, .{});
         }
@@ -218,7 +302,7 @@ test "GPU renderer matches the CPU renderer on a transparent window" {
     defer ctx.deinit();
     var device = gpu.Device.init(testing.allocator, .{
         .backend = ctx.device_options(),
-        .defaults = .{ .color_format = .rgba8, .depth_format = .none, .sample_count = 1 },
+        .defaults = .{ .color_format = .rgba8, .depth_format = .depth, .sample_count = 1 },
     }) catch return error.SkipZigTest;
     defer device.deinit();
 

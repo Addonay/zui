@@ -49,7 +49,6 @@ const B4 = @Vector(4, bool);
 
 /// GPUI's `M_PI_F`, which is deliberately not the exact value of pi.
 const PI: f32 = 3.1415926;
-const SQRT_HALF: f32 = 0.70710678;
 const zero4: F4 = @splat(0);
 const one4: F4 = @splat(1);
 const lane_offsets: F4 = .{ 0.5, 1.5, 2.5, 3.5 };
@@ -922,48 +921,108 @@ fn draw_quad(t: Target, q: *const Quad) void {
 }
 
 // ---------------------------------------------------------------------------
-// Shadows (fs_shadow)
+// Shadows (fs_shadow — Raph Levien's blurred rounded rectangle approximation)
 // ---------------------------------------------------------------------------
 
-fn erf4(v: F4) F4 {
-    const s = @select(f32, v > zero4, one4, @select(f32, v < zero4, -one4, zero4));
-    const a = @abs(v);
-    const r1 = one4 + (s4(0.278393) + (s4(0.230389) + (s4(0.000972) + s4(0.078108) * a) * a) * a) * a;
-    const r2 = r1 * r1;
-    return s - s / (r2 * r2);
+fn erf7_scalar(input: f32) f32 {
+    const x = std.math.clamp(input, -10.0, 10.0) * (2.0 / @sqrt(PI));
+    const xx = x * x;
+    const y = x + (0.24295 + (0.03395 + 0.0104 * xx) * xx) * (x * xx);
+    return y / @sqrt(1.0 + y * y);
 }
 
-fn gaussian(x: f32, sigma: f32) f32 {
-    return @exp(-(x * x) / (2.0 * sigma * sigma)) / (@sqrt(2.0 * PI) * sigma);
+fn erf7_4(v: F4) F4 {
+    const k = s4(2.0 / @sqrt(PI));
+    const x = @min(@max(v, s4(-10.0)), s4(10.0)) * k;
+    const xx = x * x;
+    const y = x + (s4(0.24295) + (s4(0.03395) + s4(0.0104) * xx) * xx) * (x * xx);
+    return y / @sqrt(one4 + y * y);
 }
 
-/// Integral of a gaussian of width `sigma` over the rounded box, along x at offset `yv`.
-fn blur_along_x(hw: f32, hh: f32, cxp: F4, yv: f32, sigma: f32, corner: F4) F4 {
-    const delta = @min(s4(hh - @abs(yv)) - corner, zero4);
-    const curved = s4(hw) - corner + @sqrt(@max(zero4, corner * corner - delta * delta));
-    const k = s4(SQRT_HALF / sigma);
-    return s4(0.5) * (erf4((cxp + curved) * k) - erf4((cxp - curved) * k));
-}
+const PreparedBlurredRoundedRect = struct {
+    half_w: f32,
+    half_h: f32,
+    s_inv: f32,
+    min_edge: f32,
+    r1: [4]f32,
+    exponent: [4]f32,
+    scale: [4]f32,
+};
 
-/// Blurred coverage of the rounded box `rr` at 4 pixels (4-sample integration in y).
-fn shadow_alpha(rr: *const RRect, blur: f32, px: F4, py: f32) F4 {
-    if (blur == 0) return sat(s4(0.5) - quad_sdf(rr, px, py));
-    const cxp = (px - s4(rr.ox)) - s4(rr.hw);
-    const cyp = (py - rr.oy) - rr.hh;
-    const corner = pick_radius(rr, cxp, cyp);
-    const low = cyp - rr.hh;
-    const high = cyp + rr.hh;
-    const start = @min(@max(-3.0 * blur, low), high);
-    const end = @min(@max(3.0 * blur, low), high);
-    const step = (end - start) / 4.0;
-    var y = start + step * 0.5;
-    var alpha = zero4;
-    for (0..4) |_| {
-        const blur_x = blur_along_x(rr.hw, rr.hh, cxp, cyp - y, blur, corner);
-        alpha += blur_x * s4(gaussian(y, blur) * step);
-        y += step;
+fn prepare_blurred_rounded_rect(w: f32, h: f32, r: Corners(ScaledPixels), sigma: f32) PreparedBlurredRoundedRect {
+    const s = @max(sigma * @sqrt(2.0), 1e-6);
+    const s_inv = 1.0 / s;
+    const min_edge = @min(w, h);
+    const r_max = 0.5 * min_edge;
+    const radii = [4]f32{ r.top_left, r.top_right, r.bottom_right, r.bottom_left };
+    var r1: [4]f32 = undefined;
+    var exponent: [4]f32 = undefined;
+    var scale: [4]f32 = undefined;
+
+    const half_ex = 0.5 * s_inv * w;
+    const half_ey = 0.5 * s_inv * h;
+    const delta = 1.25 * s * (@exp(-half_ex * half_ex) - @exp(-half_ey * half_ey));
+    const adj_w = w + @min(delta, 0.0);
+    const adj_h = h - @max(delta, 0.0);
+    const max_adj = @max(adj_w, adj_h);
+
+    for (0..4) |i| {
+        const rad = radii[i];
+        const r0 = @min(@sqrt(rad * rad + 1.15 * 1.15 * s * s), r_max);
+        const r1_i = @min(@sqrt(rad * rad + 4.0 * s * s), r_max);
+        r1[i] = r1_i;
+        exponent[i] = if (r0 > 0.0) 2.0 * r1_i / r0 else 2.0;
+        const peak = s_inv * 0.5 * (max_adj - 0.5 * rad);
+        scale[i] = 0.5 * erf7_scalar(peak);
     }
-    return alpha;
+
+    return .{
+        .half_w = 0.5 * adj_w,
+        .half_h = 0.5 * adj_h,
+        .s_inv = s_inv,
+        .min_edge = min_edge,
+        .r1 = r1,
+        .exponent = exponent,
+        .scale = scale,
+    };
+}
+
+inline fn pick_corner4(values: [4]f32, cxp: F4, cyp: f32) F4 {
+    const left_v = if (cyp < 0) values[0] else values[3];
+    const right_v = if (cyp < 0) values[1] else values[2];
+    return @select(f32, cxp < zero4, s4(left_v), s4(right_v));
+}
+
+fn blurred_rounded_rect(prep: *const PreparedBlurredRoundedRect, cxp: F4, cyp: f32) F4 {
+    const r1 = pick_corner4(prep.r1, cxp, cyp);
+    const exponent = pick_corner4(prep.exponent, cxp, cyp);
+    const scale = pick_corner4(prep.scale, cxp, cyp);
+    const s_inv = s4(prep.s_inv);
+    const min_edge = s4(prep.min_edge);
+
+    const p0x = @abs(cxp) - (s4(prep.half_w) - r1);
+    const p0y = s4(@abs(cyp) - prep.half_h) + r1;
+    const p1x = @max(p0x, zero4);
+    const p1y = @max(p0y, zero4);
+    const both_pos = (p1x > zero4) & (p1y > zero4);
+    var d_pos = p1x + p1y;
+    if (@reduce(.Or, both_pos)) {
+        const bp: [4]bool = both_pos;
+        const px_arr: [4]f32 = p1x;
+        const py_arr: [4]f32 = p1y;
+        const exp_arr: [4]f32 = exponent;
+        var dp_arr: [4]f32 = d_pos;
+        for (0..4) |i| {
+            if (bp[i]) {
+                const e = exp_arr[i];
+                dp_arr[i] = std.math.pow(f32, std.math.pow(f32, px_arr[i], e) + std.math.pow(f32, py_arr[i], e), 1.0 / e);
+            }
+        }
+        d_pos = dp_arr;
+    }
+    const d_neg = @min(@max(p0x, p0y), zero4);
+    const d = d_pos + d_neg - r1;
+    return scale * (erf7_4(s_inv * (min_edge + d)) - erf7_4(s_inv * d));
 }
 
 fn draw_shadow(t: Target, sh: *const Shadow) void {
@@ -982,14 +1041,22 @@ fn draw_shadow(t: Target, sh: *const Shadow) void {
     };
     const r = rect_pixels(region, sh.content_mask.bounds, t) orelse return;
     const c_rgb = Rgba4.splat(col);
+    const prep = if (sh.blur_radius != 0)
+        prepare_blurred_rounded_rect(sh.bounds.size.width, sh.bounds.size.height, sh.corner_radii, sh.blur_radius)
+    else
+        undefined;
 
     for (r.y0..r.y1) |y| {
         const py = @as(f32, @floatFromInt(y)) + 0.5;
+        const cyp = py - hole.cy;
         var x = r.x0;
         while (x < r.x1) : (x += 4) {
             const n = @min(4, r.x1 - x);
             const xv = x_lanes(x);
-            var alpha = shadow_alpha(&hole, sh.blur_radius, xv, py);
+            var alpha = if (sh.blur_radius == 0)
+                sat(s4(0.5) - quad_sdf(&hole, xv, py))
+            else
+                blurred_rounded_rect(&prep, xv - s4(hole.cx), cyp);
             if (inset) {
                 alpha = (one4 - alpha) * sat(s4(0.5) - quad_sdf(&elem, xv, py));
             }
@@ -1207,6 +1274,8 @@ fn draw_mono(t: Target, tex: *const CpuTexture, sp: *const MonochromeSprite) voi
 fn draw_polychrome(t: Target, tex: *const CpuTexture, sp: *const PolychromeSprite) void {
     if (sp.opacity <= 0) return;
     const r = rect_pixels(sp.bounds, sp.content_mask.bounds, t) orelse return;
+    const cr = sp.corner_radii;
+    const simple = cr.top_left == 0 and cr.top_right == 0 and cr.bottom_right == 0 and cr.bottom_left == 0 and sp.grayscale.value == 0;
     const rr = RRect.init(sp.bounds, sp.corner_radii);
     const tile = tile_texels(sp.tile);
     const ox = sp.bounds.origin.x;
@@ -1217,11 +1286,16 @@ fn draw_polychrome(t: Target, tex: *const CpuTexture, sp: *const PolychromeSprit
         const py = @as(f32, @floatFromInt(y)) + 0.5;
         for (r.x0..r.x1) |x| {
             const px = @as(f32, @floatFromInt(x)) + 0.5;
-            const sdf = quad_sdf(&rr, s4(px), py)[0];
-            const coverage = sp.opacity * sat1(0.5 - sdf);
             const u = (px - ox) / w;
             const v = (py - oy) / h;
             const s = sample_texture(tex, tile[0] + u * tile[2], tile[1] + v * tile[3]);
+            if (simple) {
+                const alpha = s[3] * sp.opacity;
+                if (alpha > 0) blend_px(t, x, y, .{ s[0], s[1], s[2], alpha });
+                continue;
+            }
+            const sdf = quad_sdf(&rr, s4(px), py)[0];
+            const coverage = sp.opacity * sat1(0.5 - sdf);
             const alpha = s[3] * coverage;
             if (!(alpha > 0)) continue;
             if (sp.grayscale.value != 0) {
@@ -1863,6 +1937,38 @@ test "blurred shadow darkens its box and leaves far pixels alone" {
     const center = target.at(15, 15)[0];
     try testing.expect(center > 80 and center < 115);
     try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, target.at(39, 39));
+}
+
+test "Levien rounded and inset shadows render smoothly and stay within clip" {
+    var sc = Scene.init(testing.allocator);
+    defer sc.deinit();
+    try sc.insert_primitive(.{ .shadow = .{
+        .blur_radius = 6,
+        .bounds = test_rect(16, 16, 32, 24),
+        .corner_radii = .{ .top_left = 8, .top_right = 8, .bottom_right = 8, .bottom_left = 8 },
+        .content_mask = test_mask(0, 0, 64, 64),
+        .color = color.hsla(0, 0, 0, 0.8),
+        .element_bounds = test_rect(16, 16, 32, 24),
+        .element_corner_radii = .{ .top_left = 8, .top_right = 8, .bottom_right = 8, .bottom_left = 8 },
+        .inset = 1,
+    } });
+    sc.finish();
+
+    var target = try TestFb.init(64, 64, .{ 255, 255, 255, 255 });
+    defer target.deinit();
+    var atlas_ = CpuAtlas.init(testing.allocator);
+    defer atlas_.deinit();
+    var renderer = CpuRenderer.init(testing.allocator);
+    defer renderer.deinit();
+    renderer.draw(&sc, &atlas_, target.fb, color.white());
+
+    // Outside element bounds must remain untouched white.
+    try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, target.at(10, 10));
+    // Near edge inside element should be darker than center (inset shadow falls inward).
+    const edge_px = target.at(17, 28)[0];
+    const center_px = target.at(32, 28)[0];
+    try testing.expect(edge_px < center_px);
+    try testing.expect(center_px < 255);
 }
 
 test "underline covers its rectangle" {

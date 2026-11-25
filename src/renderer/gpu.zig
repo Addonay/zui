@@ -29,7 +29,7 @@ const TargetSize = struct { width: u32, height: u32 };
 
 /// Where a frame is drawn.
 pub const Target = union(enum) {
-    /// A swapchain image acquired for this frame. Its depth format is ignored: the renderer draws without depth.
+    /// A swapchain image acquired for this frame (with `.depth` attachment).
     swapchain: gpu.Swapchain,
     /// An offscreen color attachment and its size in pixels.
     attachment: Attachment,
@@ -65,6 +65,7 @@ pub const Options = struct {
 /// Counters for the last `draw` call.
 pub const Stats = struct {
     quads: usize = 0,
+    opaque_quads: usize = 0,
     shadows: usize = 0,
     underlines: usize = 0,
     sprites: usize = 0,
@@ -90,8 +91,16 @@ pub const QuadInstance = extern struct {
     color1: [4]f32,
     /// Background tag, color space, angle or pattern height, first stop percentage.
     bg: [4]f32,
-    /// Second stop percentage, border style (0 solid, 1 dashed), exact pattern remainder.
+    /// Second stop percentage, border style (0 solid, 1 dashed), exact pattern remainder, quad depth.
     bg2: [4]f32,
+};
+
+pub const OpaqueQuadInstance = extern struct {
+    bounds: [4]f32,
+    clip: [4]f32,
+    solid: [4]f32,
+    /// x: quad depth in (0, 1].
+    params: [4]f32,
 };
 
 pub const ShadowInstance = extern struct {
@@ -170,6 +179,7 @@ fn vertexAttrs(comptime T: type) [@typeInfo(T).@"struct".field_names.len]gpu.Ver
 }
 
 const quad_attrs = vertexAttrs(QuadInstance);
+const opaque_quad_attrs = vertexAttrs(OpaqueQuadInstance);
 const shadow_attrs = vertexAttrs(ShadowInstance);
 const underline_attrs = vertexAttrs(UnderlineInstance);
 const mono_attrs = vertexAttrs(MonoSpriteInstance);
@@ -225,7 +235,17 @@ fn backgroundFields(bg: Background) BackgroundFields {
     };
 }
 
-fn packQuad(q: *const scene.Quad) QuadInstance {
+/// Whether `q` is an unrounded, borderless, solid quad with alpha >= 1.0 (eligible for early-Z opaque pass).
+pub fn isOpaqueRectangle(q: *const scene.Quad) bool {
+    const r = q.corner_radii;
+    const w = q.border_widths;
+    return q.background.tag == .solid and
+        q.background.solid.a >= 1.0 and
+        r.top_left == 0 and r.top_right == 0 and r.bottom_right == 0 and r.bottom_left == 0 and
+        w.top == 0 and w.right == 0 and w.bottom == 0 and w.left == 0;
+}
+
+fn packQuad(q: *const scene.Quad, depth: f32) QuadInstance {
     const bg = backgroundFields(q.background);
     return .{
         .bounds = bounds4(q.bounds),
@@ -237,7 +257,16 @@ fn packQuad(q: *const scene.Quad) QuadInstance {
         .color0 = bg.color0,
         .color1 = bg.color1,
         .bg = bg.meta,
-        .bg2 = .{ bg.extra[0], @floatFromInt(@intFromEnum(q.border_style)), bg.extra[2], 0 },
+        .bg2 = .{ bg.extra[0], @floatFromInt(@intFromEnum(q.border_style)), bg.extra[2], depth },
+    };
+}
+
+fn packOpaqueQuad(q: *const scene.Quad, depth: f32) OpaqueQuadInstance {
+    return .{
+        .bounds = bounds4(q.bounds),
+        .clip = bounds4(q.content_mask.bounds),
+        .solid = hsla4(q.background.solid),
+        .params = .{ depth, 0, 0, 0 },
     };
 }
 
@@ -593,12 +622,26 @@ pub const GpuAtlas = struct {
 
 const Programs = struct {
     quads: gpu.Pipeline = .invalid,
+    opaque_quads: gpu.Pipeline = .invalid,
     shadows: gpu.Pipeline = .invalid,
     underlines: gpu.Pipeline = .invalid,
     mono: gpu.Pipeline = .invalid,
     poly: gpu.Pipeline = .invalid,
     path_raster: gpu.Pipeline = .invalid,
     path_composite: gpu.Pipeline = .invalid,
+};
+
+/// Offscreen 32-bit float depth attachment for `.attachment` render targets.
+const DepthTarget = struct {
+    width: u32,
+    height: u32,
+    image: gpu.Image,
+    view: gpu.View,
+
+    fn deinit(self: *DepthTarget, device: *gpu.Device) void {
+        device.destroy(self.view);
+        device.destroy(self.image);
+    }
 };
 
 /// Intermediate target for path coverage: multisampled when supported, resolved for sampling.
@@ -629,14 +672,16 @@ pub const GpuRenderer = struct {
     device: *gpu.Device,
     color_format: gpu.PixelFormat,
     options: Options,
-    shader_descs: [7]gpu.Shader = @splat(.invalid),
+    shader_descs: [8]gpu.Shader = @splat(.invalid),
     programs: Programs = .{},
     sampler: gpu.Sampler = .invalid,
     /// Per-frame instance bytes; one transient vertex buffer holds them all.
     instances: gpu.Buffer = .invalid,
     instance_capacity: usize = 0,
     frame_bytes: std.ArrayList(u8) = .empty,
+    opaque_quads: Range = .{ .offset = 0, .count = 0 },
     commands: std.ArrayList(Command) = .empty,
+    depth_target: ?DepthTarget = null,
     path_target: ?PathTarget = null,
     path_sample_count: u32 = 1,
     stats: Stats = .{},
@@ -645,10 +690,10 @@ pub const GpuRenderer = struct {
     const Range = struct { offset: usize, count: usize };
     const Command = union(enum) {
         quads: Range,
-        shadows: Range,
-        underlines: Range,
-        sprites: struct { range: Range, texture: AtlasTextureId, poly: bool },
-        paths: struct { raster: Range, composite: Range },
+        shadows: struct { range: Range, depth: f32 },
+        underlines: struct { range: Range, depth: f32 },
+        sprites: struct { range: Range, texture: AtlasTextureId, poly: bool, depth: f32 },
+        paths: struct { raster: Range, composite: Range, depth: f32 },
     };
     const initial_instance_bytes = 64 * 1024;
 
@@ -691,6 +736,8 @@ pub const GpuRenderer = struct {
         const blend_premul: gpu.Blend = .{ .src_rgb = .one, .dst_rgb = .one_minus_src_alpha, .op_rgb = .add, .src_alpha = .one, .dst_alpha = .one_minus_src_alpha };
         const blend_straight: gpu.Blend = .{ .src_rgb = .src_alpha, .dst_rgb = .one_minus_src_alpha, .op_rgb = .add, .src_alpha = .one, .dst_alpha = .one_minus_src_alpha };
         const window_blend = if (options.premultiplied_alpha) blend_premul else blend_straight;
+        const depth_test: gpu.DepthState = .{ .format = .depth, .compare = .greater, .write = false };
+        const depth_write: gpu.DepthState = .{ .format = .depth, .compare = .greater, .write = true };
 
         self.shader_descs[0] = try self.createShader(shaders.quads.desc(backend));
         self.programs.quads = try self.createPipeline(self.shader_descs[0], .{
@@ -698,7 +745,17 @@ pub const GpuRenderer = struct {
             .step = .per_instance,
             .attrs = &quad_attrs,
             .blend = window_blend,
+            .depth = depth_test,
             .label = "zui quads",
+        });
+        self.shader_descs[7] = try self.createShader(shaders.opaque_quads.desc(backend));
+        self.programs.opaque_quads = try self.createPipeline(self.shader_descs[7], .{
+            .stride = @sizeOf(OpaqueQuadInstance),
+            .step = .per_instance,
+            .attrs = &opaque_quad_attrs,
+            .blend = null,
+            .depth = depth_write,
+            .label = "zui opaque quads",
         });
         self.shader_descs[1] = try self.createShader(shaders.shadows.desc(backend));
         self.programs.shadows = try self.createPipeline(self.shader_descs[1], .{
@@ -706,6 +763,7 @@ pub const GpuRenderer = struct {
             .step = .per_instance,
             .attrs = &shadow_attrs,
             .blend = window_blend,
+            .depth = depth_test,
             .label = "zui shadows",
         });
         self.shader_descs[2] = try self.createShader(shaders.underlines.desc(backend));
@@ -714,6 +772,7 @@ pub const GpuRenderer = struct {
             .step = .per_instance,
             .attrs = &underline_attrs,
             .blend = window_blend,
+            .depth = depth_test,
             .label = "zui underlines",
         });
         self.shader_descs[3] = try self.createShader(shaders.mono_sprites.desc(backend));
@@ -722,6 +781,7 @@ pub const GpuRenderer = struct {
             .step = .per_instance,
             .attrs = &mono_attrs,
             .blend = window_blend,
+            .depth = depth_test,
             .label = "zui monochrome sprites",
             .views = 1,
         });
@@ -731,6 +791,7 @@ pub const GpuRenderer = struct {
             .step = .per_instance,
             .attrs = &poly_attrs,
             .blend = window_blend,
+            .depth = depth_test,
             .label = "zui polychrome sprites",
             .views = 1,
         });
@@ -740,6 +801,7 @@ pub const GpuRenderer = struct {
             .step = .per_vertex,
             .attrs = &path_vertex_attrs,
             .blend = blend_premul,
+            .depth = .{ .format = .none },
             .label = "zui path rasterization",
             .sample_count = self.path_sample_count,
         });
@@ -749,6 +811,7 @@ pub const GpuRenderer = struct {
             .step = .per_instance,
             .attrs = &path_sprite_attrs,
             .blend = blend_premul,
+            .depth = depth_test,
             .label = "zui path composite",
             .views = 1,
         });
@@ -765,6 +828,7 @@ pub const GpuRenderer = struct {
         for (self.shader_descs) |shader| if (shader != .invalid) device.destroy(shader);
         if (self.sampler != .invalid) device.destroy(self.sampler);
         if (self.instances != .invalid) device.destroy(self.instances);
+        if (self.depth_target) |*target| target.deinit(device);
         if (self.path_target) |*target| target.deinit(device);
         self.frame_bytes.deinit(self.allocator);
         self.commands.deinit(self.allocator);
@@ -779,7 +843,8 @@ pub const GpuRenderer = struct {
         stride: u32,
         step: gpu.VertexStep,
         attrs: []const gpu.VertexAttr,
-        blend: gpu.Blend,
+        blend: ?gpu.Blend,
+        depth: gpu.DepthState = .{ .format = .none },
         label: [:0]const u8,
         /// Texture bindings: 1 for sprite and path composite programs.
         views: u32 = 0,
@@ -793,7 +858,7 @@ pub const GpuRenderer = struct {
             .vertex_attrs = opts.attrs,
             .primitive = if (opts.attrs.len == 0) .triangles else if (opts.step == .per_vertex) .triangles else .triangle_strip,
             .colors = &.{.{ .format = self.color_format, .blend = opts.blend }},
-            .depth = .{ .format = .none },
+            .depth = opts.depth,
             .sample_count = opts.sample_count,
             .label = opts.label,
         });
@@ -810,12 +875,17 @@ pub const GpuRenderer = struct {
         if (self.frame_bytes.items.len + sprite_atlas.pending_bytes.items.len > self.options.max_frame_upload_bytes) return error.FrameTooLarge;
         try sprite_atlas.before_frame();
         if (self.frame_bytes.items.len > 0) try self.uploadFrame();
-        if (self.commands.items.len > 0) {
-            var needs_paths = false;
-            for (self.commands.items) |command| needs_paths = needs_paths or command == .paths;
-            if (needs_paths) try self.ensurePathTarget(size.width, size.height);
+        if (target == .attachment) try self.ensureDepthTarget(size.width, size.height);
+
+        var has_paths = false;
+        for (self.commands.items) |command| {
+            if (command == .paths) {
+                has_paths = true;
+                break;
+            }
         }
-        self.record(target, sprite_atlas, size, clear);
+        if (has_paths) try self.ensurePathTarget(size.width, size.height);
+        self.record(target, sprite_atlas, size, clear, has_paths);
     }
 
     /// Packs the scene in batch order into `frame_bytes` and records one command per batch.
@@ -824,40 +894,77 @@ pub const GpuRenderer = struct {
         _ = height;
         self.frame_bytes.clearRetainingCapacity();
         self.commands.clearRetainingCapacity();
+
+        const depth_scale = scene.quad_depth_scale(sc.quads.items.len);
+
+        // Pack opaque rectangles front-to-back first so early-Z rejects occluded geometry behind them.
+        const oq_offset = self.frame_bytes.items.len;
+        var oq_count: usize = 0;
+        var ri = sc.quads.items.len;
+        while (ri > 0) {
+            ri -= 1;
+            const q = &sc.quads.items[ri];
+            if (!isOpaqueRectangle(q)) continue;
+            const instance = packOpaqueQuad(q, scene.quad_depth(@intCast(ri), depth_scale));
+            try self.frame_bytes.appendSlice(self.allocator, std.mem.asBytes(&instance));
+            oq_count += 1;
+        }
+        self.opaque_quads = .{ .offset = oq_offset, .count = oq_count };
+        self.stats.opaque_quads = oq_count;
+
+        var quad_cursor: u32 = 0;
         var batches = sc.batches();
         while (batches.next()) |batch| switch (batch) {
             .quads => |items| {
-                const range = try self.appendItems(QuadInstance, items, packQuad);
-                self.stats.quads += items.len;
-                try self.commands.append(self.allocator, .{ .quads = range });
+                const range = try self.appendQuads(items, quad_cursor, depth_scale);
+                quad_cursor += @intCast(items.len);
+                self.stats.quads += range.count;
+                if (range.count > 0) try self.commands.append(self.allocator, .{ .quads = range });
             },
             .shadows => |items| {
                 const range = try self.appendItems(ShadowInstance, items, packShadow);
                 self.stats.shadows += items.len;
-                try self.commands.append(self.allocator, .{ .shadows = range });
+                const depth = scene.quad_depth(quad_cursor, depth_scale);
+                try self.commands.append(self.allocator, .{ .shadows = .{ .range = range, .depth = depth } });
             },
             .underlines => |items| {
                 const range = try self.appendItems(UnderlineInstance, items, packUnderline);
                 self.stats.underlines += items.len;
-                try self.commands.append(self.allocator, .{ .underlines = range });
+                const depth = scene.quad_depth(quad_cursor, depth_scale);
+                try self.commands.append(self.allocator, .{ .underlines = .{ .range = range, .depth = depth } });
             },
             .monochrome_sprites => |b| {
                 const texture_size = sprite_atlas.texture_size(b.texture_id) orelse continue;
                 const range = try self.appendSprites(MonoSpriteInstance, b.sprites, texture_size, packMono);
                 self.stats.sprites += b.sprites.len;
-                try self.commands.append(self.allocator, .{ .sprites = .{ .range = range, .texture = b.texture_id, .poly = false } });
+                const depth = scene.quad_depth(quad_cursor, depth_scale);
+                try self.commands.append(self.allocator, .{ .sprites = .{ .range = range, .texture = b.texture_id, .poly = false, .depth = depth } });
             },
             .polychrome_sprites => |b| {
                 const texture_size = sprite_atlas.texture_size(b.texture_id) orelse continue;
                 const range = try self.appendSprites(PolySpriteInstance, b.sprites, texture_size, packPoly);
                 self.stats.sprites += b.sprites.len;
-                try self.commands.append(self.allocator, .{ .sprites = .{ .range = range, .texture = b.texture_id, .poly = true } });
+                const depth = scene.quad_depth(quad_cursor, depth_scale);
+                try self.commands.append(self.allocator, .{ .sprites = .{ .range = range, .texture = b.texture_id, .poly = true, .depth = depth } });
             },
-            .paths => |paths| try self.packPaths(paths),
+            .paths => |paths| try self.packPaths(paths, scene.quad_depth(quad_cursor, depth_scale)),
             // Subpixel sprites need dual-source blending, which is not ported yet; GPUI's wgpu
             // renderer also skips them without that feature. Surfaces are platform video frames.
             .subpixel_sprites, .surfaces => {},
         };
+    }
+
+    fn appendQuads(self: *GpuRenderer, items: []const scene.Quad, quad_cursor: u32, depth_scale: f32) !Range {
+        const offset = self.frame_bytes.items.len;
+        var count: usize = 0;
+        for (items, 0..) |*item, local_idx| {
+            if (isOpaqueRectangle(item)) continue;
+            const depth = scene.quad_depth(quad_cursor + @as(u32, @intCast(local_idx)), depth_scale);
+            const instance = packQuad(item, depth);
+            try self.frame_bytes.appendSlice(self.allocator, std.mem.asBytes(&instance));
+            count += 1;
+        }
+        return .{ .offset = offset, .count = count };
     }
 
     /// Appends a batch of instances; returns its byte range.
@@ -885,7 +992,7 @@ pub const GpuRenderer = struct {
 
     /// Path batches: every vertex of every path is rasterized into one intermediate target, then
     /// one sprite (or one per path, when orders match) composites it. Mirrors draw_paths_*.
-    fn packPaths(self: *GpuRenderer, paths: []const scene.Path(ScaledPixels)) !void {
+    fn packPaths(self: *GpuRenderer, paths: []const scene.Path(ScaledPixels), depth: f32) !void {
         var vertex_count: usize = 0;
         for (paths) |path| vertex_count += path.vertices.items.len;
         if (vertex_count == 0) return;
@@ -924,9 +1031,10 @@ pub const GpuRenderer = struct {
             const sprite: PathSpriteInstance = .{ .bounds = bounds4(bounds) };
             try self.frame_bytes.appendSlice(self.allocator, std.mem.asBytes(&sprite));
         }
-        const composite: Range = .{ .offset = sprite_offset, .count = self.frame_bytes.items.len - sprite_offset };
+        const composite_count = (self.frame_bytes.items.len - sprite_offset) / @sizeOf(PathSpriteInstance);
+        const composite: Range = .{ .offset = sprite_offset, .count = composite_count };
         self.stats.paths += paths.len;
-        try self.commands.append(self.allocator, .{ .paths = .{ .raster = raster, .composite = composite } });
+        try self.commands.append(self.allocator, .{ .paths = .{ .raster = raster, .composite = composite, .depth = depth } });
     }
 
     /// Writes the frame's instance bytes to the transient vertex buffer, growing it when needed.
@@ -945,6 +1053,25 @@ pub const GpuRenderer = struct {
         }
         self.device.writeBuffer(self.instances, 0, self.frame_bytes.items);
         self.stats.upload_bytes = needed;
+    }
+
+    fn ensureDepthTarget(self: *GpuRenderer, width: u32, height: u32) !void {
+        if (self.depth_target) |target| {
+            if (target.width == width and target.height == height) return;
+            var old = target;
+            old.deinit(self.device);
+            self.depth_target = null;
+        }
+        const image = try self.device.createImage(.{
+            .width = width,
+            .height = height,
+            .format = .depth,
+            .usage = .{ .depth_stencil_attachment = true },
+            .label = "zui depth",
+        });
+        errdefer self.device.destroy(image);
+        const view = try self.device.createView(.{ .depth_stencil_attachment = .{ .image = image } });
+        self.depth_target = .{ .width = width, .height = height, .image = image, .view = view };
     }
 
     fn ensurePathTarget(self: *GpuRenderer, width: u32, height: u32) !void {
@@ -984,48 +1111,82 @@ pub const GpuRenderer = struct {
     }
 
     /// Records every command into one pass; path batches end it, render their coverage, and resume.
-    fn record(self: *GpuRenderer, target: Target, sprite_atlas: *GpuAtlas, size: TargetSize, clear: Hsla) void {
+    fn record(self: *GpuRenderer, target: Target, sprite_atlas: *GpuAtlas, size: TargetSize, clear: Hsla, has_paths: bool) void {
         const rgba = clear.to_rgb();
         // Premultiplied targets clear to premultiplied colors, as the CPU canvas does (see cpu.premultiply).
         const scale: f32 = if (self.options.premultiplied_alpha) rgba.a else 1;
-        var pass = self.beginFramePass(target, .{ .load = .{ .clear = .{ rgba.r * scale, rgba.g * scale, rgba.b * scale, rgba.a } }, .store = .store });
+        var pass = self.beginFramePass(
+            target,
+            .{ .load = .{ .clear = .{ rgba.r * scale, rgba.g * scale, rgba.b * scale, rgba.a } }, .store = .store },
+            .{ .load = .{ .clear = 0.0 }, .store = if (has_paths) .store else .dont_care },
+        );
         pass.setViewport(.{ .width = @intCast(size.width), .height = @intCast(size.height) }, .top_left);
         const flip: f32 = if (self.device.features().origin_top_left) 0 else 1;
-        const vs: VsParams = .{ .viewport = .{ @floatFromInt(size.width), @floatFromInt(size.height), 0, 0 } };
+        const w_f: f32 = @floatFromInt(size.width);
+        const h_f: f32 = @floatFromInt(size.height);
+        const base_vs: VsParams = .{ .viewport = .{ w_f, h_f, 0, 0 } };
         const fs: FsParams = .{
             .gamma_ratios = self.gamma_ratios,
             .settings = .{ if (self.options.premultiplied_alpha) 1 else 0, self.options.grayscale_enhanced_contrast, 0, 0 },
         };
 
-        for (self.commands.items) |command| switch (command) {
-            .quads => |r| self.drawInstances(&pass, self.programs.quads, r, 4, &vs, &fs, &.{}),
-            .shadows => |r| self.drawInstances(&pass, self.programs.shadows, r, 4, &vs, &fs, &.{}),
-            .underlines => |r| self.drawInstances(&pass, self.programs.underlines, r, 4, &vs, &fs, &.{}),
+        if (self.opaque_quads.count > 0) {
+            self.drawInstances(&pass, self.programs.opaque_quads, self.opaque_quads, 4, &base_vs, &fs, &.{});
+        }
+
+        for (self.commands.items, 0..) |command, cmd_idx| switch (command) {
+            .quads => |r| self.drawInstances(&pass, self.programs.quads, r, 4, &base_vs, &fs, &.{}),
+            .shadows => |c| {
+                const vs: VsParams = .{ .viewport = .{ w_f, h_f, 0, c.depth } };
+                self.drawInstances(&pass, self.programs.shadows, c.range, 4, &vs, &fs, &.{});
+            },
+            .underlines => |c| {
+                const vs: VsParams = .{ .viewport = .{ w_f, h_f, 0, c.depth } };
+                self.drawInstances(&pass, self.programs.underlines, c.range, 4, &vs, &fs, &.{});
+            },
             .sprites => |s| {
                 const view = sprite_atlas.view(s.texture) orelse continue;
                 const pipeline = if (s.poly) self.programs.poly else self.programs.mono;
+                const vs: VsParams = .{ .viewport = .{ w_f, h_f, 0, s.depth } };
                 self.drawInstances(&pass, pipeline, s.range, 4, &vs, &fs, &.{view});
             },
             .paths => |p| {
+                var remaining_paths = false;
+                for (self.commands.items[cmd_idx + 1 ..]) |next_cmd| {
+                    if (next_cmd == .paths) {
+                        remaining_paths = true;
+                        break;
+                    }
+                }
                 pass.end();
-                self.rasterizePaths(p.raster, size, &vs);
-                pass = self.beginFramePass(target, .{ .load = .load, .store = .store });
+                self.rasterizePaths(p.raster, size, &base_vs);
+                pass = self.beginFramePass(
+                    target,
+                    .{ .load = .load, .store = .store },
+                    .{ .load = .load, .store = if (remaining_paths) .store else .dont_care },
+                );
                 pass.setViewport(.{ .width = @intCast(size.width), .height = @intCast(size.height) }, .top_left);
-                self.compositePaths(&pass, p.composite, size, flip);
+                self.compositePaths(&pass, p.composite, size, flip, p.depth);
             },
         };
         pass.end();
     }
 
-    fn beginFramePass(self: *GpuRenderer, target: Target, load: gpu.ColorAction) gpu.Pass {
+    fn beginFramePass(self: *GpuRenderer, target: Target, color_action: gpu.ColorAction, depth_action: gpu.DepthAction) gpu.Pass {
         return switch (target) {
-            .swapchain => |sc| blk: {
-                var swapchain = sc;
-                // The renderer's pipelines have no depth attachment.
-                swapchain.depth_format = .none;
-                break :blk self.device.beginPass(.{ .target = .{ .swapchain = swapchain }, .colors = &.{load} });
-            },
-            .attachment => |a| self.device.beginPass(.{ .target = .{ .attachments = .{ .colors = &.{a.view} } }, .colors = &.{load} }),
+            .swapchain => |sc| self.device.beginPass(.{
+                .target = .{ .swapchain = sc },
+                .colors = &.{color_action},
+                .depth = depth_action,
+            }),
+            .attachment => |a| self.device.beginPass(.{
+                .target = .{ .attachments = .{
+                    .colors = &.{a.view},
+                    .depth_stencil = self.depth_target.?.view,
+                } },
+                .colors = &.{color_action},
+                .depth = depth_action,
+            }),
         };
     }
 
@@ -1063,10 +1224,10 @@ pub const GpuRenderer = struct {
         self.stats.draw_calls += 1;
     }
 
-    fn compositePaths(self: *GpuRenderer, pass: *gpu.Pass, composite: Range, size: TargetSize, flip: f32) void {
+    fn compositePaths(self: *GpuRenderer, pass: *gpu.Pass, composite: Range, size: TargetSize, flip: f32, depth: f32) void {
         const target = self.path_target orelse return;
         if (composite.count == 0) return;
-        const vs: VsParams = .{ .viewport = .{ @floatFromInt(size.width), @floatFromInt(size.height), flip, 0 } };
+        const vs: VsParams = .{ .viewport = .{ @floatFromInt(size.width), @floatFromInt(size.height), flip, depth } };
         pass.setPipeline(self.programs.path_composite);
         pass.setUniforms(0, &vs);
         pass.setBindings(.{
@@ -1082,6 +1243,7 @@ pub const GpuRenderer = struct {
 test "instance layouts match the attribute counts in shaders.glsl" {
     const testing = std.testing;
     try testing.expectEqual(10, quad_attrs.len);
+    try testing.expectEqual(4, opaque_quad_attrs.len);
     try testing.expectEqual(7, shadow_attrs.len);
     try testing.expectEqual(4, underline_attrs.len);
     try testing.expectEqual(6, mono_attrs.len);
@@ -1089,8 +1251,29 @@ test "instance layouts match the attribute counts in shaders.glsl" {
     try testing.expectEqual(7, path_vertex_attrs.len);
     try testing.expectEqual(1, path_sprite_attrs.len);
     try testing.expectEqual(160, @sizeOf(QuadInstance));
+    try testing.expectEqual(64, @sizeOf(OpaqueQuadInstance));
     try testing.expectEqual(@as(usize, 16), @sizeOf(VsParams));
     try testing.expectEqual(@as(usize, 32), @sizeOf(FsParams));
+}
+
+test "isOpaqueRectangle identifies unrounded borderless opaque solid quads" {
+    const testing = std.testing;
+    var q: scene.Quad = .{ .background = color.solid_background(color.red()) };
+    try testing.expect(isOpaqueRectangle(&q));
+
+    q.corner_radii.top_left = 4;
+    try testing.expect(!isOpaqueRectangle(&q));
+
+    q.corner_radii.top_left = 0;
+    q.border_widths.top = 1;
+    try testing.expect(!isOpaqueRectangle(&q));
+
+    q.border_widths.top = 0;
+    q.background = color.solid_background(color.hsla(0, 1, 0.5, 0.5));
+    try testing.expect(!isOpaqueRectangle(&q));
+
+    q.background = color.checkerboard(color.white(), 4);
+    try testing.expect(!isOpaqueRectangle(&q));
 }
 
 test "gamma ratios match GPUI at 1.8" {
