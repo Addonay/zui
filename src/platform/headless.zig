@@ -39,6 +39,8 @@ pub const HeadlessPlatform = struct {
     unhide_other_apps_requests: u32 = 0,
     /// The appearance the platform reports. Tests change it with `set_window_appearance`.
     appearance: platform.WindowAppearance = .light,
+    /// The text scale factor the platform reports. Tests change it with `set_text_scale_factor`.
+    text_scale_factor_: f32 = 1.0,
     /// What the app last asked the platform to do, for tests.
     prompts: u32 = 0,
     restarts: u32 = 0,
@@ -76,6 +78,7 @@ pub const HeadlessPlatform = struct {
         .restart = restart,
         .set_initial_windowing = setInitialWindowing,
         .request_windowing = requestWindowing,
+        .text_scale_factor = textScaleFactor,
     };
 
     /// Accepts only headless: this platform never has a display to start in (GPUI
@@ -95,6 +98,17 @@ pub const HeadlessPlatform = struct {
             .headless => error.AlreadyHeadless,
             .windowed => error.WindowingNotSupported,
         };
+    }
+
+    fn textScaleFactor(p: *Platform) f32 {
+        return from(p).text_scale_factor_;
+    }
+
+    /// Changes the text scale factor and tells the app if it changed.
+    pub fn set_text_scale_factor(self: *HeadlessPlatform, scale: f32) void {
+        if (self.text_scale_factor_ == scale) return;
+        self.text_scale_factor_ = scale;
+        self.platform.emit_text_scale_factor_change();
     }
 
     fn windowAppearance(p: *Platform) platform.WindowAppearance {

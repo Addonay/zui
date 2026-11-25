@@ -2202,10 +2202,17 @@ pub const WaylandWindow = struct {
         _ = a.wl_proxy_marshal_flags(@ptrCast(surface), 6, null, a.wl_proxy_get_version(@ptrCast(surface)), 0);
     }
 
-    fn frameDone(data: ?*anyopaque, callback: *proto.Callback, _: u32) callconv(.c) void {
-        const self: *WaylandWindow = @ptrCast(@alignCast(data.?));
+    /// Clears `frame_callback` and `resize_throttle` on `wl_callback.done`.
+    /// The Wayland protocol leaves `wl_callback.done`'s `callback_data` clock unspecified,
+    /// so ZUI ignores it and paces frames directly from callback receipt (GPUI `bfcd5949`).
+    fn on_frame_callback_done(self: *WaylandWindow, callback: *proto.Callback) void {
         if (self.frame_callback == callback) self.frame_callback = null;
         self.resize_throttle = false;
+    }
+
+    fn frameDone(data: ?*anyopaque, callback: *proto.Callback, _: u32) callconv(.c) void {
+        const self: *WaylandWindow = @ptrCast(@alignCast(data.?));
+        self.on_frame_callback_done(callback);
         self.conn.api.wl_proxy_destroy(@ptrCast(callback));
     }
 
@@ -2824,5 +2831,31 @@ test "rounded blur rects: an empty area has no rectangles" {
         defer std.testing.allocator.free(rects);
         try std.testing.expectEqual(@as(usize, 0), rects.len);
     }
+}
+
+test "frame callback receipt clears matching pending callback and resize throttle" {
+    var dummy_a: u8 = 0;
+    var dummy_b: u8 = 0;
+    const cb_a: *proto.Callback = @ptrCast(&dummy_a);
+    const cb_b: *proto.Callback = @ptrCast(&dummy_b);
+
+    var win: WaylandWindow = .{
+        .allocator = std.testing.allocator,
+        .conn = undefined,
+        .size = .{ .width = 100, .height = 100 },
+        .atlas = undefined,
+        .renderer = undefined,
+        .frame_callback = cb_a,
+        .resize_throttle = true,
+    };
+    // A stale callback does not clear the active one, but still releases resize_throttle.
+    win.on_frame_callback_done(cb_b);
+    try std.testing.expectEqual(@as(?*proto.Callback, cb_a), win.frame_callback);
+    try std.testing.expect(!win.resize_throttle);
+
+    win.resize_throttle = true;
+    win.on_frame_callback_done(cb_a);
+    try std.testing.expectEqual(@as(?*proto.Callback, null), win.frame_callback);
+    try std.testing.expect(!win.resize_throttle);
 }
 
