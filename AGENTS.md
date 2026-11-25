@@ -67,7 +67,7 @@ src/text_system.zig + text_system/{font,line_layout,line,line_wrapper}.zig
 src/keystroke.zig interactive.zig keymap.zig keymap_context.zig key_dispatch.zig action.zig
 src/input.zig            ElementInputHandler: a view's EntityInputHandler methods as a PlatformInputHandler
 src/executor.zig         BackgroundExecutor, ForegroundExecutor, Task(T)
-src/scene.zig bounds_tree.zig atlas.zig path_builder.zig
+src/scene.zig bounds_tree.zig atlas.zig path_winding.zig path_builder.zig
 src/assets.zig svg_renderer.zig spring.zig
 src/http_client.zig http_native.zig image_disk_cache.zig   remote images: HTTP client and on-disk copies
 src/platform.zig         Platform / PlatformWindow vtable interfaces + shared types
@@ -121,7 +121,7 @@ third_party/             Wuffs, nanosvg, images.c shim
 
 | Path | Source | Why |
 | --- | --- | --- |
-| `.references/gpui` (local name; `.references/zed` in the cloud container) | `https://github.com/zed-industries/zed` (sparse: `crates/gpui`, `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_wgpu`, `gpui_web`, `gpui_platform`, `gpui_macros`) kept up to date with `git pull`; last checked at `4a6121b` (2026-11-06) | THE reference. Every port follows these files. |
+| `.references/gpui` (local name; `.references/zed` in the cloud container) | `https://github.com/zed-industries/zed` (sparse: `crates/gpui`, `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_wgpu`, `gpui_web`, `gpui_platform`, `gpui_macros`) kept up to date with `git pull`; last checked at `2664a0aa` (2026-11-25) | THE reference. Every port follows these files. |
 | `.references/zafi` | `https://github.com/Addonay/zafi` | layout API |
 | `.references/cozmic` | `https://github.com/Addonay/cozmic` | text API |
 | `.references/zicr` | `https://github.com/Addonay/zicr` | GPU layer, shader pipeline, Vulkan bootstrap example (`tools/vk_smoke.zig`) |
@@ -227,7 +227,9 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   draws restore their dispatch ancestry, element namespace, and rem size.
 - **Div paint order** matches GPUI: shadows → background → ext paint →
   children (in overflow mask, scroll-offset) → border on top.
-- **Layout**: zafi tree cleared per frame (like GPUI), styles converted to
+- **Layout**: persistent `zafi.Tree` nodes retained across frames via `LayoutCache`
+  (reusing unchanged nodes/styles/children, recycling unrequested nodes for one frame before
+  evicting, and caching keyed measured layouts for `text` and `img`), styles converted to
   device pixels (scale factor), rounding disabled, bounds snapped with
   round-half-toward-zero; measure functions via a threadlocal trampoline.
 - **Color glyphs**: cozmic renders COLRv1 through the bundled HarfBuzz's `hb-raster` and the rest
@@ -247,14 +249,20 @@ Recreate with: `git clone --depth 1 --filter=blob:none --sparse https://github.c
   `HeadlessPlatform` under `ZUI_HEADLESS=1` and tests (see Windowing modes).
 - **CPU renderer** follows GPUI's WGSL literally: straight alpha, sRGB-space
   blending (as wgpu ALPHA_BLENDING), gradient color-space handling via LUT,
-  erf-blur shadows, 4x MSAA paths with Loop-Blinn curves, gamma 1.8/contrast.
-  Underline alpha is squared exactly like GPUI's shader (looks like a GPUI quirk).
+  Raph Levien analytical blurred rounded-rect shadows (`erf7`), analytical Slug tiled
+  quadratic-curve path winding (supporting holes, self-intersections, NonZero and EvenOdd),
+  gamma 1.8/contrast. Underline alpha is squared exactly like GPUI's shader (looks like a GPUI quirk).
   Benchmarks (4 vCPU Xeon, 1080p, ReleaseFast, 4 threads): 10k opaque rects
   5.2 ms, 10k rounded 21 ms, 10k gradients 231 ms (slowest path).
 - **GPU renderer**: port of `gpui_wgpu`'s batching on the vendored `src/gpu/` layer
   (never zicr's `render2d`). Instances are per-instance vertex attributes, so it stays
-  portable to GL/WebGL. One `GpuContext` (device, atlas, pipelines) per connection, one
-  `GpuWindow` (swapchain) per window; a window that cannot get one uses the CPU renderer.
+  portable to GL/WebGL. Draws in a single render pass with a 32-bit float depth buffer:
+  front-to-back early-Z `opaque_quads` pre-pass followed by depth-tested quads, Levien
+  analytical shadows, underlines, monochrome/polychrome sprites (including zero-re-render
+  animated SVG sprites via `TimedTransformation`), and analytical Slug tiled paths reading
+  monotone quadratic curves from an `.rgba32f` texture via `texelFetch`. One `GpuContext`
+  (device, atlas, pipelines) per connection, one `GpuWindow` (swapchain) per window; a window
+  that cannot get one uses the CPU renderer.
   Selection: `ZUI_RENDERER=cpu` forces CPU, `=gpu` also accepts software Vulkan, the default
   takes hardware devices only (the CPU renderer beats llvmpipe). Debug builds log the choice.
   Requires Vulkan 1.3 with dynamic rendering, synchronization2 and buffer device address.

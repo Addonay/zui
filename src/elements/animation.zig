@@ -52,6 +52,17 @@ pub fn ease_out_quint(delta: f32) f32 {
     return 1.0 - std.math.pow(f32, 1.0 - delta, 5);
 }
 
+/// A heartbeat: a strong beat, a weaker one, then a rest. Starts and ends at 0 and peaks at 1.
+pub fn heartbeat(delta: f32) f32 {
+    const beat = struct {
+        fn f(d: f32, center: f32, width: f32, height: f32) f32 {
+            const x = (d - center) / width;
+            return height * @exp(-x * x);
+        }
+    }.f;
+    return beat(delta, 0.2, 0.06, 1.0) + beat(delta, 0.4, 0.05, 0.58);
+}
+
 /// Applies `easing` forward over the first half and in reverse over the second half.
 /// Comptime because the result closes over `easing`.
 pub fn bounce(comptime easing: EasingFn) EasingFn {
@@ -722,4 +733,11 @@ test "animation chain survives shrinking to fewer stages after a hand-off" {
     try std.testing.expectEqual(@as(usize, 0), state.animation_ix);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), shrunk.delta, 1e-6);
     try std.testing.expect(!shrunk.done);
+}
+
+test "heartbeat peaks at 0.2, has a smaller second beat at 0.4, and returns near 0" {
+    try std.testing.expect(heartbeat(0.0) < 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), heartbeat(0.2), 1e-3);
+    try std.testing.expect(heartbeat(0.4) > 0.5 and heartbeat(0.4) < 0.7);
+    try std.testing.expect(heartbeat(0.999) < 1e-3);
 }

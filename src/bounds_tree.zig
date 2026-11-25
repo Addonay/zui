@@ -1,12 +1,41 @@
 //! Port of gpui/src/bounds_tree.rs: an R-tree variant that assigns z-order to overlapping bounds.
 const std = @import("std");
 const geometry = @import("geometry.zig");
+const scene = @import("scene.zig");
 const testing = std.testing;
+
+const PrimitiveKind = scene.PrimitiveKind;
 
 /// Maximum children per internal node (R-tree style branching factor).
 const max_children = 12;
 
-/// Spatial tree that finds the maximum ordering among intersecting bounds.
+/// The ordering of a bounds, then its kind, which orders the bounds that share an ordering.
+pub const Key = struct {
+    ordering: u32,
+    kind: PrimitiveKind,
+
+    pub inline fn asU64(self: Key) u64 {
+        return (@as(u64, self.ordering) << 32) | @intFromEnum(self.kind);
+    }
+
+    pub inline fn lt(a: Key, b: Key) bool {
+        return a.asU64() < b.asU64();
+    }
+
+    pub inline fn le(a: Key, b: Key) bool {
+        return a.asU64() <= b.asU64();
+    }
+
+    pub inline fn gt(a: Key, b: Key) bool {
+        return a.asU64() > b.asU64();
+    }
+
+    pub inline fn max(a: Key, b: Key) Key {
+        return if (a.asU64() >= b.asU64()) a else b;
+    }
+};
+
+/// Spatial tree that finds the maximum key among intersecting bounds.
 pub fn BoundsTree(comptime U: type) type {
     const B = geometry.Bounds(U);
 
@@ -18,7 +47,7 @@ pub fn BoundsTree(comptime U: type) type {
         nodes: std.ArrayList(Node) = .empty,
         /// Index of the root node, if any.
         root: ?u32 = null,
-        /// Index of the leaf with the highest ordering (for fast-path lookups).
+        /// Index of the leaf with the highest key (for fast-path lookups).
         max_leaf: ?u32 = null,
         /// Reusable stack for tree traversal during insertion.
         insert_path: std.ArrayList(u32) = .empty,
@@ -28,15 +57,15 @@ pub fn BoundsTree(comptime U: type) type {
         const Node = struct {
             /// Bounding box containing this node and all descendants.
             bounds: B,
-            /// Maximum ordering value in this subtree.
-            max_order: u32,
+            /// Maximum key in this subtree.
+            max_key: Key,
             kind: Kind,
         };
 
         const Kind = union(enum) {
-            /// Leaf node holding the ordering assigned to its bounds.
-            leaf: u32,
-            /// Internal node with children; the child with the highest max_order is kept last.
+            /// Leaf node holding the key assigned to its bounds.
+            leaf: Key,
+            /// Internal node with children; the child with the highest max_key is kept last.
             internal: NodeChildren,
         };
 
@@ -74,16 +103,23 @@ pub fn BoundsTree(comptime U: type) type {
             self.search_stack.clearRetainingCapacity();
         }
 
-        /// Inserts bounds and returns its assigned ordering: one greater than the maximum
-        /// ordering of any existing bounds that intersect the new bounds.
-        pub fn insert(self: *Self, new_bounds: B) !u32 {
-            const max_intersecting = try self.find_max_ordering(new_bounds);
-            const ordering = max_intersecting + 1;
+        /// Inserts bounds of the given kind into the tree and returns its assigned ordering.
+        ///
+        /// The ordering is one greater than the maximum ordering of any existing bounds
+        /// that intersect with the new bounds. The new bounds share that maximum ordering
+        /// instead if every intersecting bounds there has a kind of at most `max_shared_kind`,
+        /// since those are drawn first.
+        pub fn insert(self: *Self, new_bounds: B, kind: PrimitiveKind, max_shared_kind: PrimitiveKind) !u32 {
+            const ordering = if (try self.find_max_key(new_bounds)) |max_key|
+                if (@intFromEnum(max_key.kind) <= @intFromEnum(max_shared_kind)) max_key.ordering else max_key.ordering + 1
+            else
+                1;
+            const key: Key = .{ .ordering = ordering, .kind = kind };
 
-            const new_leaf_idx = try self.insert_leaf(new_bounds, ordering);
+            const new_leaf_idx = try self.insert_leaf(new_bounds, key);
 
             if (self.max_leaf) |old_idx| {
-                if (self.nodes.items[old_idx].max_order < ordering) self.max_leaf = new_leaf_idx;
+                if (self.nodes.items[old_idx].max_key.lt(key)) self.max_leaf = new_leaf_idx;
             } else {
                 self.max_leaf = new_leaf_idx;
             }
@@ -91,31 +127,34 @@ pub fn BoundsTree(comptime U: type) type {
             return ordering;
         }
 
-        /// Finds the maximum ordering among all bounds that intersect the query.
-        fn find_max_ordering(self: *Self, query: B) !u32 {
-            const root_idx = self.root orelse return 0;
+        /// Finds the maximum key among all bounds that intersect the query.
+        fn find_max_key(self: *Self, query: B) !?Key {
+            const root_idx = self.root orelse return null;
 
-            // Fast path: the max-ordering leaf often intersects.
+            // Fast path: the max-key leaf often intersects.
             if (self.max_leaf) |max_idx| {
                 const max_node = &self.nodes.items[max_idx];
-                if (query.intersects(max_node.bounds)) return max_node.max_order;
+                if (query.intersects(max_node.bounds)) return max_node.max_key;
             }
 
             self.search_stack.clearRetainingCapacity();
             try self.search_stack.append(self.allocator, root_idx);
 
-            var max_found: u32 = 0;
+            var max_found: ?Key = null;
             while (self.search_stack.pop()) |node_idx| {
                 const node = &self.nodes.items[node_idx];
 
                 // Pruning: skip if this subtree can't improve the result.
-                if (node.max_order <= max_found) continue;
+                if (max_found) |mf| {
+                    if (node.max_key.le(mf)) continue;
+                }
                 if (!query.intersects(node.bounds)) continue;
 
                 switch (node.kind) {
-                    .leaf => |order| max_found = @max(max_found, order),
+                    .leaf => |key| max_found = if (max_found) |mf| Key.max(mf, key) else key,
                     .internal => |*children| for (children.slice()) |child_idx| {
-                        if (self.nodes.items[child_idx].max_order > max_found) {
+                        const child_key = self.nodes.items[child_idx].max_key;
+                        if (max_found == null or child_key.gt(max_found.?)) {
                             try self.search_stack.append(self.allocator, child_idx);
                         }
                     },
@@ -125,13 +164,13 @@ pub fn BoundsTree(comptime U: type) type {
             return max_found;
         }
 
-        /// Inserts a leaf with the given bounds and ordering and returns its index.
-        fn insert_leaf(self: *Self, bounds: B, order: u32) !u32 {
+        /// Inserts a leaf with the given bounds and key and returns its index.
+        fn insert_leaf(self: *Self, bounds: B, key: Key) !u32 {
             const new_leaf_idx: u32 = @intCast(self.nodes.items.len);
             try self.nodes.append(self.allocator, .{
                 .bounds = bounds,
-                .max_order = order,
-                .kind = .{ .leaf = order },
+                .max_key = key,
+                .kind = .{ .leaf = key },
             });
 
             const root_idx = self.root orelse {
@@ -142,11 +181,11 @@ pub fn BoundsTree(comptime U: type) type {
             // Root is a leaf: create an internal node holding both.
             if (std.meta.activeTag(self.nodes.items[root_idx].kind) == .leaf) {
                 const root_bounds = self.nodes.items[root_idx].bounds;
-                const root_order = self.nodes.items[root_idx].max_order;
+                const root_key = self.nodes.items[root_idx].max_key;
 
                 var children: NodeChildren = .{};
-                // Max-end invariant: the highest-order child goes last.
-                if (order > root_order) {
+                // Max-end invariant: the highest-key child goes last.
+                if (key.gt(root_key)) {
                     children.push(root_idx);
                     children.push(new_leaf_idx);
                 } else {
@@ -157,7 +196,7 @@ pub fn BoundsTree(comptime U: type) type {
                 const new_root_idx: u32 = @intCast(self.nodes.items.len);
                 try self.nodes.append(self.allocator, .{
                     .bounds = root_bounds.@"union"(bounds),
-                    .max_order = @max(root_order, order),
+                    .max_key = Key.max(root_key, key),
                     .kind = .{ .internal = children },
                 });
                 self.root = new_root_idx;
@@ -199,21 +238,21 @@ pub fn BoundsTree(comptime U: type) type {
                     const kids = &node.kind.internal;
                     kids.push(new_leaf_idx);
                     // Keep the max-end invariant unless the new leaf is the highest.
-                    if (order <= node.max_order) {
+                    if (key.le(node.max_key)) {
                         const last = kids.len - 1;
                         std.mem.swap(u32, &kids.indices[last - 1], &kids.indices[last]);
                     }
                     node.bounds = node.bounds.@"union"(bounds);
-                    node.max_order = @max(node.max_order, order);
+                    node.max_key = Key.max(node.max_key, key);
                     break;
                 }
 
                 // Node is full: replace the best leaf with a new internal node holding [best_leaf, new_leaf].
                 const sibling_bounds = self.nodes.items[best_child_idx].bounds;
-                const sibling_order = self.nodes.items[best_child_idx].max_order;
+                const sibling_key = self.nodes.items[best_child_idx].max_key;
 
                 var new_children: NodeChildren = .{};
-                if (order > sibling_order) {
+                if (key.gt(sibling_key)) {
                     new_children.push(best_child_idx);
                     new_children.push(new_leaf_idx);
                 } else {
@@ -222,10 +261,10 @@ pub fn BoundsTree(comptime U: type) type {
                 }
 
                 const new_internal_idx: u32 = @intCast(self.nodes.items.len);
-                const new_internal_max = @max(sibling_order, order);
+                const new_internal_max = Key.max(sibling_key, key);
                 try self.nodes.append(self.allocator, .{
                     .bounds = sibling_bounds.@"union"(bounds),
-                    .max_order = new_internal_max,
+                    .max_key = new_internal_max,
                     .kind = .{ .internal = new_children },
                 });
 
@@ -233,13 +272,13 @@ pub fn BoundsTree(comptime U: type) type {
                 const parent_kids = &parent.kind.internal;
                 const children_len = parent_kids.len;
                 parent_kids.indices[best_child_pos] = new_internal_idx;
-                if (new_internal_max > parent.max_order) {
+                if (new_internal_max.gt(parent.max_key)) {
                     std.mem.swap(u32, &parent_kids.indices[best_child_pos], &parent_kids.indices[children_len - 1]);
                 }
                 break;
             }
 
-            // Propagate bounds and max_order up the path, deepest node first.
+            // Propagate bounds and max_key up the path, deepest node first.
             var updated_child_idx: ?u32 = null;
             var path_pos = self.insert_path.items.len;
             while (path_pos > 0) {
@@ -248,8 +287,8 @@ pub fn BoundsTree(comptime U: type) type {
                 const node = &self.nodes.items[node_idx];
                 node.bounds = node.bounds.@"union"(bounds);
 
-                if (node.max_order < order) {
-                    node.max_order = order;
+                if (node.max_key.lt(key)) {
+                    node.max_key = key;
 
                     // The invariant for the updated child was already handled at its own level.
                     if (updated_child_idx) |child_idx| {
@@ -276,22 +315,38 @@ test "insert" {
     var tree = BoundsTree(f32).init(testing.allocator);
     defer tree.deinit();
 
+    const quad = PrimitiveKind.quad;
+    const shadow = PrimitiveKind.shadow;
     const bounds1 = geometry.bounds(Point(f32){ .x = 0, .y = 0 }, Size(f32){ .width = 10, .height = 10 });
     const bounds2 = geometry.bounds(Point(f32){ .x = 5, .y = 5 }, Size(f32){ .width = 10, .height = 10 });
     const bounds3 = geometry.bounds(Point(f32){ .x = 10, .y = 10 }, Size(f32){ .width = 10, .height = 10 });
 
-    // Overlapping bounds get increasing orders.
-    try testing.expectEqual(@as(u32, 1), try tree.insert(bounds1));
-    try testing.expectEqual(@as(u32, 2), try tree.insert(bounds2));
-    try testing.expectEqual(@as(u32, 3), try tree.insert(bounds3));
+    // Overlapping bounds get increasing orders when max_shared_kind < existing kind.
+    try testing.expectEqual(@as(u32, 1), try tree.insert(bounds1, quad, shadow));
+    try testing.expectEqual(@as(u32, 2), try tree.insert(bounds2, quad, shadow));
+    try testing.expectEqual(@as(u32, 3), try tree.insert(bounds3, quad, shadow));
 
     // Non-overlapping bounds reuse orders.
     const bounds4 = geometry.bounds(Point(f32){ .x = 20, .y = 20 }, Size(f32){ .width = 10, .height = 10 });
     const bounds5 = geometry.bounds(Point(f32){ .x = 40, .y = 40 }, Size(f32){ .width = 10, .height = 10 });
     const bounds6 = geometry.bounds(Point(f32){ .x = 25, .y = 25 }, Size(f32){ .width = 10, .height = 10 });
-    try testing.expectEqual(@as(u32, 1), try tree.insert(bounds4));
-    try testing.expectEqual(@as(u32, 1), try tree.insert(bounds5));
-    try testing.expectEqual(@as(u32, 2), try tree.insert(bounds6));
+    try testing.expectEqual(@as(u32, 1), try tree.insert(bounds4, quad, shadow));
+    try testing.expectEqual(@as(u32, 1), try tree.insert(bounds5, quad, shadow));
+    try testing.expectEqual(@as(u32, 2), try tree.insert(bounds6, quad, shadow));
+}
+
+test "kind-aware order sharing" {
+    var tree = BoundsTree(f32).init(testing.allocator);
+    defer tree.deinit();
+
+    const full = geometry.bounds(Point(f32){ .x = 0, .y = 0 }, Size(f32){ .width = 20, .height = 20 });
+    // Shadow followed by quad (sharing up to quad) -> same order 1.
+    try testing.expectEqual(@as(u32, 1), try tree.insert(full, .shadow, .shadow));
+    try testing.expectEqual(@as(u32, 1), try tree.insert(full, .quad, .quad));
+    // Monochrome sprite (shares up to underline) over quad -> same order 1.
+    try testing.expectEqual(@as(u32, 1), try tree.insert(full, .monochrome_sprite, .underline));
+    // Quad over monochrome sprite -> bumps to order 2 because monochrome_sprite > quad.
+    try testing.expectEqual(@as(u32, 2), try tree.insert(full, .quad, .quad));
 }
 
 test "clear retains capacity and resets ordering" {
@@ -299,14 +354,15 @@ test "clear retains capacity and resets ordering" {
     defer tree.deinit();
 
     const unit = geometry.bounds(Point(f32){ .x = 0, .y = 0 }, Size(f32){ .width = 10, .height = 10 });
-    try testing.expectEqual(@as(u32, 1), try tree.insert(unit));
-    try testing.expectEqual(@as(u32, 2), try tree.insert(unit));
+    try testing.expectEqual(@as(u32, 1), try tree.insert(unit, .quad, .shadow));
+    try testing.expectEqual(@as(u32, 2), try tree.insert(unit, .quad, .shadow));
     tree.clear();
-    try testing.expectEqual(@as(u32, 1), try tree.insert(unit));
+    try testing.expectEqual(@as(u32, 1), try tree.insert(unit, .quad, .shadow));
 }
 
 test "random iterations match brute force" {
     const max_bounds = 100;
+    const kinds = [_]PrimitiveKind{ .shadow, .quad, .path, .underline, .monochrome_sprite };
     var seed: u64 = 1;
     while (seed <= 1000) : (seed += 1) {
         var prng = std.Random.DefaultPrng.init(seed);
@@ -315,7 +371,7 @@ test "random iterations match brute force" {
         var tree = BoundsTree(f32).init(testing.allocator);
         defer tree.deinit();
 
-        var expected: std.ArrayList(struct { bounds: geometry.Bounds(f32), order: u32 }) = .empty;
+        var expected: std.ArrayList(struct { bounds: geometry.Bounds(f32), key: Key }) = .empty;
         defer expected.deinit(testing.allocator);
 
         const num_bounds = random.intRangeAtMost(usize, 1, max_bounds);
@@ -325,15 +381,25 @@ test "random iterations match brute force" {
             const width = random.float(f32) * 50.0;
             const height = random.float(f32) * 50.0;
             const bounds = geometry.bounds(Point(f32){ .x = min_x, .y = min_y }, Size(f32){ .width = width, .height = height });
+            const kind = kinds[random.intRangeLessThan(usize, 0, kinds.len)];
+            const max_shared_kind = kinds[random.intRangeLessThan(usize, 0, kinds.len)];
 
-            var expected_order: u32 = 0;
-            for (expected.items) |quad| {
-                if (quad.bounds.intersects(bounds)) expected_order = @max(expected_order, quad.order);
+            var max_intersecting: ?Key = null;
+            for (expected.items) |item| {
+                if (item.bounds.intersects(bounds)) {
+                    max_intersecting = if (max_intersecting) |m| Key.max(m, item.key) else item.key;
+                }
             }
-            expected_order += 1;
-            try expected.append(testing.allocator, .{ .bounds = bounds, .order = expected_order });
+            const expected_order: u32 = if (max_intersecting) |m|
+                if (@intFromEnum(m.kind) <= @intFromEnum(max_shared_kind)) m.ordering else m.ordering + 1
+            else
+                1;
+            try expected.append(testing.allocator, .{
+                .bounds = bounds,
+                .key = .{ .ordering = expected_order, .kind = kind },
+            });
 
-            try testing.expectEqual(expected_order, try tree.insert(bounds));
+            try testing.expectEqual(expected_order, try tree.insert(bounds, kind, max_shared_kind));
         }
     }
 }

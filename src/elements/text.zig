@@ -84,6 +84,8 @@ pub fn text_element(s: []const u8) element.AnyElement {
 // ---------------------------------------------------------------------------
 // TextLayout.
 
+const default_node_style: style.Style = .{};
+
 /// Measured text: the lines, their size, and where the element was painted.
 /// A `TextLayout` is a handle to frame-arena state, so copies share it (GPUI `Rc<RefCell<..>>`).
 pub const TextLayout = struct {
@@ -109,7 +111,6 @@ pub const TextLayout = struct {
 
     /// Requests a measured layout node for `text` with optional `runs`, measured with the inherited text style.
     pub fn layout(self: TextLayout, source: []const u8, runs: ?[]const TextRun, window: *Window, cx: *App) LayoutId {
-        _ = cx;
         const text_style = window.text_style();
         const font_size = text_style.font_size.to_pixels(window.rem_size());
         const lh = text_style.line_height_in_pixels(window.rem_size());
@@ -129,8 +130,15 @@ pub const TextLayout = struct {
             .font_size = font_size,
             .line_height = lh,
         };
-        var node_style: style.Style = .{};
-        return window.request_measured_layout(&node_style, .{ .ctx = measure, .func = MeasureCtx.measure });
+        const font_generation = cx.text_system().font_generation;
+        const key_hash = hashTextMeasureKey(source, used_runs, &text_style, font_size, lh, window.scale_factor(), font_generation);
+        return window.request_keyed_measure(
+            &default_node_style,
+            key_hash,
+            .{ .ctx = measure, .func = MeasureCtx.measure, .final_func = MeasureCtx.measureFinal },
+            MeasureCtx.reuse,
+            cx,
+        );
     }
 
     /// Records the bounds the text was given (GPUI `prepaint`).
@@ -164,7 +172,15 @@ pub const TextLayout = struct {
         const b = st.bounds orelse return error.PrepaintNotPerformed;
         const lh = st.line_height;
         var line_origin = b.origin;
-        const text_align = window.text_style().text_align;
+        const text_align: TextAlign = blk: {
+            const stack = window.text_style_stack.items;
+            var i = stack.len;
+            while (i > 0) {
+                i -= 1;
+                if (stack[i].text_align) |ta| break :blk ta;
+            }
+            break :blk .left;
+        };
         for (st.lines) |line| {
             if (pass != .foreground) {
                 line.paint_background(line_origin, lh, text_align, b, window, cx) catch |e| log_paint_error(e);
@@ -304,6 +320,160 @@ pub const TextLayout = struct {
     }
 };
 
+const TextPayload = struct {
+    len: usize,
+    lines: []WrappedLine,
+    line_height: Pixels,
+    wrap_width: ?Pixels,
+    truncate_width: ?Pixels,
+    size: Size(Pixels),
+    cache_ptr: *text_system.LineLayoutCache,
+    cache_start: text_system.line_layout.LineLayoutIndex,
+    cache_end: text_system.line_layout.LineLayoutIndex,
+
+    fn deinit(allocator: std.mem.Allocator, raw: *anyopaque) void {
+        const self: *TextPayload = @ptrCast(@alignCast(raw));
+        for (self.lines) |line| {
+            allocator.free(line.decoration_runs);
+        }
+        allocator.free(self.lines);
+        allocator.destroy(self);
+    }
+};
+
+fn saveTextPayload(
+    window: *Window,
+    len: usize,
+    lines: []const WrappedLine,
+    line_height: Pixels,
+    wrap_width: ?Pixels,
+    truncate_width: ?Pixels,
+    size: Size(Pixels),
+    cache_ptr: *text_system.LineLayoutCache,
+    cache_start: text_system.line_layout.LineLayoutIndex,
+    cache_end: text_system.line_layout.LineLayoutIndex,
+) void {
+    const alloc = window.allocator;
+    const payload = alloc.create(TextPayload) catch @panic("OOM");
+    const owned_lines = alloc.alloc(WrappedLine, lines.len) catch @panic("OOM");
+    for (lines, owned_lines) |src, *dst| {
+        dst.* = .{
+            .layout = src.layout,
+            .text = src.text,
+            .decoration_runs = alloc.dupe(text_system.line.DecorationRun, src.decoration_runs) catch @panic("OOM"),
+        };
+    }
+    payload.* = .{
+        .len = len,
+        .lines = owned_lines,
+        .line_height = line_height,
+        .wrap_width = wrap_width,
+        .truncate_width = truncate_width,
+        .size = size,
+        .cache_ptr = cache_ptr,
+        .cache_start = cache_start,
+        .cache_end = cache_end,
+    };
+    window.set_measure_payload(payload, TextPayload.deinit);
+}
+
+fn hashTextMeasureKey(
+    source: []const u8,
+    runs: []const TextRun,
+    text_style: *const TextStyle,
+    font_size: Pixels,
+    line_height: Pixels,
+    scale_factor: f32,
+    font_generation: u64,
+) u64 {
+    var h = std.hash.Wyhash.init(0x74657874);
+    h.update(std.mem.asBytes(&source.len));
+    h.update(source);
+    h.update(std.mem.asBytes(&runs.len));
+    for (runs) |run| {
+        h.update(std.mem.asBytes(&run.len));
+        run.font.hash(&h);
+        if (run.font.fallbacks) |fb| {
+            h.update(&.{1});
+            h.update(std.mem.asBytes(&fb.families.len));
+            for (fb.families) |fam| {
+                h.update(std.mem.asBytes(&fam.len));
+                h.update(fam);
+            }
+        } else h.update(&.{0});
+        hashFloat(&h, run.color.h);
+        hashFloat(&h, run.color.s);
+        hashFloat(&h, run.color.l);
+        hashFloat(&h, run.color.a);
+        if (run.background_color) |bg| {
+            h.update(&.{1});
+            hashFloat(&h, bg.h);
+            hashFloat(&h, bg.s);
+            hashFloat(&h, bg.l);
+            hashFloat(&h, bg.a);
+        } else h.update(&.{0});
+        if (run.underline) |u| {
+            h.update(&.{1});
+            hashFloat(&h, u.thickness);
+            h.update(&.{@intFromBool(u.wavy)});
+            if (u.color) |uc| {
+                h.update(&.{1});
+                hashFloat(&h, uc.h);
+                hashFloat(&h, uc.s);
+                hashFloat(&h, uc.l);
+                hashFloat(&h, uc.a);
+            } else h.update(&.{0});
+        } else h.update(&.{0});
+        if (run.strikethrough) |st| {
+            h.update(&.{1});
+            hashFloat(&h, st.thickness);
+            if (st.color) |sc| {
+                h.update(&.{1});
+                hashFloat(&h, sc.h);
+                hashFloat(&h, sc.s);
+                hashFloat(&h, sc.l);
+                hashFloat(&h, sc.a);
+            } else h.update(&.{0});
+        } else h.update(&.{0});
+    }
+    const ws: u8 = @intFromEnum(text_style.white_space);
+    h.update(&.{ws});
+    if (text_style.text_overflow) |ov| {
+        h.update(&.{1});
+        switch (ov) {
+            .truncate => |s| {
+                h.update(&.{0});
+                h.update(std.mem.asBytes(&s.len));
+                h.update(s);
+            },
+            .truncate_start => |s| {
+                h.update(&.{1});
+                h.update(std.mem.asBytes(&s.len));
+                h.update(s);
+            },
+            .truncate_middle => |s| {
+                h.update(&.{2});
+                h.update(std.mem.asBytes(&s.len));
+                h.update(s);
+            },
+        }
+    } else h.update(&.{0});
+    if (text_style.line_clamp) |lc| {
+        h.update(&.{1});
+        h.update(std.mem.asBytes(&lc));
+    } else h.update(&.{0});
+    hashFloat(&h, font_size);
+    hashFloat(&h, line_height);
+    hashFloat(&h, scale_factor);
+    h.update(std.mem.asBytes(&font_generation));
+    return h.final();
+}
+
+fn hashFloat(h: *std.hash.Wyhash, v: f32) void {
+    const bits: u32 = text_system.canonical_float_bits(v);
+    h.update(std.mem.asBytes(&bits));
+}
+
 /// The inputs of one measurement, read by the layout engine (GPUI's measure closure).
 const MeasureCtx = struct {
     state: *TextLayout.State,
@@ -313,9 +483,47 @@ const MeasureCtx = struct {
     font_size: Pixels,
     line_height: Pixels,
 
-    fn measure(ctx: *anyopaque, known: Size(?Pixels), available: Size(taffy.AvailableSpace), window: *Window, cx: *App) Size(Pixels) {
+    fn reuse(ctx: *anyopaque, payload_raw: ?*anyopaque, window: *Window, cx: *App) bool {
+        _ = window;
         const self: *MeasureCtx = @ptrCast(@alignCast(ctx));
-        return self.measure_impl(known, available, window, cx) catch Size(Pixels){ .width = 0, .height = 0 };
+        const payload_ptr = payload_raw orelse return false;
+        const payload: *TextPayload = @ptrCast(@alignCast(payload_ptr));
+        const cache = cx.text_system().active_cache;
+        if (payload.cache_ptr != cache) return false;
+        if (payload.cache_end.lines_index > cache.lines.previous_used.items.len or
+            payload.cache_end.wrapped_lines_index > cache.wrapped.previous_used.items.len)
+        {
+            return false;
+        }
+        const new_start = cache.layout_index();
+        cache.reuse_layouts(payload.cache_start, payload.cache_end) catch return false;
+        const new_end = cache.layout_index();
+        payload.cache_start = new_start;
+        payload.cache_end = new_end;
+
+        const arena = window_mod.frame_arena();
+        const cloned_lines = arena.alloc(WrappedLine, payload.lines.len) catch @panic("OOM");
+        @memcpy(cloned_lines, payload.lines);
+        self.state.* = .{
+            .measured = true,
+            .len = payload.len,
+            .lines = cloned_lines,
+            .line_height = payload.line_height,
+            .wrap_width = payload.wrap_width,
+            .truncate_width = payload.truncate_width,
+            .size = payload.size,
+            .bounds = null,
+        };
+        return true;
+    }
+
+    fn measure(ctx: *anyopaque, known: Size(?Pixels), available: Size(taffy.AvailableSpace), window: *Window, cx: *App) Size(Pixels) {
+        return measureFinal(ctx, known, available, true, window, cx);
+    }
+
+    fn measureFinal(ctx: *anyopaque, known: Size(?Pixels), available: Size(taffy.AvailableSpace), final_layout: bool, window: *Window, cx: *App) Size(Pixels) {
+        const self: *MeasureCtx = @ptrCast(@alignCast(ctx));
+        return self.measure_impl(known, available, final_layout, window, cx) catch Size(Pixels){ .width = 0, .height = 0 };
     }
 
     fn definite(space: taffy.AvailableSpace) ?Pixels {
@@ -325,8 +533,7 @@ const MeasureCtx = struct {
         };
     }
 
-    fn measure_impl(self: *MeasureCtx, known: Size(?Pixels), available: Size(taffy.AvailableSpace), window: *Window, cx: *App) !Size(Pixels) {
-        _ = window;
+    fn measure_impl(self: *MeasureCtx, known: Size(?Pixels), available: Size(taffy.AvailableSpace), final_layout: bool, window: *Window, cx: *App) !Size(Pixels) {
         const ts = cx.text_system();
         const st = self.state;
         const text_style = self.text_style;
@@ -362,6 +569,9 @@ const MeasureCtx = struct {
         // A measurement is reusable only when both available-width inputs match. In particular,
         // an unconstrained probe must not inherit the size of a previously wrapped measurement.
         if (cached_measurement_size(st, wrap_width, truncate_width)) |cached| return cached;
+
+        const cache = ts.active_cache;
+        const cache_start = cache.layout_index();
 
         var text = self.text;
         var runs = self.runs;
@@ -402,9 +612,14 @@ const MeasureCtx = struct {
         }
 
         const lines = pre_shaped_lines orelse (ts.shape_text(text, font_size, runs, wrap_width, text_style.line_clamp) catch {
-            st.* = .{ .measured = true, .len = 0, .lines = &.{}, .line_height = line_height, .wrap_width = wrap_width, .truncate_width = truncate_width, .size = Size(Pixels){ .width = 0, .height = 0 } };
+            const cache_end = cache.layout_index();
+            if (final_layout or !st.measured) {
+                st.* = .{ .measured = true, .len = 0, .lines = &.{}, .line_height = line_height, .wrap_width = wrap_width, .truncate_width = truncate_width, .size = Size(Pixels){ .width = 0, .height = 0 } };
+                saveTextPayload(window, 0, &.{}, line_height, wrap_width, truncate_width, .{ .width = 0, .height = 0 }, cache, cache_start, cache_end);
+            }
             return .{ .width = 0, .height = 0 };
         });
+        const cache_end = cache.layout_index();
 
         var size: Size(Pixels) = .{ .width = 0, .height = 0 };
         for (lines) |line| {
@@ -413,16 +628,19 @@ const MeasureCtx = struct {
             size.width = @ceil(@max(size.width, line_size.width));
         }
 
-        st.* = .{
-            .measured = true,
-            .len = text.len,
-            .lines = lines,
-            .line_height = line_height,
-            .wrap_width = wrap_width,
-            .truncate_width = truncate_width,
-            .size = size,
-            .bounds = null,
-        };
+        if (final_layout or !st.measured) {
+            st.* = .{
+                .measured = true,
+                .len = text.len,
+                .lines = lines,
+                .line_height = line_height,
+                .wrap_width = wrap_width,
+                .truncate_width = truncate_width,
+                .size = size,
+                .bounds = null,
+            };
+            saveTextPayload(window, text.len, lines, line_height, wrap_width, truncate_width, size, cache, cache_start, cache_end);
+        }
         return size;
     }
 };
@@ -957,4 +1175,112 @@ test "text measurement skips LineWrapper when not truncating or when text alread
         vcx.run_until_parked();
         try testing.expect(ts.char_widths.count() > 0);
     }
+}
+
+const CachedTextView = struct {
+    width: Pixels = 200,
+    font_size_px: Pixels = 14,
+    bold: bool = false,
+    nowrap: bool = false,
+    ellipsis: bool = false,
+    text: []const u8 = "Some longer text that wraps in narrow parents",
+
+    pub fn render(self: *CachedTextView, _: *Window, _: *app_mod.Context(CachedTextView)) *div_mod.Div {
+        var d = div_mod.div().flex().child(
+            div_mod.div()
+                .w(geometry.px(self.width))
+                .text_size(geometry.px(self.font_size_px))
+                .child(text_element(self.text)),
+        );
+        if (self.bold) d = d.font_weight(.BOLD);
+        if (self.nowrap) d = d.whitespace_nowrap();
+        if (self.ellipsis) d = d.text_ellipsis();
+        return d;
+    }
+
+    fn build(_: *Window, app: *App) app_mod.Entity(CachedTextView) {
+        return app.new(CachedTextView{});
+    }
+
+    fn touch(_: *CachedTextView, cx: *app_mod.Context(CachedTextView)) void {
+        cx.notify();
+    }
+
+    fn set_text(self: *CachedTextView, t: []const u8, cx: *app_mod.Context(CachedTextView)) void {
+        self.text = t;
+        cx.notify();
+    }
+
+    fn set_width(self: *CachedTextView, w: Pixels, cx: *app_mod.Context(CachedTextView)) void {
+        self.width = w;
+        cx.notify();
+    }
+
+    fn set_font_size(self: *CachedTextView, fs: Pixels, cx: *app_mod.Context(CachedTextView)) void {
+        self.font_size_px = fs;
+        cx.notify();
+    }
+
+    fn set_flags(self: *CachedTextView, bold: bool, nowrap: bool, ellipsis: bool, cx: *app_mod.Context(CachedTextView)) void {
+        self.bold = bold;
+        self.nowrap = nowrap;
+        self.ellipsis = ellipsis;
+        cx.notify();
+    }
+};
+
+test "text layout skips re-measurement when inputs are unchanged and paints identically across frames" {
+    const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(CachedTextView.build);
+
+    // Frame 1 (initial draw) measured the text.
+    try testing.expect(vcx.window.last_frame_measure_calls() > 0);
+    const initial_sprites = vcx.window.rendered_scene().monochrome_sprites.items.len;
+
+    // 5 consecutive unchanged frames skip measurement and keep painting identically.
+    for (0..5) |_| {
+        cx.update_entity(view, CachedTextView.touch, .{});
+        cx.run_until_parked();
+        try testing.expectEqual(@as(usize, 0), vcx.window.last_frame_measure_calls());
+        try testing.expectEqual(initial_sprites, vcx.window.rendered_scene().monochrome_sprites.items.len);
+    }
+
+    // Changing text re-measures once, then skips again.
+    cx.update_entity(view, CachedTextView.set_text, .{"Different text content"});
+    cx.run_until_parked();
+    try testing.expect(vcx.window.last_frame_measure_calls() > 0);
+    cx.update_entity(view, CachedTextView.touch, .{});
+    cx.run_until_parked();
+    try testing.expectEqual(@as(usize, 0), vcx.window.last_frame_measure_calls());
+
+    // Changing font size re-measures once.
+    cx.update_entity(view, CachedTextView.set_font_size, .{18});
+    cx.run_until_parked();
+    try testing.expect(vcx.window.last_frame_measure_calls() > 0);
+    cx.update_entity(view, CachedTextView.touch, .{});
+    cx.run_until_parked();
+    try testing.expectEqual(@as(usize, 0), vcx.window.last_frame_measure_calls());
+
+    // Changing font weight / white_space / text_overflow re-measures.
+    cx.update_entity(view, CachedTextView.set_flags, .{ true, true, true });
+    cx.run_until_parked();
+    try testing.expect(vcx.window.last_frame_measure_calls() > 0);
+
+    // Changing wrap width re-measures even with identical text/style.
+    cx.update_entity(view, CachedTextView.set_flags, .{ true, false, false });
+    cx.run_until_parked();
+    cx.update_entity(view, CachedTextView.set_width, .{60});
+    cx.run_until_parked();
+    try testing.expect(vcx.window.last_frame_measure_calls() > 0);
+    cx.update_entity(view, CachedTextView.touch, .{});
+    cx.run_until_parked();
+    try testing.expectEqual(@as(usize, 0), vcx.window.last_frame_measure_calls());
+
+    // Bumping TextSystem.font_generation invalidates text measurement cache.
+    cx.app.text_system().font_generation += 1;
+    cx.update_entity(view, CachedTextView.touch, .{});
+    cx.run_until_parked();
+    try testing.expect(vcx.window.last_frame_measure_calls() > 0);
 }

@@ -829,6 +829,10 @@ pub const Window = struct {
     animation_requested: bool = false,
     /// A throttled animation frame (`Animation.with_max_fps`) is waiting for its timer.
     throttled_frame_pending: bool = false,
+    /// Last timestamp (ns) when `advance_scene_animations` presented a frame.
+    last_animation_present_ns: u64 = 0,
+    /// A throttled scene-animation present timer is pending.
+    animation_present_timer_pending: bool = false,
     next_frame_callbacks: std.ArrayList(FrameCallback) = .empty,
     frame_count: u64 = 0,
     default_prevented_: bool = false,
@@ -2058,11 +2062,59 @@ pub const Window = struct {
 
     pub fn request_layout(self: *Window, style: *const Style, children: []const LayoutId, cx: *App) LayoutId {
         _ = cx;
-        return self.layout_engine.request_layout(style, self.rem_size(), self.scale_factor_, children);
+        return self.layout_engine.request_layout(self.current_global_id().hash, style, self.rem_size(), self.scale_factor_, children);
     }
 
     pub fn request_measured_layout(self: *Window, style: *const Style, measure: taffy.MeasureFn) LayoutId {
-        return self.layout_engine.request_measured_layout(style, self.rem_size(), self.scale_factor_, measure);
+        return self.layout_engine.request_measured_layout(self.current_global_id().hash, style, self.rem_size(), self.scale_factor_, measure);
+    }
+
+    /// Like `request_measured_layout`, but `key` describes everything the measured size depends on
+    /// besides `known` and `available`: while `key` is unchanged, Taffy's cached measurements are kept
+    /// without calling `measure` again (GPUI `request_keyed_measured_layout`).
+    pub fn request_keyed_measured_layout(self: *Window, style: *const Style, key: anytype, measure: taffy.MeasureFn) LayoutId {
+        return self.layout_engine.request_keyed_measured_layout(
+            self.current_global_id().hash,
+            style,
+            self.rem_size(),
+            self.scale_factor_,
+            taffy.hashKey(key),
+            measure,
+        );
+    }
+
+    /// Like `request_keyed_measured_layout`, with a `reuse_fn` that restores cached state when the
+    /// key matches (GPUI `request_keyed_measure`).
+    pub fn request_keyed_measure(self: *Window, style: *const Style, key_hash: u64, measure: taffy.MeasureFn, reuse_fn: taffy.ReuseFn, cx: *App) LayoutId {
+        return self.layout_engine.request_keyed_measure(
+            self.current_global_id().hash,
+            style,
+            self.rem_size(),
+            self.scale_factor_,
+            key_hash,
+            measure,
+            reuse_fn,
+            self,
+            cx,
+        );
+    }
+
+    /// Associates a persistent payload with the layout node currently being measured.
+    pub fn set_measure_payload(self: *Window, payload: ?*anyopaque, deinit_fn: ?taffy.PayloadDeinitFn) void {
+        self.layout_engine.set_current_measure_payload(payload, deinit_fn);
+    }
+
+    /// Drops the layout nodes kept from earlier frames, so the next frame builds its tree from scratch.
+    pub fn clear_layout_cache(self: *Window) void {
+        self.layout_engine.clear_layout_cache();
+    }
+
+    pub fn layout_node_count(self: *const Window) usize {
+        return self.layout_engine.node_count();
+    }
+
+    pub fn last_frame_measure_calls(self: *const Window) usize {
+        return self.layout_engine.last_frame_measure_calls;
     }
 
     pub fn compute_layout(self: *Window, id: LayoutId, available_space: Size(AvailableSpace), cx: *App) void {
@@ -2394,9 +2446,26 @@ pub const Window = struct {
     pub fn paint_path(self: *Window, path: scene_mod.Path(Pixels), color: anytype) void {
         var p = path;
         defer p.deinit();
-        var scaled = p.scale(self.scale_factor_) catch oom();
-        scaled.content_mask = self.scaled_content_mask();
-        scaled.color = color_mod.to_background(color).opacity(self.element_opacity());
+        p.close() catch oom();
+        const sf = self.scale_factor_;
+        const mask = self.scaled_content_mask();
+        var tiles = self.next_frame.scene.path_binner.bin(self.allocator, p.curves.items, p.even_odd, sf) catch oom();
+        tiles.retain_visible(mask.bounds);
+        if (tiles.tiles().len == 0) {
+            tiles.deinit();
+            return;
+        }
+        const scaled: scene_mod.Path(ScaledPixels) = .{
+            .allocator = self.allocator,
+            .id = p.id,
+            .order = p.order,
+            .bounds = tiles.painted_bounds(),
+            .paint_bounds_ = tiles.bounds(),
+            .content_mask = mask,
+            .color = color_mod.to_background(color).opacity(self.element_opacity()),
+            .even_odd = p.even_odd,
+            .tiles = tiles,
+        };
         insertPrim(&self.next_frame.scene, .{ .path = scaled });
     }
 
@@ -2526,7 +2595,7 @@ pub const Window = struct {
         };
         insertPrim(&self.next_frame.scene, .{ .monochrome_sprite = .{
             .order = 0,
-            .pad = 0,
+            .animation = .none,
             .bounds = b,
             .content_mask = self.scaled_content_mask(),
             .color = color.opacity(self.element_opacity()),
@@ -2612,6 +2681,21 @@ pub const Window = struct {
         color: Hsla,
         cx: *App,
     ) !void {
+        return self.paint_animated_svg(b, path, data, transformation, null, color, cx);
+    }
+
+    /// Like `paint_svg`, with an `animation` the window applies before every present so the
+    /// view is not re-rendered to advance it (GPUI `Window::paint_animated_svg`).
+    pub fn paint_animated_svg(
+        self: *Window,
+        b: Bounds(Pixels),
+        path: []const u8,
+        data: ?[]const u8,
+        transformation: scene_mod.TransformationMatrix,
+        animation: ?scene_mod.SpriteAnimation,
+        color: Hsla,
+        cx: *App,
+    ) !void {
         const sf = self.scale_factor_;
         const smooth = svg_renderer_mod.SMOOTH_SVG_SCALE_FACTOR;
         const device_size: Size(DevicePixels) = .{
@@ -2629,15 +2713,32 @@ pub const Window = struct {
         const center = b.center();
         const ox = @round(center.x * sf - draw_w / 2.0);
         const oy = @round(center.y * sf - draw_h / 2.0);
-        insertPrim(&self.next_frame.scene, .{ .monochrome_sprite = .{
+        const sprite: scene_mod.MonochromeSprite = .{
             .order = 0,
-            .pad = 0,
+            .animation = .none,
             .bounds = .{ .origin = .{ .x = ox, .y = oy }, .size = .{ .width = draw_w, .height = draw_h } },
             .content_mask = self.scaled_content_mask(),
             .color = color.opacity(self.element_opacity()),
             .tile = tile,
             .transformation = transformation,
-        } });
+        };
+        if (animation) |anim| {
+            self.next_frame.scene.insert_animated_sprite(sprite, anim) catch oom();
+        } else {
+            insertPrim(&self.next_frame.scene, .{ .monochrome_sprite = sprite });
+        }
+    }
+
+    /// Moves every animated sprite in the rendered scene to its pose on the app's synced clock
+    /// without re-rendering views (GPUI `Window::advance_scene_animations`).
+    pub fn advance_scene_animations(self: *Window, cx: *const App) void {
+        const elapsed = executor_mod.now_ns() -| cx.synced_animation_epoch;
+        self.rendered_frame.scene.advance_animations(elapsed);
+    }
+
+    /// How long the window may wait between presents while only scene animations need a frame.
+    pub fn animation_frame_interval(self: *const Window) ?u64 {
+        return self.rendered_frame.scene.animation_frame_interval();
     }
 
     // -- drawing -------------------------------------------------------
@@ -2646,6 +2747,9 @@ pub const Window = struct {
     pub fn draw(self: *Window, cx: *App) void {
         self.drawing = true;
         defer self.drawing = false;
+        const prev_drawing_window = cx.drawing_window;
+        cx.drawing_window = self;
+        defer cx.drawing_window = prev_drawing_window;
         const ts = self.text_system();
         if (self.line_layout_cache == null) self.line_layout_cache = ts.new_layout_cache();
         const outer_cache = ts.active_cache;
@@ -2670,7 +2774,7 @@ pub const Window = struct {
         }
 
         self.next_frame.clear();
-        self.layout_engine.clear();
+        self.layout_engine.clear_if_scale_factor_changed(self.scale_factor_);
         self.next_rendered_entities.clearRetainingCapacity();
         self.text_style_stack.clearRetainingCapacity();
         self.element_offset_stack.clearRetainingCapacity();
@@ -2700,6 +2804,7 @@ pub const Window = struct {
             if (prompt_element) |p| p.paint(self, cx);
             if (overlay) |o| o.paint(self, cx);
         }
+        self.layout_engine.clear();
         cx.pending_updates -= 1;
 
         self.refreshing = false;
@@ -3597,10 +3702,53 @@ pub const Window = struct {
 
     fn onRequestFrame(ctx: *anyopaque, opts: platform_mod.RequestFrameOptions) void {
         const self: *Window = @ptrCast(@alignCast(ctx));
-        if (self.dirty or self.animation_requested or opts.force_render) {
+        const should_draw = self.dirty or self.animation_requested or opts.force_render;
+        if (should_draw) {
             self.draw(self.app);
+            if (self.rendered_frame.scene.animation_frame_interval() != null) {
+                self.advance_scene_animations(self.app);
+                self.last_animation_present_ns = executor_mod.now_ns();
+            }
+            self.present();
+        } else if (self.rendered_frame.scene.animation_frame_interval()) |interval| {
+            const now = executor_mod.now_ns();
+            if (interval == 0 or (now -| self.last_animation_present_ns) >= interval) {
+                self.advance_scene_animations(self.app);
+                self.last_animation_present_ns = now;
+                self.needs_present = true;
+            }
+            self.present();
+        } else {
+            self.present();
         }
-        self.present();
+
+        if (self.rendered_frame.scene.animation_frame_interval()) |next_interval| {
+            if (next_interval == 0) {
+                self.platform_window.request_frame();
+            } else if (!self.animation_present_timer_pending) {
+                self.animation_present_timer_pending = true;
+                const elapsed = executor_mod.now_ns() -| self.last_animation_present_ns;
+                const delay = next_interval -| elapsed;
+                const Timer = struct {
+                    app: *App,
+                    window_id: WindowId,
+
+                    fn fire(t: @This()) void {
+                        const w = t.app.window_by_id(t.window_id) orelse return;
+                        w.animation_present_timer_pending = false;
+                        if (w.rendered_frame.scene.animation_frame_interval() != null) {
+                            w.platform_window.request_frame();
+                        }
+                    }
+                };
+                self.app.background_executor().after(
+                    self.app.foreground_executor(),
+                    @max(delay, 1),
+                    Timer.fire,
+                    Timer{ .app = self.app, .window_id = self.handle_id },
+                );
+            }
+        }
     }
 
     fn onInput(ctx: *anyopaque, event: interactive.PlatformInput) platform_mod.DispatchEventResult {
