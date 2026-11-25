@@ -19436,7 +19436,11 @@ test "visibility, cursor, opacity and debug" {
     _ = M.opacity(&el, 0.5);
     try std.testing.expectEqual(@as(f32, 0.5), el.s.opacity.?);
     _ = M.debug(&el);
-    try std.testing.expect(el.s.debug.?);
+    if (builtin.mode == .debug) {
+        try std.testing.expect(el.s.debug.?);
+    } else {
+        try std.testing.expectEqual(@as(?bool, null), el.s.debug);
+    }
 }
 
 test "bg and font family" {

@@ -212,17 +212,18 @@ Each must run headless with a correct snapshot, and be driven for real: first fr
 - Benchmark: `zig build run-frame_bench -Doptimize=ReleaseFast -j1`, isolated. It times `Window.draw` on the headless
   platform, so no renderer or display counts.
   - Baseline (2026-11-07): 20 views of 60 rows 10.6 ms uncached, 0.72 ms cached with none dirty, 1.5 ms cached with one dirty; 10k quads 36 ms; 2000 lines 5.8 ms.
-  - After Epic 2 (2026-11-25, v0.3.0): 20 views of 60 rows **5.42 ms** uncached, **1.48 ms** cached none dirty, **2.18 ms** cached one dirty; 10k quads **18.94 ms**; 2000 lines **3.25 ms**.
-- Done in Epic 1 & 2:
-  - Persistent `zafi.Tree` layout caching across frames + keyed measure cache for `text` and `img`.
-  - Kind-aware `BoundsTree` batching, fast O(N)-sorted `Scene.finish`, Levien analytical shadows, vertex-clipped primitives, early-Z `opaque_quads` pre-pass, single-pass analytical Slug tiled paths, and zero-re-render animated sprites (`TimedTransformation`).
-  - Cold `Interactivity` fields out-of-line in `InteractivityExtra`, `DivFrameState` 848 B -> 16 B, `DivPrepaintState` 904 B -> 80 B, `Div` 2656 B -> 1064 B, static div fast paths skipping `Style` materialization in layout/prepaint/paint.
-- [ ] Find what still costs in `BoundsTree.insert` / `DispatchTree`, and shrink `StyleRefinement` (968 B) further via compact length/fill layouts
+  - After Epic 2 (v0.3.0): 20 views of 60 rows 5.42 ms uncached, 1.48 ms cached none dirty, 2.18 ms cached one dirty; 10k quads 18.94 ms; 2000 lines 3.25 ms.
+  - After Epic 3 (v0.4.0): 20 views of 60 rows **3.54 ms** uncached (best 2.79 ms), **0.45 ms** cached none dirty (best 0.44 ms), **1.03 ms** cached one dirty (best 0.93 ms); 10k quads **8.65 ms** (best 7.79 ms); 2000 lines **3.24 ms** (best 2.83 ms). CPU renderer 10k gradients: **74.4 ms** (down from 231 ms).
+- Done in Epic 1–3:
+  - Persistent `zafi.Tree` layout caching across frames with dense `LayoutId` slot arrays (no hot-path HashMaps), generation-stamped bounds, and keyed measure cache for `text` and `img`.
+  - Cache-friendly SIMD balanced R-tree `BoundsTree`, compact 20 B `PaintOperation`s with O(N) counting sort in `Scene.finish`, Levien analytical shadows, vertex-clipped primitives, early-Z `opaque_quads` pre-pass, single-pass analytical Slug tiled paths, fast `Binner` small-cell sorting, preallocated GPU batch packing, and zero-re-render animated sprites (`TimedTransformation`).
+  - Optional `DispatchNode` creation (`needs_dispatch_node` skips dispatch nodes on plain `Div`, `Text`, `Empty`), `InteractivityRare` (`InteractivityExtra` 1616 B -> <=320 B), `DivPrepaintState` 904 B -> <=40 B, `DivFrameState` 848 B -> 16 B, 1-child `Div` fast path (16 B), static div fast paths skipping `Style` materialization.
+  - CPU renderer SIMD Chebyshev sRGB/Oklab gradients, hoisted gradient spans, 32-byte SIMD opaque `SolidFill`, fast interior path tiles, and 1:1 aligned glyph blitting.
+- [ ] Shrink `StyleRefinement` (968 B) further via compact length/fill layouts if needed
 - [ ] Compare view caching with GPUI in a release build. GPUI itself has not been built here
 - [ ] Run a cached view on a real Wayland and X11 window; no example uses `cached` yet
 - [ ] Tooltip and throttled animation timers refresh the whole window, because no view is current in a timer. They could remember theirs
 - [ ] X11 XShm presentation
-- [ ] SIMD gradients in the CPU renderer
 - [ ] Benchmarks against GPUI
 - [ ] Measure `paths_bench` on hardware GPU and CPU in ReleaseFast now that Slug tiled paths landed
 
