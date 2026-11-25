@@ -130,7 +130,7 @@ pub fn Drawable(comptime EPtr: type) type {
         element: EPtr,
         phase: Phase = .start,
         layout_id: LayoutId = undefined,
-        dispatch_node_id: key_dispatch.DispatchNodeId = undefined,
+        dispatch_node_id: ?key_dispatch.DispatchNodeId = null,
         global_id: ?GlobalElementId = null,
         bounds: Bounds(Pixels) = undefined,
         rl: E.RequestLayoutState = undefined,
@@ -172,6 +172,13 @@ pub fn Drawable(comptime EPtr: type) type {
             return self.layout_id;
         }
 
+        fn needsDispatchNode(self: *const Self) bool {
+            if (comptime @hasDecl(E, "needs_dispatch_node")) {
+                return self.element.needs_dispatch_node();
+            }
+            return true;
+        }
+
         fn prepaintErased(p: *anyopaque, window: *Window, cx: *App) void {
             const self: *Self = @ptrCast(@alignCast(p));
             std.debug.assert(self.phase == .request_layout or self.phase == .layout_computed);
@@ -179,11 +186,16 @@ pub fn Drawable(comptime EPtr: type) type {
             if (eid) |e| _ = window.push_element_id(e);
             self.bounds = window.layout_bounds(self.layout_id);
             const tree = &window.next_frame.dispatch_tree;
-            tree.push_node();
-            self.dispatch_node_id = tree.active_node_id();
+            const needs_node = self.needsDispatchNode();
+            if (needs_node) {
+                tree.push_node();
+                self.dispatch_node_id = tree.active_node_id();
+            } else {
+                self.dispatch_node_id = null;
+            }
             const gid_ptr: ?*const GlobalElementId = if (self.global_id) |*g| g else null;
             self.pp = self.element.prepaint(gid_ptr, self.bounds, &self.rl, window, cx);
-            tree.pop_node();
+            if (needs_node) tree.pop_node();
             if (eid != null) window.pop_element_id();
             self.phase = .prepaint;
         }
@@ -194,12 +206,17 @@ pub fn Drawable(comptime EPtr: type) type {
             const eid = self.elementId();
             if (eid) |e| _ = window.push_element_id(e);
             const tree = &window.next_frame.dispatch_tree;
-            const previous_node = tree.node_stack.getLastOrNull();
-            tree.set_active_node(self.dispatch_node_id);
-            defer if (previous_node) |id| {
-                tree.set_active_node(id);
-            } else {
-                tree.node_stack.clearRetainingCapacity();
+            const previous_node = if (self.dispatch_node_id) |nid| blk: {
+                const prev = tree.node_stack.getLastOrNull();
+                tree.set_active_node(nid);
+                break :blk prev;
+            } else null;
+            defer if (self.dispatch_node_id != null) {
+                if (previous_node) |id| {
+                    tree.set_active_node(id);
+                } else {
+                    tree.node_stack.clearRetainingCapacity();
+                }
             };
             const gid_ptr: ?*const GlobalElementId = if (self.global_id) |*g| g else null;
             self.element.paint(gid_ptr, self.bounds, &self.rl, &self.pp, window, cx);
@@ -374,4 +391,88 @@ pub fn FluentBuilder(comptime Self: type) type {
             return if (option == null) then(self) else self;
         }
     };
+}
+
+test "optional dispatch_node_id skips DispatchNode creation while preserving ancestry" {
+    const testing = std.testing;
+    const style_mod = @import("style.zig");
+    const TestAppContext = @import("app/test_context.zig").TestAppContext;
+
+    const InteractiveLeaf = struct {
+        focus: window_mod.FocusHandle,
+        paint_active_node: *?key_dispatch.DispatchNodeId,
+        pub const RequestLayoutState = void;
+        pub const PrepaintState = void;
+
+        pub fn needs_dispatch_node(_: *const @This()) bool {
+            return true;
+        }
+        pub fn request_layout(_: *@This(), _: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, void } {
+            const s: style_mod.Style = .{};
+            return .{ window.request_layout(&s, &.{}, cx), {} };
+        }
+        pub fn prepaint(self: *@This(), _: ?*const GlobalElementId, _: Bounds(Pixels), _: *void, window: *Window, cx: *App) void {
+            window.set_focus_handle(&self.focus, cx);
+        }
+        pub fn paint(self: *@This(), _: ?*const GlobalElementId, _: Bounds(Pixels), _: *void, _: *void, window: *Window, _: *App) void {
+            self.paint_active_node.* = window.next_frame.dispatch_tree.node_stack.getLastOrNull();
+        }
+    };
+
+    const SkipContainer = struct {
+        children: [2]AnyElement,
+        pub const RequestLayoutState = void;
+        pub const PrepaintState = void;
+
+        pub fn needs_dispatch_node(_: *const @This()) bool {
+            return false;
+        }
+        pub fn request_layout(self: *@This(), _: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, void } {
+            const c0 = self.children[0].request_layout(window, cx);
+            const c1 = self.children[1].request_layout(window, cx);
+            const s: style_mod.Style = .{};
+            return .{ window.request_layout(&s, &.{ c0, c1 }, cx), {} };
+        }
+        pub fn prepaint(self: *@This(), _: ?*const GlobalElementId, _: Bounds(Pixels), _: *void, window: *Window, cx: *App) void {
+            self.children[0].prepaint(window, cx);
+            self.children[1].prepaint(window, cx);
+        }
+        pub fn paint(self: *@This(), _: ?*const GlobalElementId, _: Bounds(Pixels), _: *void, _: *void, window: *Window, cx: *App) void {
+            self.children[0].paint(window, cx);
+            self.children[1].paint(window, cx);
+        }
+    };
+
+    const RootView = struct {
+        focus: window_mod.FocusHandle,
+        paint_active_node: ?key_dispatch.DispatchNodeId = null,
+
+        pub fn render(self: *@This(), _: *Window, _: *app_mod.Context(@This())) AnyElement {
+            const leaf = window_mod.frame_arena().create(InteractiveLeaf) catch @panic("OOM");
+            leaf.* = .{ .focus = self.focus, .paint_active_node = &self.paint_active_node };
+            const inner_skip = window_mod.frame_arena().create(SkipContainer) catch @panic("OOM");
+            inner_skip.* = .{ .children = .{ @import("elements/empty.zig").empty(), AnyElement.new(leaf) } };
+            const outer_skip = window_mod.frame_arena().create(SkipContainer) catch @panic("OOM");
+            outer_skip.* = .{ .children = .{ @import("elements/empty.zig").empty(), AnyElement.new(inner_skip) } };
+            return AnyElement.new(outer_skip);
+        }
+    };
+
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(struct {
+        fn build(_: *Window, app: *App) app_mod.Entity(RootView) {
+            return app.new(RootView{ .focus = app.focus_handle() });
+        }
+    }.build);
+
+    const tree = &vcx.window.rendered_frame.dispatch_tree;
+    // Only 2 dispatch nodes: RootView (0) and InteractiveLeaf (1).
+    // Both SkipContainers and both Empty elements skipped node creation!
+    try testing.expectEqual(@as(usize, 2), tree.len());
+    const leaf_node = tree.focusable_node_id(view.read(cx.app).focus.id).?;
+    try testing.expectEqual(@as(key_dispatch.DispatchNodeId, 1), leaf_node);
+    // InteractiveLeaf's parent is RootView (0) directly across the skipped ancestors.
+    try testing.expectEqual(@as(?key_dispatch.DispatchNodeId, 0), tree.node(leaf_node).parent);
+    try testing.expectEqual(@as(?key_dispatch.DispatchNodeId, 1), view.read(cx.app).paint_active_node);
 }

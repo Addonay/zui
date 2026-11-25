@@ -16,6 +16,11 @@ const Style = style_mod.Style;
 /// Identifies a node in the layout tree.
 pub const LayoutId = zafi.NodeId;
 
+/// Extracts the dense 24-bit slot index from a generational `zafi.NodeId`.
+inline fn slotIndex(id: LayoutId) u32 {
+    return @truncate(id & 0xFF_FFFF);
+}
+
 /// Available space along one axis.
 pub const AvailableSpace = union(enum) {
     definite: Pixels,
@@ -78,9 +83,11 @@ const GridBuffers = struct {
     rows_comps: [1]zafi.GridTemplateComponent = undefined,
 };
 
-const CachedNode = struct {
-    style: LayoutStyle,
-    frame: u64,
+const CachedNodeSlot = struct {
+    id: LayoutId = 0,
+    alive: bool = false,
+    style: LayoutStyle = undefined,
+    frame: u64 = 0,
     stretched: bool = false,
     grid_buffers: ?*GridBuffers = null,
 };
@@ -90,9 +97,17 @@ const ComputedBounds = struct {
     bounds: Bounds(Pixels),
 };
 
+const ComputedBoundsSlot = struct {
+    origin: Point(f32) = undefined,
+    bounds: Bounds(Pixels) = undefined,
+    bounds_frame: u64 = 0,
+    computed_frame: u64 = 0,
+};
+
 const LayoutCache = struct {
     scopes: std.AutoHashMapUnmanaged(u64, LayoutScope) = .empty,
-    nodes: std.AutoHashMapUnmanaged(LayoutId, CachedNode) = .empty,
+    /// Dense slot array indexed by `slotIndex(id)` (eliminates per-node HashMap lookups).
+    node_slots: std.ArrayList(CachedNodeSlot) = .empty,
     /// Nodes no element requested last frame, detached from the tree.
     free_nodes: std.ArrayList(LayoutId) = .empty,
     frame: u64 = 0,
@@ -101,6 +116,24 @@ const LayoutCache = struct {
     /// Single-entry cache for consecutive sibling nodes sharing the same `scope_key`.
     last_scope_key: u64 = 0,
     last_scope_ptr: ?*LayoutScope = null,
+
+    inline fn getNodeSlot(self: *LayoutCache, id: LayoutId) ?*CachedNodeSlot {
+        const idx = slotIndex(id);
+        if (idx >= self.node_slots.items.len) return null;
+        const slot = &self.node_slots.items[idx];
+        if (!slot.alive or slot.id != id) return null;
+        return slot;
+    }
+
+    inline fn putNodeSlot(self: *LayoutCache, allocator: std.mem.Allocator, id: LayoutId, slot_val: CachedNodeSlot) void {
+        const idx = slotIndex(id);
+        if (idx >= self.node_slots.items.len) {
+            const old_len = self.node_slots.items.len;
+            self.node_slots.resize(allocator, idx + 1) catch oom();
+            @memset(self.node_slots.items[old_len..], .{});
+        }
+        self.node_slots.items[idx] = slot_val;
+    }
 };
 
 const MeasureEntry = struct {
@@ -110,14 +143,24 @@ const MeasureEntry = struct {
     payload_deinit: ?PayloadDeinitFn = null,
 };
 
+const MeasureSlot = struct {
+    id: LayoutId = 0,
+    alive: bool = false,
+    entry: MeasureEntry = undefined,
+};
+
 /// GPUI `TaffyLayoutEngine`.
 pub const TaffyLayoutEngine = struct {
     taffy: zafi.Tree,
     cache: LayoutCache = .{},
     /// Kept outside `zafi.Tree`, whose `set_node_context` marks a node dirty on every call.
-    measures: std.AutoHashMapUnmanaged(LayoutId, MeasureEntry) = .empty,
-    computed_bounds: std.AutoHashMapUnmanaged(LayoutId, ComputedBounds) = .empty,
-    computed_layouts: std.AutoHashMapUnmanaged(LayoutId, void) = .empty,
+    /// Dense slot array indexed by `slotIndex(id)` (eliminates HashMap lookups in measureTrampoline).
+    measure_slots: std.ArrayList(MeasureSlot) = .empty,
+    measure_count: usize = 0,
+    /// Dense per-node bounds & layout stamp array indexed by `slotIndex(id)`.
+    bounds_slots: std.ArrayList(ComputedBoundsSlot) = .empty,
+    bounds_frame: u64 = 1,
+    dead_scopes: std.ArrayList(u64) = .empty,
     scratch: std.ArrayList(LayoutId) = .empty,
     allocator: std.mem.Allocator,
 
@@ -139,8 +182,8 @@ pub const TaffyLayoutEngine = struct {
     pub fn deinit(self: *TaffyLayoutEngine) void {
         self.freeAllCacheResources();
         self.taffy.deinit();
-        self.computed_bounds.deinit(self.allocator);
-        self.computed_layouts.deinit(self.allocator);
+        self.bounds_slots.deinit(self.allocator);
+        self.dead_scopes.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
     }
 
@@ -150,22 +193,28 @@ pub const TaffyLayoutEngine = struct {
         while (scope_it.next()) |scope| scope.nodes.deinit(self.allocator);
         self.cache.scopes.deinit(self.allocator);
 
-        var node_it = self.cache.nodes.valueIterator();
-        while (node_it.next()) |node| {
-            if (node.grid_buffers) |buf| self.allocator.destroy(buf);
+        for (self.cache.node_slots.items) |*slot| {
+            if (slot.alive) {
+                if (slot.grid_buffers) |buf| self.allocator.destroy(buf);
+                slot.grid_buffers = null;
+                slot.alive = false;
+            }
         }
-        self.cache.nodes.deinit(self.allocator);
+        self.cache.node_slots.deinit(self.allocator);
         self.cache.free_nodes.deinit(self.allocator);
         self.cache = .{};
 
-        var measure_it = self.measures.valueIterator();
-        while (measure_it.next()) |entry| {
-            if (entry.payload) |p| {
-                if (entry.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
+        for (self.measure_slots.items) |*slot| {
+            if (slot.alive) {
+                if (slot.entry.payload) |p| {
+                    if (slot.entry.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
+                }
+                slot.alive = false;
             }
         }
-        self.measures.deinit(self.allocator);
-        self.measures = .empty;
+        self.measure_slots.deinit(self.allocator);
+        self.measure_slots = .empty;
+        self.measure_count = 0;
     }
 
     /// Drops every layout node kept from earlier frames, so the next frame builds its tree from scratch.
@@ -173,8 +222,7 @@ pub const TaffyLayoutEngine = struct {
         self.freeAllCacheResources();
         self.taffy.clear();
         self.cache = .{};
-        self.computed_bounds.clearRetainingCapacity();
-        self.computed_layouts.clearRetainingCapacity();
+        self.bounds_frame += 1;
         self.measure_calls = 0;
         self.last_frame_measure_calls = 0;
     }
@@ -196,8 +244,7 @@ pub const TaffyLayoutEngine = struct {
     /// Ends the frame: nodes that weren't requested during it are detached and evicted after one spare frame.
     pub fn clear(self: *TaffyLayoutEngine) void {
         self.evict_unrequested();
-        self.computed_bounds.clearRetainingCapacity();
-        self.computed_layouts.clearRetainingCapacity();
+        self.bounds_frame += 1;
         self.last_frame_measure_calls = self.measure_calls;
         self.measure_calls = 0;
     }
@@ -206,16 +253,17 @@ pub const TaffyLayoutEngine = struct {
         const cache = &self.cache;
         cache.last_scope_ptr = null;
         for (cache.free_nodes.items) |id| {
-            if (cache.nodes.fetchRemove(id)) |kv| {
-                if (kv.value.grid_buffers) |buf| self.allocator.destroy(buf);
+            if (cache.getNodeSlot(id)) |slot| {
+                if (slot.grid_buffers) |buf| self.allocator.destroy(buf);
+                slot.grid_buffers = null;
+                slot.alive = false;
             }
             self.removeMeasure(id);
             _ = self.taffy.remove(id) catch {};
         }
         cache.free_nodes.clearRetainingCapacity();
 
-        var dead_scopes: std.ArrayList(u64) = .empty;
-        defer dead_scopes.deinit(self.allocator);
+        self.dead_scopes.clearRetainingCapacity();
         var it = cache.scopes.iterator();
         while (it.next()) |kv| {
             const scope = kv.value_ptr;
@@ -226,10 +274,10 @@ pub const TaffyLayoutEngine = struct {
                 scope.nodes.shrinkRetainingCapacity(requested);
             }
             if (requested == 0) {
-                dead_scopes.append(self.allocator, kv.key_ptr.*) catch oom();
+                self.dead_scopes.append(self.allocator, kv.key_ptr.*) catch oom();
             }
         }
-        for (dead_scopes.items) |key| {
+        for (self.dead_scopes.items) |key| {
             if (cache.scopes.fetchRemove(key)) |kv| {
                 var s = kv.value;
                 s.nodes.deinit(self.allocator);
@@ -247,18 +295,41 @@ pub const TaffyLayoutEngine = struct {
         cache.frame += 1;
     }
 
-    fn removeMeasure(self: *TaffyLayoutEngine, id: LayoutId) void {
-        if (self.measures.fetchRemove(id)) |kv| {
-            if (kv.value.payload) |p| {
-                if (kv.value.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
-            }
+    inline fn getMeasurePtr(self: *TaffyLayoutEngine, id: LayoutId) ?*MeasureEntry {
+        const idx = slotIndex(id);
+        if (idx >= self.measure_slots.items.len) return null;
+        const slot = &self.measure_slots.items[idx];
+        if (!slot.alive or slot.id != id) return null;
+        return &slot.entry;
+    }
+
+    inline fn ensureMeasureSlot(self: *TaffyLayoutEngine, id: LayoutId) *MeasureSlot {
+        const idx = slotIndex(id);
+        if (idx >= self.measure_slots.items.len) {
+            const old_len = self.measure_slots.items.len;
+            self.measure_slots.resize(self.allocator, idx + 1) catch oom();
+            @memset(self.measure_slots.items[old_len..], .{});
         }
+        return &self.measure_slots.items[idx];
+    }
+
+    fn removeMeasure(self: *TaffyLayoutEngine, id: LayoutId) void {
+        if (self.measure_count == 0) return;
+        const idx = slotIndex(id);
+        if (idx >= self.measure_slots.items.len) return;
+        const slot = &self.measure_slots.items[idx];
+        if (!slot.alive or slot.id != id) return;
+        if (slot.entry.payload) |p| {
+            if (slot.entry.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
+        }
+        slot.alive = false;
+        self.measure_count -= 1;
     }
 
     /// Updates the persistent payload on the currently-measuring node (called during `MeasureFn`).
     pub fn set_current_measure_payload(self: *TaffyLayoutEngine, payload: ?*anyopaque, deinit_fn: ?PayloadDeinitFn) void {
         const id = self.cur_measure_node orelse return;
-        const entry = self.measures.getPtr(id) orelse return;
+        const entry = self.getMeasurePtr(id) orelse return;
         if (entry.payload) |old| {
             if (old != payload) {
                 if (entry.payload_deinit) |old_deinit| old_deinit(self.allocator, old);
@@ -280,11 +351,9 @@ pub const TaffyLayoutEngine = struct {
 
     fn request_layout_any(self: *TaffyLayoutEngine, scope: u64, style: anytype, rem_size: Pixels, scale_factor: f32, children: []const LayoutId) LayoutId {
         const id = self.acquire_node(scope, style, rem_size, scale_factor, children);
-        if (self.measures.count() > 0) {
-            if (self.measures.fetchRemove(id)) |kv| {
-                if (kv.value.payload) |p| {
-                    if (kv.value.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
-                }
+        if (self.measure_count > 0) {
+            if (self.getMeasurePtr(id) != null) {
+                self.removeMeasure(id);
                 self.taffy.mark_dirty(id);
             }
         }
@@ -293,13 +362,23 @@ pub const TaffyLayoutEngine = struct {
 
     pub fn request_measured_layout(self: *TaffyLayoutEngine, scope: u64, style: *const Style, rem_size: Pixels, scale_factor: f32, measure: MeasureFn) LayoutId {
         const id = self.acquire_node(scope, style, rem_size, scale_factor, &.{});
-        const gop = self.measures.getOrPut(self.allocator, id) catch oom();
-        if (gop.found_existing) {
-            if (gop.value_ptr.payload) |p| {
-                if (gop.value_ptr.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
+        const slot = self.ensureMeasureSlot(id);
+        if (slot.alive and slot.id == id) {
+            if (slot.entry.payload) |p| {
+                if (slot.entry.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
             }
+        } else {
+            if (slot.alive) {
+                if (slot.entry.payload) |p| {
+                    if (slot.entry.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
+                }
+            } else {
+                self.measure_count += 1;
+            }
+            slot.id = id;
+            slot.alive = true;
         }
-        gop.value_ptr.* = .{ .measure = measure, .key_hash = null };
+        slot.entry = .{ .measure = measure, .key_hash = null };
         self.taffy.mark_dirty(id);
         return id;
     }
@@ -329,9 +408,9 @@ pub const TaffyLayoutEngine = struct {
         cx: ?*App,
     ) LayoutId {
         const id = self.acquire_node(scope, style, rem_size, scale_factor, &.{});
-        const gop = self.measures.getOrPut(self.allocator, id) catch oom();
-        if (gop.found_existing) {
-            const entry = gop.value_ptr;
+        const slot = self.ensureMeasureSlot(id);
+        if (slot.alive and slot.id == id) {
+            const entry = &slot.entry;
             if (entry.key_hash != null and entry.key_hash.? == key_hash) {
                 const reused = if (reuse_fn) |rf|
                     rf(measure.ctx, entry.payload, window.?, cx.?)
@@ -345,8 +424,18 @@ pub const TaffyLayoutEngine = struct {
             if (entry.payload) |p| {
                 if (entry.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
             }
+        } else {
+            if (slot.alive) {
+                if (slot.entry.payload) |p| {
+                    if (slot.entry.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
+                }
+            } else {
+                self.measure_count += 1;
+            }
+            slot.id = id;
+            slot.alive = true;
         }
-        gop.value_ptr.* = .{ .measure = measure, .key_hash = key_hash };
+        slot.entry = .{ .measure = measure, .key_hash = key_hash };
         self.taffy.mark_dirty(id);
         return id;
     }
@@ -370,7 +459,7 @@ pub const TaffyLayoutEngine = struct {
 
         if (ordinal < scope.nodes.items.len) {
             const existing_id = scope.nodes.items[ordinal];
-            const node = cache.nodes.getPtr(existing_id).?;
+            const node = cache.getNodeSlot(existing_id).?;
             std.debug.assert(node.frame != frame); // layout node requested twice in one frame
             if (node.stretched or !node.style.matchesAny(style, rem_size, scale_factor)) {
                 const prev_grid_cols = node.style.grid_cols;
@@ -398,7 +487,7 @@ pub const TaffyLayoutEngine = struct {
 
         const layout_style = LayoutStyle.fromAny(style, rem_size, scale_factor);
         const new_id: LayoutId = if (cache.free_nodes.pop()) |recycled| rblk: {
-            const node = cache.nodes.getPtr(recycled).?;
+            const node = cache.getNodeSlot(recycled).?;
             node.style = layout_style;
             node.frame = frame;
             node.stretched = false;
@@ -412,12 +501,14 @@ pub const TaffyLayoutEngine = struct {
                 if (grid_buffers) |buf| self.allocator.destroy(buf);
                 oom();
             };
-            cache.nodes.put(self.allocator, leaf_id, .{
+            cache.putNodeSlot(self.allocator, leaf_id, .{
+                .id = leaf_id,
+                .alive = true,
                 .style = layout_style,
                 .frame = frame,
                 .stretched = false,
                 .grid_buffers = grid_buffers,
-            }) catch oom();
+            });
             break :lblk leaf_id;
         };
         if (children.len > 0) {
@@ -433,7 +524,7 @@ pub const TaffyLayoutEngine = struct {
         const sw = s.size.width.is_auto();
         const sh = s.size.height.is_auto();
         if (!sw and !sh) return;
-        if (self.cache.nodes.getPtr(id)) |node| {
+        if (self.cache.getNodeSlot(id)) |node| {
             node.stretched = true;
         }
         if (sw) s.size.width = .length(@round(sz.width * scale_factor));
@@ -441,25 +532,39 @@ pub const TaffyLayoutEngine = struct {
         self.taffy.set_style(id, s) catch oom();
     }
 
+    inline fn ensureBoundsSlot(self: *TaffyLayoutEngine, id: LayoutId) u32 {
+        const idx = slotIndex(id);
+        if (idx >= self.bounds_slots.items.len) {
+            const old_len = self.bounds_slots.items.len;
+            self.bounds_slots.resize(self.allocator, idx + 1) catch oom();
+            @memset(self.bounds_slots.items[old_len..], .{});
+        }
+        return idx;
+    }
+
     pub fn compute_layout(self: *TaffyLayoutEngine, id: LayoutId, available_space: Size(AvailableSpace), window: *Window, cx: *App) void {
         // A node computed as a root may still be attached to a parent from an earlier frame
         // that no element requested in this one. Its layout must not be relative to that parent.
         if (self.taffy.parent(id) catch null) |parent| {
-            const parent_active = if (self.cache.nodes.get(parent)) |node| node.frame == self.cache.frame else false;
+            const parent_active = if (self.cache.getNodeSlot(parent)) |node| node.frame == self.cache.frame else false;
             if (!parent_active) {
                 _ = self.taffy.remove_child(parent, id) catch {};
             }
         }
-        const gop = self.computed_layouts.getOrPut(self.allocator, id) catch oom();
-        if (gop.found_existing) {
+        const idx = self.ensureBoundsSlot(id);
+        if (self.bounds_slots.items[idx].computed_frame == self.bounds_frame) {
             self.scratch.clearRetainingCapacity();
             self.scratch.append(self.allocator, id) catch oom();
             while (self.scratch.pop()) |n| {
-                _ = self.computed_bounds.remove(n);
+                const n_idx = slotIndex(n);
+                if (n_idx < self.bounds_slots.items.len) {
+                    self.bounds_slots.items[n_idx].bounds_frame = 0;
+                }
                 const kids = self.taffy.children(n) catch &.{};
                 self.scratch.appendSlice(self.allocator, kids) catch oom();
             }
         }
+        self.bounds_slots.items[idx].computed_frame = self.bounds_frame;
         const scale = window.scale_factor();
         const prev_window = self.cur_window;
         const prev_app = self.cur_app;
@@ -486,7 +591,7 @@ pub const TaffyLayoutEngine = struct {
     fn measureTrampoline(context: ?*anyopaque, inputs: zafi.LayoutInput, node_id: zafi.NodeId, s: *const zafi.Style) zafi.LayoutOutput {
         _ = context;
         const self = current_engine orelse return zafi.compute_leaf_layout(inputs, s, null, null);
-        const entry = self.measures.getPtr(node_id);
+        const entry = self.getMeasurePtr(node_id);
         const prev_final = self.cur_final_layout;
         const prev_node = self.cur_measure_node;
         self.cur_final_layout = inputs.run_mode == .perform_layout;
@@ -525,7 +630,11 @@ pub const TaffyLayoutEngine = struct {
     }
 
     fn layout_bounds_entry(self: *TaffyLayoutEngine, id: LayoutId, scale_factor: f32) ComputedBounds {
-        if (self.computed_bounds.get(id)) |entry| return entry;
+        const idx = self.ensureBoundsSlot(id);
+        const slot = self.bounds_slots.items[idx];
+        if (slot.bounds_frame == self.bounds_frame) {
+            return .{ .origin = slot.origin, .bounds = slot.bounds };
+        }
         const lay = self.taffy.layout_of(id) catch unreachable;
         const loc: Point(f32) = .{ .x = lay.location.x, .y = lay.location.y };
         const parent = self.taffy.parent(id) catch null;
@@ -538,12 +647,15 @@ pub const TaffyLayoutEngine = struct {
         const y0 = roundHalfTowardZero(origin.y) / scale_factor;
         const x1 = roundHalfTowardZero(far.x) / scale_factor;
         const y1 = roundHalfTowardZero(far.y) / scale_factor;
-        const entry: ComputedBounds = .{
-            .origin = origin,
-            .bounds = .{ .origin = .{ .x = x0, .y = y0 }, .size = .{ .width = x1 - x0, .height = y1 - y0 } },
+        const bounds: Bounds(Pixels) = .{
+            .origin = .{ .x = x0, .y = y0 },
+            .size = .{ .width = x1 - x0, .height = y1 - y0 },
         };
-        self.computed_bounds.put(self.allocator, id, entry) catch oom();
-        return entry;
+        // Re-index after recursive parent lookup in case `bounds_slots` resized.
+        self.bounds_slots.items[idx].origin = origin;
+        self.bounds_slots.items[idx].bounds = bounds;
+        self.bounds_slots.items[idx].bounds_frame = self.bounds_frame;
+        return .{ .origin = origin, .bounds = bounds };
     }
 };
 
@@ -1115,7 +1227,7 @@ test "LayoutCache reuses LayoutIds across frames, recycles and evicts unrequeste
     const root_f2 = engine.request_layout(1, &grid_style, 16, 1, &.{c0_f2});
     try testing.expectEqual(c0_f0, c0_f2);
     try testing.expectEqual(root_f0, root_f2);
-    try testing.expect(engine.cache.nodes.get(root_f2).?.grid_buffers == null);
+    try testing.expect(engine.cache.getNodeSlot(root_f2).?.grid_buffers == null);
     engine.clear();
     try testing.expectEqual(@as(usize, 1), engine.cache.free_nodes.items.len);
     try testing.expectEqual(@as(usize, 3), engine.node_count());
@@ -1139,7 +1251,7 @@ test "stretch_auto_size_to_fill restores real style when node is reused" {
     engine.stretch_auto_size_to_fill(id0, .{ .width = 300, .height = 200 }, 1);
     const stretched = try engine.taffy.style_of(id0);
     try testing.expect(!stretched.size.width.is_auto());
-    try testing.expect(engine.cache.nodes.get(id0).?.stretched);
+    try testing.expect(engine.cache.getNodeSlot(id0).?.stretched);
     engine.clear();
 
     const id1 = engine.request_layout(0, &auto_style, 16, 1, &.{});
@@ -1147,7 +1259,7 @@ test "stretch_auto_size_to_fill restores real style when node is reused" {
     const restored = try engine.taffy.style_of(id1);
     try testing.expect(restored.size.width.is_auto());
     try testing.expect(restored.size.height.is_auto());
-    try testing.expect(!engine.cache.nodes.get(id1).?.stretched);
+    try testing.expect(!engine.cache.getNodeSlot(id1).?.stretched);
     engine.clear();
 }
 
