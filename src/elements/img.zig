@@ -121,9 +121,14 @@ pub const ImgExt = struct {
         e.frame_index = advance_frame(data, gid, window, cx);
 
         // Intrinsic size in logical pixels; the measure callback fills whichever dimension is auto.
+        const intrinsic = data.render_size(e.frame_index);
         const measure = window_mod.frame_arena().create(Measure) catch @panic("OOM");
-        measure.* = .{ .intrinsic = data.render_size(e.frame_index) };
-        return window.request_measured_layout(s, .{ .ctx = measure, .func = Measure.measure });
+        measure.* = .{ .intrinsic = intrinsic };
+        const key: MeasureKey = .{
+            .intrinsic = intrinsic,
+            .object_fit = e.style.object_fit,
+        };
+        return window.request_keyed_measured_layout(s, key, .{ .ctx = measure, .func = Measure.measure });
     }
 
     pub fn paint_ext(self: anytype, bounds: Bounds(Pixels), s: *const Style, window: *Window, cx: *App) void {
@@ -174,6 +179,11 @@ fn advance_frame(data: *assets.RenderImage, gid: ?*const GlobalElementId, window
     window.request_animation_frame();
     return state.frame_index;
 }
+
+const MeasureKey = struct {
+    intrinsic: Size(Pixels),
+    object_fit: style_mod.ObjectFit,
+};
 
 const Measure = struct {
     intrinsic: Size(Pixels),
@@ -264,6 +274,83 @@ test "element protocol instantiates the image hooks" {
     _ = &Img.object_fit;
     _ = &Img.grayscale;
     _ = &Img.with_fallback;
+}
+
+test "img uses keyed measured layout and skips re-measurement when image dimensions and fit are unchanged" {
+    const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+    const alloc = std.testing.allocator;
+
+    const make_img = struct {
+        fn f(a: std.mem.Allocator, w: u32, h: u32) !*assets.RenderImage {
+            const frames = try a.alloc(assets.Frame, 1);
+            const pixels = try a.alloc(u8, w * h * 4);
+            @memset(pixels, 0xff);
+            frames[0] = .{ .width = w, .height = h, .delay_ms = 0, .pixels = pixels };
+            return assets.RenderImage.new(a, frames);
+        }
+    }.f;
+
+    const img_a = try make_img(alloc, 16, 8);
+    defer img_a.deinit();
+    const img_b = try make_img(alloc, 32, 12);
+    defer img_b.deinit();
+
+    const View = struct {
+        current: ?*assets.RenderImage = null,
+        fit: style_mod.ObjectFit = .contain,
+
+        pub fn render(self: *@This(), _: *Window, _: *app_mod.Context(@This())) *div.Div {
+            var root = div.div().flex();
+            if (self.current) |cur| root = root.child(img(cur).object_fit(self.fit));
+            return root;
+        }
+
+        fn build(_: *Window, app: *App) app_mod.Entity(@This()) {
+            return app.new(@This(){});
+        }
+        fn touch(_: *@This(), cx: *app_mod.Context(@This())) void {
+            cx.notify();
+        }
+        fn set_image(self: *@This(), next: *assets.RenderImage, cx: *app_mod.Context(@This())) void {
+            self.current = next;
+            cx.notify();
+        }
+        fn set_fit(self: *@This(), fit: style_mod.ObjectFit, cx: *app_mod.Context(@This())) void {
+            self.fit = fit;
+            cx.notify();
+        }
+    };
+
+    var cx = TestAppContext.build(0);
+    defer cx.deinit();
+    const view, const vcx = cx.add_window_view(View.build);
+
+    view.update(cx.app, View.set_image, .{img_a});
+    cx.run_until_parked();
+    try std.testing.expect(vcx.window.last_frame_measure_calls() > 0);
+
+    // Unchanged image dimensions and object_fit skip re-measurement.
+    for (0..3) |_| {
+        view.update(cx.app, View.touch, .{});
+        cx.run_until_parked();
+        try std.testing.expectEqual(@as(usize, 0), vcx.window.last_frame_measure_calls());
+    }
+
+    // Changing object_fit invalidates keyed measure.
+    view.update(cx.app, View.set_fit, .{.cover});
+    cx.run_until_parked();
+    try std.testing.expect(vcx.window.last_frame_measure_calls() > 0);
+    view.update(cx.app, View.touch, .{});
+    cx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 0), vcx.window.last_frame_measure_calls());
+
+    // Changing image dimensions invalidates keyed measure.
+    view.update(cx.app, View.set_image, .{img_b});
+    cx.run_until_parked();
+    try std.testing.expect(vcx.window.last_frame_measure_calls() > 0);
+    view.update(cx.app, View.touch, .{});
+    cx.run_until_parked();
+    try std.testing.expectEqual(@as(usize, 0), vcx.window.last_frame_measure_calls());
 }
 
 test {

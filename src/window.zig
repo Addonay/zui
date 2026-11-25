@@ -2058,11 +2058,59 @@ pub const Window = struct {
 
     pub fn request_layout(self: *Window, style: *const Style, children: []const LayoutId, cx: *App) LayoutId {
         _ = cx;
-        return self.layout_engine.request_layout(style, self.rem_size(), self.scale_factor_, children);
+        return self.layout_engine.request_layout(self.current_global_id().hash, style, self.rem_size(), self.scale_factor_, children);
     }
 
     pub fn request_measured_layout(self: *Window, style: *const Style, measure: taffy.MeasureFn) LayoutId {
-        return self.layout_engine.request_measured_layout(style, self.rem_size(), self.scale_factor_, measure);
+        return self.layout_engine.request_measured_layout(self.current_global_id().hash, style, self.rem_size(), self.scale_factor_, measure);
+    }
+
+    /// Like `request_measured_layout`, but `key` describes everything the measured size depends on
+    /// besides `known` and `available`: while `key` is unchanged, Taffy's cached measurements are kept
+    /// without calling `measure` again (GPUI `request_keyed_measured_layout`).
+    pub fn request_keyed_measured_layout(self: *Window, style: *const Style, key: anytype, measure: taffy.MeasureFn) LayoutId {
+        return self.layout_engine.request_keyed_measured_layout(
+            self.current_global_id().hash,
+            style,
+            self.rem_size(),
+            self.scale_factor_,
+            taffy.hashKey(key),
+            measure,
+        );
+    }
+
+    /// Like `request_keyed_measured_layout`, with a `reuse_fn` that restores cached state when the
+    /// key matches (GPUI `request_keyed_measure`).
+    pub fn request_keyed_measure(self: *Window, style: *const Style, key_hash: u64, measure: taffy.MeasureFn, reuse_fn: taffy.ReuseFn, cx: *App) LayoutId {
+        return self.layout_engine.request_keyed_measure(
+            self.current_global_id().hash,
+            style,
+            self.rem_size(),
+            self.scale_factor_,
+            key_hash,
+            measure,
+            reuse_fn,
+            self,
+            cx,
+        );
+    }
+
+    /// Associates a persistent payload with the layout node currently being measured.
+    pub fn set_measure_payload(self: *Window, payload: ?*anyopaque, deinit_fn: ?taffy.PayloadDeinitFn) void {
+        self.layout_engine.set_current_measure_payload(payload, deinit_fn);
+    }
+
+    /// Drops the layout nodes kept from earlier frames, so the next frame builds its tree from scratch.
+    pub fn clear_layout_cache(self: *Window) void {
+        self.layout_engine.clear_layout_cache();
+    }
+
+    pub fn layout_node_count(self: *const Window) usize {
+        return self.layout_engine.node_count();
+    }
+
+    pub fn last_frame_measure_calls(self: *const Window) usize {
+        return self.layout_engine.last_frame_measure_calls;
     }
 
     pub fn compute_layout(self: *Window, id: LayoutId, available_space: Size(AvailableSpace), cx: *App) void {
@@ -2670,7 +2718,7 @@ pub const Window = struct {
         }
 
         self.next_frame.clear();
-        self.layout_engine.clear();
+        self.layout_engine.clear_if_scale_factor_changed(self.scale_factor_);
         self.next_rendered_entities.clearRetainingCapacity();
         self.text_style_stack.clearRetainingCapacity();
         self.element_offset_stack.clearRetainingCapacity();
@@ -2700,6 +2748,7 @@ pub const Window = struct {
             if (prompt_element) |p| p.paint(self, cx);
             if (overlay) |o| o.paint(self, cx);
         }
+        self.layout_engine.clear();
         cx.pending_updates -= 1;
 
         self.refreshing = false;
