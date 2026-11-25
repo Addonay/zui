@@ -10,6 +10,10 @@ pub const Empty = struct {
     pub const RequestLayoutState = void;
     pub const PrepaintState = void;
 
+    pub fn needs_dispatch_node(_: *const Empty) bool {
+        return false;
+    }
+
     pub fn request_layout(_: *Empty, _: ?*const element_mod.GlobalElementId, window: *window_mod.Window, cx: *@import("../app.zig").App) struct { taffy.LayoutId, void } {
         const style: style_mod.Style = .{};
         return .{ window.request_layout(&style, &.{}, cx), {} };

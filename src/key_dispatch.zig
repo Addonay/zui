@@ -182,6 +182,7 @@ pub const DispatchTree = struct {
     nodes: std.ArrayList(DispatchNode) = .empty,
     count: usize = 0,
     node_stack: std.ArrayList(DispatchNodeId) = .empty,
+    reuse_stack: std.ArrayList(DispatchNodeId) = .empty,
     focusable: std.AutoHashMapUnmanaged(u64, DispatchNodeId) = .empty,
     view_nodes: std.AutoHashMapUnmanaged(app_mod.EntityId, DispatchNodeId) = .empty,
 
@@ -196,6 +197,7 @@ pub const DispatchTree = struct {
         }
         self.nodes.deinit(self.gpa);
         self.node_stack.deinit(self.gpa);
+        self.reuse_stack.deinit(self.gpa);
         self.focusable.deinit(self.gpa);
         self.view_nodes.deinit(self.gpa);
     }
@@ -301,19 +303,18 @@ pub const DispatchTree = struct {
     pub fn reuse_subtree(self: *DispatchTree, old_start: usize, old_end: usize, source: *DispatchTree, focus: ?u64) ReusedSubtree {
         const new_start = self.count;
         var contains_focus = false;
-        // Ancestors within the range.
-        var stack: std.ArrayList(DispatchNodeId) = .empty;
-        defer stack.deinit(self.gpa);
+        // Ancestors within the range (reuse stack avoids per-call heap allocation).
+        self.reuse_stack.clearRetainingCapacity();
         for (source.nodes.items[old_start..old_end], old_start..) |*source_node, source_id| {
-            while (stack.items.len > 0 and source_node.parent != stack.items[stack.items.len - 1]) {
-                _ = stack.pop();
+            while (self.reuse_stack.items.len > 0 and source_node.parent != self.reuse_stack.items[self.reuse_stack.items.len - 1]) {
+                _ = self.reuse_stack.pop();
                 self.pop_node();
             }
-            stack.append(self.gpa, @intCast(source_id)) catch oom();
+            self.reuse_stack.append(self.gpa, @intCast(source_id)) catch oom();
             if (source_node.focus_id != null and source_node.focus_id == focus) contains_focus = true;
             self.move_node(source_node);
         }
-        for (stack.items) |_| self.pop_node();
+        for (self.reuse_stack.items) |_| self.pop_node();
         return .{ .old_start = old_start, .old_end = old_end, .new_start = new_start, .contains_focus_ = contains_focus };
     }
 
