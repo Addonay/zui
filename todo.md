@@ -187,10 +187,11 @@ These exist, so the comparison counts them, but they do nothing yet.
 
 ## Paths
 
-- [ ] **Fill self-intersecting paths**: the ear-clipping in `path_builder.zig` drops them, so `painting`
-      has no lightning bolt. Lyon fills them; a general tessellator is needed
+- [x] **Fill self-intersecting paths & holes**: replaced ear-clipping and 4x MSAA paths with GPUI's
+      analytical Slug tiled winding-number renderer (`src/path_winding.zig`, `shaders.glsl`, `gpu.zig`,
+      `cpu.zig`). Self-intersecting polygons, holes, NonZero/EvenOdd rules, and exact quadratic curves
+      now render identically on GPU (single pass with early-Z) and CPU.
 - [ ] `painting`'s Rust logo needs lyon's path data, about 800 lines
-- [ ] `painting` has only run on the CPU renderer
 
 ## Text
 
@@ -208,25 +209,22 @@ Each must run headless with a correct snapshot, and be driven for real: first fr
 
 ## Performance (after API parity)
 
-- On hold: the owner wants the API finished first, with naive implementations, and performance after.
 - Benchmark: `zig build run-frame_bench -Doptimize=ReleaseFast -j1`, isolated. It times `Window.draw` on the headless
-  platform, so no renderer or display counts. On a Ryzen 5 5625U, 2026-11-07, median per frame:
-  20 views of 60 rows 10.6 ms uncached, 0.72 ms cached with none dirty, 1.5 ms cached with one dirty; 10k quads 36 ms; 2000 lines 5.8 ms.
-- Profile: `perf` needs a kernel setting, so use callgrind. Build with `-Dcpu=x86_64`, because valgrind rejects native instructions, and pass
-  `--toggle-collect='window.Window.draw'`, or font startup swamps it. Before the first fixes, of instructions in `draw`:
-  `BoundsTree.insert` about 20%, `memcpy` 13% (`compute_style` 3%, element building 2%), layout in zafi most of the rest. Re-profile: the fixes below changed this.
-  - Done: tree nodes are no longer copied while searching, and their indices are u32. An element refines its base style once, and paint recomputes style only if it has hover or drag styles. Cold `Interactivity` fields live out-of-line in `InteractivityExtra` and `DivPrepaintState` borrows `base_style` unless dynamic (`Div` 2656 B -> 1104 B, `DivPrepaintState` 904 B -> 80 B).
-- [ ] Find what still costs in `BoundsTree.insert`, and why `10k quads` costs about 3.6 us per element
-- [ ] Shrink `StyleRefinement` (968 B) and `Style` (848 B) further where usually empty
+  platform, so no renderer or display counts.
+  - Baseline (2026-11-07): 20 views of 60 rows 10.6 ms uncached, 0.72 ms cached with none dirty, 1.5 ms cached with one dirty; 10k quads 36 ms; 2000 lines 5.8 ms.
+  - After Epic 2 (2026-11-25, v0.3.0): 20 views of 60 rows **5.42 ms** uncached, **1.48 ms** cached none dirty, **2.18 ms** cached one dirty; 10k quads **18.94 ms**; 2000 lines **3.25 ms**.
+- Done in Epic 1 & 2:
+  - Persistent `zafi.Tree` layout caching across frames + keyed measure cache for `text` and `img`.
+  - Kind-aware `BoundsTree` batching, fast O(N)-sorted `Scene.finish`, Levien analytical shadows, vertex-clipped primitives, early-Z `opaque_quads` pre-pass, single-pass analytical Slug tiled paths, and zero-re-render animated sprites (`TimedTransformation`).
+  - Cold `Interactivity` fields out-of-line in `InteractivityExtra`, `DivFrameState` 848 B -> 16 B, `DivPrepaintState` 904 B -> 80 B, `Div` 2656 B -> 1064 B, static div fast paths skipping `Style` materialization in layout/prepaint/paint.
+- [ ] Find what still costs in `BoundsTree.insert` / `DispatchTree`, and shrink `StyleRefinement` (968 B) further via compact length/fill layouts
 - [ ] Compare view caching with GPUI in a release build. GPUI itself has not been built here
 - [ ] Run a cached view on a real Wayland and X11 window; no example uses `cached` yet
 - [ ] Tooltip and throttled animation timers refresh the whole window, because no view is current in a timer. They could remember theirs
-- [ ] Avoid full layout when nothing changed
 - [ ] X11 XShm presentation
 - [ ] SIMD gradients in the CPU renderer
 - [ ] Benchmarks against GPUI
-- [ ] `paths_bench` has no numbers: a Debug build drew no first frame in 25 s on the CPU renderer. Measure
-      it in release, on the GPU too, since 2000 path stars that slow may be a real problem
+- [ ] Measure `paths_bench` on hardware GPU and CPU in ReleaseFast now that Slug tiled paths landed
 
 ### Left naive on purpose (the owner asked for the API first)
 

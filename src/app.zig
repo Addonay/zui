@@ -1229,6 +1229,8 @@ pub const App = struct {
     restart_arguments: []const []const u8 = &.{},
     entities: EntityMap = .{},
     windows: std.ArrayList(?*Window) = .empty,
+    /// The window currently inside `Window.draw`, if any (O(1) entity read tracking).
+    drawing_window: ?*Window = null,
     /// The windowing switch waiting for the foreground executor, with the generation of the request
     /// that made it. A request made later replaces it, and its own task then finds it superseded.
     pending_windowing: ?PendingWindowing = null,
@@ -1443,13 +1445,9 @@ pub const App = struct {
     }
 
     fn record_entity_access(self: *App, id: EntityId) void {
-        if (self.windows.items.len == 0 or self.flushing_effects or self.pending_updates == 0) return;
-        for (self.windows.items) |maybe_win| {
-            const win = maybe_win orelse continue;
-            if (win.drawing) {
-                win.observe_entity_for_redraw(id);
-                break;
-            }
+        if (self.flushing_effects) return;
+        if (self.drawing_window) |win| {
+            win.observe_entity_for_redraw(id);
         }
     }
 

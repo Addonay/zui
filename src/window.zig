@@ -2747,6 +2747,9 @@ pub const Window = struct {
     pub fn draw(self: *Window, cx: *App) void {
         self.drawing = true;
         defer self.drawing = false;
+        const prev_drawing_window = cx.drawing_window;
+        cx.drawing_window = self;
+        defer cx.drawing_window = prev_drawing_window;
         const ts = self.text_system();
         if (self.line_layout_cache == null) self.line_layout_cache = ts.new_layout_cache();
         const outer_cache = ts.active_cache;

@@ -378,11 +378,13 @@ const AnimatedSvgView = struct {
 
     pub fn render(self: *AnimatedSvgView, _: *Window, _: *app_mod.Context(AnimatedSvgView)) *div.Div {
         if (self.renders) |r| r.* += 1;
-        const el = svg()
-            .data(square_svg)
-            .size(geometry.px(16))
-            .text_color(color_mod.red());
-        return div.div().child(SvgExt.with_timed_transformation(el, self.transformation));
+        return div.div().child(
+            svg()
+                .data(square_svg)
+                .size(geometry.px(16))
+                .text_color(color_mod.red())
+                .with_timed_transformation(self.transformation),
+        );
     }
 
     fn set(this: *AnimatedSvgView, t: TimedTransformation, r: *usize, cx: *app_mod.Context(AnimatedSvgView)) void {
@@ -519,8 +521,8 @@ test "test_scene_presents_as_often_as_its_least_capped_animation" {
         spin: TimedTransformation,
 
         pub fn render(self: *@This(), _: *Window, _: *app_mod.Context(@This())) *div.Div {
-            const s1 = SvgExt.with_timed_transformation(svg().data(square_svg).size(geometry.px(16)).text_color(color_mod.red()), self.spin.with_max_fps(10.0));
-            const s2 = SvgExt.with_timed_transformation(svg().data(square_svg).size(geometry.px(16)).text_color(color_mod.red()), self.spin.with_max_fps(20.0));
+            const s1 = svg().data(square_svg).size(geometry.px(16)).text_color(color_mod.red()).with_timed_transformation(self.spin.with_max_fps(10.0));
+            const s2 = svg().data(square_svg).size(geometry.px(16)).text_color(color_mod.red()).with_timed_transformation(self.spin.with_max_fps(20.0));
             const s3 = svg().data(square_svg).size(geometry.px(16)).text_color(color_mod.red()).with_transformation(Transformation.alpha(0.5));
             return div.div().child(s1).child(s2).child(s3);
         }
