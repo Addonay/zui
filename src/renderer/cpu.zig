@@ -11,6 +11,7 @@ const builtin = @import("builtin");
 const geometry = @import("../geometry.zig");
 const color = @import("../color.zig");
 const atlas = @import("../atlas.zig");
+const path_winding = @import("../path_winding.zig");
 const scene = @import("../scene.zig");
 const testing = std.testing;
 
@@ -52,8 +53,6 @@ const PI: f32 = 3.1415926;
 const zero4: F4 = @splat(0);
 const one4: F4 = @splat(1);
 const lane_offsets: F4 = .{ 0.5, 1.5, 2.5, 3.5 };
-/// Coverage sample positions of the 4x MSAA pattern used for paths, relative to the pixel corner.
-const msaa_offsets = [4][2]f32{ .{ 0.375, 0.125 }, .{ 0.875, 0.375 }, .{ 0.125, 0.625 }, .{ 0.625, 0.875 } };
 
 /// Sprite contrast and gamma settings with the renderer defaults (gamma 1.8, enhanced contrast 1.0 / 0.5).
 const grayscale_enhanced_contrast: f32 = 1.0;
@@ -1339,121 +1338,136 @@ fn draw_subpixel(t: Target, tex: *const CpuTexture, sp: *const SubpixelSprite) v
 }
 
 // ---------------------------------------------------------------------------
-// Paths (fs_path_rasterization + fs_path, 4x MSAA)
+// Paths (fs_path_tile, analytical Slug winding)
 // ---------------------------------------------------------------------------
 
-/// Rasterizes one triangle into the per-sample accumulators `acc` (4 samples per pixel of `r`).
-fn rasterize_triangle(acc: []F4, r: PixelRect, bp: *const BgPrep, ox: f32, oy: f32, v: [3]scene.PathVertex(ScaledPixels)) void {
-    const x0 = v[0].xy_position.x;
-    const y0 = v[0].xy_position.y;
-    const x1 = v[1].xy_position.x;
-    const y1 = v[1].xy_position.y;
-    const x2 = v[2].xy_position.x;
-    const y2 = v[2].xy_position.y;
-    const det = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
-    if (!(@abs(det) > 1e-12)) return;
-    const inv = 1.0 / det;
-    const db1dx = (y2 - y0) * inv;
-    const db1dy = -(x2 - x0) * inv;
-    const db2dx = -(y1 - y0) * inv;
-    const db2dy = (x1 - x0) * inv;
-    const s0 = v[0].st_position;
-    const s1 = v[1].st_position;
-    const s2 = v[2].st_position;
-    // Screen-space derivatives of the (affine) texture coordinates.
-    const dsdx = (s1.x - s0.x) * db1dx + (s2.x - s0.x) * db2dx;
-    const dtdx = (s1.y - s0.y) * db1dx + (s2.y - s0.y) * db2dx;
-    const dsdy = (s1.x - s0.x) * db1dy + (s2.x - s0.x) * db2dy;
-    const dtdy = (s1.y - s0.y) * db1dy + (s2.y - s0.y) * db2dy;
-    const straight = dsdx * dsdx + dsdy * dsdy < 1e-6;
+fn add_curve_winding(
+    curve: path_winding.PathCurve,
+    cx: f32,
+    cy: f32,
+    wx: *f32,
+    wy: *f32,
+    weight_x: *f32,
+    weight_y: *f32,
+) void {
+    const min_x = curve.min_x();
+    const max_x = curve.max_x();
 
-    const coords = [6]f32{ x0, y0, x1, y1, x2, y2 };
-    for (coords) |c| if (!std.math.isFinite(c)) return;
-    const min_x = @min(x0, @min(x1, x2));
-    const max_x = @max(x0, @max(x1, x2));
-    const min_y = @min(y0, @min(y1, y2));
-    const max_y = @max(y0, @max(y1, y2));
-    const px0: usize = @max(r.x0, @as(usize, @intFromFloat(std.math.clamp(@floor(min_x), 0, 1e9))));
-    const py0: usize = @max(r.y0, @as(usize, @intFromFloat(std.math.clamp(@floor(min_y), 0, 1e9))));
-    const px1: usize = @min(r.x1, @as(usize, @intFromFloat(std.math.clamp(@ceil(max_x) + 1, 0, 1e9))));
-    const py1: usize = @min(r.y1, @as(usize, @intFromFloat(std.math.clamp(@ceil(max_y) + 1, 0, 1e9))));
-    // The triangle lies outside the clip rect: `py0..py1` would have a negative length.
-    if (px1 <= px0 or py1 <= py0) return;
-    const w = r.x1 - r.x0;
+    if (curve.p0.y <= cy and cy < curve.p1.y) {
+        if (max_x <= cx - 0.5) {
+            wx.* += curve.sign;
+        } else {
+            const t = path_winding.monotone_quadratic_root(curve.a.y, curve.b.y, curve.p0.y - cy, 1.0);
+            const x = (curve.a.x * t + curve.b.x) * t + curve.p0.x;
+            const dist = cx - x;
+            wx.* += curve.sign * sat1(dist + 0.5);
+            weight_x.* = @max(weight_x.*, sat1(1.0 - 2.0 * @abs(dist)));
+        }
+    }
 
-    for (py0..py1) |py_i| {
-        for (px0..px1) |px_i| {
-            // Coverage per MSAA sample.
-            var mask: u4 = 0;
-            for (msaa_offsets, 0..) |o, s| {
-                const sx = @as(f32, @floatFromInt(px_i)) + o[0];
-                const sy = @as(f32, @floatFromInt(py_i)) + o[1];
-                const b1 = ((sx - x0) * (y2 - y0) - (x2 - x0) * (sy - y0)) * inv;
-                const b2 = ((x1 - x0) * (sy - y0) - (sx - x0) * (y1 - y0)) * inv;
-                const b0 = 1 - b1 - b2;
-                if (b1 >= 0 and b2 >= 0 and b0 >= 0) mask |= @as(u4, 1) << @intCast(s);
-            }
-            if (mask == 0) continue;
-
-            // Fragment shading happens once per pixel, at its center.
-            const cx = @as(f32, @floatFromInt(px_i)) + 0.5;
-            const cy = @as(f32, @floatFromInt(py_i)) + 0.5;
-            const b1c = ((cx - x0) * (y2 - y0) - (x2 - x0) * (cy - y0)) * inv;
-            const b2c = ((x1 - x0) * (cy - y0) - (cx - x0) * (y1 - y0)) * inv;
-            const s_x = s0.x + (s1.x - s0.x) * b1c + (s2.x - s0.x) * b2c;
-            const s_y = s0.y + (s1.y - s0.y) * b1c + (s2.y - s0.y) * b2c;
-            var alpha: f32 = 1;
-            if (!straight) {
-                const gx = 2.0 * s_x * dsdx - dtdx;
-                const gy = 2.0 * s_x * dsdy - dtdy;
-                const f = s_x * s_x - s_y;
-                const distance = f / @sqrt(gx * gx + gy * gy);
-                alpha = sat1(0.5 - distance);
-            }
-            const bgc = background_lanes(bp, ox, oy, s4(cx), cy);
-            const a = bgc.a[0] * alpha;
-            const frag = F4{ bgc.r[0] * bgc.a[0] * alpha, bgc.g[0] * bgc.a[0] * alpha, bgc.b[0] * bgc.a[0] * alpha, a };
-            if (!(a > 0)) continue;
-
-            const pixel = (py_i - r.y0) * w + (px_i - r.x0);
-            for (0..4) |s| {
-                if (mask & (@as(u4, 1) << @intCast(s)) == 0) continue;
-                const slot = &acc[pixel * 4 + s];
-                slot.* = over_premul(slot.*, frag);
-            }
+    if (min_x <= cx and cx < max_x) {
+        const direction: f32 = if (curve.p1.x > curve.p0.x) 1.0 else -1.0;
+        if (curve.p1.y <= cy - 0.5) {
+            wy.* -= curve.sign * direction;
+        } else if (curve.p0.y < cy + 0.5) {
+            const t = path_winding.monotone_quadratic_root(curve.a.x, curve.b.x, curve.p0.x - cx, direction);
+            const y = (curve.a.y * t + curve.b.y) * t + curve.p0.y;
+            const dist = cy - y;
+            wy.* -= curve.sign * direction * sat1(dist + 0.5);
+            weight_y.* = @max(weight_y.*, sat1(1.0 - 2.0 * @abs(dist)));
         }
     }
 }
 
-fn draw_path(scratch: *std.ArrayList(F4), gpa: std.mem.Allocator, t: Target, p: *const scene.Path(ScaledPixels)) void {
-    const verts = p.vertices.items;
-    if (verts.len < 3) return;
-    const cb = p.clipped_bounds();
-    const r = rect_pixels(cb, cb, t) orelse return;
-    const w = r.x1 - r.x0;
-    const h = r.y1 - r.y0;
-
-    scratch.resize(gpa, w * h * 4) catch return;
-    const acc = scratch.items;
-    @memset(acc, zero4);
-
-    const bp = BgPrep.init(p.color, cb.size.width, cb.size.height);
-    var i: usize = 0;
-    while (i + 3 <= verts.len) : (i += 3) {
-        rasterize_triangle(acc, r, &bp, cb.origin.x, cb.origin.y, .{ verts[i], verts[i + 1], verts[i + 2] });
+fn correct_for_endpoint(
+    endpoint: geometry.Point(f32),
+    step_val: f32,
+    reference: geometry.Point(f32),
+    cx: f32,
+    cy: f32,
+    wx: *f32,
+    wy: *f32,
+) void {
+    if (endpoint.x <= reference.x) {
+        const a: f32 = if (endpoint.y <= cy) 1.0 else 0.0;
+        const b: f32 = if (endpoint.y <= reference.y) 1.0 else 0.0;
+        wx.* -= step_val * (a - b);
     }
+    if (endpoint.y <= reference.y and endpoint.x <= cx) {
+        wy.* += step_val;
+    }
+}
 
-    // Resolve the samples and composite the premultiplied result.
-    for (0..h) |ry| {
-        for (0..w) |rx| {
-            const base = (ry * w + rx) * 4;
-            const sum = acc[base] + acc[base + 1] + acc[base + 2] + acc[base + 3];
-            const c = sum * s4(0.25);
-            if (!(c[3] > 0)) continue;
-            const x = r.x0 + rx;
-            const y = r.y0 + ry;
-            const off = t.offset(x, y);
-            t.store(off, over_premul(t.load(off), c));
+fn draw_path(t: Target, p: *const scene.Path(ScaledPixels)) void {
+    const ptiles = p.tiles orelse return;
+    const tiles = ptiles.tiles();
+    const curves = ptiles.curves();
+    if (tiles.len == 0) return;
+
+    const clip = p.content_mask.bounds;
+    const pb = p.paint_bounds();
+    const bp = BgPrep.init(p.color, pb.size.width, pb.size.height);
+    const ox = pb.origin.x;
+    const oy = pb.origin.y;
+    const even_odd = p.even_odd;
+
+    for (tiles) |tile| {
+        const tile_bounds: Bounds(ScaledPixels) = .{
+            .origin = .{ .x = tile.top_left.x, .y = tile.top_left.y },
+            .size = .{
+                .width = tile.bottom_right.x - tile.top_left.x,
+                .height = tile.bottom_right.y - tile.top_left.y,
+            },
+        };
+        const r = rect_pixels(tile_bounds, clip, t) orelse continue;
+        const tile_curves = curves[tile.curve_start .. tile.curve_start + tile.curve_count];
+
+        for (r.y0..r.y1) |py_i| {
+            const cy = @as(f32, @floatFromInt(py_i)) + 0.5;
+            if (tile.curve_count == 0 or (bp.tag == .solid and (cy < tile.curves_top_left.y or cy > tile.curves_bottom_right.y))) {
+                fill_span(t, py_i, r.x0, r.x1, &bp, ox, oy);
+                continue;
+            }
+            for (r.x0..r.x1) |px_i| {
+                const cx = @as(f32, @floatFromInt(px_i)) + 0.5;
+                if (bp.tag == .solid and
+                    (cx < tile.curves_top_left.x or cy < tile.curves_top_left.y or
+                        cx > tile.curves_bottom_right.x or cy > tile.curves_bottom_right.y))
+                {
+                    blend_px(t, px_i, py_i, .{ bp.solid[0], bp.solid[1], bp.solid[2], bp.solid[3] });
+                    continue;
+                }
+
+                var wx: f32 = @floatFromInt(tile.backdrop);
+                var wy: f32 = wx;
+                var weight_x: f32 = 0.0;
+                var weight_y: f32 = 0.0;
+
+                for (tile_curves) |curve| {
+                    if (curve.min_x() >= cx + 0.5) break;
+                    if (curve.p0.y < cy + 0.5) {
+                        add_curve_winding(curve, cx, cy, &wx, &wy, &weight_x, &weight_y);
+                        correct_for_endpoint(curve.p0, curve.sign, tile.reference, cx, cy, &wx, &wy);
+                        correct_for_endpoint(curve.p1, -curve.sign, tile.reference, cx, cy, &wx, &wy);
+                    }
+                }
+
+                const dot_ww = wx * weight_x + wy * weight_y;
+                var coverage = @max(
+                    @abs(dot_ww) / @max(weight_x + weight_y, 1.0 / 65536.0),
+                    @min(@abs(wx), @abs(wy)),
+                );
+                if (even_odd) {
+                    const frac = coverage * 0.5 - @floor(coverage * 0.5);
+                    coverage = 1.0 - @abs(1.0 - frac * 2.0);
+                } else {
+                    coverage = sat1(coverage);
+                }
+                if (coverage == 0.0) continue;
+
+                const bgc = background_lanes(&bp, ox, oy, s4(cx), cy);
+                blend_px(t, px_i, py_i, .{ bgc.r[0], bgc.g[0], bgc.b[0], bgc.a[0] * coverage });
+            }
         }
     }
 }
@@ -1462,13 +1476,7 @@ fn draw_path(scratch: *std.ArrayList(F4), gpa: std.mem.Allocator, t: Target, p: 
 // Renderer
 // ---------------------------------------------------------------------------
 
-fn empty_scratch() [CpuRenderer.max_bands]std.ArrayList(F4) {
-    var lists: [CpuRenderer.max_bands]std.ArrayList(F4) = undefined;
-    for (&lists) |*list| list.* = .empty;
-    return lists;
-}
-
-/// Software renderer for `Scene`. Owns scratch memory reused across frames.
+/// Software renderer for `Scene`.
 pub const CpuRenderer = struct {
     /// Upper bound on worker bands per frame.
     pub const max_bands = 16;
@@ -1478,17 +1486,13 @@ pub const CpuRenderer = struct {
     allocator: std.mem.Allocator,
     /// Threads to draw with: 0 uses the CPU count, 1 draws on the calling thread.
     threads: usize = 0,
-    /// Per-band scratch for path rasterization.
-    scratch: [max_bands]std.ArrayList(F4) = empty_scratch(),
 
-    /// Creates a renderer; scratch buffers grow on demand.
     pub fn init(allocator: std.mem.Allocator) CpuRenderer {
         return .{ .allocator = allocator };
     }
 
-    /// Releases the scratch buffers.
     pub fn deinit(self: *CpuRenderer) void {
-        for (&self.scratch) |*list| list.deinit(self.allocator);
+        _ = self;
     }
 
     /// Clears `fb` to `clear` and draws `scene` (already `finish()`ed), sampling sprite textures from `atlas`.
@@ -1526,13 +1530,15 @@ pub const CpuRenderer = struct {
     }
 
     fn draw_band(self: *CpuRenderer, index: usize, sc: *const Scene, atlas_: *const CpuAtlas, t: Target, clear_px: [4]f32) void {
+        _ = self;
+        _ = index;
         for (t.y0..t.y1) |y| fill_opaque(t, y, 0, t.width, clear_px);
 
         var batches = sc.batches();
         while (batches.next()) |batch| switch (batch) {
             .shadows => |items| for (items) |*item| draw_shadow(t, item),
             .quads => |items| for (items) |*item| draw_quad(t, item),
-            .paths => |items| for (items) |*item| draw_path(&self.scratch[index], self.allocator, t, item),
+            .paths => |items| for (items) |*item| draw_path(t, item),
             .underlines => |items| for (items) |*item| draw_underline(t, item),
             .monochrome_sprites => |b| if (atlas_.texture(b.texture_id)) |tex| {
                 for (b.sprites) |*item| draw_mono(t, tex, item);

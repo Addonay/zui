@@ -818,19 +818,24 @@ void main() {
 }
 @end
 
-@vs path_raster_vs
+@vs path_tiles_vs
 layout(binding=0) uniform vs_params { vec4 viewport; };
 @include_block common
-layout(location=0) in vec4 r_xy_st;
-layout(location=1) in vec4 r_bounds;
-layout(location=2) in vec4 r_bg;
-layout(location=3) in vec4 r_solid;
-layout(location=4) in vec4 r_color0;
-layout(location=5) in vec4 r_color1;
-layout(location=6) in vec4 r_bg2;
-out vec2 v_st;
+layout(location=0) in vec4 t_rect;
+layout(location=1) in vec4 t_curve_box;
+layout(location=2) in vec4 t_meta;
+layout(location=3) in vec4 t_flags;
+layout(location=4) in vec4 p_bounds;
+layout(location=5) in vec4 p_clip;
+layout(location=6) in vec4 p_solid;
+layout(location=7) in vec4 p_color0;
+layout(location=8) in vec4 p_color1;
+layout(location=9) in vec4 p_bg;
+layout(location=10) in vec4 p_bg2;
 out vec2 v_pos;
-out vec4 v_clip;
+flat out vec4 f_curve_box;
+flat out vec4 f_meta;
+flat out vec4 f_flags;
 flat out vec4 f_bounds;
 flat out vec4 f_bg;
 flat out vec4 f_bg2;
@@ -838,26 +843,42 @@ flat out vec4 f_solid;
 flat out vec4 f_color0;
 flat out vec4 f_color1;
 void main() {
-    gl_Position = to_device(r_xy_st.xy, viewport.xy, 0.0);
-    v_st = r_xy_st.zw;
-    v_pos = r_xy_st.xy;
-    v_clip = distance_from_clip(r_xy_st.xy, r_bounds);
+    vec2 unit = vec2(float(gl_VertexIndex & 1), 0.5 * float(gl_VertexIndex & 2));
+    vec2 mask_tl = p_clip.xy;
+    vec2 mask_br = p_clip.xy + p_clip.zw;
+    vec2 top_left = clamp(t_rect.xy, mask_tl, mask_br);
+    vec2 bottom_right = clamp(t_rect.zw, top_left, mask_br);
+    vec2 position = vec2(
+        unit.x != 0.0 ? bottom_right.x : top_left.x,
+        unit.y != 0.0 ? bottom_right.y : top_left.y
+    );
+    gl_Position = to_device(position, viewport.xy, t_flags.z);
+    v_pos = position;
     vec4 solid; vec4 color0; vec4 color1;
-    prepare_gradient(r_bg.x, r_bg.y, r_solid, r_color0, r_color1, solid, color0, color1);
-    f_bounds = r_bounds;
-    f_bg = r_bg;
-    f_bg2 = r_bg2;
+    prepare_gradient(p_bg.x, p_bg.y, p_solid, p_color0, p_color1, solid, color0, color1);
+    f_curve_box = t_curve_box;
+    f_meta = t_meta;
+    f_flags = t_flags;
+    f_bounds = p_bounds;
+    f_bg = p_bg;
+    f_bg2 = p_bg2;
     f_solid = solid;
     f_color0 = color0;
     f_color1 = color1;
 }
 @end
 
-@fs path_raster_fs
+@fs path_tiles_fs
 @include_block common
-in vec2 v_st;
+@include_block fs_params
+@image_sample_type curve_tex unfilterable_float
+@sampler_type curve_smp nonfiltering
+layout(binding=0) uniform texture2D curve_tex;
+layout(binding=0) uniform sampler curve_smp;
 in vec2 v_pos;
-in vec4 v_clip;
+flat in vec4 f_curve_box;
+flat in vec4 f_meta;
+flat in vec4 f_flags;
 flat in vec4 f_bounds;
 flat in vec4 f_bg;
 flat in vec4 f_bg2;
@@ -865,50 +886,121 @@ flat in vec4 f_solid;
 flat in vec4 f_color0;
 flat in vec4 f_color1;
 layout(location=0) out vec4 frag_color;
-void main() {
-    vec2 dx = dFdx(v_st);
-    vec2 dy = dFdy(v_st);
-    if (any(lessThan(v_clip, vec4(0.0)))) discard;
 
-    float alpha;
-    if (length(vec2(dx.x, dy.x)) < 0.001) {
-        // The gradient is too small: solid coverage.
-        alpha = 1.0;
-    } else {
-        vec2 gradient = 2.0 * v_st.x * vec2(dx.x, dy.x) - vec2(dx.y, dy.y);
-        float f = v_st.x * v_st.x - v_st.y;
-        float sdf_distance = f / length(gradient);
-        alpha = saturate(0.5 - sdf_distance);
+struct PathCurveData {
+    vec2 p0;
+    vec2 p1;
+    vec2 a;
+    vec2 b;
+    float sign_val;
+};
+
+PathCurveData load_path_curve(int index) {
+    int t = index * 3;
+    vec4 t0 = texelFetch(sampler2D(curve_tex, curve_smp), ivec2(t & 1023, t >> 10), 0);
+    int t1_idx = t + 1;
+    vec4 t1 = texelFetch(sampler2D(curve_tex, curve_smp), ivec2(t1_idx & 1023, t1_idx >> 10), 0);
+    int t2_idx = t + 2;
+    vec4 t2 = texelFetch(sampler2D(curve_tex, curve_smp), ivec2(t2_idx & 1023, t2_idx >> 10), 0);
+    PathCurveData c;
+    c.p0 = t0.xy;
+    c.p1 = t0.zw;
+    c.a = t1.xy;
+    c.b = t1.zw;
+    c.sign_val = t2.x;
+    return c;
+}
+
+float monotone_quadratic_root(float a, float b, float c, float direction) {
+    float discriminant = max(b * b - 4.0 * a * c, 0.0);
+    float denominator = b + direction * sqrt(discriminant);
+    if (denominator == 0.0) {
+        return 0.0;
     }
+    return saturate(-2.0 * c / denominator);
+}
+
+void add_curve_winding(PathCurveData curve, vec2 center, inout vec2 winding, inout vec2 weight) {
+    float min_x = min(curve.p0.x, curve.p1.x);
+    float max_x = max(curve.p0.x, curve.p1.x);
+
+    if (curve.p0.y <= center.y && center.y < curve.p1.y) {
+        if (max_x <= center.x - 0.5) {
+            winding.x += curve.sign_val;
+        } else {
+            float t = monotone_quadratic_root(curve.a.y, curve.b.y, curve.p0.y - center.y, 1.0);
+            float x = (curve.a.x * t + curve.b.x) * t + curve.p0.x;
+            float dist = center.x - x;
+            winding.x += curve.sign_val * saturate(dist + 0.5);
+            weight.x = max(weight.x, saturate(1.0 - 2.0 * abs(dist)));
+        }
+    }
+
+    if (min_x <= center.x && center.x < max_x) {
+        float direction = (curve.p1.x > curve.p0.x) ? 1.0 : -1.0;
+        if (curve.p1.y <= center.y - 0.5) {
+            winding.y -= curve.sign_val * direction;
+        } else if (curve.p0.y < center.y + 0.5) {
+            float t = monotone_quadratic_root(curve.a.x, curve.b.x, curve.p0.x - center.x, direction);
+            float y = (curve.a.y * t + curve.b.y) * t + curve.p0.y;
+            float dist = center.y - y;
+            winding.y -= curve.sign_val * direction * saturate(dist + 0.5);
+            weight.y = max(weight.y, saturate(1.0 - 2.0 * abs(dist)));
+        }
+    }
+}
+
+void correct_for_endpoint(vec2 endpoint, float step_val, vec2 reference, vec2 center, inout vec2 winding) {
+    if (endpoint.x <= reference.x) {
+        winding.x -= step_val * (float(endpoint.y <= center.y) - float(endpoint.y <= reference.y));
+    }
+    if (endpoint.y <= reference.y && endpoint.x <= center.x) {
+        winding.y += step_val;
+    }
+}
+
+void main() {
+    vec2 center = floor(v_pos) + 0.5;
+    if (f_bg.x == 0.0 && (any(lessThan(center, f_curve_box.xy)) || any(greaterThan(center, f_curve_box.zw)))) {
+        frag_color = blend_color(f_solid, 1.0);
+        return;
+    }
+
+    vec2 reference = f_meta.xy;
+    int curve_start = int(f_meta.z);
+    int curve_count = int(f_meta.w);
+    vec2 winding = vec2(f_flags.x);
+    vec2 weight = vec2(0.0);
+
+    for (int i = 0; i < curve_count; i++) {
+        PathCurveData curve = load_path_curve(curve_start + i);
+        if (min(curve.p0.x, curve.p1.x) >= center.x + 0.5) {
+            break;
+        }
+        if (curve.p0.y < center.y + 0.5) {
+            add_curve_winding(curve, center, winding, weight);
+            correct_for_endpoint(curve.p0, curve.sign_val, reference, center, winding);
+            correct_for_endpoint(curve.p1, -curve.sign_val, reference, center, winding);
+        }
+    }
+
+    float coverage = max(
+        abs(dot(winding, weight)) / max(weight.x + weight.y, 1.0 / 65536.0),
+        min(abs(winding.x), abs(winding.y)));
+    if (f_flags.y != 0.0) {
+        coverage = 1.0 - abs(1.0 - fract(coverage * 0.5) * 2.0);
+    } else {
+        coverage = saturate(coverage);
+    }
+
+    if (coverage == 0.0) {
+        frag_color = vec4(0.0);
+        return;
+    }
+
     vec4 color = gradient_color(f_bg.x, f_bg.y, f_bg.z, f_bg.w, f_bg2.x, f_bg2.z,
         f_bounds, v_pos, f_solid, f_color0, f_color1);
-    frag_color = vec4(color.rgb * color.a * alpha, color.a * alpha);
-}
-@end
-
-@vs path_composite_vs
-layout(binding=0) uniform vs_params { vec4 viewport; };
-@include_block common
-layout(location=0) in vec4 c_bounds;
-out vec2 v_uv;
-void main() {
-    vec2 unit = vec2(float(gl_VertexIndex & 1), 0.5 * float(gl_VertexIndex & 2));
-    vec2 position = unit * c_bounds.zw + c_bounds.xy;
-    gl_Position = to_device(position, viewport.xy, viewport.w);
-    // Screen position to texture coordinates; flipped when the backend's rows start at the bottom.
-    vec2 uv = position / viewport.xy;
-    if (viewport.z > 0.5) uv.y = 1.0 - uv.y;
-    v_uv = uv;
-}
-@end
-
-@fs path_composite_fs
-layout(binding=0) uniform texture2D path_tex;
-layout(binding=0) uniform sampler path_smp;
-in vec2 v_uv;
-layout(location=0) out vec4 frag_color;
-void main() {
-    frag_color = texture(sampler2D(path_tex, path_smp), v_uv);
+    frag_color = blend_color(color, coverage);
 }
 @end
 
@@ -918,5 +1010,4 @@ void main() {
 @program underlines underlines_vs underlines_fs
 @program mono_sprites mono_vs mono_fs
 @program poly_sprites poly_vs poly_fs
-@program path_raster path_raster_vs path_raster_fs
-@program path_composite path_composite_vs path_composite_fs
+@program path_tiles path_tiles_vs path_tiles_fs
