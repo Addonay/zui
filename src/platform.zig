@@ -1007,6 +1007,8 @@ pub const Platform = struct {
     will_open_app_menu_: ?Listener = null,
     /// Set by `on_validate_app_menu_command`.
     validate_app_menu_command_: ?ActionValidator = null,
+    /// Set by `on_text_scale_factor_change`.
+    text_scale_factor_change_: ?Listener = null,
 
     pub const VTable = struct {
         /// Runs the event loop until quit, calling `on_launch(app)` once ready.
@@ -1018,6 +1020,8 @@ pub const Platform = struct {
         open_window: *const fn (*Platform, window_mod.WindowOptions, ?*PlatformWindow) anyerror!*PlatformWindow,
         /// The titlebar button layout (GPUI `Platform::button_layout`). Null where the platform has none.
         button_layout: *const fn (*Platform) ?WindowButtonLayout = noButtonLayout,
+        /// The factor by which text should be scaled, on top of the window's scale factor (GPUI `Platform::text_scale_factor`).
+        text_scale_factor: *const fn (*Platform) f32 = defaultTextScaleFactor,
         /// Wakes the event loop from another thread (foreground executor).
         wake: *const fn (*Platform) void,
         activate: *const fn (*Platform, bool) void = noopBool,
@@ -1158,6 +1162,9 @@ pub const Platform = struct {
     fn noButtonLayout(_: *Platform) ?WindowButtonLayout {
         return null;
     }
+    fn defaultTextScaleFactor(_: *Platform) f32 {
+        return 1.0;
+    }
     fn noopClip(_: *Platform, _: ClipboardItem) void {}
     fn noClip(_: *Platform) ?ClipboardItem {
         return null;
@@ -1183,6 +1190,9 @@ pub const Platform = struct {
     }
     pub fn button_layout(self: *Platform) ?WindowButtonLayout {
         return self.vtable.button_layout(self);
+    }
+    pub fn text_scale_factor(self: *Platform) f32 {
+        return self.vtable.text_scale_factor(self);
     }
     pub fn power_mode(self: *Platform) PowerMode {
         return self.vtable.power_mode(self);
@@ -1294,6 +1304,17 @@ pub const Platform = struct {
         return v.func(v.ctx, action);
     }
 
+    /// Registers the callback run when `text_scale_factor` changes (GPUI
+    /// `Platform::on_text_scale_factor_change`). Replaces the earlier callback.
+    pub fn on_text_scale_factor_change(self: *Platform, listener: Listener) void {
+        self.text_scale_factor_change_ = listener;
+    }
+
+    /// Backends call this when the desktop text scale factor changed.
+    pub fn emit_text_scale_factor_change(self: *Platform) void {
+        if (self.text_scale_factor_change_) |l| l.func(l.ctx);
+    }
+
     /// Drops every listener the app registered, so the platform never calls into an app that is
     /// going away. No GPUI counterpart: GPUI's platforms are dropped with the app instead.
     pub fn clear_app_listeners(self: *Platform) void {
@@ -1302,6 +1323,7 @@ pub const Platform = struct {
         self.app_menu_action_ = null;
         self.will_open_app_menu_ = null;
         self.validate_app_menu_command_ = null;
+        self.text_scale_factor_change_ = null;
     }
     pub fn emit_keyboard_layout_changed(self: *Platform) void {
         if (self.callbacks) |c| c.keyboard_layout_changed(c.ctx);

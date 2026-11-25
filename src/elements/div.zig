@@ -3454,8 +3454,14 @@ pub const ScrollHandle = struct {
 
     pub fn new(allocator: std.mem.Allocator) ScrollHandle {
         const s = allocator.create(ScrollHandleState) catch oom();
-        s.* = .{};
+        s.* = .{ .allocator = allocator };
         return .{ .state = s };
+    }
+
+    pub fn deinit(self: ScrollHandle) void {
+        const allocator = self.state.allocator orelse return;
+        self.state.child_bounds.deinit(allocator);
+        allocator.destroy(self.state);
     }
     pub fn offset(self: ScrollHandle) Point(Pixels) {
         return self.state.offset;
@@ -3815,15 +3821,13 @@ pub const InteractiveElementState = struct {
     long_press_tooltip_active: bool = false,
 };
 
-/// All interactive and stateful behavior of a styled element (GPUI `Interactivity`).
-pub const Interactivity = struct {
-    element_id: ?ElementId = null,
+/// Cold interactive/stateful fields of `Interactivity`, allocated lazily in `frame_arena()`.
+pub const InteractivityExtra = struct {
     key_context: ?key_dispatch.KeyContext = null,
     focusable: bool = false,
     tracked_focus_handle: ?FocusHandle = null,
     tracked_scroll_handle: ?ScrollHandle = null,
     group: ?[]const u8 = null,
-    base_style: StyleRefinement = .{},
     focus_style: ?*StyleRefinement = null,
     in_focus_style: ?*StyleRefinement = null,
     focus_visible_style: ?*StyleRefinement = null,
@@ -3866,23 +3870,68 @@ pub const Interactivity = struct {
     tab_index: ?isize = null,
     tab_stop: ?bool = null,
     tab_group_: bool = false,
+};
+
+/// All interactive and stateful behavior of a styled element (GPUI `Interactivity`).
+/// Plain non-interactive elements keep `extra == null` so they pay no allocation or struct size
+/// overhead for listeners, handles, or state-dependent styles.
+pub const Interactivity = struct {
+    base_style: StyleRefinement = .{},
+    element_id: ?ElementId = null,
+    extra: ?*InteractivityExtra = null,
+
+    /// Allocates `extra` lazily in the current frame arena on first use.
+    pub fn ensure_extra(self: *Interactivity) *InteractivityExtra {
+        if (self.extra) |ex| return ex;
+        const ex = arena().create(InteractivityExtra) catch oom();
+        ex.* = .{};
+        self.extra = ex;
+        return ex;
+    }
+
+    pub fn set_tracked_scroll_handle(self: *Interactivity, handle: ScrollHandle) void {
+        self.ensure_extra().tracked_scroll_handle = handle;
+    }
+
+    pub fn tracked_scroll_handle(self: *const Interactivity) ?ScrollHandle {
+        return if (self.extra) |ex| ex.tracked_scroll_handle else null;
+    }
+
+    pub fn add_scroll_wheel_listener(self: *Interactivity, listener: Listener(ScrollWheelEvent)) void {
+        self.ensure_extra().scroll_wheel_listeners.append(arena(), listener) catch oom();
+    }
+
+    pub fn scroll_wheel_listeners(self: *const Interactivity) []const Listener(ScrollWheelEvent) {
+        return if (self.extra) |ex| ex.scroll_wheel_listeners.items else &.{};
+    }
 
     /// Blocks mouse events from reaching the elements behind this one (GPUI `occlude_mouse`).
     pub fn occlude_mouse(self: *Interactivity) void {
-        self.occlude_mouse_ = true;
+        self.ensure_extra().occlude_mouse_ = true;
+    }
+
+    /// Whether `compute_style_from` needs a per-frame `Style` copy in `DivPrepaintState`.
+    pub fn has_dynamic_style(self: *const Interactivity, cx: *const App) bool {
+        if (cx.active_drag != null) return true;
+        const ex = self.extra orelse return false;
+        if (ex.tracked_focus_handle != null and (ex.in_focus_style != null or ex.focus_style != null or ex.focus_visible_style != null)) return true;
+        return ex.hover_style != null or ex.group_hover_style != null or
+            ex.active_style != null or ex.group_active_style != null;
     }
 
     fn needs_hitbox(self: *const Interactivity) bool {
-        return self.element_id != null or self.focusable or self.tracked_focus_handle != null or self.hover_style != null or
-            self.active_style != null or self.group != null or self.occlude_mouse_ or self.block_mouse_except_scroll_ or
-            self.mouse_down_listeners.items.len > 0 or self.mouse_up_listeners.items.len > 0 or self.mouse_down_out_listeners.items.len > 0 or
-            self.mouse_move_listeners.items.len > 0 or self.scroll_wheel_listeners.items.len > 0 or self.click_listeners.items.len > 0 or
-            self.mouse_exit_listeners.items.len > 0 or self.file_drop_exit_listeners.items.len > 0 or self.drag_move_listeners.items.len > 0 or
-            self.hover_listener != null or self.base_style.mouse_cursor != null or
-            self.aux_click_listeners.items.len > 0 or self.pinch_listeners.items.len > 0 or self.capture_pinch_listeners.items.len > 0 or
-            self.mouse_pressure_listeners.items.len > 0 or self.capture_mouse_pressure_listeners.items.len > 0 or
-            self.drop_listeners.items.len > 0 or self.drag_listener != null or self.drag_over_styles.items.len > 0 or
-            self.tooltip_builder != null or self.mouse_up_out_listeners.items.len > 0;
+        if (self.element_id != null or self.base_style.mouse_cursor != null) return true;
+        const ex = self.extra orelse return false;
+        return ex.focusable or ex.tracked_focus_handle != null or ex.hover_style != null or
+            ex.active_style != null or ex.group != null or ex.occlude_mouse_ or ex.block_mouse_except_scroll_ or
+            ex.mouse_down_listeners.items.len > 0 or ex.mouse_up_listeners.items.len > 0 or ex.mouse_down_out_listeners.items.len > 0 or
+            ex.mouse_move_listeners.items.len > 0 or ex.scroll_wheel_listeners.items.len > 0 or ex.click_listeners.items.len > 0 or
+            ex.mouse_exit_listeners.items.len > 0 or ex.file_drop_exit_listeners.items.len > 0 or ex.drag_move_listeners.items.len > 0 or
+            ex.hover_listener != null or
+            ex.aux_click_listeners.items.len > 0 or ex.pinch_listeners.items.len > 0 or ex.capture_pinch_listeners.items.len > 0 or
+            ex.mouse_pressure_listeners.items.len > 0 or ex.capture_mouse_pressure_listeners.items.len > 0 or
+            ex.drop_listeners.items.len > 0 or ex.drag_listener != null or ex.drag_over_styles.items.len > 0 or
+            ex.tooltip_builder != null or ex.mouse_up_out_listeners.items.len > 0;
     }
 
     /// The style for this frame: base refined by focus/hover/active states (GPUI `compute_style`).
@@ -3896,34 +3945,38 @@ pub const Interactivity = struct {
     /// asks for its style in layout, prepaint and paint, so it refines its base only once.
     pub fn compute_style_from(self: *const Interactivity, base: *const Style, hitbox: ?*const Hitbox, state: ?*const InteractiveElementState, window: *Window, cx: *App) Style {
         var s = base.*;
-        if (self.tracked_focus_handle) |h| {
-            if (self.in_focus_style) |r| if (h.within_focused(window, cx)) s.refine(r);
-            if (self.focus_style) |r| if (h.is_focused(window)) s.refine(r);
-            if (self.focus_visible_style) |r| if (h.is_focused(window) and window.last_input_was_keyboard()) s.refine(r);
-        }
-        if (hitbox) |hb| {
-            if (self.hover_style) |r| if (hb.is_hovered(window)) s.refine(r);
-            if (self.group_hover_style) |g| if (group_hitbox(g.group)) |gh| if (window_hovered(gh, window)) s.refine(g.style);
-        }
-        if (state) |st| {
-            if (st.active) {
-                if (self.active_style) |r| s.refine(r);
+        if (self.extra) |ex| {
+            if (ex.tracked_focus_handle) |h| {
+                if (ex.in_focus_style) |r| if (h.within_focused(window, cx)) s.refine(r);
+                if (ex.focus_style) |r| if (h.is_focused(window)) s.refine(r);
+                if (ex.focus_visible_style) |r| if (h.is_focused(window) and window.last_input_was_keyboard()) s.refine(r);
             }
-        }
-        if (self.group_active_style) |g| if (group_active(g.group)) s.refine(g.style);
-        if (cx.active_drag) |drag| {
-            const allowed = if (self.can_drop_predicate) |predicate| predicate(drag.value, window, cx) else true;
-            if (allowed) {
-                for (self.group_drag_over_styles.items) |g| {
-                    if (g.type_id != drag.value.type_id) continue;
-                    if (group_hitbox(g.group)) |gh| if (window_hovered(gh, window)) s.refine(g.style);
+            if (hitbox) |hb| {
+                if (ex.hover_style) |r| if (hb.is_hovered(window)) s.refine(r);
+                if (ex.group_hover_style) |g| if (group_hitbox(g.group, window)) |gh| if (window_hovered(gh, window)) s.refine(g.style);
+            }
+            if (state) |st| {
+                if (st.active) {
+                    if (ex.active_style) |r| s.refine(r);
                 }
-                if (hitbox) |hb| {
-                    for (self.drag_over_styles.items) |d| {
-                        if (d.type_id == drag.value.type_id and hb.is_hovered(window)) s.refine(d.style);
+            }
+            if (ex.group_active_style) |g| if (group_active(g.group, window)) s.refine(g.style);
+            if (cx.active_drag) |drag| {
+                const allowed = if (ex.can_drop_predicate) |predicate| predicate(drag.value, window, cx) else true;
+                if (allowed) {
+                    for (ex.group_drag_over_styles.items) |g| {
+                        if (g.type_id != drag.value.type_id) continue;
+                        if (group_hitbox(g.group, window)) |gh| if (window_hovered(gh, window)) s.refine(g.style);
+                    }
+                    if (hitbox) |hb| {
+                        for (ex.drag_over_styles.items) |d| {
+                            if (d.type_id == drag.value.type_id and hb.is_hovered(window)) s.refine(d.style);
+                        }
                     }
                 }
             }
+        }
+        if (cx.active_drag) |drag| {
             s.mouse_cursor = drag.cursor_style;
         }
         return s;
@@ -3931,15 +3984,11 @@ pub const Interactivity = struct {
 
     // -- per-frame group registry (GPUI GroupHitboxes) --------------------
 
-    threadlocal var groups: std.StringHashMapUnmanaged(GroupInfo) = .empty;
-    threadlocal var groups_frame: u64 = 0;
-    const GroupInfo = struct { hitbox: window_mod.HitboxId, active: bool };
-
-    fn group_hitbox(name: []const u8) ?window_mod.HitboxId {
-        return if (groups.get(name)) |g| g.hitbox else null;
+    fn group_hitbox(name: []const u8, window: *const Window) ?window_mod.HitboxId {
+        return if (window.next_frame.group_hitboxes.get(name)) |g| g.hitbox else null;
     }
-    fn group_active(name: []const u8) bool {
-        return if (groups.get(name)) |g| g.active else false;
+    fn group_active(name: []const u8, window: *const Window) bool {
+        return if (window.next_frame.group_hitboxes.get(name)) |g| g.active else false;
     }
     fn window_hovered(id: window_mod.HitboxId, window: *Window) bool {
         const hb: Hitbox = .{ .id = id, .bounds = undefined, .content_mask = undefined };
@@ -3959,7 +4008,8 @@ pub const DivFrameState = struct {
 
 pub const DivPrepaintState = struct {
     hitbox: ?Hitbox = null,
-    style: Style = .{},
+    /// Allocated in `frame_arena()` only when dynamic state (focus/hover/active/group/drag) modifies `base_style`.
+    dynamic_style: ?*Style = null,
     state: ?*InteractiveElementState = null,
     scroll_offset: Point(Pixels) = .{ .x = 0, .y = 0 },
 };
@@ -4038,14 +4088,14 @@ pub fn StyledElement(comptime Ext: type) type {
 
         /// Names a group for `group_hover` / `group_active` styles.
         pub fn group(self: *Self, name: []const u8) *Self {
-            self.interactivity.group = name;
+            self.interactivity.ensure_extra().group = name;
             return self;
         }
 
         /// Sets the key context used to match key bindings.
         pub fn key_context(self: *Self, context: anytype) *Self {
             const T = @TypeOf(context);
-            self.interactivity.key_context = if (T == key_dispatch.KeyContext)
+            self.interactivity.ensure_extra().key_context = if (T == key_dispatch.KeyContext)
                 context
             else
                 key_dispatch.KeyContext.parse(context) catch @panic("invalid key context");
@@ -4054,127 +4104,130 @@ pub fn StyledElement(comptime Ext: type) type {
 
         /// Tracks focus with `handle` (GPUI `track_focus`).
         pub fn track_focus(self: *Self, handle: *const FocusHandle) *Self {
-            self.interactivity.focusable = true;
-            self.interactivity.tracked_focus_handle = handle.*;
+            const ex = self.interactivity.ensure_extra();
+            ex.focusable = true;
+            ex.tracked_focus_handle = handle.*;
             return self;
         }
 
         /// Makes this element focusable with an implicit handle.
         pub fn focusable(self: *Self) *Self {
-            self.interactivity.focusable = true;
+            self.interactivity.ensure_extra().focusable = true;
             return self;
         }
 
         /// Sets where this element comes in tab order, which makes it focusable and a tab stop.
         pub fn tab_index(self: *Self, index: isize) *Self {
-            self.interactivity.focusable = true;
-            self.interactivity.tab_index = index;
-            self.interactivity.tab_stop = true;
+            const ex = self.interactivity.ensure_extra();
+            ex.focusable = true;
+            ex.tab_index = index;
+            ex.tab_stop = true;
             return self;
         }
 
         /// Gives this element one place in the tab order, inside which its children's tab
         /// indices start over.
         pub fn tab_group(self: *Self) *Self {
-            self.interactivity.tab_group_ = true;
-            if (self.interactivity.tab_index == null) self.interactivity.tab_index = 0;
+            const ex = self.interactivity.ensure_extra();
+            ex.tab_group_ = true;
+            if (ex.tab_index == null) ex.tab_index = 0;
             return self;
         }
 
         pub fn tab_stop(self: *Self, v: bool) *Self {
-            self.interactivity.tab_stop = v;
+            self.interactivity.ensure_extra().tab_stop = v;
             return self;
         }
 
         /// Style applied while hovered: `.hover(style().bg(red()))`.
         pub fn hover(self: *Self, s: anytype) *Self {
-            self.interactivity.hover_style = to_style_refinement(s);
+            self.interactivity.ensure_extra().hover_style = to_style_refinement(s);
             return self;
         }
 
         pub fn group_hover(self: *Self, group_name: []const u8, s: anytype) *Self {
-            self.interactivity.group_hover_style = .{ .group = group_name, .style = to_style_refinement(s) };
+            self.interactivity.ensure_extra().group_hover_style = .{ .group = group_name, .style = to_style_refinement(s) };
             return self;
         }
 
         /// Style applied while pressed.
         pub fn active(self: *Self, s: anytype) *Self {
-            self.interactivity.active_style = to_style_refinement(s);
+            self.interactivity.ensure_extra().active_style = to_style_refinement(s);
             return self;
         }
 
         pub fn group_active(self: *Self, group_name: []const u8, s: anytype) *Self {
-            self.interactivity.group_active_style = .{ .group = group_name, .style = to_style_refinement(s) };
+            self.interactivity.ensure_extra().group_active_style = .{ .group = group_name, .style = to_style_refinement(s) };
             return self;
         }
 
         /// Style applied while this element is focused.
         pub fn focus(self: *Self, s: anytype) *Self {
-            self.interactivity.focus_style = to_style_refinement(s);
+            self.interactivity.ensure_extra().focus_style = to_style_refinement(s);
             return self;
         }
 
         /// Style applied while this element or a descendant is focused.
         pub fn in_focus(self: *Self, s: anytype) *Self {
-            self.interactivity.in_focus_style = to_style_refinement(s);
+            self.interactivity.ensure_extra().in_focus_style = to_style_refinement(s);
             return self;
         }
 
         pub fn focus_visible(self: *Self, s: anytype) *Self {
-            self.interactivity.focus_visible_style = to_style_refinement(s);
+            self.interactivity.ensure_extra().focus_visible_style = to_style_refinement(s);
             return self;
         }
 
         pub fn on_mouse_down(self: *Self, button: MouseButton, listener: anytype) *Self {
-            self.interactivity.mouse_down_listeners.append(arena(), .{ .button = button, .phase = .bubble, .listener = app_mod.to_listener(MouseDownEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().mouse_down_listeners.append(arena(), .{ .button = button, .phase = .bubble, .listener = app_mod.to_listener(MouseDownEvent, listener) }) catch oom();
             return self;
         }
 
         pub fn capture_any_mouse_down(self: *Self, listener: anytype) *Self {
-            self.interactivity.mouse_down_listeners.append(arena(), .{ .button = null, .phase = .capture, .listener = app_mod.to_listener(MouseDownEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().mouse_down_listeners.append(arena(), .{ .button = null, .phase = .capture, .listener = app_mod.to_listener(MouseDownEvent, listener) }) catch oom();
             return self;
         }
 
         pub fn on_any_mouse_down(self: *Self, listener: anytype) *Self {
-            self.interactivity.mouse_down_listeners.append(arena(), .{ .button = null, .phase = .bubble, .listener = app_mod.to_listener(MouseDownEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().mouse_down_listeners.append(arena(), .{ .button = null, .phase = .bubble, .listener = app_mod.to_listener(MouseDownEvent, listener) }) catch oom();
             return self;
         }
 
         pub fn on_mouse_up(self: *Self, button: MouseButton, listener: anytype) *Self {
-            self.interactivity.mouse_up_listeners.append(arena(), .{ .button = button, .phase = .bubble, .listener = app_mod.to_listener(MouseUpEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().mouse_up_listeners.append(arena(), .{ .button = button, .phase = .bubble, .listener = app_mod.to_listener(MouseUpEvent, listener) }) catch oom();
             return self;
         }
 
         pub fn capture_any_mouse_up(self: *Self, listener: anytype) *Self {
-            self.interactivity.mouse_up_listeners.append(arena(), .{ .button = null, .phase = .capture, .listener = app_mod.to_listener(MouseUpEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().mouse_up_listeners.append(arena(), .{ .button = null, .phase = .capture, .listener = app_mod.to_listener(MouseUpEvent, listener) }) catch oom();
             return self;
         }
 
         pub fn on_any_mouse_up(self: *Self, listener: anytype) *Self {
-            self.interactivity.mouse_up_listeners.append(arena(), .{ .button = null, .phase = .bubble, .listener = app_mod.to_listener(MouseUpEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().mouse_up_listeners.append(arena(), .{ .button = null, .phase = .bubble, .listener = app_mod.to_listener(MouseUpEvent, listener) }) catch oom();
             return self;
         }
 
         /// Fires when the mouse goes down outside this element.
         pub fn on_mouse_down_out(self: *Self, listener: anytype) *Self {
-            self.interactivity.mouse_down_out_listeners.append(arena(), .{ .listener = app_mod.to_listener(MouseDownEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().mouse_down_out_listeners.append(arena(), .{ .listener = app_mod.to_listener(MouseDownEvent, listener) }) catch oom();
             return self;
         }
 
         /// Fires when `button` is released outside this element, as for ending a drag.
         pub fn on_mouse_up_out(self: *Self, button: MouseButton, listener: anytype) *Self {
-            self.interactivity.mouse_up_out_listeners.append(arena(), .{ .button = button, .listener = app_mod.to_listener(MouseUpEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().mouse_up_out_listeners.append(arena(), .{ .button = button, .listener = app_mod.to_listener(MouseUpEvent, listener) }) catch oom();
             return self;
         }
 
         pub fn on_mouse_move(self: *Self, listener: anytype) *Self {
-            self.interactivity.mouse_move_listeners.append(arena(), app_mod.to_listener(MouseMoveEvent, listener)) catch oom();
+            self.interactivity.ensure_extra().mouse_move_listeners.append(arena(), app_mod.to_listener(MouseMoveEvent, listener)) catch oom();
             return self;
         }
 
         /// Scroll events over this element, in the bubble phase (GPUI `on_scroll`).
         pub fn on_scroll(self: *Self, listener: anytype) *Self {
-            self.interactivity.scroll_wheel_listeners.append(arena(), app_mod.to_listener(ScrollWheelEvent, listener)) catch oom();
+            self.interactivity.add_scroll_wheel_listener(app_mod.to_listener(ScrollWheelEvent, listener));
             return self;
         }
 
@@ -4185,14 +4238,14 @@ pub fn StyledElement(comptime Ext: type) type {
 
         /// Called when the mouse leaves the window while over this element (GPUI `on_mouse_exit`).
         pub fn on_mouse_exit(self: *Self, listener: anytype) *Self {
-            self.interactivity.mouse_exit_listeners.append(arena(), app_mod.to_listener(MouseExitEvent, listener)) catch oom();
+            self.interactivity.ensure_extra().mouse_exit_listeners.append(arena(), app_mod.to_listener(MouseExitEvent, listener)) catch oom();
             return self;
         }
 
         /// Called with `FileDropEvent.exited` when a file drag leaves the window while over this
         /// element (GPUI `on_file_drop_exit`).
         pub fn on_file_drop_exit(self: *Self, listener: anytype) *Self {
-            self.interactivity.file_drop_exit_listeners.append(arena(), app_mod.to_listener(FileDropEvent, listener)) catch oom();
+            self.interactivity.ensure_extra().file_drop_exit_listeners.append(arena(), app_mod.to_listener(FileDropEvent, listener)) catch oom();
             return self;
         }
 
@@ -4203,7 +4256,7 @@ pub fn StyledElement(comptime Ext: type) type {
             const E = DragMoveEvent(T);
             const held = arena().create(Listener(E)) catch oom();
             held.* = app_mod.to_listener(E, listener);
-            self.interactivity.drag_move_listeners.append(arena(), .{ .type_id = app_mod.type_id(T), .ctx = held, .call = struct {
+            self.interactivity.ensure_extra().drag_move_listeners.append(arena(), .{ .type_id = app_mod.type_id(T), .ctx = held, .call = struct {
                 fn call(raw: *anyopaque, event: *const MouseMoveEvent, bounds: Bounds(Pixels), item: *anyopaque, window: *Window, cx: *App) void {
                     const l: *const Listener(E) = @ptrCast(@alignCast(raw));
                     const ev: E = .{ .event = event.*, .bounds = bounds, .item = @ptrCast(@alignCast(item)) };
@@ -4215,13 +4268,13 @@ pub fn StyledElement(comptime Ext: type) type {
 
         /// Sets the hit testing `on_hover` uses (GPUI `hover_listener_mode`).
         pub fn hover_listener_mode(self: *Self, mode: HoverListenerMode) *Self {
-            self.interactivity.hover_listener_mode = mode;
+            self.interactivity.ensure_extra().hover_listener_mode = mode;
             return self;
         }
 
         /// Keeps this element scrolled into view by its scroll container (GPUI `anchor_scroll`).
         pub fn anchor_scroll(self: *Self, scroll_anchor: ?ScrollAnchor) *Self {
-            self.interactivity.scroll_anchor = scroll_anchor;
+            self.interactivity.ensure_extra().scroll_anchor = scroll_anchor;
             return self;
         }
 
@@ -4251,27 +4304,27 @@ pub fn StyledElement(comptime Ext: type) type {
         }
 
         pub fn on_key_down(self: *Self, listener: anytype) *Self {
-            self.interactivity.key_down_listeners.append(arena(), .{ .phase = .bubble, .l = app_mod.to_listener(KeyDownEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().key_down_listeners.append(arena(), .{ .phase = .bubble, .l = app_mod.to_listener(KeyDownEvent, listener) }) catch oom();
             return self;
         }
 
         pub fn capture_key_down(self: *Self, listener: anytype) *Self {
-            self.interactivity.key_down_listeners.append(arena(), .{ .phase = .capture, .l = app_mod.to_listener(KeyDownEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().key_down_listeners.append(arena(), .{ .phase = .capture, .l = app_mod.to_listener(KeyDownEvent, listener) }) catch oom();
             return self;
         }
 
         pub fn on_key_up(self: *Self, listener: anytype) *Self {
-            self.interactivity.key_up_listeners.append(arena(), .{ .phase = .bubble, .l = app_mod.to_listener(KeyUpEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().key_up_listeners.append(arena(), .{ .phase = .bubble, .l = app_mod.to_listener(KeyUpEvent, listener) }) catch oom();
             return self;
         }
 
         pub fn capture_key_up(self: *Self, listener: anytype) *Self {
-            self.interactivity.key_up_listeners.append(arena(), .{ .phase = .capture, .l = app_mod.to_listener(KeyUpEvent, listener) }) catch oom();
+            self.interactivity.ensure_extra().key_up_listeners.append(arena(), .{ .phase = .capture, .l = app_mod.to_listener(KeyUpEvent, listener) }) catch oom();
             return self;
         }
 
         pub fn on_modifiers_changed(self: *Self, listener: anytype) *Self {
-            self.interactivity.modifiers_changed_listeners.append(arena(), app_mod.to_listener(ModifiersChangedEvent, listener)) catch oom();
+            self.interactivity.ensure_extra().modifiers_changed_listeners.append(arena(), app_mod.to_listener(ModifiersChangedEvent, listener)) catch oom();
             return self;
         }
 
@@ -4300,7 +4353,7 @@ pub fn StyledElement(comptime Ext: type) type {
             };
             const ctx = arena().create(S.ActionCtx) catch oom();
             ctx.* = .{ .l = l, .phase = phase };
-            self.interactivity.action_listeners.append(arena(), .{ .action_type = app_mod.type_id(A), .phase = phase, .ctx = ctx, .func = S.call }) catch oom();
+            self.interactivity.ensure_extra().action_listeners.append(arena(), .{ .action_type = app_mod.type_id(A), .phase = phase, .ctx = ctx, .func = S.call }) catch oom();
             return self;
         }
 
@@ -4311,7 +4364,7 @@ pub fn StyledElement(comptime Ext: type) type {
         }
 
         pub fn block_mouse_except_scroll(self: *Self) *Self {
-            self.interactivity.block_mouse_except_scroll_ = true;
+            self.interactivity.ensure_extra().block_mouse_except_scroll_ = true;
             return self;
         }
 
@@ -4320,30 +4373,30 @@ pub fn StyledElement(comptime Ext: type) type {
         /// Click handler (requires `.id(...)`).
         /// Fires for clicks with any button but the left one.
         pub fn on_aux_click(self: *Self, listener: anytype) *Self {
-            self.interactivity.aux_click_listeners.append(arena(), app_mod.to_listener(ClickEvent, listener)) catch oom();
+            self.interactivity.ensure_extra().aux_click_listeners.append(arena(), app_mod.to_listener(ClickEvent, listener)) catch oom();
             return self;
         }
 
         pub fn on_pinch(self: *Self, listener: anytype) *Self {
-            self.interactivity.pinch_listeners.append(arena(), app_mod.to_listener(PinchEvent, listener)) catch oom();
+            self.interactivity.ensure_extra().pinch_listeners.append(arena(), app_mod.to_listener(PinchEvent, listener)) catch oom();
             return self;
         }
 
         pub fn capture_pinch(self: *Self, listener: anytype) *Self {
-            self.interactivity.capture_pinch_listeners.append(arena(), app_mod.to_listener(PinchEvent, listener)) catch oom();
+            self.interactivity.ensure_extra().capture_pinch_listeners.append(arena(), app_mod.to_listener(PinchEvent, listener)) catch oom();
             return self;
         }
 
         /// Pressure changes over this element (GPUI `on_mouse_pressure`). Only macOS trackpads
         /// report pressure; no other platform emits these events.
         pub fn on_mouse_pressure(self: *Self, listener: anytype) *Self {
-            self.interactivity.mouse_pressure_listeners.append(arena(), app_mod.to_listener(MousePressureEvent, listener)) catch oom();
+            self.interactivity.ensure_extra().mouse_pressure_listeners.append(arena(), app_mod.to_listener(MousePressureEvent, listener)) catch oom();
             return self;
         }
 
         /// The capture-phase form of `on_mouse_pressure` (GPUI `capture_mouse_pressure`).
         pub fn capture_mouse_pressure(self: *Self, listener: anytype) *Self {
-            self.interactivity.capture_mouse_pressure_listeners.append(arena(), app_mod.to_listener(MousePressureEvent, listener)) catch oom();
+            self.interactivity.ensure_extra().capture_mouse_pressure_listeners.append(arena(), app_mod.to_listener(MousePressureEvent, listener)) catch oom();
             return self;
         }
 
@@ -4354,7 +4407,7 @@ pub fn StyledElement(comptime Ext: type) type {
             const T = @TypeOf(value);
             const held = arena().create(T) catch oom();
             held.* = value;
-            self.interactivity.drag_listener = .{ .value = held, .start = struct {
+            self.interactivity.ensure_extra().drag_listener = .{ .value = held, .start = struct {
                 fn start(raw: *anyopaque, offset: Point(Pixels), window: *Window, cx: *App) app_mod.AnyDrag {
                     const source: *const T = @ptrCast(@alignCast(raw));
                     const copy = cx.allocator.create(T) catch oom();
@@ -4378,7 +4431,7 @@ pub fn StyledElement(comptime Ext: type) type {
         pub fn on_drop(self: *Self, comptime T: type, listener: anytype) *Self {
             const held = arena().create(Listener(T)) catch oom();
             held.* = app_mod.to_listener(T, listener);
-            self.interactivity.drop_listeners.append(arena(), .{ .type_id = app_mod.type_id(T), .ctx = held, .call = struct {
+            self.interactivity.ensure_extra().drop_listeners.append(arena(), .{ .type_id = app_mod.type_id(T), .ctx = held, .call = struct {
                 fn call(raw: *anyopaque, value: *anyopaque, window: *Window, cx: *App) void {
                     const l: *const Listener(T) = @ptrCast(@alignCast(raw));
                     l.call(@ptrCast(@alignCast(value)), window, cx);
@@ -4389,50 +4442,52 @@ pub fn StyledElement(comptime Ext: type) type {
 
         /// Decides whether the drag may be dropped here, and whether drag_over styles apply.
         pub fn can_drop(self: *Self, predicate: *const fn (app_mod.AnyDragValue, *Window, *App) bool) *Self {
-            self.interactivity.can_drop_predicate = predicate;
+            self.interactivity.ensure_extra().can_drop_predicate = predicate;
             return self;
         }
 
         /// Style applied while a dragged `T` is over this element.
         pub fn drag_over(self: *Self, comptime T: type, s: anytype) *Self {
-            self.interactivity.drag_over_styles.append(arena(), .{ .type_id = app_mod.type_id(T), .style = to_style_refinement(s) }) catch oom();
+            self.interactivity.ensure_extra().drag_over_styles.append(arena(), .{ .type_id = app_mod.type_id(T), .style = to_style_refinement(s) }) catch oom();
             return self;
         }
 
         /// Style applied while a dragged `T` is over the named group.
         pub fn group_drag_over(self: *Self, comptime T: type, group_name: []const u8, s: anytype) *Self {
-            self.interactivity.group_drag_over_styles.append(arena(), .{ .type_id = app_mod.type_id(T), .group = group_name, .style = to_style_refinement(s) }) catch oom();
+            self.interactivity.ensure_extra().group_drag_over_styles.append(arena(), .{ .type_id = app_mod.type_id(T), .group = group_name, .style = to_style_refinement(s) }) catch oom();
             return self;
         }
 
         /// Shows a view after the pointer rests here. Takes a `fn(*Window, *App) AnyView` or
         /// a `TooltipBuilder`. The element needs an id.
         pub fn tooltip(self: *Self, build_tooltip: anytype) *Self {
-            self.interactivity.tooltip_builder = to_tooltip_builder(build_tooltip);
-            self.interactivity.tooltip_hoverable = false;
+            const ex = self.interactivity.ensure_extra();
+            ex.tooltip_builder = to_tooltip_builder(build_tooltip);
+            ex.tooltip_hoverable = false;
             return self;
         }
 
         /// Like `tooltip`, but the pointer may move onto the tooltip without it closing.
         pub fn hoverable_tooltip(self: *Self, build_tooltip: anytype) *Self {
-            self.interactivity.tooltip_builder = to_tooltip_builder(build_tooltip);
-            self.interactivity.tooltip_hoverable = true;
+            const ex = self.interactivity.ensure_extra();
+            ex.tooltip_builder = to_tooltip_builder(build_tooltip);
+            ex.tooltip_hoverable = true;
             return self;
         }
 
         pub fn tooltip_show_delay(self: *Self, delay_ms: u64) *Self {
-            self.interactivity.tooltip_show_delay_ns = delay_ms * std.time.ns_per_ms;
+            self.interactivity.ensure_extra().tooltip_show_delay_ns = delay_ms * std.time.ns_per_ms;
             return self;
         }
 
         pub fn on_click(self: *Self, listener: anytype) *Self {
-            self.interactivity.click_listeners.append(arena(), app_mod.to_listener(ClickEvent, listener)) catch oom();
+            self.interactivity.ensure_extra().click_listeners.append(arena(), app_mod.to_listener(ClickEvent, listener)) catch oom();
             return self;
         }
 
         /// Called with `true`/`false` when hover starts/ends.
         pub fn on_hover(self: *Self, listener: anytype) *Self {
-            self.interactivity.hover_listener = app_mod.to_listener(bool, listener);
+            self.interactivity.ensure_extra().hover_listener = app_mod.to_listener(bool, listener);
             return self;
         }
 
@@ -4449,13 +4504,13 @@ pub fn StyledElement(comptime Ext: type) type {
             };
             const held = arena().create(Held) catch oom();
             held.* = .{ .action = action };
-            self.interactivity.action_listeners.append(arena(), .{ .action_type = action.type_id, .phase = .bubble, .ctx = held, .func = Held.call }) catch oom();
+            self.interactivity.ensure_extra().action_listeners.append(arena(), .{ .action_type = action.type_id, .phase = .bubble, .ctx = held, .func = Held.call }) catch oom();
             return self;
         }
 
         /// Tracks the scroll position in `handle`.
         pub fn track_scroll(self: *Self, handle: *const ScrollHandle) *Self {
-            self.interactivity.tracked_scroll_handle = handle.*;
+            self.interactivity.set_tracked_scroll_handle(handle.*);
             return self;
         }
 
@@ -4488,62 +4543,70 @@ pub fn StyledElement(comptime Ext: type) type {
             const it = &self.interactivity;
             var pp: DivPrepaintState = .{};
             if (gid) |g| pp.state = window.element_state(InteractiveElementState, g.*, .{});
-            // Where an anchored element is, so its container can scroll to it (GPUI `scroll_anchor`).
-            if (it.scroll_anchor) |anchor| {
-                const offset = window.element_offset();
-                anchor.last_origin.* = .{ .x = bounds.origin.x - offset.x, .y = bounds.origin.y - offset.y };
-            }
-
-            // Focus handle: tracked, or an implicit one stored in element state.
-            if (it.focusable and it.tracked_focus_handle == null) {
-                if (pp.state) |st| {
-                    if (st.focus_handle == null) st.focus_handle = cx.focus_handle();
-                    it.tracked_focus_handle = st.focus_handle;
+            if (it.extra) |ex| {
+                // Where an anchored element is, so its container can scroll to it (GPUI `scroll_anchor`).
+                if (ex.scroll_anchor) |anchor| {
+                    const offset = window.element_offset();
+                    anchor.last_origin.* = .{ .x = bounds.origin.x - offset.x, .y = bounds.origin.y - offset.y };
                 }
+
+                // Focus handle: tracked, or an implicit one stored in element state.
+                if (ex.focusable and ex.tracked_focus_handle == null) {
+                    if (pp.state) |st| {
+                        if (st.focus_handle == null) st.focus_handle = cx.focus_handle();
+                        ex.tracked_focus_handle = st.focus_handle;
+                    }
+                }
+                if (ex.tracked_focus_handle) |*fh| {
+                    var hh = fh.*;
+                    if (ex.tab_index) |ti| hh.tab_index_ = ti;
+                    if (ex.tab_stop) |ts| hh.tab_stop_ = ts;
+                    window.set_focus_handle(&hh, cx);
+                }
+                if (ex.tab_group_) window.next_frame.dispatch_tree.set_tab_group(ex.tab_index.?);
+                if (ex.key_context) |kc| window.set_key_context(kc);
             }
-            if (it.tracked_focus_handle) |*fh| {
-                var hh = fh.*;
-                if (it.tab_index) |ti| hh.tab_index_ = ti;
-                if (it.tab_stop) |ts| hh.tab_stop_ = ts;
-                window.set_focus_handle(&hh, cx);
-            }
-            if (it.tab_group_) window.next_frame.dispatch_tree.set_tab_group(it.tab_index.?);
-            if (it.key_context) |kc| window.set_key_context(kc);
 
             // A tooltip that is showing asks to be drawn at the end of the frame.
             if (pp.state) |st| {
-                st.tooltip_builder = it.tooltip_builder;
-                st.tooltip_hoverable = it.tooltip_hoverable;
+                const tb = if (it.extra) |ex| ex.tooltip_builder else null;
+                st.tooltip_builder = tb;
+                st.tooltip_hoverable = if (it.extra) |ex| ex.tooltip_hoverable else false;
                 st.tooltip_source_bounds = bounds;
-                if (it.tooltip_builder == null) {
+                if (tb == null) {
                     clear_tooltip(st, window, cx);
                 } else if (st.tooltip_view) |view| {
                     window.set_tooltip(.{ .view = view, .mouse_position = st.tooltip_mouse, .ctx = st, .check_visible_and_update = tooltip_check_visible });
                 }
             }
 
-            // Key & action listeners attach to this element's dispatch node.
-            for (it.key_down_listeners.items) |*kl| registerKey(KeyDownEvent, window, kl.phase, &kl.l);
-            for (it.key_up_listeners.items) |*kl| registerKey(KeyUpEvent, window, kl.phase, &kl.l);
-            for (it.action_listeners.items) |al| window.on_action(al.action_type, al.ctx, al.func);
+            if (it.extra) |ex| {
+                // Key & action listeners attach to this element's dispatch node.
+                for (ex.key_down_listeners.items) |*kl| registerKey(KeyDownEvent, window, kl.phase, &kl.l);
+                for (ex.key_up_listeners.items) |*kl| registerKey(KeyUpEvent, window, kl.phase, &kl.l);
+                for (ex.action_listeners.items) |al| window.on_action(al.action_type, al.ctx, al.func);
+            }
 
             if (it.needs_hitbox()) {
-                const behavior: window_mod.HitboxBehavior = if (it.occlude_mouse_) .block_mouse else if (it.block_mouse_except_scroll_) .block_mouse_except_scroll else .normal;
+                const behavior: window_mod.HitboxBehavior = if (it.extra) |ex|
+                    (if (ex.occlude_mouse_) .block_mouse else if (ex.block_mouse_except_scroll_) .block_mouse_except_scroll else .normal)
+                else
+                    .normal;
                 pp.hitbox = window.insert_hitbox(bounds, behavior);
-                if (it.group) |g| {
-                    if (Interactivity.groups_frame != window.frame_count) {
-                        Interactivity.groups.clearRetainingCapacity();
-                        Interactivity.groups_frame = window.frame_count;
-                    }
+                if (it.extra) |ex| if (ex.group) |g| {
                     const is_active = if (pp.state) |st| st.active else false;
-                    Interactivity.groups.put(std.heap.page_allocator, g, .{ .hitbox = pp.hitbox.?.id, .active = is_active }) catch oom();
-                }
+                    window.next_frame.group_hitboxes.put(window.allocator, g, .{ .hitbox = pp.hitbox.?.id, .active = is_active }) catch oom();
+                };
             }
 
             // Without the hitbox: what is hovered is only known once prepaint has finished. Paint
             // computes it again with the hitbox, as GPUI does.
-            pp.style = it.compute_style_from(&rl.base_style, null, pp.state, window, cx);
-            const s = &pp.style;
+            if (it.has_dynamic_style(cx)) {
+                const dyn = arena().create(Style) catch oom();
+                dyn.* = it.compute_style_from(&rl.base_style, null, pp.state, window, cx);
+                pp.dynamic_style = dyn;
+            }
+            const s: *const Style = pp.dynamic_style orelse &rl.base_style;
 
             const has_text = s.text_style() != null;
             if (has_text) window.push_text_style(s.text);
@@ -4554,15 +4617,17 @@ pub fn StyledElement(comptime Ext: type) type {
             var scroll: Point(Pixels) = .{ .x = 0, .y = 0 };
             // The children are measured, and the requests made since the last frame applied, before the
             // offset is clamped (GPUI `Div::prepaint` and `scroll_to_active_item`).
-            if (it.tracked_scroll_handle) |sh| {
+            const tracked_scroll = it.tracked_scroll_handle();
+            if (tracked_scroll) |sh| {
                 sh.state.child_bounds.clearRetainingCapacity();
-                const allocator = sh.state.allocator orelse std.heap.page_allocator;
-                for (rl.child_layout_ids) |lid| sh.state.child_bounds.append(allocator, window.layout_bounds(lid)) catch oom();
+                if (sh.state.allocator == null) sh.state.allocator = window.allocator;
+                const scroll_alloc = sh.state.allocator.?;
+                for (rl.child_layout_ids) |lid| sh.state.child_bounds.append(scroll_alloc, window.layout_bounds(lid)) catch oom();
                 sh.scroll_to_active_item();
             }
             if (s.overflow.x == .scroll or s.overflow.y == .scroll) {
                 const max = scroll_max(bounds, s, rl.child_layout_ids, window);
-                if (it.tracked_scroll_handle) |sh| {
+                if (tracked_scroll) |sh| {
                     sh.state.max_offset = max;
                     sh.state.bounds = bounds;
                     sh.state.overflow = s.overflow;
@@ -4574,7 +4639,7 @@ pub fn StyledElement(comptime Ext: type) type {
                 }
                 if (pp.state) |st| {
                     st.scroll_max = max;
-                    if (it.tracked_scroll_handle == null) scroll = clamp_scroll(st.scroll_offset, max);
+                    if (tracked_scroll == null) scroll = clamp_scroll(st.scroll_offset, max);
                     st.scroll_offset = scroll;
                 }
             }
@@ -4606,13 +4671,25 @@ pub fn StyledElement(comptime Ext: type) type {
 
         pub fn paint(self: *Self, gid: ?*const GlobalElementId, bounds: Bounds(Pixels), rl: *DivFrameState, pp: *DivPrepaintState, window: *Window, cx: *App) void {
             _ = gid;
-            // Only these depend on the hit test, which prepaint could not know.
-            const hover_dependent = self.interactivity.hover_style != null or self.interactivity.group_hover_style != null or
-                self.interactivity.drag_over_styles.items.len > 0 or self.interactivity.group_drag_over_styles.items.len > 0;
-            if (hover_dependent) pp.style = self.interactivity.compute_style_from(&rl.base_style, if (pp.hitbox) |*hbx| hbx else null, pp.state, window, cx);
-            const s = &pp.style;
-            if (s.visibility == .hidden) return;
             const it = &self.interactivity;
+            // Only these depend on the hit test, which prepaint could not know.
+            const hover_dependent = if (it.extra) |ex|
+                ex.hover_style != null or ex.group_hover_style != null or
+                    (cx.active_drag != null and (ex.drag_over_styles.items.len > 0 or ex.group_drag_over_styles.items.len > 0))
+            else
+                false;
+            if (hover_dependent) {
+                const computed = it.compute_style_from(&rl.base_style, if (pp.hitbox) |*hbx| hbx else null, pp.state, window, cx);
+                if (pp.dynamic_style) |dyn| {
+                    dyn.* = computed;
+                } else {
+                    const dyn = arena().create(Style) catch oom();
+                    dyn.* = computed;
+                    pp.dynamic_style = dyn;
+                }
+            }
+            const s: *const Style = pp.dynamic_style orelse &rl.base_style;
+            if (s.visibility == .hidden) return;
 
             if (pp.hitbox) |*hb| {
                 self.register_mouse_listeners(hb, pp.state, window);
@@ -4668,7 +4745,6 @@ pub fn StyledElement(comptime Ext: type) type {
             if (s.debug or s.debug_below) {
                 window.paint_quad(window_mod.outline(bounds, color_mod.red(), .solid));
             }
-            _ = it;
         }
 
         fn registerKey(comptime E: type, window: *Window, phase: DispatchPhase, l: *const Listener(E)) void {
@@ -4691,24 +4767,33 @@ pub fn StyledElement(comptime Ext: type) type {
 
         fn register_mouse_listeners(self: *Self, hb: *const Hitbox, state: ?*InteractiveElementState, window: *Window) void {
             const it = &self.interactivity;
+            const scrollable = it.base_style.overflow.x == .scroll or it.base_style.overflow.y == .scroll;
+            const ex = it.extra orelse {
+                if (scrollable) {
+                    const ctx = arena().create(MouseCtx) catch oom();
+                    ctx.* = .{ .self = self, .hitbox = hb.*, .state = state };
+                    window.on_mouse_event(ScrollWheelEvent, ctx, onScrollWheel);
+                }
+                return;
+            };
             const ctx = arena().create(MouseCtx) catch oom();
             ctx.* = .{ .self = self, .hitbox = hb.*, .state = state };
 
-            const needs_down = it.mouse_down_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or
-                it.tracked_focus_handle != null or it.group_active_style != null or it.mouse_down_out_listeners.items.len > 0 or
-                it.aux_click_listeners.items.len > 0 or it.drag_listener != null or it.tooltip_builder != null;
+            const needs_down = ex.mouse_down_listeners.items.len > 0 or ex.click_listeners.items.len > 0 or ex.active_style != null or
+                ex.tracked_focus_handle != null or ex.group_active_style != null or ex.mouse_down_out_listeners.items.len > 0 or
+                ex.aux_click_listeners.items.len > 0 or ex.drag_listener != null or ex.tooltip_builder != null;
             if (needs_down) window.on_mouse_event(MouseDownEvent, ctx, onMouseDown);
-            if (it.pinch_listeners.items.len > 0 or it.capture_pinch_listeners.items.len > 0) window.on_mouse_event(PinchEvent, ctx, onPinch);
-            if (it.mouse_pressure_listeners.items.len > 0 or it.capture_mouse_pressure_listeners.items.len > 0) window.on_mouse_event(MousePressureEvent, ctx, onMousePressure);
-            if (it.drop_listeners.items.len > 0 or it.aux_click_listeners.items.len > 0 or it.drag_listener != null or it.tooltip_builder != null or it.mouse_up_out_listeners.items.len > 0 or it.mouse_up_listeners.items.len > 0 or it.click_listeners.items.len > 0 or it.active_style != null or it.group != null)
+            if (ex.pinch_listeners.items.len > 0 or ex.capture_pinch_listeners.items.len > 0) window.on_mouse_event(PinchEvent, ctx, onPinch);
+            if (ex.mouse_pressure_listeners.items.len > 0 or ex.capture_mouse_pressure_listeners.items.len > 0) window.on_mouse_event(MousePressureEvent, ctx, onMousePressure);
+            if (ex.drop_listeners.items.len > 0 or ex.aux_click_listeners.items.len > 0 or ex.drag_listener != null or ex.tooltip_builder != null or ex.mouse_up_out_listeners.items.len > 0 or ex.mouse_up_listeners.items.len > 0 or ex.click_listeners.items.len > 0 or ex.active_style != null or ex.group != null)
                 window.on_mouse_event(MouseUpEvent, ctx, onMouseUp);
-            if (it.drag_listener != null or it.tooltip_builder != null or it.drag_over_styles.items.len > 0 or it.mouse_move_listeners.items.len > 0 or it.hover_style != null or it.hover_listener != null or it.group_hover_style != null or it.group != null or it.drag_move_listeners.items.len > 0)
+            if (ex.drag_listener != null or ex.tooltip_builder != null or ex.drag_over_styles.items.len > 0 or ex.mouse_move_listeners.items.len > 0 or ex.hover_style != null or ex.hover_listener != null or ex.group_hover_style != null or ex.group != null or ex.drag_move_listeners.items.len > 0)
                 window.on_mouse_event(MouseMoveEvent, ctx, onMouseMove);
-            if (it.mouse_exit_listeners.items.len > 0 or it.hover_listener != null) window.on_mouse_event(MouseExitEvent, ctx, onMouseExit);
-            if (it.file_drop_exit_listeners.items.len > 0) window.on_mouse_event(FileDropEvent, ctx, onFileDrop);
-            if (it.tooltip_builder != null or it.scroll_wheel_listeners.items.len > 0 or it.base_style.overflow.x == .scroll or it.base_style.overflow.y == .scroll)
+            if (ex.mouse_exit_listeners.items.len > 0 or ex.hover_listener != null) window.on_mouse_event(MouseExitEvent, ctx, onMouseExit);
+            if (ex.file_drop_exit_listeners.items.len > 0) window.on_mouse_event(FileDropEvent, ctx, onFileDrop);
+            if (ex.tooltip_builder != null or ex.scroll_wheel_listeners.items.len > 0 or scrollable)
                 window.on_mouse_event(ScrollWheelEvent, ctx, onScrollWheel);
-            if (it.tooltip_builder != null) window.on_mouse_event(interactive.LongPressEvent, ctx, onLongPress);
+            if (ex.tooltip_builder != null) window.on_mouse_event(interactive.LongPressEvent, ctx, onLongPress);
         }
 
         /// Shows the tooltip at once when a long press starts over this element, and hides it when the
@@ -4737,21 +4822,21 @@ pub fn StyledElement(comptime Ext: type) type {
 
         fn onMouseDown(raw: *anyopaque, e: *const MouseDownEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
-            const it = &c.self.interactivity;
+            const ex = c.self.interactivity.extra orelse return;
             const hovered = c.hitbox.is_hovered(window);
-            if (it.tooltip_builder != null) if (c.state) |st| dismiss_tooltip_on_input(st, window, cx);
+            if (ex.tooltip_builder != null) if (c.state) |st| dismiss_tooltip_on_input(st, window, cx);
             if (phase == .bubble and !hovered) {
-                for (it.mouse_down_out_listeners.items) |l| l.listener.call(e, window, cx);
+                for (ex.mouse_down_out_listeners.items) |l| l.listener.call(e, window, cx);
             }
             if (!hovered) return;
-            for (it.mouse_down_listeners.items) |l| {
+            for (ex.mouse_down_listeners.items) |l| {
                 if (l.phase != phase) continue;
                 if (l.button) |b| if (!b.eql(e.button)) continue;
                 l.listener.call(e, window, cx);
                 if (!window.propagate_event) return;
             }
             if (phase != .bubble) return;
-            if (it.tracked_focus_handle) |fh| {
+            if (ex.tracked_focus_handle) |fh| {
                 if (!window.default_prevented()) {
                     window.focus(fh);
                     // A focusable parent must not take focus back as the event bubbles.
@@ -4759,10 +4844,10 @@ pub fn StyledElement(comptime Ext: type) type {
                 }
             }
             if (c.state) |st| {
-                if ((it.drag_listener != null and e.button == .left) or it.aux_click_listeners.items.len > 0 and e.button != .left) st.pending_mouse_down = e.*;
-                if (it.tooltip_builder != null) st.pending_mouse_down = e.*;
-                if (it.click_listeners.items.len > 0 and e.button == .left) st.pending_mouse_down = e.*;
-                if (it.active_style != null or it.group != null) {
+                if ((ex.drag_listener != null and e.button == .left) or ex.aux_click_listeners.items.len > 0 and e.button != .left) st.pending_mouse_down = e.*;
+                if (ex.tooltip_builder != null) st.pending_mouse_down = e.*;
+                if (ex.click_listeners.items.len > 0 and e.button == .left) st.pending_mouse_down = e.*;
+                if (ex.active_style != null or ex.group != null) {
                     st.active = true;
                     window.notify_current_view();
                 }
@@ -4771,16 +4856,16 @@ pub fn StyledElement(comptime Ext: type) type {
 
         fn onMouseUp(raw: *anyopaque, e: *const MouseUpEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
-            const it = &c.self.interactivity;
+            const ex = c.self.interactivity.extra orelse return;
             const hovered = c.hitbox.is_hovered(window);
             // Capture phase, as in GPUI: nothing outside may stop the element hearing it.
             if (phase == .capture and !hovered) {
-                for (it.mouse_up_out_listeners.items) |l| {
+                for (ex.mouse_up_out_listeners.items) |l| {
                     if (l.button.eql(e.button)) l.listener.call(e, window, cx);
                 }
             }
             if (hovered) {
-                for (it.mouse_up_listeners.items) |l| {
+                for (ex.mouse_up_listeners.items) |l| {
                     if (l.phase != phase) continue;
                     if (l.button) |b| if (!b.eql(e.button)) continue;
                     l.listener.call(e, window, cx);
@@ -4800,11 +4885,11 @@ pub fn StyledElement(comptime Ext: type) type {
                 }
                 return;
             }
-            if (hovered and it.drop_listeners.items.len > 0) {
+            if (hovered and ex.drop_listeners.items.len > 0) {
                 if (cx.active_drag) |drag| {
-                    for (it.drop_listeners.items) |l| {
+                    for (ex.drop_listeners.items) |l| {
                         if (l.type_id != drag.value.type_id) continue;
-                        const allowed = if (it.can_drop_predicate) |predicate| predicate(drag.value, window, cx) else true;
+                        const allowed = if (ex.can_drop_predicate) |predicate| predicate(drag.value, window, cx) else true;
                         if (allowed) {
                             l.call(l.ctx, drag.value.ptr, window, cx);
                             window.refresh();
@@ -4824,9 +4909,9 @@ pub fn StyledElement(comptime Ext: type) type {
                     st.captured_mouse_down = null;
                     const click: ClickEvent = .{ .mouse = .{ .down = down, .up = e.* } };
                     if (down.button == .left) {
-                        for (it.click_listeners.items) |l| l.call(&click, window, cx);
+                        for (ex.click_listeners.items) |l| l.call(&click, window, cx);
                     } else {
-                        for (it.aux_click_listeners.items) |l| l.call(&click, window, cx);
+                        for (ex.aux_click_listeners.items) |l| l.call(&click, window, cx);
                     }
                 }
             }
@@ -4835,20 +4920,21 @@ pub fn StyledElement(comptime Ext: type) type {
         fn onMouseMove(raw: *anyopaque, e: *const MouseMoveEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
             const it = &c.self.interactivity;
+            const ex = it.extra orelse return;
             const hovered = c.hitbox.is_hovered(window);
             // Drag-move listeners hear every move of a drag of their type, wherever the pointer is.
             if (phase == .capture) if (cx.active_drag) |drag| {
-                for (it.drag_move_listeners.items) |l| {
+                for (ex.drag_move_listeners.items) |l| {
                     if (l.type_id != drag.value.type_id) continue;
                     l.call(l.ctx, e, c.hitbox.bounds, drag.value.ptr, window, cx);
                 }
             };
-            if (it.tooltip_builder != null) if (c.state) |st| tooltip_on_mouse_move(st, hovered, phase, it.tooltip_show_delay_ns orelse DEFAULT_TOOLTIP_SHOW_DELAY_NS, window, cx);
+            if (ex.tooltip_builder != null) if (c.state) |st| tooltip_on_mouse_move(st, hovered, phase, ex.tooltip_show_delay_ns orelse DEFAULT_TOOLTIP_SHOW_DELAY_NS, window, cx);
             if (phase == .bubble and hovered) {
-                for (it.mouse_move_listeners.items) |l| l.call(e, window, cx);
+                for (ex.mouse_move_listeners.items) |l| l.call(e, window, cx);
             }
             if (phase == .bubble and !cx.has_active_drag()) {
-                if (it.drag_listener) |listener| if (c.state) |st| if (st.pending_mouse_down) |down| {
+                if (ex.drag_listener) |listener| if (c.state) |st| if (st.pending_mouse_down) |down| {
                     const dx = e.position.x - down.position.x;
                     const dy = e.position.y - down.position.y;
                     if (down.button == .left and @sqrt(dx * dx + dy * dy) > DROP_DRAG_THRESHOLD) {
@@ -4868,33 +4954,33 @@ pub fn StyledElement(comptime Ext: type) type {
             if (c.state) |st| {
                 if (st.hovered != hovered) {
                     st.hovered = hovered;
-                    if (it.hover_style != null or it.group != null) window.notify_current_view();
+                    if (ex.hover_style != null or ex.group != null) window.notify_current_view();
                 }
-                if (it.hover_listener) |hl| {
+                if (ex.hover_listener) |hl| {
                     // Not while a button is held or a drag runs, as in GPUI.
                     const listener_hovered = st.pending_mouse_down == null and !cx.has_active_drag() and
-                        it.hover_listener_mode.is_hovered(&c.hitbox, window);
+                        ex.hover_listener_mode.is_hovered(&c.hitbox, window);
                     if (st.hover_listener_state != listener_hovered) {
                         st.hover_listener_state = listener_hovered;
                         hl.call(&listener_hovered, window, cx);
                     }
                 }
-            } else if (it.hover_style != null) {
+            } else if (ex.hover_style != null) {
                 // Without persistent state, refresh whenever hover may have changed.
                 window.notify_current_view();
             }
-            if (it.group_hover_style != null) window.notify_current_view();
+            if (ex.group_hover_style != null) window.notify_current_view();
         }
 
         fn onMouseExit(raw: *anyopaque, e: *const MouseExitEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
-            const it = &c.self.interactivity;
+            const ex = c.self.interactivity.extra orelse return;
             if (phase != .bubble) return;
             if (c.hitbox.is_hovered(window)) {
-                for (it.mouse_exit_listeners.items) |l| l.call(e, window, cx);
+                for (ex.mouse_exit_listeners.items) |l| l.call(e, window, cx);
             }
             // The pointer can leave without a last move, so the hover listener is cleared here too.
-            if (it.hover_listener) |hl| if (c.state) |st| {
+            if (ex.hover_listener) |hl| if (c.state) |st| {
                 if (st.hover_listener_state) {
                     st.hover_listener_state = false;
                     const off = false;
@@ -4905,48 +4991,49 @@ pub fn StyledElement(comptime Ext: type) type {
 
         fn onFileDrop(raw: *anyopaque, e: *const FileDropEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
-            const it = &c.self.interactivity;
+            const ex = c.self.interactivity.extra orelse return;
             if (phase != .bubble or std.meta.activeTag(e.*) != .exited) return;
             if (!c.hitbox.is_hovered_ignoring_last_input(window)) return;
-            for (it.file_drop_exit_listeners.items) |l| l.call(e, window, cx);
+            for (ex.file_drop_exit_listeners.items) |l| l.call(e, window, cx);
         }
 
         fn onPinch(raw: *anyopaque, e: *const PinchEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
-            const it = &c.self.interactivity;
+            const ex = c.self.interactivity.extra orelse return;
             if (!c.hitbox.is_hovered(window)) return;
-            const list = if (phase == .capture) it.capture_pinch_listeners.items else it.pinch_listeners.items;
+            const list = if (phase == .capture) ex.capture_pinch_listeners.items else ex.pinch_listeners.items;
             for (list) |l| l.call(e, window, cx);
         }
 
         fn onMousePressure(raw: *anyopaque, e: *const MousePressureEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
-            const it = &c.self.interactivity;
+            const ex = c.self.interactivity.extra orelse return;
             if (!c.hitbox.is_hovered(window)) return;
-            const list = if (phase == .capture) it.capture_mouse_pressure_listeners.items else it.mouse_pressure_listeners.items;
+            const list = if (phase == .capture) ex.capture_mouse_pressure_listeners.items else ex.mouse_pressure_listeners.items;
             for (list) |l| l.call(e, window, cx);
         }
 
         fn onScrollWheel(raw: *anyopaque, e: *const ScrollWheelEvent, phase: DispatchPhase, window: *Window, cx: *App) void {
             const c: *MouseCtx = @ptrCast(@alignCast(raw));
             const it = &c.self.interactivity;
-            if (it.tooltip_builder != null) if (c.state) |st| dismiss_tooltip_on_input(st, window, cx);
+            if (it.extra) |ex| if (ex.tooltip_builder != null) if (c.state) |st| dismiss_tooltip_on_input(st, window, cx);
             if (phase != .bubble or !c.hitbox.should_handle_scroll(window)) return;
-            for (it.scroll_wheel_listeners.items) |l| l.call(e, window, cx);
+            for (it.scroll_wheel_listeners()) |l| l.call(e, window, cx);
             const s = it.base_style.overflow;
             if (s.x != .scroll and s.y != .scroll) return;
             const delta = e.delta.pixel_delta(window.line_height());
-            const old: Point(Pixels) = if (it.tracked_scroll_handle) |sh| sh.offset() else if (c.state) |st| st.scroll_offset else return;
+            const tracked_scroll = it.tracked_scroll_handle();
+            const old: Point(Pixels) = if (tracked_scroll) |sh| sh.offset() else if (c.state) |st| st.scroll_offset else return;
             // Unset refinements read as the defaults: visible overflow, and both flags off.
             const step = scroll_step(delta, s.x orelse .visible, s.y orelse .visible, it.base_style.restrict_scroll_to_axis orelse false, it.base_style.allow_concurrent_scroll orelse false);
             var off: Point(Pixels) = .{ .x = old.x + step.x, .y = old.y + step.y };
             // Unknown until the first frame; prepaint clamps again in any case.
-            const max: ?Size(Pixels) = if (it.tracked_scroll_handle) |sh| sh.max_offset() else if (c.state) |st| st.scroll_max else null;
+            const max: ?Size(Pixels) = if (tracked_scroll) |sh| sh.max_offset() else if (c.state) |st| st.scroll_max else null;
             if (max) |limit| off = clamp_scroll(off, limit);
             // At the limit nothing moved, so nothing needs drawing. Unlike the old behaviour, the event
             // is not stopped: an outer scroll container under this one scrolls too, as in GPUI.
             if (off.x == old.x and off.y == old.y) return;
-            if (it.tracked_scroll_handle) |sh| sh.set_offset(off);
+            if (tracked_scroll) |sh| sh.set_offset(off);
             if (c.state) |st| st.scroll_offset = off;
             window.notify_current_view();
         }
@@ -8205,4 +8292,208 @@ pub fn div() *Div {
 
 test {
     _ = Div;
+}
+
+test "div: Interactivity and DivPrepaintState stay compact and plain divs skip extra allocation" {
+    const testing = std.testing;
+    // Before refactor: @sizeOf(Div)=2656, @sizeOf(Interactivity)=2568, @sizeOf(DivPrepaintState)=904.
+    try testing.expect(@sizeOf(Interactivity) <= @sizeOf(StyleRefinement) + 48);
+    try testing.expect(@sizeOf(Div) <= @sizeOf(StyleRefinement) + 144);
+    try testing.expect(@sizeOf(DivPrepaintState) <= 96);
+
+    const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+
+    const CheckView = struct {
+        plain_extra_null: bool = false,
+        plain_no_dynamic: bool = false,
+        plain_no_hitbox: bool = false,
+        plain_dyn_style_null: bool = false,
+        inter_has_extra: bool = false,
+        inter_has_dynamic: bool = false,
+        inter_has_hitbox: bool = false,
+
+        fn build(_: *Window, app: *app_mod.App) app_mod.Entity(@This()) {
+            return app.new(@This(){});
+        }
+        pub fn render(self: *@This(), window: *Window, c: *app_mod.Context(@This())) *Div {
+            const plain = div().flex().w(geometry.px(10)).bg(color_mod.red());
+            self.plain_extra_null = plain.interactivity.extra == null;
+            self.plain_no_dynamic = !plain.interactivity.has_dynamic_style(c.app);
+            self.plain_no_hitbox = !plain.interactivity.needs_hitbox();
+
+            const rl = plain.request_layout(null, window, c.app);
+            var fs = rl[1];
+            const pp = plain.prepaint(null, .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 10, .height = 10 } }, &fs, window, c.app);
+            self.plain_dyn_style_null = pp.dynamic_style == null;
+
+            const interactive_div = div().id("btn").hover(style().bg(color_mod.blue()));
+            self.inter_has_extra = interactive_div.interactivity.extra != null;
+            self.inter_has_dynamic = interactive_div.interactivity.has_dynamic_style(c.app);
+            self.inter_has_hitbox = interactive_div.interactivity.needs_hitbox();
+            return plain;
+        }
+    };
+    const view, _ = cx.add_window_view(CheckView.build);
+    const st = view.read(cx.app);
+    try testing.expect(st.plain_extra_null);
+    try testing.expect(st.plain_no_dynamic);
+    try testing.expect(st.plain_no_hitbox);
+    try testing.expect(st.plain_dyn_style_null);
+    try testing.expect(st.inter_has_extra);
+    try testing.expect(st.inter_has_dynamic);
+    try testing.expect(st.inter_has_hitbox);
+}
+
+test "div: ScrollHandle.new/deinit and null-allocator fallback free cleanly with zero leaks" {
+    const testing = std.testing;
+    const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+
+    // 1. ScrollHandle.new stores allocator and deinit frees child_bounds + state.
+    const sh1 = ScrollHandle.new(testing.allocator);
+    defer sh1.deinit();
+    try testing.expect(sh1.state.allocator != null);
+
+    // 2. Fallback when state.allocator is null uses window.allocator (not page_allocator).
+    const raw_state = try cx.allocator.create(ScrollHandleState);
+    raw_state.* = .{};
+    const sh2: ScrollHandle = .{ .state = raw_state };
+    defer sh2.deinit();
+    try testing.expect(sh2.state.allocator == null);
+
+    const ScrollView = struct {
+        handle: ?ScrollHandle = null,
+        fn build(_: *Window, app: *app_mod.App) app_mod.Entity(@This()) {
+            return app.new(@This(){});
+        }
+        fn set_handle(self: *@This(), h: ScrollHandle, c: *app_mod.Context(@This())) void {
+            self.handle = h;
+            c.notify();
+        }
+        pub fn render(self: *@This(), _: *Window, _: *app_mod.Context(@This())) *Div {
+            var root = div()
+                .id("scroller")
+                .w(geometry.px(100))
+                .h(geometry.px(100))
+                .overflow_y_scroll()
+                .child(div().w(geometry.px(100)).h(geometry.px(300)));
+            if (self.handle) |*h| root = root.track_scroll(h);
+            return root;
+        }
+    };
+    const sv, const vcx = cx.add_window_view(ScrollView.build);
+    cx.update_entity(sv, ScrollView.set_handle, .{sh2});
+    vcx.window.draw(cx.app);
+    try testing.expect(sh2.state.allocator != null);
+    try testing.expectEqual(@as(usize, 1), sh2.children_count());
+}
+
+test "div: hover, active, focus, group_hover, group_active, drag_over, tooltip, and dynamic style work end-to-end" {
+    const testing = std.testing;
+    const TestAppContext = @import("../app/test_context.zig").TestAppContext;
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+
+    const DragPayload = struct { tag: u32 };
+    const DragGhost = struct {
+        pub fn render(_: *@This(), _: *Window, _: *app_mod.Context(@This())) *Div {
+            return div().w(geometry.px(10)).h(geometry.px(10));
+        }
+    };
+    const TipView = struct {
+        pub fn render(_: *@This(), _: *Window, _: *app_mod.Context(@This())) *Div {
+            return div().w(geometry.px(20)).h(geometry.px(10));
+        }
+    };
+
+    const View = struct {
+        fh: FocusHandle,
+        clicks: usize = 0,
+        drops: usize = 0,
+
+        fn build(_: *Window, app: *app_mod.App) app_mod.Entity(@This()) {
+            return app.new(@This(){ .fh = app.focus_handle() });
+        }
+        fn onClick(self: *@This(), _: *const ClickEvent, _: *Window, _: *app_mod.Context(@This())) void {
+            self.clicks += 1;
+        }
+        fn onDrop(self: *@This(), payload: *const DragPayload, _: *Window, _: *app_mod.Context(@This())) void {
+            if (payload.tag == 42) self.drops += 1;
+        }
+        fn makeDrag(_: *const DragPayload, _: Point(Pixels), _: *Window, app: *app_mod.App) app_mod.Entity(DragGhost) {
+            return app.new(DragGhost{});
+        }
+        fn buildTip(_: *Window, app: *app_mod.App) view_mod.AnyView {
+            return view_mod.AnyView.from(app.new(TipView{}));
+        }
+
+        pub fn render(self: *@This(), _: *Window, c: *app_mod.Context(@This())) *Div {
+            return div()
+                .w(geometry.px(200))
+                .h(geometry.px(200))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id("grp")
+                        .group("card")
+                        .w(geometry.px(100))
+                        .h(geometry.px(40))
+                        .bg(color_mod.rgb(0x111111))
+                        .hover(style().bg(color_mod.rgb(0x222222)))
+                        .active(style().bg(color_mod.rgb(0x333333)))
+                        .track_focus(&self.fh)
+                        .focus(style().border_1().border_color(color_mod.white()))
+                        .on_click(c.listener(onClick))
+                        .on_drag(DragPayload{ .tag = 42 }, makeDrag)
+                        .tooltip(buildTip)
+                        .child(
+                            div()
+                                .id("grp-child")
+                                .w(geometry.px(50))
+                                .h(geometry.px(20))
+                                .bg(color_mod.rgb(0x444444))
+                                .group_hover("card", style().bg(color_mod.rgb(0x555555)))
+                                .group_active("card", style().bg(color_mod.rgb(0x666666)))
+                                .group_drag_over(DragPayload, "card", style().bg(color_mod.rgb(0x777777))),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("drop-target")
+                        .w(geometry.px(100))
+                        .h(geometry.px(40))
+                        .bg(color_mod.rgb(0x888888))
+                        .drag_over(DragPayload, style().bg(color_mod.rgb(0x999999)))
+                        .on_drop(DragPayload, c.listener(onDrop)),
+                );
+        }
+    };
+
+    const view, const vcx = cx.add_window_view(View.build);
+    vcx.window.draw(cx.app);
+    try testing.expect(vcx.window.rendered_frame.group_hitboxes.count() >= 1);
+
+    // Move mouse over the group card -> triggers hover + group_hover.
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 10 }, null, .{});
+    vcx.window.draw(cx.app);
+    // Click on the group card -> triggers active, focus, and click listener.
+    vcx.simulate_click(.{ .x = 10, .y = 10 }, .{});
+    vcx.window.draw(cx.app);
+    try testing.expectEqual(@as(usize, 1), view.read(cx.app).clicks);
+    try testing.expect(view.read(cx.app).fh.is_focused(vcx.window));
+
+    // Drag from card (10,10) to drop target (10, 60).
+    vcx.simulate_mouse_down(.{ .x = 10, .y = 10 }, .left, .{});
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 20 }, .left, .{});
+    vcx.window.draw(cx.app);
+    try testing.expect(cx.app.has_active_drag());
+    vcx.simulate_mouse_move(.{ .x = 10, .y = 60 }, .left, .{});
+    vcx.window.draw(cx.app);
+    vcx.simulate_mouse_up(.{ .x = 10, .y = 60 }, .left, .{});
+    vcx.window.draw(cx.app);
+    try testing.expectEqual(@as(usize, 1), view.read(cx.app).drops);
 }

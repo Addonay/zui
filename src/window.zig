@@ -441,6 +441,11 @@ pub const PaintIndex = struct {
     line_layout_index: text_system_mod.line_layout.LineLayoutIndex = .{},
 };
 
+pub const GroupHitboxInfo = struct {
+    hitbox: HitboxId,
+    active: bool,
+};
+
 pub const Frame = struct {
     scene: scene_mod.Scene,
     /// The element states this frame used, so reusing a cached view keeps its elements' states alive.
@@ -448,6 +453,8 @@ pub const Frame = struct {
     /// The entities this frame rendered, so reusing a cached view still redraws when they notify.
     accessed_entities: std.ArrayList(EntityId) = .empty,
     hitboxes: std.ArrayList(Hitbox) = .empty,
+    /// Named element groups registered during prepaint for `group_hover` / `group_active` / `group_drag_over`.
+    group_hitboxes: std.StringHashMapUnmanaged(GroupHitboxInfo) = .empty,
     mouse_listeners: std.ArrayList(MouseListener) = .empty,
     dispatch_tree: key_dispatch.DispatchTree,
     cursor_styles: std.ArrayList(CursorStyleRequest) = .empty,
@@ -471,6 +478,7 @@ pub const Frame = struct {
         self.accessed_element_states.deinit(gpa);
         self.accessed_entities.deinit(gpa);
         self.hitboxes.deinit(gpa);
+        self.group_hitboxes.deinit(gpa);
         self.mouse_listeners.deinit(gpa);
         self.dispatch_tree.deinit();
         self.cursor_styles.deinit(gpa);
@@ -485,6 +493,7 @@ pub const Frame = struct {
         self.accessed_element_states.clearRetainingCapacity();
         self.accessed_entities.clearRetainingCapacity();
         self.hitboxes.clearRetainingCapacity();
+        self.group_hitboxes.clearRetainingCapacity();
         self.mouse_listeners.clearRetainingCapacity();
         self.dispatch_tree.clear();
         self.cursor_styles.clearRetainingCapacity();

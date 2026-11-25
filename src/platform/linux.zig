@@ -196,6 +196,8 @@ pub const LinuxPlatform = struct {
     launcher: launch.Launcher = .{},
     /// The titlebar button layout: GPUI's fallback until the settings portal reports the desktop's.
     button_layout: platform.WindowButtonLayout = platform.WindowButtonLayout.linux_default(),
+    /// The desktop text scale factor (`org.gnome.desktop.interface` / `text-scaling-factor`).
+    text_scale_factor_: f32 = 1.0,
     /// Where `app_path` writes the path of the executable.
     app_path_buf: [4096]u8 = undefined,
 
@@ -205,6 +207,7 @@ pub const LinuxPlatform = struct {
         .deinit = deinit,
         .open_window = openWindow,
         .button_layout = buttonLayout,
+        .text_scale_factor = textScaleFactor,
         .wake = wake,
         .displays = displays,
         .set_cursor_style = setCursorStyle,
@@ -249,6 +252,10 @@ pub const LinuxPlatform = struct {
         return from(p).backend.window_appearance();
     }
 
+    fn textScaleFactor(p: *platform.Platform) f32 {
+        return from(p).text_scale_factor_;
+    }
+
     /// The desktop's settings as the portal reports them (GPUI's `XDPEventSource` handler).
     fn onSetting(raw: *anyopaque, setting: portal.Setting) void {
         const self: *LinuxPlatform = @ptrCast(@alignCast(raw));
@@ -257,7 +264,15 @@ pub const LinuxPlatform = struct {
             .cursor_theme => |name| self.backend.set_cursor_theme(name),
             .cursor_size => |size| self.backend.set_cursor_size(size),
             .button_layout => |text| self.set_button_layout(text),
+            .text_scale_factor => |scale| self.set_text_scale_factor(scale),
         }
+    }
+
+    /// Stores `scale` and notifies the app only when it actually changed.
+    fn set_text_scale_factor(self: *LinuxPlatform, scale: f32) void {
+        if (self.text_scale_factor_ == scale) return;
+        self.text_scale_factor_ = scale;
+        self.platform.emit_text_scale_factor_change();
     }
 
     /// Stores the layout the desktop reports and tells every window, as GPUI does on each event.
@@ -887,4 +902,31 @@ test "a headless window asks for frames that the loop draws, then stops asking" 
     try std.testing.expect(self.backend.timeout(0) != null);
     self.backend.pump();
     try std.testing.expect(self.backend.timeout(0) == null);
+}
+
+test "linux platform: text_scale_factor defaults to 1.0 and notifies only on changes" {
+    const p = try create(std.testing.allocator, platform.WindowingModes.HEADLESS);
+    defer p.deinit();
+    const self = LinuxPlatform.from(p);
+
+    const Counter = struct {
+        calls: usize = 0,
+        fn on_change(ctx: *anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.calls += 1;
+        }
+    };
+    var counter: Counter = .{};
+    p.on_text_scale_factor_change(.{ .ctx = &counter, .func = Counter.on_change });
+    try std.testing.expectEqual(@as(f32, 1.0), p.text_scale_factor());
+
+    LinuxPlatform.onSetting(self, .{ .text_scale_factor = 1.0 });
+    try std.testing.expectEqual(@as(usize, 0), counter.calls);
+
+    LinuxPlatform.onSetting(self, .{ .text_scale_factor = 1.5 });
+    try std.testing.expectEqual(@as(f32, 1.5), p.text_scale_factor());
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
+
+    LinuxPlatform.onSetting(self, .{ .text_scale_factor = 1.5 });
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
 }

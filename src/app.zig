@@ -1045,6 +1045,8 @@ const SubscriberKind = enum {
     displays,
     /// The keyboard layout changed (`App.on_keyboard_layout_change`).
     keyboard_layout,
+    /// The text scale factor changed (`App.on_text_scale_factor_change`).
+    text_scale_factor,
     /// The app was reopened (`App.on_reopen`).
     reopen,
     /// The app is about to restart (`App.on_app_restart`).
@@ -1318,6 +1320,12 @@ pub const App = struct {
             fn f(ctx: *anyopaque) void {
                 const self: *App = @ptrCast(@alignCast(ctx));
                 self.displays_changed();
+            }
+        }.f });
+        platform.on_text_scale_factor_change(.{ .ctx = app, .func = struct {
+            fn f(ctx: *anyopaque) void {
+                const self: *App = @ptrCast(@alignCast(ctx));
+                self.dispatch_text_scale_factor_change();
             }
         }.f });
         platform.on_will_open_app_menu(.{ .ctx = app, .func = struct {
@@ -2520,6 +2528,28 @@ pub const App = struct {
         self.dispatch_global(.keyboard_layout, null);
     }
 
+    /// The factor by which text should be scaled, on top of the window's scale factor
+    /// (GPUI `App::text_scale_factor`).
+    pub fn text_scale_factor(self: *const App) f32 {
+        return self.platform.text_scale_factor();
+    }
+
+    /// Runs `f(cx)` when the text scale factor changes (GPUI `App::on_text_scale_factor_change`).
+    pub fn on_text_scale_factor_change(self: *App, comptime f: fn (*App) void) Subscription {
+        const S = struct {
+            fn call(app: *App, _: EntityId, _: usize, _: ?*const anyopaque) bool {
+                f(app);
+                return true;
+            }
+        };
+        return self.add_subscriber(.{ .kind = .text_scale_factor, .emitter = 0, .ctx = 0, .func = S.call, .id = 0 });
+    }
+
+    /// The text scale factor changed: runs the `on_text_scale_factor_change` observers.
+    pub fn dispatch_text_scale_factor_change(self: *App) void {
+        self.dispatch_global(.text_scale_factor, null);
+    }
+
     /// Runs `f(cx)` when the app is reopened (GPUI `on_reopen`). Only macOS reports reopens, as
     /// GPUI's Linux platform never calls its reopen callback either.
     pub fn on_reopen(self: *App, comptime f: fn (*App) void) Subscription {
@@ -3276,4 +3306,43 @@ test "App.insert_entity runs deinit on release and shutdown" {
     try std.testing.expectEqual(@as(u32, 2), e2.read(&cx).tag);
     e2.release(&cx);
     try std.testing.expectEqual(@as(usize, 1), TrackedWithApp.deinit_count);
+}
+
+test "App.on_text_scale_factor_change fires only on actual changes and stops after unsubscribe" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+    const headless_mod = @import("platform/headless.zig");
+    const hp = headless_mod.HeadlessPlatform.from(cx.platform);
+
+    const S = struct {
+        var calls: usize = 0;
+        var last: f32 = 0;
+        fn on_change(app: *App) void {
+            calls += 1;
+            last = app.text_scale_factor();
+        }
+    };
+    S.calls = 0;
+    S.last = 0;
+
+    try std.testing.expectEqual(@as(f32, 1.0), cx.app.text_scale_factor());
+    const sub = cx.app.on_text_scale_factor_change(S.on_change);
+
+    // Setting the current value (1.0) is a no-op.
+    hp.set_text_scale_factor(1.0);
+    try std.testing.expectEqual(@as(usize, 0), S.calls);
+
+    hp.set_text_scale_factor(1.25);
+    try std.testing.expectEqual(@as(usize, 1), S.calls);
+    try std.testing.expectEqual(@as(f32, 1.25), S.last);
+    try std.testing.expectEqual(@as(f32, 1.25), cx.app.text_scale_factor());
+
+    // Repeating the same value does not re-fire.
+    hp.set_text_scale_factor(1.25);
+    try std.testing.expectEqual(@as(usize, 1), S.calls);
+
+    sub.unsubscribe();
+    hp.set_text_scale_factor(1.5);
+    try std.testing.expectEqual(@as(usize, 1), S.calls);
+    try std.testing.expectEqual(@as(f32, 1.5), cx.app.text_scale_factor());
 }
