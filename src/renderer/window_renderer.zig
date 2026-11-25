@@ -55,7 +55,7 @@ pub const GpuContext = struct {
         backend.vulkan.transient_staging_buffer_size = transient_staging_bytes;
         self.device = try gpu.Device.init(allocator, .{
             .backend = backend,
-            .defaults = .{ .color_format = .bgra8, .depth_format = .none, .sample_count = 1 },
+            .defaults = .{ .color_format = .bgra8, .depth_format = .depth, .sample_count = 1 },
         });
         errdefer self.device.deinit();
         self.atlas = renderer.GpuAtlas.init(allocator, &self.device);

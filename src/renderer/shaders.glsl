@@ -104,8 +104,33 @@ float quad_sdf(vec2 point, vec4 bounds, vec4 radii) {
 }
 
 // Device position of a pixel-space point, origin at the top left.
-vec4 to_device(vec2 position, vec2 viewport) {
-    return vec4(position / viewport * vec2(2.0, -2.0) + vec2(-1.0, 1.0), 0.0, 1.0);
+vec4 to_device(vec2 position, vec2 viewport, float depth) {
+    return vec4(position / viewport * vec2(2.0, -2.0) + vec2(-1.0, 1.0), depth, 1.0);
+}
+
+struct ClippedVertex {
+    vec2 position;
+    vec2 unit_vertex;
+};
+
+// Clips axis-aligned bounds against content mask on the vertex stage.
+ClippedVertex clip_to_mask(vec2 unit_vertex, vec4 bounds, vec4 mask) {
+    vec2 origin = max(bounds.xy, mask.xy);
+    vec2 corner = min(bounds.xy + bounds.zw, mask.xy + mask.zw);
+    vec2 size = max(corner - origin, vec2(0.0));
+    ClippedVertex res;
+    res.position = origin + unit_vertex * size;
+    res.unit_vertex = (bounds.z != 0.0 && bounds.w != 0.0)
+        ? (res.position - bounds.xy) / bounds.zw
+        : vec2(0.0);
+    return res;
+}
+
+float erf7(float input_val) {
+    float x = clamp(input_val, -10.0, 10.0) * (2.0 / sqrt(M_PI_F));
+    float xx = x * x;
+    float y = x + (0.24295 + (0.03395 + 0.0104 * xx) * xx) * (x * xx);
+    return y / sqrt(1.0 + y * y);
 }
 
 // Distances to the clip rect (left, right, top, bottom); negative means clipped.
@@ -225,7 +250,6 @@ layout(location=7) in vec4 q_color1;
 layout(location=8) in vec4 q_bg;
 layout(location=9) in vec4 q_bg2;
 out vec2 v_pos;
-out vec4 v_clip;
 flat out vec4 f_bounds;
 flat out vec4 f_radii;
 flat out vec4 f_widths;
@@ -237,18 +261,20 @@ flat out vec4 f_color0;
 flat out vec4 f_color1;
 void main() {
     vec2 unit = vec2(float(gl_VertexIndex & 1), 0.5 * float(gl_VertexIndex & 2));
-    vec2 position = unit * q_bounds.zw + q_bounds.xy;
-    gl_Position = to_device(position, viewport.xy);
-    v_pos = position;
-    v_clip = distance_from_clip(position, q_clip);
+    ClippedVertex clipped = clip_to_mask(unit, q_bounds, q_clip);
+    gl_Position = to_device(clipped.position, viewport.xy, q_bg2.w);
+    v_pos = clipped.position;
     vec4 solid; vec4 color0; vec4 color1;
     prepare_gradient(q_bg.x, q_bg.y, q_solid, q_color0, q_color1, solid, color0, color1);
+    bool unrounded = q_radii.x == 0.0 && q_radii.y == 0.0 && q_radii.z == 0.0 && q_radii.w == 0.0;
+    bool no_border = q_widths.x == 0.0 && q_widths.y == 0.0 && q_widths.z == 0.0 && q_widths.w == 0.0;
+    bool simple = unrounded && no_border && q_bg.x == 0.0;
     f_bounds = q_bounds;
     f_radii = q_radii;
     f_widths = q_widths;
     f_border = hsla_to_rgba(q_border);
     f_bg = q_bg;
-    f_bg2 = q_bg2;
+    f_bg2 = vec4(q_bg2.xyz, simple ? 1.0 : 0.0);
     f_solid = solid;
     f_color0 = color0;
     f_color1 = color1;
@@ -260,7 +286,6 @@ void main() {
 @include_block fs_params
 @include_block dash_alpha_fn
 in vec2 v_pos;
-in vec4 v_clip;
 flat in vec4 f_bounds;
 flat in vec4 f_radii;
 flat in vec4 f_widths;
@@ -272,7 +297,10 @@ flat in vec4 f_color0;
 flat in vec4 f_color1;
 layout(location=0) out vec4 frag_color;
 void main() {
-    if (any(lessThan(v_clip, vec4(0.0)))) discard;
+    if (f_bg2.w != 0.0) {
+        frag_color = blend_color(f_solid, 1.0);
+        return;
+    }
 
     float border_style = f_bg2.y;
     vec4 background_color = gradient_color(f_bg.x, f_bg.y, f_bg.z, f_bg.w, f_bg2.x, f_bg2.z,
@@ -470,6 +498,31 @@ void main() {
 @end
 
 
+@vs opaque_quads_vs
+layout(binding=0) uniform vs_params { vec4 viewport; };
+@include_block common
+layout(location=0) in vec4 oq_bounds;
+layout(location=1) in vec4 oq_clip;
+layout(location=2) in vec4 oq_solid;
+layout(location=3) in vec4 oq_params;
+flat out vec4 f_color;
+void main() {
+    vec2 unit = vec2(float(gl_VertexIndex & 1), 0.5 * float(gl_VertexIndex & 2));
+    ClippedVertex clipped = clip_to_mask(unit, oq_bounds, oq_clip);
+    gl_Position = to_device(clipped.position, viewport.xy, oq_params.x);
+    f_color = hsla_to_rgba(oq_solid);
+}
+@end
+
+@fs opaque_quads_fs
+@include_block fs_params
+flat in vec4 f_color;
+layout(location=0) out vec4 frag_color;
+void main() {
+    frag_color = blend_color(f_color, 1.0);
+}
+@end
+
 @vs shadows_vs
 layout(binding=0) uniform vs_params { vec4 viewport; };
 @include_block common
@@ -481,34 +534,55 @@ layout(location=4) in vec4 s_element_bounds;
 layout(location=5) in vec4 s_element_radii;
 layout(location=6) in vec4 s_params;
 out vec2 v_pos;
-out vec4 v_clip;
 flat out vec4 f_color;
 flat out vec4 f_bounds;
 flat out vec4 f_radii;
 flat out vec4 f_element_bounds;
 flat out vec4 f_element_radii;
 flat out vec4 f_params;
+flat out vec4 f_blur_shape;
+flat out vec4 f_blur_r1;
+flat out vec4 f_blur_exponent;
+flat out vec4 f_blur_scale;
 void main() {
     vec2 unit = vec2(float(gl_VertexIndex & 1), 0.5 * float(gl_VertexIndex & 2));
     bool inset = s_params.y > 0.5;
-    vec4 geometry;
+    vec4 paint_bounds;
     if (inset) {
-        geometry = s_element_bounds;
+        paint_bounds = s_element_bounds;
     } else {
-        // Leave room for the gaussian tail outside the shadow rect.
         float margin = 3.0 * s_params.x;
-        geometry = vec4(s_bounds.xy - vec2(margin), s_bounds.zw + 2.0 * vec2(margin));
+        paint_bounds = vec4(s_bounds.xy - vec2(margin), s_bounds.zw + 2.0 * vec2(margin));
     }
-    vec2 position = unit * geometry.zw + geometry.xy;
-    gl_Position = to_device(position, viewport.xy);
-    v_pos = position;
-    v_clip = distance_from_clip(position, s_clip);
+    ClippedVertex clipped = clip_to_mask(unit, paint_bounds, s_clip);
+    gl_Position = to_device(clipped.position, viewport.xy, viewport.w);
+    v_pos = clipped.position;
     f_color = hsla_to_rgba(s_color);
     f_bounds = s_bounds;
     f_radii = s_radii;
     f_element_bounds = s_element_bounds;
     f_element_radii = s_element_radii;
     f_params = s_params;
+
+    // Raph Levien's blurred rounded rectangle precomputation.
+    float s = max(s_params.x * sqrt(2.0), 1e-6);
+    float s_inv = 1.0 / s;
+    float min_edge = min(s_bounds.z, s_bounds.w);
+    float r_max = 0.5 * min_edge;
+    vec4 r0 = min(sqrt(s_radii * s_radii + vec4(1.15 * 1.15 * s * s)), vec4(r_max));
+    vec4 r1 = min(sqrt(s_radii * s_radii + vec4(4.0 * s * s)), vec4(r_max));
+    vec2 half_extent = 0.5 * s_inv * s_bounds.zw;
+    float delta = 1.25 * s * (exp(-half_extent.x * half_extent.x) - exp(-half_extent.y * half_extent.y));
+    vec2 adjusted_size = vec2(s_bounds.z + min(delta, 0.0), s_bounds.w - max(delta, 0.0));
+    vec4 peak = s_inv * 0.5 * (vec4(max(adjusted_size.x, adjusted_size.y)) - 0.5 * s_radii);
+    f_blur_shape = vec4(0.5 * adjusted_size, s_inv, min_edge);
+    f_blur_r1 = r1;
+    f_blur_exponent = vec4(
+        r0.x > 0.0 ? 2.0 * r1.x / r0.x : 2.0,
+        r0.y > 0.0 ? 2.0 * r1.y / r0.y : 2.0,
+        r0.z > 0.0 ? 2.0 * r1.z / r0.z : 2.0,
+        r0.w > 0.0 ? 2.0 * r1.w / r0.w : 2.0);
+    f_blur_scale = 0.5 * vec4(erf7(peak.x), erf7(peak.y), erf7(peak.z), erf7(peak.w));
 }
 @end
 
@@ -516,67 +590,50 @@ void main() {
 @include_block common
 @include_block fs_params
 in vec2 v_pos;
-in vec4 v_clip;
 flat in vec4 f_color;
 flat in vec4 f_bounds;
 flat in vec4 f_radii;
 flat in vec4 f_element_bounds;
 flat in vec4 f_element_radii;
 flat in vec4 f_params;
+flat in vec4 f_blur_shape;
+flat in vec4 f_blur_r1;
+flat in vec4 f_blur_exponent;
+flat in vec4 f_blur_scale;
 layout(location=0) out vec4 frag_color;
 
-float gaussian(float x, float sigma) {
-    return exp(-(x * x) / (2.0 * sigma * sigma)) / (sqrt(2.0 * M_PI_F) * sigma);
-}
+float blurred_rounded_rect(vec2 center_to_point, vec4 shape, vec4 blur_r1, vec4 blur_exponent, vec4 blur_scale) {
+    float r1 = pick_corner_radius(center_to_point, blur_r1);
+    float exponent = pick_corner_radius(center_to_point, blur_exponent);
+    float scale = pick_corner_radius(center_to_point, blur_scale);
+    float s_inv = shape.z;
+    float min_edge = shape.w;
 
-// Approximates the error function, needed for the gaussian integral.
-vec2 erf_approx(vec2 v) {
-    vec2 s = sign(v);
-    vec2 a = abs(v);
-    vec2 r1 = 1.0 + (0.278393 + (0.230389 + (0.000972 + 0.078108 * a) * a) * a) * a;
-    vec2 r2 = r1 * r1;
-    return s - s / (r2 * r2);
-}
+    vec2 p0 = abs(center_to_point) - (shape.xy - vec2(r1));
+    vec2 p1 = max(p0, vec2(0.0));
+    float d_pos;
+    if (p1.x > 0.0 && p1.y > 0.0) {
+        d_pos = pow(pow(p1.x, exponent) + pow(p1.y, exponent), 1.0 / exponent);
+    } else {
+        d_pos = p1.x + p1.y;
+    }
 
-float blur_along_x(float x, float y, float sigma, float corner, vec2 half_size) {
-    float delta = min(half_size.y - corner - abs(y), 0.0);
-    float curved = half_size.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
-    vec2 integral = 0.5 + 0.5 * erf_approx((x + vec2(-curved, curved)) * (sqrt(0.5) / sigma));
-    return integral.y - integral.x;
+    float d_neg = min(max(p0.x, p0.y), 0.0);
+    float d = d_pos + d_neg - r1;
+    return scale * (erf7(s_inv * (min_edge + d)) - erf7(s_inv * d));
 }
 
 void main() {
-    if (any(lessThan(v_clip, vec4(0.0)))) discard;
-
-    vec2 half_size = f_bounds.zw / 2.0;
-    vec2 center = f_bounds.xy + half_size;
-    vec2 center_to_point = v_pos - center;
     float blur_radius = f_params.x;
     bool inset = f_params.y > 0.5;
-
-    float corner_radius = pick_corner_radius(center_to_point, f_radii);
 
     float alpha;
     if (blur_radius == 0.0) {
         float sdf = quad_sdf(v_pos, f_bounds, f_radii);
         alpha = saturate(0.5 - sdf);
     } else {
-        // The signal is only non-zero in a limited range.
-        float low = center_to_point.y - half_size.y;
-        float high = center_to_point.y + half_size.y;
-        float blur_start = clamp(-3.0 * blur_radius, low, high);
-        float blur_end = clamp(3.0 * blur_radius, low, high);
-
-        // Accumulate samples.
-        float blur_step = (blur_end - blur_start) / 4.0;
-        float y = blur_start + blur_step * 0.5;
-        alpha = 0.0;
-        for (int i = 0; i < 4; i++) {
-            float blur = blur_along_x(center_to_point.x, center_to_point.y - y,
-                blur_radius, corner_radius, half_size);
-            alpha += blur * gaussian(y, blur_radius) * blur_step;
-            y += blur_step;
-        }
+        vec2 center = f_bounds.xy + f_bounds.zw / 2.0;
+        alpha = blurred_rounded_rect(v_pos - center, f_blur_shape, f_blur_r1, f_blur_exponent, f_blur_scale);
     }
 
     if (inset) {
@@ -598,16 +655,14 @@ layout(location=1) in vec4 u_clip;
 layout(location=2) in vec4 u_color;
 layout(location=3) in vec4 u_params;
 out vec2 v_pos;
-out vec4 v_clip;
 flat out vec4 f_color;
 flat out vec4 f_bounds;
 flat out vec4 f_params;
 void main() {
     vec2 unit = vec2(float(gl_VertexIndex & 1), 0.5 * float(gl_VertexIndex & 2));
-    vec2 position = unit * u_bounds.zw + u_bounds.xy;
-    gl_Position = to_device(position, viewport.xy);
-    v_pos = position;
-    v_clip = distance_from_clip(position, u_clip);
+    ClippedVertex clipped = clip_to_mask(unit, u_bounds, u_clip);
+    gl_Position = to_device(clipped.position, viewport.xy, viewport.w);
+    v_pos = clipped.position;
     f_color = hsla_to_rgba(u_color);
     f_bounds = u_bounds;
     f_params = u_params;
@@ -618,7 +673,6 @@ void main() {
 @include_block common
 @include_block fs_params
 in vec2 v_pos;
-in vec4 v_clip;
 flat in vec4 f_color;
 flat in vec4 f_bounds;
 flat in vec4 f_params;
@@ -626,8 +680,6 @@ layout(location=0) out vec4 frag_color;
 void main() {
     const float wave_frequency = 2.0;
     const float wave_height_ratio = 0.8;
-
-    if (any(lessThan(v_clip, vec4(0.0)))) discard;
 
     if (f_params.y == 0.0) {
         frag_color = blend_color(f_color, f_color.a);
@@ -668,7 +720,7 @@ void main() {
     vec2 position = unit * m_bounds.zw + m_bounds.xy;
     // Row-major rotation_scale applied to the position, then the translation.
     vec2 transformed = vec2(dot(m_rs.xy, position), dot(m_rs.zw, position)) + m_translation.xy;
-    gl_Position = to_device(transformed, viewport.xy);
+    gl_Position = to_device(transformed, viewport.xy, viewport.w);
     v_tile = m_uv.xy + unit * m_uv.zw;
     v_clip = distance_from_clip(transformed, m_clip);
     f_color = hsla_to_rgba(m_color);
@@ -721,20 +773,20 @@ layout(location=3) in vec4 p_radii;
 layout(location=4) in vec4 p_params;
 out vec2 v_tile;
 out vec2 v_pos;
-out vec4 v_clip;
 flat out vec4 f_bounds;
 flat out vec4 f_radii;
 flat out vec4 f_params;
 void main() {
     vec2 unit = vec2(float(gl_VertexIndex & 1), 0.5 * float(gl_VertexIndex & 2));
-    vec2 position = unit * p_bounds.zw + p_bounds.xy;
-    gl_Position = to_device(position, viewport.xy);
-    v_tile = p_uv.xy + unit * p_uv.zw;
-    v_pos = position;
-    v_clip = distance_from_clip(position, p_clip);
+    ClippedVertex clipped = clip_to_mask(unit, p_bounds, p_clip);
+    gl_Position = to_device(clipped.position, viewport.xy, viewport.w);
+    v_tile = p_uv.xy + clipped.unit_vertex * p_uv.zw;
+    v_pos = clipped.position;
+    bool unrounded = p_radii.x == 0.0 && p_radii.y == 0.0 && p_radii.z == 0.0 && p_radii.w == 0.0;
+    bool simple = unrounded && p_params.x == 0.0;
     f_bounds = p_bounds;
     f_radii = p_radii;
-    f_params = p_params;
+    f_params = vec4(p_params.xy, simple ? 1.0 : 0.0, 0.0);
 }
 @end
 
@@ -745,16 +797,16 @@ layout(binding=0) uniform texture2D atlas_tex;
 layout(binding=0) uniform sampler atlas_smp;
 in vec2 v_tile;
 in vec2 v_pos;
-in vec4 v_clip;
 flat in vec4 f_bounds;
 flat in vec4 f_radii;
 flat in vec4 f_params;
 layout(location=0) out vec4 frag_color;
 void main() {
     vec4 sample_color = texture(sampler2D(atlas_tex, atlas_smp), v_tile);
-
-    // Alpha clip after using the derivatives.
-    if (any(lessThan(v_clip, vec4(0.0)))) discard;
+    if (f_params.z != 0.0) {
+        frag_color = blend_color(sample_color, f_params.y);
+        return;
+    }
 
     float sdf = quad_sdf(v_pos, f_bounds, f_radii);
     vec4 color = sample_color;
@@ -786,7 +838,7 @@ flat out vec4 f_solid;
 flat out vec4 f_color0;
 flat out vec4 f_color1;
 void main() {
-    gl_Position = to_device(r_xy_st.xy, viewport.xy);
+    gl_Position = to_device(r_xy_st.xy, viewport.xy, 0.0);
     v_st = r_xy_st.zw;
     v_pos = r_xy_st.xy;
     v_clip = distance_from_clip(r_xy_st.xy, r_bounds);
@@ -842,7 +894,7 @@ out vec2 v_uv;
 void main() {
     vec2 unit = vec2(float(gl_VertexIndex & 1), 0.5 * float(gl_VertexIndex & 2));
     vec2 position = unit * c_bounds.zw + c_bounds.xy;
-    gl_Position = to_device(position, viewport.xy);
+    gl_Position = to_device(position, viewport.xy, viewport.w);
     // Screen position to texture coordinates; flipped when the backend's rows start at the bottom.
     vec2 uv = position / viewport.xy;
     if (viewport.z > 0.5) uv.y = 1.0 - uv.y;
@@ -861,6 +913,7 @@ void main() {
 @end
 
 @program quads quads_vs quads_fs
+@program opaque_quads opaque_quads_vs opaque_quads_fs
 @program shadows shadows_vs shadows_fs
 @program underlines underlines_vs underlines_fs
 @program mono_sprites mono_vs mono_fs

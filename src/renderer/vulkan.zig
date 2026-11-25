@@ -204,6 +204,7 @@ const InstanceFns = struct {
     vkEnumeratePhysicalDevices: *const fn (Instance, *u32, ?[*]PhysicalDevice) callconv(.c) i32,
     vkGetPhysicalDeviceProperties: *const fn (PhysicalDevice, *DeviceProperties) callconv(.c) void,
     vkGetPhysicalDeviceFeatures2: *const fn (PhysicalDevice, *Features2) callconv(.c) void,
+    vkGetPhysicalDeviceMemoryProperties: *const fn (PhysicalDevice, *sdk.PhysicalDeviceMemoryProperties) callconv(.c) void,
     vkGetPhysicalDeviceQueueFamilyProperties: *const fn (PhysicalDevice, *u32, ?[*]QueueFamilyProperties) callconv(.c) void,
     vkEnumerateDeviceExtensionProperties: *const fn (PhysicalDevice, ?[*:0]const u8, *u32, ?[*]ExtensionProperties) callconv(.c) i32,
     vkCreateDevice: *const fn (PhysicalDevice, *const DeviceCreateInfo, ?*const anyopaque, *Device) callconv(.c) i32,
@@ -215,6 +216,12 @@ const DeviceFns = struct {
     vkDestroyDevice: *const fn (Device, ?*const anyopaque) callconv(.c) void,
     vkDeviceWaitIdle: *const fn (Device) callconv(.c) i32,
     vkGetDeviceQueue: *const fn (Device, u32, u32, *Queue) callconv(.c) void,
+    vkCreateImage: *const fn (Device, *const sdk.ImageCreateInfo, ?*const anyopaque, *u64) callconv(.c) i32,
+    vkDestroyImage: *const fn (Device, u64, ?*const anyopaque) callconv(.c) void,
+    vkGetImageMemoryRequirements: *const fn (Device, u64, *sdk.MemoryRequirements) callconv(.c) void,
+    vkAllocateMemory: *const fn (Device, *const sdk.MemoryAllocateInfo, ?*const anyopaque, *u64) callconv(.c) i32,
+    vkFreeMemory: *const fn (Device, u64, ?*const anyopaque) callconv(.c) void,
+    vkBindImageMemory: *const fn (Device, u64, u64, u64) callconv(.c) i32,
     vkCreateImageView: *const fn (Device, *const ImageViewCreateInfo, ?*const anyopaque, *u64) callconv(.c) i32,
     vkDestroyImageView: *const fn (Device, u64, ?*const anyopaque) callconv(.c) void,
     vkCreateSemaphore: *const fn (Device, *const SemaphoreCreateInfo, ?*const anyopaque, *u64) callconv(.c) i32,
@@ -509,6 +516,9 @@ pub const WindowSwapchain = struct {
     count: u32 = 0,
     images: [max_images]u64 = @splat(0),
     views: [max_images]u64 = @splat(0),
+    depth_image: u64 = 0,
+    depth_memory: u64 = 0,
+    depth_view: u64 = 0,
     /// Signaled by presentation-ready rendering; one per image, reused when it is acquired again.
     finished: [max_images]u64 = @splat(0),
     /// Waited by rendering. One per image plus a spare, swapped into the acquired image's slot.
@@ -610,6 +620,81 @@ pub const WindowSwapchain = struct {
         self.views = @splat(0);
         self.images = @splat(0);
         self.count = 0;
+        self.destroy_depth();
+    }
+
+    fn destroy_depth(self: *WindowSwapchain) void {
+        const d = &self.ctx.device_fns;
+        if (self.depth_view != 0) {
+            d.vkDestroyImageView(self.ctx.device, self.depth_view, null);
+            self.depth_view = 0;
+        }
+        if (self.depth_image != 0) {
+            d.vkDestroyImage(self.ctx.device, self.depth_image, null);
+            self.depth_image = 0;
+        }
+        if (self.depth_memory != 0) {
+            d.vkFreeMemory(self.ctx.device, self.depth_memory, null);
+            self.depth_memory = 0;
+        }
+    }
+
+    fn create_depth(self: *WindowSwapchain, width: u32, height: u32) !void {
+        const ctx = self.ctx;
+        const d = &ctx.device_fns;
+        errdefer self.destroy_depth();
+
+        var image: u64 = 0;
+        if (d.vkCreateImage(ctx.device, &.{
+            .sType = sdk.STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = sdk.IMAGE_TYPE_2D,
+            .format = sdk.FORMAT_D32_SFLOAT,
+            .extent = .{ .width = width, .height = height, .depth = 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = 1,
+            .tiling = sdk.IMAGE_TILING_OPTIMAL,
+            .usage = sdk.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            .sharingMode = sdk.SHARING_MODE_EXCLUSIVE,
+            .initialLayout = sdk.IMAGE_LAYOUT_UNDEFINED,
+        }, null, &image) != SUCCESS) return error.SwapchainCreationFailed;
+        self.depth_image = image;
+
+        var req: sdk.MemoryRequirements = .{};
+        d.vkGetImageMemoryRequirements(ctx.device, image, &req);
+
+        var mem_props: sdk.PhysicalDeviceMemoryProperties = .{};
+        ctx.fns.vkGetPhysicalDeviceMemoryProperties(ctx.physical, &mem_props);
+        var mem_type_idx: ?u32 = null;
+        var fallback_idx: ?u32 = null;
+        for (0..mem_props.memoryTypeCount) |i| {
+            const bit = @as(u32, 1) << @intCast(i);
+            if ((req.memoryTypeBits & bit) == 0) continue;
+            if (fallback_idx == null) fallback_idx = @intCast(i);
+            if ((mem_props.memoryTypes[i].propertyFlags & sdk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+                mem_type_idx = @intCast(i);
+                break;
+            }
+        }
+        const chosen_type = mem_type_idx orelse fallback_idx orelse return error.SwapchainCreationFailed;
+
+        var memory: u64 = 0;
+        if (d.vkAllocateMemory(ctx.device, &.{
+            .sType = sdk.STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = req.size,
+            .memoryTypeIndex = chosen_type,
+        }, null, &memory) != SUCCESS) return error.SwapchainCreationFailed;
+        self.depth_memory = memory;
+
+        if (d.vkBindImageMemory(ctx.device, image, memory, 0) != SUCCESS) return error.SwapchainCreationFailed;
+
+        var view: u64 = 0;
+        if (d.vkCreateImageView(ctx.device, &.{
+            .image = image,
+            .format = sdk.FORMAT_D32_SFLOAT,
+            .subresourceRange = .{ .aspectMask = sdk.IMAGE_ASPECT_DEPTH_BIT },
+        }, null, &view) != SUCCESS) return error.SwapchainCreationFailed;
+        self.depth_view = view;
     }
 
     /// Switches the window between opaque and transparent. The swapchain is recreated with the
@@ -676,6 +761,7 @@ pub const WindowSwapchain = struct {
             if (self.finished[i] == 0) self.finished[i] = try self.new_semaphore();
             if (self.acquired[i] == 0) self.acquired[i] = try self.new_semaphore();
         }
+        try self.create_depth(extent.width, extent.height);
         self.needs_recreate = false;
     }
 
@@ -707,10 +793,12 @@ pub const WindowSwapchain = struct {
             .height = self.height,
             .sample_count = 1,
             .color_format = self.color_format,
-            .depth_format = .none,
+            .depth_format = .depth,
             .native = .{ .vulkan = .{
                 .render_image = @ptrFromInt(self.images[self.index]),
                 .render_view = @ptrFromInt(self.views[self.index]),
+                .depth_stencil_image = @ptrFromInt(self.depth_image),
+                .depth_stencil_view = @ptrFromInt(self.depth_view),
                 .render_finished_semaphore = @ptrFromInt(self.finished[self.index]),
                 .present_complete_semaphore = @ptrFromInt(semaphore),
             } },

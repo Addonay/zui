@@ -109,6 +109,37 @@ pub const TransformationMatrix = struct {
         }
         return .{ .x = output[0], .y = output[1] };
     }
+
+    /// The smallest axis-aligned bounds containing `b` once transformed.
+    pub fn transform_bounds(self: TransformationMatrix, b: Bounds(ScaledPixels)) Bounds(ScaledPixels) {
+        if (std.meta.eql(self, TransformationMatrix{})) return b;
+        const xx = self.rotation_scale[0][0];
+        const xy = self.rotation_scale[0][1];
+        const yx = self.rotation_scale[1][0];
+        const yy = self.rotation_scale[1][1];
+        const tx = self.translation[0];
+        const ty = self.translation[1];
+        const corners = [4]Point(ScaledPixels){
+            b.origin,
+            b.top_right(),
+            b.bottom_left(),
+            b.bottom_right(),
+        };
+        var top_left: Point(ScaledPixels) = .{
+            .x = xx * corners[0].x + xy * corners[0].y + tx,
+            .y = yx * corners[0].x + yy * corners[0].y + ty,
+        };
+        var bottom_right = top_left;
+        for (corners[1..]) |c| {
+            const p: Point(ScaledPixels) = .{
+                .x = xx * c.x + xy * c.y + tx,
+                .y = yx * c.x + yy * c.y + ty,
+            };
+            top_left = top_left.min(p);
+            bottom_right = bottom_right.max(p);
+        }
+        return Bounds(ScaledPixels).from_corners(top_left, bottom_right);
+    }
 };
 
 pub const Quad = struct {
@@ -353,6 +384,19 @@ pub const Primitive = union(enum) {
     polychrome_sprite: PolychromeSprite,
     surface: PaintSurface,
 
+    pub fn kind(self: *const Primitive) PrimitiveKind {
+        return switch (self.*) {
+            .shadow => .shadow,
+            .quad => .quad,
+            .path => .path,
+            .underline => .underline,
+            .monochrome_sprite => .monochrome_sprite,
+            .subpixel_sprite => .subpixel_sprite,
+            .polychrome_sprite => .polychrome_sprite,
+            .surface => .surface,
+        };
+    }
+
     pub fn bounds(self: *const Primitive) Bounds(ScaledPixels) {
         return switch (self.*) {
             .shadow => |shadow| shadow.bounds,
@@ -363,6 +407,14 @@ pub const Primitive = union(enum) {
             .subpixel_sprite => |sprite| sprite.bounds,
             .polychrome_sprite => |sprite| sprite.bounds,
             .surface => |surface| surface.bounds,
+        };
+    }
+
+    pub fn transformation(self: *const Primitive) TransformationMatrix {
+        return switch (self.*) {
+            .monochrome_sprite => |sprite| sprite.transformation,
+            .subpixel_sprite => |sprite| sprite.transformation,
+            else => TransformationMatrix.unit(),
         };
     }
 
@@ -377,6 +429,19 @@ pub const Primitive = union(enum) {
             .polychrome_sprite => |sprite| sprite.content_mask,
             .surface => |surface| surface.content_mask,
         };
+    }
+
+    pub fn clipped_bounds(self: *const Primitive) Bounds(ScaledPixels) {
+        const b = switch (self.*) {
+            .shadow => |shadow| if (shadow.inset != 0 and !shadow.element_bounds.is_empty())
+                shadow.element_bounds
+            else if (shadow.inset == 0 and shadow.blur_radius > 0)
+                shadow.bounds.dilate(3.0 * shadow.blur_radius)
+            else
+                shadow.bounds,
+            else => self.transformation().transform_bounds(self.bounds()),
+        };
+        return b.intersect(self.content_mask().bounds);
     }
 
     /// Returns a deep copy; only paths allocate.
@@ -406,6 +471,17 @@ pub const PrimitiveKind = enum {
     subpixel_sprite,
     polychrome_sprite,
     surface,
+
+    /// A primitive can share the draw order of the topmost primitive it overlaps
+    /// if that primitive's kind is at most `max_shared_kind()`.
+    pub fn max_shared_kind(self: PrimitiveKind) PrimitiveKind {
+        return switch (self) {
+            .monochrome_sprite => .underline,
+            .subpixel_sprite => .monochrome_sprite,
+            .polychrome_sprite => .subpixel_sprite,
+            else => self,
+        };
+    }
 };
 
 /// Half-open index range into a scene's paint operations.
@@ -554,12 +630,36 @@ pub const BatchIterator = struct {
     }
 };
 
+const Layer = struct {
+    primitives: std.ArrayList(Range) = .empty,
+    bounds: Bounds(ScaledPixels) = .{},
+    max_kind: PrimitiveKind = .shadow,
+    max_shared_kind: PrimitiveKind = .surface,
+
+    fn deinit(self: *Layer, allocator: std.mem.Allocator) void {
+        self.primitives.deinit(allocator);
+    }
+};
+
+const SortEntry = struct {
+    key: u64,
+    index: u32,
+};
+
+fn join_bounds(a: Bounds(ScaledPixels), b: Bounds(ScaledPixels)) Bounds(ScaledPixels) {
+    if (a.is_empty()) return b;
+    if (b.is_empty()) return a;
+    return a.@"union"(b);
+}
+
 /// The per-frame list of primitives with draw-order assignment and batching.
 pub const Scene = struct {
     allocator: std.mem.Allocator,
     paint_operations: std.ArrayList(PaintOperation) = .empty,
     primitive_bounds: BoundsTree(ScaledPixels),
-    layer_stack: std.ArrayList(DrawOrder) = .empty,
+    layer_stack: std.ArrayList(usize) = .empty,
+    layers: std.ArrayList(Layer) = .empty,
+    sort_keys: std.ArrayList(SortEntry) = .empty,
     shadows: std.ArrayList(Shadow) = .empty,
     quads: std.ArrayList(Quad) = .empty,
     paths: std.ArrayList(Path(ScaledPixels)) = .empty,
@@ -578,9 +678,12 @@ pub const Scene = struct {
 
     pub fn deinit(self: *Scene) void {
         self.release_paths();
+        self.release_layers();
         self.paint_operations.deinit(self.allocator);
         self.primitive_bounds.deinit();
         self.layer_stack.deinit(self.allocator);
+        self.layers.deinit(self.allocator);
+        self.sort_keys.deinit(self.allocator);
         self.paths.deinit(self.allocator);
         self.shadows.deinit(self.allocator);
         self.quads.deinit(self.allocator);
@@ -594,9 +697,11 @@ pub const Scene = struct {
     /// Removes all primitives and layers, retaining allocated capacity.
     pub fn clear(self: *Scene) void {
         self.release_paths();
+        self.release_layers();
         self.paint_operations.clearRetainingCapacity();
         self.primitive_bounds.clear();
         self.layer_stack.clearRetainingCapacity();
+        self.layers.clearRetainingCapacity();
         self.shadows.clearRetainingCapacity();
         self.quads.clearRetainingCapacity();
         self.paths.clearRetainingCapacity();
@@ -613,6 +718,10 @@ pub const Scene = struct {
         for (self.paths.items) |*path| path.deinit();
     }
 
+    fn release_layers(self: *Scene) void {
+        for (self.layers.items) |*layer| layer.deinit(self.allocator);
+    }
+
     /// The number of recorded paint operations.
     pub fn len(self: *const Scene) usize {
         return self.paint_operations.items.len;
@@ -622,8 +731,8 @@ pub const Scene = struct {
     pub fn push_layer(self: *Scene, bounds: Bounds(ScaledPixels)) !void {
         try self.paint_operations.ensureUnusedCapacity(self.allocator, 1);
         try self.layer_stack.ensureUnusedCapacity(self.allocator, 1);
-        const order = try self.primitive_bounds.insert(bounds);
-        self.layer_stack.appendAssumeCapacity(order);
+        try self.layers.append(self.allocator, .{});
+        self.layer_stack.appendAssumeCapacity(self.layers.items.len - 1);
         self.paint_operations.appendAssumeCapacity(.{ .start_layer = bounds });
     }
 
@@ -631,7 +740,30 @@ pub const Scene = struct {
     pub fn pop_layer(self: *Scene) !void {
         try self.paint_operations.ensureUnusedCapacity(self.allocator, 1);
         _ = self.layer_stack.pop();
+        if (self.layer_stack.items.len == 0) {
+            for (self.layers.items) |*layer| {
+                defer {
+                    layer.deinit(self.allocator);
+                    layer.* = .{};
+                }
+                try self.insert_layer(layer);
+            }
+            self.layers.clearRetainingCapacity();
+        }
         self.paint_operations.appendAssumeCapacity(.end_layer);
+    }
+
+    fn insert_layer(self: *Scene, layer: *const Layer) !void {
+        if (layer.primitives.items.len == 0) return;
+        const order = try self.primitive_bounds.insert(layer.bounds, layer.max_kind, layer.max_shared_kind);
+        for (layer.primitives.items) |range| {
+            for (range.start..range.end) |index| {
+                switch (self.paint_operations.items[index]) {
+                    .primitive => |*primitive| try self.push_primitive(primitive, order),
+                    .start_layer, .end_layer => {},
+                }
+            }
+        }
     }
 
     /// Adds a primitive, assigning its draw order. Takes ownership; invisible primitives are dropped.
@@ -639,19 +771,35 @@ pub const Scene = struct {
         var owned = primitive;
         errdefer owned.deinit();
 
-        const clipped_bounds = owned.bounds().intersect(owned.content_mask().bounds);
+        const clipped_bounds = owned.clipped_bounds();
         if (clipped_bounds.is_empty()) {
             owned.deinit();
             return;
         }
 
         try self.paint_operations.ensureUnusedCapacity(self.allocator, 1);
-        const order = if (self.layer_stack.getLastOrNull()) |layer_order|
-            layer_order
-        else
-            try self.primitive_bounds.insert(clipped_bounds);
+        const prim_kind = owned.kind();
+        if (self.layer_stack.getLastOrNull()) |layer_idx| {
+            const layer = &self.layers.items[layer_idx];
+            layer.bounds = join_bounds(layer.bounds, clipped_bounds);
+            layer.max_kind = @enumFromInt(@max(@intFromEnum(layer.max_kind), @intFromEnum(prim_kind)));
+            layer.max_shared_kind = @enumFromInt(@min(@intFromEnum(layer.max_shared_kind), @intFromEnum(prim_kind.max_shared_kind())));
+            const index = self.paint_operations.items.len;
+            if (layer.primitives.items.len > 0 and layer.primitives.items[layer.primitives.items.len - 1].end == index) {
+                layer.primitives.items[layer.primitives.items.len - 1].end += 1;
+            } else {
+                try layer.primitives.append(self.allocator, .{ .start = index, .end = index + 1 });
+            }
+        } else {
+            const order = try self.primitive_bounds.insert(clipped_bounds, prim_kind, prim_kind.max_shared_kind());
+            try self.push_primitive(&owned, order);
+        }
 
-        switch (owned) {
+        self.paint_operations.appendAssumeCapacity(.{ .primitive = owned });
+    }
+
+    fn push_primitive(self: *Scene, primitive: *Primitive, order: DrawOrder) !void {
+        switch (primitive.*) {
             .shadow => |*shadow| {
                 shadow.order = order;
                 try self.shadows.append(self.allocator, shadow.*);
@@ -688,8 +836,6 @@ pub const Scene = struct {
                 try self.surfaces.append(self.allocator, surface.*);
             },
         }
-
-        self.paint_operations.appendAssumeCapacity(.{ .primitive = owned });
     }
 
     /// Re-inserts the paint operations in `range` of `prev_scene` into this scene.
@@ -705,14 +851,15 @@ pub const Scene = struct {
 
     /// Sorts every primitive list by draw order (and texture for sprites). Call before `batches`.
     pub fn finish(self: *Scene) void {
-        sort_by_order(Shadow, self.shadows.items);
-        sort_by_order(Quad, self.quads.items);
-        sort_by_order(Path(ScaledPixels), self.paths.items);
-        sort_by_order(Underline, self.underlines.items);
-        sort_by_order_and_texture(MonochromeSprite, self.monochrome_sprites.items);
-        sort_by_order_and_texture(SubpixelSprite, self.subpixel_sprites.items);
-        sort_by_order_and_texture(PolychromeSprite, self.polychrome_sprites.items);
-        sort_by_order(PaintSurface, self.surfaces.items);
+        std.debug.assert(self.layer_stack.items.len == 0);
+        sort_in_place(Shadow, self.shadows.items, &self.sort_keys, self.allocator, order_key(Shadow));
+        sort_in_place(Quad, self.quads.items, &self.sort_keys, self.allocator, order_key(Quad));
+        sort_in_place(Path(ScaledPixels), self.paths.items, &self.sort_keys, self.allocator, order_key(Path(ScaledPixels)));
+        sort_in_place(Underline, self.underlines.items, &self.sort_keys, self.allocator, order_key(Underline));
+        sort_in_place(MonochromeSprite, self.monochrome_sprites.items, &self.sort_keys, self.allocator, order_texture_key(MonochromeSprite));
+        sort_in_place(SubpixelSprite, self.subpixel_sprites.items, &self.sort_keys, self.allocator, order_texture_key(SubpixelSprite));
+        sort_in_place(PolychromeSprite, self.polychrome_sprites.items, &self.sort_keys, self.allocator, order_texture_key(PolychromeSprite));
+        sort_in_place(PaintSurface, self.surfaces.items, &self.sort_keys, self.allocator, order_key(PaintSurface));
     }
 
     /// Iterates the sorted primitives as batches. Call `finish` first.
@@ -730,22 +877,92 @@ pub const Scene = struct {
     }
 };
 
-// Unstable sort: primitives sharing an order do not overlap, so their relative order does not matter.
-fn sort_by_order(comptime T: type, items: []T) void {
-    std.sort.pdq(T, items, {}, struct {
-        fn less(_: void, lhs: T, rhs: T) bool {
-            return lhs.order < rhs.order;
-        }
-    }.less);
+/// The depth step between consecutive quads in a frame with `quad_count` quads.
+pub fn quad_depth_scale(quad_count: usize) f32 {
+    const clamped = @min(quad_count, (1 << 24) - 1) + 1;
+    const denominator = std.math.ceilPowerOfTwo(usize, clamped) catch (1 << 24);
+    return 1.0 / @as(f32, @floatFromInt(denominator));
 }
 
-fn sort_by_order_and_texture(comptime T: type, items: []T) void {
-    std.sort.pdq(T, items, {}, struct {
-        fn less(_: void, lhs: T, rhs: T) bool {
-            if (lhs.order != rhs.order) return lhs.order < rhs.order;
-            return lhs.tile.texture_id.index < rhs.tile.texture_id.index;
+/// Maps a quad's index in `Scene.quads` to depth, with greater values closer.
+pub fn quad_depth(quad_id: u32, scale: f32) f32 {
+    return @min(@as(f32, @floatFromInt(quad_id + 1)) * scale, 1.0);
+}
+
+fn order_key(comptime T: type) fn (*const T) u64 {
+    return struct {
+        fn get(item: *const T) u64 {
+            return @as(u64, item.order) << 32;
         }
-    }.less);
+    }.get;
+}
+
+fn order_texture_key(comptime T: type) fn (*const T) u64 {
+    return struct {
+        fn get(item: *const T) u64 {
+            return (@as(u64, item.order) << 32) | @as(u64, item.tile.texture_id.index);
+        }
+    }.get;
+}
+
+fn sort_entry_less(_: void, lhs: SortEntry, rhs: SortEntry) bool {
+    if (lhs.key != rhs.key) return lhs.key < rhs.key;
+    return lhs.index < rhs.index;
+}
+
+/// Sorts small `(key, index)` pairs instead of the large primitives themselves, then permutes
+/// primitives into place in a single pass of cycles. Ties preserve insertion order via `index`.
+fn sort_in_place(
+    comptime T: type,
+    primitives: []T,
+    keys: *std.ArrayList(SortEntry),
+    allocator: std.mem.Allocator,
+    comptime key_fn: fn (*const T) u64,
+) void {
+    if (primitives.len <= 1) return;
+
+    var sorted = true;
+    var prev_key = key_fn(&primitives[0]);
+    for (primitives[1..]) |*item| {
+        const k = key_fn(item);
+        if (k < prev_key) {
+            sorted = false;
+            break;
+        }
+        prev_key = k;
+    }
+    if (sorted) return;
+
+    keys.resize(allocator, primitives.len) catch {
+        // Fallback when scratch allocation fails: stable in-place sort with zero allocations.
+        std.sort.block(T, primitives, {}, struct {
+            fn less(_: void, lhs: T, rhs: T) bool {
+                return key_fn(&lhs) < key_fn(&rhs);
+            }
+        }.less);
+        return;
+    };
+
+    for (primitives, 0..) |*item, index| {
+        keys.items[index] = .{ .key = key_fn(item), .index = @intCast(index) };
+    }
+    std.sort.pdq(SortEntry, keys.items, {}, sort_entry_less);
+
+    for (0..primitives.len) |start| {
+        if (keys.items[start].index == start) continue;
+        const displaced = primitives[start];
+        var target = start;
+        while (true) {
+            const source = keys.items[target].index;
+            keys.items[target].index = @intCast(target);
+            if (source == start) {
+                primitives[target] = displaced;
+                break;
+            }
+            primitives[target] = primitives[source];
+            target = source;
+        }
+    }
 }
 
 fn rect(x: f32, y: f32, width: f32, height: f32) Bounds(ScaledPixels) {
@@ -788,7 +1005,30 @@ test "primitives outside their content mask are dropped" {
     try testing.expectEqual(@as(usize, 0), scene.quads.items.len);
 }
 
-test "overlapping primitives get increasing draw orders" {
+test "kind-aware batching shares order for quad + text and bumps when quad overlaps text" {
+    var scene = Scene.init(testing.allocator);
+    defer scene.deinit();
+
+    // Background quad + text sprites on top share order 1; an overlapping quad bumps to order 2.
+    try scene.insert_primitive(.{ .quad = quad_at(0, 0, 100, 20) });
+    try scene.insert_primitive(.{ .monochrome_sprite = sprite_at(5, 5, 1) });
+    try scene.insert_primitive(.{ .monochrome_sprite = sprite_at(20, 5, 1) });
+    try scene.insert_primitive(.{ .quad = quad_at(10, 0, 30, 20) });
+    scene.finish();
+
+    try testing.expectEqual(@as(DrawOrder, 1), scene.quads.items[0].order);
+    try testing.expectEqual(@as(DrawOrder, 1), scene.monochrome_sprites.items[0].order);
+    try testing.expectEqual(@as(DrawOrder, 1), scene.monochrome_sprites.items[1].order);
+    try testing.expectEqual(@as(DrawOrder, 2), scene.quads.items[1].order);
+
+    var batches = scene.batches();
+    try testing.expectEqual(@as(usize, 1), batches.next().?.quads.len);
+    try testing.expectEqual(@as(usize, 2), batches.next().?.monochrome_sprites.sprites.len);
+    try testing.expectEqual(@as(usize, 1), batches.next().?.quads.len);
+    try testing.expectEqual(@as(?PrimitiveBatch, null), batches.next());
+}
+
+test "overlapping primitives respect kind-aware draw orders" {
     var scene = Scene.init(testing.allocator);
     defer scene.deinit();
 
@@ -798,22 +1038,74 @@ test "overlapping primitives get increasing draw orders" {
 
     try testing.expectEqual(@as(usize, 3), scene.len());
     try testing.expectEqual(@as(DrawOrder, 1), scene.quads.items[0].order);
-    try testing.expectEqual(@as(DrawOrder, 2), scene.underlines.items[0].order);
-    try testing.expectEqual(@as(DrawOrder, 3), scene.quads.items[1].order);
+    try testing.expectEqual(@as(DrawOrder, 1), scene.underlines.items[0].order);
+    try testing.expectEqual(@as(DrawOrder, 2), scene.quads.items[1].order);
 }
 
-test "finish sorts primitives by draw order" {
+test "finish sorts primitives by draw order and preserves stability on ties" {
     var scene = Scene.init(testing.allocator);
     defer scene.deinit();
 
+    // Order 1 (first quad), Order 1 (overlaps first quad), Order 2 (overlaps underline at order 1), Order 1 (non-overlapping).
     try scene.insert_primitive(.{ .quad = quad_at(0, 0, 10, 10) });
+    try scene.insert_primitive(.{ .underline = underline_at(0, 0, 10, 2) });
     try scene.insert_primitive(.{ .quad = quad_at(0, 0, 10, 10) });
     try scene.insert_primitive(.{ .quad = quad_at(50, 50, 10, 10) });
     scene.finish();
 
     const orders = [_]DrawOrder{ scene.quads.items[0].order, scene.quads.items[1].order, scene.quads.items[2].order };
     try testing.expectEqualSlices(DrawOrder, &.{ 1, 1, 2 }, &orders);
+    try testing.expectEqual(@as(f32, 0), scene.quads.items[0].bounds.origin.x);
     try testing.expectEqual(@as(f32, 50), scene.quads.items[1].bounds.origin.x);
+    try testing.expectEqual(@as(f32, 0), scene.quads.items[2].bounds.origin.x);
+}
+
+test "fast sort_in_place handles already-sorted, reversed, and interleaved inputs stably" {
+    var keys: std.ArrayList(SortEntry) = .empty;
+    defer keys.deinit(testing.allocator);
+
+    // Already sorted
+    var sorted_quads = [_]Quad{
+        .{ .order = 1, .bounds = rect(1, 0, 1, 1) },
+        .{ .order = 1, .bounds = rect(2, 0, 1, 1) },
+        .{ .order = 2, .bounds = rect(3, 0, 1, 1) },
+    };
+    sort_in_place(Quad, &sorted_quads, &keys, testing.allocator, order_key(Quad));
+    try testing.expectEqual(@as(f32, 1), sorted_quads[0].bounds.origin.x);
+    try testing.expectEqual(@as(f32, 2), sorted_quads[1].bounds.origin.x);
+    try testing.expectEqual(@as(f32, 3), sorted_quads[2].bounds.origin.x);
+
+    // Reversed with ties
+    var reversed_quads = [_]Quad{
+        .{ .order = 3, .bounds = rect(10, 0, 1, 1) },
+        .{ .order = 2, .bounds = rect(20, 0, 1, 1) },
+        .{ .order = 2, .bounds = rect(21, 0, 1, 1) },
+        .{ .order = 1, .bounds = rect(30, 0, 1, 1) },
+        .{ .order = 1, .bounds = rect(31, 0, 1, 1) },
+    };
+    sort_in_place(Quad, &reversed_quads, &keys, testing.allocator, order_key(Quad));
+    try testing.expectEqual(@as(f32, 30), reversed_quads[0].bounds.origin.x);
+    try testing.expectEqual(@as(f32, 31), reversed_quads[1].bounds.origin.x);
+    try testing.expectEqual(@as(f32, 20), reversed_quads[2].bounds.origin.x);
+    try testing.expectEqual(@as(f32, 21), reversed_quads[3].bounds.origin.x);
+    try testing.expectEqual(@as(f32, 10), reversed_quads[4].bounds.origin.x);
+
+    // Interleaved sprites by (order, texture_id)
+    var sprites = [_]MonochromeSprite{
+        sprite_at(1, 0, 3),
+        sprite_at(2, 0, 1),
+        sprite_at(3, 0, 2),
+        sprite_at(4, 0, 1),
+    };
+    sprites[0].order = 2;
+    sprites[1].order = 2;
+    sprites[2].order = 1;
+    sprites[3].order = 2;
+    sort_in_place(MonochromeSprite, &sprites, &keys, testing.allocator, order_texture_key(MonochromeSprite));
+    try testing.expectEqual(@as(f32, 3), sprites[0].bounds.origin.x); // order 1, tex 2
+    try testing.expectEqual(@as(f32, 2), sprites[1].bounds.origin.x); // order 2, tex 1 (first)
+    try testing.expectEqual(@as(f32, 4), sprites[2].bounds.origin.x); // order 2, tex 1 (second)
+    try testing.expectEqual(@as(f32, 1), sprites[3].bounds.origin.x); // order 2, tex 3
 }
 
 test "batches alternate between kinds in draw order" {
@@ -854,7 +1146,7 @@ test "sprite batches break on texture change" {
     try testing.expectEqual(@as(?PrimitiveBatch, null), batches.next());
 }
 
-test "layers assign their order to contained primitives" {
+test "layers assign their order to contained primitives and preserve paint order" {
     var scene = Scene.init(testing.allocator);
     defer scene.deinit();
 
@@ -866,6 +1158,39 @@ test "layers assign their order to contained primitives" {
     try testing.expectEqual(@as(usize, 4), scene.len());
     try testing.expectEqual(@as(DrawOrder, 1), scene.quads.items[0].order);
     try testing.expectEqual(@as(DrawOrder, 1), scene.quads.items[1].order);
+
+    // Nested layers are drawn above their parents.
+    var nested = Scene.init(testing.allocator);
+    defer nested.deinit();
+    try nested.push_layer(rect(0, 0, 100, 100));
+    try nested.insert_primitive(.{ .underline = underline_at(0, 0, 10, 10) });
+    try nested.push_layer(rect(0, 0, 100, 100));
+    try nested.insert_primitive(.{ .quad = quad_at(5, 0, 10, 10) });
+    try nested.pop_layer();
+    try nested.insert_primitive(.{ .underline = underline_at(5, 0, 10, 10) });
+    try nested.pop_layer();
+    nested.finish();
+
+    var batches = nested.batches();
+    try testing.expectEqual(@as(usize, 2), batches.next().?.underlines.len);
+    try testing.expectEqual(@as(usize, 1), batches.next().?.quads.len);
+    try testing.expectEqual(@as(?PrimitiveBatch, null), batches.next());
+}
+
+test "quad_depth_scale and quad_depth are monotonic in (0, 1]" {
+    const scale0 = quad_depth_scale(0);
+    try testing.expectEqual(@as(f32, 1.0), scale0);
+    try testing.expectEqual(@as(f32, 1.0), quad_depth(0, scale0));
+
+    const count: usize = 5;
+    const scale = quad_depth_scale(count);
+    var prev: f32 = 0.0;
+    for (0..count + 1) |i| {
+        const d = quad_depth(@intCast(i), scale);
+        try testing.expect(d > prev);
+        try testing.expect(d <= 1.0);
+        prev = d;
+    }
 }
 
 test "replay copies paint operations from another scene" {
