@@ -876,20 +876,41 @@ pub const GpuRenderer = struct {
         self.curve_texels.clearRetainingCapacity();
         self.commands.clearRetainingCapacity();
 
+        var path_tile_count: usize = 0;
+        var path_curve_count: usize = 0;
+        for (sc.paths.items) |*path| {
+            const ptiles = path.tiles orelse continue;
+            path_tile_count += ptiles.tiles().len;
+            path_curve_count += ptiles.curves().len;
+        }
+        const max_frame_bytes =
+            sc.quads.items.len * @sizeOf(QuadInstance) +
+            sc.shadows.items.len * @sizeOf(ShadowInstance) +
+            sc.underlines.items.len * @sizeOf(UnderlineInstance) +
+            sc.monochrome_sprites.items.len * @sizeOf(MonoSpriteInstance) +
+            sc.polychrome_sprites.items.len * @sizeOf(PolySpriteInstance) +
+            path_tile_count * @sizeOf(PathTileInstance);
+        try self.frame_bytes.ensureTotalCapacity(self.allocator, max_frame_bytes);
+        if (path_curve_count > 0) {
+            try self.curve_texels.ensureTotalCapacity(self.allocator, path_curve_count * 3);
+        }
+
         const depth_scale = scene.quad_depth_scale(sc.quads.items.len);
 
         // Pack opaque rectangles front-to-back first so early-Z rejects occluded geometry behind them.
         const oq_offset = self.frame_bytes.items.len;
+        var oq_ptr: [*]u8 = self.frame_bytes.items.ptr + oq_offset;
         var oq_count: usize = 0;
         var ri = sc.quads.items.len;
         while (ri > 0) {
             ri -= 1;
             const q = &sc.quads.items[ri];
             if (!isOpaqueRectangle(q)) continue;
-            const instance = packOpaqueQuad(q, scene.quad_depth(@intCast(ri), depth_scale));
-            try self.frame_bytes.appendSlice(self.allocator, std.mem.asBytes(&instance));
+            @as(*align(1) OpaqueQuadInstance, @ptrCast(oq_ptr)).* = packOpaqueQuad(q, scene.quad_depth(@intCast(ri), depth_scale));
+            oq_ptr += @sizeOf(OpaqueQuadInstance);
             oq_count += 1;
         }
+        self.frame_bytes.items.len = oq_offset + oq_count * @sizeOf(OpaqueQuadInstance);
         self.opaque_quads = .{ .offset = oq_offset, .count = oq_count };
         self.stats.opaque_quads = oq_count;
 
@@ -937,25 +958,31 @@ pub const GpuRenderer = struct {
 
     fn appendQuads(self: *GpuRenderer, items: []const scene.Quad, quad_cursor: u32, depth_scale: f32) !Range {
         const offset = self.frame_bytes.items.len;
+        try self.frame_bytes.ensureUnusedCapacity(self.allocator, items.len * @sizeOf(QuadInstance));
+        var out_ptr: [*]u8 = self.frame_bytes.items.ptr + offset;
         var count: usize = 0;
         for (items, 0..) |*item, local_idx| {
             if (isOpaqueRectangle(item)) continue;
             const depth = scene.quad_depth(quad_cursor + @as(u32, @intCast(local_idx)), depth_scale);
-            const instance = packQuad(item, depth);
-            try self.frame_bytes.appendSlice(self.allocator, std.mem.asBytes(&instance));
+            @as(*align(1) QuadInstance, @ptrCast(out_ptr)).* = packQuad(item, depth);
+            out_ptr += @sizeOf(QuadInstance);
             count += 1;
         }
+        self.frame_bytes.items.len = offset + count * @sizeOf(QuadInstance);
         return .{ .offset = offset, .count = count };
     }
 
     /// Appends a batch of instances; returns its byte range.
     fn appendItems(self: *GpuRenderer, comptime T: type, items: anytype, comptime pack_fn: anytype) !Range {
         const offset = self.frame_bytes.items.len;
-        try self.frame_bytes.ensureUnusedCapacity(self.allocator, items.len * @sizeOf(T));
+        const total_bytes = items.len * @sizeOf(T);
+        try self.frame_bytes.ensureUnusedCapacity(self.allocator, total_bytes);
+        var out_ptr: [*]u8 = self.frame_bytes.items.ptr + offset;
         for (items) |*item| {
-            const instance: T = pack_fn(item);
-            self.frame_bytes.appendSliceAssumeCapacity(std.mem.asBytes(&instance));
+            @as(*align(1) T, @ptrCast(out_ptr)).* = pack_fn(item);
+            out_ptr += @sizeOf(T);
         }
+        self.frame_bytes.items.len = offset + total_bytes;
         return .{ .offset = offset, .count = items.len };
     }
 
@@ -963,11 +990,14 @@ pub const GpuRenderer = struct {
         const w: f32 = @floatFromInt(texture_size[0]);
         const h: f32 = @floatFromInt(texture_size[1]);
         const offset = self.frame_bytes.items.len;
-        try self.frame_bytes.ensureUnusedCapacity(self.allocator, sprites.len * @sizeOf(T));
+        const total_bytes = sprites.len * @sizeOf(T);
+        try self.frame_bytes.ensureUnusedCapacity(self.allocator, total_bytes);
+        var out_ptr: [*]u8 = self.frame_bytes.items.ptr + offset;
         for (sprites) |*sprite| {
-            const instance: T = pack_fn(sprite, w, h);
-            self.frame_bytes.appendSliceAssumeCapacity(std.mem.asBytes(&instance));
+            @as(*align(1) T, @ptrCast(out_ptr)).* = pack_fn(sprite, w, h);
+            out_ptr += @sizeOf(T);
         }
+        self.frame_bytes.items.len = offset + total_bytes;
         return .{ .offset = offset, .count = sprites.len };
     }
 
@@ -982,26 +1012,32 @@ pub const GpuRenderer = struct {
             if (tiles.len == 0) continue;
 
             const curves = ptiles.curves();
-            const curve_base: u32 = @intCast(self.curve_texels.items.len / 3);
+            const curve_offset = self.curve_texels.items.len;
+            const curve_base: u32 = @intCast(curve_offset / 3);
             try self.curve_texels.ensureUnusedCapacity(self.allocator, curves.len * 3);
+            var c_ptr = self.curve_texels.items.ptr + curve_offset;
             for (curves) |c| {
-                self.curve_texels.appendAssumeCapacity(.{ c.p0.x, c.p0.y, c.p1.x, c.p1.y });
-                self.curve_texels.appendAssumeCapacity(.{ c.a.x, c.a.y, c.b.x, c.b.y });
-                self.curve_texels.appendAssumeCapacity(.{ c.sign, 0, 0, 0 });
+                c_ptr[0] = .{ c.p0.x, c.p0.y, c.p1.x, c.p1.y };
+                c_ptr[1] = .{ c.a.x, c.a.y, c.b.x, c.b.y };
+                c_ptr[2] = .{ c.sign, 0, 0, 0 };
+                c_ptr += 3;
             }
+            self.curve_texels.items.len = curve_offset + curves.len * 3;
 
             const bg = backgroundFields(path.color);
             const pb = bounds4(path.paint_bounds());
             const clip = bounds4(path.content_mask.bounds);
             const even_odd_f: f32 = if (path.even_odd) 1.0 else 0.0;
 
+            const batch_offset = self.frame_bytes.items.len;
             try self.frame_bytes.ensureUnusedCapacity(self.allocator, tiles.len * @sizeOf(PathTileInstance));
+            var pt_ptr: [*]u8 = self.frame_bytes.items.ptr + batch_offset;
             for (tiles) |tile| {
                 const cbox: [4]f32 = if (tile.curve_count == 0)
                     .{ 1e30, 1e30, -1e30, -1e30 }
                 else
                     .{ tile.curves_top_left.x, tile.curves_top_left.y, tile.curves_bottom_right.x, tile.curves_bottom_right.y };
-                const instance: PathTileInstance = .{
+                @as(*align(1) PathTileInstance, @ptrCast(pt_ptr)).* = .{
                     .rect = .{ tile.top_left.x, tile.top_left.y, tile.bottom_right.x, tile.bottom_right.y },
                     .curve_box = cbox,
                     .meta = .{
@@ -1019,9 +1055,10 @@ pub const GpuRenderer = struct {
                     .bg = bg.meta,
                     .bg2 = .{ bg.extra[0], 0, bg.extra[2], 0 },
                 };
-                self.frame_bytes.appendSliceAssumeCapacity(std.mem.asBytes(&instance));
+                pt_ptr += @sizeOf(PathTileInstance);
                 tile_count += 1;
             }
+            self.frame_bytes.items.len = batch_offset + tiles.len * @sizeOf(PathTileInstance);
             self.stats.paths += 1;
         }
         if (tile_count == 0) return;
