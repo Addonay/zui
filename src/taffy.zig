@@ -85,6 +85,11 @@ const CachedNode = struct {
     grid_buffers: ?*GridBuffers = null,
 };
 
+const ComputedBounds = struct {
+    origin: Point(f32),
+    bounds: Bounds(Pixels),
+};
+
 const LayoutCache = struct {
     scopes: std.AutoHashMapUnmanaged(u64, LayoutScope) = .empty,
     nodes: std.AutoHashMapUnmanaged(LayoutId, CachedNode) = .empty,
@@ -93,6 +98,9 @@ const LayoutCache = struct {
     frame: u64 = 0,
     /// Scale factor cached device-pixel styles and measurements were computed at.
     scale_factor: ?f32 = null,
+    /// Single-entry cache for consecutive sibling nodes sharing the same `scope_key`.
+    last_scope_key: u64 = 0,
+    last_scope_ptr: ?*LayoutScope = null,
 };
 
 const MeasureEntry = struct {
@@ -108,8 +116,7 @@ pub const TaffyLayoutEngine = struct {
     cache: LayoutCache = .{},
     /// Kept outside `zafi.Tree`, whose `set_node_context` marks a node dirty on every call.
     measures: std.AutoHashMapUnmanaged(LayoutId, MeasureEntry) = .empty,
-    absolute_layout_bounds: std.AutoHashMapUnmanaged(LayoutId, Bounds(Pixels)) = .empty,
-    absolute_outer_origins: std.AutoHashMapUnmanaged(LayoutId, Point(f32)) = .empty,
+    computed_bounds: std.AutoHashMapUnmanaged(LayoutId, ComputedBounds) = .empty,
     computed_layouts: std.AutoHashMapUnmanaged(LayoutId, void) = .empty,
     scratch: std.ArrayList(LayoutId) = .empty,
     allocator: std.mem.Allocator,
@@ -132,13 +139,13 @@ pub const TaffyLayoutEngine = struct {
     pub fn deinit(self: *TaffyLayoutEngine) void {
         self.freeAllCacheResources();
         self.taffy.deinit();
-        self.absolute_layout_bounds.deinit(self.allocator);
-        self.absolute_outer_origins.deinit(self.allocator);
+        self.computed_bounds.deinit(self.allocator);
         self.computed_layouts.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
     }
 
     fn freeAllCacheResources(self: *TaffyLayoutEngine) void {
+        self.cache.last_scope_ptr = null;
         var scope_it = self.cache.scopes.valueIterator();
         while (scope_it.next()) |scope| scope.nodes.deinit(self.allocator);
         self.cache.scopes.deinit(self.allocator);
@@ -166,8 +173,7 @@ pub const TaffyLayoutEngine = struct {
         self.freeAllCacheResources();
         self.taffy.clear();
         self.cache = .{};
-        self.absolute_layout_bounds.clearRetainingCapacity();
-        self.absolute_outer_origins.clearRetainingCapacity();
+        self.computed_bounds.clearRetainingCapacity();
         self.computed_layouts.clearRetainingCapacity();
         self.measure_calls = 0;
         self.last_frame_measure_calls = 0;
@@ -190,8 +196,7 @@ pub const TaffyLayoutEngine = struct {
     /// Ends the frame: nodes that weren't requested during it are detached and evicted after one spare frame.
     pub fn clear(self: *TaffyLayoutEngine) void {
         self.evict_unrequested();
-        self.absolute_layout_bounds.clearRetainingCapacity();
-        self.absolute_outer_origins.clearRetainingCapacity();
+        self.computed_bounds.clearRetainingCapacity();
         self.computed_layouts.clearRetainingCapacity();
         self.last_frame_measure_calls = self.measure_calls;
         self.measure_calls = 0;
@@ -199,6 +204,7 @@ pub const TaffyLayoutEngine = struct {
 
     fn evict_unrequested(self: *TaffyLayoutEngine) void {
         const cache = &self.cache;
+        cache.last_scope_ptr = null;
         for (cache.free_nodes.items) |id| {
             if (cache.nodes.fetchRemove(id)) |kv| {
                 if (kv.value.grid_buffers) |buf| self.allocator.destroy(buf);
@@ -263,12 +269,24 @@ pub const TaffyLayoutEngine = struct {
     }
 
     pub fn request_layout(self: *TaffyLayoutEngine, scope: u64, style: *const Style, rem_size: Pixels, scale_factor: f32, children: []const LayoutId) LayoutId {
+        return self.request_layout_any(scope, style, rem_size, scale_factor, children);
+    }
+
+    /// Like `request_layout`, but reads directly from a `*const StyleRefinement` without
+    /// constructing an intermediate `Style`.
+    pub fn request_layout_refinement(self: *TaffyLayoutEngine, scope: u64, style: *const style_mod.StyleRefinement, rem_size: Pixels, scale_factor: f32, children: []const LayoutId) LayoutId {
+        return self.request_layout_any(scope, style, rem_size, scale_factor, children);
+    }
+
+    fn request_layout_any(self: *TaffyLayoutEngine, scope: u64, style: anytype, rem_size: Pixels, scale_factor: f32, children: []const LayoutId) LayoutId {
         const id = self.acquire_node(scope, style, rem_size, scale_factor, children);
-        if (self.measures.fetchRemove(id)) |kv| {
-            if (kv.value.payload) |p| {
-                if (kv.value.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
+        if (self.measures.count() > 0) {
+            if (self.measures.fetchRemove(id)) |kv| {
+                if (kv.value.payload) |p| {
+                    if (kv.value.payload_deinit) |deinit_fn| deinit_fn(self.allocator, p);
+                }
+                self.taffy.mark_dirty(id);
             }
-            self.taffy.mark_dirty(id);
         }
         return id;
     }
@@ -333,26 +351,32 @@ pub const TaffyLayoutEngine = struct {
         return id;
     }
 
-    fn acquire_node(self: *TaffyLayoutEngine, scope_key: u64, style: *const Style, rem_size: Pixels, scale_factor: f32, children: []const LayoutId) LayoutId {
+    fn acquire_node(self: *TaffyLayoutEngine, scope_key: u64, style: anytype, rem_size: Pixels, scale_factor: f32, children: []const LayoutId) LayoutId {
         const cache = &self.cache;
         const frame = cache.frame;
 
-        const scope_gop = cache.scopes.getOrPut(self.allocator, scope_key) catch oom();
-        if (!scope_gop.found_existing) scope_gop.value_ptr.* = .{};
-        const scope = scope_gop.value_ptr;
+        const scope: *LayoutScope = if (cache.last_scope_ptr != null and cache.last_scope_key == scope_key)
+            cache.last_scope_ptr.?
+        else blk: {
+            const scope_gop = cache.scopes.getOrPut(self.allocator, scope_key) catch oom();
+            if (!scope_gop.found_existing) scope_gop.value_ptr.* = .{};
+            cache.last_scope_key = scope_key;
+            cache.last_scope_ptr = scope_gop.value_ptr;
+            break :blk scope_gop.value_ptr;
+        };
 
         const ordinal = scope.requested;
         scope.requested += 1;
 
-        const id: LayoutId = if (ordinal < scope.nodes.items.len) blk: {
+        if (ordinal < scope.nodes.items.len) {
             const existing_id = scope.nodes.items[ordinal];
             const node = cache.nodes.getPtr(existing_id).?;
             std.debug.assert(node.frame != frame); // layout node requested twice in one frame
-            if (node.stretched or !node.style.matches(style, rem_size, scale_factor)) {
+            if (node.stretched or !node.style.matchesAny(style, rem_size, scale_factor)) {
                 const prev_grid_cols = node.style.grid_cols;
                 const prev_grid_rows = node.style.grid_rows;
                 const was_stretched = node.stretched;
-                node.style = LayoutStyle.fromStyle(style, rem_size, scale_factor);
+                node.style = LayoutStyle.fromAny(style, rem_size, scale_factor);
                 node.stretched = false;
                 const taffy_style = node.style.toZafi(self.allocator, &node.grid_buffers);
                 const same_grid = std.meta.eql(prev_grid_cols, node.style.grid_cols) and std.meta.eql(prev_grid_rows, node.style.grid_rows);
@@ -368,40 +392,39 @@ pub const TaffyLayoutEngine = struct {
             if (!std.mem.eql(LayoutId, existing_children, children)) {
                 self.taffy.set_children(existing_id, children) catch oom();
             }
-            break :blk existing_id;
-        } else blk: {
-            const layout_style = LayoutStyle.fromStyle(style, rem_size, scale_factor);
-            const new_id: LayoutId = if (cache.free_nodes.pop()) |recycled| rblk: {
-                const node = cache.nodes.getPtr(recycled).?;
-                node.style = layout_style;
-                node.stretched = false;
-                const taffy_style = node.style.toZafi(self.allocator, &node.grid_buffers);
-                self.taffy.set_style(recycled, taffy_style) catch oom();
-                break :rblk recycled;
-            } else lblk: {
-                var grid_buffers: ?*GridBuffers = null;
-                const taffy_style = layout_style.toZafi(self.allocator, &grid_buffers);
-                const leaf_id = self.taffy.new_leaf(taffy_style) catch {
-                    if (grid_buffers) |buf| self.allocator.destroy(buf);
-                    oom();
-                };
-                cache.nodes.put(self.allocator, leaf_id, .{
-                    .style = layout_style,
-                    .frame = frame,
-                    .stretched = false,
-                    .grid_buffers = grid_buffers,
-                }) catch oom();
-                break :lblk leaf_id;
-            };
-            if (children.len > 0) {
-                self.taffy.set_children(new_id, children) catch oom();
-            }
-            scope.nodes.append(self.allocator, new_id) catch oom();
-            break :blk new_id;
-        };
+            node.frame = frame;
+            return existing_id;
+        }
 
-        cache.nodes.getPtr(id).?.frame = frame;
-        return id;
+        const layout_style = LayoutStyle.fromAny(style, rem_size, scale_factor);
+        const new_id: LayoutId = if (cache.free_nodes.pop()) |recycled| rblk: {
+            const node = cache.nodes.getPtr(recycled).?;
+            node.style = layout_style;
+            node.frame = frame;
+            node.stretched = false;
+            const taffy_style = node.style.toZafi(self.allocator, &node.grid_buffers);
+            self.taffy.set_style(recycled, taffy_style) catch oom();
+            break :rblk recycled;
+        } else lblk: {
+            var grid_buffers: ?*GridBuffers = null;
+            const taffy_style = layout_style.toZafi(self.allocator, &grid_buffers);
+            const leaf_id = self.taffy.new_leaf(taffy_style) catch {
+                if (grid_buffers) |buf| self.allocator.destroy(buf);
+                oom();
+            };
+            cache.nodes.put(self.allocator, leaf_id, .{
+                .style = layout_style,
+                .frame = frame,
+                .stretched = false,
+                .grid_buffers = grid_buffers,
+            }) catch oom();
+            break :lblk leaf_id;
+        };
+        if (children.len > 0) {
+            self.taffy.set_children(new_id, children) catch oom();
+        }
+        scope.nodes.append(self.allocator, new_id) catch oom();
+        return new_id;
     }
 
     /// Makes an auto-sized root fill `sz` (GPUI `stretch_auto_size_to_fill`).
@@ -432,8 +455,7 @@ pub const TaffyLayoutEngine = struct {
             self.scratch.clearRetainingCapacity();
             self.scratch.append(self.allocator, id) catch oom();
             while (self.scratch.pop()) |n| {
-                _ = self.absolute_layout_bounds.remove(n);
-                _ = self.absolute_outer_origins.remove(n);
+                _ = self.computed_bounds.remove(n);
                 const kids = self.taffy.children(n) catch &.{};
                 self.scratch.appendSlice(self.allocator, kids) catch oom();
             }
@@ -499,24 +521,29 @@ pub const TaffyLayoutEngine = struct {
     }
 
     pub fn layout_bounds(self: *TaffyLayoutEngine, id: LayoutId, scale_factor: f32) Bounds(Pixels) {
-        if (self.absolute_layout_bounds.get(id)) |b| return b;
+        return self.layout_bounds_entry(id, scale_factor).bounds;
+    }
+
+    fn layout_bounds_entry(self: *TaffyLayoutEngine, id: LayoutId, scale_factor: f32) ComputedBounds {
+        if (self.computed_bounds.get(id)) |entry| return entry;
         const lay = self.taffy.layout_of(id) catch unreachable;
         const loc: Point(f32) = .{ .x = lay.location.x, .y = lay.location.y };
         const parent = self.taffy.parent(id) catch null;
         const origin: Point(f32) = if (parent) |p| blk: {
-            _ = self.layout_bounds(p, scale_factor);
-            const po = self.absolute_outer_origins.get(p).?;
-            break :blk .{ .x = po.x + loc.x, .y = po.y + loc.y };
+            const pe = self.layout_bounds_entry(p, scale_factor);
+            break :blk .{ .x = pe.origin.x + loc.x, .y = pe.origin.y + loc.y };
         } else loc;
-        self.absolute_outer_origins.put(self.allocator, id, origin) catch oom();
         const far: Point(f32) = .{ .x = origin.x + lay.size.width, .y = origin.y + lay.size.height };
         const x0 = roundHalfTowardZero(origin.x) / scale_factor;
         const y0 = roundHalfTowardZero(origin.y) / scale_factor;
         const x1 = roundHalfTowardZero(far.x) / scale_factor;
         const y1 = roundHalfTowardZero(far.y) / scale_factor;
-        const b: Bounds(Pixels) = .{ .origin = .{ .x = x0, .y = y0 }, .size = .{ .width = x1 - x0, .height = y1 - y0 } };
-        self.absolute_layout_bounds.put(self.allocator, id, b) catch oom();
-        return b;
+        const entry: ComputedBounds = .{
+            .origin = origin,
+            .bounds = .{ .origin = .{ .x = x0, .y = y0 }, .size = .{ .width = x1 - x0, .height = y1 - y0 } },
+        };
+        self.computed_bounds.put(self.allocator, id, entry) catch oom();
+        return entry;
     }
 };
 
@@ -618,40 +645,170 @@ const LayoutStyle = struct {
     grid_cols: ?style_mod.GridTemplate,
     grid_location: ?style_mod.GridLocation,
 
-    fn fromStyle(s: *const Style, rem_size: Pixels, scale_factor: f32) LayoutStyle {
+    inline fn valOr(comptime T: type, v: anytype, default: T) T {
+        return if (@TypeOf(v) == ?T) (v orelse default) else v;
+    }
+
+    inline fn resolvePoint(comptime T: type, p: anytype, default: T) Point(T) {
+        return .{ .x = valOr(T, p.x, default), .y = valOr(T, p.y, default) };
+    }
+
+    inline fn resolveSize(comptime T: type, sz: anytype, default: T) Size(T) {
+        return .{ .width = valOr(T, sz.width, default), .height = valOr(T, sz.height, default) };
+    }
+
+    inline fn resolveEdges(comptime T: type, ed: anytype, default: T) geometry.Edges(T) {
+        return .{
+            .top = valOr(T, ed.top, default),
+            .right = valOr(T, ed.right, default),
+            .bottom = valOr(T, ed.bottom, default),
+            .left = valOr(T, ed.left, default),
+        };
+    }
+
+    const zero_abs: geometry.AbsoluteLength = .{ .pixels = 0 };
+    const zero_def: geometry.DefiniteLength = .{ .absolute = zero_abs };
+    const zero_len: geometry.Length = .{ .definite = zero_def };
+
+    fn fromAny(s: anytype, rem_size: Pixels, scale_factor: f32) LayoutStyle {
         return .{
             .rem_size = rem_size,
             .scale_factor = scale_factor,
-            .display = s.display,
-            .overflow = s.overflow,
-            .scrollbar_width = s.scrollbar_width,
-            .position = s.position,
-            .inset = s.inset,
-            .size = s.size,
-            .min_size = s.min_size,
-            .max_size = s.max_size,
+            .display = valOr(style_mod.Display, s.display, .block),
+            .overflow = resolvePoint(style_mod.Overflow, s.overflow, .visible),
+            .scrollbar_width = valOr(geometry.AbsoluteLength, s.scrollbar_width, zero_abs),
+            .position = valOr(style_mod.Position, s.position, .relative),
+            .inset = resolveEdges(geometry.Length, s.inset, .auto),
+            .size = resolveSize(geometry.Length, s.size, .auto),
+            .min_size = resolveSize(geometry.Length, s.min_size, .auto),
+            .max_size = resolveSize(geometry.Length, s.max_size, .auto),
             .aspect_ratio = s.aspect_ratio,
-            .margin = s.margin,
-            .padding = s.padding,
-            .border_widths = s.border_widths,
+            .margin = resolveEdges(geometry.Length, s.margin, zero_len),
+            .padding = resolveEdges(geometry.DefiniteLength, s.padding, zero_def),
+            .border_widths = resolveEdges(geometry.AbsoluteLength, s.border_widths, zero_abs),
             .align_items = s.align_items,
             .align_self = s.align_self,
             .align_content = s.align_content,
             .justify_content = s.justify_content,
-            .gap = s.gap,
-            .flex_direction = s.flex_direction,
-            .flex_wrap = s.flex_wrap,
-            .flex_basis = s.flex_basis,
-            .flex_grow = s.flex_grow,
-            .flex_shrink = s.flex_shrink,
+            .gap = resolveSize(geometry.DefiniteLength, s.gap, zero_def),
+            .flex_direction = valOr(style_mod.FlexDirection, s.flex_direction, .row),
+            .flex_wrap = valOr(style_mod.FlexWrap, s.flex_wrap, .no_wrap),
+            .flex_basis = valOr(geometry.Length, s.flex_basis, .auto),
+            .flex_grow = valOr(f32, s.flex_grow, 0),
+            .flex_shrink = valOr(f32, s.flex_shrink, 1),
             .grid_rows = s.grid_rows,
             .grid_cols = s.grid_cols,
             .grid_location = s.grid_location,
         };
     }
 
-    fn matches(self: *const LayoutStyle, s: *const Style, rem_size: Pixels, scale_factor: f32) bool {
-        return std.meta.eql(self.*, fromStyle(s, rem_size, scale_factor));
+    fn fromStyle(s: *const Style, rem_size: Pixels, scale_factor: f32) LayoutStyle {
+        return fromAny(s, rem_size, scale_factor);
+    }
+
+    inline fn matchAbsLen(a: geometry.AbsoluteLength, b: anytype) bool {
+        if (@TypeOf(b) == ?geometry.AbsoluteLength) {
+            const v = b orelse return a == .pixels and a.pixels == 0;
+            return switch (a) {
+                .pixels => |p| v == .pixels and v.pixels == p,
+                .rems => |r| v == .rems and v.rems.value == r.value,
+            };
+        }
+        return switch (a) {
+            .pixels => |p| b == .pixels and b.pixels == p,
+            .rems => |r| b == .rems and b.rems.value == r.value,
+        };
+    }
+
+    inline fn matchDefLen(a: geometry.DefiniteLength, b: anytype) bool {
+        if (@TypeOf(b) == ?geometry.DefiniteLength) {
+            const v = b orelse return a == .absolute and a.absolute == .pixels and a.absolute.pixels == 0;
+            return switch (a) {
+                .absolute => |ab| v == .absolute and matchAbsLen(ab, v.absolute),
+                .fraction => |f| v == .fraction and v.fraction == f,
+            };
+        }
+        return switch (a) {
+            .absolute => |ab| b == .absolute and matchAbsLen(ab, b.absolute),
+            .fraction => |f| b == .fraction and b.fraction == f,
+        };
+    }
+
+    inline fn matchLen(a: geometry.Length, b: anytype, comptime default_auto: bool) bool {
+        if (@TypeOf(b) == ?geometry.Length) {
+            const v = b orelse {
+                if (default_auto) return a == .auto;
+                return a == .definite and a.definite == .absolute and a.definite.absolute == .pixels and a.definite.absolute.pixels == 0;
+            };
+            return switch (a) {
+                .definite => |d| v == .definite and matchDefLen(d, v.definite),
+                .auto => v == .auto,
+            };
+        }
+        return switch (a) {
+            .definite => |d| b == .definite and matchDefLen(d, b.definite),
+            .auto => b == .auto,
+        };
+    }
+
+    inline fn matchSizeLen(a: Size(geometry.Length), b: anytype, comptime default_auto: bool) bool {
+        return matchLen(a.width, b.width, default_auto) and matchLen(a.height, b.height, default_auto);
+    }
+
+    inline fn matchSizeDef(a: Size(geometry.DefiniteLength), b: anytype) bool {
+        return matchDefLen(a.width, b.width) and matchDefLen(a.height, b.height);
+    }
+
+    inline fn matchEdgesLen(a: geometry.Edges(geometry.Length), b: anytype, comptime default_auto: bool) bool {
+        return matchLen(a.top, b.top, default_auto) and
+            matchLen(a.right, b.right, default_auto) and
+            matchLen(a.bottom, b.bottom, default_auto) and
+            matchLen(a.left, b.left, default_auto);
+    }
+
+    inline fn matchEdgesDef(a: geometry.Edges(geometry.DefiniteLength), b: anytype) bool {
+        return matchDefLen(a.top, b.top) and
+            matchDefLen(a.right, b.right) and
+            matchDefLen(a.bottom, b.bottom) and
+            matchDefLen(a.left, b.left);
+    }
+
+    inline fn matchEdgesAbs(a: geometry.Edges(geometry.AbsoluteLength), b: anytype) bool {
+        return matchAbsLen(a.top, b.top) and
+            matchAbsLen(a.right, b.right) and
+            matchAbsLen(a.bottom, b.bottom) and
+            matchAbsLen(a.left, b.left);
+    }
+
+    fn matchesAny(self: *const LayoutStyle, s: anytype, rem_size: Pixels, scale_factor: f32) bool {
+        if (self.rem_size != rem_size or self.scale_factor != scale_factor) return false;
+        if (self.display != valOr(style_mod.Display, s.display, .block)) return false;
+        if (self.position != valOr(style_mod.Position, s.position, .relative)) return false;
+        if (self.flex_direction != valOr(style_mod.FlexDirection, s.flex_direction, .row)) return false;
+        if (self.flex_wrap != valOr(style_mod.FlexWrap, s.flex_wrap, .no_wrap)) return false;
+        if (self.flex_grow != valOr(f32, s.flex_grow, 0)) return false;
+        if (self.flex_shrink != valOr(f32, s.flex_shrink, 1)) return false;
+        if (!matchSizeLen(self.size, s.size, true)) return false;
+        if (self.overflow.x != valOr(style_mod.Overflow, s.overflow.x, .visible) or
+            self.overflow.y != valOr(style_mod.Overflow, s.overflow.y, .visible)) return false;
+        if (!matchAbsLen(self.scrollbar_width, s.scrollbar_width)) return false;
+        if (!matchEdgesLen(self.inset, s.inset, true)) return false;
+        if (!matchSizeLen(self.min_size, s.min_size, true)) return false;
+        if (!matchSizeLen(self.max_size, s.max_size, true)) return false;
+        if (self.aspect_ratio != s.aspect_ratio) return false;
+        if (!matchEdgesLen(self.margin, s.margin, false)) return false;
+        if (!matchEdgesDef(self.padding, s.padding)) return false;
+        if (!matchEdgesAbs(self.border_widths, s.border_widths)) return false;
+        if (self.align_items != s.align_items) return false;
+        if (self.align_self != s.align_self) return false;
+        if (self.align_content != s.align_content) return false;
+        if (self.justify_content != s.justify_content) return false;
+        if (!matchSizeDef(self.gap, s.gap)) return false;
+        if (!matchLen(self.flex_basis, s.flex_basis, true)) return false;
+        if (!std.meta.eql(self.grid_rows, s.grid_rows)) return false;
+        if (!std.meta.eql(self.grid_cols, s.grid_cols)) return false;
+        if (!std.meta.eql(self.grid_location, s.grid_location)) return false;
+        return true;
     }
 
     fn toZafi(self: *const LayoutStyle, allocator: std.mem.Allocator, grid_buffers: *?*GridBuffers) zafi.Style {

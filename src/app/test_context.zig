@@ -5980,3 +5980,151 @@ test "simulate_window_scale_factor_change updates scale factor and preserves log
     try std.testing.expectEqual(@as(Pixels, 640), vcx.window.viewport_size().width);
     try std.testing.expectEqual(@as(Pixels, 480), vcx.window.viewport_size().height);
 }
+
+test "App.is_read_without_view tracks model reads, views, unread entities, and cached siblings" {
+    var cx = TestAppContext.init();
+    defer cx.deinit();
+
+    const DataModel = struct {
+        value: usize = 1,
+        fn set(self: *@This(), v: usize, c: *app_mod.Context(@This())) void {
+            self.value = v;
+            c.notify();
+        }
+    };
+
+    const ChildView = struct {
+        renders: usize = 0,
+        label: []const u8 = "child",
+        pub fn render(self: *@This(), _: *Window, _: *app_mod.Context(@This())) *div_mod.Div {
+            self.renders += 1;
+            return div().id("child").w(px(40)).h(px(20)).child(self.label);
+        }
+        fn touch(_: *@This(), c: *app_mod.Context(@This())) void {
+            c.notify();
+        }
+    };
+
+    const CachedSibling = struct {
+        target: Entity(ChildView),
+        renders: usize = 0,
+        last_seen_renders: usize = 0,
+        pub fn render(self: *@This(), _: *Window, c: *app_mod.Context(@This())) *div_mod.Div {
+            self.renders += 1;
+            self.last_seen_renders = self.target.read(c.app).renders;
+            return div().id("sibling").w(px(40)).h(px(20));
+        }
+    };
+
+    const CachedModelReader = struct {
+        model: Entity(DataModel),
+        renders: usize = 0,
+        last_value: usize = 0,
+        pub fn render(self: *@This(), _: *Window, c: *app_mod.Context(@This())) *div_mod.Div {
+            self.renders += 1;
+            self.last_value = self.model.read(c.app).value;
+            return div().id("reader").w(px(40)).h(px(20));
+        }
+    };
+
+    const RootView = struct {
+        model: Entity(DataModel),
+        child_view: Entity(ChildView),
+        sibling: Entity(CachedSibling),
+        reader: Entity(CachedModelReader),
+        show_model: bool = true,
+        renders: usize = 0,
+
+        pub fn render(self: *@This(), _: *Window, c: *app_mod.Context(@This())) *div_mod.Div {
+            self.renders += 1;
+            if (self.show_model) _ = self.model.read(c.app).value;
+            return div()
+                .flex()
+                .size_full()
+                .child(self.child_view)
+                .child(self.sibling.cached(div_mod.style().w(px(40)).h(px(20))))
+                .child(self.reader.cached(div_mod.style().w(px(40)).h(px(20))));
+        }
+
+        fn build(_: *Window, app: *App) Entity(@This()) {
+            const m = app.new(DataModel{});
+            const cv = app.new(ChildView{});
+            const sib = app.new(CachedSibling{ .target = cv });
+            const rdr = app.new(CachedModelReader{ .model = m });
+            return app.new(@This(){
+                .model = m,
+                .child_view = cv,
+                .sibling = sib,
+                .reader = rdr,
+            });
+        }
+        fn set_show_model(self: *@This(), show: bool, c: *app_mod.Context(@This())) void {
+            self.show_model = show;
+            c.notify();
+        }
+    };
+
+    const unread = cx.app.new(DataModel{ .value = 99 });
+    // Before any window opens, nothing is read without view.
+    try std.testing.expect(!cx.app.is_read_without_view(unread.entity_id()));
+
+    const root, const vcx = cx.add_window_view(RootView.build);
+    const model = root.read(cx.app).model;
+    const child_view = root.read(cx.app).child_view;
+    const sibling = root.read(cx.app).sibling;
+    const reader = root.read(cx.app).reader;
+
+    // 1. Entities rendered as views return false (root, child_view, cached sibling, cached reader).
+    try std.testing.expect(!cx.app.is_read_without_view(root.entity_id()));
+    try std.testing.expect(!cx.app.is_read_without_view(child_view.entity_id()));
+    try std.testing.expect(!cx.app.is_read_without_view(sibling.entity_id()));
+    try std.testing.expect(!cx.app.is_read_without_view(reader.entity_id()));
+
+    // 2. A model entity read by a view (never drawn as its own view) returns true.
+    try std.testing.expect(cx.app.is_read_without_view(model.entity_id()));
+
+    // 3. An entity never read by any window returns false.
+    try std.testing.expect(!cx.app.is_read_without_view(unread.entity_id()));
+
+    // 4. Cached sibling view read `child_view`, which IS drawn as a view elsewhere in this window:
+    //    `is_read_without_view(child_view)` stays false, and notifying `child_view` does NOT
+    //    redraw `sibling` (the cached sibling).
+    const sibling_renders_before = sibling.read(cx.app).renders;
+    const child_renders_before = child_view.read(cx.app).renders;
+    cx.update_entity(child_view, ChildView.touch, .{});
+    cx.run_until_parked();
+    try std.testing.expectEqual(child_renders_before + 1, child_view.read(cx.app).renders);
+    try std.testing.expectEqual(sibling_renders_before, sibling.read(cx.app).renders);
+    try std.testing.expect(!cx.app.is_read_without_view(child_view.entity_id()));
+
+    // Even when root stops reading `model`, cached `reader` still keeps `model` in rendered_entities
+    // via `reuse_prepaint` accessed_entities, and notifying `model` refreshes the window so `reader` updates.
+    cx.update_entity(root, RootView.set_show_model, .{false});
+    cx.run_until_parked();
+    try std.testing.expect(cx.app.is_read_without_view(model.entity_id()));
+
+    const reader_renders_before = reader.read(cx.app).renders;
+    cx.update_entity(model, DataModel.set, .{42});
+    cx.run_until_parked();
+    try std.testing.expectEqual(reader_renders_before + 1, reader.read(cx.app).renders);
+    try std.testing.expectEqual(@as(usize, 42), reader.read(cx.app).last_value);
+
+    // If a second window reads `child_view` without drawing it as a view, `is_read_without_view(child_view)` becomes true.
+    const SecondWinView = struct {
+        target: Entity(ChildView),
+        pub fn render(self: *@This(), _: *Window, c: *app_mod.Context(@This())) *div_mod.Div {
+            _ = self.target.read(c.app).renders;
+            return div().id("second").w(px(20)).h(px(20));
+        }
+    };
+    const Holder = struct {
+        var target: Entity(ChildView) = undefined;
+        fn build(_: *Window, app: *App) Entity(SecondWinView) {
+            return app.new(SecondWinView{ .target = target });
+        }
+    };
+    Holder.target = child_view;
+    _, _ = cx.add_window_view(Holder.build);
+    try std.testing.expect(cx.app.is_read_without_view(child_view.entity_id()));
+    _ = vcx;
+}

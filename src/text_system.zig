@@ -354,6 +354,8 @@ pub const TextSystem = struct {
     active_cache: *LineLayoutCache,
 
     fonts: std.ArrayList(FontEntry) = .empty,
+    /// Monotonic counter incremented whenever fonts are added or changed (`add_fonts`).
+    font_generation: u64 = 0,
     /// Hash of a `Font` to its entry; verified with `Font.eql` on lookup.
     font_index: std.AutoHashMapUnmanaged(u64, FontId) = .empty,
     /// Plain entries interned per cozmic face, for glyphs that fell back to another face.
@@ -456,6 +458,7 @@ pub const TextSystem = struct {
             if (self.raster) |*raster| try raster.addFromFontSystem(&self.fs, self.fs.fontIds()[before..]);
         }
         // A family asked for before may now resolve to a new face, and a glyph reported missing may now exist.
+        if (fonts.len > 0) self.font_generation += 1;
         self.font_index.clearRetainingCapacity();
         self.presentation_faces.clearRetainingCapacity();
         self.clear_missing_glyph_seen();
@@ -1709,8 +1712,10 @@ test "add_fonts: a font from memory resolves by family name, shapes and rasteriz
     if (ts.fs.db.query(.{ .name = "Fira Mono" }, 500, .normal, .normal) != null) return error.SkipZigTest;
 
     const f = font("Fira Mono");
+    const gen_before = ts.font_generation;
     const before = try ts.font_id(&f);
     try ts.add_fonts(&.{font_bytes});
+    try testing.expectEqual(gen_before + 1, ts.font_generation);
     const after = try ts.font_id(&f);
     try testing.expect(before != after);
     const face = ts.fs.db.query(.{ .name = "Fira Mono" }, 500, .normal, .normal).?;
@@ -1720,6 +1725,14 @@ test "add_fonts: a font from memory resolves by family name, shapes and rasteriz
     const layout = try ts.layout_cache.layout_line("A", 16, &runs, null);
     try testing.expect(layout.width > 0);
     try testing.expect((try ts.raster.?.ensureFace(face)) != null);
+}
+
+test "TextSystem.font_generation starts at 0 and ignores empty add_fonts" {
+    const ts = try TextSystem.create(testing.allocator);
+    defer ts.destroy();
+    try testing.expectEqual(@as(u64, 0), ts.font_generation);
+    try ts.add_fonts(&.{});
+    try testing.expectEqual(@as(u64, 0), ts.font_generation);
 }
 
 fn put_u16(buf: []u8, at: usize, v: u16) void {

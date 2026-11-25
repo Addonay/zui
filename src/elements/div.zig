@@ -3763,9 +3763,21 @@ fn clamp_scroll(offset: Point(Pixels), max: Size(Pixels)) Point(Pixels) {
     return .{ .x = std.math.clamp(offset.x, -max.width, 0), .y = std.math.clamp(offset.y, -max.height, 0) };
 }
 
+inline fn optOr(comptime T: type, v: anytype, default: T) T {
+    if (@TypeOf(v) == ?T) return v orelse default;
+    return v;
+}
+
+inline fn padPixels(pad: anytype, basis: geometry.AbsoluteLength, rem: Pixels) Pixels {
+    if (@TypeOf(pad) == ?geometry.DefiniteLength) {
+        return if (pad) |p| p.to_pixels(basis, rem) else 0;
+    }
+    return pad.to_pixels(basis, rem);
+}
+
 /// How far the children can scroll inside `bounds`, with the box's padding (GPUI
-/// `clamp_scroll_position`).
-fn scroll_max(bounds: Bounds(Pixels), s: *const Style, child_layout_ids: []const LayoutId, window: *Window) Size(Pixels) {
+/// `clamp_scroll_position`). Accepts `*const Style` or `*const StyleRefinement`.
+fn scroll_max(bounds: Bounds(Pixels), s: anytype, child_layout_ids: []const LayoutId, window: *Window) Size(Pixels) {
     if (child_layout_ids.len == 0) return .{ .width = 0, .height = 0 };
     const inf = std.math.inf(f32);
     var min_x = inf;
@@ -3782,8 +3794,8 @@ fn scroll_max(bounds: Bounds(Pixels), s: *const Style, child_layout_ids: []const
     const rem = window.rem_size();
     const basis_x: geometry.AbsoluteLength = .{ .pixels = bounds.size.width };
     const basis_y: geometry.AbsoluteLength = .{ .pixels = bounds.size.height };
-    const width = (max_x - min_x) + s.padding.left.to_pixels(basis_x, rem) + s.padding.right.to_pixels(basis_x, rem);
-    const height = (max_y - min_y) + s.padding.top.to_pixels(basis_y, rem) + s.padding.bottom.to_pixels(basis_y, rem);
+    const width = (max_x - min_x) + padPixels(s.padding.left, basis_x, rem) + padPixels(s.padding.right, basis_x, rem);
+    const height = (max_y - min_y) + padPixels(s.padding.top, basis_y, rem) + padPixels(s.padding.bottom, basis_y, rem);
     // Layout results differ after about five decimals, which must not make a box scrollable.
     return .{
         .width = @max(0, @round((width - bounds.size.width) * 100) / 100),
@@ -3870,6 +3882,12 @@ pub const InteractivityExtra = struct {
     tab_index: ?isize = null,
     tab_stop: ?bool = null,
     tab_group_: bool = false,
+    /// The image cache for the images under this element (set with `image_cache`).
+    image_cache_provider: ?image_cache_mod.ImageCacheProvider = null,
+    /// Set by `on_children_prepainted` (GPUI `prepaint_listener`).
+    prepaint_listener: ?Listener(PrepaintedChildren) = null,
+    /// Set by `with_dynamic_prepaint_order` (GPUI `prepaint_order_fn`).
+    prepaint_order_fn: ?*const fn (window: *Window, cx: *App) []const usize = null,
 };
 
 /// All interactive and stateful behavior of a styled element (GPUI `Interactivity`).
@@ -3917,6 +3935,55 @@ pub const Interactivity = struct {
         if (ex.tracked_focus_handle != null and (ex.in_focus_style != null or ex.focus_style != null or ex.focus_visible_style != null)) return true;
         return ex.hover_style != null or ex.group_hover_style != null or
             ex.active_style != null or ex.group_active_style != null;
+    }
+
+    /// True when any focus, active, or drag state that can alter style during prepaint is
+    /// currently active (hover styles depend on the hit test and are evaluated in paint).
+    fn has_active_prepaint_style(self: *const Interactivity, state: ?*const InteractiveElementState, window: *const Window, cx: *const App) bool {
+        if (cx.active_drag != null) return true;
+        const ex = self.extra orelse return false;
+        if (ex.tracked_focus_handle) |h| {
+            if (ex.in_focus_style != null and h.within_focused(window, cx)) return true;
+            if (ex.focus_style != null and h.is_focused(window)) return true;
+            if (ex.focus_visible_style != null and h.is_focused(window) and window.last_input_was_keyboard()) return true;
+        }
+        if (state) |st| {
+            if (st.active and ex.active_style != null) return true;
+        }
+        if (ex.group_active_style) |g| {
+            if (group_active(g.group, window)) return true;
+        }
+        return false;
+    }
+
+    /// True when any hover or drag-over style actually matches this frame's hit test.
+    fn has_active_hover_style(self: *const Interactivity, hitbox: ?*const Hitbox, window: *Window, cx: *App) bool {
+        const ex = self.extra orelse return false;
+        if (hitbox) |hb| {
+            if (ex.hover_style != null and hb.is_hovered(window)) return true;
+            if (ex.group_hover_style) |g| {
+                if (group_hitbox(g.group, window)) |gh| {
+                    if (window_hovered(gh, window)) return true;
+                }
+            }
+        }
+        if (cx.active_drag) |drag| {
+            if (ex.drag_over_styles.items.len > 0 or ex.group_drag_over_styles.items.len > 0) {
+                const allowed = if (ex.can_drop_predicate) |predicate| predicate(drag.value, window, cx) else true;
+                if (allowed) {
+                    for (ex.group_drag_over_styles.items) |g| {
+                        if (g.type_id != drag.value.type_id) continue;
+                        if (group_hitbox(g.group, window)) |gh| if (window_hovered(gh, window)) return true;
+                    }
+                    if (hitbox) |hb| {
+                        for (ex.drag_over_styles.items) |d| {
+                            if (d.type_id == drag.value.type_id and hb.is_hovered(window)) return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     fn needs_hitbox(self: *const Interactivity) bool {
@@ -4002,8 +4069,6 @@ pub const Interactivity = struct {
 /// The per-frame state between layout, prepaint and paint.
 pub const DivFrameState = struct {
     child_layout_ids: []LayoutId = &.{},
-    /// `base_style` over the defaults, before an element's own hook changed it.
-    base_style: Style = .{},
 };
 
 pub const DivPrepaintState = struct {
@@ -4029,12 +4094,6 @@ pub fn StyledElement(comptime Ext: type) type {
         interactivity: Interactivity = .{},
         children_list: element_mod.Children = .empty,
         ext: Ext = .{},
-        /// The image cache for the images under this element (set with `image_cache`).
-        image_cache_provider: ?image_cache_mod.ImageCacheProvider = null,
-        /// Set by `on_children_prepainted` (GPUI `prepaint_listener`).
-        prepaint_listener: ?Listener(PrepaintedChildren) = null,
-        /// Set by `with_dynamic_prepaint_order` (GPUI `prepaint_order_fn`).
-        prepaint_order_fn: ?*const fn (window: *Window, cx: *App) []const usize = null,
 
         pub const RequestLayoutState = DivFrameState;
         pub const PrepaintState = DivPrepaintState;
@@ -4056,7 +4115,7 @@ pub fn StyledElement(comptime Ext: type) type {
         /// Sets the image cache for the images under this element (GPUI `image_cache`). Those images
         /// load through it instead of the app's own cache; see `image_cache.zig`.
         pub fn image_cache(self: *Self, provider: anytype) *Self {
-            self.image_cache_provider = image_cache_mod.ImageCacheProvider.from(provider);
+            self.interactivity.ensure_extra().image_cache_provider = image_cache_mod.ImageCacheProvider.from(provider);
             return self;
         }
 
@@ -4292,14 +4351,14 @@ pub fn StyledElement(comptime Ext: type) type {
 
         /// Runs `listener` with the bounds of the children once they are prepainted (GPUI `on_children_prepainted`).
         pub fn on_children_prepainted(self: *Self, listener: anytype) *Self {
-            self.prepaint_listener = app_mod.to_listener(PrepaintedChildren, listener);
+            self.interactivity.ensure_extra().prepaint_listener = app_mod.to_listener(PrepaintedChildren, listener);
             return self;
         }
 
         /// Prepaints the children in the order `order_fn` returns their indices (GPUI `with_dynamic_prepaint_order`).
         /// Each index must appear once. The order is asked for in every prepaint.
         pub fn with_dynamic_prepaint_order(self: *Self, comptime order_fn: fn (*Window, *App) []const usize) *Self {
-            self.prepaint_order_fn = &order_fn;
+            self.interactivity.ensure_extra().prepaint_order_fn = &order_fn;
             return self;
         }
 
@@ -4517,26 +4576,50 @@ pub fn StyledElement(comptime Ext: type) type {
         // -- Element protocol ---------------------------------------------
 
         pub fn request_layout(self: *Self, gid: ?*const GlobalElementId, window: *Window, cx: *App) struct { LayoutId, DivFrameState } {
-            var s: Style = .{};
-            s.refine(&self.interactivity.base_style);
-            const base_style = s;
-            const has_text = s.text_style() != null;
-            if (has_text) window.push_text_style(s.text);
+            const base_r = &self.interactivity.base_style;
+            const has_ext = @hasDecl(Ext, "request_layout_ext");
+            const kid_count = self.children_list.items.len;
+
+            // Leaf divs (no children, no extension hook) skip text-style checks, image cache
+            // checks, arena slice allocation, and constructing an 832-byte `Style`.
+            if (!has_ext and kid_count == 0) {
+                const lid = window.layout_engine.request_layout_refinement(
+                    window.current_global_id().hash,
+                    base_r,
+                    window.rem_size(),
+                    window.scale_factor(),
+                    &.{},
+                );
+                return .{ lid, .{} };
+            }
+
+            const has_text = !style_mod.is_text_empty(&base_r.text);
+            if (has_text) window.push_text_style(base_r.text);
             defer if (has_text) window.pop_text_style();
 
             // Set before the element's own hook and its children, so `img` sees its own cache on top.
-            const pushed_cache = if (self.image_cache_provider) |provider| blk: {
+            const ic_provider = if (self.interactivity.extra) |ex| ex.image_cache_provider else null;
+            const pushed_cache = if (ic_provider) |provider| blk: {
                 window.push_image_cache(provider.provide(window, cx));
                 break :blk true;
             } else false;
             defer if (pushed_cache) window.pop_image_cache();
 
-            if (@hasDecl(Ext, "request_layout_ext")) {
-                if (Ext.request_layout_ext(self, gid, &s, window, cx)) |lid| return .{ lid, .{ .base_style = base_style } };
+            if (has_ext) {
+                var s_buf: Style = .{};
+                s_buf.refine(base_r);
+                if (Ext.request_layout_ext(self, gid, &s_buf, window, cx)) |lid| return .{ lid, .{} };
             }
-            const ids = arena().alloc(LayoutId, self.children_list.items.len) catch oom();
+            const ids: []LayoutId = if (kid_count == 0) &.{} else arena().alloc(LayoutId, kid_count) catch oom();
             for (self.children_list.items, 0..) |c, i| ids[i] = c.request_layout(window, cx);
-            return .{ window.request_layout(&s, ids, cx), .{ .child_layout_ids = ids, .base_style = base_style } };
+            const lid = window.layout_engine.request_layout_refinement(
+                window.current_global_id().hash,
+                base_r,
+                window.rem_size(),
+                window.scale_factor(),
+                ids,
+            );
+            return .{ lid, .{ .child_layout_ids = ids } };
         }
 
         pub fn prepaint(self: *Self, gid: ?*const GlobalElementId, bounds: Bounds(Pixels), rl: *DivFrameState, window: *Window, cx: *App) DivPrepaintState {
@@ -4601,15 +4684,36 @@ pub fn StyledElement(comptime Ext: type) type {
 
             // Without the hitbox: what is hovered is only known once prepaint has finished. Paint
             // computes it again with the hitbox, as GPUI does.
-            if (it.has_dynamic_style(cx)) {
+            if (it.has_active_prepaint_style(pp.state, window, cx)) {
                 const dyn = arena().create(Style) catch oom();
-                dyn.* = it.compute_style_from(&rl.base_style, null, pp.state, window, cx);
+                dyn.* = it.compute_style(null, pp.state, window, cx);
                 pp.dynamic_style = dyn;
             }
-            const s: *const Style = pp.dynamic_style orelse &rl.base_style;
 
-            const has_text = s.text_style() != null;
-            if (has_text) window.push_text_style(s.text);
+            if (pp.dynamic_style) |dyn| {
+                self.prepaint_children(bounds, @as(*const Style, dyn), rl, &pp, window, cx);
+            } else {
+                self.prepaint_children(bounds, @as(*const StyleRefinement, &it.base_style), rl, &pp, window, cx);
+            }
+
+            return pp;
+        }
+
+        fn prepaint_children(self: *Self, bounds: Bounds(Pixels), s_or_r: anytype, rl: *DivFrameState, pp: *DivPrepaintState, window: *Window, cx: *App) void {
+            const it = &self.interactivity;
+            const kid_count = self.children_list.items.len;
+            const has_prepaint_ext = @hasDecl(Ext, "prepaint_ext");
+            const pp_listener = if (it.extra) |ex| ex.prepaint_listener else null;
+            const tracked_scroll = it.tracked_scroll_handle();
+            const ov_x = optOr(style_mod.Overflow, s_or_r.overflow.x, .visible);
+            const ov_y = optOr(style_mod.Overflow, s_or_r.overflow.y, .visible);
+
+            if (kid_count == 0 and !has_prepaint_ext and pp_listener == null and tracked_scroll == null and ov_x != .scroll and ov_y != .scroll) {
+                return;
+            }
+
+            const has_text = if (kid_count > 0 or has_prepaint_ext) !style_mod.is_text_empty(&s_or_r.text) else false;
+            if (has_text) window.push_text_style(s_or_r.text);
             defer if (has_text) window.pop_text_style();
 
             // Scroll offset, clamped before the children use it (GPUI `clamp_scroll_position`):
@@ -4617,7 +4721,6 @@ pub fn StyledElement(comptime Ext: type) type {
             var scroll: Point(Pixels) = .{ .x = 0, .y = 0 };
             // The children are measured, and the requests made since the last frame applied, before the
             // offset is clamped (GPUI `Div::prepaint` and `scroll_to_active_item`).
-            const tracked_scroll = it.tracked_scroll_handle();
             if (tracked_scroll) |sh| {
                 sh.state.child_bounds.clearRetainingCapacity();
                 if (sh.state.allocator == null) sh.state.allocator = window.allocator;
@@ -4625,12 +4728,12 @@ pub fn StyledElement(comptime Ext: type) type {
                 for (rl.child_layout_ids) |lid| sh.state.child_bounds.append(scroll_alloc, window.layout_bounds(lid)) catch oom();
                 sh.scroll_to_active_item();
             }
-            if (s.overflow.x == .scroll or s.overflow.y == .scroll) {
-                const max = scroll_max(bounds, s, rl.child_layout_ids, window);
+            if (ov_x == .scroll or ov_y == .scroll) {
+                const max = scroll_max(bounds, s_or_r, rl.child_layout_ids, window);
                 if (tracked_scroll) |sh| {
                     sh.state.max_offset = max;
                     sh.state.bounds = bounds;
-                    sh.state.overflow = s.overflow;
+                    sh.state.overflow = .{ .x = ov_x, .y = ov_y };
                     const to_bottom = sh.state.scroll_to_bottom;
                     sh.state.scroll_to_bottom = false;
                     scroll = clamp_scroll(sh.offset(), max);
@@ -4645,41 +4748,38 @@ pub fn StyledElement(comptime Ext: type) type {
             }
             pp.scroll_offset = scroll;
 
-            const mask = s.overflow_mask(bounds, window.rem_size());
-            if (mask) |mk| window.push_content_mask(.{ .bounds = mk });
-            defer if (mask != null) window.pop_content_mask();
+            if (kid_count > 0) {
+                const mask = style_mod.overflow_mask_any(s_or_r, bounds, window.rem_size());
+                if (mask) |mk| window.push_content_mask(.{ .bounds = mk });
+                defer if (mask != null) window.pop_content_mask();
 
-            window.push_element_offset(scroll);
-            if (self.prepaint_order_fn) |order_fn| {
-                for (order_fn(window, cx)) |ix| {
-                    if (ix < self.children_list.items.len) self.children_list.items[ix].prepaint(window, cx);
+                window.push_element_offset(scroll);
+                const order_fn_opt = if (it.extra) |ex| ex.prepaint_order_fn else null;
+                if (order_fn_opt) |order_fn| {
+                    for (order_fn(window, cx)) |ix| {
+                        if (ix < kid_count) self.children_list.items[ix].prepaint(window, cx);
+                    }
+                } else {
+                    for (self.children_list.items) |c| c.prepaint(window, cx);
                 }
-            } else {
-                for (self.children_list.items) |c| c.prepaint(window, cx);
+                window.pop_element_offset();
             }
-            window.pop_element_offset();
-            if (self.prepaint_listener) |listener| {
+            if (pp_listener) |listener| {
                 const child_bounds = arena().alloc(Bounds(Pixels), rl.child_layout_ids.len) catch oom();
                 for (rl.child_layout_ids, 0..) |lid, i| child_bounds[i] = window.layout_bounds(lid);
                 const prepainted: PrepaintedChildren = .{ .bounds = child_bounds };
                 listener.call(&prepainted, window, cx);
             }
-            if (@hasDecl(Ext, "prepaint_ext")) Ext.prepaint_ext(self, bounds, window, cx);
-
-            return pp;
+            if (has_prepaint_ext) Ext.prepaint_ext(self, bounds, window, cx);
         }
 
         pub fn paint(self: *Self, gid: ?*const GlobalElementId, bounds: Bounds(Pixels), rl: *DivFrameState, pp: *DivPrepaintState, window: *Window, cx: *App) void {
             _ = gid;
+            _ = rl;
             const it = &self.interactivity;
             // Only these depend on the hit test, which prepaint could not know.
-            const hover_dependent = if (it.extra) |ex|
-                ex.hover_style != null or ex.group_hover_style != null or
-                    (cx.active_drag != null and (ex.drag_over_styles.items.len > 0 or ex.group_drag_over_styles.items.len > 0))
-            else
-                false;
-            if (hover_dependent) {
-                const computed = it.compute_style_from(&rl.base_style, if (pp.hitbox) |*hbx| hbx else null, pp.state, window, cx);
+            if (it.has_active_hover_style(if (pp.hitbox) |*hbx| hbx else null, window, cx)) {
+                const computed = it.compute_style(if (pp.hitbox) |*hbx| hbx else null, pp.state, window, cx);
                 if (pp.dynamic_style) |dyn| {
                     dyn.* = computed;
                 } else {
@@ -4688,61 +4788,86 @@ pub fn StyledElement(comptime Ext: type) type {
                     pp.dynamic_style = dyn;
                 }
             }
-            const s: *const Style = pp.dynamic_style orelse &rl.base_style;
-            if (s.visibility == .hidden) return;
+            if (pp.dynamic_style) |dyn| {
+                self.paint_with(bounds, @as(*const Style, dyn), pp, window, cx);
+            } else if (@hasDecl(Ext, "paint_ext")) {
+                var s_buf: Style = .{};
+                s_buf.refine(&it.base_style);
+                self.paint_with(bounds, @as(*const Style, &s_buf), pp, window, cx);
+            } else {
+                self.paint_with(bounds, @as(*const StyleRefinement, &it.base_style), pp, window, cx);
+            }
+        }
+
+        fn paint_with(self: *Self, bounds: Bounds(Pixels), s_or_r: anytype, pp: *DivPrepaintState, window: *Window, cx: *App) void {
+            const vis = optOr(style_mod.Visibility, s_or_r.visibility, .visible);
+            if (vis == .hidden) return;
 
             if (pp.hitbox) |*hb| {
                 self.register_mouse_listeners(hb, pp.state, window);
                 // During a drag its cursor applies everywhere, not just over this element.
                 if (cx.active_drag) |drag| {
                     if (drag.cursor_style) |c| window.set_window_cursor_style(c);
-                } else if (s.mouse_cursor) |c| {
+                } else if (s_or_r.mouse_cursor) |c| {
                     window.set_cursor_style(c, hb);
                 }
             }
 
-            const has_text = s.text_style() != null;
-            if (has_text) window.push_text_style(s.text);
+            const kid_count = self.children_list.items.len;
+            const has_paint_ext = @hasDecl(Ext, "paint_ext");
+            const has_text = if (kid_count > 0 or has_paint_ext) !style_mod.is_text_empty(&s_or_r.text) else false;
+            if (has_text) window.push_text_style(s_or_r.text);
             defer if (has_text) window.pop_text_style();
-            window.push_element_opacity(s.opacity);
-            defer window.pop_element_opacity();
+
+            const has_opacity = s_or_r.opacity != null;
+            if (has_opacity) window.push_element_opacity(s_or_r.opacity);
+            defer if (has_opacity) window.pop_element_opacity();
 
             const rem = window.rem_size();
-            const radii = s.corner_radii.to_pixels(rem).clamp_radii_for_quad_size(bounds.size);
+            const has_bg = s_or_r.background != null;
+            const sh: []const style_mod.BoxShadow = optOr([]const style_mod.BoxShadow, s_or_r.box_shadow, &.{});
+            const has_shadows = sh.len > 0;
+            const has_border = s_or_r.border_color != null and style_mod.is_border_visible_any(s_or_r);
+            const radii: Corners(Pixels) = if (has_bg or has_shadows or has_border)
+                style_mod.resolve_corner_radii_any(s_or_r, rem).clamp_radii_for_quad_size(bounds.size)
+            else
+                Corners(Pixels).all(0);
 
-            window.paint_drop_shadows(bounds, radii, s.box_shadow);
-            if (s.background) |bgf| {
+            if (has_shadows) window.paint_drop_shadows(bounds, radii, sh);
+            if (s_or_r.background) |bgf| {
                 const bgc = bgf.get_color() orelse color_mod.to_background(color_mod.transparent_black());
                 if (!bgc.is_transparent()) {
                     window.paint_quad(.{ .bounds = bounds, .corner_radii = radii, .background = bgc });
                 }
             }
-            window.paint_inset_shadows(bounds, radii, s.box_shadow);
+            if (has_shadows) window.paint_inset_shadows(bounds, radii, sh);
 
-            if (@hasDecl(Ext, "paint_ext")) Ext.paint_ext(self, bounds, s, window, cx);
+            if (comptime has_paint_ext) Ext.paint_ext(self, bounds, s_or_r, window, cx);
 
             // Children inside the overflow mask, offset by scroll.
-            const mask = s.overflow_mask(bounds, rem);
-            if (mask) |mk| window.push_content_mask(.{ .bounds = mk });
-            for (self.children_list.items) |c| c.paint(window, cx);
-            if (mask != null) window.pop_content_mask();
-
-            // Border on top of children (GPUI paints borders after content).
-            if (s.is_border_visible()) {
-                if (s.border_color) |bc| {
-                    const bw = s.border_widths.to_pixels(.{rem});
-                    window.paint_quad(.{
-                        .bounds = bounds,
-                        .corner_radii = radii,
-                        .background = color_mod.to_background(color_mod.transparent_black()),
-                        .border_widths = bw,
-                        .border_color = bc,
-                        .border_style = s.border_style,
-                    });
-                }
+            if (kid_count > 0) {
+                const mask = style_mod.overflow_mask_any(s_or_r, bounds, rem);
+                if (mask) |mk| window.push_content_mask(.{ .bounds = mk });
+                for (self.children_list.items) |c| c.paint(window, cx);
+                if (mask != null) window.pop_content_mask();
             }
 
-            if (s.debug or s.debug_below) {
+            // Border on top of children (GPUI paints borders after content).
+            if (has_border) {
+                const bw = style_mod.resolve_border_widths_any(s_or_r, rem);
+                const b_style = optOr(style_mod.BorderStyle, s_or_r.border_style, .solid);
+                window.paint_quad(.{
+                    .bounds = bounds,
+                    .corner_radii = radii,
+                    .background = color_mod.to_background(color_mod.transparent_black()),
+                    .border_widths = bw,
+                    .border_color = s_or_r.border_color.?,
+                    .border_style = b_style,
+                });
+            }
+
+            const dbg = optOr(bool, s_or_r.debug, false) or optOr(bool, s_or_r.debug_below, false);
+            if (dbg) {
                 window.paint_quad(window_mod.outline(bounds, color_mod.red(), .solid));
             }
         }
@@ -8266,6 +8391,7 @@ pub fn StyledElement(comptime Ext: type) type {
         pub const external_path = if (@hasDecl(Ext, "external_path")) Ext.external_path else {};
         pub const data = if (@hasDecl(Ext, "data")) Ext.data else {};
         pub const with_transformation = if (@hasDecl(Ext, "with_transformation")) Ext.with_transformation else {};
+        pub const with_timed_transformation = if (@hasDecl(Ext, "with_timed_transformation")) Ext.with_timed_transformation else {};
 
         // -- GPUI `AnimationExt` for every styled element.
         pub const with_animation = animation_mod.AnimationExt(*Self).with_animation;
@@ -8296,9 +8422,10 @@ test {
 
 test "div: Interactivity and DivPrepaintState stay compact and plain divs skip extra allocation" {
     const testing = std.testing;
-    // Before refactor: @sizeOf(Div)=2656, @sizeOf(Interactivity)=2568, @sizeOf(DivPrepaintState)=904.
+    // Before refactor: @sizeOf(Div)=2656, @sizeOf(Interactivity)=2568, @sizeOf(DivFrameState)=848, @sizeOf(DivPrepaintState)=904.
     try testing.expect(@sizeOf(Interactivity) <= @sizeOf(StyleRefinement) + 48);
-    try testing.expect(@sizeOf(Div) <= @sizeOf(StyleRefinement) + 144);
+    try testing.expect(@sizeOf(Div) <= @sizeOf(StyleRefinement) + 96);
+    try testing.expect(@sizeOf(DivFrameState) <= 16);
     try testing.expect(@sizeOf(DivPrepaintState) <= 96);
 
     const TestAppContext = @import("../app/test_context.zig").TestAppContext;

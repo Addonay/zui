@@ -391,24 +391,7 @@ pub const Style = struct {
 
     /// The content mask for overflow clipping, or null when overflow is visible on both axes.
     pub fn overflow_mask(self: *const Style, b: Bounds(Pixels), rem_size: Pixels) ?Bounds(Pixels) {
-        if (self.overflow.x == .visible and self.overflow.y == .visible) return null;
-        var min = b.origin;
-        var max = b.bottom_right();
-        if (self.overflow.x != .visible) {
-            min.x += self.border_widths.left.to_pixels(rem_size);
-            max.x -= self.border_widths.right.to_pixels(rem_size);
-        } else {
-            min.x = -std.math.floatMax(f32);
-            max.x = std.math.floatMax(f32);
-        }
-        if (self.overflow.y != .visible) {
-            min.y += self.border_widths.top.to_pixels(rem_size);
-            max.y -= self.border_widths.bottom.to_pixels(rem_size);
-        } else {
-            min.y = -std.math.floatMax(f32);
-            max.y = std.math.floatMax(f32);
-        }
-        return Bounds(Pixels).from_corners(min, max);
+        return compute_overflow_mask(self.overflow.x, self.overflow.y, self.border_widths, b, rem_size);
     }
 
     /// True if this style paints a fully opaque background.
@@ -431,6 +414,96 @@ pub const Style = struct {
 };
 
 pub const StyleRefinement = Refinement(Style);
+
+/// True if no fields of `t` are set.
+pub fn is_text_empty(t: *const TextStyleRefinement) bool {
+    return refineable.is_empty(TextStyle, t);
+}
+
+fn abs_px_opt(l: ?AbsoluteLength, rem_size: Pixels) Pixels {
+    return if (l) |v| v.to_pixels(rem_size) else 0;
+}
+
+fn compute_overflow_mask(ox: Overflow, oy: Overflow, border_widths: anytype, b: Bounds(Pixels), rem_size: Pixels) ?Bounds(Pixels) {
+    if (ox == .visible and oy == .visible) return null;
+    var min = b.origin;
+    var max = b.bottom_right();
+    if (ox != .visible) {
+        const bw_l = if (@TypeOf(border_widths.left) == ?AbsoluteLength) abs_px_opt(border_widths.left, rem_size) else border_widths.left.to_pixels(rem_size);
+        const bw_r = if (@TypeOf(border_widths.right) == ?AbsoluteLength) abs_px_opt(border_widths.right, rem_size) else border_widths.right.to_pixels(rem_size);
+        min.x += bw_l;
+        max.x -= bw_r;
+    } else {
+        min.x = -std.math.floatMax(f32);
+        max.x = std.math.floatMax(f32);
+    }
+    if (oy != .visible) {
+        const bw_t = if (@TypeOf(border_widths.top) == ?AbsoluteLength) abs_px_opt(border_widths.top, rem_size) else border_widths.top.to_pixels(rem_size);
+        const bw_b = if (@TypeOf(border_widths.bottom) == ?AbsoluteLength) abs_px_opt(border_widths.bottom, rem_size) else border_widths.bottom.to_pixels(rem_size);
+        min.y += bw_t;
+        max.y -= bw_b;
+    } else {
+        min.y = -std.math.floatMax(f32);
+        max.y = std.math.floatMax(f32);
+    }
+    return Bounds(Pixels).from_corners(min, max);
+}
+
+/// Content mask for overflow clipping directly from a `StyleRefinement`, avoiding building a full `Style`.
+pub fn overflow_mask_refinement(r: *const StyleRefinement, b: Bounds(Pixels), rem_size: Pixels) ?Bounds(Pixels) {
+    return compute_overflow_mask(r.overflow.x orelse .visible, r.overflow.y orelse .visible, r.border_widths, b, rem_size);
+}
+
+pub inline fn overflow_mask_any(s_or_r: anytype, b: Bounds(Pixels), rem_size: Pixels) ?Bounds(Pixels) {
+    if (@TypeOf(s_or_r) == *const StyleRefinement) return overflow_mask_refinement(s_or_r, b, rem_size);
+    return s_or_r.overflow_mask(b, rem_size);
+}
+
+/// True if any border width on `r` is non-null and non-zero.
+pub fn is_border_visible_refinement(r: *const StyleRefinement) bool {
+    inline for (.{ r.border_widths.top, r.border_widths.right, r.border_widths.bottom, r.border_widths.left }) |edge| {
+        if (edge) |e| if (!e.is_zero()) return true;
+    }
+    return false;
+}
+
+pub inline fn is_border_visible_any(s_or_r: anytype) bool {
+    if (@TypeOf(s_or_r) == *const StyleRefinement) return is_border_visible_refinement(s_or_r);
+    return s_or_r.is_border_visible();
+}
+
+/// Resolves refined border widths to pixels without materializing a full `Style`.
+pub fn resolve_border_widths(bw: *const @FieldType(StyleRefinement, "border_widths"), rem_size: Pixels) Edges(Pixels) {
+    return .{
+        .top = abs_px_opt(bw.top, rem_size),
+        .right = abs_px_opt(bw.right, rem_size),
+        .bottom = abs_px_opt(bw.bottom, rem_size),
+        .left = abs_px_opt(bw.left, rem_size),
+    };
+}
+
+pub inline fn resolve_border_widths_any(s_or_r: anytype, rem_size: Pixels) Edges(Pixels) {
+    if (@TypeOf(s_or_r) == *const StyleRefinement) return resolve_border_widths(&s_or_r.border_widths, rem_size);
+    return s_or_r.border_widths.to_pixels(.{rem_size});
+}
+
+/// Resolves refined corner radii to pixels without materializing a full `Style`.
+pub fn resolve_corner_radii(cr: *const @FieldType(StyleRefinement, "corner_radii"), rem_size: Pixels) Corners(Pixels) {
+    if (cr.top_left == null and cr.top_right == null and cr.bottom_right == null and cr.bottom_left == null) {
+        return Corners(Pixels).all(0);
+    }
+    return .{
+        .top_left = abs_px_opt(cr.top_left, rem_size),
+        .top_right = abs_px_opt(cr.top_right, rem_size),
+        .bottom_right = abs_px_opt(cr.bottom_right, rem_size),
+        .bottom_left = abs_px_opt(cr.bottom_left, rem_size),
+    };
+}
+
+pub inline fn resolve_corner_radii_any(s_or_r: anytype, rem_size: Pixels) Corners(Pixels) {
+    if (@TypeOf(s_or_r) == *const StyleRefinement) return resolve_corner_radii(&s_or_r.corner_radii, rem_size);
+    return s_or_r.corner_radii.to_pixels(rem_size);
+}
 
 fn zeroLen(comptime T: type) T {
     return switch (T) {
